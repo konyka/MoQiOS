@@ -6801,3 +6801,19 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修复：安装命令显式加上 `ipxe-qemu`。在同一个容器里验证：`qemu-system-misc qemu-system-arm ipxe-qemu` 装好后 aarch64 `dumpdtb` 成功退出 0，`qemu-system-riscv64 --version` 正常。
 - 如实说明：①容器验证的是 QEMU 能否启动，**不是**完整的 `zig build smoke-aarch64`（容器里没有 Zig 和仓库）；完整结论要等下一次 CI 运行；②这次的教训：改 CI 配置要在与 runner 相同的环境里验证，不能用本地结果代替；③下载时间的问题是否真的解决了，要看下一次运行里这个步骤的耗时（上次是 16 秒，但 apt 镜像的速度本身不稳定）。
 
+## libc 的 `select` 与 `fd_set`（hello234 H 组）
+
+- 缺口：libc 有 `poll` 但没有 `select`，也没有 `fd_set` 和 `FD_*` 宏。
+- 红灯：host 测试 `test_select_abi.c` 在没有 `src/select.c` 时编译失败；写好后通过。布局取自 glibc 实测：`sizeof(fd_set)` 128、`FD_SETSIZE` 1024，描述符 n 是第 n/64 个 64 位字的第 n%64 位。
+- 实现：`include/select.h`、`src/select.c`（一个系统调用，`SYS_select`=163，错误转成 -1/errno）、`FD_ZERO` 用数组本身而不是 `fd_set` 类型名（第一版用了类型名，我的 host 测试为了避免和系统头文件冲突把类型改了名，宏就编译不过）。
+- 变异：字索引改错（`FD_ISSET` 用错字）、`FD_CLR` 变成置位、`timeout` 清零、`exceptfds` 清零、`readfds`/`writefds` 互换、`errno` 不设置，全部被抓住。其中前两轮有几个变异只是编译不过（未使用参数），不算有效证据；`exceptfds` 清零这个变异第一版**没抓住**，因为我的测试对这个参数传了 `NULL`，改成传一个真实的集合后抓住。
+- QEMU（hello234 H 组 4 项）：空管道超时、读写端同时就绪、未打开的描述符是 `EBADF`、信号处理函数运行后 `EINTR`。第一版 `EBADF` 用例用了描述符 999，失败了。我用 gcc 在 Linux 上测：关闭的描述符 20 给 `EBADF`，但 500 和 999 返回 `r=0`（超出已打开描述符范围的位 Linux 不报 `EBADF`）；这个内核与 Linux 一致，是我的期望写错，改成 `p[1]+8`。
+- 如实说明：①Linux 对"超出当前最高已打开描述符"的关闭描述符返回 0 而不是 `EBADF`，这个内核的实现我没有逐条核对，只验证了上面这一个点；②`FD_SET` 等宏不检查 `fd < FD_SETSIZE`，越界是未定义行为（与 glibc 的默认构建一致）；③`pselect6`、`epoll_*` 仍没有 libc 封装。
+
+## CI：`smoke-qemu` 的 QEMU 安装也会被慢镜像拖住
+
+- 观察：`16cde16` 的运行里，`smoke-qemu` 的 `Install QEMU and xorriso` 步骤用了 20 分钟（16:39 → 16:59），其它运行里同一步骤只要约 20–40 秒。job 的上限是 30 分钟：安装 20 分钟加 SMP=1 的 10.7 分钟，SMP=2 在上限处被取消（`smoke-qemu cancelled`）。我先在这一节预判了这个风险，随后运行结果证实了；所以 `16cde16` 的 CI 没有 `smoke-qemu` 的完整结论（SMP=1 步骤成功，SMP=2 未跑完）。这和 `smoke-cross-arch` 的症状一样，都是 Ubuntu 镜像下载慢。
+- 修复：和跨架构 job 同样处理：`--no-install-recommends`、显式加 `ipxe-qemu`、每次 `apt-get` 限时 240 秒、最多三次、步骤上限 11 分钟。
+- 验证：在 Ubuntu 24.04 容器里装 `qemu-system-x86 xorriso ipxe-qemu`（无推荐依赖），`qemu-system-x86_64 -machine q35 ... -device e1000` 能启动；`xorriso` 正常。这**不是**完整的 `zig build smoke`，要靠下一次 CI 运行。
+- 如实说明：①这个 job 之前没有因此被取消过；这是第一次，之后才有了证据；②我没有改 `seabios`（`--no-install-recommends` 下 `qemu-system-x86` 的 BIOS 是否齐全，容器里 `qemu-system-x86_64` 在 q35 下能启动，但**没有**走 Limine 的完整引导流程验证）。
+

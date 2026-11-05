@@ -35,7 +35,19 @@ jobs:
           curl -sSfL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | sudo tar -xJ -C /opt
           echo "/opt/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
       - name: Install QEMU and xorriso
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 xorriso
+        # Same bounded, retried install as the cross-arch job: a slow Ubuntu mirror once held this step for 20 of the job's 30
+        # minutes, leaving the smoke too little time. ipxe-qemu is named explicitly (a recommended package, and the e1000 and virtio
+        # network devices need its option ROMs).
+        timeout-minutes: 11
+        run: |
+          for attempt in 1 2 3; do
+            if sudo timeout 240 apt-get update && sudo timeout 240 apt-get install -y --no-install-recommends qemu-system-x86 xorriso ipxe-qemu; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed or timed out" >&2
+            sleep 5
+          done
+          exit 1
       - name: Smoke SMP=1
         run: zig build smoke
         env:

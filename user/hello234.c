@@ -10,6 +10,7 @@
 #include "../lib/moqi_libc/include/signal.h"
 #include "../lib/moqi_libc/include/time.h"
 #include "../lib/moqi_libc/include/poll.h"
+#include "../lib/moqi_libc/include/select.h"
 
 static int failures;
 static void check(int ok, const char *what) {
@@ -140,6 +141,65 @@ int main(int argc, char **argv, char **envp) {
         check(r == 0 && dt >= 150 && hits == 1, what);
     }
     waitpid(kid, (int *)0, 0);
+
+    /* select(): the same readiness as poll, with fd_set bit sets and a struct timeval */
+    pipe(p);
+    {
+        fd_set rs, ws;
+        struct timeval tv;
+        FD_ZERO(&rs);
+        FD_SET(p[0], &rs);
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000;
+        t0 = now_ms();
+        r = select(p[0] + 1, &rs, (fd_set *)0, (fd_set *)0, &tv);
+        dt = now_ms() - t0;
+        check(r == 0 && !FD_ISSET(p[0], &rs) && dt >= 80 && dt < 1500, "H: select on an empty pipe times out with 0 after about 100 ms and clears the set");
+
+        write(p[1], "q", 1);
+        FD_ZERO(&rs);
+        FD_SET(p[0], &rs);
+        FD_ZERO(&ws);
+        FD_SET(p[1], &ws);
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        r = select((p[0] > p[1] ? p[0] : p[1]) + 1, &rs, &ws, (fd_set *)0, &tv);
+        check(r == 2 && FD_ISSET(p[0], &rs) && FD_ISSET(p[1], &ws), "H: select reports the readable read end and the writable write end (2 ready)");
+
+        read(p[0], &c, 1);
+        FD_ZERO(&rs);
+        FD_SET(p[0], &rs);
+        FD_SET(p[1] + 8, &rs);
+        tv.tv_sec = 0;
+        tv.tv_usec = 0;
+        errno = 0;
+        r = select(p[1] + 9, &rs, (fd_set *)0, (fd_set *)0, &tv);
+        {
+            char what[120];
+            snprintf(what, sizeof what, "H: a descriptor that is not open in the set is -1 / EBADF (r=%d errno=%d)", r, errno);
+            check(r == -1 && errno == EBADF, what);
+        }
+
+        /* a signal handler that runs during the wait: EINTR, and the handler has run when select returns */
+        hits = 0;
+        kid = fork();
+        if (kid == 0) {
+            struct timespec ts4 = { 0, 60000000L };
+            nanosleep(&ts4, 0);
+            kill(me, SIGUSR1);
+            _exit(0);
+        }
+        FD_ZERO(&rs);
+        FD_SET(p[0], &rs);
+        errno = 0;
+        r = select(p[0] + 1, &rs, (fd_set *)0, (fd_set *)0, (struct timeval *)0);
+        {
+            char what[120];
+            snprintf(what, sizeof what, "H: a signal handler that runs during select makes it fail with EINTR (r=%d errno=%d hits=%d)", r, errno, (int)hits);
+            check(r == -1 && errno == EINTR && hits == 1, what);
+        }
+        waitpid(kid, (int *)0, 0);
+    }
 
     close(p[0]);
     close(p[1]);

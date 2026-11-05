@@ -7,7 +7,7 @@
  * poll returns the number of descriptors whose revents is non-zero, 0 when the timeout (milliseconds, negative = forever) ran
  * out first, and -1 with errno on failure (EINTR when a signal handler ran, EINVAL for a bad nfds, EFAULT for a bad array).
  * ppoll takes a struct timespec (NULL = forever) and an optional signal mask installed for the duration of the wait; the mask
- * size passed to the kernel is 8 (0 when there is no mask). There is no select(); the kernel call exists but the library has no wrapper yet.
+ * size passed to the kernel is 8 (0 when there is no mask). select() is in select.h.
  */
 #ifndef MOQI_POLL_H
 #define MOQI_POLL_H
