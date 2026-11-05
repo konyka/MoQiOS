@@ -64,13 +64,15 @@ jobs:
         # qemu-system-aarch64 in qemu-system-arm; without the latter the
         # AArch64 step failed on every run ("qemu-system-aarch64 not found").
         # --no-install-recommends keeps the download to the emulators themselves (the recommended packages pull in audio, USB-redirect,
-        # Ceph and SPICE libraries that a headless serial smoke never uses). Each attempt has its own time limit, so a stalled mirror
+        # Ceph and SPICE libraries that a headless serial smoke never uses). ipxe-qemu has to be named explicitly: it is only a
+        # recommendation, and without it qemu-system-aarch64 refuses to start ("failed to find romfile efi-virtio.rom") because the
+        # default virtio network device needs that ROM. Each attempt has its own time limit, so a stalled mirror
         # download is abandoned and retried instead of eating the whole job's budget (this step was cancelled by the 15-minute job
         # limit on two consecutive runs while downloading qemu-system-misc).
         timeout-minutes: 11
         run: |
           for attempt in 1 2 3; do
-            if sudo timeout 240 apt-get update && sudo timeout 240 apt-get install -y --no-install-recommends qemu-system-misc qemu-system-arm; then
+            if sudo timeout 240 apt-get update && sudo timeout 240 apt-get install -y --no-install-recommends qemu-system-misc qemu-system-arm ipxe-qemu; then
               exit 0
             fi
             echo "apt attempt $attempt failed or timed out" >&2

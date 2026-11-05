@@ -6794,3 +6794,10 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 如实说明：①`mq_timedsend` 在满队列上被信号打断的情形**没有**QEMU 用例（只靠 host 清单）；②`connect` 用例依赖 SLIRP 的网关地址 10.0.2.2，如果 QEMU 网络配置变了会失效；③`msgsnd`/`msgrcv` 仍没有改：这个内核里它们不阻塞。
 - CI：`smoke-cross-arch` 在 `7dd7e52` 和 `823f1c7` 两次运行里都是 `cancelled`，原因是 `Install cross-architecture QEMU` 步骤里 `apt-get` 从 Ubuntu 镜像下载 `qemu-system-misc`（57 MB）很慢，吃光了 job 的 15 分钟（更早的两次运行同一步骤只要约 1 分钟）。本地我跑了 `zig build -Darch=riscv64 smoke-riscv` 和 `-Darch=aarch64 smoke-aarch64`，都 PASS，所以代码本身没有问题；改了 `.github/workflows/test.yml`：该步骤加 `--no-install-recommends`（`qemu-system-misc` 的推荐依赖是音频/SPICE/Ceph 之类的库），三次尝试、每次 `apt-get` 限时 240 秒、步骤上限 11 分钟。这个改动**没有办法在本地验证**（不是 GitHub runner），要靠下一次 CI 运行确认；我没有 `actionlint`，只用 Python 的 YAML 解析确认语法合法。
 
+## CI 跨架构 job：我上一次修复引入的回归（订正）
+
+- 经过：`smoke-cross-arch` 因 `apt-get install qemu-system-misc` 下载太慢被 15 分钟上限取消，我改成 `--no-install-recommends` 加重试（`bf0fc02`）。那次运行里安装只用了 16 秒，RISC-V 通过，但 **AArch64 失败**：`ERROR: QEMU exited before aarch64 smoke markers appeared`。我当时在本地跑过 `smoke-aarch64` 并通过，就判断"代码没问题"，没有想到本地的 QEMU 是 Fedora 的完整安装，和 CI 的最小安装不同——这个判断对代码是对的，但没有验证我改的 CI 配置本身。
+- 根因（在 Ubuntu 24.04 容器里用 podman 复现）：只装 `qemu-system-arm` 时，`qemu-system-aarch64 -machine virt ...` 报 `failed to find romfile "efi-virtio.rom"` 并以 1 退出。这个 ROM 在 `ipxe-qemu` 包里，对 `qemu-system-arm` 只是"推荐依赖"，`--no-install-recommends` 把它丢了。
+- 修复：安装命令显式加上 `ipxe-qemu`。在同一个容器里验证：`qemu-system-misc qemu-system-arm ipxe-qemu` 装好后 aarch64 `dumpdtb` 成功退出 0，`qemu-system-riscv64 --version` 正常。
+- 如实说明：①容器验证的是 QEMU 能否启动，**不是**完整的 `zig build smoke-aarch64`（容器里没有 Zig 和仓库）；完整结论要等下一次 CI 运行；②这次的教训：改 CI 配置要在与 runner 相同的环境里验证，不能用本地结果代替；③下载时间的问题是否真的解决了，要看下一次运行里这个步骤的耗时（上次是 16 秒，但 apt 镜像的速度本身不稳定）。
+
