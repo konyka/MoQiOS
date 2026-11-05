@@ -114,6 +114,91 @@ int main(int argc, char **argv, char **envp) {
         close(ep2);
     }
 
+    /* a pipe's write end whose last reader has gone: EPOLLERR together with EPOLLOUT (measured on Linux: events 0xc) */
+    {
+        int q[2];
+        pipe(q);
+        signal(SIGPIPE, SIG_IGN);
+        int ep3 = epoll_create1(0);
+        struct epoll_event e3;
+        memset(&e3, 0, sizeof e3);
+        e3.events = EPOLLOUT;
+        e3.data.u32 = 3;
+        epoll_ctl(ep3, EPOLL_CTL_ADD, q[1], &e3);
+        close(q[0]);
+        struct epoll_event o3[2];
+        memset(o3, 0, sizeof o3);
+        int n3 = epoll_wait(ep3, o3, 2, 500);
+        char what[140];
+        snprintf(what, sizeof what, "G: a write end with no reader reports EPOLLERR|EPOLLOUT (n=%d events=0x%x)", n3, n3 > 0 ? o3[0].events : 0u);
+        check(n3 == 1 && o3[0].events == (EPOLLOUT | EPOLLERR), what);
+        close(q[1]);
+        close(ep3);
+    }
+
+    /* EPOLLONESHOT: reported once, then disarmed until EPOLL_CTL_MOD rearms it. The sequence and the counts (1, 0, 0, 1) were measured
+     * on Linux. */
+    {
+        int q[2];
+        pipe(q);
+        int ep4 = epoll_create1(0);
+        struct epoll_event e4;
+        memset(&e4, 0, sizeof e4);
+        e4.events = EPOLLIN | EPOLLONESHOT;
+        e4.data.u32 = 1;
+        epoll_ctl(ep4, EPOLL_CTL_ADD, q[0], &e4);
+        write(q[1], "a", 1);
+        struct epoll_event o4[2];
+        int n1 = epoll_wait(ep4, o4, 2, 200);
+        int n2 = epoll_wait(ep4, o4, 2, 50);
+        write(q[1], "b", 1);
+        int n3 = epoll_wait(ep4, o4, 2, 50);
+        e4.events = EPOLLIN | EPOLLONESHOT;
+        e4.data.u32 = 2;
+        epoll_ctl(ep4, EPOLL_CTL_MOD, q[0], &e4);
+        memset(o4, 0, sizeof o4);
+        int n4 = epoll_wait(ep4, o4, 2, 200);
+        char what[160];
+        snprintf(what, sizeof what, "H: EPOLLONESHOT is reported once, stays disarmed, and MOD rearms it (counts %d,%d,%d,%d; data %u)", n1, n2, n3, n4, n4 > 0 ? o4[0].data.u32 : 0u);
+        check(n1 == 1 && n2 == 0 && n3 == 0 && n4 == 1 && o4[0].data.u32 == 2, what);
+        close(q[0]);
+        close(q[1]);
+        close(ep4);
+    }
+
+    /* EPOLLET: a registration is reported on a new edge only. The sequence and the counts (1, 0, 0, 1, then 1 with EPOLLHUP) were measured
+     * on Linux: one report for the first data, none while it stays unread, none after a partial read, one for new data, one for the
+     * hang-up. */
+    {
+        int q[2];
+        pipe(q);
+        int ep5 = epoll_create1(0);
+        struct epoll_event e5;
+        memset(&e5, 0, sizeof e5);
+        e5.events = EPOLLIN | EPOLLET;
+        e5.data.u32 = 1;
+        epoll_ctl(ep5, EPOLL_CTL_ADD, q[0], &e5);
+        write(q[1], "ab", 2);
+        struct epoll_event o5[2];
+        int e1 = epoll_wait(ep5, o5, 2, 200);
+        int e2 = epoll_wait(ep5, o5, 2, 50);
+        char rc;
+        read(q[0], &rc, 1);
+        int e3 = epoll_wait(ep5, o5, 2, 50);
+        write(q[1], "c", 1);
+        int e4 = epoll_wait(ep5, o5, 2, 200);
+        read(q[0], &rc, 1);
+        read(q[0], &rc, 1);
+        close(q[1]);
+        memset(o5, 0, sizeof o5);
+        int e5n = epoll_wait(ep5, o5, 2, 200);
+        char what[180];
+        snprintf(what, sizeof what, "I: EPOLLET reports new edges only (counts %d,%d,%d,%d,%d; last events 0x%x)", e1, e2, e3, e4, e5n, e5n > 0 ? o5[0].events : 0u);
+        check(e1 == 1 && e2 == 0 && e3 == 0 && e4 == 1 && e5n == 1 && (o5[0].events & EPOLLHUP), what);
+        close(q[0]);
+        close(ep5);
+    }
+
     errno = 0;
     check(epoll_wait(999, out, 4, 0) == -1 && errno == EBADF, "F: epoll_wait on a descriptor that is not open is -1 / EBADF");
     errno = 0;

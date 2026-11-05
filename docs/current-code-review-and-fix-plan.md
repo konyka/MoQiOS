@@ -6824,5 +6824,15 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：`epoll_policy.zig` 新增 `ALWAYS_REPORTED` 和 `notifyMatch(ready, interest) = ready & (interest | ALWAYS_REPORTED)`，`epollNotify` 用它；host 测试 2 个。变异：把 `notifyMatch` 改回 `ready & interest`、把 `ALWAYS_REPORTED` 去掉 `EPOLLHUP`，都被抓住。
 - libc 部分：`include/epoll.h`、`src/epoll.c`（三个函数各一个系统调用，用原生编号 146/147/148；原生 `epoll_wait` 没有 sigmask 参数）。host 测试 `test_epoll_abi.c`：没有 `epoll.c` 时编译失败，写好后通过；六个变异（结构不 packed、`EPOLLET` 值错、`ctl` 的 `fd` 和 `op` 互换、`wait` 超时置零、`create1` 的 flags 置零、`errno` 不设置）全部被抓住。
 - QEMU：hello236 共 18 项全过，包括布局、`EEXIST`/`ENOENT`、超时、水平触发、`MOD`/`DEL`、`EPOLLHUP`、`EBADF`/`EINVAL`。
-- 如实说明：①我没有核对 `EPOLLHUP` 之外其它"总是报告"的情形：poll 路径（`pollWait`）是否有同类遗漏我没查，hello234 里 `poll` 在写端关闭后给 `POLLHUP`，那是 poll 自己扫描的结果；②`epoll_pwait`、`epoll_pwait2`、`epoll_create` 没有封装；③ET（边缘触发）模式下 HUP 通知的行为我没有单独测，`notifyMatch` 在 ET 分支前，所以 HUP 也会受 `last_reported` 去重影响，没有验证。
+- 如实说明：①我没有核对 `EPOLLHUP` 之外其它"总是报告"的情形：poll 路径（`pollWait`）是否有同类遗漏我没查，hello234 里 `poll` 在写端关闭后给 `POLLHUP`，那是 poll 自己扫描的结果；②`epoll_pwait`、`epoll_pwait2`、`epoll_create` 没有封装；③ET（边缘触发）模式下 HUP 通知的行为：见下一节，已验证。
+
+## epoll/poll 的补充回归用例（hello234 I、hello236 G/H/I）
+
+- 做法：先在宿主机用 gcc 测出 Linux 的结果，再写成用例，在这个内核上跑。三类行为：
+  - 管道写端的读者全部消失：Linux 给 `POLLOUT|POLLERR`（`0xc`），`poll` 和 `epoll` 都一样；
+  - `EPOLLONESHOT`：计数序列 1、0、0、MOD 重新装填后 1，数据字是 MOD 时给的新值；
+  - `EPOLLET`：首次数据 1 次、数据仍未读 0 次、部分读之后 0 次、新数据 1 次、写端关闭得 `EPOLLHUP` 1 次。
+- 结果：**这个内核的行为与 Linux 在这些点上完全一致，第一次运行就通过，没有发现新缺陷。**所以这一节是回归保护，不是修复；这些用例不能证明"修复前会失败"。
+- 过程中的一个小事故：我写 ET 的宿主机探针时多读了一次，让探针挂住了（在读完所有数据之后再 `read` 会阻塞），改正后才得到上面的序列。这只影响探针，不影响用例。
+- 如实说明：上面只验证了管道这一种描述符；`EPOLLONESHOT`/`EPOLLET` 在 socket、eventfd、timerfd 上的行为没有测。
 

@@ -142,6 +142,20 @@ int main(int argc, char **argv, char **envp) {
     }
     waitpid(kid, (int *)0, 0);
 
+    /* a pipe's write end whose last reader has gone: POLLERR together with POLLOUT (measured on Linux: revents 0xc) */
+    {
+        int q[2];
+        pipe(q);
+        signal(SIGPIPE, SIG_IGN);
+        close(q[0]);
+        struct pollfd wf = { q[1], POLLOUT, 0 };
+        int rr = poll(&wf, 1, 0);
+        char what[120];
+        snprintf(what, sizeof what, "I: a write end with no reader reports POLLERR|POLLOUT (r=%d revents=0x%x)", rr, (unsigned)(unsigned short)wf.revents);
+        check(rr == 1 && wf.revents == (POLLOUT | POLLERR), what);
+        close(q[1]);
+    }
+
     /* select(): the same readiness as poll, with fd_set bit sets and a struct timeval */
     pipe(p);
     {
