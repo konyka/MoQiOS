@@ -70,7 +70,7 @@
 > **2026-06-21 SMP 性能三件套**：FPU/SSE 任务状态保存、Per-CPU 调度队列 + Work-Stealing、
 > 范围 TLB Shootdown 同时完成。三者互为前提，完成后用户任务可跨核迁移，AP 参与负载均衡。
 
-**用户程序**: ~3,600 行 C/ASM | **测试**: `zig build test` 覆盖主机可运行的共享库逻辑；QEMU
+**规模**（`wc -l`，2026-11 统计）: 内核约 109,000 行 Zig（含 `kernel/shared` 里的内核自检）| 用户程序约 42,000 行 C/ASM（`user/*.c`，主要是 hello 系列测试）| moqi_libc 约 9,500 行 | **测试**: `zig build test` 覆盖主机可运行的共享库逻辑；QEMU
 `smoke`/`smoke-smp`/`smoke-smp-matrix` 覆盖 x86_64 启动与集成路径（矩阵默认测试 1/2/3/4/6/8 核），
 `init` 自动执行其中配置好的非交互 hello 用例；`hello38`–`hello41` 是 2026-07-28 新增的强制 smoke 门禁（`copy_file_range`、`setsockopt`/`getsockopt`、`futex_waitv`、`rt_sigsuspend`）。
 
@@ -181,6 +181,8 @@
 | 284 | process_vm_writev | 仅当前进程地址空间；最多 4096 字节内核 staging，保留 partial-copy/EFAULT 边界 |
 
 ## 测试程序
+
+下表只列了早期和少数几组用例。`user/` 里现在有两百多个 `helloN` 探针（hello2–hello233），init 自动序列和每组的覆盖范围以 [docs/user-space.md](docs/user-space.md) 第 4 节和 `servers/init/main.c` 为准。
 
 | 测试 | 功能 |
 |---|---|

@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前为 `hello2`–`hello101`；其中 `hello11` 与 `hello28` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello229`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28` **不**在
    init 自动序列内），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -201,7 +201,7 @@ main():
 
 ## 4. 测试程序（hello 系列）
 
-`user/hello2.c` ~ `user/hello101.c` 是渐进式功能测试；其中 hello2~hello44 是早期基础系列，
+`user/hello2.*` ~ `user/hello233.c` 是渐进式功能测试；其中 hello2~hello44 是早期基础系列，
 hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启动：
 
 | 程序 | 测试焦点 |

@@ -6763,3 +6763,10 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 结果：hello227 共 111 项，SMP=1 全过；"wait 什么都不做"的变异被抓住。
 - 如实说明：①裸 `wait` 现在把 shell 的**所有**子进程都当作后台任务，而前台命令已经按自己的 pid 等过了，所以不会漏也不会多收；②`wait PID` 对表外的 pid 一直有效，没有改；③`MAX_JOBS` 仍是 16，只影响提示符前的回收（表满时那些任务要等 `wait` 或 shell 退出才被回收）；④慢任务的 300 毫秒是实测的，在负载很高的机器上快任务也可能更慢，但测试只依赖"慢任务比快任务晚结束"，不依赖绝对时间。
 
+## 文档里写死的范围和规模（核对）
+
+- 核对对象：文档里反复出现的"init 自动 spawn hello2–hello101""用户程序约 3,600 行""内核约 63,000 行"。
+- 事实（用 `servers/init/main.c` 和 `wc -l` 取得）：init 的 `run_test` 序列是 216 个、编号 3 到 229，另有 4 个静默版本（hello13..hello16）和 hello2；`user/` 里有 14 个编号不在序列里：hello2（汇编、用 `spawn_child` 单独跑）、hello6（读键盘会阻塞）、hello11（`exec` 目标）、hello28、hello116（hello115 的 exec 目标）、hello149（手工复现程序）、hello230–hello233（hello227 用的探针）；hello13..hello16 在 init 里以静默方式跑。内核 Zig 约 108,800 行（含 `kernel/shared` 里的内核自检；去掉 `sk*` 约 96,800 行），`user/*.c` 加汇编约 41,800 行，moqi_libc 约 9,500 行。
+- 修改：`docs/user-space.md`（init 范围、测试程序总范围）、`docs/moqios-architecture-current.md`（五处 hello2–hello101）、`README.md`、`README.en.md`（规模数字，并在测试程序表前注明表只列早期用例、完整情况看 user-space.md 第 4 节）。
+- 如实说明：①"hello2–hello229"是序列的两端，序列中间并不连续（上面那 14 个不在其中）；②规模数字是一次 `wc -l` 的取整结果，会随提交变化，所以写成"约"并注明统计口径和时间；③`docs/` 里其它文件的数字（例如各轮验证记录里的"host 720/720"）是当时的历史记录，没有改。
+

@@ -34,7 +34,7 @@ An x86_64-first operating system kernel written in Zig, using the Limine boot pr
 > smoke pass. ReleaseFast builds pass. Run: `zig build smoke-smp-matrix` or
 > `MOQI_SMOKE_MATRIX_CPUS="1 2 4 8" zig build smoke-smp-matrix`.
 
-**Kernel**: ~63,000 lines Zig | **User programs**: ~3,600 lines C/ASM | **Tests**: host unit tests + QEMU smoke gates (`smoke`, `smoke-smp`, `smoke-smp-matrix`, `smoke-smp-stress`)
+**Size** (`wc -l`, 2026-11): kernel ~109,000 lines Zig (including the kernel self-checks in `kernel/shared`) | user programs ~42,000 lines C/ASM (`user/*.c`, mostly the hello test series) | moqi_libc ~9,500 lines | **Tests**: host unit tests + QEMU smoke gates (`smoke`, `smoke-smp`, `smoke-smp-matrix`, `smoke-smp-stress`)
 
 ## Canonical Disk Fixture
 
@@ -130,6 +130,8 @@ contracts with `tools/disk_fixture.sh disk.img.manifest disk.img` and
 | 284 | process_vm_writev | Caller address space only; up to 4096-byte kernel staging with partial-copy/EFAULT boundaries |
 
 ## Test Programs
+
+This table lists only the early series and a few groups. `user/` now holds over two hundred `helloN` probes (hello2–hello233); the init sequence and what each group covers are in section 4 of [docs/user-space.md](docs/user-space.md) (Chinese) and in `servers/init/main.c`.
 
 | Test | Feature |
 |---|---|
