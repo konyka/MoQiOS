@@ -18,6 +18,11 @@ extern void __moqi_tls_setup(unsigned long *sp);
 /* Process environment, set by _start_c from the initial stack. */
 char **environ;
 
+/* argv[0] and its last path component (see errno.h); "" when the program was started without arguments. */
+static char no_name[] = "";
+char *program_invocation_name = no_name;
+char *program_invocation_short_name = no_name;
+
 __attribute__((used)) void _start_c(unsigned long *sp) {
     long argc;
     char **argv;
@@ -27,6 +32,13 @@ __attribute__((used)) void _start_c(unsigned long *sp) {
     __pthread_init_main();
     moqi_parse_initial_stack(sp, &argc, &argv, &envp);
     environ = envp;
+    if (argc > 0 && argv[0] != (char *)0) {
+        char *base = argv[0];
+        for (char *p = argv[0]; *p; p++)
+            if (*p == '/') base = p + 1;
+        program_invocation_name = argv[0];
+        program_invocation_short_name = base;
+    }
     int code = main((int)argc, argv, envp);
     exit(code); /* flushes the FILE buffers */
 }

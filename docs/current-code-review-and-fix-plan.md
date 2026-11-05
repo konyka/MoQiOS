@@ -6516,3 +6516,31 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 机理（推断，未在失败现场直接观测）：`bbrPacedRate` 把 `delivery_rate` 当发送节拍，每段间隔 `mss*1000/rate` 毫秒；5.5 kB/s 对应约 264 ms 一段。节拍之后每个 ACK 只覆盖一个段，而 `deliverySampleUsable` 会拒绝"不超过一个 MSS"的样本（hello173 修的同一类问题），所以估计永远升不回去。hello173 的修复只挡住了"应用受限的小样本"这一条入口，没有给节拍本身设下限。
 - 修复（加固）：`tcp_util.pacedRate(rate, cwnd, srtt_ms)` 把节拍速率下限设为 `cwnd / srtt`（一个 RTT 发完一个窗口；RTT 未测时按 1 ms），`bbrPacedRate` 的两个返回路径（Startup/ProbeRTT 与 ProbeBW）都经过它；没有速率估计（`rate==0`）时仍不节拍。host 测试先红后绿（`paceRateFloor`/`pacedRate` 的数值与 `bbrPacedRate` 接线）。
 - 如实说明：①这个偶发失败只在 CI 与一次本地压力轮里各出现过，本地 12+1+3 次定向复现从未命中，所以**无法用"修复前失败、修复后通过"来证明**因果；修复依据是上面的失败现场数据与机理推断，不是复现。②`hello174` 在失败时现在还会打印每秒累计已读字节与最长读间隔，下次再失败可以直接区分"均匀慢速"与"突发"。③下限只会让发送更快，不会降低任何已有的发送速率。
+
+## libc 进程终止与信号（hello226）：dup2 到 0/1/2 的管道写端永不释放
+
+- 起因：给 moqi_libc 补 `atexit`/`exit`/`_Exit`、`abort`/`raise`/`signal`/`sigset_t`/`sigprocmask`、`assert`、`perror`/`remove`/`rename`/`isatty`/`getuid` 族。`hello226` 把每个会终止进程的用例放进 fork 出的子进程，父进程用管道收集子进程的 stdout/stderr（子进程里 `dup2(pipe_w, 1)`、`dup2(pipe_w, 2)`），读到 EOF 后 `waitpid`。
+- **真实内核缺陷**：第一个子进程退出后父进程在 `read()` 上永远等不到 EOF。原因有两处叠加：①`FdTable.close(fd)` 对 `fd <= 2` 一律返回 0（"标准流不可关"），即使该槽位已被 `dup2` 换成管道写端；②进程退出时的关闭循环从 fd 3 开始。于是 `dup2(p, 1)` 之后，管道的写端引用只要经过 fd 1/2 就永远不被释放，读端永远没有 EOF。（shell 的管道/重定向恰好走这条路：`cmd > file`、`cmd | other` 的子进程退出后，管道写端泄漏，读方挂住。）
+- 修复：`close()` 只在该槽位仍是控制台（`fd_type == .special`）时对 0..2 返回 0；退出路径（`exitTask` 与未发布子进程的 abort 路径）从 fd 0 开始遍历。host 测试（源码结构断言）先红后绿。
+- 同一轮还发现的 libc 缺陷：`fflush(NULL)` 与 `exit()` 不刷新缓冲的 `stdout`（标准流不在已打开流链表上，`printf` 不缓冲而 `fprintf(stdout, …)` 缓冲，exit 之后后者的数据丢失）。现在 `stdio_streams.c` 经 `EXTRA_FLUSH_ALL` 钩子把 `stdout`/`stderr` 并入 `fflush(NULL)`；host 测试（`test_file_abi.c`）变异验证：去掉钩子调用即红。
+- `signal.h` 改用 glibc 编号（`SIGUSR2` 是 12；内核常量 `signal.zig` 的 `SIGUSR2` 原为 31，已改为 12；该常量在内核里没有其它使用点（grep 确认），`hello89`/`hello109`/`hello112` 里的本地 `#define SIGUSR2 31` 只是把 31 当作一个任意信号来用，行为不受影响）。
+- 验证：`hello226` 56 项在 SMP=1 通过（修复前：父进程在第一个子进程退出后挂在管道读上；修复 close 之后 5 项失败，其中 3 项是 stdout 缓冲、1 项 assert 被 `-DNDEBUG`（`zig cc -O2`）吞掉，探针里 `#undef NDEBUG`）；host 1017/1017，libc host 测试全绿，三架构构建通过。
+
+## moqi_libc：getopt
+
+- `getopt`（`include/getopt.h`、`src/getopt.c`）按 glibc 2.43 实测行为实现：选项簇、附着/分开的参数、`::` 可选参数、`+`/`-`/`:` 前缀、`POSIXLY_CORRECT`、argv 置换（选项移到非选项之前，`optind` 指向第一个非选项）、`--`、孤立的 `-`、`optind=0` 重启、诊断行（`prog: invalid option -- 'z'`、`prog: option requires an argument -- 'b'`，`opterr==0` 或选项串以 `:` 开头时静默）。`optopt` 保持 glibc 的怪癖：成功调用不清除它，保留上一次错误的值。
+- 测试：`host_tests/test_getopt_abi.c` + `test_getopt_rows.inc`（54 个场景由 `gen/gen_getopt_rows.c` 在 glibc 2.43 上生成，含每步 `{返回值, optarg, optind, optopt}` 与最终 argv），外加诊断行、`optind=0/1` 重启、`argc<1`、`optopt` 持久性。8 个变异（改默认排序、去掉静默、`:` 返回值、簇内 `optind` 推进、`--` 后范围、argv 回退、`optarg` 取值、`optopt` 持久）全部被杀。
+- `getopt_long` / `getopt_long_only`：`struct option`、`--name[=value]`、唯一前缀缩写、歧义判定（只有 `has_arg`/`flag`/`val` 全相同的候选才不算歧义；精确匹配优先）、`flag` 指针、`longind`、`W;`、`getopt_long_only` 的单横线规则，以及 glibc 的全部诊断行。`host_tests/test_getopt_long_abi.c` 用 `getopt_long_table.inc` 这一张共享的选项表，`gen/gen_getopt_long_rows.c` 在 glibc 2.43 上生成 50 个场景（每步 `{返回值, optarg, optind, optopt, longindex, flag 变量}`、最终 argv、完整 stderr 文本）。变异检查中第一轮有 2 个变异存活（`flag` 比较、`getopt_long_only` 的单横线判断），各补了一行场景（`--qq` 与 `-W` 的未知名）后全部被杀。每次调用结尾统一发布 `optopt`（glibc 的包装函数就是这样做的，成功的长选项返回也会带出上一次错误的 `optopt`）。
+- 如实说明：`getopt` 的状态是进程全局的，非线程安全（与 glibc 相同）；本轮没有 QEMU 探针（行为完全由 host 测试覆盖，程序里只是纯 C 逻辑加一次 `write`）。
+
+## moqi_libc：setbuf 族、freopen、fgetpos/fsetpos、tmpfile
+
+- 先在 glibc 2.43 上量行为（`setbuf(f, NULL)` 无缓冲、`setbuf(f, buf)` 全缓冲、`setlinebuf` 在换行后写出、`fsetpos` 清 EOF 且越界/非法偏移为 EINVAL、`fgetpos` 在管道上 ESPIPE、`freopen` 保持同一个 `FILE*` 和同一个描述符号并先冲刷待写数据、失败时关闭旧流并返回 NULL、坏模式 EINVAL、`freopen(NULL, mode, f)` 只改模式且描述符不允许时 EINVAL、保留缓冲模式、清 EOF/错误、`a` 模式从文件尾开始），再在 `host_tests/test_file_abi.c` 里写测试，最后实现于 `stdio_file.c`（同一份代码在宿主机对内存文件系统运行）。`freopen` 把新文件 `dup2` 到旧描述符上，所以 `freopen(path, "w", stdout)` 重定向 fd 1。`tmpfile` 以 `O_CREAT|O_EXCL|O_RDWR` 打开 `/tmp/tmpf_<pid>_<n>` 并立刻 unlink（tmpfs 支持 unlink-while-open），重名则换下一个名字。
+- 变异验证：对这批代码做了 13 个变异（setbuf/setlinebuf 模式、freopen 的冲刷、EOF 清除、dup2、`a` 模式定位、fsetpos 的偏移、失败时关闭旧流、tmpfile 的 unlink、`O_EXCL`、重名重试、失败回收描述符、读写模式）。第一轮有 3 个存活（`a` 模式定位、`O_EXCL`、重名重试），各补了断言（`ftell` 在 append 重开后为 2；预先占住下一个名字的文件必须保持不变）后全部被杀。
+- 如实说明：①`fpos_t` 是 16 字节的 `{偏移, 备用}`，与 glibc 同大小但不含多字节转换状态（本库没有宽字符流）；②`tmpfile` 目前固定放在 `/tmp`，不读 `TMPDIR`；③QEMU 侧由 `hello226` 的 H 组覆盖。
+
+## moqi_libc：dirent.h
+
+- `opendir`/`readdir`/`closedir`/`rewinddir`/`telldir`/`seekdir`/`dirfd`，布局与行为按 glibc 2.43 实测：`struct dirent` 280 字节（`d_ino`@0、`d_off`@8、`d_reclen`@16、`d_type`@18、`d_name`@19），流用一块 4096 字节缓冲装 `getdents64` 记录，所有 `readdir` 结果共用流里同一块存储，目录以 close-on-exec 打开，到末尾返回 NULL 且不动 `errno`，`opendir("")` 与缺失路径为 `ENOENT`，普通文件为 `ENOTDIR`。内核的 `open()` 对任何文件都成功，所以 `opendir` 打开后用 `fstat` 的 `st_mode` 判断是不是目录，不是就关掉描述符并报 `ENOTDIR`（不泄漏 fd，host 测试断言了这一点）。
+- 测试：`host_tests/test_dirent_abi.c` 用记录桩模拟内核的 `getdents64`（含小缓冲多次调用、失败后恢复、超长名截断到 255、`closedir` 传递关闭错误并仍释放）；变异验证试了 14 个：第一轮存活的 `rewinddir` 不丢弃缓冲余量一项补了"读一条后 rewind 再读"的断言后被杀；另有 1 个语义等价的改写（`!= S_IFDIR_ + (mode & 0)`）自然存活，不算缺口。QEMU 侧由 `hello226` 的 I 组覆盖。
+- 如实说明：`seekdir` 依赖内核的目录游标：tmpfs/ext2 的 `d_off` 是可恢复的 cookie，rofs（ext4/NTFS）目录只接受 `lseek(fd, 0, SEEK_SET)`，其它位置 `EINVAL`（`seekdir` 无返回值，调用方看不到）；没有 `scandir`/`alphasort`、`readdir_r`、`fdopendir`。

@@ -16,6 +16,9 @@ extern int __moqi_vformat(char *buf, size_t size, moqi_sink_fn sink, void *ctx, 
 #define IO_WRITE(fd, b, n) write(fd, b, n)
 #define IO_LSEEK(fd, o, w) lseek(fd, o, w)
 #define IO_CLOSE(fd) close(fd)
+#define IO_DUP2(a, b) dup2(a, b)
+#define IO_UNLINK(p) unlink(p)
+#define TMPFILE_PID() ((unsigned long)getpid())
 #define IO_GETFL(fd) syscall3(SYS_FCNTL, fd, 3, 0)
 #define MEM_ALLOC(n) malloc(n)
 #define MEM_FREE(p) free(p)
@@ -33,11 +36,19 @@ static void list_lock(void) {
 static void list_unlock(void) { __atomic_store_n(&list_lk, 0, __ATOMIC_RELEASE); }
 #define LIST_LOCK() list_lock()
 #define LIST_UNLOCK() list_unlock()
+static void flush_std_streams(int *rc);
+#define EXTRA_FLUSH_ALL(rcp) flush_std_streams(rcp)
 #include "stdio_file.c"
 
 static struct FILE_s std_in = { .fd = 0, .flags = F_READ | F_STATIC, .bmode = FB_FULL, .bufmode_fixed = 1 };
 static struct FILE_s std_out = { .fd = 1, .flags = F_WRITE | F_STATIC, .bmode = FB_LINE, .bufmode_fixed = 1 };
 static struct FILE_s std_err = { .fd = 2, .flags = F_WRITE | F_STATIC, .bmode = FB_NONE, .bufmode_fixed = 1 };
+/* The standard streams are not on the open-stream list, so fflush(NULL) and exit() would skip a buffered stdout. */
+static void flush_std_streams(int *rc) {
+    if (std_out.wpos && flush_out(&std_out) != 0) *rc = -1;
+    if (std_err.wpos && flush_out(&std_err) != 0) *rc = -1;
+}
+
 FILE *stdin = &std_in;
 FILE *stdout = &std_out;
 FILE *stderr = &std_err;

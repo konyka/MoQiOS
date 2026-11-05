@@ -16,7 +16,7 @@
  *     back at least one byte (more while there is room in front of the read position);
  *   - an operation in the wrong direction (reading a write-only stream, writing a read-only one) is EBADF and sets the
  *     error flag; the kernel's own error code is passed on for everything else.
- * Not provided: file locking, wide-character streams, tmpfile, popen, freopen, fgetpos/fsetpos, setbuf.
+ * Not provided: file locking, wide-character streams, popen.
  */
 #ifndef MOQI_STDIO_FILE_H
 #define MOQI_STDIO_FILE_H

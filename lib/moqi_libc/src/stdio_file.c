@@ -24,6 +24,17 @@
 
 static struct FILE_s *open_streams;
 
+/* The position type: the freestanding build uses stdio.h's fpos_t, the host test its own (the host's <stdio.h> has another). */
+#ifndef FPOS_T
+#define FPOS_T fpos_t
+#endif
+
+/* Streams that are not on the list (the three standard ones) are flushed by fflush(NULL) through this hook, which the file
+ * that defines them sets; a build without such streams leaves it empty. */
+#ifndef EXTRA_FLUSH_ALL
+#define EXTRA_FLUSH_ALL(rcp) ((void)(rcp))
+#endif
+
 static void list_add(struct FILE_s *f) {
     LIST_LOCK();
     f->next = open_streams;
@@ -254,6 +265,7 @@ int NAME(fflush)(struct FILE_s *f) {
         for (struct FILE_s *p = open_streams; p; p = p->next)
             if ((p->flags & F_WRITE) && p->wpos && flush_out(p) != 0) rc = -1;
         LIST_UNLOCK();
+        EXTRA_FLUSH_ALL(&rc);
         return rc;
     }
     int rc = 0;
@@ -300,6 +312,107 @@ int NAME(setvbuf)(struct FILE_s *f, char *buf, int mode, size_t size) {
         f->flags |= F_USERBUF;
     }
     return 0;
+}
+
+void NAME(setbuf)(struct FILE_s *f, char *buf) {
+    if (buf) NAME(setvbuf)(f, buf, 0, BUFSIZ);
+    else NAME(setvbuf)(f, (char *)0, 2, 0);
+}
+
+void NAME(setbuffer)(struct FILE_s *f, char *buf, size_t size) {
+    if (buf) NAME(setvbuf)(f, buf, 0, size);
+    else NAME(setvbuf)(f, (char *)0, 2, 0);
+}
+
+void NAME(setlinebuf)(struct FILE_s *f) { NAME(setvbuf)(f, (char *)0, 1, 0); }
+
+/* freopen: the stream object stays the same (so stdout stays stdout) and, when a path is given, so does the descriptor number:
+ * the new file is opened and moved onto the old descriptor, as glibc does. Pending output is written first. The buffering mode
+ * and any user buffer are kept; end-of-file, error and read-ahead state are cleared. When the new file cannot be opened the old
+ * stream is closed and the result is NULL. A NULL path keeps the file and only changes the mode. */
+struct FILE_s *NAME(freopen)(const char *path, const char *mode, struct FILE_s *f) {
+    long oflags;
+    int fflags, excl;
+    int bad_mode = parse_mode(mode, &oflags, &fflags, &excl) != 0;
+    if (f->wpos) flush_out(f);
+    if (f->rend > f->rpos) drop_readahead(f);
+    long newfd = f->fd;
+    int saved_errno = 0;
+    if (bad_mode) {
+        saved_errno = EINVAL;
+    } else if (path) {
+        newfd = IO_OPEN(path, oflags, 0666);
+        if (newfd < 0) saved_errno = (int)-newfd;
+    } else {
+        long cur = IO_GETFL(f->fd);
+        if (cur < 0) saved_errno = (int)-cur;
+        else {
+            int acc = (int)(cur & 3);
+            if (((fflags & F_READ) && acc == 1) || ((fflags & F_WRITE) && acc == 0)) saved_errno = EINVAL;
+        }
+    }
+    if (saved_errno) {
+        NAME(fclose)(f);
+        errno = saved_errno;
+        return (struct FILE_s *)0;
+    }
+    if (path && newfd != f->fd) {
+        long r = IO_DUP2((int)newfd, f->fd);
+        IO_CLOSE((int)newfd);
+        if (r < 0) {
+            int e = (int)-r;
+            NAME(fclose)(f);
+            errno = e;
+            return (struct FILE_s *)0;
+        }
+    }
+    f->flags = (f->flags & (F_USERBUF | F_STATIC)) | fflags;
+    f->rpos = f->rend = f->wpos = 0;
+    f->fresh_buf = 0;
+    if (fflags & F_APPEND) IO_LSEEK(f->fd, 0, 2);
+    return f;
+}
+
+/* tmpfile: an anonymous file opened "w+" and unlinked at once, so it disappears when closed (or when the process dies). The name
+ * is made of the process id, a per-process counter and the address of the counter, and the open is exclusive, so a name that
+ * is already taken is skipped. If the directory is missing, or no free name turns up, the call fails with the open error. */
+struct FILE_s *NAME(tmpfile)(void) {
+    static unsigned int counter;
+    char path[64];
+    for (int attempt = 0; attempt < 100; attempt++) {
+        unsigned int n = __atomic_add_fetch(&counter, 1, __ATOMIC_RELAXED);
+        unsigned long pid = TMPFILE_PID();
+        const char *prefix = "/tmp/tmpf";
+        size_t k = 0;
+        while (prefix[k]) { path[k] = prefix[k]; k++; }
+        unsigned long parts[2] = { pid, n };
+        for (int i = 0; i < 2; i++) {
+            path[k++] = '_';
+            char digits[24];
+            int nd = 0;
+            unsigned long v = parts[i];
+            if (v == 0) digits[nd++] = '0';
+            while (v) { digits[nd++] = (char)('0' + v % 10); v /= 10; }
+            while (nd) path[k++] = digits[--nd];
+        }
+        path[k] = 0;
+        long fd = IO_OPEN(path, 0x40 | 0x80 | 2, 0600); /* O_CREAT | O_EXCL | O_RDWR */
+        if (fd == -EEXIST) continue;
+        if (fd < 0) {
+            errno = (int)-fd;
+            return (struct FILE_s *)0;
+        }
+        IO_UNLINK(path);
+        struct FILE_s *f = new_stream((int)fd, F_READ | F_WRITE);
+        if (!f) {
+            IO_CLOSE((int)fd);
+            errno = ENOMEM;
+            return (struct FILE_s *)0;
+        }
+        return f;
+    }
+    errno = EEXIST;
+    return (struct FILE_s *)0;
 }
 
 /* ---- reading --------------------------------------------------------------------------------------------------- */
@@ -539,6 +652,21 @@ int NAME(fseek)(struct FILE_s *f, long off, int whence) {
 void NAME(rewind)(struct FILE_s *f) {
     NAME(fseek)(f, 0, 0);
     f->flags &= ~F_ERR;
+}
+
+/* fpos_t holds the byte offset; fgetpos fails like ftell does (ESPIPE on a pipe), fsetpos like fseek (EINVAL for an offset that
+ * cannot be sought to) and clears the end-of-file flag. */
+int NAME(fgetpos)(struct FILE_s *f, FPOS_T *pos) {
+    long p = NAME(ftell)(f);
+    if (p < 0) return -1;
+    long *w = (long *)pos; /* FPOS_T is two longs: the offset and a spare word (glibc's is 16 bytes too) */
+    w[0] = p;
+    w[1] = 0;
+    return 0;
+}
+
+int NAME(fsetpos)(struct FILE_s *f, const FPOS_T *pos) {
+    return NAME(fseek)(f, ((const long *)pos)[0], 0);
 }
 
 /* ---- formatted output ------------------------------------------------------------------------------------------ */

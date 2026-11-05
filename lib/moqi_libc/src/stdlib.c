@@ -1,15 +1,7 @@
-/* stdlib.c — exit, simple conversions, environment lookup. */
+/* stdlib.c — simple conversions, environment lookup (exit and atexit are in exit.c). */
 #include "../include/stdlib.h"
 #include "../include/unistd.h"
 #include "../include/ctype.h"
-
-/* No atexit handlers; the FILE buffers are flushed first (stdio.c). */
-/* Weak, so a program (or a host test) that does not link the stdio code still gets a working exit. */
-extern int fflush_all(void) __attribute__((weak));
-void exit(int code) {
-    if (fflush_all) fflush_all();
-    _exit(code);
-}
 
 /* environ is defined and initialised by crt0.c from the initial stack. */
 char *getenv(const char *name) {

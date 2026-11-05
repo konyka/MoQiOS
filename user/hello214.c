@@ -18,7 +18,6 @@ static void check(int ok, const char *what) {
 }
 
 static long raw_umask(long mask) { return syscall1(95, mask); }
-static long rmdir(const char *p) { return syscall1(84, (long)p); }
 
 enum { OP_NONE, OP_GETCWD, OP_CHDIR, OP_UMASK, OP_MKDIR, OP_QUIT };
 static volatile int op, done_flag;

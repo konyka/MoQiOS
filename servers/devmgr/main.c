@@ -21,7 +21,6 @@
 
 #define DEV_PATH       "/dev"
 #define WATCH_PATH     "/dev/devfs-watch"
-#define SYS_getdents64 78
 #define POLL_NS    (1000L * 1000L * 1000L) /* 1s */
 
 /* Snapshot the node names into one space-separated line. */

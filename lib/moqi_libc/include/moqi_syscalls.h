@@ -45,12 +45,30 @@
 #define SYS_lseek       197
 #define SYS_fstat       110
 #define SYS_unlink      111
+#define SYS_getdents64  173
+#define SYS_fcntl       142
 #define SYS_mkdir       123
 
 /* Signals */
 #define SYS_sigaction   13
 #define SYS_sigprocmask 14
 #define SYS_sigreturn   15
+#define SYS_sigpending  219
+#define SYS_sigsuspend  220
+#define SYS_tkill       223
+#define SYS_gettid      497
+
+/* Processes, identity and terminals */
+#define SYS_pause       34
+#define SYS_alarm       37
+#define SYS_ioctl       165
+#define SYS_getuid      201
+#define SYS_getgid      202
+#define SYS_geteuid     203
+#define SYS_getegid     204
+#define SYS_getppid     205
+#define SYS_rename      212
+#define SYS_rmdir       84
 
 /* Time / scheduling */
 #define SYS_yield       24  /* sched_yield */

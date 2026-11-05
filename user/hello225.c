@@ -11,7 +11,7 @@
 #include "../lib/moqi_libc/include/time.h"
 #include "../lib/moqi_libc/include/pthread.h"
 
-#define SIGALRM 14
+
 #define SYS_pause_  34
 #define SYS_alarm_  37
 #define SYS_gettid_ 497

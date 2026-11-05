@@ -28,7 +28,7 @@
  * FILE streams (fopen, fread, fgets, fprintf, ...) follow glibc as measured: fully buffered files (4096-byte buffer), line
  * buffered stdout, unbuffered stderr, separate sticky EOF and error flags, EBADF for an operation in the wrong direction,
  * a read-ahead window that is given back before a write or a seek. The buffers are flushed by fflush, fclose and exit()
- * and by returning from main. Not provided: locking, wide-character streams, tmpfile, popen, freopen, fgetpos/fsetpos, setbuf.
+ * and by returning from main. Not provided: locking, wide-character streams, popen.
  */
 #ifndef MOQI_STDIO_H
 #define MOQI_STDIO_H
@@ -84,6 +84,19 @@ int   feof(FILE *f);
 int   ferror(FILE *f);
 void  clearerr(FILE *f);
 int   setvbuf(FILE *f, char *buf, int mode, size_t size);
+void  setbuf(FILE *f, char *buf);                        /* buf ? fully buffered in buf (BUFSIZ bytes) : unbuffered */
+void  setbuffer(FILE *f, char *buf, size_t size);        /* same with the caller's size */
+void  setlinebuf(FILE *f);
+/* freopen reuses the stream object and, for a path, the descriptor number (so freopen(path, "w", stdout) redirects fd 1). The
+ * buffering mode is kept, pending output is written first, EOF and error are cleared. On failure the old stream is closed and
+ * NULL returned with errno set; a NULL path only changes the mode of the open file. */
+FILE *freopen(const char *path, const char *mode, FILE *f);
+/* An anonymous read/write file in /tmp, removed from the directory at once so it disappears when closed; NULL with errno on failure. */
+FILE *tmpfile(void);
+/* fpos_t is the byte offset (16 bytes, glibc's size); fgetpos fails like ftell (ESPIPE on a pipe), fsetpos like fseek (EINVAL). */
+typedef struct { long off; long state; } fpos_t;
+int   fgetpos(FILE *f, fpos_t *pos);
+int   fsetpos(FILE *f, const fpos_t *pos);
 int   fgetc(FILE *f);
 int   getc(FILE *f);
 int   ungetc(int c, FILE *f);
@@ -118,6 +131,14 @@ int   vscanf(const char *fmt, va_list ap);
  * form is not provided. */
 int   sscanf(const char *s, const char *fmt, ...);
 int   vsscanf(const char *s, const char *fmt, va_list ap);
+
+/* Files by name, with the POSIX convention (0, or -1 with errno). remove() unlinks a file or removes an empty directory
+ * (ENOENT if missing, ENOTEMPTY if the directory is not empty); rename() replaces an existing target atomically (ENOENT if the
+ * source or the target's directory is missing). perror(s) writes "s: message\n" to standard error with one write (just
+ * "message\n" when s is NULL or empty), where message is strerror(errno); errno is unchanged unless the write fails. */
+int  remove(const char *path);
+int  rename(const char *oldpath, const char *newpath);
+void perror(const char *s);
 
 /* Output (freestanding only — these issue the write syscall). */
 void print(const char *s);

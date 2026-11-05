@@ -222,13 +222,18 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | `include/stdio.h` | printf 家族（printf/vprintf/dprintf/vdprintf/snprintf/vsnprintf/sprintf/vsprintf/asprintf/vasprintf）、puts/putchar；语法与 glibc 一致：标志 `# 0 - + 空格 ' I`、宽度、精度、`*`、长度 `hh h l ll L q z Z j t`、转换 `d i u o x X b B c s p n m C S %`；浮点 `f F e E g G a A` 与 glibc 逐位一致，无 `long double`、无位置参数（`%1$d`） |
 | `include/stdlib.h` | malloc/free/calloc（brk 上的首次适配空闲链表）、exit、atoi、getenv |
 | `include/ctype.h` | isdigit/isalpha/isspace/toupper 等（纯头文件） |
-| `include/signal.h` | `struct ksigaction`（匹配内核读取的 28 字节布局）、sigaction、SIGINT/SIG_IGN 等 |
+| `include/signal.h` | glibc 的信号编号（SIGUSR1=10、SIGUSR2=12、SIGALRM=14、SIGRTMIN=34）、`sigset_t`（128 字节，只用前 64 位）、`signal()`（BSD 语义，返回旧处理函数）、`raise()`（发给调用线程，经 `gettid`+`tkill`）、`abort()`、`sigemptyset/sigfillset/sigaddset/sigdelset/sigismember`、`sigprocmask`/`sigpending`/`sigsuspend`、`struct ksigaction`（匹配内核读取的 28 字节布局）与 `sigaction` |
+| `include/assert.h` | `assert`（失败时 stderr 输出 glibc 同款一行并 `abort()`，`NDEBUG` 下展开为空且不求值）、`static_assert` |
 | `src/crt0.c` | `_start`（naked）：捕获入口 rsp → `_start_c` 解析 argc/argv/envp → 设置 `environ` → `main(argc, argv, envp)` → `_exit(main(...))` |
 | `src/format.c` | printf 格式化核心（无 syscall，可在宿主机测试） |
 | `src/malloc.c` | 分配器核心（无 syscall；经弱符号 `__moqi_heap_grow` 扩容） |
 | `src/sbrk.c` | 强符号 `__moqi_heap_grow`，基于 brk 实现 |
-| `src/unistd.c` `src/stdio.c` `src/signal.c` `src/stdlib.c` | 薄 syscall 封装、fd 1 输出与 getenv（仅 freestanding） |
-| `host_tests/` | 宿主机单元测试（test_string / test_format / test_malloc / test_args + run_tests.sh） |
+| `src/unistd.c` `src/stdio.c` `src/stdlib.c` | 薄 syscall 封装、fd 1 输出与 getenv（仅 freestanding） |
+| `src/exit.c` | `atexit`（后注册先执行；handler 内可再注册或再调 `exit`；首块静态、其后 malloc；`atexit(NULL)` 返回 EINVAL）、`exit`（跑完 handler 后 flush 所有 FILE）、`_Exit` |
+| `src/dirent.c` / `include/dirent.h` | `opendir`/`readdir`/`closedir`/`rewinddir`/`telldir`/`seekdir`/`dirfd`（glibc 布局：`struct dirent` 280 字节、`d_name` 偏移 19；基于 `getdents64` 的 4096 字节缓冲，close-on-exec，`opendir` 用 `fstat` 判目录并给出 `ENOTDIR`；`seekdir` 依赖内核的 `lseek` 游标，rofs（ext4/NTFS）目录只接受回到 0） |
+| `src/getopt.c` / `include/getopt.h` | `getopt`/`getopt_long`/`getopt_long_only`（glibc 同款：簇、`::` 可选参数、`+`/`-`/`:` 前缀、`POSIXLY_CORRECT`、argv 置换、`optind=0` 重启、长选项缩写与歧义、`flag` 指针、`W;`、诊断行；54 个短选项场景 + 50 个长选项场景由 glibc 2.43 生成并逐项核对，变异验证） |
+| `src/signal.c` `src/assert.c` `src/posix.c` | 信号与 `abort`/`raise`、`assert` 失败路径、`getuid/geteuid/getgid/getegid/getppid`、`alarm/pause`、`isatty`、`remove/rename/rmdir`、`perror`；经 `src/hostsys.h` 的 `MSYS*` 宏取系统调用，宿主机测试用记录桩替换 |
+| `host_tests/` | 宿主机单元测试（test_string / test_format / test_malloc / test_args / test_exit_abi / test_signal_abi / test_assert_abi / test_posix_abi … + run_tests.sh） |
 
 ### 5.2 设计要点
 
@@ -277,9 +282,9 @@ init 的源文件不在 `user/` 下，构建时以显式路径调用 `addLibcUse
 
 ### 5.4 有意缺失
 
-宽字符流、`tmpfile`/`popen`/`freopen`/`fgetpos`/`setbuf`、文件锁、`long double`（`strtold`、`%Lf`，`scanf` 的 `%Lf` 同样拒绝）、locale、
-完整 POSIX 信号语义、`<math.h>` 里的超越函数（`sin`/`cos`/`exp`/`log`/`pow`…）、`float`/`long double` 版本和 `fma`。（`errno`、`realloc`、线程与 TLS、`setenv`/`putenv`、浮点
-`printf`/`strtod`、`FILE` 流（`fopen`/`fgets`/`fread`/`fprintf`…）、`scanf` 族（`sscanf`/`fscanf`/`scanf`/`vsscanf`/`vfscanf`/`vscanf`）、`setjmp`/`longjmp`/`sigsetjmp`/`siglongjmp`、`ctype.h` 的全部分类函数和 `<math.h>` 里结果有精确定义的那部分（`sqrt`、取整、`fmod`/`remainder`/`remquo`、`fmax`/`fmin`/`fdim`、`nextafter`、`ldexp`/`frexp`/`modf`、`lround` 族、分类宏）此前列在这里或不存在，现已实现，见各自的 hello 探针与 current-code-review-and-fix-plan.md。）
+宽字符流、`popen`、文件锁、`long double`（`strtold`、`%Lf`，`scanf` 的 `%Lf` 同样拒绝）、locale、
+完整 POSIX 信号语义（`SA_RESTART` 目前只被内核记录、不重启被打断的调用）、`system()`、`<math.h>` 里的超越函数（`sin`/`cos`/`exp`/`log`/`pow`…）、`float`/`long double` 版本和 `fma`。（`errno`、`realloc`、线程与 TLS、`setenv`/`putenv`、浮点
+`printf`/`strtod`、`FILE` 流（`fopen`/`fgets`/`fread`/`fprintf`…）、`scanf` 族（`sscanf`/`fscanf`/`scanf`/`vsscanf`/`vfscanf`/`vscanf`）、`setbuf`/`setbuffer`/`setlinebuf`、`freopen`、`fgetpos`/`fsetpos`、`tmpfile`、`setjmp`/`longjmp`/`sigsetjmp`/`siglongjmp`、`ctype.h` 的全部分类函数和 `<math.h>` 里结果有精确定义的那部分（`sqrt`、取整、`fmod`/`remainder`/`remquo`、`fmax`/`fmin`/`fdim`、`nextafter`、`ldexp`/`frexp`/`modf`、`lround` 族、分类宏）此前列在这里或不存在，现已实现，见各自的 hello 探针与 current-code-review-and-fix-plan.md。）
 需要时请按最小需求追加，不要预先泛化。
 
 `lib/zig_crt/` 另含 `start.zig`：Zig 用户程序的最小 `_start`（对齐栈 →

@@ -51,6 +51,22 @@ long setpgid(long pid, long pgid);
 long getpgid(long pid);
 long getsid(long pid);
 
+/* Process identity, alarm clocks and terminals, with the POSIX convention (a failure is -1 with errno; the identity calls
+ * cannot fail). alarm(n) arranges SIGALRM in n seconds, 0 cancels, and returns the whole seconds that were left on the
+ * previous alarm (rounded down, 0 if none). pause() sleeps until a signal handler has run and then fails with EINTR; it never
+ * returns 0. isatty(fd) is 1 for a terminal; otherwise 0 with errno ENOTTY (a descriptor that is not a terminal) or EBADF. */
+unsigned int getuid(void);
+unsigned int geteuid(void);
+unsigned int getgid(void);
+unsigned int getegid(void);
+int getppid(void);
+unsigned int alarm(unsigned int seconds);
+int pause(void);
+int isatty(int fd);
+
+/* Removes an empty directory; the raw kernel value like unlink and mkdir above (0 or -errno, ENOTEMPTY if not empty). */
+long rmdir(const char *path);
+
 long pipe(int fds[2]);
 long dup2(int oldfd, int newfd);
 

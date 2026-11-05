@@ -114,6 +114,45 @@ $CC $CFLAGS $SJ_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/setjmp.c -o "$OUT/setj
 $CC $CFLAGS $SJ_RENAME -o "$OUT/test_setjmp_abi" test_setjmp_abi.c "$OUT/setjmp.o"
 "$OUT/test_setjmp_abi" || fail=1
 
+echo "== test_exit_abi =="
+EX_RENAME="-Dexit=moqi_exit -Datexit=moqi_atexit -D_exit=moqi__exit -D_Exit=moqi__Exit"
+$CC $CFLAGS $EX_RENAME -Dmalloc=test_malloc -Dfree=test_free -c ../src/exit.c -o "$OUT/exit.o"
+$CC $CFLAGS $EX_RENAME -o "$OUT/test_exit_abi" test_exit_abi.c "$OUT/exit.o"
+"$OUT/test_exit_abi" || fail=1
+
+echo "== test_signal_abi =="
+SG_RENAME="-Dsignal=moqi_signal -Draise=moqi_raise -Dabort=moqi_abort -Dsigaction=moqi_sigaction -Dsigemptyset=moqi_sigemptyset -Dsigfillset=moqi_sigfillset -Dsigaddset=moqi_sigaddset -Dsigdelset=moqi_sigdelset -Dsigismember=moqi_sigismember -Dsigprocmask=moqi_sigprocmask -Dsigpending=moqi_sigpending -Dsigsuspend=moqi_sigsuspend -D_exit=moqi__exit"
+$CC $CFLAGS $SG_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/signal.c -o "$OUT/signal.o"
+$CC $CFLAGS $SG_RENAME -o "$OUT/test_signal_abi" test_signal_abi.c "$OUT/signal.o"
+"$OUT/test_signal_abi" || fail=1
+
+echo "== test_assert_abi =="
+$CC $CFLAGS -Dwrite=moqi_write -Dabort=moqi_abort -c ../src/assert.c -o "$OUT/assert.o"
+$CC $CFLAGS -o "$OUT/test_assert_abi" test_assert_abi.c "$OUT/assert.o"
+"$OUT/test_assert_abi" || fail=1
+$CC $CFLAGS -o "$OUT/test_assert_ndebug" test_assert_ndebug.c
+"$OUT/test_assert_ndebug" || fail=1
+
+echo "== test_posix_abi =="
+PX_RENAME="-Dgetuid=moqi_getuid -Dgeteuid=moqi_geteuid -Dgetgid=moqi_getgid -Dgetegid=moqi_getegid -Dgetppid=moqi_getppid -Dalarm=moqi_alarm -Dpause=moqi_pause -Disatty=moqi_isatty -Drmdir=moqi_rmdir -Drename=moqi_rename -Dremove=moqi_remove -Dperror=moqi_perror"
+$CC $CFLAGS $PX_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/posix.c -o "$OUT/posix.o"
+$CC $CFLAGS -o "$OUT/test_posix_abi" test_posix_abi.c "$OUT/posix.o"
+"$OUT/test_posix_abi" || fail=1
+
+echo "== test_getopt_abi =="
+GO_RENAME="-Dgetopt=moqi_getopt -Dgetopt_long=moqi_getopt_long -Dgetopt_long_only=moqi_getopt_long_only -Doptarg=moqi_optarg -Doptind=moqi_optind -Dopterr=moqi_opterr -Doptopt=moqi_optopt -Dgetenv=moqi_getenv_stub"
+$CC $CFLAGS $GO_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/getopt.c -o "$OUT/getopt.o"
+$CC $CFLAGS $GO_RENAME -o "$OUT/test_getopt_abi" test_getopt_abi.c "$OUT/getopt.o"
+"$OUT/test_getopt_abi" || fail=1
+$CC $CFLAGS $GO_RENAME -o "$OUT/test_getopt_long_abi" test_getopt_long_abi.c "$OUT/getopt.o"
+"$OUT/test_getopt_long_abi" || fail=1
+
+echo "== test_dirent_abi =="
+DE_RENAME="-Dopendir=moqi_opendir -Dreaddir=moqi_readdir -Dclosedir=moqi_closedir -Drewinddir=moqi_rewinddir -Dtelldir=moqi_telldir -Dseekdir=moqi_seekdir -Ddirfd=moqi_dirfd -Ddirent=moqi_dirent -DDIR=MOQI_DIR -D__moqi_dir=__moqi_dir_t"
+$CC $CFLAGS $DE_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/dirent.c -o "$OUT/dirent.o"
+$CC $CFLAGS $DE_RENAME -o "$OUT/test_dirent_abi" test_dirent_abi.c "$OUT/dirent.o"
+"$OUT/test_dirent_abi" || fail=1
+
 echo "== test_ctype_abi =="
 $CC $CFLAGS -o "$OUT/test_ctype_abi" test_ctype_abi.c
 "$OUT/test_ctype_abi" || fail=1

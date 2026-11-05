@@ -137,6 +137,21 @@ long test_lseek(int fd, long off, int whence) {
     fds[fd].off = base + off;
     return fds[fd].off;
 }
+long test_unlink(const char *path) {
+    for (int i = 0; i < MAXF; i++)
+        if (files[i].used && strcmp(files[i].name, path) == 0) {
+            files[i].name[0] = 0;                 /* the name goes; open descriptors keep the data (files[i].used stays) */
+            return 0;
+        }
+    return -ENOENT;
+}
+long test_dup2(int from, int to) {
+    if (from < 0 || from >= 32 || !fds[from].used || to < 0 || to >= 32) return -EBADF;
+    if (from == to) return to;
+    fds[to] = fds[from];
+    fds[to].used = 1;
+    return to;
+}
 long test_fcntl_getfl(int fd) {
     if (fd < 0 || fd >= 32 || !fds[fd].used) return -EBADF;
     return fds[fd].flags;
@@ -151,6 +166,11 @@ void test_free(void *p);
 #define IO_WRITE(fd, b, n) test_write(fd, b, n)
 #define IO_LSEEK(fd, o, w) test_lseek(fd, o, w)
 #define IO_CLOSE(fd) test_close(fd)
+#define IO_DUP2(a, b) test_dup2(a, b)
+#define IO_UNLINK(p) test_unlink(p)
+#define TMPFILE_PID() 4321UL
+typedef struct { long off; long state; } mfpos_t;
+#define FPOS_T mfpos_t
 #define IO_GETFL(fd) test_fcntl_getfl(fd)
 #define MEM_ALLOC(n) test_malloc(n)
 #define MEM_FREE(p) test_free(p)
@@ -161,6 +181,9 @@ void test_free(void *p);
 #undef errno
 #define errno errno_slot
 int *__moqi_dummy_errno(void);
+/* As in stdio_streams.c: the standard streams are not on the open-stream list, fflush(NULL) reaches them through this hook. */
+static void flush_std_streams(int *rc);
+#define EXTRA_FLUSH_ALL(rcp) flush_std_streams(rcp)
 typedef int (*moqi_sink_fn)(void *ctx, const char *data, size_t n);
 int __moqi_vformat(char *buf, size_t size, moqi_sink_fn sink, void *ctx, const char *fmt, va_list ap);
 #include "../src/stdio_file.c"
@@ -182,6 +205,10 @@ void *test_realloc(void *p, size_t n) {
 static struct FILE_s std_in = { .fd = 0, .flags = F_READ | F_STATIC, .bmode = FB_FULL, .bufmode_fixed = 1 };
 static struct FILE_s std_out = { .fd = 1, .flags = F_WRITE | F_STATIC, .bmode = FB_LINE, .bufmode_fixed = 1 };
 static struct FILE_s std_err = { .fd = 2, .flags = F_WRITE | F_STATIC, .bmode = FB_NONE, .bufmode_fixed = 1 };
+static void flush_std_streams(int *rc) {
+    if (std_out.wpos && flush_out(&std_out) != 0) *rc = -1;
+    if (std_err.wpos && flush_out(&std_err) != 0) *rc = -1;
+}
 #define mstdin (&std_in)
 #define mstdout (&std_out)
 #define mstderr (&std_err)
@@ -908,6 +935,18 @@ int main(void) {
     CHECK(mfflush(f) == -1 && mferror(f));
     CHECK(mfflush(f) == 0 && file_size("t") == 0);
     mfclose(f);
+    /* fflush(NULL) also reaches a buffered standard output, which is not on the list of opened streams (exit() relies on it) */
+    reset();
+    {
+        std_out.fd = (int)test_open("so", T_O_RDWR | T_O_CREAT | T_O_TRUNC, 0644);
+        std_out.bmode = FB_FULL;
+        CHECK(mfputs("data", mstdout) >= 0);
+        CHECK(file_size("so") == 0);
+        CHECK(mfflush((MFILE *)0) == 0 && file_size("so") == 4);
+        test_close(std_out.fd);
+        std_out.fd = 1;
+        std_out.bmode = FB_LINE;
+    }
     /* fflush(NULL) reaches every open output stream and leaves the unwritten ones alone */
     reset();
     {
@@ -1187,6 +1226,214 @@ int main(void) {
             CHECK(test_vfscanf_call(f, "%d %d", &x, &y) == 2 && x == 8 && y == 9);
         }
         mfclose(f);
+    }
+
+    /* setbuf, setbuffer, setlinebuf: the modes glibc gives (measured) */
+    {
+        MFILE *f;
+        reset();
+        f = mfopen("t", "w");
+        msetbuf(f, (char *)0);
+        mfputs("abc", f);
+        CHECK(file_size("t") == 3);                      /* unbuffered: written at once */
+        mfclose(f);
+        reset();
+        {
+            static char sb[8192];
+            f = mfopen("t", "w");
+            msetbuf(f, sb);
+            mfputs("abc", f);
+            CHECK(file_size("t") == 0);                  /* fully buffered in the caller's buffer */
+            CHECK(mfflush(f) == 0 && file_size("t") == 3);
+            mfclose(f);
+        }
+        reset();
+        {
+            char small[8];
+            f = mfopen("t", "w");
+            msetbuffer(f, small, sizeof small);
+            mfputs("0123456789", f);
+            CHECK(file_size("t") == 10 || file_size("t") == 8);   /* a buffer smaller than the data: written through */
+            mfclose(f);
+            CHECK(file_size("t") == 10);
+        }
+        reset();
+        f = mfopen("t", "w");
+        msetlinebuf(f);
+        mfputs("ab", f);
+        CHECK(file_size("t") == 0);
+        mfputs("c\nd", f);
+        CHECK(file_size("t") == 4);                      /* up to and including the newline, glibc measured "abc\n" */
+        mfclose(f);
+    }
+
+    /* fgetpos / fsetpos */
+    {
+        MFILE *f;
+        mfpos_t p, bp;
+        reset();
+        f = mfopen("t", "w+");
+        mfputs("0123456789", f);
+        CHECK(sizeof(mfpos_t) == 16);
+        CHECK(mfgetpos(f, &p) == 0);
+        mrewind(f);
+        char c3[4] = { 0 };
+        mfread(c3, 1, 3, f);
+        CHECK(mfgetpos(f, &p) == 0);
+        mfread(c3, 1, 3, f);
+        CHECK(mfsetpos(f, &p) == 0 && mfgetc(f) == '3' && mftell(f) == 4);
+        mfseek(f, 0, 2);
+        mfgetc(f);
+        CHECK(mfeof(f));
+        CHECK(mfsetpos(f, &p) == 0 && !mfeof(f));        /* fsetpos clears end-of-file */
+        memset(&bp, 0xff, sizeof bp);
+        errno_slot = 0;
+        CHECK(mfsetpos(f, &bp) == -1 && errno_slot == EINVAL);
+        mfclose(f);
+        /* a pipe cannot report a position */
+        reset();
+        {
+            long fd = test_open("p", T_O_RDWR | T_O_CREAT, 0644);
+            fds[fd].pipe = 1;
+            f = mfdopen((int)fd, "r");
+            errno_slot = 0;
+            CHECK(mfgetpos(f, &p) == -1 && errno_slot == ESPIPE);
+            mfclose(f);
+        }
+    }
+
+    /* tmpfile */
+    {
+        MFILE *f, *g;
+        reset();
+        f = mtmpfile();
+        CHECK(f != (MFILE *)0 && mfileno(f) > 2);
+        CHECK(file_size("/tmp/tmpf_4321_1") == -1);     /* unlinked at once: no name is left */
+        CHECK(mfputs("tmp", f) >= 0);
+        mrewind(f);
+        char t7[8] = { 0 };
+        CHECK(mfread(t7, 1, 7, f) == 3 && strcmp(t7, "tmp") == 0);   /* read and write */
+        g = mtmpfile();
+        CHECK(g != (MFILE *)0 && g != f && mfileno(g) != mfileno(f));
+        CHECK(mfputs("other", g) >= 0);
+        mrewind(f);
+        CHECK(mfread(t7, 1, 7, f) == 3);                 /* the two files are separate */
+        mfclose(f);
+        mfclose(g);
+        /* the first name is taken: the next attempt uses another */
+        reset();
+        put_file("/tmp/tmpf_4321_3", "x", 1);           /* two calls so far: the counter is at 2, the next name ends in _3 */
+        f = mtmpfile();
+        CHECK(f != (MFILE *)0);
+        CHECK(file_size("/tmp/tmpf_4321_3") == 1);      /* the file that was already there is untouched ... */
+        CHECK(mfputs("new", f) >= 0 && mfflush(f) == 0);
+        CHECK(file_size("/tmp/tmpf_4321_3") == 1);      /* ... and was not the one opened */
+        mfclose(f);
+        /* no space for a descriptor: the open error */
+        reset();
+        for (int i = 3; i < 32; i++) fds[i].used = 1;
+        errno_slot = 0;
+        CHECK(mtmpfile() == (MFILE *)0 && errno_slot == EMFILE);
+        /* no memory for the stream: the descriptor is given back */
+        reset();
+        fail_malloc = 1;
+        errno_slot = 0;
+        CHECK(mtmpfile() == (MFILE *)0 && errno_slot == ENOMEM);
+        {
+            int open_fds = 0;
+            for (int i = 3; i < 32; i++) open_fds += fds[i].used;
+            CHECK(open_fds == 0);
+        }
+    }
+
+    /* freopen */
+    {
+        MFILE *f, *g;
+        reset();
+        put_file("a", "0123456789", 10);
+        f = mfopen("a", "r");
+        int fd = mfileno(f);
+        mfgetc(f);
+        CHECK(mftell(f) == 1);
+        g = mfreopen("a", "r", f);
+        CHECK(g == f && mfileno(g) == fd);               /* same stream object and descriptor number */
+        CHECK(mftell(g) == 0 && mfgetc(g) == '0');       /* a fresh open: the position is the start */
+        mfclose(g);
+
+        /* a new file and mode; pending output goes to the old file first */
+        reset();
+        f = mfopen("w1", "w");
+        mfputs("pending", f);
+        fd = mfileno(f);
+        g = mfreopen("w2", "w", f);
+        CHECK(g == f && mfileno(g) == fd);
+        CHECK(file_size("w1") == 7);                     /* flushed before the switch */
+        mfputs("zz", g);
+        mfclose(g);
+        CHECK(file_size("w2") == 2);
+
+        /* end-of-file and error are cleared */
+        reset();
+        put_file("a", "ab", 2);
+        f = mfopen("a", "r");
+        mfgetc(f); mfgetc(f); mfgetc(f);
+        CHECK(mfeof(f));
+        g = mfreopen("a", "r", f);
+        CHECK(g == f && !mfeof(g) && !mferror(g));
+        mfclose(g);
+
+        /* a missing file: the old stream is closed, the result is NULL with errno from open */
+        reset();
+        put_file("a", "ab", 2);
+        f = mfopen("a", "r");
+        fd = mfileno(f);
+        errno_slot = 0;
+        g = mfreopen("nonexistent", "r", f);
+        CHECK(g == (MFILE *)0 && errno_slot == ENOENT && !fds[fd].used);
+
+        /* a bad mode: EINVAL and the old stream is gone */
+        reset();
+        put_file("a", "ab", 2);
+        f = mfopen("a", "r");
+        fd = mfileno(f);
+        errno_slot = 0;
+        g = mfreopen("a", "q", f);
+        CHECK(g == (MFILE *)0 && errno_slot == EINVAL && !fds[fd].used);
+
+        /* append mode starts at the end */
+        reset();
+        put_file("a", "ab", 2);
+        f = mfopen("a", "r");
+        g = mfreopen("a", "a", f);
+        CHECK(mftell(g) == 2);                           /* an appending stream starts at the end, as fopen("a") does */
+        mfputs("YY", g);
+        mfclose(g);
+        CHECK(file_size("a") == 4);
+
+        /* a NULL path keeps the file and changes the mode; the descriptor must allow it */
+        reset();
+        put_file("a", "zz", 2);
+        f = mfopen("a", "r+");
+        g = mfreopen((const char *)0, "r", f);
+        CHECK(g == f);
+        char x3[4] = { 0 };
+        CHECK(mfread(x3, 1, 3, g) == 2 && memcmp(x3, "zz", 2) == 0);
+        mfclose(g);
+        reset();
+        put_file("a", "zz", 2);
+        f = mfopen("a", "r");
+        errno_slot = 0;
+        g = mfreopen((const char *)0, "w", f);           /* a read-only descriptor cannot become writable */
+        CHECK(g == (MFILE *)0 && errno_slot == EINVAL);
+
+        /* the buffering mode survives: an unbuffered stream stays unbuffered */
+        reset();
+        f = mfopen("a", "w");
+        msetvbuf(f, (char *)0, M_IONBF, 0);
+        g = mfreopen("b", "w", f);
+        mfputs("q", g);
+        CHECK(file_size("b") == 1);
+        mfclose(g);
     }
 
     if (bad) {

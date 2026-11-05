@@ -1,7 +1,7 @@
 /* stdlib.h — stdlib-lite for MoQiOS user programs.
  *
  * malloc/free/calloc: first-fit free-list allocator over the kernel brk
- * syscall. exit() is _exit() (no atexit, no stdio flush).
+ * syscall.
  *
  * malloc/free/calloc are thread-safe but NOT async-signal-safe. A signal
  * handler that interrupts its own thread inside the allocator does not
@@ -35,7 +35,16 @@ int posix_memalign(void **memptr, size_t align, size_t size);
 void *aligned_alloc(size_t align, size_t size);
 void *memalign(size_t align, size_t size);
 
+/* Process termination, with glibc's behavior (measured): atexit registers a function to run at exit(), the one registered
+ * last first; a function may itself register another (it runs next) or call exit() (that call goes on with the functions
+ * still pending and its status is the one the process ends with); a function registered twice runs twice; at least 32 can
+ * be registered (more as memory allows), and failure is -1 with errno ENOMEM. atexit(NULL) fails with EINVAL (glibc
+ * crashes). After the last function exit() flushes every FILE stream and ends the process with the status. _Exit ends it at
+ * once: no registered function, no flush. Returning from main is exit(). The registered functions are shared by all
+ * threads, and the list is locked; a function must not be registered from a signal handler. abort and raise are in signal.h. */
+int atexit(void (*fn)(void));
 void exit(int code) __attribute__((noreturn));
+void _Exit(int code) __attribute__((noreturn));
 
 int atoi(const char *s);
 long atol(const char *s);

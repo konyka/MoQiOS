@@ -13,8 +13,6 @@
 #include "../lib/moqi_libc/include/pthread.h"
 
 #define SYS_tkill 223
-#define SIGUSR1 10
-#define SIGUSR2 31
 #define SIG_BLOCK_ 0
 #define SIG_SETMASK_ 2
 

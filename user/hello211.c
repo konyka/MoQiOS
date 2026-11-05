@@ -10,8 +10,6 @@
 #include "../lib/moqi_libc/include/signal.h"
 #include "../lib/moqi_libc/include/pthread.h"
 
-#define SIGUSR1 10
-#define SIGUSR2 12
 
 static int failures;
 static void check(int ok, const char *what) {
