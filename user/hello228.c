@@ -1,8 +1,7 @@
 /* hello228: a joined thread must be finished with its memory when pthread_join returns. join frees the thread's block (TCB and
- * stack) and the next allocation of that size gets the same memory. This storm creates a thread, joins it, and at once
- * allocates a block of the same size and zeroes its start (where the TCB was), a thousand times over. If an exiting thread
- * still reads its TCB after join has returned (it re-reads %fs:0 and its detached flag after announcing its exit), it now
- * reads zeros and faults or takes a wrong branch; the kernel logs such a fault. */
+ * stack) and the next pthread_create gets the same memory. This storm creates a thread, joins it, and at once allocates and
+ * zeroes a block of the same size, thousands of times over; every worker also guards a canary array on its own stack (see
+ * worker). A thread that is still running pthread_exit after join returned writes to the stack its successor is using. */
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
 #include "../lib/moqi_libc/include/stdio.h"
 #include "../lib/moqi_libc/include/unistd.h"
@@ -19,8 +18,20 @@ static void check(int ok, const char *what) {
     if (!ok) failures++;
 }
 
-static volatile long ran;
+static volatile long ran, corrupted;
+
+/* The worker keeps a canary array in its own frame and checks it after spinning for a while. pthread_exit of the PREVIOUS thread
+ * (whose block join has just freed and pthread_create has handed to this one) pushes a return address for its call to _exit
+ * at the depth where this function's frame lives; if that late push lands after this thread has filled the canary, the
+ * pattern no longer matches. */
 static void *worker(void *arg) {
+    volatile unsigned char canary[256];
+    unsigned char pat = (unsigned char)(0x5a ^ (unsigned long)arg);
+    for (int i = 0; i < 256; i++) canary[i] = pat;
+    for (volatile int spin = 0; spin < 20000; spin++) {}
+    int bad = 0;
+    for (int i = 0; i < 256; i++) if (canary[i] != pat) bad = 1;
+    if (bad) __atomic_add_fetch(&corrupted, 1, __ATOMIC_SEQ_CST);
     __atomic_add_fetch(&ran, 1, __ATOMIC_SEQ_CST);
     return arg;
 }
@@ -43,6 +54,8 @@ int main(int argc, char **argv, char **envp) {
     check(made == 4000, "A: 4000 threads created");
     check(bad_join == 0, "A: every join returned the thread's value");
     check(ran == made, "A: every thread ran exactly once");
+    { char m[64]; snprintf(m, sizeof m, "hello228: corrupted canaries=%ld\n", (long)corrupted); print(m); }
+    check(corrupted == 0, "B: no worker found its stack changed under it by the thread that used the block before");
     print(failures == 0 ? "hello228: PASS\n" : "hello228: FAIL\n");
     return failures;
 }
