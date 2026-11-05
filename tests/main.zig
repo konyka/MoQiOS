@@ -679,6 +679,33 @@ test "every restartable syscall number delivers signals on its way out" {
     }
 }
 
+test "blocking calls that can return EINTR deliver signals on their way out" {
+    // A handler must have run before a call returns -EINTR (that is what Linux does, and what hello234/hello235 check on the real
+    // kernel). These dispatch branches wait inside the kernel and return -EINTR for a signal; each must call
+    // checkSignalsOnSyscallReturn after the call. The list is by number (native and Linux aliases) -- add a number here when a new
+    // blocking call is wired in.
+    const source = kt.syscall_entry_source;
+    const blocking = [_]u64{ 6, 10, 1, 23, 34, 35, 43, 45, 47, 61, 65, 73, 120, 122, 130, 131, 138, 139, 143, 148, 154, 162, 163, 185, 199, 220, 221, 247, 248, 263, 441, 493, 494 };
+    for (blocking) |nr| {
+        var needle_buf: [32]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&needle_buf, "\n        {d} => ", .{nr});
+        var from: usize = 0;
+        var found_branch = false;
+        while (std.mem.indexOfPos(u8, source, from, needle)) |at| {
+            from = at + needle.len;
+            const end = std.mem.indexOfPos(u8, source, at, "\n        },") orelse source.len;
+            const body = source[at..end];
+            if (std.mem.indexOf(u8, body, "frame") == null) continue;
+            found_branch = true;
+            if (std.mem.indexOf(u8, body, "checkSignalsOnSyscallReturn(frame)") == null) {
+                std.debug.print("blocking syscall {d}: branch has no checkSignalsOnSyscallReturn:\n{s}\n", .{ nr, body });
+                return error.BlockingBranchWithoutSignalDelivery;
+            }
+        }
+        try std.testing.expect(found_branch);
+    }
+}
+
 test "a pipe write that fits an empty pipe is written whole or not at all" {
     const source = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "const atomic = count <= PIPE_BUF_SIZE - 1;") != null);

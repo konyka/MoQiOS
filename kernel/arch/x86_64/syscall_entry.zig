@@ -710,6 +710,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         143 => { // futex(uaddr, op, val, val2, uaddr2, val3)
             // v53.44: Linux x86_64 ABI: r10=val2/timeout, r8=uaddr2, r9=val3
             frame.rax = @bitCast(futex_mod.futex(frame.rdi, @bitCast(frame.rsi), frame.rdx, frame.r10, frame.r8, frame.r9));
+            checkSignalsOnSyscallReturn(frame);
         },
         144 => { // sendfile(out_fd, in_fd, offset_ptr, count)
             frame.rax = @bitCast(splice_mod.sysSendfile(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, frame.r10));
@@ -764,6 +765,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const max_ev: i32 = @bitCast(@as(u32, @truncate(frame.rdx)));
             const timeout: i32 = @bitCast(@as(u32, @truncate(frame.r10)));
             frame.rax = @bitCast(epollWaitFd(epfd_idx, frame.rsi, max_ev, timeout));
+            checkSignalsOnSyscallReturn(frame);
         },
         149 => { // shmget(key, size, shmflg)
             const shm_mod = @import("../../ipc/sysv_shm.zig");
@@ -795,6 +797,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const sem_mod = @import("../../ipc/sysv_sem.zig");
             const op: i16 = @bitCast(@as(u16, @truncate(frame.rdx)));
             frame.rax = @bitCast(sem_mod.semop(@truncate(frame.rdi), @truncate(frame.rsi), op));
+            checkSignalsOnSyscallReturn(frame);
         },
         155 => { // semctl(semid, semnum, cmd, arg)
             const sem_mod = @import("../../ipc/sysv_sem.zig");
@@ -1031,6 +1034,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         185 => { // flock(fd, operation)
             frame.rax = @bitCast(flock_mod.sysFlock(frame.rdi, frame.rsi));
+            checkSignalsOnSyscallReturn(frame);
         },
         // ── v31.3: POSIX MQ / POSIX Timer ─────────────────────────
         186 => { // mq_open(name, oflag, mode, attr)
@@ -1209,6 +1213,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         221 => { // rt_sigtimedwait(sigset, info, timeout, sigsetsize)
             frame.rax = @bitCast(signal_syscall_mod.rtSigtimedwait(frame.rdi, frame.rsi, frame.rdx, frame.r10));
+            checkSignalsOnSyscallReturn(frame);
         },
         222 => { // rt_sigqueueinfo(tgid, sig, uinfo)
             frame.rax = @bitCast(signal_syscall_mod.rtSigqueueinfo(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx));
@@ -1790,6 +1795,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         73 => { // flock(fd, operation)
             frame.rax = @bitCast(flock_mod.sysFlock(frame.rdi, frame.rsi));
+            checkSignalsOnSyscallReturn(frame);
         },
         74 => { // fsync(fd)
             frame.rax = @bitCast(syscallFsync(@truncate(frame.rdi)));
@@ -1939,6 +1945,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const sem_mod = @import("../../ipc/sysv_sem.zig");
             const op: i16 = @bitCast(@as(u16, @truncate(frame.rdx)));
             frame.rax = @bitCast(sem_mod.semop(@truncate(frame.rdi), @truncate(frame.rsi), op));
+            checkSignalsOnSyscallReturn(frame);
         },
         66 => { // semctl(semid, semnum, cmd, arg)
             const sem_mod = @import("../../ipc/sysv_sem.zig");

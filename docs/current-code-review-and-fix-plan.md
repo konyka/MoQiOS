@@ -6778,3 +6778,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异（wrapper，host 测试）：把 `poll` 的超时参数改成常量 → 被抓住；`ppoll` 的掩码大小恒为 8 → 第一版测试**没抓住**（我只检查了有掩码时的 8，没检查无掩码时必须是 0），补上无掩码的断言后抓住；`errno` 不设置、错误返回 0、`ppoll` 用错系统调用号 → 都被抓住。
 - 如实说明：①内核补上的三个 `checkSignalsOnSyscallReturn` 没有 host 层的保护，只靠 hello234 的 F 项；②Linux 的 `poll` 号是 7，这里 7 是 `brk`，所以 `poll` 只有 native 编号 162，`select` 有 162 以外的 163 和 23 两个；③`select()` 仍然没有 libc 封装；④`pselect6`、`epoll_*` 没有 libc 封装也没有出现在头文件里。
 
+## 更多阻塞调用在返回 EINTR 之前运行信号处理函数（hello235）
+
+- 缺口：上一节发现 `poll`/`select` 的分发分支漏了 `checkSignalsOnSyscallReturn`。这一节把同样的检查扩到所有"在内核里等待、会因信号返回 `-EINTR`"的调用。逐个看分发分支：`epoll_wait`(148)、`futex`(143)、`semop`(65 和 154)、`rt_sigtimedwait`(221)、`flock`(73 和 185) 都没有调用；`connect`(42)、`msgsnd`/`msgrcv`、`recvmmsg`、`mq_timed*` 也没有调用，但它们的情形不同（见下）。
+- 红灯：hello235 四项在旧内核上全部失败，现场是 `r=-4 hits=0`：调用确实返回了 `-EINTR`，但处理函数还没跑。Linux 上是 `hits=1`（处理函数先于返回）。
+- 实现：`syscall_entry.zig` 的 143、148、65、154、221、185、73 七个分支补上 `checkSignalsOnSyscallReturn(frame)`。
+- 测试：hello235（QEMU，4 项）；host 测试 `blocking calls that can return EINTR deliver signals on their way out`：对一个按编号写死的清单（33 个号码，含 `read`/`write`/`waitpid`/`wait4`/socket 收发/`poll`/`select`/`ppoll`/`pselect6`/`epoll_pwait`/`nanosleep` 等）断言每个分支都调用了 `checkSignalsOnSyscallReturn`。变异：去掉 148、143、162 三个分支里的调用，都被抓住，文件已恢复。
+- 如实说明：①清单是**手写**的，不是从内核自动推出来的，新增阻塞调用时需要手动加号码；②`connect`(42)、`recvmmsg`(134)、`msgsnd`/`msgrcv`(69/70/157/158)、`mq_timedsend`/`mq_timedreceive`(188/189) 的分支仍然没有调用：`msgrcv` 在这个内核里根本不阻塞（空队列直接 `EAGAIN`，hello235 里我为此把原来的 msgrcv 用例删了，没有留下失败的测试），`connect`、`recvmmsg`、`mq_*` 我没有验证它们被信号打断时的行为，所以没有改；③`futex` 的 `FUTEX_WAIT` 在 Linux 上默认并不是 `SA_RESTART` 可重启的，这里也没有加入可重启表；④Linux 数字 7（poll）在这里是 `brk`，这是已知的编号差异。
+

@@ -352,6 +352,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello228"); /* join, then reuse the joined thread's block */
     run_test("hello229"); /* SA_RESTART: blocked read/waitpid restart or EINTR */
     run_test("hello234"); /* poll and ppoll */
+    run_test("hello235"); /* handler runs before EINTR: epoll_wait, futex, msgrcv, semop, sigtimedwait */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */
