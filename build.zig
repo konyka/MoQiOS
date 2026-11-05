@@ -78,6 +78,7 @@ const moqi_libc_sources = [_][]const u8{
     "lib/moqi_libc/src/assert.c",
     "lib/moqi_libc/src/posix.c",
     "lib/moqi_libc/src/poll.c",
+    "lib/moqi_libc/src/select.c",
     "lib/moqi_libc/src/getopt.c",
     "lib/moqi_libc/src/system.c",
     "lib/moqi_libc/src/dirent.c",
