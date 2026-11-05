@@ -13,12 +13,25 @@ static int g_command_mode;
 
 /* Utility functions */
 
+/* True when standard input is a terminal: the prompt and the echo of typed characters are for people, and only a terminal can have
+ * "no data yet" -- on a file or a pipe a read that returns 0 is the end of the input. */
+static int g_interactive = 1;
+
+/* Result of read_line at the end of the input (and nothing was read on the line). */
+#define LINE_EOF (-2)
+
 /* Read a line from stdin with basic line editing */
 static int read_line(char *buf, int max) {
     int pos = 0;
     while (pos < max - 1) {
         long n = read(STDIN_FILENO, buf + pos, 1);
         if (n <= 0) {
+            if (!g_interactive) {
+                /* End of a script or pipe: a last line without its newline still counts, an empty one means we are done. */
+                if (pos == 0) return LINE_EOF;
+                buf[pos] = '\0';
+                return pos;
+            }
             /* EOF/error: yield instead of busy-spinning at 100% CPU */
             yield();
             continue;
@@ -42,8 +55,10 @@ static int read_line(char *buf, int max) {
             continue;
         }
         /* Echo character */
-        char echo[2] = {c, 0};
-        print(echo);
+        if (g_interactive) {
+            char echo[2] = {c, 0};
+            print(echo);
+        }
         pos++;
     }
     buf[pos] = '\0';
@@ -719,17 +734,26 @@ int main(int argc, char **argv, char **envp) {
     struct ksigaction ign = { SIG_IGN, 0, 0, 0 };
     sigaction(SIGINT, &ign, (void *)0);
 
-    print("MoQiOS shell\n");
+    /* Commands from a file or a pipe ("sh < script"): no banner, no prompt, no echo; the shell ends at the end of the input with
+     * the status of the last command it ran. */
+    g_interactive = isatty(STDIN_FILENO) != 0;
+    if (g_interactive) print("MoQiOS shell\n");
+    int last_status = 0;
 
     for (;;) {
         jobs_reap_finished();
-        print("> ");
+        if (g_interactive) print("> ");
         char line[256];
         int len = read_line(line, sizeof(line));
+        if (len == LINE_EOF) {
+            int sig = last_status & 0x7f;
+            return sig ? 128 + sig : (last_status >> 8) & 0xff;
+        }
         if (len < 0) continue;
         if (len == 0) continue;
 
         protect_quotes(line);
-        execute_list(line);
+        int status = execute_list(line);
+        last_status = status < 0 ? (1 << 8) : status;
     }
 }

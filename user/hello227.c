@@ -422,6 +422,37 @@ int main(int argc, char **argv, char **envp) {
         }
     }
 
+    /* B15: the shell reading commands from a file or pipe instead of the terminal. At end of input it must exit (status of the last
+     * command), not wait forever; commands run in order; the prompt and the echo of typed characters are for people at a terminal and
+     * are not printed into a pipe's output. */
+    unlink("/tmp/h227_script");
+    unlink("/tmp/h227_sout");
+    f = fopen("/tmp/h227_script", "w");
+    if (f) { fputs("echo one\necho two\nexit 5\necho never\n", f); fclose(f); }
+    st = system("sh < /tmp/h227_script > /tmp/h227_sout");
+    memset(qb, 0, sizeof qb);
+    f = fopen("/tmp/h227_sout", "r");
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 5), "B: 'sh < script' runs the commands and 'exit 5' ends it with status 5");
+    check(strstr(qb, "one\ntwo\n") != (char *)0 && strstr(qb, "never") == (char *)0, "B: and the output holds the commands' output, not what comes after exit");
+    f = fopen("/tmp/h227_script", "w");
+    if (f) { fputs("echo a\nhello11\n", f); fclose(f); }
+    st = system("sh < /tmp/h227_script > /tmp/h227_sout");
+    check(exited(st, 42), "B: at end of input 'sh' ends with the status of the last command (hello11 = 42), it does not wait for more");
+    f = fopen("/tmp/h227_script", "w");
+    if (f) { fclose(f); }
+    st = system("sh < /tmp/h227_script > /tmp/h227_sout");
+    check(exited(st, 0), "B: an empty input ends the shell with status 0");
+    f = fopen("/tmp/h227_script", "w");
+    if (f) { fputs("echo last-without-newline", f); fclose(f); }
+    st = system("sh < /tmp/h227_script > /tmp/h227_sout");
+    memset(qb, 0, sizeof qb);
+    f = fopen("/tmp/h227_sout", "r");
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 0) && strstr(qb, "last-without-newline") != (char *)0, "B: a last line without a newline still runs");
+    unlink("/tmp/h227_script");
+    unlink("/tmp/h227_sout");
+
     /* C: the caller's signal state is exactly what it was */
     struct ksigaction a = { on_int, 0, 0, 0 };
     sigaction(SIGINT, &a, (struct ksigaction *)0);

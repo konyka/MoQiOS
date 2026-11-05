@@ -6736,3 +6736,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 结果：host 测试 1034/1034。
 - 如实说明：这是源码文本匹配，不是行为测试；它只保证"表里的号码都有投递信号的调用"，不保证调用的位置在系统调用结果写入 `frame.rax` 之后（这一点靠 hello229 的 QEMU 用例）。原来没有 QEMU 用例的 `sendto`、`sendmsg`、`recvmsg`、`accept4` 现在至少有接线保护，行为仍未实测。
 
+
+
+## shell 从文件或管道读命令（hello227 B15）
+
+- 缺口：交互循环在 `read` 返回 0（EOF）时只是 `yield()` 然后继续读，永远不会退出；横幅、提示符和每个字符的回显也无条件打印。所以 `sh < script` 或 `producer | sh` 会在脚本跑完之后挂住，并且把提示符和回显混进输出。
+- 红灯：hello227 新增 5 项；旧 shell 上第一项 `sh < script` 就挂住（read 读到 EOF 后无限循环），脚本超时 295 秒没有 PASS/FAIL 输出，算红灯但不是干净的 FAIL 行。
+- 实现（`user/sh.c`）：`g_interactive = isatty(0)`；非交互时不打印横幅/提示符/回显，`read_line` 在 EOF 时返回 `LINE_EOF`（已读到半行则先返回这一行）；主循环遇到 `LINE_EOF` 以最后一个命令的状态退出。我曾经加过一个"EOF 时等待所有子进程"的循环，随即撤回：POSIX shell 不等后台任务，而且会让长任务卡住结束。
+- 结果：hello227 共 102 项，SMP=1 全过。
+- 如实说明：①`isatty` 的判断依赖内核的 `ioctl(TCGETS)` 对管道/文件返回错误（hello141 已经验证过）；②输入行仍受 255 字节限制，更长的行会被分成两行执行；③`-s`、`sh script.sh`（以文件名为参数）没有实现，只支持标准输入；④"输出里有命令的输出且没有 exit 之后的内容"这一项只通过最终的 PASS 间接确认，我没有单独打印它的结果行。
