@@ -59,6 +59,14 @@ pub fn prepareExecAt(dirfd: i64, name_ptr: u64, argv_ptr: u64, envp_ptr: u64, fl
 
 /// Load ramdisk program `name` and switch the current task to it. Failures
 /// before the commit point leave the old image intact and report an errno.
+/// True when the user string at `addr` has its NUL right after `len` bytes (it was not longer than the copy buffer).
+fn argEndsHere(addr: u64, len: usize) bool {
+    const copy = @import("../mm/copy_from_user.zig");
+    var b: [1]u8 = undefined;
+    if (copy.copyFromUser(b[0..], @ptrFromInt(addr + len), 1) != 1) return false;
+    return b[0] == 0;
+}
+
 pub fn prepareExecName(name: []const u8, argv_ptr: u64, envp_ptr: u64) Prepared {
     const policy = @import("exec_policy.zig");
     if (threadedExecDenied()) return .{ .err = policy.errno(.denied) };
@@ -92,7 +100,10 @@ pub fn prepareExecName(name: []const u8, argv_ptr: u64, envp_ptr: u64) Prepared 
             if (pc < 8) break;
             const arg_ptr: u64 = @bitCast(ptr_bytes);
             if (arg_ptr == 0 or arg_ptr >= 0x0000_8000_0000_0000) break;
-            const al = copy.copyStringFromUser(argv_buffers[i][0..127], arg_ptr) orelse break;
+            const al = copy.copyStringFromUser(argv_buffers[i][0..policy.ARG_STRING_MAX], arg_ptr) orelse break;
+            // The copy stops at the buffer end: a string that fills it and is not at its NUL there was cut. That is E2BIG, not a
+            // shorter argument.
+            if (al == policy.ARG_STRING_MAX and !argEndsHere(arg_ptr, al)) return .{ .err = policy.errno(.too_big) };
             argv_buffers[i][al] = 0;
             argv_slices[i] = argv_buffers[i][0..al];
             argc = i + 1;
@@ -116,7 +127,8 @@ pub fn prepareExecName(name: []const u8, argv_ptr: u64, envp_ptr: u64) Prepared 
             if (pc < 8) break;
             const env_ptr: u64 = @bitCast(ptr_bytes);
             if (env_ptr == 0 or env_ptr >= 0x0000_8000_0000_0000) break;
-            const el = copy.copyStringFromUser(envp_buffers[i][0..127], env_ptr) orelse break;
+            const el = copy.copyStringFromUser(envp_buffers[i][0..policy.ARG_STRING_MAX], env_ptr) orelse break;
+            if (el == policy.ARG_STRING_MAX and !argEndsHere(env_ptr, el)) return .{ .err = policy.errno(.too_big) };
             envp_buffers[i][el] = 0;
             envp_slices[i] = envp_buffers[i][0..el];
             envc = i + 1;

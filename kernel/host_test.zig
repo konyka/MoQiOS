@@ -316,6 +316,7 @@ pub const readv_source = @embedFile("fs/readv.zig");
 // arch/x86_64/clone.zig and mm/process_vm.zig.
 test {
     _ = @import("proc/syscall_restart_policy.zig");
+    _ = @import("proc/exec_policy.zig");
     _ = @import("arch/x86_64/irq_time_policy.zig");
     _ = @import("mm/munmap_policy.zig");
     _ = @import("mm/mmap_policy.zig");

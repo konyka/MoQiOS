@@ -9,6 +9,8 @@
 #include "../lib/moqi_libc/include/errno.h"
 #include "../lib/moqi_libc/include/signal.h"
 
+#define MSYS3_EXEC(path, argv) syscall3(SYS_execve, (long)(path), (long)(argv), 0)
+
 static int failures;
 static void check(int ok, const char *what) {
     print(ok ? "hello227:   ok   " : "hello227:   FAIL ");
@@ -338,6 +340,38 @@ int main(int argc, char **argv, char **envp) {
     check(exited(st, 1), "B: a name containing '.' is status 1");
     st = system("export 1ABC=1");
     check(exited(st, 1), "B: a name that starts with a digit is status 1");
+
+    /* B13: an argument that does not fit is an error, not a silent cut. execve copies each argument into a 127-byte buffer; a longer
+     * one used to be truncated there, so "sh -c LONGLINE" ran a different, shorter command. Now execve says E2BIG, and system()
+     * therefore reports the shell as not started (status 127). A line of up to 127 bytes still works whole. */
+    for (int len = 120; len <= 135; len += 3) {
+        char line[200];
+        memset(line, ' ', sizeof line);
+        const char tail[] = "exit 3";
+        int tl = (int)sizeof tail - 1;
+        memcpy(line + len - tl, tail, (size_t)tl);
+        line[len] = 0;
+        st = system(line);
+        char what[112];
+        snprintf(what, sizeof what, "B: a command line of %d bytes ending in 'exit 3' (status 0x%x)", len, (unsigned)st);
+        if (len <= 127) check(exited(st, 3), what);
+        else check(exited(st, 127), what);
+    }
+    {
+        char *av[3] = { (char *)"hello11", (char *)0, (char *)0 };
+        static char big[200];
+        memset(big, 'a', 150);
+        big[150] = 0;
+        av[1] = big;
+        long kid_pid = fork();
+        if (kid_pid == 0) {
+            long r = MSYS3_EXEC("hello11", av);
+            _exit(r == -7 ? 77 : 78); /* only reached when execve failed */
+        }
+        int es = -1;
+        waitpid(kid_pid, &es, 0);
+        check(exited(es, 77), "B: execve with a 150-byte argument is E2BIG and the caller keeps running (hello11 would exit 42)");
+    }
 
     /* C: the caller's signal state is exactly what it was */
     struct ksigaction a = { on_int, 0, 0, 0 };
