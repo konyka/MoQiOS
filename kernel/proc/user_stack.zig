@@ -232,22 +232,35 @@ test "fits: a page of maximal strings does not" {
     try testing.expect(!fits(sixteen[0..], sixteen[0..]));
 }
 
-test "fits: the boundary is exact" {
-    // one argument of n bytes: n + 1 (NUL) + pointer area for argc 1, nenv 0 must be <= 4096
-    const area = pointerAreaBytes(1, 0);
+test "fits: the boundary is exact, with literal numbers" {
+    // Pointer part for one argument and no environment: pad 8 + (13 auxv pairs + AT_NULL) 224 + envp NULL 8 + argv NULL 8 + one argv
+    // pointer 8 + argc 8 = 264 bytes. An argument of 4096 - 264 - 1 (its NUL) = 3831 bytes is the longest that fits.
     var buf: [4096]u8 = @splat('x');
-    const max_len: usize = 4096 - area - 1;
-    try testing.expect(fits(&.{buf[0..max_len]}, &.{}));
-    try testing.expect(!fits(&.{buf[0 .. max_len + 1]}, &.{}));
+    try testing.expect(fits(&.{buf[0..3831]}, &.{}));
+    try testing.expect(!fits(&.{buf[0..3832]}, &.{}));
 }
 
-test "fits: strings past the 16th are not counted, because they are dropped" {
-    var arg: [127]u8 = @splat('x');
-    const a: []const u8 = arg[0..];
-    var many: [20][]const u8 = undefined;
-    for (&many) |*m| m.* = "k";
-    many[16] = a;
-    many[17] = a;
+test "fits: each environment string costs its pointer and its NUL" {
+    // One argument and one environment string: 264 + 8 = 272 bytes of pointers, 2 NULs, so the two strings may hold
+    // 4096 - 272 - 2 = 3822 bytes together.
+    var buf: [4096]u8 = @splat('x');
+    try testing.expect(fits(&.{buf[0..2000]}, &.{buf[0..1822]}));
+    try testing.expect(!fits(&.{buf[0..2000]}, &.{buf[0..1823]}));
+}
+
+test "fits: each argument costs its pointer and its NUL" {
+    // Three arguments: 264 + 16 = 280 bytes of pointers, 3 NULs, so the strings may hold 4096 - 280 - 3 = 3813 bytes.
+    var buf: [4096]u8 = @splat('x');
+    try testing.expect(fits(&.{ buf[0..1000], buf[0..1000], buf[0..1813] }, &.{}));
+    try testing.expect(!fits(&.{ buf[0..1000], buf[0..1000], buf[0..1814] }, &.{}));
+}
+
+test "fits: strings past the 16th are dropped and so do not count" {
+    // 16 one-byte arguments take 16 * 2 = 32 bytes of strings and 384 bytes of pointers. A 17th argument of 4000 bytes would not fit
+    // if it were counted; buildUserStack drops it, so it does not matter.
+    var big: [4000]u8 = @splat('y');
+    var many: [17][]const u8 = undefined;
+    for (many[0..16]) |*m| m.* = "k";
+    many[16] = big[0..];
     try testing.expect(fits(many[0..], &.{}));
 }
-
