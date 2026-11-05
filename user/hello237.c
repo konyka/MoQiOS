@@ -12,6 +12,9 @@
 #include "../lib/moqi_libc/include/time.h"
 #include "../lib/moqi_libc/include/epoll.h"
 
+#define SYS_sendto   121
+#define SYS_recvfrom 122
+
 static int failures;
 static void check(int ok, const char *what) {
     print(ok ? "hello237:   ok   " : "hello237:   FAIL ");
@@ -152,6 +155,83 @@ int main(int argc, char **argv, char **envp) {
         close(ep);
     } else {
         check(0, "D: a connected loopback pair could not be made");
+    }
+
+    /* What the reset does to recv and send on the side that received it. Measured on Linux (two orders): the reset is reported ONCE,
+     * to whichever of recv and send comes first, as -ECONNRESET; after that recv returns 0 (end of file) and send is -EPIPE. */
+    if (make_pair(&c, &s) == 0) {
+        char rb[16];
+        write(c, "zz", 2);
+        pump(100);
+        close(s);
+        pump(100);
+        long r1 = syscall6(SYS_recvfrom, c, (long)rb, sizeof rb, 0, 0, 0);
+        long r2 = syscall6(SYS_sendto, c, (long)"q", 1, 0x4000 /* MSG_NOSIGNAL */, 0, 0);
+        long r3 = syscall6(SYS_recvfrom, c, (long)rb, sizeof rb, 0, 0, 0);
+        char what[160];
+        snprintf(what, sizeof what, "E: recv first: -ECONNRESET once, then send is -EPIPE and the next recv is 0 (%ld, %ld, %ld)", r1, r2, r3);
+        check(r1 == -104 && r2 == -32 && r3 == 0, what);
+        close(c);
+    } else {
+        check(0, "E: a connected loopback pair could not be made");
+    }
+
+    if (make_pair(&c, &s) == 0) {
+        char rb[16];
+        write(c, "zz", 2);
+        pump(100);
+        close(s);
+        pump(100);
+        long r1 = syscall6(SYS_sendto, c, (long)"q", 1, 0x4000, 0, 0);
+        long r2 = syscall6(SYS_sendto, c, (long)"q", 1, 0x4000, 0, 0);
+        long r3 = syscall6(SYS_recvfrom, c, (long)rb, sizeof rb, 0, 0, 0);
+        char what[160];
+        snprintf(what, sizeof what, "E2: send first: -ECONNRESET once, then -EPIPE, and the next recv is 0 (%ld, %ld, %ld)", r1, r2, r3);
+        check(r1 == -104 && r2 == -32 && r3 == 0, what);
+        close(c);
+    } else {
+        check(0, "E2: a connected loopback pair could not be made");
+    }
+
+    if (make_pair(&c, &s) == 0) {
+        char rb[16];
+        write(s, "hello", 5);
+        write(c, "zz", 2);
+        pump(100);
+        close(s);
+        pump(100);
+        long r1 = syscall6(SYS_recvfrom, c, (long)rb, sizeof rb, 0, 0, 0);
+        long r2 = syscall6(SYS_recvfrom, c, (long)rb, sizeof rb, 0, 0, 0);
+        char what[160];
+        long r3 = syscall6(SYS_recvfrom, c, (long)rb, sizeof rb, 0, 0, 0);
+        snprintf(what, sizeof what, "F: data queued before the reset is delivered first (5 bytes), then -ECONNRESET once, then 0 (%ld, %ld, %ld)", r1, r2, r3);
+        check(r1 == 5 && r2 == -104 && r3 == 0, what);
+        close(c);
+    } else {
+        check(0, "F: a connected loopback pair could not be made");
+    }
+
+    /* POLLERR is the pending error: it is there until the ECONNRESET has been read, then it goes (Linux: revents 0x19 before, 0x11 after:
+     * POLLIN|POLLERR|POLLHUP, then POLLIN|POLLHUP). */
+    if (make_pair(&c, &s) == 0) {
+        char rb[16];
+        write(c, "zz", 2);
+        pump(100);
+        close(s);
+        pump(100);
+        struct { int fd; short events; short revents; } pf = { c, 1 /* POLLIN */, 0 };
+        syscall3(162 /* poll */, (long)&pf, 1, 0);
+        int before = pf.revents;
+        syscall6(SYS_recvfrom, c, (long)rb, sizeof rb, 0, 0, 0);
+        pf.revents = 0;
+        syscall3(162, (long)&pf, 1, 0);
+        int after = pf.revents;
+        char what[160];
+        snprintf(what, sizeof what, "G: POLLERR is reported until the ECONNRESET is read, then gone (before 0x%x, after 0x%x)", before, after);
+        check(before == 0x19 && after == 0x11, what);
+        close(c);
+    } else {
+        check(0, "G: a connected loopback pair could not be made");
     }
 
     print(failures == 0 ? "hello237: PASS\n" : "hello237: FAIL\n");

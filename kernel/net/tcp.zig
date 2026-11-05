@@ -3311,6 +3311,15 @@ fn absorbDataAckBeforeFin(tcb: *TcpTcb, ack_num: u32, window: u32) void {
     }
 }
 
+/// The value of a recv that copies no data. A connection reset by the peer reports ECONNRESET to ONE call (the first recv or send to
+/// look at it), exactly as Linux does (sk_err is cleared when read); afterwards the connection reads as ended: recv returns 0 and
+/// send is EPIPE. tcp_lock held.
+fn reportRecvResult(tcb: *TcpTcb, decision: tcp_recv_policy.RecvDecision) i64 {
+    const r = tcp_recv_policy.emptyResult(decision);
+    if (decision == .reset) tcb.reset_by_peer = false;
+    return r;
+}
+
 /// Receive data from a connection. Returns bytes read; 0 only at EOF (peer
 /// FIN seen or connection closed, ring drained); -EAGAIN when the ring is
 /// empty but the peer may still send (no blocking wait exists yet, so this
@@ -3338,7 +3347,7 @@ pub fn tcpPeek(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
     if (tcp_recv_policy.shutRdEof(tcb.shut_rd)) return 0;
     const available = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
     const decision = tcp_recv_policy.decide(tcb.state, available, tcb.reset_by_peer);
-    if (decision != .read_data) return tcp_recv_policy.emptyResult(decision);
+    if (decision != .read_data) return reportRecvResult(tcb, decision);
     const to_read = @min(available, len);
     ringRead(&tcb.recv_buf, RECV_BUF_SIZE, tcb.recv_head, buf, to_read);
     return @intCast(to_read);
@@ -3526,7 +3535,9 @@ fn sendFailure(tcb_idx: u32, raw: i64) i64 {
     defer tcp_lock.release(lock_flags);
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return -9; // EBADF: slot torn down
-    return tcp_recv_policy.sendErrno(tcb.state, tcb.fin_pending, tcb.reset_by_peer, tcb.was_established);
+    const e = tcp_recv_policy.sendErrno(tcb.state, tcb.fin_pending, tcb.reset_by_peer, tcb.was_established);
+    if (tcb.reset_by_peer) tcb.reset_by_peer = false; // reported once, like recv
+    return e;
 }
 
 /// write()/send() on a TCP socket: queue all `len` bytes, sleeping while the
@@ -3603,7 +3614,7 @@ fn recvLocked(tcb: *TcpTcb, buf: [*]u8, len: u32) i64 {
     const decision = tcp_recv_policy.decide(tcb.state, available, tcb.reset_by_peer);
     if (decision != .read_data) {
         if (decision == .eof and tcp_recv_policy.recvNeverConnected(tcb.state, tcb.was_established)) return -107; // ENOTCONN
-        return tcp_recv_policy.emptyResult(decision);
+        return reportRecvResult(tcb, decision);
     }
 
     const to_read = @min(available, len);

@@ -6846,3 +6846,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异：把传给 `closeSendsReset` 的未读字节数乘 0（等于没有这条规则），hello237 D 项回到 `0x2001` 失败，被抓住（我第一次变异因为"未使用的局部常量"没编译过，那次运行用的是旧二进制，不算数，重做后才有效）。
 - 如实说明：①缺口二的修复只覆盖了 RST 到达；其它会让 TCP 套接字变得"可读/挂断"的事件（例如超时放弃重传）我没有逐个查它们是否通知 epoll；②`tcpClose` 的新规则只在有未读数据**且**连接已同步的状态下生效，`syn_received`、`closing`、`last_ack` 等没有处理；③`close_wait` 状态（对端已发 FIN）本端有未读数据时 `tcpClose` 也发 RST；这条是我按 Linux `tcp_close` 的规则（任何有未读数据的关闭都 RST）写的，**没有**用对端观察到的行为验证过（对端在这种情形下已经关闭，没有观察者）；④没有写"本端有未读数据并 close"的 TCP 对端侧 `recv` 返回 `ECONNRESET` 的 QEMU 用例，只通过 epoll 事件字间接确认了对端收到了 RST；⑤这两处改动都在 TCP 的核心路径上，我跑了 SMP=1 和 SMP=8 的完整冒烟，没有跑完整的压力门禁。
 
+## TCP：RST 的 ECONNRESET 只报告一次（hello237 E/E2/F/G）
+
+- 缺口：收到 RST 之后，这个内核的每一次 `recv`/`send` 都返回 `-ECONNRESET`，永远不会变成 EOF 或 `EPIPE`。Linux 的语义（`sk_err` 读一次就清）是：RST 只对**第一个**去看它的调用报告 `-ECONNRESET`（`recv` 或 `send` 谁先到就报给谁），之后 `recv` 返回 0（EOF）、`send` 返回 `-EPIPE`。已经排队的数据先交付（`5`，然后 `-ECONNRESET`，然后 `0`）。`poll` 的 `POLLERR` 也一样：错误读掉之前是 `0x19`，读掉之后是 `0x11`。上面这些都是我先在宿主机用 gcc 对 Linux 测出来的（两种顺序：recv 先、send 先；有排队数据；`poll` 前后）。
+- 红灯：hello237 E、E2、F、G 四项在旧内核上都失败：`(-104, -104, -104)`、`(-104, -104, -104)`、`(5, -104, -104)`，G 的 `before 0x19, after 0x19`。
+- 实现：`tcp.zig` 新增 `reportRecvResult`，读到 `.reset` 决定时把 `reset_by_peer` 清掉；`sendFailure` 在报告之后同样清掉。非阻塞 `tcpRecv`、`recvLocked` 两处 `recv` 路径都走它。阻塞 `recv` 里的"是否继续等"检查没有改（它只判断 `would_block`）。
+- 变异：①把清除改成空操作（recv 路径）→ E、F、G 失败，E2（send 先）不受影响；②把 `sendFailure` 里的清除改成空操作 → E2 失败，E 不受影响。两条路径各自被一个变异保护，文件已恢复。
+- 如实说明：①`reset_by_peer` 同时被用作"连接被 RST 过"和"待报告的错误"两个意思，清除它之后 `tcp_ready_policy`（`POLLERR`）和 `send` 的错误选择都改用同一个标志，我只验证了上面列出的序列；②阻塞 `recv` 在睡眠里被 RST 唤醒后走哪条路径，我没有写专门的用例（hello237 的用例都是 RST 到达之后才调用 `recv`）；③其它依赖 `reset_by_peer` 的地方只有 `tcpReadiness`，我没有查有没有别的模块读这个标志。
+
