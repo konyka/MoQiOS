@@ -110,11 +110,13 @@ static int make_pair(int port, int *cli, int *srv) {
     uint8_t sa[16];
     mk_addr(sa, port);
     int64_t l = syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
-    if (l < 0) return -1;
-    if (syscall3(SYS_BIND, (uint64_t)l, (uint64_t)sa, 16) != 0) return -2;
-    if (syscall2(SYS_LISTEN, (uint64_t)l, 4) != 0) return -3;
+    if (l < 0) { mp_last = l; return -1; }
+    mp_last = syscall3(SYS_BIND, (uint64_t)l, (uint64_t)sa, 16);
+    if (mp_last != 0) return -2;
+    mp_last = syscall2(SYS_LISTEN, (uint64_t)l, 4);
+    if (mp_last != 0) return -3;
     int64_t c = syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
-    if (c < 0) return -4;
+    if (c < 0) { mp_last = c; return -4; }
     int64_t cr = syscall3(SYS_CONNECT, (uint64_t)c, (uint64_t)sa, 16);
     if (cr < 0) syscall1(SYS_NETPOLL, 0);
     for (int i = 0; i < 20 && cr < 0; i++) {
@@ -191,7 +193,7 @@ void _start(void) {
     }
     {
         int c, s;
-        int mp = make_pair(18152, &c, &s);
+        int mp = make_pair(18452, &c, &s);
         if (mp == 0) {
             probe("C: TCP: read(8192) with exactly 4096 queued returns 4096", c, s, 4096, 8192, 3000);
             probe("C: TCP: read(20000) with 8192 queued returns 8192", c, s, 8192, 20000, 3000);

@@ -311,6 +311,54 @@ int main(int argc, char **argv, char **envp) {
         close((int)c);
     }
 
+    /* J: shutdown() on a listener, measured on Linux. SHUT_RD and SHUT_RDWR stop the listener like close does: the queued child is
+     * reset (client poll 0x201d), a new connect is ECONNREFUSED and accept is EINVAL. SHUT_WR changes nothing: the client stays
+     * quiet (poll 0x4), a new connect succeeds and accept returns the queued child. */
+    for (int how = 0; how < 3; how++) {
+        unsigned char sa[16];
+        int port = port_next++;
+        mk_addr(sa, port);
+        long ls = syscall3(SYS_socket, 2, 1, 0);
+        int ok = ls >= 0 && syscall3(SYS_bind, ls, (long)sa, 16) == 0 && syscall3(SYS_listen, ls, 4, 0) == 0;
+        long c = syscall3(SYS_socket, 2, 1, 0);
+        long r = ok ? syscall3(SYS_connect, c, (long)sa, 16) : -1;
+        for (int i = 0; ok && i < 100 && r < 0 && r != -106; i++) {
+            pump(20);
+            r = syscall3(SYS_connect, c, (long)sa, 16);
+        }
+        pump(100);
+        long sr = syscall2(48 /* SYS_shutdown */, ls, how);
+        pump(100);
+        int epj = epoll_create1(0);
+        struct epoll_event evj, oj[2];
+        memset(&evj, 0, sizeof evj);
+        evj.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
+        evj.data.fd = (int)c;
+        epoll_ctl(epj, EPOLL_CTL_ADD, (int)c, &evj);
+        memset(oj, 0, sizeof oj);
+        int nj = wait_ev(epj, oj, 300);
+        unsigned want = how == 1 ? 0x4u : 0x201du;
+        long c2 = syscall3(SYS_socket, 2, 1, 0);
+        long r2 = syscall3(SYS_connect, c2, (long)sa, 16);
+        for (int i = 0; i < 100 && r2 < 0 && r2 != -106 && r2 != -111; i++) {
+            pump(20);
+            r2 = syscall3(SYS_connect, c2, (long)sa, 16);
+        }
+        pump(60);
+        long ac = syscall4(SYS_accept4, ls, 0, 0, 0x800 /* SOCK_NONBLOCK */);
+        char what[200];
+        snprintf(what, sizeof what, "J: shutdown(listener, %d): client events 0x%x, second connect %ld, accept %ld (shutdown=%ld n=%d events=0x%x)", how, want, how == 1 ? 0L : -111L, how == 1 ? 1L : -22L, sr, nj, nj > 0 ? oj[0].events : 0u);
+        int events_ok = how == 1 ? (nj == 1 && oj[0].events == 0x4u) : (nj == 1 && oj[0].events == 0x201du);
+        int connect_ok = how == 1 ? r2 == 0 : r2 == -111;
+        int accept_ok = how == 1 ? ac >= 0 : ac == -22;
+        check(ok && r == 0 && sr == 0 && events_ok && connect_ok && accept_ok, what);
+        if (ac >= 0) close((int)ac);
+        close(epj);
+        close((int)c);
+        close((int)c2);
+        close((int)ls);
+    }
+
     print(failures == 0 ? "hello237: PASS\n" : "hello237: FAIL\n");
     return failures;
 }

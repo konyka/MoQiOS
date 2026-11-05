@@ -518,6 +518,27 @@ fn dropUnacceptedChild(child: *TcpTcb) void {
     deactivateTcb(child);
 }
 
+/// Stop a listener: clear its listen slot so the port stops answering SYNs, and reset or free the backlog children nobody can
+/// accept anymore. Caller holds tcp_lock and then marks the listener TCB closed.
+fn stopListening(tcb: *TcpTcb) void {
+    var lbm = listen_active_bitmap;
+    while (lbm != 0) {
+        const i = @ctz(lbm);
+        lbm &= lbm - 1;
+        const ls = &listen_slots[i];
+        if (ls.local_port == tcb.local_port and ls.is_v6 == tcb.is_v6) {
+            while (ls.pending_head != ls.pending_tail) {
+                const pidx = ls.pending_tpbs[ls.pending_head % LISTEN_BACKLOG];
+                ls.pending_head += 1;
+                if (pidx < MAX_CONNECTIONS and tcbs[pidx].active) dropUnacceptedChild(&tcbs[pidx]);
+            }
+            listen_active_bitmap &= ~(@as(u64, 1) << @intCast(i));
+            ls.active = false;
+            break;
+        }
+    }
+}
+
 /// Marker for a backlog ring entry whose handshake died (never a real TCB
 /// index — MAX_CONNECTIONS is 64).
 const INVALID_PENDING: u32 = 0xFFFF_FFFF;
@@ -3707,24 +3728,7 @@ pub fn tcpClose(tcb_idx: u32) i64 {
         // (FIN_WAIT_1 / LAST_ACK from then on).
         .established, .close_wait => requestFin(tcb),
         .listen => {
-            // Clear the listen slot so the port stops answering SYNs, and
-            // free pending backlog TCBs nobody can accept anymore.
-            var lbm = listen_active_bitmap;
-            while (lbm != 0) {
-                const i = @ctz(lbm);
-                lbm &= lbm - 1;
-                const ls = &listen_slots[i];
-                if (ls.local_port == tcb.local_port and ls.is_v6 == tcb.is_v6) {
-                    while (ls.pending_head != ls.pending_tail) {
-                        const pidx = ls.pending_tpbs[ls.pending_head % LISTEN_BACKLOG];
-                        ls.pending_head += 1;
-                        if (pidx < MAX_CONNECTIONS and tcbs[pidx].active) dropUnacceptedChild(&tcbs[pidx]);
-                    }
-                    listen_active_bitmap &= ~(@as(u64, 1) << @intCast(i));
-                    ls.active = false;
-                    break;
-                }
-            }
+            stopListening(tcb);
             tcb.state = .closed;
             deactivateTcb(tcb);
         },
@@ -4390,6 +4394,14 @@ pub fn tcpShutdown(tcb_idx: u32, how: u32) i64 {
 
     switch (how) {
         0 => {
+            // A listener has nothing to read: SHUT_RD stops it the way close does (Linux inet_shutdown: TCP_LISTEN with SHUT_RD
+            // calls tcp_disconnect), so queued children are reset and later SYNs are refused.
+            if (tcb.state == .listen) {
+                stopListening(tcb);
+                tcb.state = .closed;
+                deactivateTcb(tcb);
+                return 0;
+            }
             // SHUT_RD: discard further received data
             // The ring is emptied, reads see EOF and later data is dropped.
             tcb.recv_head = tcb.recv_tail;
@@ -4411,25 +4423,7 @@ pub fn tcpShutdown(tcb_idx: u32, how: u32) i64 {
             switch (tcb.state) {
                 .established, .close_wait => requestFin(tcb),
                 .listen => {
-                    // Same teardown as tcpClose's .listen arm: clear the
-                    // listen slot so the port stops answering SYNs, and free
-                    // the pending backlog TCBs nobody can accept anymore.
-                    var lbm = listen_active_bitmap;
-                    while (lbm != 0) {
-                        const i = @ctz(lbm);
-                        lbm &= lbm - 1;
-                        const ls = &listen_slots[i];
-                        if (ls.local_port == tcb.local_port and ls.is_v6 == tcb.is_v6) {
-                            while (ls.pending_head != ls.pending_tail) {
-                                const pidx = ls.pending_tpbs[ls.pending_head % LISTEN_BACKLOG];
-                                ls.pending_head += 1;
-                                if (pidx < MAX_CONNECTIONS and tcbs[pidx].active) dropUnacceptedChild(&tcbs[pidx]);
-                            }
-                            listen_active_bitmap &= ~(@as(u64, 1) << @intCast(i));
-                            ls.active = false;
-                            break;
-                        }
-                    }
+                    stopListening(tcb);
                     tcb.state = .closed;
                     deactivateTcb(tcb);
                 },

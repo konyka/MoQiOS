@@ -6882,3 +6882,19 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异：把发 RST 的条件改成 `.syn_received`（等于不发），hello237 I 回到 `events=0x4`、`(-11, -11)`，被抓住，文件已恢复。
 - QEMU：hello237 共 H、I 等所有项通过（I 项第一次修复后 `0x201d`、`(-104, 0)`）。
 - 如实说明：①只测了 `tcpClose` 路径（`close`）；`tcpShutdown` 的监听分支用了同一个函数，但没有单独的用例；②IPv6 监听套接字走同一个分支，没有测；③`syn_received` 的半开子连接 Linux 不发 RST，我没有在宿主机上单独验证这一点（读自内核行为，不是实测）；④关闭后"再连同一端口得 `ECONNREFUSED`"这个行为没有新加用例，hello134/hello160 等已有 ECONNREFUSED 用例覆盖了监听不存在的端口。
+
+## TCP：对监听套接字 `shutdown(SHUT_RD)`（hello237 J）
+
+- 缺口：上一节只覆盖了 `close`。宿主机实测 `shutdown(listener, how)`：`SHUT_RD`（0）和 `SHUT_RDWR`（2）都会像 `close` 一样停止监听——队列里的子连接被 RST（客户端 `poll` 得 `0x201d`），之后再连同一端口得 `ECONNREFUSED`，`accept` 得 `EINVAL`；`SHUT_WR`（1）什么都不改变（客户端 `0x4`，再连成功，`accept` 返回队列里的子连接）。这个内核里 `SHUT_RDWR` 已经对（`tcpShutdown` 的第 2 分支有监听拆除），但 `SHUT_RD` 分支把一个监听 TCB 当作普通连接处理（清空接收环、置 `shut_rd`），监听照常工作。
+- 红灯：hello237 J 的 `how=0` 在旧内核上 `events=0x4`（客户端没被 RST），`how=1` 与 `how=2` 一开始就对。
+- 实现：把监听拆除抽成 `stopListening`（`tcpClose`、`tcpShutdown` 的 `SHUT_RDWR` 与新的 `SHUT_RD` 监听分支共用，去掉了两份重复代码）；`SHUT_RD` 在监听状态下调用它并关闭 TCB。
+- 变异：把 `SHUT_RD` 的监听判断改成永不为真（等于旧行为），hello237 J 的 `how=0` 失败，被抓住，文件已恢复。
+- 如实说明：①`SHUT_RD` 之后 Linux 的监听套接字本身还能 `close`，这个内核里 TCB 已被释放，再 `close` 走的是 `tcb.active == false` 的返回路径（返回 -1 的行为我没有逐点核对）；②只测了 IPv4 回环；③`how` 为其它值的 `EINVAL` 原来就有，没有改动。
+
+## hello152 `C: loopback connection` 偶发失败：找到最可能的原因（测试端口冲突）
+
+- 现象回顾：`fa94348` 的 CI（SMP=2）和本地 `qemu_smoke.sh 8` 里各出现过一次 `hello152: FAIL C: loopback connection`；更早的 SMP=8 门禁里也出现过（上文 5846、5853 行）。
+- 新的诊断输出（上一轮加的）这次在本地 SMP=8 失败里起了作用：`hello152: make_pair failed, step 2`，即 `bind()` 失败。当时 `bind` 的返回值没有记下来（显示的 `last syscall result 0` 是上一个已成功的调用），所以**没有直接看到 -98**。
+- 原因（推断，不是直接观察）：`hello151` 的 B 段和 `hello152` 的 C 段用的是同一个端口 18152，而 `servers/init/main.c` 里它们是**连续**运行的（hello151 → hello152）。hello151 刚关掉的连接若还留在 TIME_WAIT / FIN_WAIT 状态，hello152 不带 `SO_REUSEADDR` 的 `bind(18152)` 就会 `EADDRINUSE`（Linux 对同样的情形也是 `EADDRINUSE`，所以这是测试的端口冲突，不是内核缺陷）。是否撞上取决于两个测试之间的时序，所以只是偶发。这也与 5868 行当时对 hello177/hello174 端口冲突的旁证是同一类问题。我在仓库里扫了 `user/*.c` 里所有五位数端口号：被两个以上测试程序使用的，除了 hello152/hello151 的 18152，其余都是不是监听端口的数值常量（如 10000、12345、16384），没有别的监听端口冲突。
+- 处理：hello152 的 C 段改用 18452（仓库里没有其它地方使用）；`make_pair` 现在把 `socket`/`bind`/`listen` 的返回值也记下来，再失败时能直接看到 `-98`。
+- 如实说明：这个结论要靠之后一段时间不再复现来支持；我没有做"修复前后失败率"的对比实验（失败率太低，做不出有意义的样本）。如果之后还出现 `make_pair failed, step 2`，请看输出里的 `last syscall result`。
