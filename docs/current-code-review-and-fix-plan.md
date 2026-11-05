@@ -6552,3 +6552,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：`src/system.c`（host 测试 `test_system_abi.c` 用记录桩验证：块 SIGCHLD → 忽略 INT/QUIT → fork，父进程等待（EINTR 重试）后按"恢复掩码与处理函数"收尾，子进程先恢复再 `execve("sh", {"sh","-c",cmd})`，失败 `_exit(127)`，fork 失败返回 -1 并恢复信号状态，wait 失败为 -1 加 errno；9 个变异全部被杀）。`user/sh.c` 新增 `-c` 模式：展开变量、执行一行、不打印提示或 `bye`，以命令的退出码结束（被信号杀死则 128+信号）；`exit N` 现在按 N 退出（低 8 位）。`errno.h` 补 `ECHILD`。
 - QEMU：`hello227`——`exit 3`→3、`exit`→0、`hello11`→42、缺失命令→127、重定向到 `/tmp` 文件、调用前后 SIGINT 处理函数与信号掩码不变、连续 8 次调用各返回各自的状态。
 - 如实说明：shell 的 `exit` 解析是最朴素的十进制；`sh -c` 沿用交互 shell 的语法（管道、`>` 重定向、几个内建命令），没有 `&&`/`;`/引号；`system()` 的命令长度受 shell 的 256 字节行缓冲限制（更长被截断）。
+
+## pthread_join 与线程退出之间的窗口：测得的事实与一个回归守卫（hello228）
+
+- 背景：`hello210` 里曾出现一次未复现的用户态崩溃（`pthread_exit` 内联 `dead_push` 处 `r8 == 0`）。这一节只补测得的事实，**没有找到崩溃原因，也没有改 libc**。
+- 事实一（测得）：`pthread_join` 在线程把 `state` 置 1 时就返回，而内核此时还没把该任务标成已退出。临时探针（连续创建并 join 3000 个线程，join 返回后立刻 `tkill(tid, 0)`）在 SMP=8 上有 2525/3000 次仍然成功。也就是说，**join 返回时，退出中的线程多数情况下还在 `pthread_exit` 里跑，且跑在 join 刚 `free` 的那块内存上**。这个窗口是真实存在的，不是理论推演。这个探针没有保留（它量的是内核标记时刻，不是内存是否被误用）。
+- 事实二（测得）：`hello228` 把这个窗口变成可观察的：每次 join 之后立刻 `malloc` 一块同样大小的 64 KiB 并把开头 2 KiB 清零（线程的 TCB 就在那里），重复 4000 次。SMP=8 上全部通过，`hello228` 自己的日志区间内没有用户态缺页、没有 `[kill]`、没有 panic（日志里后面出现的缺页全部属于下一个测试 `hello190`，它故意传非法参数）。所以：窗口存在，但在这个构造下没有造成内存破坏——退出路径在 join 返回之后读到的只是 `state` 之后的 `detached`/`join_claimed`，读到零值时走的分支（不压链）恰好是正确的。
+- 结论与保留：`hello228` 作为回归守卫保留（接线 `build.zig`/`qemu_run.sh`/`init`/`qemu_smoke.sh`）。它不能证明窗口无害（读到零与读到别的值是两回事），只能说明"线程在 free 之后读 TCB"这一类错误至少在这个构造里没有被观察到。
+- 真正的修法（未做）：让 join 等内核的 `CLONE_CHILD_CLEARTID` 清零（`task.zig` 的 `exitTask` 已经在任务退出时清零并唤醒该地址），而不是等线程自己写的 `state`；这样 join 返回时线程一定已经不再使用这块内存。这会改 `clone` 标志和 join/detach/exit 协议，我想先有一个能复现内存破坏的失败用例再动。

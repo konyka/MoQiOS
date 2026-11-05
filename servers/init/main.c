@@ -349,6 +349,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello225"); /* pause, alarm, gettid */
     run_test("hello226"); /* libc: atexit/abort/raise/assert/signal/sigset/perror/remove/rename/isatty */
     run_test("hello227"); /* libc system(): sh -c, exit status, 127, redirection, signal state restored */
+    run_test("hello228"); /* join, then reuse the joined thread's block */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */
