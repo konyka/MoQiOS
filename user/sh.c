@@ -430,7 +430,7 @@ static int execute_pipeline(const char *line) {
             while (rest[idx] == ' ') idx++;
             int code = 0;
             for (const char *d = rest + idx; *d >= '0' && *d <= '9'; d++) code = (code * 10 + (*d - '0')) & 0xff;
-            if (!g_command_mode) print("bye\n");
+            if (!g_command_mode && g_interactive) print("bye\n");
             _exit(code);
         }
         if (strcmp(cmd, "pid") == 0) {
@@ -729,6 +729,31 @@ int main(int argc, char **argv, char **envp) {
         if (status < 0) return 1;
         int sig = status & 0x7f;
         return sig ? 128 + sig : (status >> 8) & 0xff;
+    }
+
+    /* "sh FILE": run the commands in FILE as if they had been piped in. The file replaces standard input; one that cannot be opened,
+     * or is not a regular readable file, is status 127 and nothing runs. Further arguments are ignored. */
+    if (argc >= 2 && argv[1][0] != '-') {
+        long fd = open(argv[1], O_RDONLY, 0);
+        if (fd < 0) {
+            print("sh: cannot open ");
+            print(argv[1]);
+            print("\n");
+            return 127;
+        }
+        /* A directory opens but cannot be read: probe with a real read (a zero-length one is not required to fail), and put the
+         * byte back by seeking, since the script is about to be read from the start. */
+        char probe;
+        long got = read((int)fd, &probe, 1);
+        if (got < 0) {
+            print("sh: cannot read ");
+            print(argv[1]);
+            print("\n");
+            return 127;
+        }
+        lseek((int)fd, 0, 0);
+        dup2((int)fd, STDIN_FILENO);
+        close((int)fd);
     }
 
     struct ksigaction ign = { SIG_IGN, 0, 0, 0 };

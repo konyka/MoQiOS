@@ -434,7 +434,7 @@ int main(int argc, char **argv, char **envp) {
     f = fopen("/tmp/h227_sout", "r");
     if (f) { fread(qb, 1, 31, f); fclose(f); }
     check(exited(st, 5), "B: 'sh < script' runs the commands and 'exit 5' ends it with status 5");
-    check(strstr(qb, "one\ntwo\n") != (char *)0 && strstr(qb, "never") == (char *)0, "B: and the output holds the commands' output, not what comes after exit");
+    check(strcmp(qb, "one\ntwo\n") == 0, "B: and the output is exactly the commands' output (no 'bye', nothing after exit)");
     f = fopen("/tmp/h227_script", "w");
     if (f) { fputs("echo a\nhello11\n", f); fclose(f); }
     st = system("sh < /tmp/h227_script > /tmp/h227_sout");
@@ -452,6 +452,44 @@ int main(int argc, char **argv, char **envp) {
     check(exited(st, 0) && strstr(qb, "last-without-newline") != (char *)0, "B: a last line without a newline still runs");
     unlink("/tmp/h227_script");
     unlink("/tmp/h227_sout");
+
+    /* B16: "sh FILE" runs the commands in FILE, with no prompt or echo, ending at the end of the file with the status of the last
+     * command; a missing file is status 127 (the shell could not run it) and a directory or unreadable file likewise. The script's
+     * own name and arguments are not used by the shell. */
+    unlink("/tmp/h227_file");
+    unlink("/tmp/h227_fout");
+    f = fopen("/tmp/h227_file", "w");
+    if (f) { fputs("echo from-file\nexit 6\necho never\n", f); fclose(f); }
+    st = system("sh /tmp/h227_file > /tmp/h227_fout");
+    memset(qb, 0, sizeof qb);
+    f = fopen("/tmp/h227_fout", "r");
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 6), "B: 'sh FILE' runs the file and its 'exit 6' ends it with status 6");
+    {
+        char shown[40];
+        int k = 0;
+        for (const char *c = qb; *c && k < 38; c++) shown[k++] = (*c == '\n') ? '|' : *c;
+        shown[k] = 0;
+        char what[120];
+        snprintf(what, sizeof what, "B: and prints exactly the commands' output (no banner, prompt or echo): got '%s'", shown);
+        check(strcmp(qb, "from-file\n") == 0, what);
+    }
+    f = fopen("/tmp/h227_file", "w");
+    if (f) { fputs("hello11\n", f); fclose(f); }
+    st = system("sh /tmp/h227_file");
+    check(exited(st, 42), "B: at the end of the file 'sh FILE' ends with the status of the last command (42)");
+    st = system("sh /tmp/h227_no_such_script");
+    check(exited(st, 127), "B: a script that does not exist is status 127");
+    st = system("sh /tmp");
+    check(exited(st, 127), "B: a directory given as the script is status 127");
+    st = system("sh /tmp/h227_file && exit 8");
+    check(exited(st, 42), "B: and '&&' after a failing script does not run the next command");
+    f = fopen("/tmp/h227_file", "w");
+    if (f) { fputs("export H231V=from-script\nhello231 from-script\n", f); fclose(f); }
+    st = system("sh /tmp/h227_file");
+    check(exited(st, 0), "B: the script's own 'export' reaches the programs it starts");
+    unlink("/tmp/h227_file");
+    unlink("/tmp/h227_fout");
 
     /* C: the caller's signal state is exactly what it was */
     struct ksigaction a = { on_int, 0, 0, 0 };
