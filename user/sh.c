@@ -200,9 +200,12 @@ static int expand_vars(const char *src, char *dst, int max) {
             if (ki > 0) {
                 char val[128];
                 long vlen = moqi_getenv(key, val, sizeof(val));
+                const char *inherited = vlen >= 0 ? (const char *)0 : getenv(key);
+                if (inherited) vlen = (long)strlen(inherited);
                 if (vlen >= 0) {
                     for (int v = 0; v < vlen && di < max - 1; v++) {
-                        dst[di++] = quoted ? protect_char(val[v]) : val[v];
+                        char ch = inherited ? inherited[v] : val[v];
+                        dst[di++] = quoted ? protect_char(ch) : ch;
                     }
                 }
             }
@@ -283,7 +286,7 @@ static void run_command(const char *cmd, int pipe_in, int pipe_out, const char *
     for (int i = 0; i < nargs; i++) argv[i + 1] = args[i];
     argv[nargs + 1] = (void*)0;
 
-    execve(name, argv, (void *)0);
+    execve(name, argv, environ);
     /* If execve returns, it failed */
     print("sh: ");
     print(name);
@@ -420,7 +423,7 @@ static int execute_pipeline(const char *line) {
             goto builtin_done;
         }
         if (strcmp(cmd, "help") == 0) {
-            out_str("Commands: exit, pid, echo, ls, cd, pwd, export, env, help, <program>\n");
+            out_str("Commands: exit, pid, echo, ls, cd, pwd, export, env, wait, help, <program>\n");
             goto builtin_done;
         }
         if (strcmp(cmd, "echo") == 0) {
@@ -443,11 +446,22 @@ static int execute_pipeline(const char *line) {
                 char kv[256];
                 unprotect(kv, rest + idx, sizeof(kv));
                 moqi_setenv(kv);
+                /* The kernel's per-task table above is what "$NAME" reads; the C library's environ is what the programs started
+                 * from here inherit (it is passed to execve), so both are kept in step. */
+                char *eq = kv;
+                while (*eq && *eq != '=') eq++;
+                if (*eq == '=') {
+                    *eq = '\0';
+                    setenv(kv, eq + 1, 1);
+                }
             }
             return 0;
         }
         if (strcmp(cmd, "env") == 0) {
-            out_str("(use export VAR=value to set)\n");
+            for (char **e = environ; e && *e; e++) {
+                out_str(*e);
+                out_str("\n");
+            }
             goto builtin_done;
         }
         if (strcmp(cmd, "ls") == 0) {

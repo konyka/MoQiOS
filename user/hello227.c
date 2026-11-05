@@ -228,6 +228,28 @@ int main(int argc, char **argv, char **envp) {
     unlink("/tmp/h227_out");
     unlink("/tmp/h227_out2");
 
+    /* B8: the environment. "export" puts a variable into the shell's environment and every program the shell starts inherits
+     * it; "env" prints the environment. hello231 exits 0 when H231V equals its argument. */
+    st = system("export H231V=child-value ; hello231 child-value");
+    check(exited(st, 0), "B: a program started after 'export' sees the variable");
+    st = system("hello231 child-value");
+    check(!exited(st, 0), "B: and without the export it does not (a fresh shell has no H231V)");
+    st = system("export H231V=\"two words\" ; hello231 \"two words\"");
+    check(exited(st, 0), "B: a quoted value with a space reaches the program whole");
+    st = system("export H231V=a ; export H231V=b ; hello231 b");
+    check(exited(st, 0), "B: a second 'export' of the same name replaces the value");
+    st = system("export H231V=deep ; sh -c \"hello231 deep\"");
+    check(exited(st, 0), "B: the variable passes through a nested shell to its child");
+    st = system("export H231V=bg ; hello231 bg & wait $! ; exit $?");
+    check(exited(st, 0), "B: a background program inherits the variable too");
+    unlink("/tmp/h227_env");
+    st = system("export H231V=listed ; env > /tmp/h227_env");
+    f = fopen("/tmp/h227_env", "r");
+    char eb[512] = { 0 };
+    if (f) { fread(eb, 1, 511, f); fclose(f); }
+    check(exited(st, 0) && strstr(eb, "H231V=listed\n") != (char *)0, "B: 'env' prints the exported variable as NAME=value");
+    unlink("/tmp/h227_env");
+
     /* C: the caller's signal state is exactly what it was */
     struct ksigaction a = { on_int, 0, 0, 0 };
     sigaction(SIGINT, &a, (struct ksigaction *)0);

@@ -6656,3 +6656,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 结果：hello227 共 57 项，SMP=1 全过。
 - 如实说明：①没有 `2>`、`>&`、here-doc；②同一命令里写两个 `<` 或两个 `>` 取第一个；③对内建命令的 `<` 被忽略（内建不读标准输入）；④管道中间的命令写 `<` 或 `>` 会被忽略（只认第一个命令的 `<` 和最后一个命令的 `>`，沿用原有的结构）。
 
+## shell 的环境变量：`export` 真正传给子进程，`env` 真正打印（hello227 B8、hello231）
+
+- 缺口：`export` 只写进内核的每任务环境表（`moqi_setenv`），而 shell 启动程序时调用的是 `execve(name, argv, NULL)`，所以 `export X=1` 之后启动的程序**什么环境都看不到**；`env` 内建只打印一行"用 export VAR=value 设置"，文档却写着"打印所有环境变量"。与上一轮的 `<`/`>>` 一样，这是文档声称而实现没有的功能。
+- 红灯：hello227 新增 7 项，新增探针 `hello231`（环境里 `H231V` 等于参数则退出 0）。旧 shell 上 6 项失败（export 后的程序看得到、带空格的引号值、二次 export 覆盖、嵌套 `sh -c` 传递、后台程序继承、`env` 打印 `NAME=value`）；"没有 export 就看不到"那项旧 shell 本来就过，约束力弱。
+- 实现（`user/sh.c`）：`export` 在写内核表之后也调用 libc 的 `setenv`；`execve` 传 `environ`；`env` 逐行打印 `environ`；`$NAME` 展开先读内核表，没有再读 `environ`（让从父进程继承来的变量也能在 `$NAME` 里用）。
+- 结果：hello227 共 64 项，SMP=1 全过。
+- 如实说明：①内核的 `execve` 最多接收 16 个环境变量、每个最长 127 字节（`prepareExecName` 的缓冲）：第 17 个及以后的被丢弃；某一项超过 127 字节时拷贝失败、循环在那里 `break`，**该项和它后面所有项**都不会传给新程序（这一条是读代码得出的，没有单独的用例）；②没有 `unset`、没有 `export` 不带值的形式（`export X` 把 X 标成导出），也没有 `NAME=value cmd` 的前缀赋值；③内核表和 `environ` 是两份，`export` 同时写两处，但程序自己 `setenv` 只影响 `environ`；④shell 里用 `$NAME` 的优先级是内核表在前、`environ` 在后。
+

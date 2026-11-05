@@ -152,13 +152,14 @@ main():
 | `ls [path]` | 列出目录 |
 | `cd <path>` | 切换工作目录（`chdir`） |
 | `pwd` | 打印当前工作目录（`getcwd`） |
-| `export KEY=VALUE` | 设置环境变量（`setenv`） |
-| `env` | 打印所有环境变量 |
+| `export KEY=VALUE` | 设置环境变量：同时写进内核的每任务环境表（`$NAME` 读它）和 C 库的 `environ`（shell 启动的程序继承它） |
+| `env` | 打印 `environ` 里所有的 `NAME=value`，每行一个 |
+| `wait [PID]` | 等待后台任务（见 3.2a） |
 | `help` | 显示内置命令帮助 |
 
 ### 3.2 外部命令
 
-通过 `spawn`/`fork`+`execve` 启动 ELF；按 `PATH` 解析（默认 `/`）。
+通过 `spawn`/`fork`+`execve` 启动 ELF；按 `PATH` 解析（默认 `/`）。`execve` 把 shell 当前的 `environ` 传给新程序，所以 `export` 过的变量会被继承（含后台任务、嵌套的 `sh -c`）。
 
 ### 3.2a 命令列表与 `sh -c`
 
