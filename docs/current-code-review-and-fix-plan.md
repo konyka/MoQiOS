@@ -6786,3 +6786,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 测试：hello235（QEMU，4 项）；host 测试 `blocking calls that can return EINTR deliver signals on their way out`：对一个按编号写死的清单（33 个号码，含 `read`/`write`/`waitpid`/`wait4`/socket 收发/`poll`/`select`/`ppoll`/`pselect6`/`epoll_pwait`/`nanosleep` 等）断言每个分支都调用了 `checkSignalsOnSyscallReturn`。变异：去掉 148、143、162 三个分支里的调用，都被抓住，文件已恢复。
 - 如实说明：①清单是**手写**的，不是从内核自动推出来的，新增阻塞调用时需要手动加号码；②`connect`(42)、`recvmmsg`(134)、`msgsnd`/`msgrcv`(69/70/157/158)、`mq_timedsend`/`mq_timedreceive`(188/189) 的分支仍然没有调用：`msgrcv` 在这个内核里根本不阻塞（空队列直接 `EAGAIN`，hello235 里我为此把原来的 msgrcv 用例删了，没有留下失败的测试），`connect`、`recvmmsg`、`mq_*` 我没有验证它们被信号打断时的行为，所以没有改；③`futex` 的 `FUTEX_WAIT` 在 Linux 上默认并不是 `SA_RESTART` 可重启的，这里也没有加入可重启表；④Linux 数字 7（poll）在这里是 `brk`，这是已知的编号差异。
 
+## 补充：mq_timed*、recvmmsg、connect，以及 CI 的跨架构 job（hello235 E/F/G）
+
+- 订正：上一节写"`connect`、`recvmmsg`、`mq_timed*` 我没有验证它们被信号打断时的行为，所以没有改"。这一节验证了：三者都有同样的缺陷（返回 `-EINTR` 但处理函数没跑，`r=-4 hits=0`）。
+- 实现：`syscall_entry.zig` 里 `mq_timedsend`/`mq_timedreceive`(188/189)、`recvmmsg`(134)、Linux 号 `connect`(42) 和原生号 `connect`(124) 补上 `checkSignalsOnSyscallReturn(frame)`。`connect` 有两个编号：我先只修了 42，hello235 G 项仍然失败，因为它用的是 124；这说明测试必须覆盖两个编号，host 清单现在两个都有。
+- 测试：hello235 共 7 项（A–G）全过；`mq_timedreceive` 用 `mq_open` 建一个空队列，`recvmmsg` 用 socketpair，`connect` 去 10.0.2.2:80（SLIRP 网关，没有 TCP 服务，握手要重传约两分钟）。host 清单扩到 38 个号码；去掉 124、189 的调用，测试都失败。
+- 如实说明：①`mq_timedsend` 在满队列上被信号打断的情形**没有**QEMU 用例（只靠 host 清单）；②`connect` 用例依赖 SLIRP 的网关地址 10.0.2.2，如果 QEMU 网络配置变了会失效；③`msgsnd`/`msgrcv` 仍没有改：这个内核里它们不阻塞。
+- CI：`smoke-cross-arch` 在 `7dd7e52` 和 `823f1c7` 两次运行里都是 `cancelled`，原因是 `Install cross-architecture QEMU` 步骤里 `apt-get` 从 Ubuntu 镜像下载 `qemu-system-misc`（57 MB）很慢，吃光了 job 的 15 分钟（更早的两次运行同一步骤只要约 1 分钟）。本地我跑了 `zig build -Darch=riscv64 smoke-riscv` 和 `-Darch=aarch64 smoke-aarch64`，都 PASS，所以代码本身没有问题；改了 `.github/workflows/test.yml`：该步骤加 `--no-install-recommends`（`qemu-system-misc` 的推荐依赖是音频/SPICE/Ceph 之类的库），三次尝试、每次 `apt-get` 限时 240 秒、步骤上限 11 分钟。这个改动**没有办法在本地验证**（不是 GitHub runner），要靠下一次 CI 运行确认；我没有 `actionlint`，只用 Python 的 YAML 解析确认语法合法。
+

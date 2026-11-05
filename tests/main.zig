@@ -685,7 +685,7 @@ test "blocking calls that can return EINTR deliver signals on their way out" {
     // checkSignalsOnSyscallReturn after the call. The list is by number (native and Linux aliases) -- add a number here when a new
     // blocking call is wired in.
     const source = kt.syscall_entry_source;
-    const blocking = [_]u64{ 6, 10, 1, 23, 34, 35, 43, 45, 47, 61, 65, 73, 120, 122, 130, 131, 138, 139, 143, 148, 154, 162, 163, 185, 199, 220, 221, 247, 248, 263, 441, 493, 494 };
+    const blocking = [_]u64{ 6, 10, 1, 23, 34, 35, 42, 43, 45, 47, 61, 65, 73, 120, 122, 124, 130, 131, 134, 138, 139, 143, 148, 154, 162, 163, 185, 188, 189, 199, 220, 221, 247, 248, 263, 441, 493, 494 };
     for (blocking) |nr| {
         var needle_buf: [32]u8 = undefined;
         const needle = try std.fmt.bufPrint(&needle_buf, "\n        {d} => ", .{nr});

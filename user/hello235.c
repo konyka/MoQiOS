@@ -113,6 +113,70 @@ int main(int argc, char **argv, char **envp) {
     }
     waitpid(kid, (int *)0, 0);
 
+    /* mq_timedreceive on an empty queue with no timeout */
+    long mq = syscall4(186 /* mq_open */, (long)"/h235-q", 02 /* O_RDWR */ | 0x40 /* O_CREAT */, 0600, 0);
+    if (mq >= 0) {
+        char mbuf[8192];
+        hits = 0;
+        kid = spawn_signaller(me);
+        r = syscall5(189 /* mq_timedreceive */, mq, (long)mbuf, sizeof mbuf, 0, 0);
+        char what[140];
+        snprintf(what, sizeof what, "E: mq_timedreceive on an empty queue is interrupted and the handler had run (r=%ld hits=%d)", r, (int)hits);
+        check(r == -EINTR && hits == 1, what);
+        waitpid(kid, (int *)0, 0);
+        syscall1(187 /* mq_unlink */, (long)"/h235-q");
+    } else {
+        char what[100];
+        snprintf(what, sizeof what, "E: mq_open failed (%ld)", mq);
+        check(0, what);
+    }
+
+    /* recvmmsg on an AF_UNIX stream socketpair with nothing to read (blocking, no timeout) */
+    int sv[2];
+    if (syscall4(128 /* socketpair */, 1, 1, 0, (long)sv) == 0) {
+        struct { void *base; unsigned long len; } iov1;
+        char rb[16];
+        iov1.base = rb;
+        iov1.len = sizeof rb;
+        struct {
+            void *name; unsigned int namelen, pad0; void *iov; unsigned long iovlen; void *ctl; unsigned long ctllen;
+            unsigned int flags, pad1; unsigned int len, pad;
+        } mm;
+        memset(&mm, 0, sizeof mm);
+        mm.iov = &iov1;
+        mm.iovlen = 1;
+        hits = 0;
+        kid = spawn_signaller(me);
+        r = syscall5(134 /* recvmmsg */, sv[0], (long)&mm, 1, 0, 0);
+        char what[140];
+        snprintf(what, sizeof what, "F: recvmmsg with nothing to read is interrupted and the handler had run (r=%ld hits=%d)", r, (int)hits);
+        check(r == -EINTR && hits == 1, what);
+        waitpid(kid, (int *)0, 0);
+        close(sv[0]);
+        close(sv[1]);
+    } else {
+        check(0, "F: socketpair failed");
+    }
+
+    /* connect() to 10.0.2.2:80, the SLIRP gateway, which has no TCP service: the blocking handshake is retransmitted for about two
+     * minutes (see hello27), so a handler's signal arrives while connect waits. */
+    {
+        long cs = syscall3(117 /* socket */, 2 /* AF_INET */, 1 /* SOCK_STREAM */, 0);
+        if (cs >= 0) {
+            unsigned char sa[16] = { 2, 0, 0, 80, 10, 0, 2, 2, 0 };
+            hits = 0;
+            kid = spawn_signaller(me);
+            r = syscall3(124 /* connect */, cs, (long)sa, 16);
+            char what[140];
+            snprintf(what, sizeof what, "G: a blocking connect that cannot complete is interrupted and the handler had run (r=%ld hits=%d)", r, (int)hits);
+            check(r == -EINTR && hits == 1, what);
+            waitpid(kid, (int *)0, 0);
+            close((int)cs);
+        } else {
+            check(0, "G: socket failed");
+        }
+    }
+
     print(failures == 0 ? "hello235: PASS\n" : "hello235: FAIL\n");
     return failures;
 }

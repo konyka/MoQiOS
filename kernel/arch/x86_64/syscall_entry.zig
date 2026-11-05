@@ -640,6 +640,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         124 => {
             syscallConnect(frame);
+            checkSignalsOnSyscallReturn(frame);
         },
         228 => {
             syscallClock_gettime(frame);
@@ -677,6 +678,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         134 => { // recvmmsg(sockfd, msgvec, vlen, flags, timeout)
             frame.rax = @bitCast(socket_mod.recvmmsg(@truncate(frame.rdi), frame.rsi, frame.rdx, @truncate(frame.r10), frame.r8));
+            checkSignalsOnSyscallReturn(frame);
         },
         135 => { // sendmmsg(sockfd, msgvec, vlen, flags)
             frame.rax = @bitCast(socket_mod.sendmmsg(@truncate(frame.rdi), frame.rsi, frame.rdx, @truncate(frame.r10)));
@@ -1045,9 +1047,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         188 => { // mq_timedsend(mqd, msg_ptr, msg_len, msg_prio, abs_timeout)
             frame.rax = @bitCast(mq_mod.mqTimedSend(@truncate(frame.rdi), frame.rsi, frame.rdx, @truncate(frame.r10), frame.r8));
+            checkSignalsOnSyscallReturn(frame);
         },
         189 => { // mq_timedreceive(mqd, msg_ptr, msg_len, msg_prio, abs_timeout)
             frame.rax = @bitCast(mq_mod.mqTimedReceive(@truncate(frame.rdi), frame.rsi, frame.rdx, frame.r10, frame.r8));
+            checkSignalsOnSyscallReturn(frame);
         },
         190 => { // mq_notify(mqd, notification)
             frame.rax = @bitCast(mq_mod.mqNotify(@truncate(frame.rdi), frame.rsi));
@@ -1719,6 +1723,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         42 => { // connect(fd, addr, addrlen)
             frame.rax = @bitCast(socket_mod.connect(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
+            checkSignalsOnSyscallReturn(frame);
         },
         43 => { // accept(fd, addr, addrlen)
             frame.rax = @bitCast(socket_mod.accept(@truncate(frame.rdi), frame.rsi, frame.rdx));
