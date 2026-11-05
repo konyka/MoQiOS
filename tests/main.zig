@@ -9815,6 +9815,17 @@ test "TCP delivery-rate samples: only bulk, recent acknowledgements measure the 
     try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "if (tcp_util.deliverySampleUsable(delivered, mssForTcb(tcb), elapsed)) {") != null);
 }
 
+test "a pipe dup2'd onto stdin/stdout/stderr is released by close() and at exit, so its reader sees EOF" {
+    const vfs = kt.vfs_source;
+    // close(0..2) is a no-op only while the slot still holds the console; once dup2 put something else there it is a real close.
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "if (fd <= FD_STDERR and self.fds[fd].fd_type == .special) return 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "        if (fd <= FD_STDERR) return 0;\n") == null);
+    // Both exit paths walk the whole table, not just fd 3 and up.
+    const ts = kt.task_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "var fd: u32 = 3;") == null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ts, "var fd: u32 = 0;\n"));
+}
+
 test "TCP pacing never drops below one congestion window per RTT, so a collapsed delivery-rate estimate cannot lock the sender" {
     const tu = kt.tcp_util;
     // The stuck state seen in hello174: a 5.5 kB/s estimate, a two-segment window, ~100 ms RTT (delayed ACKs).

@@ -1081,7 +1081,7 @@ pub fn exitTask(exit_code: i32) void {
     {
         const vfs = @import("../fs/vfs.zig");
         if (vfs.releaseFdTable(t.fd_table)) {
-            var fd: u32 = 3;
+            var fd: u32 = 0;
             while (fd < vfs.MAX_FDS) : (fd += 1) {
                 if (t.fd_table.fds[fd].fd_type != .none) {
                     _ = t.fd_table.close(fd);
@@ -1401,7 +1401,7 @@ pub fn abortUnpublishedChild(slot: u32) bool {
     {
         const vfs = @import("../fs/vfs.zig");
         if (vfs.releaseFdTable(t.fd_table)) {
-            var fd: u32 = 3;
+            var fd: u32 = 0;
             while (fd < vfs.MAX_FDS) : (fd += 1) {
                 if (t.fd_table.fds[fd].fd_type != .none) _ = t.fd_table.close(fd);
             }

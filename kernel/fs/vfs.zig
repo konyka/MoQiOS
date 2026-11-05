@@ -1811,7 +1811,7 @@ pub const FdTable = struct {
             // POSIX mq descriptors live outside the per-task table (300+).
             return @import("../ipc/posix_mq.zig").mqClose(fd);
         }
-        if (fd <= FD_STDERR) return 0;
+        if (fd <= FD_STDERR and self.fds[fd].fd_type == .special) return 0;
         const flags = self.slot_locks[fd].acquire();
         const state = @atomicLoad(u32, &self.transfer_state[fd], .acquire);
         if (slotLifecycle(state) != SLOT_LIVE) {
