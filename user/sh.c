@@ -64,6 +64,16 @@ static void out_str(const char *s) {
  * control byte 1..7 typed on the line is indistinguishable from a protected character. */
 static const char PROTECTED_CHARS[] = " \t;&|><";
 
+/* A '$' inside quotes is written as this byte, so that expand_vars() knows the variable's value has to be protected too and the
+ * value of "$X" stays one word whatever it holds. */
+#define QUOTED_DOLLAR '\010'
+
+static char protect_char(char ch) {
+    for (const char *c = PROTECTED_CHARS; *c; c++)
+        if (*c == ch) return (char)(1 + (c - PROTECTED_CHARS));
+    return ch;
+}
+
 static void protect_quotes(char *line) {
     char *w = line;
     char quote = 0;
@@ -73,10 +83,7 @@ static void protect_quotes(char *line) {
                 quote = 0;
                 continue;
             }
-            const char *hit = (const char *)0;
-            for (const char *c = PROTECTED_CHARS; *c; c++)
-                if (*c == *r) hit = c;
-            *w++ = hit ? (char)(1 + (hit - PROTECTED_CHARS)) : *r;
+            *w++ = *r == '$' ? QUOTED_DOLLAR : protect_char(*r);
         } else if (*r == '"' || *r == '\'') {
             quote = *r;
         } else {
@@ -114,10 +121,25 @@ static const char *copy_token(char *dst, int max, const char *src) {
     return src;
 }
 
+/* Exit code of the last command that ran, for "$?": the code for a normal exit, 128 + signal for a command killed by one. */
+static int g_last_code;
+
+static void set_last_code(int status) {
+    if (status < 0) g_last_code = 1;
+    else if (status & 0x7f) g_last_code = 128 + (status & 0x7f);
+    else g_last_code = (status >> 8) & 0xff;
+}
+
 static int expand_vars(const char *src, char *dst, int max) {
     int si = 0, di = 0;
     while (src[si] && di < max - 1) {
-        if (src[si] == '$') {
+        if ((src[si] == '$' || src[si] == QUOTED_DOLLAR) && src[si + 1] == '?') {
+            si += 2;
+            char num[8];
+            int n = snprintf(num, sizeof(num), "%d", g_last_code);
+            for (int v = 0; v < n && di < max - 1; v++) dst[di++] = num[v];
+        } else if (src[si] == '$' || src[si] == QUOTED_DOLLAR) {
+            int quoted = src[si] == QUOTED_DOLLAR;
             si++;
             char key[64];
             int ki = 0;
@@ -133,7 +155,7 @@ static int expand_vars(const char *src, char *dst, int max) {
                 long vlen = moqi_getenv(key, val, sizeof(val));
                 if (vlen >= 0) {
                     for (int v = 0; v < vlen && di < max - 1; v++) {
-                        dst[di++] = val[v];
+                        dst[di++] = quoted ? protect_char(val[v]) : val[v];
                     }
                 }
             }
@@ -462,8 +484,9 @@ static int status_ok(int status) {
 
 /* Run a command list: pipelines joined by ';' (always run the next), '&&' (run it only after success) and '||' (only after
  * failure). Evaluated left to right with no precedence and no grouping, as the shell's other syntax is just as plain. The
- * status is that of the last pipeline that ran, in the same encoding execute_pipeline returns. A separator inside a word is not
- * looked for (there is no quoting), and an empty element between separators counts as success. */
+ * status is that of the last pipeline that ran, in the same encoding execute_pipeline returns. The line has been through
+ * protect_quotes(), so a quoted separator is not seen here. Each element is variable-expanded just before it runs (so "$?" and a
+ * variable exported earlier in the same line are current); an empty element between separators counts as success. */
 static int execute_list(const char *line) {
     char elem[256];
     int status = 0;
@@ -476,8 +499,14 @@ static int execute_list(const char *line) {
         elem[n] = '\0';
         if (run_next) {
             const char *e = skip_spaces(elem);
-            if (*e) status = execute_pipeline(e);
-            else status = 0;
+            if (*e) {
+                char expanded[256];
+                expand_vars(e, expanded, sizeof(expanded));
+                status = execute_pipeline(expanded);
+            } else {
+                status = 0;
+            }
+            set_last_code(status);
         }
         if (*p == '\0') break;
         if (*p == ';') {
@@ -502,10 +531,10 @@ int main(int argc, char **argv, char **envp) {
      * the C library starts the shell like this. */
     if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
         g_command_mode = 1;
-        char expanded[256];
-        expand_vars(argv[2], expanded, sizeof(expanded));
-        protect_quotes(expanded);
-        int status = execute_list(expanded);
+        char quoted[256];
+        snprintf(quoted, sizeof(quoted), "%s", argv[2]);
+        protect_quotes(quoted);
+        int status = execute_list(quoted);
         if (status < 0) return 1;
         int sig = status & 0x7f;
         return sig ? 128 + sig : (status >> 8) & 0xff;
@@ -523,10 +552,7 @@ int main(int argc, char **argv, char **envp) {
         if (len < 0) continue;
         if (len == 0) continue;
 
-        char expanded[256];
-        expand_vars(line, expanded, sizeof(expanded));
-        protect_quotes(expanded);
-
-        execute_list(expanded);
+        protect_quotes(line);
+        execute_list(line);
     }
 }

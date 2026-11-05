@@ -86,6 +86,36 @@ int main(int argc, char **argv, char **envp) {
     st = system("echo \"unterminated");
     check(exited(st, 0), "B: an unterminated quote runs to the end of the line");
 
+    /* B4: "$?" is the exit status of the command that ran before it in the line (0 before any command has run). It is replaced
+     * when its list element is about to run, not when the line is read. */
+    st = system("hello11 ; exit $?");
+    check(exited(st, 42), "B: $? is the exit status of the previous command (42)");
+    st = system("exit $?");
+    check(exited(st, 0), "B: $? is 0 before any command has run");
+    st = system("hello11 ; cd /tmp ; exit $?");
+    check(exited(st, 0), "B: $? follows the latest command (a successful cd resets it to 0)");
+    st = system("hello11 || exit $?");
+    check(exited(st, 42), "B: $? works as the argument after '||'");
+    st = system("hello11 && exit 1 ; exit $?");
+    check(exited(st, 42), "B: a skipped command leaves $? as it was");
+    unlink("/tmp/h227_q");
+    st = system("hello11 ; echo \"s=$?\" > /tmp/h227_q");
+    f = fopen("/tmp/h227_q", "r");
+    memset(qb, 0, sizeof qb);
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 0) && strcmp(qb, "s=42\n") == 0, "B: $? inside double quotes is replaced in place");
+    st = system("export H227V=5 ; exit $H227V");
+    check(exited(st, 5), "B: a variable exported earlier in the same line is expanded for the next command");
+    unlink("/tmp/h227_q");
+    st = system("export H227W=a b ; echo \"$H227W\" > /tmp/h227_q");
+    f = fopen("/tmp/h227_q", "r");
+    memset(qb, 0, sizeof qb);
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 0) && strcmp(qb, "a b\n") == 0, "B: a quoted variable whose value has a space stays one word");
+    unlink("/tmp/h227_q");
+    st = system("nosuchprogram_zz ; exit $?");
+    check(exited(st, 127), "B: $? after a missing program is 127");
+
     /* C: the caller's signal state is exactly what it was */
     struct ksigaction a = { on_int, 0, 0, 0 };
     sigaction(SIGINT, &a, (struct ksigaction *)0);
