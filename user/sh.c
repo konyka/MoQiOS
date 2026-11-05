@@ -415,11 +415,14 @@ static int execute_pipeline(const char *line) {
                 job_remove(target);
                 return st;
             }
-            while (g_njobs > 0) {
+            /* Every child of the shell is a background job here (a foreground command has already been waited for by its own pid), so
+             * wait with pid -1 until none is left. The job table has room for 16 and must not decide which jobs are waited for: a
+             * job that did not fit would otherwise be left running while "wait" returns. */
+            for (;;) {
                 int st = 0;
-                waitpid(g_jobs[0], &st, 0);
-                job_remove(g_jobs[0]);
+                if (waitpid(-1, &st, 0) <= 0) break;
             }
+            g_njobs = 0;
             return 0;
         }
         if (strcmp(cmd, "exit") == 0) {

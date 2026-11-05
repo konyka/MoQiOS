@@ -491,6 +491,29 @@ int main(int argc, char **argv, char **envp) {
     unlink("/tmp/h227_file");
     unlink("/tmp/h227_fout");
 
+    /* B17: a bare "wait" waits for every background job, including the ones that did not fit in the shell's job table (16 entries).
+     * The script is a file because the command line given to "sh -c" is limited to 127 bytes, and all the jobs are on ONE line: the
+     * shell reaps finished jobs between lines, which would keep the table from ever filling. Sixteen quick jobs fill the table; the
+     * two jobs after them are not in it. They are made much slower than the sixteen (each sleeps ~300 ms, while the quick ones take
+     * a few ms), so that waiting for the table's jobs alone cannot, by itself, take long enough for them to finish. */
+    unlink("/tmp/h227_jobs");
+    f = fopen("/tmp/h227_jobscript", "w");
+    if (f) {
+        for (int i = 0; i < 16; i++) fputs("hello11&", f);
+        fputs("sh -c \"hello233;echo x>>/tmp/h227_jobs\"&", f);
+        fputs("sh -c \"hello233;echo x>>/tmp/h227_jobs\"&", f);
+        fputs("\nwait\necho y>>/tmp/h227_jobs\n", f);
+        fclose(f);
+    }
+    st = system("sh /tmp/h227_jobscript");
+    char jb2[16] = { 0 };
+    f = fopen("/tmp/h227_jobs", "r");
+    if (f) { fread(jb2, 1, 15, f); fclose(f); }
+    check(exited(st, 0), "B: a script with 18 background jobs on one line and a bare 'wait' ends with status 0");
+    check(strcmp(jb2, "x\nx\ny\n") == 0, "B: and 'wait' returned only after both slow jobs outside the table were done (their lines come before the line after 'wait')");
+    unlink("/tmp/h227_jobscript");
+    unlink("/tmp/h227_jobs");
+
     /* C: the caller's signal state is exactly what it was */
     struct ksigaction a = { on_int, 0, 0, 0 };
     sigaction(SIGINT, &a, (struct ksigaction *)0);
