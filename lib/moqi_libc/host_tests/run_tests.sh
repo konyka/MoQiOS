@@ -153,6 +153,13 @@ $CC $CFLAGS $DE_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/dirent.c -o "$OUT/dire
 $CC $CFLAGS $DE_RENAME -o "$OUT/test_dirent_abi" test_dirent_abi.c "$OUT/dirent.o"
 "$OUT/test_dirent_abi" || fail=1
 
+echo "== test_system_abi =="
+SY_RENAME="-Dsystem=moqi_system -D_exit=moqi__exit -Dsigaction=moqi_sigaction -Dsigprocmask=moqi_sigprocmask -Dsignal=moqi_signal -Draise=moqi_raise -Dabort=moqi_abort -Dsigemptyset=moqi_sigemptyset -Dsigfillset=moqi_sigfillset -Dsigaddset=moqi_sigaddset -Dsigdelset=moqi_sigdelset -Dsigismember=moqi_sigismember -Dsigpending=moqi_sigpending -Dsigsuspend=moqi_sigsuspend"
+$CC $CFLAGS $SY_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/system.c -o "$OUT/system.o"
+$CC $CFLAGS $SY_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/signal.c -o "$OUT/signal_sy.o"
+$CC $CFLAGS $SY_RENAME -o "$OUT/test_system_abi" test_system_abi.c "$OUT/system.o" "$OUT/signal_sy.o"
+"$OUT/test_system_abi" || fail=1
+
 echo "== test_ctype_abi =="
 $CC $CFLAGS -o "$OUT/test_ctype_abi" test_ctype_abi.c
 "$OUT/test_ctype_abi" || fail=1

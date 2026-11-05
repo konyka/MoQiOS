@@ -43,6 +43,11 @@ void *memalign(size_t align, size_t size);
  * once: no registered function, no flush. Returning from main is exit(). The registered functions are shared by all
  * threads, and the list is locked; a function must not be registered from a signal handler. abort and raise are in signal.h. */
 int atexit(void (*fn)(void));
+/* system(command) runs "sh -c command" in a child and returns its wait status (decode it with the usual bit layout: exit code in
+ * bits 8..15, terminating signal in bits 0..6); -1 with errno if the child cannot be created or waited for, and a status of exit
+ * code 127 if the shell cannot be started. system(NULL) is non-zero: a shell exists. While the command runs the caller ignores
+ * SIGINT and SIGQUIT and blocks SIGCHLD, restored afterwards. */
+int system(const char *command);
 void exit(int code) __attribute__((noreturn));
 void _Exit(int code) __attribute__((noreturn));
 

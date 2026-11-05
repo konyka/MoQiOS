@@ -6544,3 +6544,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - `opendir`/`readdir`/`closedir`/`rewinddir`/`telldir`/`seekdir`/`dirfd`，布局与行为按 glibc 2.43 实测：`struct dirent` 280 字节（`d_ino`@0、`d_off`@8、`d_reclen`@16、`d_type`@18、`d_name`@19），流用一块 4096 字节缓冲装 `getdents64` 记录，所有 `readdir` 结果共用流里同一块存储，目录以 close-on-exec 打开，到末尾返回 NULL 且不动 `errno`，`opendir("")` 与缺失路径为 `ENOENT`，普通文件为 `ENOTDIR`。内核的 `open()` 对任何文件都成功，所以 `opendir` 打开后用 `fstat` 的 `st_mode` 判断是不是目录，不是就关掉描述符并报 `ENOTDIR`（不泄漏 fd，host 测试断言了这一点）。
 - 测试：`host_tests/test_dirent_abi.c` 用记录桩模拟内核的 `getdents64`（含小缓冲多次调用、失败后恢复、超长名截断到 255、`closedir` 传递关闭错误并仍释放）；变异验证试了 14 个：第一轮存活的 `rewinddir` 不丢弃缓冲余量一项补了"读一条后 rewind 再读"的断言后被杀；另有 1 个语义等价的改写（`!= S_IFDIR_ + (mode & 0)`）自然存活，不算缺口。QEMU 侧由 `hello226` 的 I 组覆盖。
 - 如实说明：`seekdir` 依赖内核的目录游标：tmpfs/ext2 的 `d_off` 是可恢复的 cookie，rofs（ext4/NTFS）目录只接受 `lseek(fd, 0, SEEK_SET)`，其它位置 `EINVAL`（`seekdir` 无返回值，调用方看不到）；没有 `scandir`/`alphasort`、`readdir_r`、`fdopendir`。
+
+## moqi_libc：system() 与 shell 的 `-c` 模式（hello227）
+
+- 缺口：libc 没有 `system()`，而 `sh` 只有交互模式（`argv` 被忽略），`exit N` 也不认参数（一律 `bye` + 退出码 0），所以连 `sh -c` 的前提都不具备。
+- 先量 glibc 2.43：`system(NULL)` 非零；`exit 3` 得到 wait 状态 768；被信号杀死是 `WIFSIGNALED`；找不到命令是退出码 127；调用期间父进程忽略 SIGINT/SIGQUIT 并阻塞 SIGCHLD，调用后处理函数与掩码原样恢复；子进程拿回原来的处理函数和掩码。
+- 实现：`src/system.c`（host 测试 `test_system_abi.c` 用记录桩验证：块 SIGCHLD → 忽略 INT/QUIT → fork，父进程等待（EINTR 重试）后按"恢复掩码与处理函数"收尾，子进程先恢复再 `execve("sh", {"sh","-c",cmd})`，失败 `_exit(127)`，fork 失败返回 -1 并恢复信号状态，wait 失败为 -1 加 errno；9 个变异全部被杀）。`user/sh.c` 新增 `-c` 模式：展开变量、执行一行、不打印提示或 `bye`，以命令的退出码结束（被信号杀死则 128+信号）；`exit N` 现在按 N 退出（低 8 位）。`errno.h` 补 `ECHILD`。
+- QEMU：`hello227`——`exit 3`→3、`exit`→0、`hello11`→42、缺失命令→127、重定向到 `/tmp` 文件、调用前后 SIGINT 处理函数与信号掩码不变、连续 8 次调用各返回各自的状态。
+- 如实说明：shell 的 `exit` 解析是最朴素的十进制；`sh -c` 沿用交互 shell 的语法（管道、`>` 重定向、几个内建命令），没有 `&&`/`;`/引号；`system()` 的命令长度受 shell 的 256 字节行缓冲限制（更长被截断）。

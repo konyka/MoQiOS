@@ -6,6 +6,9 @@
 
 #define CTRL_C  0x03
 
+/* Set by "sh -c": no prompt, no farewell. */
+static int g_command_mode;
+
 /* Utility functions */
 
 /* Read a line from stdin with basic line editing */
@@ -43,6 +46,14 @@ static int read_line(char *buf, int max) {
     }
     buf[pos] = '\0';
     return pos;
+}
+
+/* Where a built-in writes: standard output, or the file of a "> file" on its command line. */
+static int g_out_fd = STDOUT_FILENO;
+static void out_str(const char *s) {
+    size_t n = 0;
+    while (s[n]) n++;
+    write(g_out_fd, s, n);
 }
 
 /* Skip leading whitespace */
@@ -196,32 +207,68 @@ static int execute_pipeline(const char *line) {
         r++;
     }
 
+    /* "cmd args > file": the text before '>' is the command, the file is not one of its arguments. The fork-and-exec path stops
+     * each command at '>' by itself (copy_token), but a built-in reads the raw text, so cut it here for them. */
+    char single[256];
+    if (ncmds == 1) {
+        int n = 0;
+        while (cmds[0][n] && cmds[0][n] != '>' && n < (int)sizeof(single) - 1) { single[n] = cmds[0][n]; n++; }
+        while (n > 0 && (single[n - 1] == ' ' || single[n - 1] == '\t')) n--;
+        single[n] = '\0';
+        cmds[0] = single;
+    }
+
     if (ncmds == 1) {
         /* Single command — no pipes */
         char cmd[64];
         copy_token(cmd, sizeof(cmd), cmds[0]);
 
+        /* A built-in that writes output has "> file" honoured: it writes to the file instead of the console. */
+        int redirected_fd = -1;
+        if (redir_out && redir_out[0] &&
+            (strcmp(cmd, "pid") == 0 || strcmp(cmd, "help") == 0 || strcmp(cmd, "echo") == 0 || strcmp(cmd, "ls") == 0 ||
+             strcmp(cmd, "pwd") == 0 || strcmp(cmd, "env") == 0)) {
+            long rfd = open(redir_out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (rfd < 0) {
+                print("sh: cannot open ");
+                print(redir_out);
+                print("\n");
+                return 1;
+            }
+            redirected_fd = (int)rfd;
+            g_out_fd = redirected_fd;
+        }
+
         /* Built-in commands */
         if (strcmp(cmd, "exit") == 0) {
-            print("bye\n");
-            _exit(0);
+            /* "exit N" ends the shell with status N (low 8 bits); without a number it is 0. The farewell is only for people. */
+            const char *rest = cmds[0];
+            int idx = 0;
+            while (rest[idx] && rest[idx] != ' ') idx++;
+            while (rest[idx] == ' ') idx++;
+            int code = 0;
+            for (const char *d = rest + idx; *d >= '0' && *d <= '9'; d++) code = (code * 10 + (*d - '0')) & 0xff;
+            if (!g_command_mode) print("bye\n");
+            _exit(code);
         }
         if (strcmp(cmd, "pid") == 0) {
-            printf("%ld\n", getpid());
-            return 0;
+            char num[24];
+            snprintf(num, sizeof(num), "%ld\n", getpid());
+            out_str(num);
+            goto builtin_done;
         }
         if (strcmp(cmd, "help") == 0) {
-            print("Commands: exit, pid, echo, ls, cd, pwd, export, env, help, <program>\n");
-            return 0;
+            out_str("Commands: exit, pid, echo, ls, cd, pwd, export, env, help, <program>\n");
+            goto builtin_done;
         }
         if (strcmp(cmd, "echo") == 0) {
             const char *rest = cmds[0];
             int idx = 0;
             while (rest[idx] && rest[idx] != ' ') idx++;
             while (rest[idx] == ' ') idx++;
-            print(rest + idx);
-            print("\n");
-            return 0;
+            out_str(rest + idx);
+            out_str("\n");
+            goto builtin_done;
         }
         if (strcmp(cmd, "export") == 0) {
             const char *rest = cmds[0];
@@ -234,16 +281,16 @@ static int execute_pipeline(const char *line) {
             return 0;
         }
         if (strcmp(cmd, "env") == 0) {
-            print("(use export VAR=value to set)\n");
-            return 0;
+            out_str("(use export VAR=value to set)\n");
+            goto builtin_done;
         }
         if (strcmp(cmd, "ls") == 0) {
             char lsbuf[4096];
             long n = moqi_listdir(lsbuf, sizeof(lsbuf));
             if (n > 0) {
-                write(STDOUT_FILENO, lsbuf, (size_t)n);
+                write(g_out_fd, lsbuf, (size_t)n);
             }
-            return 0;
+            goto builtin_done;
         }
         if (strcmp(cmd, "cd") == 0) {
             const char *rest = cmds[0];
@@ -264,14 +311,22 @@ static int execute_pipeline(const char *line) {
             memset(buf, 0, sizeof(buf));
             long n = getcwd(buf, sizeof(buf));
             if (n > 0) {
-                print(buf);
-                print("\n");
+                out_str(buf);
+                out_str("\n");
             } else {
                 print("pwd: failed\n");
             }
-            return 0;
+            goto builtin_done;
         }
 
+        goto not_builtin;
+builtin_done:
+        if (redirected_fd >= 0) {
+            close(redirected_fd);
+            g_out_fd = STDOUT_FILENO;
+        }
+        return 0;
+not_builtin:;
         /* Fork and exec */
         long pid = fork();
         if (pid < 0) {
@@ -354,7 +409,21 @@ static int execute_pipeline(const char *line) {
 }
 
 int main(int argc, char **argv, char **envp) {
-    (void)argc; (void)argv; (void)envp;
+    (void)envp;
+
+    /* "sh -c command": run one command line (pipes, redirection and the built-ins work as at the prompt), print nothing of its
+     * own, and end with the command's exit status; a command killed by a signal ends the shell with 128 + signal. system() in
+     * the C library starts the shell like this. */
+    if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
+        g_command_mode = 1;
+        char expanded[256];
+        expand_vars(argv[2], expanded, sizeof(expanded));
+        int status = execute_pipeline(expanded);
+        if (status < 0) return 1;
+        int sig = status & 0x7f;
+        return sig ? 128 + sig : (status >> 8) & 0xff;
+    }
+
     struct ksigaction ign = { SIG_IGN, 0, 0, 0 };
     sigaction(SIGINT, &ign, (void *)0);
 
