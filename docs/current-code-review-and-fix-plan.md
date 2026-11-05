@@ -6664,3 +6664,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 结果：hello227 共 64 项，SMP=1 全过。
 - 如实说明：①内核的 `execve` 最多接收 16 个环境变量、每个最长 127 字节（`prepareExecName` 的缓冲）：第 17 个及以后的被丢弃；某一项超过 127 字节时拷贝失败、循环在那里 `break`，**该项和它后面所有项**都不会传给新程序（这一条是读代码得出的，没有单独的用例）；②没有 `unset`、没有 `export` 不带值的形式（`export X` 把 X 标成导出），也没有 `NAME=value cmd` 的前缀赋值；③内核表和 `environ` 是两份，`export` 同时写两处，但程序自己 `setenv` 只影响 `environ`；④shell 里用 `$NAME` 的优先级是内核表在前、`environ` 在后。
 
+## shell 的 `ls` 接受路径（hello227 B9）
+
+- 缺口：`docs/user-space.md` 的内建命令表写着 `ls [path]` 列出目录，实际的 `ls` 内建完全忽略参数，调用的是 `moqi_listdir`——这个系统调用把内存盘、FAT32 和 ext2 **根目录**的文件名拼在一起，与当前工作目录无关。所以 `cd /tmp ; ls` 列出的仍是根目录，`ls /tmp` 也是根目录。
+- 红灯：hello227 新增 5 项，旧 shell 上 4 项失败（`ls DIR` 只列 DIR 的条目、`cd` 之后 `ls` 列工作目录、不存在的目录状态为 1、`ls FILE` 打印文件名）；"不列 . 和 .."那项旧 shell 本来就过（它根本没列这些），约束力弱。
+- 实现（`user/sh.c`）：`ls` 用 `opendir`/`readdir`，不带参数时打开 `.`；跳过 `.` 和 `..`；不是目录（`ENOTDIR`）就打印给定的名字；其它打开失败打印 `ls: cannot open ...` 并以状态 1 结束；输出仍走 `g_out_fd`，所以 `> file` / `>> file` 照常工作。`moqi_listdir` 系统调用本身保留，没有改。
+- 结果：hello227 共 69 项，SMP=1 全过。
+- 如实说明：①没有 `-l`、`-a`、排序（顺序是文件系统给出的顺序）、通配符；②目录条目很多时按 `readdir` 逐条输出，不再有旧实现的 4096 字节上限；③`ls FILE` 和 `ls DIR` 只在 `/tmp` 下验证过（没有逐个文件系统验证）；④命令词之后的整串文本被当作**一个**路径，不按空格拆分（`ls a b` 会去打开名为 `a b` 的路径）。
+

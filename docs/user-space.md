@@ -149,7 +149,7 @@ main():
 | `exit [code]` | 退出 Shell |
 | `pid` | 打印当前 PID |
 | `echo [args...]` | 回显参数 |
-| `ls [path]` | 列出目录 |
+| `ls [path]` | 列出目录（`opendir`/`readdir`，每行一个名字，不含 `.` 和 `..`）；不带参数列工作目录；`path` 是文件则打印它的名字；打不开则报错并以状态 1 结束 |
 | `cd <path>` | 切换工作目录（`chdir`） |
 | `pwd` | 打印当前工作目录（`getcwd`） |
 | `export KEY=VALUE` | 设置环境变量：同时写进内核的每任务环境表（`$NAME` 读它）和 C 库的 `environ`（shell 启动的程序继承它） |

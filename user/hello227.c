@@ -250,6 +250,40 @@ int main(int argc, char **argv, char **envp) {
     check(exited(st, 0) && strstr(eb, "H231V=listed\n") != (char *)0, "B: 'env' prints the exported variable as NAME=value");
     unlink("/tmp/h227_env");
 
+    /* B9: ls. "ls" lists the working directory, "ls DIR" lists DIR, one name per line, and a directory that cannot be opened is a
+     * message and status 1. A fresh directory is used so that the expected names are exactly known. */
+    unlink("/tmp/h227_d/a.txt");
+    unlink("/tmp/h227_d/b.txt");
+    rmdir("/tmp/h227_d");
+    mkdir("/tmp/h227_d", 0755);
+    f = fopen("/tmp/h227_d/a.txt", "w");
+    if (f) { fputs("A", f); fclose(f); }
+    f = fopen("/tmp/h227_d/b.txt", "w");
+    if (f) { fputs("B", f); fclose(f); }
+    unlink("/tmp/h227_ls");
+    st = system("ls /tmp/h227_d > /tmp/h227_ls");
+    char lb[256] = { 0 };
+    f = fopen("/tmp/h227_ls", "r");
+    if (f) { fread(lb, 1, 255, f); fclose(f); }
+    check(exited(st, 0) && strstr(lb, "a.txt\n") && strstr(lb, "b.txt\n") && !strstr(lb, "hello"), "B: 'ls DIR' lists exactly the entries of DIR, one per line");
+    check(!strstr(lb, ".\n") && !strstr(lb, "..\n"), "B: and does not list '.' or '..'");
+    memset(lb, 0, sizeof lb);
+    st = system("cd /tmp/h227_d ; ls > /tmp/h227_ls");
+    f = fopen("/tmp/h227_ls", "r");
+    if (f) { fread(lb, 1, 255, f); fclose(f); }
+    check(exited(st, 0) && strstr(lb, "a.txt\n") && strstr(lb, "b.txt\n") && !strstr(lb, "hello"), "B: 'ls' without an argument lists the working directory");
+    st = system("ls /tmp/h227_no_such_dir");
+    check(exited(st, 1), "B: 'ls' of a directory that does not exist is status 1");
+    st = system("ls /tmp/h227_d/a.txt > /tmp/h227_ls");
+    memset(lb, 0, sizeof lb);
+    f = fopen("/tmp/h227_ls", "r");
+    if (f) { fread(lb, 1, 255, f); fclose(f); }
+    check(exited(st, 0) && strcmp(lb, "/tmp/h227_d/a.txt\n") == 0, "B: 'ls FILE' prints the file's name");
+    unlink("/tmp/h227_d/a.txt");
+    unlink("/tmp/h227_d/b.txt");
+    rmdir("/tmp/h227_d");
+    unlink("/tmp/h227_ls");
+
     /* C: the caller's signal state is exactly what it was */
     struct ksigaction a = { on_int, 0, 0, 0 };
     sigaction(SIGINT, &a, (struct ksigaction *)0);

@@ -3,6 +3,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <dirent.h>
+#include <errno.h>
 
 #define CTRL_C  0x03
 
@@ -465,12 +467,39 @@ static int execute_pipeline(const char *line) {
             goto builtin_done;
         }
         if (strcmp(cmd, "ls") == 0) {
-            char lsbuf[4096];
-            long n = moqi_listdir(lsbuf, sizeof(lsbuf));
-            if (n > 0) {
-                write(g_out_fd, lsbuf, (size_t)n);
+            /* "ls" lists the working directory and "ls PATH" lists PATH, one name per line ("." and ".." left out). A path that is
+             * not a directory is printed as it was given when it exists; one that cannot be opened is a message and status 1. */
+            const char *rest = cmds[0];
+            int idx = 0;
+            while (rest[idx] && rest[idx] != ' ') idx++;
+            while (rest[idx] == ' ') idx++;
+            char target[256];
+            if (rest[idx]) unprotect(target, rest + idx, sizeof(target));
+            else { target[0] = '.'; target[1] = '\0'; }
+            DIR *d = opendir(target);
+            int ls_status = 0;
+            if (d) {
+                struct dirent *ent;
+                while ((ent = readdir(d)) != (struct dirent *)0) {
+                    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+                    out_str(ent->d_name);
+                    out_str("\n");
+                }
+                closedir(d);
+            } else if (errno == ENOTDIR) {
+                out_str(target);
+                out_str("\n");
+            } else {
+                print("ls: cannot open ");
+                print(target);
+                print("\n");
+                ls_status = 1;
             }
-            goto builtin_done;
+            if (redirected_fd >= 0) {
+                close(redirected_fd);
+                g_out_fd = STDOUT_FILENO;
+            }
+            return ls_status ? (1 << 8) : 0;
         }
         if (strcmp(cmd, "cd") == 0) {
             const char *rest = cmds[0];
