@@ -234,6 +234,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello235 | 被信号打断的阻塞调用在返回 `-EINTR` **之前**已经运行了处理函数：`epoll_wait`、`futex(FUTEX_WAIT)`、SysV `semop`、`rt_sigtimedwait`、`mq_timedreceive`、`recvmmsg`、`connect` |
 | hello236 | `epoll_*` 的 libc 封装在真内核上：packed 布局、`ADD`/`MOD`/`DEL`、`EEXIST`/`ENOENT`、超时、水平触发、数据字原样返回、写端关闭后的 `EPOLLHUP`、`EBADF`/`EINVAL` |
 | hello237 | TCP 套接字上的 epoll（回环，靠 `netpoll` 推进）：`EPOLLET` 只报新边沿；正常 FIN 关闭给 `EPOLLIN\|EPOLLRDHUP`（`0x2001`）；对端关闭时带着未读数据（RST）给 `0x2019` |
+| hello238 | `pselect` 与 `epoll_pwait` 的 libc 封装在真内核上：超时、`timespec` 不被改写、就绪管道；信号被阻塞且待处理时，空的临时掩码让处理函数先运行、调用以 `EINTR` 失败、旧掩码恢复；掩码为 NULL 时阻塞的信号不打断等待 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。
@@ -265,8 +266,8 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | `src/malloc.c` | 分配器核心（无 syscall；经弱符号 `__moqi_heap_grow` 扩容） |
 | `src/sbrk.c` | 强符号 `__moqi_heap_grow`，基于 brk 实现 |
 | `src/unistd.c` `src/stdio.c` `src/stdlib.c` | 薄 syscall 封装、fd 1 输出与 getenv（仅 freestanding） |
-| `include/epoll.h` `src/epoll.c` | `epoll_create1`/`epoll_ctl`/`epoll_wait`：`struct epoll_event` 是 **packed 的 12 字节**（`events` 偏移 0、8 字节 `data` 联合偏移 4），`EPOLLIN`…`EPOLLET` 等位与 glibc 一致；成功返回内核值，失败 -1 加 errno。没有 `epoll_create`、`epoll_pwait`、`epoll_pwait2` 的封装 |
-| `include/select.h` `src/select.c` | `select`、`fd_set`（128 字节，`FD_SETSIZE` 1024）和 `FD_ZERO/FD_SET/FD_CLR/FD_ISSET`，布局与 glibc 一致（`FD_SET(3)` 使第 0 个 64 位字等于 0x8）；失败 -1 加 errno，超时 0；内核把剩余时间写回非空的 `timeval`。宏不检查描述符是否小于 `FD_SETSIZE` |
+| `include/epoll.h` `src/epoll.c` | `epoll_create1`/`epoll_ctl`/`epoll_wait`/`epoll_pwait`：`struct epoll_event` 是 **packed 的 12 字节**（`events` 偏移 0、8 字节 `data` 联合偏移 4），`EPOLLIN`…`EPOLLET` 等位与 glibc 一致；成功返回内核值，失败 -1 加 errno。`epoll_pwait` 多一个信号掩码参数（`const void *`，实际是 `sigset_t *`，只用前 64 位，NULL 表示不换掩码；传给内核的大小固定 8，无掩码时 0）。没有 `epoll_create`、`epoll_pwait2` 的封装 |
+| `include/select.h` `src/select.c` | `select`、`pselect`、`fd_set`（128 字节，`FD_SETSIZE` 1024）和 `FD_ZERO/FD_SET/FD_CLR/FD_ISSET`，布局与 glibc 一致（`FD_SET(3)` 使第 0 个 64 位字等于 0x8）；失败 -1 加 errno，超时 0；内核把剩余时间写回非空的 `timeval`。宏不检查描述符是否小于 `FD_SETSIZE`。`pselect` 的超时是 `const struct timespec *`（NULL 永久等待）加一个可选信号掩码；库把超时拷到局部变量再交给内核，所以调用者的 `timespec` 不会被改写（与 glibc 的包装一致），掩码在等待期间替换阻塞集、返回前恢复 |
 | `include/poll.h` `src/poll.c` | `poll`/`ppoll`：glibc 的 `struct pollfd`（8 字节）和事件位；`poll` 返回就绪描述符个数、超时 0、失败 -1 加 errno（被信号处理函数打断是 `EINTR`）；`ppoll` 的信号掩码大小固定传 8（掩码为 NULL 时传 0）。`select()` 见 `select.h` |
 | `include/errno.h` `time.h` `mman.h` `resource.h` `netdb.h` `byteorder.h` `setjmp.h` `pthread.h` `math.h` `getopt.h` `dirent.h` | 对应的 libc 头文件：`errno`（每线程）、`clock_gettime`/`nanosleep`/`strftime` 等、`mmap` 家族、`getrlimit`/`setrlimit`、`gethostbyname`/`getaddrinfo`（仅 IPv4）、`htons` 家族、`setjmp` 家族（仅 x86-64）、pthread 子集、`<math.h>` 里结果有精确定义的部分 |
 | `src/env.c` | `setenv/unsetenv/putenv/clearenv`（第一次修改时把初始栈上的 envp 拷进自己持有的 malloc 数组，被替换的旧字符串和旧数组不释放，因为 `getenv` 不加锁遍历） |

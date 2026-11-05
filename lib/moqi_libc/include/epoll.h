@@ -6,8 +6,10 @@
  *
  * Every function returns the kernel's value on success (epoll_create1: the new descriptor, epoll_ctl: 0, epoll_wait: the number of
  * events written, 0 on timeout) and -1 with errno on failure (EINTR when a signal handler ran during epoll_wait, EBADF, EEXIST,
- * ENOENT, EINVAL, ...). epoll_wait's timeout is in milliseconds, negative = forever. There is no epoll_create, epoll_pwait or
- * epoll_pwait2 wrapper.
+ * ENOENT, EINVAL, ...). epoll_wait's timeout is in milliseconds, negative = forever. epoll_pwait is epoll_wait with an optional
+ * signal mask (a sigset_t *, only its first 64 bits are used; NULL = none) that replaces the blocked set for the duration of the
+ * wait and is restored before it returns; a signal it unblocks runs its handler and the call fails with EINTR. There is no
+ * epoll_create or epoll_pwait2 wrapper.
  */
 #ifndef MOQI_EPOLL_H
 #define MOQI_EPOLL_H
@@ -46,5 +48,6 @@ struct epoll_event {
 int epoll_create1(int flags);
 int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
 int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout);
+int epoll_pwait(int epfd, struct epoll_event *events, int maxevents, int timeout, const void *sigmask);
 
 #endif

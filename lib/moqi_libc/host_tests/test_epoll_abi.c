@@ -17,6 +17,7 @@
 #define epoll_create1 moqi_epoll_create1_decl
 #define epoll_ctl moqi_epoll_ctl_decl
 #define epoll_wait moqi_epoll_wait_decl
+#define epoll_pwait moqi_epoll_pwait_decl
 #include "../include/epoll.h"
 #undef epoll_event
 #undef epoll_data
@@ -24,10 +25,12 @@
 #undef epoll_create1
 #undef epoll_ctl
 #undef epoll_wait
+#undef epoll_pwait
 
 int moqi_epoll_create1(int flags);
 int moqi_epoll_ctl(int epfd, int op, int fd, struct moqi_epoll_event *event);
 int moqi_epoll_wait(int epfd, struct moqi_epoll_event *events, int maxevents, int timeout);
+int moqi_epoll_pwait(int epfd, struct moqi_epoll_event *events, int maxevents, int timeout, const void *sigmask);
 
 static int bad;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); bad++; } } while (0)
@@ -36,13 +39,12 @@ static int errno_slot;
 int *__errno_location(void) { return &errno_slot; }
 
 static int ncalls;
-static long c_nr, c_a1, c_a2, c_a3, c_a4;
+static long c_nr, c_a1, c_a2, c_a3, c_a4, c_a5, c_a6;
 static long reply;
 
 long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
-    (void)a5; (void)a6;
     ncalls++;
-    c_nr = nr; c_a1 = a1; c_a2 = a2; c_a3 = a3; c_a4 = a4;
+    c_nr = nr; c_a1 = a1; c_a2 = a2; c_a3 = a3; c_a4 = a4; c_a5 = a5; c_a6 = a6;
     return reply;
 }
 
@@ -86,6 +88,21 @@ int main(void) {
     CHECK(moqi_epoll_create1(0x7777) == -1 && errno_slot == EINVAL);
     reply = -17;
     CHECK(moqi_epoll_ctl(7, EPOLL_CTL_ADD, 4, &ev) == -1 && errno_slot == EEXIST);
+
+    /* epoll_pwait: the mask pointer and its size (8 bytes) follow the timeout; without a mask both are 0 */
+    CHECK(SYS_epoll_pwait == 248);
+    unsigned long msk[16] = { 0x4000 };
+    reply = 2;
+    ncalls = 0;
+    CHECK(moqi_epoll_pwait(7, out, 4, 250, msk) == 2);
+    CHECK(ncalls == 1 && c_nr == SYS_epoll_pwait && c_a1 == 7 && c_a2 == (long)out && c_a3 == 4 && c_a4 == 250 && c_a5 == (long)msk && c_a6 == 8);
+    reply = 0;
+    CHECK(moqi_epoll_pwait(7, out, 4, -1, NULL) == 0 && (int)c_a4 == -1 && c_a5 == 0 && c_a6 == 0);
+    reply = -4;
+    errno_slot = 0;
+    CHECK(moqi_epoll_pwait(7, out, 4, 100, msk) == -1 && errno_slot == EINTR);
+    reply = -22;
+    CHECK(moqi_epoll_pwait(7, out, 4, 100, NULL) == -1 && errno_slot == EINVAL);
 
     if (bad) { fprintf(stderr, "%d check(s) failed\n", bad); return 1; }
     printf("test_epoll_abi: ok\n");

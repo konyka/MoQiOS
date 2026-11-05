@@ -6863,3 +6863,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 复现尝试：`fa94348` 的内核上 hello152 在 SMP=2 单独启动 11 次加 14 次，共 25 次全部通过，**没有复现**。`make_pair` 里只有 `socket/bind/listen/connect/accept4/netpoll`，没有 `recv/send`，而 `fa94348` 的改动（`reportRecvResult`、`sendFailure` 里清标志）只作用在 `recv/send` 路径，所以从读码看不太可能有因果关系；但我**没有**在同一环境下对比 `de07714` 与 `fa94348` 的失败率，样本也太小（失败率若在 5% 量级，25 次干净的概率仍有约 28%），所以不能断言无关，也不能断言已修。
 - 这一轮做的事（只加诊断，不改行为）：①`tools/qemu_smoke.sh` 在报告 `FAIL` 时，对每个失败的 hello 程序（最多 5 个）再打印它输出的全部行（最多 40 行），下次 CI 失败能直接看到失败码；②`user/hello152.c` 的 `make_pair` 失败时打印失败步骤和最后一次系统调用的返回值（原来只打印步骤，且对大于 9 的值截断）。
 - 状态：**已知未解决的偶发问题**，不是已修复。下一次出现时，日志里会有 `hello152: make_pair failed, step N, last syscall result R`，据此再查。
+
+## libc 的 `pselect` 与 `epoll_pwait`（hello238）
+
+- 缺口：内核早有 `pselect6`（494）和 `epoll_pwait`（248），但 libc 只有 `select`/`epoll_wait`，没有带信号掩码的版本；需要在"等待期间临时放开某个信号"的程序（典型写法：先阻塞 SIGUSR1，再 `pselect`/`epoll_pwait` 带一个空掩码）无法用 libc 写。
+- 先在宿主机用 glibc 测期望值：`pselect` 超时返回 0 且 `const` 的 `timespec` 不变；信号被阻塞且待处理时，带空掩码的 `pselect`/`epoll_pwait` 先运行处理函数、返回 -1 / `EINTR`、旧掩码恢复；NULL 掩码时信号继续阻塞，是普通等待。
+- 红灯：host 测试 `test_select_abi`、`test_epoll_abi` 增加了 `pselect`/`epoll_pwait` 的参数核对（系统调用号、第六个参数是指向 `{掩码指针, 8}` 的指针、无掩码时是 0、超时被拷到局部变量交给内核、错误码映射），第一次运行链接失败（符号不存在）。
+- 实现：`src/select.c` 的 `pselect`（超时拷贝到局部变量，掩码打包成 `{指针, 8}`）、`src/epoll.c` 的 `epoll_pwait`（掩码指针加大小 8，无掩码时都是 0）；`hostsys.h` 新增 `MSYS6`；`moqi_syscalls.h` 新增 `SYS_pselect6`、`SYS_epoll_pwait`。
+- 变异（4 个，文件已恢复，`grep MUTATION` 为空）：掩码大小改成 16、无掩码时仍传指针、`epoll_pwait` 无掩码时仍传大小 8、超时不拷贝而直接把调用者的指针交给内核，都被 host 测试抓住。第一次的"超时不拷贝"变异因 `-Werror`（变量未使用）没编译过，不算证据，改成能编译的写法重做后才被抓住。
+- QEMU：hello238 共 12 项，第一次运行就全部通过（内核一直是对的，缺的只是封装），所以 QEMU 层是回归保护，不能证明修复前会失败；"修复前会失败"的证据是 host 层的链接失败。
+- 如实说明：①`pselect` 的 `timespec` 不写回，这是 glibc 包装的行为（Linux 系统调用本身会写回）；我没有提供写回版本；②信号掩码参数类型是 `const void *`，不是 `const sigset_t *`，以免 `select.h`/`epoll.h` 依赖 `signal.h`；③只测了管道，没有测套接字和 `timerfd`；④没有 `epoll_pwait2`。

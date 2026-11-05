@@ -19,6 +19,7 @@ extern long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long
 #define MSYS3(nr, a, b, c) moqi_test_syscall6((nr), (long)(a), (long)(b), (long)(c), 0, 0, 0)
 #define MSYS4(nr, a, b, c, d) moqi_test_syscall6((nr), (long)(a), (long)(b), (long)(c), (long)(d), 0, 0)
 #define MSYS5(nr, a, b, c, d, e) moqi_test_syscall6((nr), (long)(a), (long)(b), (long)(c), (long)(d), (long)(e), 0)
+#define MSYS6(nr, a, b, c, d, e, f) moqi_test_syscall6((nr), (long)(a), (long)(b), (long)(c), (long)(d), (long)(e), (long)(f))
 #else
 #define MSYS0(nr) syscall0(nr)
 #define MSYS1(nr, a) syscall1((nr), (long)(a))
@@ -26,6 +27,7 @@ extern long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long
 #define MSYS3(nr, a, b, c) syscall3((nr), (long)(a), (long)(b), (long)(c))
 #define MSYS4(nr, a, b, c, d) syscall4((nr), (long)(a), (long)(b), (long)(c), (long)(d))
 #define MSYS5(nr, a, b, c, d, e) syscall5((nr), (long)(a), (long)(b), (long)(c), (long)(d), (long)(e))
+#define MSYS6(nr, a, b, c, d, e, f) syscall6((nr), (long)(a), (long)(b), (long)(c), (long)(d), (long)(e), (long)(f))
 #endif
 
 static inline int __moqi_is_error(long ret) {

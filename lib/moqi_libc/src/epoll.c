@@ -1,4 +1,4 @@
-/* epoll.c -- epoll_create1, epoll_ctl and epoll_wait (see include/epoll.h). One system call each; the kernel does the work. */
+/* epoll.c -- epoll_create1, epoll_ctl, epoll_wait and epoll_pwait (see include/epoll.h). One system call each; the kernel does the work. */
 #include "../include/epoll.h"
 #include "hostsys.h"
 
@@ -20,4 +20,8 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event) {
 
 int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout) {
     return epoll_ret(MSYS4(SYS_epoll_wait, epfd, events, maxevents, timeout));
+}
+
+int epoll_pwait(int epfd, struct epoll_event *events, int maxevents, int timeout, const void *sigmask) {
+    return epoll_ret(MSYS6(SYS_epoll_pwait, epfd, events, maxevents, timeout, sigmask, sigmask ? 8 : 0));
 }

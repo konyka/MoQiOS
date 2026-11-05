@@ -7,6 +7,11 @@
  * failure (EINTR when a signal handler ran, EINVAL for a bad nfds or timeout, EBADF for a closed descriptor in a set). A NULL
  * timeout waits forever; the kernel writes the time left back into a non-NULL one, as Linux does. The sets are rewritten to the
  * ready descriptors only. FD_SET, FD_CLR and FD_ISSET do not check that the descriptor is below FD_SETSIZE.
+ *
+ * pselect is select with a struct timespec timeout (NULL = forever) and an optional signal mask (a sigset_t *, only its first 64
+ * bits are used) that replaces the blocked set for the duration of the wait. Unlike select, the timeout is const: the time left
+ * is not written back (Linux's system call does write it, glibc's wrapper hides that). A signal that is pending and unblocked by
+ * the temporary mask runs its handler first and the call fails with EINTR; the old mask is restored before pselect returns.
  */
 #ifndef MOQI_SELECT_H
 #define MOQI_SELECT_H
@@ -28,5 +33,6 @@ typedef struct {
 #define FD_ISSET(fd, set) (((set)->fds_bits[(unsigned)(fd) / 64] >> ((unsigned)(fd) % 64)) & 1UL)
 
 int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout);
+int pselect(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, const struct timespec *timeout, const void *sigmask);
 
 #endif

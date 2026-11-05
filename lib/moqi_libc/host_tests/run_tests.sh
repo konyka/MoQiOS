@@ -145,12 +145,12 @@ $CC $CFLAGS -o "$OUT/test_poll_abi" test_poll_abi.c "$OUT/poll.o"
 "$OUT/test_poll_abi" || fail=1
 
 echo "== test_select_abi =="
-$CC $CFLAGS -Dselect=moqi_select -DMOQI_HOST_TEST_SYSCALL -c ../src/select.c -o "$OUT/select.o"
+$CC $CFLAGS -Dselect=moqi_select -Dpselect=moqi_pselect -DMOQI_HOST_TEST_SYSCALL -c ../src/select.c -o "$OUT/select.o"
 $CC $CFLAGS -o "$OUT/test_select_abi" test_select_abi.c "$OUT/select.o"
 "$OUT/test_select_abi" || fail=1
 
 echo "== test_epoll_abi =="
-$CC $CFLAGS -Depoll_event=moqi_epoll_event -Depoll_data=moqi_epoll_data -Depoll_data_t=moqi_epoll_data_t -Depoll_create1=moqi_epoll_create1 -Depoll_ctl=moqi_epoll_ctl -Depoll_wait=moqi_epoll_wait -DMOQI_HOST_TEST_SYSCALL -c ../src/epoll.c -o "$OUT/epoll.o"
+$CC $CFLAGS -Depoll_event=moqi_epoll_event -Depoll_data=moqi_epoll_data -Depoll_data_t=moqi_epoll_data_t -Depoll_create1=moqi_epoll_create1 -Depoll_ctl=moqi_epoll_ctl -Depoll_wait=moqi_epoll_wait -Depoll_pwait=moqi_epoll_pwait -DMOQI_HOST_TEST_SYSCALL -c ../src/epoll.c -o "$OUT/epoll.o"
 $CC $CFLAGS -o "$OUT/test_epoll_abi" test_epoll_abi.c "$OUT/epoll.o"
 "$OUT/test_epoll_abi" || fail=1
 
