@@ -56,6 +56,46 @@ static void out_str(const char *s) {
     write(g_out_fd, s, n);
 }
 
+/* Quoting. Before a line is split into list elements, pipeline commands and words, protect_quotes() rewrites it in place: the
+ * quote characters are dropped, and inside them every character the splitting code would act on (space, tab, ';', '&', '|', '>',
+ * '<') is replaced by a control byte 1..7 that no splitter looks for. The words that come out are turned back with unprotect(),
+ * so a quoted separator ends up as plain text in the word. Single and double quotes work the same (no variable or escape
+ * processing differs between them), an unterminated quote runs to the end of the line, and "" on its own makes no word. A
+ * control byte 1..7 typed on the line is indistinguishable from a protected character. */
+static const char PROTECTED_CHARS[] = " \t;&|><";
+
+static void protect_quotes(char *line) {
+    char *w = line;
+    char quote = 0;
+    for (const char *r = line; *r; r++) {
+        if (quote) {
+            if (*r == quote) {
+                quote = 0;
+                continue;
+            }
+            const char *hit = (const char *)0;
+            for (const char *c = PROTECTED_CHARS; *c; c++)
+                if (*c == *r) hit = c;
+            *w++ = hit ? (char)(1 + (hit - PROTECTED_CHARS)) : *r;
+        } else if (*r == '"' || *r == '\'') {
+            quote = *r;
+        } else {
+            *w++ = *r;
+        }
+    }
+    *w = '\0';
+}
+
+/* Turn the control bytes of protect_quotes() back into the characters they stand for, copying src into dst (at most max bytes). */
+static void unprotect(char *dst, const char *src, int max) {
+    int i = 0;
+    for (; *src && i < max - 1; src++, i++) {
+        unsigned char c = (unsigned char)*src;
+        dst[i] = (c >= 1 && c <= (unsigned char)(sizeof(PROTECTED_CHARS) - 1)) ? PROTECTED_CHARS[c - 1] : (char)c;
+    }
+    dst[i] = '\0';
+}
+
 /* Skip leading whitespace */
 static const char *skip_spaces(const char *s) {
     while (*s == ' ' || *s == '\t') s++;
@@ -70,6 +110,7 @@ static const char *copy_token(char *dst, int max, const char *src) {
         dst[i++] = *src++;
     }
     dst[i] = '\0';
+    unprotect(dst, dst, max);
     return src;
 }
 
@@ -266,7 +307,9 @@ static int execute_pipeline(const char *line) {
             int idx = 0;
             while (rest[idx] && rest[idx] != ' ') idx++;
             while (rest[idx] == ' ') idx++;
-            out_str(rest + idx);
+            char text[256];
+            unprotect(text, rest + idx, sizeof(text));
+            out_str(text);
             out_str("\n");
             goto builtin_done;
         }
@@ -276,7 +319,9 @@ static int execute_pipeline(const char *line) {
             while (rest[idx] && rest[idx] != ' ') idx++;
             while (rest[idx] == ' ') idx++;
             if (rest[idx]) {
-                moqi_setenv(rest + idx);
+                char kv[256];
+                unprotect(kv, rest + idx, sizeof(kv));
+                moqi_setenv(kv);
             }
             return 0;
         }
@@ -301,7 +346,9 @@ static int execute_pipeline(const char *line) {
                 long ret = chdir("/");
                 if (ret < 0) print("cd: failed\n");
             } else {
-                long ret = chdir(rest + idx);
+                char dir[256];
+                unprotect(dir, rest + idx, sizeof(dir));
+                long ret = chdir(dir);
                 if (ret < 0) print("cd: failed\n");
             }
             return 0;
@@ -457,6 +504,7 @@ int main(int argc, char **argv, char **envp) {
         g_command_mode = 1;
         char expanded[256];
         expand_vars(argv[2], expanded, sizeof(expanded));
+        protect_quotes(expanded);
         int status = execute_list(expanded);
         if (status < 0) return 1;
         int sig = status & 0x7f;
@@ -477,6 +525,7 @@ int main(int argc, char **argv, char **envp) {
 
         char expanded[256];
         expand_vars(line, expanded, sizeof(expanded));
+        protect_quotes(expanded);
 
         execute_list(expanded);
     }

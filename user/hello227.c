@@ -68,6 +68,24 @@ int main(int argc, char **argv, char **envp) {
     st = system("exit 2 ; exit 9");
     check(exited(st, 2), "B: an exit ends the shell, so nothing after it runs");
 
+    /* B3: quoting. Inside double or single quotes a separator, a '>' or a '|' is text, spaces are kept, and the quotes
+     * themselves are not part of the word. */
+    unlink("/tmp/h227_q");
+    st = system("echo \"a ; b  c\" > /tmp/h227_q");
+    check(exited(st, 0), "B: a quoted separator does not split the command");
+    f = fopen("/tmp/h227_q", "r");
+    char qb[32] = { 0 };
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(strcmp(qb, "a ; b  c\n") == 0, "B: the quoted text is written as it is, spaces kept and quotes dropped");
+    st = system("echo 'x | y' > /tmp/h227_q");
+    f = fopen("/tmp/h227_q", "r");
+    memset(qb, 0, sizeof qb);
+    if (f) { fread(qb, 1, 31, f); fclose(f); }
+    check(exited(st, 0) && strcmp(qb, "x | y\n") == 0, "B: single quotes protect a pipe character");
+    unlink("/tmp/h227_q");
+    st = system("echo \"unterminated");
+    check(exited(st, 0), "B: an unterminated quote runs to the end of the line");
+
     /* C: the caller's signal state is exactly what it was */
     struct ksigaction a = { on_int, 0, 0, 0 };
     sigaction(SIGINT, &a, (struct ksigaction *)0);
