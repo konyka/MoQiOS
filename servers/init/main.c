@@ -354,6 +354,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello234"); /* poll and ppoll */
     run_test("hello235"); /* handler runs before EINTR: epoll_wait, futex, semop, sigtimedwait, mq_timedreceive, recvmmsg, connect */
     run_test("hello236"); /* libc epoll wrappers */
+    run_test("hello237"); /* epoll on TCP sockets */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

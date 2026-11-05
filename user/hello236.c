@@ -199,6 +199,70 @@ int main(int argc, char **argv, char **envp) {
         close(ep5);
     }
 
+    /* The same ET and ONESHOT sequences on an AF_UNIX stream socket pair, and a peer close with EPOLLRDHUP asked for. Counts and the
+     * final event word (0x2011 = EPOLLIN|EPOLLHUP|EPOLLRDHUP) were measured on Linux. */
+    {
+        int sv[2];
+        syscall4(128 /* socketpair */, 1 /* AF_UNIX */, 1 /* SOCK_STREAM */, 0, (long)sv);
+        int ep6 = epoll_create1(0);
+        struct epoll_event e6;
+        memset(&e6, 0, sizeof e6);
+        e6.events = EPOLLIN | EPOLLET;
+        e6.data.u32 = 1;
+        epoll_ctl(ep6, EPOLL_CTL_ADD, sv[0], &e6);
+        write(sv[1], "ab", 2);
+        struct epoll_event o6[2];
+        int a1 = epoll_wait(ep6, o6, 2, 200);
+        int a2 = epoll_wait(ep6, o6, 2, 50);
+        char rc;
+        read(sv[0], &rc, 1);
+        int a3 = epoll_wait(ep6, o6, 2, 50);
+        write(sv[1], "c", 1);
+        int a4 = epoll_wait(ep6, o6, 2, 200);
+        char what[160];
+        snprintf(what, sizeof what, "J: EPOLLET on a socket reports new edges only (counts %d,%d,%d,%d)", a1, a2, a3, a4);
+        check(a1 == 1 && a2 == 0 && a3 == 0 && a4 == 1, what);
+        close(sv[0]);
+        close(sv[1]);
+        close(ep6);
+
+        int sw[2];
+        syscall4(128, 1, 1, 0, (long)sw);
+        int ep7 = epoll_create1(0);
+        memset(&e6, 0, sizeof e6);
+        e6.events = EPOLLIN | EPOLLONESHOT;
+        e6.data.u32 = 1;
+        epoll_ctl(ep7, EPOLL_CTL_ADD, sw[0], &e6);
+        write(sw[1], "a", 1);
+        int b1 = epoll_wait(ep7, o6, 2, 200);
+        int b2 = epoll_wait(ep7, o6, 2, 50);
+        write(sw[1], "b", 1);
+        int b3 = epoll_wait(ep7, o6, 2, 50);
+        e6.events = EPOLLIN | EPOLLONESHOT;
+        e6.data.u32 = 2;
+        epoll_ctl(ep7, EPOLL_CTL_MOD, sw[0], &e6);
+        int b4 = epoll_wait(ep7, o6, 2, 200);
+        snprintf(what, sizeof what, "K: EPOLLONESHOT on a socket is reported once and MOD rearms it (counts %d,%d,%d,%d)", b1, b2, b3, b4);
+        check(b1 == 1 && b2 == 0 && b3 == 0 && b4 == 1, what);
+        close(sw[0]);
+        close(sw[1]);
+        close(ep7);
+
+        int sx[2];
+        syscall4(128, 1, 1, 0, (long)sx);
+        int ep8 = epoll_create1(0);
+        memset(&e6, 0, sizeof e6);
+        e6.events = EPOLLIN | EPOLLRDHUP;
+        epoll_ctl(ep8, EPOLL_CTL_ADD, sx[0], &e6);
+        close(sx[1]);
+        memset(o6, 0, sizeof o6);
+        int c1 = epoll_wait(ep8, o6, 2, 200);
+        snprintf(what, sizeof what, "L: a closed peer reports EPOLLIN|EPOLLHUP|EPOLLRDHUP, 0x2011 (n=%d events=0x%x)", c1, c1 > 0 ? o6[0].events : 0u);
+        check(c1 == 1 && o6[0].events == 0x2011, what);
+        close(sx[0]);
+        close(ep8);
+    }
+
     errno = 0;
     check(epoll_wait(999, out, 4, 0) == -1 && errno == EBADF, "F: epoll_wait on a descriptor that is not open is -1 / EBADF");
     errno = 0;

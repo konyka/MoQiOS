@@ -706,6 +706,25 @@ test "blocking calls that can return EINTR deliver signals on their way out" {
     }
 }
 
+test "tcp close: unread received data makes the close a reset, a clean close is a FIN" {
+    const tu = kt.tcp_util;
+    try std.testing.expect(tu.closeSendsReset(false, 0, 1));
+    try std.testing.expect(tu.closeSendsReset(false, 0, 4096));
+    try std.testing.expect(!tu.closeSendsReset(false, 0, 0));
+}
+
+test "tcp close: SO_LINGER with a zero timeout is a reset whatever is buffered" {
+    const tu = kt.tcp_util;
+    try std.testing.expect(tu.closeSendsReset(true, 0, 0));
+    try std.testing.expect(tu.closeSendsReset(true, 0, 10));
+}
+
+test "tcp close: a non-zero linger with nothing unread is a FIN, with unread data still a reset" {
+    const tu = kt.tcp_util;
+    try std.testing.expect(!tu.closeSendsReset(true, 5, 0));
+    try std.testing.expect(tu.closeSendsReset(true, 5, 3));
+}
+
 test "a pipe write that fits an empty pipe is written whole or not at all" {
     const source = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "const atomic = count <= PIPE_BUF_SIZE - 1;") != null);

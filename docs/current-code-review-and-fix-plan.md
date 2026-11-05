@@ -6834,5 +6834,15 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - `EPOLLET`：首次数据 1 次、数据仍未读 0 次、部分读之后 0 次、新数据 1 次、写端关闭得 `EPOLLHUP` 1 次。
 - 结果：**这个内核的行为与 Linux 在这些点上完全一致，第一次运行就通过，没有发现新缺陷。**所以这一节是回归保护，不是修复；这些用例不能证明"修复前会失败"。
 - 过程中的一个小事故：我写 ET 的宿主机探针时多读了一次，让探针挂住了（在读完所有数据之后再 `read` 会阻塞），改正后才得到上面的序列。这只影响探针，不影响用例。
-- 如实说明：上面只验证了管道这一种描述符；`EPOLLONESHOT`/`EPOLLET` 在 socket、eventfd、timerfd 上的行为没有测。
+- 套接字：同样的 ET 序列（1、0、0、1）、ONESHOT 序列（1、0、0、1）和"对端关闭"的事件字（`EPOLLIN|EPOLLHUP|EPOLLRDHUP`，`0x2011`）在 AF_UNIX 流套接字对上也先在宿主机测出 Linux 的值，再写成 hello236 的 J、K、L 三项；这个内核第一次运行就与 Linux 一致。
+- 如实说明：①验证过的描述符只有管道和 AF_UNIX 流套接字对；TCP（它走另一条就绪路径 `tcpReadiness`，而且回环要靠 `netpoll` 驱动）、eventfd、timerfd 上的 `EPOLLONESHOT`/`EPOLLET` 没有测——我在宿主机测过 TCP 的 Linux 值（ET 序列 1、0、0、1；对端正常关闭后事件字 `0x2001`，即 `EPOLLIN|EPOLLRDHUP`），但没有写成内核用例，这是下一步；②订正：我早先的草稿里把 `0x2019` 和 `0x2001` 的差别归因于"本端有没有未读数据"，不准确。重新核对两次宿主机探针后：`0x2019`（`EPOLLIN|EPOLLERR|EPOLLHUP|EPOLLRDHUP`）出现在**关闭的那一端自己还有对端没读走的数据**时（关闭一个接收队列里有未读数据的 TCP 套接字会发 RST，对端看到错误和挂断）；而关闭的一端没有未读数据时是正常 FIN，另一端无论自己有没有未读数据都是 `0x2001`（我分别测了：对端关闭前本端有无未读数据，两种都是 `0x2001`）。内核用例需要覆盖这两种关闭方式，期望值取这里的三个数字。
+
+## TCP：关闭时有未读数据要发 RST，收到 RST 要唤醒 epoll（hello237）
+
+- 缺口一（发送侧）：`tcpClose` 只在 `SO_LINGER` 且超时为 0 时发 RST，其余一律走 FIN。Linux 在关闭一个**接收队列里还有没读走的数据**的连接时发 RST（RFC 2525 2.17，Linux `tcp_close`）：数据被丢弃，对端看到的是 `ECONNRESET`，而不是一次正常的 EOF。这个内核发 FIN，所以数据被悄悄丢掉、对端却以为是一次正常的结束。
+- 缺口二（接收侧，写 hello237 时才发现）：收到 RST 的两个分支（`.established` 和其它状态）调用 `closeTcbRemote` 把状态改成 `closed`，但**没有通知 epoll**；对 epoll 来说什么都没发生，等待者一直睡到超时（`n=0`）。poll 路径靠自己重新扫描所以不受影响，epoll 靠通知驱动所以漏掉了。这也解释了为什么只修发送侧会让 hello237 D 项从 `0x2001` 变成 `n=0`（更糟）：RST 现在发出去了，但接收端不会被唤醒。
+- 红灯：hello237 D 项在旧内核上 `n=1 events=0x2001`（FIN，缺口一）；只修缺口一后变成 `n=0 events=0x0`（缺口二暴露）；两处都修后 `0x2019`。
+- 实现：`tcp_util.closeSendsReset(linger_on, linger_sec, unread_bytes)`（纯函数，3 个 host 测试）；`tcpClose` 在状态为 `established`/`close_wait`/`fin_wait_1`/`fin_wait_2` 且接收环里有数据时发 `RST|ACK`、拆除连接；两个 RST 接收分支把 `EPOLLIN|EPOLLERR|EPOLLHUP|EPOLLRDHUP` 记进 `pending_events`，由现有的延迟通知机制在释放 `tcp_lock` 之后唤醒 epoll。
+- 变异：把传给 `closeSendsReset` 的未读字节数乘 0（等于没有这条规则），hello237 D 项回到 `0x2001` 失败，被抓住（我第一次变异因为"未使用的局部常量"没编译过，那次运行用的是旧二进制，不算数，重做后才有效）。
+- 如实说明：①缺口二的修复只覆盖了 RST 到达；其它会让 TCP 套接字变得"可读/挂断"的事件（例如超时放弃重传）我没有逐个查它们是否通知 epoll；②`tcpClose` 的新规则只在有未读数据**且**连接已同步的状态下生效，`syn_received`、`closing`、`last_ack` 等没有处理；③`close_wait` 状态（对端已发 FIN）本端有未读数据时 `tcpClose` 也发 RST；这条是我按 Linux `tcp_close` 的规则（任何有未读数据的关闭都 RST）写的，**没有**用对端观察到的行为验证过（对端在这种情形下已经关闭，没有观察者）；④没有写"本端有未读数据并 close"的 TCP 对端侧 `recv` 返回 `ECONNRESET` 的 QEMU 用例，只通过 epoll 事件字间接确认了对端收到了 RST；⑤这两处改动都在 TCP 的核心路径上，我跑了 SMP=1 和 SMP=8 的完整冒烟，没有跑完整的压力门禁。
 

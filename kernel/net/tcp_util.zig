@@ -321,3 +321,11 @@ pub fn resetReply(has_ack: bool, ack_num: u32, seq_num: u32, payload_len: u32, s
     const extra: u32 = (if (syn) @as(u32, 1) else 0) +% (if (fin) @as(u32, 1) else 0);
     return .{ .seq = 0, .ack = seq_num +% payload_len +% extra, .with_ack = true };
 }
+
+/// How a close() ends the connection (RFC 1122 4.2.2.13, RFC 2525 2.17; Linux tcp_close): an abortive RST when SO_LINGER is on
+/// with a zero timeout, and also when the socket still has received data nobody read -- the data is thrown away and the peer is told
+/// with a reset instead of a FIN, so it sees ECONNRESET rather than an orderly end of file. Otherwise the connection closes with FIN.
+pub fn closeSendsReset(linger_on: bool, linger_sec: u32, unread_bytes: u32) bool {
+    if (linger_on and linger_sec == 0) return true;
+    return unread_bytes > 0;
+}

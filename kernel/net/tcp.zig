@@ -2189,6 +2189,8 @@ fn driveTcbStateMachine(
                     .syn_received, .fin_wait_1, .fin_wait_2 => true,
                     else => false,
                 };
+                pending_events.* |= epoll.EPOLLIN | epoll.EPOLLERR | epoll.EPOLLHUP | epoll.EPOLLRDHUP;
+                pending_idx.* = tcbIdx(tcb);
                 closeTcbRemote(tcb);
                 tcpLog("[tcp] RST received, connection reset\n");
                 return;
@@ -2288,6 +2290,10 @@ fn driveTcbStateMachine(
                 const in_window = seq_num -% tcb.rcv_nxt < tcb.rcv_wnd;
                 if (in_window) {
                     tcb.reset_by_peer = true;
+                    // A reset ends the connection in both directions: wake epoll/poll with the full set Linux reports for it (the
+                    // sweep matches ERR and HUP whatever the registration asked for, and IN/RDHUP for those that did).
+                    pending_events.* |= epoll.EPOLLIN | epoll.EPOLLERR | epoll.EPOLLHUP | epoll.EPOLLRDHUP;
+                    pending_idx.* = tcbIdx(tcb);
                     closeTcbRemote(tcb);
                     tcpLog("[tcp] RST received, connection reset\n");
                     return;
@@ -3658,10 +3664,16 @@ pub fn tcpClose(tcb_idx: u32) i64 {
     }
     tcb.ref_count = 0;
 
-    // SO_LINGER with linger=0: abortive close — send RST, discard unsent data
-    if (tcb.options.linger_on and tcb.options.linger_sec == 0) {
+    // Abortive close -- send RST, discard unsent data: SO_LINGER with linger=0, and also a connection that still holds received data
+    // nobody read (Linux tcp_close, RFC 2525 2.17): the peer is told with a reset instead of an orderly FIN. Only a synchronised
+    // connection can be reset (a listener or a half-open one has no peer to tell).
+    const unread: u32 = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
+    const synchronised = tcb.state == .established or tcb.state == .close_wait or tcb.state == .fin_wait_1 or tcb.state == .fin_wait_2;
+    if (tcp_util.closeSendsReset(tcb.options.linger_on, tcb.options.linger_sec, if (synchronised) unread else 0) or
+        (tcb.options.linger_on and tcb.options.linger_sec == 0))
+    {
         _ = sendSegment(tcb, RST | ACK, undefined, 0);
-        tcpLog("[tcp] SO_LINGER(0) → RST sent, abortive close\n");
+        tcpLog("[tcp] abortive close, RST sent\n");
         tcb.state = .closed;
         deactivateTcb(tcb);
         return 0;
