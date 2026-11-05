@@ -234,7 +234,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | `include/unistd.h` | read/write/open/close/lseek/fork/execve/waitpid/_exit/pipe/dup2/yield/nanosleep/brk/sbrk 等 + `extern char **environ` |
 | `include/string.h` | memcpy/memmove/memset/memcmp/strlen/strcmp/strncmp/strcpy/strncpy/strcat/strchr/strrchr |
 | `include/stdio.h` | printf 家族（printf/vprintf/dprintf/vdprintf/snprintf/vsnprintf/sprintf/vsprintf/asprintf/vasprintf）、puts/putchar；语法与 glibc 一致：标志 `# 0 - + 空格 ' I`、宽度、精度、`*`、长度 `hh h l ll L q z Z j t`、转换 `d i u o x X b B c s p n m C S %`；浮点 `f F e E g G a A` 与 glibc 逐位一致，无 `long double`、无位置参数（`%1$d`） |
-| `include/stdlib.h` | malloc/free/calloc（brk 上的首次适配空闲链表）、exit、atoi、getenv |
+| `include/stdlib.h` | malloc 家族（`malloc/free/calloc/realloc/reallocarray/posix_memalign/aligned_alloc/memalign`）、`exit/atexit/_Exit/abort`、`strtol` 家族与 `atoi` 系列、`strtod/strtof/atof`、`qsort/bsearch/rand/srand/rand_r`、`abs/div` 家族、`getenv/setenv/unsetenv/putenv/clearenv`、`system` |
 | `include/ctype.h` | isdigit/isalpha/isspace/toupper 等（纯头文件） |
 | `include/signal.h` | glibc 的信号编号（SIGUSR1=10、SIGUSR2=12、SIGALRM=14、SIGRTMIN=34）、`sigset_t`（128 字节，只用前 64 位）、`signal()`（BSD 语义，返回旧处理函数）、`raise()`（发给调用线程，经 `gettid`+`tkill`）、`abort()`、`sigemptyset/sigfillset/sigaddset/sigdelset/sigismember`、`sigprocmask`/`sigpending`/`sigsuspend`、`struct ksigaction`（匹配内核读取的 28 字节布局）与 `sigaction` |
 | `include/assert.h` | `assert`（失败时 stderr 输出 glibc 同款一行并 `abort()`，`NDEBUG` 下展开为空且不求值）、`static_assert` |
@@ -243,6 +243,16 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | `src/malloc.c` | 分配器核心（无 syscall；经弱符号 `__moqi_heap_grow` 扩容） |
 | `src/sbrk.c` | 强符号 `__moqi_heap_grow`，基于 brk 实现 |
 | `src/unistd.c` `src/stdio.c` `src/stdlib.c` | 薄 syscall 封装、fd 1 输出与 getenv（仅 freestanding） |
+| `include/errno.h` `time.h` `mman.h` `resource.h` `netdb.h` `byteorder.h` `setjmp.h` `pthread.h` `math.h` `getopt.h` `dirent.h` | 对应的 libc 头文件：`errno`（每线程）、`clock_gettime`/`nanosleep`/`strftime` 等、`mmap` 家族、`getrlimit`/`setrlimit`、`gethostbyname`/`getaddrinfo`（仅 IPv4）、`htons` 家族、`setjmp` 家族（仅 x86-64）、pthread 子集、`<math.h>` 里结果有精确定义的部分 |
+| `src/env.c` | `setenv/unsetenv/putenv/clearenv`（第一次修改时把初始栈上的 envp 拷进自己持有的 malloc 数组，被替换的旧字符串和旧数组不释放，因为 `getenv` 不加锁遍历） |
+| `src/algo.c` `src/numconv.c` `src/strtod.c` | `qsort/bsearch/rand_r`；`strtol` 家族、`abs/div`、`rand/srand`；`strtod/strtof/atof`（大数整数运算的精确舍入，不用浮点） |
+| `src/strfunc.c` `src/string.c` | `string.h` 的其余函数与基础的 `mem*`/`str*` |
+| `src/scan.c` `src/scanf.c` `src/stdio_file.c` `src/stdio_streams.c` | `scanf` 引擎与 `sscanf`；`FILE` 层（`fopen/fgets/fread/fprintf/fscanf/...`）与三个标准流 |
+| `src/math.c` | `<math.h>` 里只用整数运算、不依赖舍入模式的精确函数（`sqrt`、取整、`fmod`、`nextafter` 等） |
+| `src/time.c` `src/timeconv.c` | 时钟与睡眠封装；日历转换与 `strftime`/`strptime`（本地时区固定为 UTC） |
+| `src/pthread.c` | pthread 子集（x86-64 TLS variant II，线程栈 64 KiB） |
+| `src/mman.c` `src/rlimit.c` `src/netdb.c` | `mmap` 家族、资源限制、主机名解析的封装 |
+| `src/setjmp.c` | `setjmp/sigsetjmp/longjmp/siglongjmp`（汇编，仅 x86-64） |
 | `src/exit.c` | `atexit`（后注册先执行；handler 内可再注册或再调 `exit`；首块静态、其后 malloc；`atexit(NULL)` 返回 EINVAL）、`exit`（跑完 handler 后 flush 所有 FILE）、`_Exit` |
 | `src/system.c` | `system()`：子进程 `sh -c <命令>`，父进程在调用期间忽略 SIGINT/SIGQUIT、阻塞 SIGCHLD，结束后原样恢复，子进程 exec 前先恢复；返回 wait 状态，`system(NULL)` 非零，shell 起不来是退出码 127，fork/wait 失败是 -1 加 errno |
 | `src/dirent.c` / `include/dirent.h` | `opendir`/`readdir`/`closedir`/`rewinddir`/`telldir`/`seekdir`/`dirfd`（glibc 布局：`struct dirent` 280 字节、`d_name` 偏移 19；基于 `getdents64` 的 4096 字节缓冲，close-on-exec，`opendir` 用 `fstat` 判目录并给出 `ENOTDIR`；`seekdir` 依赖内核的 `lseek` 游标，rofs（ext4/NTFS）目录只接受回到 0） |
@@ -275,11 +285,14 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
   （`loader.loadProgram`）envp 为空。crt0 的 naked `_start` 捕获入口 rsp，
   `_start_c` 用 `include/crt0.h` 的 `moqi_parse_initial_stack` 解析，
   设置全局 `environ` 后以 `main(argc, argv, envp)` 进入程序。
-- **environ / getenv**：`environ`（unistd.h 声明，crt0.c 定义）指向初始栈上的
-  envp 数组；`getenv(name)`（stdlib）纯遍历 environ，不发 syscall，返回指向
-  environ 条目内部的指针。libc 不提供 setenv——修改内核侧环境请用
-  `moqi_setenv`（注意：内核环境表与栈上 envp 是两套机制，execve 只传
-  调用者给的 envp，不继承 `moqi_setenv` 设置的变量）。
+- **environ / getenv / setenv**：`environ`（unistd.h 声明，crt0.c 定义）指向初始栈上的
+  envp 数组；`getenv(name)`（stdlib）纯遍历 `environ`，不发 syscall，返回指向
+  `environ` 条目内部的指针。`setenv/unsetenv/putenv/clearenv`（`src/env.c`）在 `environ`
+  上工作，行为按 glibc 实测（见 `include/stdlib.h`）；初始栈上的数组不会被原地增长，
+  第一次修改时拷贝到自己持有的 malloc 数组。**内核另有一张每任务环境表**
+  （`moqi_setenv`/`moqi_getenv`），与 `environ` 是两套机制：`execve` 只传调用者给的 envp，
+  不会自动带上内核表里的变量。shell 的 `export` 同时写两处，并把 `environ` 传给
+  `execve`（见 3.2），所以 shell 启动的程序能继承 `export` 过的变量。
 
 ### 5.3 编写新的 libc 用户程序
 
