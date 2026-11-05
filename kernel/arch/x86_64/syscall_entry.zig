@@ -624,6 +624,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         120 => {
             syscallAccept(frame);
+            checkSignalsOnSyscallReturn(frame);
         },
         121 => {
             syscallSendto(frame);
@@ -632,6 +633,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         122 => {
             syscallRecvfrom(frame);
+            checkSignalsOnSyscallReturn(frame);
         },
         123 => {
             syscallMkdir(frame);
@@ -661,9 +663,11 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         130 => { // recvmsg(fd, msg, flags)
             frame.rax = @bitCast(socket_mod.recvmsg(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
+            checkSignalsOnSyscallReturn(frame);
         },
         131 => { // accept4(fd, addr, addrlen, flags)
             frame.rax = @bitCast(socket_mod.accept4(@truncate(frame.rdi), frame.rsi, frame.rdx, @truncate(frame.r10)));
+            checkSignalsOnSyscallReturn(frame);
         },
         132 => { // setsockopt(fd, level, optname, optval, optlen)
             frame.rax = @bitCast(socket_mod.setsockopt(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8));
@@ -686,6 +690,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         138 => { // readv(fd, iov, iovcnt)
             frame.rax = @bitCast(readv_mod.readv(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
+            checkSignalsOnSyscallReturn(frame);
         },
         139 => { // writev(fd, iov, iovcnt)
             frame.rax = @bitCast(readv_mod.writev(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
@@ -693,6 +698,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         140 => { // preadv(fd, iov, iovcnt, pos_l)
             frame.rax = @bitCast(readv_mod.preadv(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx), frame.r10));
+            checkSignalsOnSyscallReturn(frame);
         },
         141 => { // pwritev(fd, iov, iovcnt, pos_l)
             frame.rax = @bitCast(readv_mod.pwritev(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx), frame.r10));
@@ -1396,6 +1402,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         263 => { // wait4(pid, status, options, rusage) — extend waitpid
             frame.rax = @bitCast(syscallWait4(frame.rdi, frame.rsi, @truncate(frame.rdx), frame.r10));
+            checkSignalsOnSyscallReturn(frame);
         },
         264 => { // sethostname(name, len)
             frame.rax = @bitCast(if (!checkCapForCurrent("cap_sys_admin")) @as(i64, -1) else syscallSethostname(frame.rdi, @truncate(frame.rsi)));
@@ -1653,6 +1660,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         19 => { // readv(fd, iov, iovcnt)
             frame.rax = @bitCast(readv_mod.readv(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
+            checkSignalsOnSyscallReturn(frame);
         },
         20 => { // writev(fd, iov, iovcnt)
             frame.rax = @bitCast(readv_mod.writev(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
@@ -1706,18 +1714,23 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         43 => { // accept(fd, addr, addrlen)
             frame.rax = @bitCast(socket_mod.accept(@truncate(frame.rdi), frame.rsi, frame.rdx));
+            checkSignalsOnSyscallReturn(frame);
         },
         44 => { // sendto(fd, buf, len, flags, addr, addrlen)
             frame.rax = @bitCast(socket_mod.sendto(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx), @truncate(frame.r10), frame.r8, @truncate(frame.r9)));
+            checkSignalsOnSyscallReturn(frame);
         },
         45 => { // recvfrom(fd, buf, len, flags, addr, addrlen)
             frame.rax = @bitCast(socket_mod.recvfrom(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx), @truncate(frame.r10), frame.r8, @truncate(frame.r9)));
+            checkSignalsOnSyscallReturn(frame);
         },
         46 => { // sendmsg(fd, msg, flags)
             frame.rax = @bitCast(socket_mod.sendmsg(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
+            checkSignalsOnSyscallReturn(frame);
         },
         47 => { // recvmsg(fd, msg, flags)
             frame.rax = @bitCast(socket_mod.recvmsg(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx)));
+            checkSignalsOnSyscallReturn(frame);
         },
         48 => { // shutdown(fd, how)
             frame.rax = @bitCast(socket_mod.shutdown(@truncate(frame.rdi), @truncate(frame.rsi)));
@@ -1770,6 +1783,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         61 => { // wait4(pid, status, options, rusage)
             frame.rax = @bitCast(syscallWait4(frame.rdi, frame.rsi, @truncate(frame.rdx), frame.r10));
+            checkSignalsOnSyscallReturn(frame);
         },
         73 => { // flock(fd, operation)
             frame.rax = @bitCast(flock_mod.sysFlock(frame.rdi, frame.rsi));

@@ -6614,3 +6614,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异：`SYSCALL_INSN_LEN` 改 3、把 35（nanosleep）加入可重启表、去掉对 `sa_flags` 的检查，3 个都被 host 测试抓住。
 - 如实说明：①只覆盖三个调用（它们的分发路径本来就会在返回时投递信号）；`wait4`、`readv`/`writev`、`recv`/`accept`/`connect`、`flock`、`futex`、`read` 之外的阻塞读（tty、socket）**没有**覆盖，仍返回 `-EINTR`；`pipeWrite` 阻塞时的信号处理未改；②重启是"重新执行 syscall 指令"，对 `read` 在被打断前已经读到的数据没有影响（被打断时尚未返回任何数据）；③只有 x86_64 实现，riscv64/aarch64 的分发路径不同、未做；④`SA_RESTART` 与 `SA_NODEFER` 等其它标志可以组合。
 
+## SA_RESTART 扩展到 wait4、readv/writev 和 socket 调用（hello229）
+
+- 缺口：第一版 `SA_RESTART` 只覆盖 `read`/`write`/`waitpid`，其余同类阻塞调用被信号打断后仍然 `-EINTR`，而且这些调用的分发路径在返回前根本不投递信号（处理函数要等到下一次系统调用或时钟中断才跑）。
+- 红灯：hello229 新增 E 组 7 项，在第一版上 6 项失败（`readv`/`wait4`/`recvfrom` 各自"无 SA_RESTART 返回 EINTR"和"有 SA_RESTART 等待并返回数据"，`socketpair` 那项只是准备步骤、本来就过）。
+- 实现：`syscall_restart_policy.zig` 的可重启表扩到 `wait4`(61/263)、`readv`(138/19)、`writev`(139/20)、`accept`(120/43)、`accept4`(131)、`sendto`(121/44)、`recvfrom`(122/45)、`sendmsg`(129/46)、`recvmsg`(130/47)；这些调用的分发分支原来不在返回前投递信号，现在补上了 `checkSignalsOnSyscallReturn`（共 14 个分支：120、122、130、131、138、140、263、19、43、44、45、46、47、61；`preadv`(140) 也补了，但它不在可重启表里）。
+- 不重启：`connect`（POSIX 规定被打断后连接继续在后台进行）、`flock`、`futex`、睡眠、`pause`、`sigsuspend`、poll/epoll/select 的等待。
+- 变异：从表里删掉 `recvfrom`(45) 并加入 `connect`(42)，host 测试抓住。
+- 如实说明：①hello229 里只验证了 `readv`、`wait4`、`recvfrom` 三个新增调用的真实行为，`accept`、`sendto`、`sendmsg`、`recvmsg`、`writev` 只靠策略表的单元测试和代码审查，**没有各自的 QEMU 用例**；②`preadv`/`pwritev`/`pread`/`pwrite` 是否阻塞取决于文件类型，未列入可重启表；③`tty` 读走的是 `read`(10)，已包含，但没有单独验证；④仍只有 x86_64 实现。
+

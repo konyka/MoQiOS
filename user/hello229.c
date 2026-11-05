@@ -125,6 +125,59 @@ int main(int argc, char **argv, char **envp) {
     close(p[0]);
     close(p[1]);
 
+    /* E: the other blocking calls that restart: readv on a pipe, wait4, and recvfrom on a socket. */
+    struct iovec_ { void *base; unsigned long len; };
+    install(0);
+    pipe(p);
+    kid = spawn_signaller(me, p[1], "ab", 0);
+    struct iovec_ iov = { buf, sizeof buf };
+    r = syscall3(19 /* readv */, p[0], (long)&iov, 1);
+    check(r == -EINTR && hits == 1, "E: without SA_RESTART a blocked readv returns -EINTR");
+    if (r == -EINTR) r = syscall3(19, p[0], (long)&iov, 1);
+    waitpid(kid, (int *)0, 0);
+    close(p[0]);
+    close(p[1]);
+    install(SA_RESTART_BIT);
+    pipe(p);
+    kid = spawn_signaller(me, p[1], "abc", 0);
+    iov.base = buf;
+    iov.len = sizeof buf;
+    r = syscall3(19, p[0], (long)&iov, 1);
+    check(r == 3 && hits == 1, "E: with SA_RESTART readv waits through the handler and returns the data (3 bytes)");
+    waitpid(kid, (int *)0, 0);
+    close(p[0]);
+    close(p[1]);
+
+    install(SA_RESTART_BIT);
+    kid = spawn_signaller(me, -1, (const char *)0, 5);
+    st = -1;
+    r = syscall4(61 /* wait4 */, kid, (long)&st, 0, 0);
+    check(r == kid && ((st >> 8) & 0xff) == 5 && hits == 1, "E: with SA_RESTART wait4 waits through the handler and returns the child (status 5)");
+    install(0);
+    kid = spawn_signaller(me, -1, (const char *)0, 6);
+    r = syscall4(61, kid, (long)&st, 0, 0);
+    check(r == -EINTR && hits == 1, "E: without SA_RESTART a blocked wait4 returns -EINTR");
+    waitpid(kid, (int *)0, 0);
+
+    int sv[2];
+    install(0);
+    long sr = syscall4(128 /* socketpair */, 1 /* AF_UNIX */, 1 /* SOCK_STREAM */, 0, (long)sv);
+    check(sr == 0, "E: socketpair for the socket cases");
+    if (sr == 0) {
+        kid = spawn_signaller(me, sv[1], "sock", 0);
+        r = syscall6(45 /* recvfrom */, sv[0], (long)buf, sizeof buf, 0, 0, 0);
+        check(r == -EINTR && hits == 1, "E: without SA_RESTART a blocked recvfrom returns -EINTR");
+        if (r == -EINTR) syscall6(45, sv[0], (long)buf, sizeof buf, 0, 0, 0);
+        waitpid(kid, (int *)0, 0);
+        install(SA_RESTART_BIT);
+        kid = spawn_signaller(me, sv[1], "sock", 0);
+        r = syscall6(45, sv[0], (long)buf, sizeof buf, 0, 0, 0);
+        check(r == 4 && buf[0] == 's' && hits == 1, "E: with SA_RESTART recvfrom waits through the handler and returns the data (4 bytes)");
+        waitpid(kid, (int *)0, 0);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
     print(failures == 0 ? "hello229: PASS\n" : "hello229: FAIL\n");
     return failures;
 }
