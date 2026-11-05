@@ -39,6 +39,24 @@ pub const StackInfo = struct {
     interp_base: u64 = 0,
 };
 
+/// Bytes the pointer part of the stack takes at most: the alignment pad, the auxv (13 pairs plus AT_NULL), the envp and argv
+/// terminators, one pointer per string and argc.
+fn pointerAreaBytes(argc: usize, nenv: usize) u64 {
+    return 8 + 14 * 16 + 8 + 8 * @as(u64, nenv) + 8 + 8 * @as(u64, argc) + 8;
+}
+
+/// True when the strings and the pointer part of the stack fit in the one page: the strings grow up from the bottom of the page
+/// and the pointers grow down from the top, so they must not meet. Only the first 16 arguments and 16 environment strings are
+/// used (the rest are dropped), and are what this counts.
+pub fn fits(argv: []const []const u8, envp: []const []const u8) bool {
+    const argc: usize = @min(argv.len, @as(usize, 16));
+    const nenv: usize = @min(envp.len, @as(usize, 16));
+    var strings: u64 = 0;
+    for (argv[0..argc]) |a| strings += a.len + 1;
+    for (envp[0..nenv]) |e| strings += e.len + 1;
+    return strings + pointerAreaBytes(argc, nenv) <= PAGE_SIZE;
+}
+
 /// Build the initial user stack with argc/argv/envp/auxv per the Linux ABI.
 /// Writes directly to the physical stack page via HHDM (identity on
 /// non-x86). Returns the new SP value for the user process.
@@ -67,6 +85,10 @@ pub fn buildUserStack(
     envp: []const []const u8,
     info: StackInfo,
 ) u64 {
+    // Strings and pointers share one page and must not meet. Callers check `fits` first (execve answers E2BIG); a stack that does
+    // not fit is refused here too, with the null stack pointer, instead of letting the pointer part overwrite the strings.
+    if (!fits(argv, envp)) return 0;
+
     // Access the stack page via HHDM
     const page_base: [*]u8 = @ptrFromInt(hhdm.physToVirt(stack_phys));
     const page_size: u64 = PAGE_SIZE;
@@ -84,7 +106,7 @@ pub fn buildUserStack(
         page_base[str_offset] = 0;
         str_offset += 1;
     }
-    const argc = @min(argv.len, @as(usize, 16));
+    const argc: usize = @min(argv.len, @as(usize, 16));
 
     for (envp, 0..) |env, i| {
         if (i >= 16) break;
@@ -94,7 +116,7 @@ pub fn buildUserStack(
         page_base[str_offset] = 0;
         str_offset += 1;
     }
-    const nenv = @min(envp.len, @as(usize, 16));
+    const nenv: usize = @min(envp.len, @as(usize, 16));
 
     // Phase 2: Build the structure from the top of the page downward.
     // We'll compute offsets relative to the start of the page, then
@@ -195,3 +217,37 @@ pub fn buildUserStack(
     const user_sp: u64 = stack_top - page_size + pos;
     return user_sp;
 }
+
+const testing = @import("std").testing;
+
+test "fits: ordinary argv and envp fit" {
+    try testing.expect(fits(&.{"prog"}, &.{}));
+    try testing.expect(fits(&.{ "prog", "a", "b" }, &.{ "K=V", "L=W" }));
+}
+
+test "fits: a page of maximal strings does not" {
+    var arg: [127]u8 = @splat('x');
+    const a: []const u8 = arg[0..];
+    const sixteen = [_][]const u8{ a, a, a, a, a, a, a, a, a, a, a, a, a, a, a, a };
+    try testing.expect(!fits(sixteen[0..], sixteen[0..]));
+}
+
+test "fits: the boundary is exact" {
+    // one argument of n bytes: n + 1 (NUL) + pointer area for argc 1, nenv 0 must be <= 4096
+    const area = pointerAreaBytes(1, 0);
+    var buf: [4096]u8 = @splat('x');
+    const max_len: usize = 4096 - area - 1;
+    try testing.expect(fits(&.{buf[0..max_len]}, &.{}));
+    try testing.expect(!fits(&.{buf[0 .. max_len + 1]}, &.{}));
+}
+
+test "fits: strings past the 16th are not counted, because they are dropped" {
+    var arg: [127]u8 = @splat('x');
+    const a: []const u8 = arg[0..];
+    var many: [20][]const u8 = undefined;
+    for (&many) |*m| m.* = "k";
+    many[16] = a;
+    many[17] = a;
+    try testing.expect(fits(many[0..], &.{}));
+}
+

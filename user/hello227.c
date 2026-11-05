@@ -373,6 +373,55 @@ int main(int argc, char **argv, char **envp) {
         check(exited(es, 77), "B: execve with a 150-byte argument is E2BIG and the caller keeps running (hello11 would exit 42)");
     }
 
+    /* B14: the biggest argument list that fits. The arguments and the environment strings share one 4 KiB page with the pointer
+     * arrays and the auxiliary vector. Sixteen 127-byte arguments plus sixteen 127-byte environment strings are 4096 bytes of text
+     * alone and cannot fit: execve must say E2BIG and leave the caller running, not start a program whose stack was overwritten.
+     * Arguments that do fit arrive intact. */
+    {
+        static char arg_store[17][128];
+        static char env_store[16][128];
+        char *av[20];
+        char *ev[18];
+        long rc;
+        for (int round = 0; round < 3; round++) {
+            int nargs = round == 0 ? 3 : (round == 1 ? 10 : 16);
+            int envs = round == 0 ? 0 : (round == 1 ? 4 : 16);
+            int alen = round == 2 ? 127 : 100;
+            av[0] = (char *)"hello232";
+            char cnt[8];
+            snprintf(cnt, sizeof cnt, "%d", nargs - 1);
+            av[1] = cnt;
+            for (int i = 2; i < nargs; i++) {
+                memset(arg_store[i], 'a' + i, (size_t)alen);
+                arg_store[i][alen] = 0;
+                av[i] = arg_store[i];
+            }
+            if (nargs < 3) { av[2] = arg_store[2]; memset(arg_store[2], 'z', 4); arg_store[2][4] = 0; nargs = 3; }
+            for (int i = 0; i < envs; i++) {
+                memset(env_store[i], 'A' + i, (size_t)alen);
+                env_store[i][alen] = 0;
+                ev[i] = env_store[i];
+            }
+            ev[envs] = (char *)0;
+            av[nargs] = (char *)0;
+            long kid_pid = fork();
+            if (kid_pid == 0) {
+                rc = syscall3(SYS_execve, (long)"hello232", (long)av, (long)ev);
+                _exit(rc == -7 ? 77 : 78);
+            }
+            int es = -1;
+            waitpid(kid_pid, &es, 0);
+            char what[128];
+            if (round == 2) {
+                snprintf(what, sizeof what, "B: 16 arguments and 16 environment strings of 127 bytes do not fit one page: E2BIG, caller runs on (status 0x%x)", (unsigned)es);
+                check(exited(es, 77), what);
+            } else {
+                snprintf(what, sizeof what, "B: %d arguments with %d environment strings of %d bytes arrive intact (status 0x%x)", nargs - 1, envs, alen, (unsigned)es);
+                check(exited(es, 0), what);
+            }
+        }
+    }
+
     /* C: the caller's signal state is exactly what it was */
     struct ksigaction a = { on_int, 0, 0, 0 };
     sigaction(SIGINT, &a, (struct ksigaction *)0);

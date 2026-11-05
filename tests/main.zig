@@ -361,6 +361,48 @@ test "initial user stack keeps auxv adjacent to envp and 16-aligned" {
     }
 }
 
+test "initial user stack: the largest argv and envp fit or are refused, never overlap the pointer area" {
+    const hhdm = kt.hhdm;
+    const user_stack = kt.user_stack;
+    const fake_phys: u64 = 0x32_0000;
+    const stack_top: u64 = 0x42_0000;
+    const page = try std.heap.page_allocator.alloc(u8, 4096);
+    defer std.heap.page_allocator.free(page);
+    hhdm.init(@intFromPtr(page.ptr) -% fake_phys);
+
+    // 16 arguments and 16 environment strings of the longest length execve accepts (127 bytes plus the NUL) need 4096 bytes of
+    // strings alone; the page also has to hold argc, 34 pointers and the auxv. Whatever buildUserStack does with that, a
+    // returned stack pointer must lead to argv[i] strings that read back unchanged.
+    var storage: [32][127]u8 = undefined;
+    var argv: [16][]const u8 = undefined;
+    var envp: [16][]const u8 = undefined;
+    for (0..16) |i| {
+        @memset(&storage[i], @as(u8, 'a') + @as(u8, @intCast(i)));
+        argv[i] = storage[i][0..];
+        @memset(&storage[16 + i], @as(u8, 'A') + @as(u8, @intCast(i)));
+        envp[i] = storage[16 + i][0..];
+    }
+    @memset(page, 0);
+    const sp = user_stack.buildUserStack(fake_phys, stack_top, argv[0..], envp[0..], .{ .phdr_addr = 0x1000, .phnum = 5, .entry = 0x2000 });
+    if (sp == 0) return; // refusing is acceptable
+    const page_virt = stack_top - 4096;
+    try std.testing.expect(sp >= page_virt and sp < stack_top);
+    const words = @as([*]const u64, @ptrFromInt(@intFromPtr(page.ptr) + (sp - page_virt)));
+    try std.testing.expectEqual(@as(u64, 16), words[0]);
+    for (0..16) |i| {
+        const p = words[1 + i];
+        try std.testing.expect(p >= page_virt and p + 128 <= stack_top);
+        const text: [*]const u8 = @ptrFromInt(@intFromPtr(page.ptr) + (p - page_virt));
+        try std.testing.expectEqualSlices(u8, argv[i], text[0..127]);
+        try std.testing.expectEqual(@as(u8, 0), text[127]);
+    }
+    for (0..16) |i| {
+        const p = words[1 + 16 + 1 + i];
+        const text: [*]const u8 = @ptrFromInt(@intFromPtr(page.ptr) + (p - page_virt));
+        try std.testing.expectEqualSlices(u8, envp[i], text[0..127]);
+    }
+}
+
 test "user stack omits AT_PHDR for flat binaries" {
     const hhdm = kt.hhdm;
     const user_stack = kt.user_stack;

@@ -135,6 +135,10 @@ pub fn prepareExecName(name: []const u8, argv_ptr: u64, envp_ptr: u64) Prepared 
         }
     }
 
+    // The strings and the pointer part of the initial stack share one page: when they cannot fit, say so (E2BIG) before anything
+    // is loaded, the way Linux does for an argument list over the limit.
+    if (!@import("user_stack.zig").fits(argv_slices[0..argc], envp_slices[0..envc])) return .{ .err = policy.errno(.too_big) };
+
     // Load the new program — if this fails, old address space is intact, caller can return error
     const loader = @import("loader.zig");
     const result = loader.loadProgramForExec(name, argv_slices[0..argc], envp_slices[0..envc]) orelse {

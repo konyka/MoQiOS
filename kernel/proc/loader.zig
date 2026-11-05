@@ -473,6 +473,10 @@ pub fn loadProgramForExec(name: []const u8, argv: []const []const u8, envp: []co
         return null;
     }
 
+    if (!user_stack.fits(argv, envp)) {
+        user_space.destroyUserSpace(new_pml4);
+        return null;
+    }
     const stack_phys = pmm.allocPage() orelse {
         user_space.destroyUserSpace(new_pml4);
         return null;
