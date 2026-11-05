@@ -234,6 +234,45 @@ int main(int argc, char **argv, char **envp) {
         check(0, "G: a connected loopback pair could not be made");
     }
 
+    /* A recv that is already asleep when the reset arrives: it wakes with -ECONNRESET (about 120 ms in), and the next recv is 0. The
+     * peer's last copy is closed by a child so the parent can be blocked in recv at that moment. Measured on Linux. */
+    if (make_pair(&c, &s) == 0) {
+        char rb[16];
+        write(c, "zz", 2);
+        pump(100);
+        long kid = fork();
+        if (kid == 0) {
+            close(c);
+            struct timespec ts = { 0, 120000000L };
+            nanosleep(&ts, 0);
+            close(s);
+            for (int i = 0; i < 20; i++) pump(10);
+            _exit(0);
+        }
+        close(s);
+        long t0 = 0;
+        {
+            struct timespec t;
+            clock_gettime(CLOCK_MONOTONIC, &t);
+            t0 = t.tv_sec * 1000L + t.tv_nsec / 1000000L;
+        }
+        long r1 = syscall6(SYS_recvfrom, c, (long)rb, sizeof rb, 0, 0, 0);
+        long dt;
+        {
+            struct timespec t;
+            clock_gettime(CLOCK_MONOTONIC, &t);
+            dt = t.tv_sec * 1000L + t.tv_nsec / 1000000L - t0;
+        }
+        long r2 = syscall6(SYS_recvfrom, c, (long)rb, sizeof rb, 0, 0, 0);
+        char what[160];
+        snprintf(what, sizeof what, "H: a recv asleep when the reset arrives wakes with -ECONNRESET, then 0 (%ld, %ld after %ld ms)", r1, r2, dt);
+        check(r1 == -104 && r2 == 0 && dt >= 80, what);
+        waitpid(kid, (int *)0, 0);
+        close(c);
+    } else {
+        check(0, "H: a connected loopback pair could not be made");
+    }
+
     print(failures == 0 ? "hello237: PASS\n" : "hello237: FAIL\n");
     return failures;
 }

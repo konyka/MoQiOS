@@ -87,6 +87,18 @@ static int64_t now_ms(void) {
     syscall2(SYS_CLOCK_GETTIME, 1, (uint64_t)&t);
     return t.s * 1000 + t.n / 1000000;
 }
+static void print_num(int64_t v) {
+    char buf[24];
+    int n = 0;
+    uint64_t u = v < 0 ? (uint64_t)(-v) : (uint64_t)v;
+    do { buf[n++] = (char)('0' + u % 10); u /= 10; } while (u);
+    if (v < 0) buf[n++] = '-';
+    char rev[24];
+    for (int i = 0; i < n; i++) rev[i] = buf[n - 1 - i];
+    rev[n] = 0;
+    print(rev);
+}
+static int64_t mp_last = 0;
 static uint8_t out[20000];
 static uint8_t in[20000];
 
@@ -109,13 +121,13 @@ static int make_pair(int port, int *cli, int *srv) {
         cr = syscall3(SYS_CONNECT, (uint64_t)c, (uint64_t)sa, 16);
         if (cr < 0) syscall1(SYS_NETPOLL, 0);
     }
-    if (cr != 0) return -5;
+    if (cr != 0) { mp_last = cr; return -5; }
     int64_t a = -1;
     for (int i = 0; i < 20 && a < 0; i++) {
         syscall1(SYS_NETPOLL, 0);
         a = syscall4(SYS_ACCEPT4, (uint64_t)l, 0, 0, 0);
     }
-    if (a < 0) return -6;
+    if (a < 0) { mp_last = a; return -6; }
     syscall1(SYS_CLOSE, (uint64_t)l);
     *cli = (int)c;
     *srv = (int)a;
@@ -186,7 +198,11 @@ void _start(void) {
             syscall1(SYS_CLOSE, c);
             syscall1(SYS_CLOSE, s);
         } else {
-            { char code[4] = { 'm', 'p', (char)('0' + (-mp > 9 ? 9 : -mp)), 0 }; print("hello152: make_pair failed, code -"); print(code + 2); print("\n"); }
+            print("hello152: make_pair failed, step ");
+            print_num(-mp);
+            print(", last syscall result ");
+            print_num(mp_last);
+            print("\n");
             check(0, "C: loopback connection");
         }
     }

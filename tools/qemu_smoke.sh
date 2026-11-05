@@ -200,6 +200,10 @@ check_fatal_output() {
     if [ -f "$LOG_FILE" ] && grep -aqE "^hello[0-9]+: FAIL"$'\r'"?\$" "$LOG_FILE" && grep -aq "MoQiOS shell" "$LOG_FILE"; then
         echo "FAIL: a test reported FAIL during smoke (SMP=$SMP_COUNT)."
         grep -aE "^hello[0-9]+: +FAIL|^hello[0-9]+: FAIL" "$LOG_FILE" | head -20
+        # The FAIL lines alone say which check failed, not why; show every line the failing programs printed.
+        for failed_name in $(grep -aoE "^hello[0-9]+: FAIL" "$LOG_FILE" | sed 's/: FAIL//' | sort -u | head -5); do
+            grep -aE "^${failed_name}:" "$LOG_FILE" | head -40
+        done
         echo "Serial log: $LOG_FILE"
         exit 1
     fi

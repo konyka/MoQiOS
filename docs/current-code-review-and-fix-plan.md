@@ -6844,7 +6844,8 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello237 D 项在旧内核上 `n=1 events=0x2001`（FIN，缺口一）；只修缺口一后变成 `n=0 events=0x0`（缺口二暴露）；两处都修后 `0x2019`。
 - 实现：`tcp_util.closeSendsReset(linger_on, linger_sec, unread_bytes)`（纯函数，3 个 host 测试）；`tcpClose` 在状态为 `established`/`close_wait`/`fin_wait_1`/`fin_wait_2` 且接收环里有数据时发 `RST|ACK`、拆除连接；两个 RST 接收分支把 `EPOLLIN|EPOLLERR|EPOLLHUP|EPOLLRDHUP` 记进 `pending_events`，由现有的延迟通知机制在释放 `tcp_lock` 之后唤醒 epoll。
 - 变异：把传给 `closeSendsReset` 的未读字节数乘 0（等于没有这条规则），hello237 D 项回到 `0x2001` 失败，被抓住（我第一次变异因为"未使用的局部常量"没编译过，那次运行用的是旧二进制，不算数，重做后才有效）。
-- 如实说明：①缺口二的修复只覆盖了 RST 到达；其它会让 TCP 套接字变得"可读/挂断"的事件（例如超时放弃重传）我没有逐个查它们是否通知 epoll；②`tcpClose` 的新规则只在有未读数据**且**连接已同步的状态下生效，`syn_received`、`closing`、`last_ack` 等没有处理；③`close_wait` 状态（对端已发 FIN）本端有未读数据时 `tcpClose` 也发 RST；这条是我按 Linux `tcp_close` 的规则（任何有未读数据的关闭都 RST）写的，**没有**用对端观察到的行为验证过（对端在这种情形下已经关闭，没有观察者）；④没有写"本端有未读数据并 close"的 TCP 对端侧 `recv` 返回 `ECONNRESET` 的 QEMU 用例，只通过 epoll 事件字间接确认了对端收到了 RST；⑤这两处改动都在 TCP 的核心路径上，我跑了 SMP=1 和 SMP=8 的完整冒烟，没有跑完整的压力门禁。
+- 如实说明：①缺口二的修复只覆盖了 RST 到达；其它会让 TCP 套接字变得"可读/挂断"的事件（例如超时放弃重传）我没有逐个查它们是否通知 epoll；
+  - 这一条我读了代码：`timerTickOne` 里重传次数超过 5 次时调用 `closeTcbRemote`（`syn_sent` 状态还会置 `so_error = 110`，ETIMEDOUT），**不通知 epoll**，和 RST 路径是同一类遗漏。触发它需要网络丢包（初始 RTO 2 秒、逐次翻倍，放弃要约两分钟），回环上没有现成的丢包注入手段，要测必须先加一个测试钩子，所以没有在这一节处理，也没有写修复——没有失败用例，不改。②`tcpClose` 的新规则只在有未读数据**且**连接已同步的状态下生效，`syn_received`、`closing`、`last_ack` 等没有处理；③`close_wait` 状态（对端已发 FIN）本端有未读数据时 `tcpClose` 也发 RST；这条是我按 Linux `tcp_close` 的规则（任何有未读数据的关闭都 RST）写的，**没有**用对端观察到的行为验证过（对端在这种情形下已经关闭，没有观察者）；④没有写"本端有未读数据并 close"的 TCP 对端侧 `recv` 返回 `ECONNRESET` 的 QEMU 用例，只通过 epoll 事件字间接确认了对端收到了 RST；⑤这两处改动都在 TCP 的核心路径上，我跑了 SMP=1 和 SMP=8 的完整冒烟，没有跑完整的压力门禁。
 
 ## TCP：RST 的 ECONNRESET 只报告一次（hello237 E/E2/F/G）
 
@@ -6852,5 +6853,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello237 E、E2、F、G 四项在旧内核上都失败：`(-104, -104, -104)`、`(-104, -104, -104)`、`(5, -104, -104)`，G 的 `before 0x19, after 0x19`。
 - 实现：`tcp.zig` 新增 `reportRecvResult`，读到 `.reset` 决定时把 `reset_by_peer` 清掉；`sendFailure` 在报告之后同样清掉。非阻塞 `tcpRecv`、`recvLocked` 两处 `recv` 路径都走它。阻塞 `recv` 里的"是否继续等"检查没有改（它只判断 `would_block`）。
 - 变异：①把清除改成空操作（recv 路径）→ E、F、G 失败，E2（send 先）不受影响；②把 `sendFailure` 里的清除改成空操作 → E2 失败，E 不受影响。两条路径各自被一个变异保护，文件已恢复。
-- 如实说明：①`reset_by_peer` 同时被用作"连接被 RST 过"和"待报告的错误"两个意思，清除它之后 `tcp_ready_policy`（`POLLERR`）和 `send` 的错误选择都改用同一个标志，我只验证了上面列出的序列；②阻塞 `recv` 在睡眠里被 RST 唤醒后走哪条路径，我没有写专门的用例（hello237 的用例都是 RST 到达之后才调用 `recv`）；③其它依赖 `reset_by_peer` 的地方只有 `tcpReadiness`，我没有查有没有别的模块读这个标志。
+- 如实说明：①`reset_by_peer` 同时被用作"连接被 RST 过"和"待报告的错误"两个意思，清除它之后 `tcp_ready_policy`（`POLLERR`）和 `send` 的错误选择都改用同一个标志，我只验证了上面列出的序列；②阻塞 `recv` 在睡眠里被 RST 唤醒：已验证（hello237 H 项，一个子进程在 120 ms 后关闭对端的最后一份拷贝，父进程此时正阻塞在 `recv`；先在宿主机测出 Linux 返回 `-ECONNRESET`，下一次是 0）。这个内核第一次运行就一致（`-104, 0`，约 130 ms），是回归保护，不能证明修复前会失败；③其它依赖 `reset_by_peer` 的地方只有 `tcpReadiness`，我没有查有没有别的模块读这个标志。
 
+
+## hello152 C 项偶发失败：又一次出现（原因仍未知），诊断输出补全
+
+- 现象：提交 `fa94348` 的 CI（运行 42100350440）里 `smoke-qemu` 的 SMP=2 步骤出现 `hello152: FAIL C: loopback connection`，SMP=1、host-tests、smoke-cross-arch 都成功。这和上面记录过的是同一个失败（`make_pair` 建立回环连接失败）。
+- 为什么没看到失败码：CI 脚本只打印了 `^hello[0-9]+: FAIL` 的摘要行，没有打印失败测试自己输出的其它行，所以 `make_pair failed` 那一行即使存在也没出现在日志里。
+- 复现尝试：`fa94348` 的内核上 hello152 在 SMP=2 单独启动 11 次加 14 次，共 25 次全部通过，**没有复现**。`make_pair` 里只有 `socket/bind/listen/connect/accept4/netpoll`，没有 `recv/send`，而 `fa94348` 的改动（`reportRecvResult`、`sendFailure` 里清标志）只作用在 `recv/send` 路径，所以从读码看不太可能有因果关系；但我**没有**在同一环境下对比 `de07714` 与 `fa94348` 的失败率，样本也太小（失败率若在 5% 量级，25 次干净的概率仍有约 28%），所以不能断言无关，也不能断言已修。
+- 这一轮做的事（只加诊断，不改行为）：①`tools/qemu_smoke.sh` 在报告 `FAIL` 时，对每个失败的 hello 程序（最多 5 个）再打印它输出的全部行（最多 40 行），下次 CI 失败能直接看到失败码；②`user/hello152.c` 的 `make_pair` 失败时打印失败步骤和最后一次系统调用的返回值（原来只打印步骤，且对大于 9 的值截断）。
+- 状态：**已知未解决的偶发问题**，不是已修复。下一次出现时，日志里会有 `hello152: make_pair failed, step N, last syscall result R`，据此再查。
