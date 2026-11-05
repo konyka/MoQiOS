@@ -94,8 +94,8 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello229`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28` **不**在
-   init 自动序列内），并 `waitpid` 收回；随后进入交互 shell。
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello229`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+   init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
 3. 测试全部通过后启动一次交互式 Shell（`sh`）；PID 1 保持运行并继续回收子进程。

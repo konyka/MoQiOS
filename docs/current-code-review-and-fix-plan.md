@@ -6766,7 +6766,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 ## 文档里写死的范围和规模（核对）
 
 - 核对对象：文档里反复出现的"init 自动 spawn hello2–hello101""用户程序约 3,600 行""内核约 63,000 行"。
-- 事实（用 `servers/init/main.c` 和 `wc -l` 取得）：init 的 `run_test` 序列是 216 个、编号 3 到 229，另有 4 个静默版本（hello13..hello16）和 hello2；`user/` 里有 14 个编号不在序列里：hello2（汇编、用 `spawn_child` 单独跑）、hello6（读键盘会阻塞）、hello11（`exec` 目标）、hello28、hello116（hello115 的 exec 目标）、hello149（手工复现程序）、hello230–hello233（hello227 用的探针）；hello13..hello16 在 init 里以静默方式跑。内核 Zig 约 108,800 行（含 `kernel/shared` 里的内核自检；去掉 `sk*` 约 96,800 行），`user/*.c` 加汇编约 41,800 行，moqi_libc 约 9,500 行。
+- 事实（用 `servers/init/main.c` 和 `wc -l` 取得）：init 运行 hello2（`spawn_child`，单独处理）加 220 个 `run_test`/`run_test_quiet` 序列项（其中 4 个是静默版本 hello13..hello16），编号最大到 229。`user/` 里**不在 init 序列**的编号有 9 个：hello6（读键盘会阻塞）、hello11（`exec` 目标）、hello28、hello116（hello115 的 exec 目标）、hello149（手工复现程序）、hello230–hello233（hello227 用的探针）。内核 Zig 约 108,800 行（含 `kernel/shared` 里的内核自检；去掉 `sk*` 约 96,800 行），`user/*.c` 加汇编约 41,800 行，moqi_libc 约 9,500 行。（这一条第一版写成“216 个、14 个不在序列里”，是只数了 `run_test("…")`、漏掉 `run_test_quiet` 和 `spawn_child("hello2")` 得到的错误数字，已按实测改正。）
 - 修改：`docs/user-space.md`（init 范围、测试程序总范围）、`docs/moqios-architecture-current.md`（五处 hello2–hello101）、`README.md`、`README.en.md`（规模数字，并在测试程序表前注明表只列早期用例、完整情况看 user-space.md 第 4 节）。
 - 如实说明：①"hello2–hello229"是序列的两端，序列中间并不连续（上面那 14 个不在其中）；②规模数字是一次 `wc -l` 的取整结果，会随提交变化，所以写成"约"并注明统计口径和时间；③`docs/` 里其它文件的数字（例如各轮验证记录里的"host 720/720"）是当时的历史记录，没有改。
 
