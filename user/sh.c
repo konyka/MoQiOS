@@ -447,12 +447,23 @@ static int execute_pipeline(const char *line) {
             if (rest[idx]) {
                 char kv[256];
                 unprotect(kv, rest + idx, sizeof(kv));
-                moqi_setenv(kv);
-                /* The kernel's per-task table above is what "$NAME" reads; the C library's environ is what the programs started
-                 * from here inherit (it is passed to execve), so both are kept in step. */
                 char *eq = kv;
                 while (*eq && *eq != '=') eq++;
+                /* The name before '=' (or the whole word when there is none) must look like a variable name. */
+                int valid = kv[0] != '\0' && kv[0] != '=' && !(kv[0] >= '0' && kv[0] <= '9');
+                for (const char *c = kv; c < eq && valid; c++)
+                    if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '_')) valid = 0;
+                if (!valid) {
+                    print("export: not a valid name\n");
+                    return 1 << 8;
+                }
                 if (*eq == '=') {
+                    /* The kernel's per-task table is what "$NAME" reads; the C library's environ is what the programs started
+                     * from here inherit (it is passed to execve), so both are kept in step. */
+                    if (moqi_setenv(kv) < 0) {
+                        print("export: cannot set\n");
+                        return 1 << 8;
+                    }
                     *eq = '\0';
                     setenv(kv, eq + 1, 1);
                 }

@@ -320,6 +320,24 @@ int main(int argc, char **argv, char **envp) {
     st = system("echo hi > /tmp/h227_no_such_dir/out && exit 6");
     check(exited(st, 1), "B: '&&' after it does not");
 
+    /* B12: export failures and forms. A name without "=" is not an assignment: "export NAME" marks an existing variable (here: it
+     * succeeds and leaves the value alone) and is status 0 whether or not NAME is set; an empty name ("=x") or a name with
+     * characters a variable cannot have is status 1; running out of room in the environment table is status 1. */
+    st = system("export =novalue");
+    check(exited(st, 1), "B: 'export =x' (empty name) is status 1");
+    st = system("export =novalue || exit 6");
+    check(exited(st, 6), "B: and '||' after it runs the next command");
+    st = system("export H231V=kept ; export H231V ; hello231 kept");
+    check(exited(st, 0), "B: 'export NAME' without a value keeps the value and passes it on");
+    st = system("export H231NOTSET");
+    check(exited(st, 0), "B: 'export NAME' for a name that is not set is status 0");
+    st = system("export H231V=ok ; export H231V=ok2 && hello231 ok2");
+    check(exited(st, 0), "B: a successful export is status 0 (the '&&' command runs)");
+    st = system("export A.B=1");
+    check(exited(st, 1), "B: a name containing '.' is status 1");
+    st = system("export 1ABC=1");
+    check(exited(st, 1), "B: a name that starts with a digit is status 1");
+
     /* C: the caller's signal state is exactly what it was */
     struct ksigaction a = { on_int, 0, 0, 0 };
     sigaction(SIGINT, &a, (struct ksigaction *)0);

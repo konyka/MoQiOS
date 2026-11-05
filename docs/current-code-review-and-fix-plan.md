@@ -6688,3 +6688,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 结果：hello227 共 80 项，SMP=1 全过。
 - 如实说明：①只修了这一处；`fork`/`pipe` 失败的 `return -1` 由 `execute_list` 的调用方按"负数 = 失败"处理，没有改；②`sh -c` 在 `status < 0` 时以 1 结束。
 
+## shell 的 `export` 校验名字并报告失败（hello227 B12）
+
+- 缺口：`export` 对任何输入都返回 0：`export =x`（空名字）、`export A.B=1`、`export 1ABC=1` 这类写法被原样交给内核和 `setenv`，既不报错也不是失败状态；内核表写满（`moqi_setenv` 返回负数）也被忽略。上一节的"其它内建的失败状态没有审计"里点名的就是这一条。
+- 红灯：hello227 新增 7 项，旧 shell 上 4 项失败（空名字状态 1、其后 `||` 运行下一个命令、含 `.` 的名字、数字开头的名字）；`export NAME` 保持原值、对未设置的名字状态 0、成功的 export 状态 0 三项旧 shell 本来就过，约束力弱。
+- 实现（`user/sh.c`）：名字（`=` 之前或整词）必须匹配 `[A-Za-z_][A-Za-z0-9_]*`，否则打印 `export: not a valid name` 并返回 `1 << 8`；`moqi_setenv` 失败时打印 `export: cannot set` 并返回 1；成功才去调 libc 的 `setenv`。
+- 结果：hello227 共 87 项，SMP=1 全过。
+- 如实说明：①"内核环境表写满返回 1"这条路径**没有用例**（需要先写满 ENV_MAX_VARS 个变量，x86 下是 32 个，没有写这个测试）；②`export NAME` 只是接受，不会把一个已存在于内核表而不在 `environ` 里的变量补进 `environ`；③`pwd` 在 `getcwd` 失败时仍返回 0，未改（`getcwd` 在正常运行中不会失败）。
+
