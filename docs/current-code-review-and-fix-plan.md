@@ -6621,7 +6621,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：`syscall_restart_policy.zig` 的可重启表扩到 `wait4`(61/263)、`readv`(138/19)、`writev`(139/20)、`accept`(120/43)、`accept4`(131)、`sendto`(121/44)、`recvfrom`(122/45)、`sendmsg`(129/46)、`recvmsg`(130/47)；这些调用的分发分支原来不在返回前投递信号，现在补上了 `checkSignalsOnSyscallReturn`（共 14 个分支：120、122、130、131、138、140、263、19、43、44、45、46、47、61；`preadv`(140) 也补了，但它不在可重启表里）。
 - 不重启：`connect`（POSIX 规定被打断后连接继续在后台进行）、`flock`、`futex`、睡眠、`pause`、`sigsuspend`、poll/epoll/select 的等待。
 - 变异：从表里删掉 `recvfrom`(45) 并加入 `connect`(42)，host 测试抓住。
-- 如实说明：①hello229 里只验证了 `readv`、`wait4`、`recvfrom` 三个新增调用的真实行为，`accept`、`sendto`、`sendmsg`、`recvmsg`、`writev` 只靠策略表的单元测试和代码审查，**没有各自的 QEMU 用例**；②`preadv`/`pwritev`/`pread`/`pwrite` 是否阻塞取决于文件类型，未列入可重启表；③`tty` 读走的是 `read`(10)，已包含，但没有单独验证；④仍只有 x86_64 实现。
+- 如实说明：①hello229 的 E 组验证了 `readv`、`wait4`、`recvfrom`，H 组（见文末）补上了 `accept` 和 `writev`；`sendto`、`sendmsg`、`recvmsg`、`accept4` 仍只靠策略表的单元测试和代码审查，**没有各自的 QEMU 用例**；②`preadv`/`pwritev`/`pread`/`pwrite` 是否阻塞取决于文件类型，未列入可重启表；③`tty` 读走的是 `read`(10)，已包含，但没有单独验证；④仍只有 x86_64 实现。
 
 ## 管道写会阻塞（hello229 F 组）
 
@@ -6640,4 +6640,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 副作用：一个 4095 字节的原子写要等管道完全读空才能进去，所以读得慢的读者会让这类写者等得更久；但不会死锁（读者读空即放行）。
 - 变异：把 `atomic` 的阈值改成 `count <= 1`，host 源码断言抓住；QEMU 层面没有再单独做这一变异（恒真那种变异因未使用变量编译失败，不算有效变异）。
 - 如实说明：①host 测试仍是源码文本断言加 QEMU 行为用例；②`splice`/`sendfile` 经过 `pipeWrite`，块大小事先受 `destinationCapacity` 限制，原子条件不会让它们卡住，但没有单独测；③只在 x86_64 实测。
+
+## hello229 H 组：accept 与 writev 的 SA_RESTART 实测
+
+- 缺口：`accept` 和 `writev` 在可重启表里，但没有 QEMU 用例证明它们在真内核上确实被打断、确实重启。
+- 做法：H 组 7 项（AF_UNIX 流套接字）：无 `SA_RESTART` 的阻塞 `accept` 返回 `-EINTR` 且之后连接的客户端仍能被接受；有 `SA_RESTART` 的 `accept` 等过处理函数返回连接；满管道上的 `writev` 无 `SA_RESTART` 返回 `-EINTR`，有 `SA_RESTART` 写满 4095 字节，读者先后收到 4095 字节填充和 4095 字节 `writev` 数据。
+- 结果：这些用例**第一次运行就全部通过**，没有红灯阶段——内核改动在上一轮已经做完，这一组只是把原来靠审查的结论变成实测。因此它们不能证明"修复前会失败"，只证明当前行为正确；对应的变异（从可重启表里删掉 43/20）会被上面那个 host 策略表测试抓住，H 组本身没有单独做变异。
+- 仍缺 QEMU 用例：`sendto`、`sendmsg`、`recvmsg`、`accept4`。
 

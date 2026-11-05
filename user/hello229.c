@@ -308,6 +308,91 @@ int main(int argc, char **argv, char **envp) {
     close(p[0]);
     close(p[1]);
 
+    /* H: accept and writev, the two restartable calls the groups above did not reach. */
+    struct { unsigned short family; char path[108]; } ua;
+    ua.family = 1;
+    const char *sp = "/tmp/h229.sock";
+    int pl = 0;
+    while (sp[pl]) { ua.path[pl] = sp[pl]; pl++; }
+    ua.path[pl] = 0;
+    long ualen = 2 + pl + 1;
+    unlink(sp);
+    long srv = syscall3(SYS_socket, 1, 1, 0);
+    check(srv >= 0 && syscall3(SYS_bind, srv, (long)&ua, ualen) == 0 && syscall3(SYS_listen, srv, 4, 0) == 0, "H: a listening AF_UNIX stream socket");
+
+    install(0);
+    kid = fork();
+    if (kid == 0) {
+        pause_ms(60);
+        kill(me, SIGUSR1);
+        pause_ms(60);
+        long c = syscall3(SYS_socket, 1, 1, 0);
+        int ok = syscall3(SYS_connect, c, (long)&ua, ualen) == 0;
+        pause_ms(30);
+        close((int)c);
+        _exit(ok ? 0 : 1);
+    }
+    long conn = syscall3(43 /* accept */, srv, 0, 0);
+    check(conn == -EINTR && hits == 1, "H: without SA_RESTART a blocked accept returns -EINTR");
+    if (conn == -EINTR) conn = syscall3(43, srv, 0, 0);
+    check(conn >= 0, "H: and the client that connects afterwards is still accepted");
+    if (conn >= 0) close((int)conn);
+    waitpid(kid, (int *)0, 0);
+
+    install(SA_RESTART_BIT);
+    kid = fork();
+    if (kid == 0) {
+        pause_ms(60);
+        kill(me, SIGUSR1);
+        pause_ms(60);
+        long c = syscall3(SYS_socket, 1, 1, 0);
+        int ok = syscall3(SYS_connect, c, (long)&ua, ualen) == 0;
+        pause_ms(30);
+        close((int)c);
+        _exit(ok ? 0 : 1);
+    }
+    conn = syscall3(43, srv, 0, 0);
+    check(conn >= 0 && hits == 1, "H: with SA_RESTART accept waits through the handler and returns the connection");
+    if (conn >= 0) close((int)conn);
+    waitpid(kid, (int *)0, 0);
+    close((int)srv);
+    unlink(sp);
+
+    /* writev to a full pipe: interrupted without SA_RESTART, completed with it. */
+    static char wa[3000], wb[1095];
+    memset(wa, 'a', sizeof wa);
+    memset(wb, 'b', sizeof wb);
+    struct iovec_ wv[2] = { { wa, sizeof wa }, { wb, sizeof wb } };
+    install(0);
+    pipe(p);
+    r = write(p[1], big, 4095);
+    kid = spawn_signaller(me, -1, (const char *)0, 0);
+    r = syscall3(20 /* writev */, p[1], (long)wv, 2);
+    check(r == -EINTR && hits == 1, "H: without SA_RESTART a blocked writev returns -EINTR");
+    waitpid(kid, (int *)0, 0);
+    install(SA_RESTART_BIT);
+    kid = fork();
+    if (kid == 0) {
+        pause_ms(60);
+        kill(me, SIGUSR1);
+        pause_ms(60);
+        char rb[4096];
+        long n = read(p[0], rb, sizeof rb);
+        long tot = n;
+        while (tot < 4095 + 4095 && n > 0) {
+            n = read(p[0], rb, sizeof rb);
+            if (n > 0) tot += n;
+        }
+        _exit(tot == 4095 + 4095 ? 0 : 1);
+    }
+    r = syscall3(20, p[1], (long)wv, 2);
+    check(r == 4095 && hits == 1, "H: with SA_RESTART writev waits through the handler and writes all 4095 bytes");
+    close(p[1]);
+    st = -1;
+    waitpid(kid, &st, 0);
+    check(((st >> 8) & 0xff) == 0, "H: and the reader received the 4095 filler bytes plus the 4095 writev bytes");
+    close(p[0]);
+
     print(failures == 0 ? "hello229: PASS\n" : "hello229: FAIL\n");
     return failures;
 }
