@@ -1,4 +1,4 @@
-/// hello135: signal call argument and errno rules.
+/// hello139: poll and select readiness and timeouts.
 
 #include <stdint.h>
 

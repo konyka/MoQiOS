@@ -1,4 +1,4 @@
-/// hello135: signal call argument and errno rules.
+/// hello144: UDP receive: blocking, timeout, non-blocking.
 
 #include <stdint.h>
 

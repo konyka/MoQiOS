@@ -1,4 +1,4 @@
-/// hello135: signal call argument and errno rules.
+/// hello145: UDP sendmsg/recvmsg and the AF_UNIX receive timeout.
 
 #include <stdint.h>
 

@@ -1,4 +1,4 @@
-/// hello135: signal call argument and errno rules.
+/// hello143: socket options on every socket kind.
 
 #include <stdint.h>
 

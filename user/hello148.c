@@ -1,4 +1,4 @@
-/// hello135: signal call argument and errno rules.
+/// hello148: fstat reports the right file type for every descriptor kind.
 
 #include <stdint.h>
 

@@ -213,6 +213,10 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello44 | SCHED_FIFO / SCHED_RR 实时调度类（F3） |
 | hello50 | SMP 并发压力（J1）：4 个 worker 经 sched_setaffinity 绑核（CPU 数不足返回 EINVAL 时跳过绑核、SMP=1 下共享 CPU 0），各跑 300 轮 tmpfs 文件写读校验 + pipe + loopback UDP 自收发 + 64 KiB 匿名 mmap 校验；任一轮数据错误或异常负返回 → 子进程以 10+i 退出，父进程汇总 PASS/FAIL |
 | hello45..hello101 | 当前验收门禁，覆盖 libc ABI、IPC、网络、SMP、swap 与 raw syscall；完整启动顺序以 `servers/init/main.c` 和 `tools/qemu_smoke.sh` 为准 |
+| hello102..hello113 | 内核行为回归：阻塞 `clock_nanosleep`/`getrusage`、`UMIP`、实时线程唤醒抢占、超时在下一个 tick 到期、控制台滚动开销、内核锁争用、回收僵尸不抢 RT 任务、`sigaction/sigreturn`、`madvise(MADV_DONTNEED)`、`kill`/`SIGCHLD`、`sigaltstack`、SysV IPC/poll/AF_UNIX 加固 |
+| hello114..hello134 | 第二块 virtio 盘上的只读 ext4/NTFS；身份变更与能力；`prctl`；`memfd_create`；`rename`/`renameat2`；`mseal`；工作目录与目录描述符；`execve` 错误；`utimensat`；`linkat`/`symlinkat`/`fchownat`；`statx`；`access`；`open/unlink/rmdir/mkdir/rename/truncate` 的 errno；fd 语义；`fcntl/dup3/pipe`；`mmap` 家族错误；时钟；进程生命周期；`socket` 类型标志 |
+| hello135..hello148 | 信号调用参数与 errno；实时信号 32..64；`siginfo_t`/`ucontext_t`；`uname`/`rlimit`/`sysinfo`；`poll/select`；`ppoll/pselect6`；`ioctl`；`SCM_RIGHTS`；各种 socket 选项；UDP 阻塞/超时接收；`sendmsg/recvmsg`；`sendmmsg/recvmmsg`；`fstat` 文件类型 |
+| hello149..hello195 | AF_UNIX 阻塞写与 `shutdown`；TCP 读写/半关闭/`SIGPIPE`/`poll`/`EPOLLRDHUP`/关闭端口的 RST；UDP 端口不可达；`MSG_PEEK/WAITALL/TRUNC`；`SEQPACKET`；进程 CPU 时间；IPv6 回环；`TIOCOUTQ`、`SO_SNDBUF/RCVBUF`、网卡 ioctl、TCP/IP/套接字选项；`getsockname`；`bind` 错误；各类 errno 一致性（对照真实 Linux）；hello190..hello193 是敌意参数扫描；hello195 是 `dns_resolve`。hello149 是只在手工启动时用的复现程序，init 与冒烟不跑它 |
 | hello196..hello199 | `gethostbyname_ipv4`/`ipv4_to_text`；`gettimeofday` 指针错误；`mlock` 与 `mlockall`/`MAP_LOCKED` 的 `RLIMIT_MEMLOCK` 门禁（期望值取自真实 Linux） |
 | hello200..hello208 | moqi_libc 在真内核上的验收：`mmap` 家族、时间 API、`gmtime_r/timegm/mktime/strftime`、`strptime/asctime/ctime`、`strtol` 家族与 `string.h`、`qsort/bsearch/rand_r`、`setenv` 家族（含传给 `execve`）、`realloc` 与对齐分配、`printf` 家族 |
 | hello209..hello215 | 线程共享的进程状态：`brk`、映射、信号处置、`RLIMIT_AS`、资源限制、`chdir`/`umask`（`CLONE_FS`）、`pthread_create`+`join` 反复 |

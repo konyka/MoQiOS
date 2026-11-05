@@ -1,4 +1,4 @@
-/// hello135: signal call argument and errno rules.
+/// hello164: SCM_CREDENTIALS / SO_PASSCRED on AF_UNIX sockets.
 
 #include <stdint.h>
 

@@ -1,4 +1,4 @@
-/// hello135: signal call argument and errno rules.
+/// hello146: sendmmsg / recvmmsg.
 
 #include <stdint.h>
 

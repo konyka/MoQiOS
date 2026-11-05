@@ -1,4 +1,4 @@
-/// hello135: signal call argument and errno rules.
+/// hello142: SCM_RIGHTS descriptor passing.
 
 #include <stdint.h>
 

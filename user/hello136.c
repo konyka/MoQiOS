@@ -1,4 +1,4 @@
-/// hello135: signal call argument and errno rules.
+/// hello136: real-time signals 32..64.
 
 #include <stdint.h>
 

@@ -1,4 +1,4 @@
-/// hello135: signal call argument and errno rules.
+/// hello138: uname, hostname, rlimit and sysinfo.
 
 #include <stdint.h>
 

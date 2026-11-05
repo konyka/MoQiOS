@@ -1,4 +1,4 @@
-/// hello135: signal call argument and errno rules.
+/// hello140: ppoll and pselect6.
 
 #include <stdint.h>
 
