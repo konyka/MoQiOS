@@ -2267,7 +2267,7 @@ pub fn freeFdTable(table: *FdTable) void {
 /// Kinds whose reference is held per descriptor (every dup'd fd owns one);
 /// all others hold one reference per distinct resource per table.
 fn refIsPerFd(t: FdType) bool {
-    return t == .pipe_read or t == .pipe_write or t == .fat32_file;
+    return t == .pipe_read or t == .pipe_write or t == .fat32_file or t == .tmpfs_file;
 }
 
 /// Take one more reference to the resource behind `desc`. False for kinds that
@@ -2351,6 +2351,12 @@ pub fn retainSharedResources(table: *FdTable) void {
         if (slotLifecycle(@atomicLoad(u32, &table.transfer_state[i], .acquire)) != SLOT_LIVE) continue;
         const desc = &table.fds[i];
         if (desc.fd_type == .none) continue;
+        // tmpfs is reference counted per descriptor (open takes one, dup retains one, close releases one), so every copied descriptor
+        // retains its own; the once-per-resource scan below is for the kinds whose close runs once per table.
+        if (desc.fd_type == .tmpfs_file) {
+            @import("tmpfs.zig").tmpfsRetain(@intCast(desc.tmpfs_idx));
+            continue;
+        }
         var seen = false;
         for (0..i) |j| {
             if (slotLifecycle(@atomicLoad(u32, &table.transfer_state[j], .acquire)) != SLOT_LIVE) continue;
@@ -2365,7 +2371,6 @@ pub fn retainSharedResources(table: *FdTable) void {
                 .unix_socket => seen = other.unix_sock_idx == desc.unix_sock_idx,
                 .timerfd => seen = other.timerfd_idx == desc.timerfd_idx,
                 .eventfd => seen = other.eventfd_idx == desc.eventfd_idx,
-                .tmpfs_file => seen = other.tmpfs_idx == desc.tmpfs_idx,
                 else => {},
             }
             if (seen) break;
@@ -2374,7 +2379,6 @@ pub fn retainSharedResources(table: *FdTable) void {
         switch (desc.fd_type) {
             .ext2_file => @import("ext2.zig").retainFile(desc.ext2_file_idx),
             .fat32_file => @import("fat32.zig").retainFile(desc.fat32_file_idx),
-            .tmpfs_file => @import("tmpfs.zig").tmpfsRetain(@intCast(desc.tmpfs_idx)),
             .tcp_socket => {
                 const tcp = @import("../net/tcp.zig");
                 tcp.tcpRetain(desc.tcb_idx);

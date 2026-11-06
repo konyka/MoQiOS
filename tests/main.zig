@@ -3330,6 +3330,23 @@ test "tmpfs references: every descriptor owns one open_count, so close never tre
     try std.testing.expect(std.mem.indexOf(u8, src[dupat..dupat_end], "tmpfsRetain(") != null);
 }
 
+test "fork retains a tmpfs entry once per descriptor, the same count close releases" {
+    const src = kt.vfs_source;
+    const start = std.mem.indexOf(u8, src, "pub fn retainSharedResources(") orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, src, start, "/// Block read callback for readahead") orelse return error.TestUnexpectedResult;
+    const body = src[start..end];
+    // tmpfs must not be de-duplicated per table (the "seen" scan), because close releases one reference per descriptor.
+    try std.testing.expect(std.mem.indexOf(u8, body, ".tmpfs_file => seen") == null);
+    // ...and the retain for tmpfs is taken for every descriptor, so it must sit before the "seen" skip.
+    const retain = std.mem.indexOf(u8, body, "if (desc.fd_type == .tmpfs_file) {") orelse return error.TestUnexpectedResult;
+    const skip = std.mem.indexOf(u8, body, "if (seen) continue;") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(retain < skip);
+    try std.testing.expect(std.mem.indexOf(u8, body[retain..skip], "tmpfsRetain(") != null);
+    // SCM_RIGHTS: a passed tmpfs descriptor keeps its own reference as well.
+    const per_fd = std.mem.indexOf(u8, src, "fn refIsPerFd(") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, src[per_fd .. per_fd + 200], ".tmpfs_file") != null);
+}
+
 test "tmpfs mkdir releases the reference its create took, so rmdir can free the slot" {
     const source = kt.tmpfs_source;
     const start = std.mem.indexOf(u8, source, "pub fn tmpfsMkdirAuthorized(") orelse return error.TestUnexpectedResult;

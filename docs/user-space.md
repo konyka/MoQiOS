@@ -237,7 +237,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello238 | `pselect` 与 `epoll_pwait` 的 libc 封装在真内核上：超时、`timespec` 不被改写、就绪管道；信号被阻塞且待处理时，空的临时掩码让处理函数先运行、调用以 `EINTR` 失败、旧掩码恢复；掩码为 NULL 时阻塞的信号不打断等待 |
 | hello239 | 上面那批描述符/文件调用在真内核上（48 项）：`dup` 共享偏移、`dup3` 的 `EINVAL`/`O_CLOEXEC`、`fcntl` 各命令、`pread`/`pwrite` 不动文件偏移、`truncate`/`ftruncate` 截断与零填充扩展、`fsync`/`fdatasync`、`access` 的 `ENOENT`/`EINVAL`、`umask`、`pipe2` 的 `O_NONBLOCK`/`O_CLOEXEC`、`fchdir`；以及 tmpfs 文件的大小对所有描述符一致（`truncate`/`ftruncate`/追加写通过另一个描述符可见） |
 | hello240 | `stat`/`lstat`/`fstat`/`chmod`/`fchmod`/`readlink`/`symlink`/`link` 在真内核上（tmpfs 与 ext2）：类型/权限/大小/链接数、`ENOENT`/`ENOTDIR`/`ENAMETOOLONG`/`EBADF`/`EEXIST`/`EINVAL`、符号链接 `lstat` 与 `stat` 的差别、`readlink` 不带 NUL、硬链接使 `nlink` 变 2、`chmod` 保留 setuid/setgid/sticky；文件名结尾的 `/` 对普通文件是 `ENOTDIR`（`open`/`stat`/`access`/`chmod`） |
-| hello241 | tmpfs 条目在最后一次 `close` 后归还（用“创建文件直到表满”测剩余条目数）：`create+close+unlink`、`stat` 一个已打开的文件、同一文件 `open` 两次后按两种顺序关闭、打开后 `unlink` 仍可读、`dup`/`fcntl(F_DUPFD)`/`dup3`/`dup2`（覆盖已打开的目标）、`dup` 在原描述符关闭并 `unlink` 后仍可读写、`mkdir`+`chdir`+相对名 `open`+`rmdir` 不留条目 |
+| hello241 | tmpfs 条目在最后一次 `close` 后归还（用“创建文件直到表满”测剩余条目数）：`create+close+unlink`、`stat` 一个已打开的文件、同一文件 `open` 两次后按两种顺序关闭、打开后 `unlink` 仍可读、`dup`/`fcntl(F_DUPFD)`/`dup3`/`dup2`（覆盖已打开的目标）、`dup` 在原描述符关闭并 `unlink` 后仍可读写、`mkdir`+`chdir`+相对名 `open`+`rmdir` 不留条目；`fork` 后子进程关闭自己那份、父进程的描述符仍可读写，子进程不关闭直接退出也各释放一份 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。

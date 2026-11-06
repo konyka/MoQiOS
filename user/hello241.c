@@ -166,6 +166,78 @@ int main(int argc, char **argv, char **envp) {
     snprintf(what, sizeof what, "G: mkdir, chdir, open+stat+close+unlink, rmdir leaves nothing behind (%d free, baseline %d)", n, base);
     check(n == base, what);
 
+    /* H: fork. The child's table holds its own reference per descriptor, so two descriptors of one file in the child must be closed
+     * independently: the child closes both and exits, and the parent still reads and writes the file through its own descriptor.
+     * (A reference count that is one short lets the child's closes recycle the entry under the parent's feet.) */
+    fd = (int)open("/tmp/h241f", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    write(fd, "abc", 3);
+    fd2 = (int)open("/tmp/h241f", O_RDONLY, 0);
+    long kid = fork();
+    if (kid == 0) {
+        close(fd);
+        close(fd2);
+        _exit(0);
+    }
+    int st_k = 0;
+    waitpid(kid, &st_k, 0);
+    {
+        char r3[4] = {0};
+        lseek(fd, 0, SEEK_SET);
+        long a3 = read(fd, r3, 3);
+        long w3 = write(fd, "def", 3);
+        lseek(fd2, 0, SEEK_SET);
+        char r4[8] = {0};
+        long a4 = read(fd2, r4, 6);
+        snprintf(what, sizeof what, "H: after a child closed its copies of both descriptors the parent still reads \"%s\" (%ld), writes (%ld) and the other descriptor reads \"%s\" (%ld)", r3, a3, w3, r4, a4);
+        check(a3 == 3 && memcmp(r3, "abc", 3) == 0 && w3 == 3 && a4 == 6 && memcmp(r4, "abcdef", 6) == 0, what);
+    }
+    close(fd);
+    close(fd2);
+    unlink("/tmp/h241f");
+    n = free_entries();
+    snprintf(what, sizeof what, "H: after fork, child exit and parent close the entry is back (%d free, baseline %d)", n, base);
+    check(n == base, what);
+
+    /* H2: after fork, each side closes one of its two descriptors; the file must stay usable through the other (an undercounted
+     * reference would let the entry be recycled while the parent's second descriptor is still open). */
+    fd = (int)open("/tmp/h241f", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    write(fd, "abc", 3);
+    fd2 = (int)open("/tmp/h241f", O_RDWR, 0);
+    kid = fork();
+    if (kid == 0) {
+        close(fd);
+        close(fd2);
+        _exit(0);
+    }
+    waitpid(kid, &st_k, 0);
+    close(fd);
+    unlink("/tmp/h241f");
+    {
+        char r5[4] = {0};
+        lseek(fd2, 0, SEEK_SET);
+        long a5 = read(fd2, r5, 3);
+        int mid = free_entries();
+        snprintf(what, sizeof what, "H2: the child closed both, the parent closed one and unlinked: the other still reads \"%s\" (%ld) and the entry is still held (%d free, baseline %d)", r5, a5, mid, base);
+        check(a5 == 3 && memcmp(r5, "abc", 3) == 0 && mid == base - 1, what);
+    }
+    close(fd2);
+    n = free_entries();
+    snprintf(what, sizeof what, "H2: closing the last descriptor returns the entry (%d free, baseline %d)", n, base);
+    check(n == base, what);
+
+    /* I: the child exits without closing: the kernel closes its descriptors, one release each */
+    fd = (int)open("/tmp/h241f", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    fd2 = (int)open("/tmp/h241f", O_RDONLY, 0);
+    kid = fork();
+    if (kid == 0) _exit(0);
+    waitpid(kid, &st_k, 0);
+    close(fd);
+    close(fd2);
+    unlink("/tmp/h241f");
+    n = free_entries();
+    snprintf(what, sizeof what, "I: a child that exits holding two descriptors of one file releases both (%d free, baseline %d)", n, base);
+    check(n == base, what);
+
     print(failures == 0 ? "hello241: PASS\n" : "hello241: FAIL\n");
     return failures;
 }
