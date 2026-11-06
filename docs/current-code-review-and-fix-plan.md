@@ -6997,10 +6997,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 因此 hello245 的判定是**有界**的：最多 8 次未立刻迁移（占 200 次的 4%）算通过，旧内核的最坏一次（30 次）会失败；它不断言"零"，因为剩余的竞态仍然存在，不能让一条会随机失败的断言守着冒烟。每次运行都打印确切的计数。
 - 未做：①找出剩余 0.3% 的原因（怀疑与启动初期其它 CPU 的 idle 状态有关，没有证据）；②`sched_setaffinity` 之后让调用者在返回用户态之前同步迁移（Linux 的做法），当前是异步的。
 
-## FAT32：槽位生命周期已验证；`unlink` 后已打开的描述符读不到数据（未解决，hello246）
+## FAT32：多描述符一致性与 `unlink` 后继续使用（hello246，已修）
 
-- 验证了的（hello246，5 项）：FAT32 根目录文件的槽位（表里 64 个，测得 57 个空闲）在创建/写/关闭/`unlink`、对已打开文件 `stat`、同一文件打开两次再关闭之后都归还，没有泄漏。读码确认 FAT32 的引用计数设计是对称的：`vfs` 打开时用 `openFileRetained` 每个描述符取一份、`close` 放一份、`dup`/`dup2`/`fork` 各 retain 一份、`refIsPerFd` 含 `.fat32_file`。所以 tmpfs 上那三类泄漏（hello241）在 FAT32 上不存在。
-- **发现但未修的缺陷**：我最初的 hello246 还有"`unlink` 之后，已打开的描述符继续读写文件"几项（与 Linux 一致：宿主机实测读到原数据、可继续写、最后一次 `close` 才回收）。这几项在这个内核的 FAT32 上失败：另一个描述符读到 0 字节（`3 "abc", 0 ""`），`dup` 在原描述符关闭并 `unlink` 之后写入成功但读回只有原来的 3 字节而不是 6 字节，`fork` 后子进程关闭、父进程的描述符读到 0 字节。槽位本身最终是归还的（`57 free, baseline 57`），**出问题的是数据可见性，不是泄漏**。
-- 我没有找到原因。读 `fat32.zig`：`unlink` 在 `ref_count != 0` 时只置 `unlink_pending`、不释放簇链（这一点是对的），但在这之前已经把目录项写成 `0xE5`，并且 `unlink` 路径会让页缓存/回写缓冲失效；我推测读取路径在目录项被墓碑化或缓存失效之后不再返回原数据，但**没有验证**。
-- 我做过一次修改尝试（让 `allow_pending` 分支跳过目录扫描和 `0xE5`），hello246 的失败项没有变化，说明它不是原因，已经 `git checkout` 还原，没有提交。
-- 因此 hello246 现在只含上面验证了的 5 项，**并不代表 FAT32 的 `unlink`-后继续使用已打开文件这个行为是正确的**；它是一个已知缺陷，下一轮可以从"读路径在 `unlink_pending` 之后为什么返回 0 字节"查起（`vfs.zig` 的 `.fat32_file` 读分支、`writeback.readBuffered`、`fat32.readFile`）。
+- 先前版本的本节（"未解决"）作废，下面是后来找到并修好的结论。
+- 症状（hello246 在旧内核上 7 项失败）：同一 FAT32 文件的第二个描述符看不到第一个描述符刚写的数据（`fstat` 大小 0、`SEEK_END` 0、`read` 0 字节）；`unlink` 之后另一个描述符读到 0 字节；`dup` 在原描述符关闭并 `unlink` 之后写入成功但读回只有 3 字节而不是 6 字节；`fork` 后子进程关掉它那两个描述符、父进程剩下的那个读到 0 字节。宿主机 Linux 对这些都是"看得到"。**它们同一个根因的前三项，第四项是另一个。**
+- 根因一（可见性，覆盖前三类症状）：FAT32 的写入先放进按文件共享的写回缓冲（`writeback`），要到刷盘才更新 `files[idx].size`。但每个描述符在自己的 `file_size` 字段里缓存大小，读、`fstat`、`lseek(SEEK_END)`、`O_APPEND` 写都只看这个缓存值：不是做写入的那个描述符就看到旧大小，`offset >= file_size` 直接返回 0。ext2 早就有 `refreshSize`，tmpfs 上一轮加了刷新，FAT32 没有。我先误以为是 `unlink` 抹掉了数据，读代码和一次诊断程序（输出每个描述符在 `unlink` 前后的 `fstat`/`SEEK_END`/`read`）才发现 `unlink` 之前第二个描述符就已经读到 0——所以不是 `unlink` 的问题。
+- 根因二（读取只拿到一部分）：`read` 的 FAT32 分支先试"从恰好这个偏移开始的缓冲区"，再试 readahead 缓存，最后才读盘。前两条都不会把盘上的字节和缓冲区里的字节合并，读跨越缓冲区边界或读到别的描述符之后才写的数据都不对。新增 `fat32ReadMerged`（与 `ext2ReadMerged` 同样的做法：读盘上字节再把所有暂存区间覆盖上去），`read` 和 `pread` 都走它。
+- 根因三（引用计数，对应最后一项症状）：`fork` 的 `retainSharedResources` 对 FAT32 同样是"每个进程每个文件只 retain 一次"，而 FAT32 的 `open` 是每个描述符取一份、`close` 是每个描述符放一份。同一文件在父进程里有两个描述符时，子进程只多拿一份引用却要放两份，子进程关闭两个描述符就让文件在父进程手里被回收。这和上一轮 tmpfs 的 fork 问题一模一样（那里已修）。
+- 修改：`fat32.currentSize`（记录的大小与暂存区间末端取大）；`read`/`pread`/`write`（`O_APPEND`）/`lseek(SEEK_END)`/`fstat` 在使用前取它；`fat32ReadMerged`；`retainSharedResources` 对 FAT32 每个描述符各 retain 一份（与 tmpfs 同一个位置）。host 测试加了对应的源码形状检查（`retainSharedResources` 里 FAT32 的 retain 在"每个资源一次"的扫描之前、`.fat32_file => seen` 已不存在）。
+- 红灯/绿灯：hello246 15 项，旧内核 7 项失败，新内核全部通过。我第一次修完 `currentSize` 后只剩 5 项失败，加上 `fat32ReadMerged` 后剩 1 项（`fork`），再改 `retainSharedResources` 才全绿——每一步都是单独验证的。
+- **一次回归（已修）**：我第一版 `currentSize` 的调用处写成 `desc.file_size = @max(desc.file_size, currentSize(..))`（和 ext2 的写法一样），完整冒烟 SMP=1 里 **hello114 S 项失败**（`truncate(path, 5)` 之后读回不是 5 字节）：通过另一个描述符把文件截短后，缓存值比真实大小大，`max` 让描述符继续报告旧长度。改为直接赋值 `desc.file_size = currentSize(..)`（5 处：`read`、`write`/`O_APPEND`、`pread` 的合并读、`lseek(SEEK_END)`、`fstat`），hello114 恢复通过；新增 host 测试"FAT32 的描述符大小取自文件，不与描述符的旧缓存做 max"守着这一点。**ext2 的 `refreshSize` 仍是 `max`**，它那边截短后是否有同样的问题我没有查。
+- **仍须说明的事**：①我第一版的 hello246 里 E 项的第二个描述符是只读（`O_RDONLY`），却又拿它去写，那一项失败是**测试写错**，不是内核问题，改成 `O_RDWR`；②我中间做过一次"让 `allow_pending` 跳过目录扫描"的修改，没有任何效果，已还原；③`read` 去掉了 readahead 缓存的快速路径（只保留顺序读的 `checkAndPrefetch` 预取触发），因为那条快速路径返回的是别的描述符写入之前取的旧数据。**这可能降低大文件顺序读的速度，我没有测量**；④FAT32 `write` 之后别的描述符的 readahead 缓存没有失效（read 现在不再读它，所以不影响正确性，但预取出来的页仍占着）。

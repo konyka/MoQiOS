@@ -83,7 +83,11 @@ pub fn fstat(fd: u64, stat_ptr: u64) i64 {
     bo.writeU32Le(stat_buf[24..28], fsp.mode(fd_kind, fdesc.writable));
     bo.writeU64Le(stat_buf[56..64], 4096); // st_blksize
 
-    const size: i64 = @intCast(fdesc.file_size);
+    // A FAT32 file's size includes writes still staged for it by any descriptor.
+    const size: i64 = if (fdesc.fd_type == .fat32_file)
+        @intCast(@import("fat32.zig").currentSize(fdesc.fat32_file_idx))
+    else
+        @intCast(fdesc.file_size);
     bo.writeI64Le(stat_buf[48..56], size);
 
     if (fdesc.fd_type == .rofs_file) {

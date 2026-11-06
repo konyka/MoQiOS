@@ -1385,25 +1385,13 @@ pub const FdTable = struct {
                 return @intCast(to_read);
             },
             .fat32_file => {
+                // The size belongs to the file: another descriptor may have extended it (its writes sit in the shared writeback buffer).
+                desc.file_size = @import("fat32.zig").currentSize(desc.fat32_file_idx);
                 if (desc.offset >= desc.file_size) return 0;
-                // 1. Check writeback cache (read-after-write consistency)
-                const n_cached = writeback.readBuffered(desc.inode_id, desc.offset, buf, @intCast(count), .fat32);
-                if (n_cached > 0) {
-                    desc.offset += @as(u64, n_cached);
-                    return @intCast(n_cached);
-                }
-                // 2. Check readahead cache
-                const block_num = desc.offset / 4096;
-                const block_offset: u32 = @intCast(desc.offset % 4096);
-                const cached = readahead.copyFromCache(&desc.readahead_state, block_num, block_offset, buf, @intCast(count));
-                if (cached > 0) {
-                    desc.offset += cached;
-                    _ = page_cache.recordAccess(desc.inode_id, block_num);
-                    return cached;
-                }
-                // 3. Fall back to FS readFile
-                const fat32 = @import("fat32.zig");
-                const n = fat32.readFile(desc.fat32_file_idx, @intCast(desc.offset), buf, @intCast(count));
+                // Every read is the on-disk bytes with the staged extents laid over them. The earlier shortcuts (a staged extent that
+                // starts exactly here, then the readahead copy) returned only part of a read that spanned an extent boundary, and the
+                // readahead copy was taken before another descriptor's later writes.
+                const n = fat32ReadMerged(desc, buf, count, desc.offset);
                 if (n > 0) {
                     desc.offset += @intCast(n);
                     // 4. Update readahead state and trigger prefetch
@@ -1596,7 +1584,8 @@ pub const FdTable = struct {
             },
             .pipe_read => return -1,
             .fat32_file => {
-                // O_APPEND: every sequential write goes to the current end.
+                // O_APPEND: every sequential write goes to the current end of the file, which another descriptor may have moved.
+                desc.file_size = @import("fat32.zig").currentSize(desc.fat32_file_idx);
                 if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
                 const gate = fsizeGate(desc.offset, count);
                 if (gate < 0) return gate;
@@ -1700,6 +1689,22 @@ pub const FdTable = struct {
         return @intCast(@max(disk_n, staged, want));
     }
 
+    /// Read `count` bytes at `offset` of a FAT32 file as the process must see them: the on-disk bytes with every staged (not yet written
+    /// back) extent laid over them, up to the file's current size (which includes staged writes from any descriptor). Without the overlay
+    /// a read that does not start exactly at a staged extent misses the staged bytes, and a second descriptor sees the file as it was
+    /// before the other descriptor's writes.
+    fn fat32ReadMerged(desc: *FileDescriptor, buf: [*]u8, count: usize, offset: u64) i64 {
+        const fat32 = @import("fat32.zig");
+        desc.file_size = fat32.currentSize(desc.fat32_file_idx);
+        if (offset >= desc.file_size) return 0;
+        const want: u32 = @intCast(@min(@as(u64, count), @min(desc.file_size - offset, 4096)));
+        if (want == 0) return 0;
+        @memset(buf[0..want], 0);
+        _ = fat32.readFile(desc.fat32_file_idx, @intCast(offset), buf, want);
+        _ = writeback.overlayStaged(desc.inode_id, offset, buf, want, .fat32);
+        return @intCast(want);
+    }
+
     pub fn readAtOffset(self: *FdTable, fd: u32, buf: [*]u8, count: usize, offset: u64) i64 {
         if (fd >= MAX_FDS) return -9; // EBADF
         const desc = &self.fds[fd];
@@ -1721,12 +1726,9 @@ pub const FdTable = struct {
                 return @intCast(to_read);
             },
             .fat32_file => {
+                desc.file_size = @import("fat32.zig").currentSize(desc.fat32_file_idx);
                 if (offset >= desc.file_size) return 0;
-                const n_cached = writeback.readBuffered(desc.inode_id, offset, buf, @intCast(count), .fat32);
-                if (n_cached > 0) return @intCast(n_cached);
-                const fat32 = @import("fat32.zig");
-                const n = fat32.readFile(desc.fat32_file_idx, @intCast(offset), buf, @intCast(count));
-                return n;
+                return fat32ReadMerged(desc, buf, count, offset);
             },
             .rofs_file => {
                 if (desc.rofs_is_dir) return -21; // EISDIR
@@ -2357,6 +2359,12 @@ pub fn retainSharedResources(table: *FdTable) void {
             @import("tmpfs.zig").tmpfsRetain(@intCast(desc.tmpfs_idx));
             continue;
         }
+        // FAT32 is the same: open takes one reference per descriptor (openFileRetained / createFile), dup retains one, and close releases
+        // one, so a table with two descriptors of one file needs two retains for its copy, not one.
+        if (desc.fd_type == .fat32_file) {
+            @import("fat32.zig").retainFile(desc.fat32_file_idx);
+            continue;
+        }
         var seen = false;
         for (0..i) |j| {
             if (slotLifecycle(@atomicLoad(u32, &table.transfer_state[j], .acquire)) != SLOT_LIVE) continue;
@@ -2364,7 +2372,6 @@ pub fn retainSharedResources(table: *FdTable) void {
             if (other.fd_type != desc.fd_type) continue;
             switch (desc.fd_type) {
                 .ext2_file => seen = other.ext2_file_idx == desc.ext2_file_idx,
-                .fat32_file => seen = other.fat32_file_idx == desc.fat32_file_idx,
                 .tcp_socket => seen = other.tcb_idx == desc.tcb_idx,
                 .udp_socket => seen = other.udp_port == desc.udp_port,
                 .epoll => seen = other.epoll_idx == desc.epoll_idx,
@@ -2378,7 +2385,6 @@ pub fn retainSharedResources(table: *FdTable) void {
         if (seen) continue;
         switch (desc.fd_type) {
             .ext2_file => @import("ext2.zig").retainFile(desc.ext2_file_idx),
-            .fat32_file => @import("fat32.zig").retainFile(desc.fat32_file_idx),
             .tcp_socket => {
                 const tcp = @import("../net/tcp.zig");
                 tcp.tcpRetain(desc.tcb_idx);

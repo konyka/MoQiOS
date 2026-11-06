@@ -549,6 +549,22 @@ pub fn getFileSize(idx: u32) u64 {
     return @intCast(files[idx].size);
 }
 
+/// The size every descriptor of a file must see: the larger of the size recorded in the directory entry and the end of the furthest write
+/// still staged in the writeback buffer. Callers assign it to the descriptor's cached size outright (not `max` with the cache): after a
+/// truncate through another descriptor the file is SHORTER than the cache says, and a `max` would keep reporting the old length. Writes are staged per file (shared by all descriptors) and reach `files[idx].size` only when
+/// flushed, so a descriptor that did not do the write would otherwise report a stale size, read EOF too early and show 0 bytes.
+pub fn currentSize(idx: u32) u64 {
+    const flags = fs_lock.acquire();
+    if (idx >= file_count or !files[idx].active) {
+        fs_lock.release(flags);
+        return 0;
+    }
+    const recorded: u64 = files[idx].size;
+    const inode_id: u64 = 0x2000_0000_0000_0000 + @as(u64, files[idx].first_cluster);
+    fs_lock.release(flags);
+    return @max(recorded, @import("writeback.zig").stagedEnd(inode_id, .fat32));
+}
+
 /// Best-effort prefetch of aligned 4 KiB pages into a descriptor's readahead
 /// cache. This uses FAT32 file mapping rather than treating pages as raw LBAs.
 pub fn prefetchFilePages(file_idx: u32, start_page: u64, count: u32, state: *@import("readahead.zig").ReadaheadState) void {

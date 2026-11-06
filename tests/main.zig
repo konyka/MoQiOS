@@ -3369,6 +3369,11 @@ test "fork retains a tmpfs entry once per descriptor, the same count close relea
     const skip = std.mem.indexOf(u8, body, "if (seen) continue;") orelse return error.TestUnexpectedResult;
     try std.testing.expect(retain < skip);
     try std.testing.expect(std.mem.indexOf(u8, body[retain..skip], "tmpfsRetain(") != null);
+    // FAT32 is per-descriptor too (the same rule): its retain also sits before the scan.
+    const fat_retain = std.mem.indexOf(u8, body, "if (desc.fd_type == .fat32_file) {") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(fat_retain < skip);
+    try std.testing.expect(std.mem.indexOf(u8, body[fat_retain..skip], "retainFile(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, ".fat32_file => seen") == null);
     // SCM_RIGHTS: a passed tmpfs descriptor keeps its own reference as well.
     const per_fd = std.mem.indexOf(u8, src, "fn refIsPerFd(") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, src[per_fd .. per_fd + 200], ".tmpfs_file") != null);
@@ -11132,4 +11137,21 @@ test "publishOldTask kicks the pin CPU after the task is back on its queue" {
     const enq = std.mem.indexOf(u8, body, "per_cpu.enqueueTask(old_task)") orelse return error.TestUnexpectedResult;
     const kick = std.mem.indexOf(u8, body, "kickAfterPublish(") orelse return error.TestUnexpectedResult;
     try std.testing.expect(enq < kick);
+}
+
+test "FAT32 descriptor sizes are taken from the file, never max()ed with a descriptor's stale cache" {
+    // A truncate through one descriptor shortens the file for all of them; a max() with the cached size would keep the old length
+    // (hello114 S: truncate(path, 5) must read back 5 bytes).
+    const src = kt.vfs_source;
+    var pos: usize = 0;
+    var seen: usize = 0;
+    while (std.mem.indexOfPos(u8, src, pos, "currentSize(")) |at| {
+        const line_start = std.mem.lastIndexOfScalar(u8, src[0..at], '\n') orelse 0;
+        const line_end = std.mem.indexOfPos(u8, src, at, "\n") orelse src.len;
+        const line = src[line_start..line_end];
+        try std.testing.expect(std.mem.indexOf(u8, line, "@max(desc.file_size") == null);
+        seen += 1;
+        pos = line_end;
+    }
+    try std.testing.expect(seen >= 4);
 }
