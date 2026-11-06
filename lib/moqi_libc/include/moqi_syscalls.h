@@ -47,6 +47,18 @@
 #define SYS_unlink      111
 #define SYS_getdents64  173
 #define SYS_fcntl       142
+#define SYS_pread64     136
+#define SYS_pwrite64    137
+#define SYS_dup         160
+#define SYS_dup3        161
+#define SYS_access      198
+#define SYS_truncate    210
+#define SYS_ftruncate   211
+#define SYS_fchdir      234
+#define SYS_umask       239
+#define SYS_fsync       244
+#define SYS_fdatasync   245
+#define SYS_pipe2       250
 #define SYS_mkdir       123
 
 /* Signals */

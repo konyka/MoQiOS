@@ -235,6 +235,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello236 | `epoll_*` 的 libc 封装在真内核上：packed 布局、`ADD`/`MOD`/`DEL`、`EEXIST`/`ENOENT`、超时、水平触发、数据字原样返回、写端关闭后的 `EPOLLHUP`、`EBADF`/`EINVAL` |
 | hello237 | TCP 套接字上的 epoll（回环，靠 `netpoll` 推进）：`EPOLLET` 只报新边沿；正常 FIN 关闭给 `EPOLLIN\|EPOLLRDHUP`（`0x2001`）；对端关闭时带着未读数据（RST）给 `0x2019`；被 RST 唤醒的阻塞 `recv`；监听套接字关闭时尚未被 `accept` 的已建立连接收到 RST（`0x201d`，`recv` 先 `-ECONNRESET` 再 0）；对监听套接字 `shutdown`：`SHUT_RD`/`SHUT_RDWR` 与 `close` 一样停止监听、`SHUT_WR` 不改变任何东西；RST 之后 `getsockopt(SO_ERROR)` 读到 `ECONNRESET` 一次并清掉（`send` 先报告则读到 0） |
 | hello238 | `pselect` 与 `epoll_pwait` 的 libc 封装在真内核上：超时、`timespec` 不被改写、就绪管道；信号被阻塞且待处理时，空的临时掩码让处理函数先运行、调用以 `EINTR` 失败、旧掩码恢复；掩码为 NULL 时阻塞的信号不打断等待 |
+| hello239 | 上面那批描述符/文件调用在真内核上（48 项）：`dup` 共享偏移、`dup3` 的 `EINVAL`/`O_CLOEXEC`、`fcntl` 各命令、`pread`/`pwrite` 不动文件偏移、`truncate`/`ftruncate` 截断与零填充扩展、`fsync`/`fdatasync`、`access` 的 `ENOENT`/`EINVAL`、`umask`、`pipe2` 的 `O_NONBLOCK`/`O_CLOEXEC`、`fchdir`；以及 tmpfs 文件的大小对所有描述符一致（`truncate`/`ftruncate`/追加写通过另一个描述符可见） |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。
@@ -267,6 +268,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | `src/sbrk.c` | 强符号 `__moqi_heap_grow`，基于 brk 实现 |
 | `src/unistd.c` `src/stdio.c` `src/stdlib.c` | 薄 syscall 封装、fd 1 输出与 getenv（仅 freestanding） |
 | `include/epoll.h` `src/epoll.c` | `epoll_create1`/`epoll_ctl`/`epoll_wait`/`epoll_pwait`：`struct epoll_event` 是 **packed 的 12 字节**（`events` 偏移 0、8 字节 `data` 联合偏移 4），`EPOLLIN`…`EPOLLET` 等位与 glibc 一致；成功返回内核值，失败 -1 加 errno。`epoll_pwait` 多一个信号掩码参数（`const void *`，实际是 `sigset_t *`，只用前 64 位，NULL 表示不换掩码；传给内核的大小固定 8，无掩码时 0）。没有 `epoll_create`、`epoll_pwait2` 的封装 |
+| `include/fcntl.h` `include/unistd.h` `src/fdops.c` | `dup`/`dup3`/`fcntl`/`pread`/`pwrite`/`truncate`/`ftruncate`/`fsync`/`fdatasync`/`access`/`umask`/`pipe2`/`fchdir`：POSIX/glibc 约定（成功返回内核值，失败 -1 加 errno；`umask` 不会失败）。`fcntl(fd, cmd, ...)` 的第三个参数按 `long` 读；`fcntl.h` 提供 `O_NONBLOCK`/`O_CLOEXEC`/`O_EXCL`/`O_DIRECTORY`/`O_NOFOLLOW`/`O_ACCMODE` 与 `F_*`/`FD_CLOEXEC`（`O_RDONLY`…`O_APPEND` 仍在 `unistd.h`），`unistd.h` 提供 `F_OK`/`R_OK`/`W_OK`/`X_OK`。宿主机测试 `test_fdops_abi` |
 | `include/select.h` `src/select.c` | `select`、`pselect`、`fd_set`（128 字节，`FD_SETSIZE` 1024）和 `FD_ZERO/FD_SET/FD_CLR/FD_ISSET`，布局与 glibc 一致（`FD_SET(3)` 使第 0 个 64 位字等于 0x8）；失败 -1 加 errno，超时 0；内核把剩余时间写回非空的 `timeval`。宏不检查描述符是否小于 `FD_SETSIZE`。`pselect` 的超时是 `const struct timespec *`（NULL 永久等待）加一个可选信号掩码；库把超时拷到局部变量再交给内核，所以调用者的 `timespec` 不会被改写（与 glibc 的包装一致），掩码在等待期间替换阻塞集、返回前恢复 |
 | `include/poll.h` `src/poll.c` | `poll`/`ppoll`：glibc 的 `struct pollfd`（8 字节）和事件位；`poll` 返回就绪描述符个数、超时 0、失败 -1 加 errno（被信号处理函数打断是 `EINTR`）；`ppoll` 的信号掩码大小固定传 8（掩码为 NULL 时传 0）。`select()` 见 `select.h` |
 | `include/errno.h` `time.h` `mman.h` `resource.h` `netdb.h` `byteorder.h` `setjmp.h` `pthread.h` `math.h` `getopt.h` `dirent.h` | 对应的 libc 头文件：`errno`（每线程）、`clock_gettime`/`nanosleep`/`strftime` 等、`mmap` 家族、`getrlimit`/`setrlimit`、`gethostbyname`/`getaddrinfo`（仅 IPv4）、`htons` 家族、`setjmp` 家族（仅 x86-64）、pthread 子集、`<math.h>` 里结果有精确定义的部分 |

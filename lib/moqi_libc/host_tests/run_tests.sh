@@ -144,6 +144,12 @@ $CC $CFLAGS -Dpoll=moqi_poll -Dppoll=moqi_ppoll -DMOQI_HOST_TEST_SYSCALL -c ../s
 $CC $CFLAGS -o "$OUT/test_poll_abi" test_poll_abi.c "$OUT/poll.o"
 "$OUT/test_poll_abi" || fail=1
 
+echo "== test_fdops_abi =="
+FD_RENAME="-Ddup=moqi_dup -Ddup3=moqi_dup3 -Dfcntl=moqi_fcntl -Dpread=moqi_pread -Dpwrite=moqi_pwrite -Dtruncate=moqi_truncate -Dftruncate=moqi_ftruncate -Dfsync=moqi_fsync -Dfdatasync=moqi_fdatasync -Daccess=moqi_access -Dumask=moqi_umask -Dpipe2=moqi_pipe2 -Dfchdir=moqi_fchdir"
+$CC $CFLAGS $FD_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/fdops.c -o "$OUT/fdops.o"
+$CC $CFLAGS -o "$OUT/test_fdops_abi" test_fdops_abi.c "$OUT/fdops.o"
+"$OUT/test_fdops_abi" || fail=1
+
 echo "== test_select_abi =="
 $CC $CFLAGS -Dselect=moqi_select -Dpselect=moqi_pselect -DMOQI_HOST_TEST_SYSCALL -c ../src/select.c -o "$OUT/select.o"
 $CC $CFLAGS -o "$OUT/test_select_abi" test_select_abi.c "$OUT/select.o"

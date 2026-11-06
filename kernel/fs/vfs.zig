@@ -1483,6 +1483,8 @@ pub const FdTable = struct {
             .tmpfs_file => {
                 const tmpfs = @import("tmpfs.zig");
                 if (@import("namespace_policy.zig").readGate(if (tmpfs.tmpfsGetMetadata(@intCast(desc.tmpfs_idx))) |m| m.is_dir else false) != 0) return -21;
+                // The size belongs to the file: another descriptor may have truncated or extended it since this one last looked.
+                desc.file_size = tmpfs.tmpfsGetSize(@intCast(desc.tmpfs_idx));
                 if (desc.offset >= desc.file_size) return 0;
                 const n = tmpfs.tmpfsRead(@intCast(desc.tmpfs_idx), desc.offset, buf, @intCast(count));
                 if (n > 0) {
@@ -1645,16 +1647,15 @@ pub const FdTable = struct {
                 return @import("devfs_proxy.zig").ctrlWrite(desc.devfs_ctrl_idx, desc.devfs_generation, buf, count);
             },
             .tmpfs_file => {
+                const tmpfs = @import("tmpfs.zig");
+                desc.file_size = tmpfs.tmpfsGetSize(@intCast(desc.tmpfs_idx));
                 if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
                 const gate = fsizeGate(desc.offset, count);
                 if (gate < 0) return gate;
-                const tmpfs = @import("tmpfs.zig");
                 const n = tmpfs.tmpfsWrite(@intCast(desc.tmpfs_idx), desc.offset, buf, @intCast(gate));
                 if (n > 0) {
                     desc.offset += @intCast(n);
-                    if (desc.offset > desc.file_size) {
-                        desc.file_size = desc.offset;
-                    }
+                    desc.file_size = tmpfs.tmpfsGetSize(@intCast(desc.tmpfs_idx));
                 }
                 return n;
             },

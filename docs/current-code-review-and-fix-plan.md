@@ -6915,3 +6915,17 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：`tcp.zig` 新增 `tcpPendingSoError`（已存的 `so_error`，否则在 `reset_by_peer` 未被报告时是 104）；`sysGetSockopt` 的 TCP 分支用它填 `SO_ERROR`；`tcpClearSoErrorIfEqual` 读到 104 且存的 `so_error` 为 0 时同时清掉 `reset_by_peer`，所以下一次 `SO_ERROR` 和 `recv` 都看不到了。
 - 变异：把清除 `reset_by_peer` 改成空操作，K 项变成 `(104, 104, recv -104)`，被抓住，文件已恢复。
 - 如实说明：①只改了 `sysGetSockopt` 的通用 `SOL_SOCKET` 路径；`getTcpSockopt` 里原来还有一份 `SOL_SOCKET` 的选项表（含另一份 `SO_ERROR`，不认 `reset_by_peer`），但 `getTcpSockopt` 只在 `level == SOL_TCP` 时被调用，那份表是**读码确认的不可达代码**（所有 `SOL_SOCKET` 选项都先走通用路径），后来已经删除（49 行，只剩 `SOL_TCP` 选项），避免以后有人改错那一份；hello143（getsockopt 覆盖面最广的探针）在删除后仍通过；②"读取"与"清除"是两次加锁，之间若另一个线程的 `recv` 刚好报告了重置，可能出现两边都报告一次，Linux 里这是原子的；窗口很小，没有为它写并发用例；③只测了 IPv4 回环。
+
+## libc 的描述符/文件调用，以及 tmpfs 文件大小对所有描述符一致（hello239）
+
+- 缺口一（libc）：内核早有这些系统调用，但 libc 没有封装：`dup`、`dup3`、`fcntl`、`pread`、`pwrite`、`truncate`、`ftruncate`、`fsync`、`fdatasync`、`access`、`umask`、`pipe2`、`fchdir`；也没有 `<fcntl.h>`（`O_NONBLOCK`、`O_CLOEXEC`、`F_GETFL`… 只能在各探针里自己 `#define`）。写一个正常的小程序（非阻塞管道、复制描述符、检查文件权限）都做不到。
+- 实现：`src/fdops.c`（13 个函数，POSIX/glibc 约定），`include/fcntl.h`，`unistd.h` 增加声明与 `F_OK`/`R_OK`/`W_OK`/`X_OK`，`moqi_syscalls.h` 增加系统调用号。`fcntl` 是变参函数，第三个参数按 `long` 读（glibc 同样）。
+- 红灯（libc）：host 测试 `test_fdops_abi` 第一次编译就因为 `fdops.c` 不存在而失败。变异 4 个（`pread` 的偏移与长度互换、`dup3` 丢掉 flags、`umask` 当作可失败、`ftruncate` 用 `truncate` 的号）都被抓住。
+- 缺口二、三（内核，hello239 写探针时发现，宿主机 Linux 实测对照）：
+  - `fsync`/`fdatasync` 对 tmpfs 文件（`/tmp`）返回 `-EINVAL`，Linux 返回 0（内存文件系统无需刷新）。`syscallFsync` 只认 ext2/fat32。
+  - tmpfs 文件的大小在描述符里缓存（`desc.file_size`），别的描述符或路径改变大小后这个缓存不更新：`truncate(path, 4)` 之后原来的描述符 `lseek(SEEK_END)` 仍是 10、`read` 仍读到 10 字节；通过第二个描述符 `ftruncate(8)` 或追加写，第一个描述符看不到。ext2 路径早有 `refreshSize`，tmpfs 没有。
+- 红灯（内核）：hello239 的 E（`truncate` 后 `SEEK_END` 仍是 12）、F（`fsync` 得 `-1 / EINVAL`）、I 组（`SEEK_END 10 and 10`、`ftruncate(8)` 后第一个描述符仍是 10）在旧内核上失败。
+- 修复：`syscallFsync` 对 `.tmpfs_file` 返回 0；tmpfs 的 `read`、`write`（含 `O_APPEND` 取末尾）和 `lseek(SEEK_END)` 在使用前从 tmpfs 取当前大小；写完后也用 tmpfs 的大小而不是 `max(缓存, 偏移)`。
+- 变异：把 `read` 里的刷新去掉（`desc.offset >= desc.file_size` 直接用缓存），hello239 I 组里"读到旧末尾之后别人追加的字节"失败（`10 then 0`），被抓住。**第一次尝试的变异用 `@max` 保留旧值，结果测试仍全过**，因为那个测试用例（截断后读）本来就不依赖这一行——这是我写测试时的疏漏，后来补了一条"已读到旧末尾的描述符还能读到别人追加的字节"才让这一行被保护。
+- QEMU：hello239 共 48 项通过。`/tmp` 是 tmpfs，所以 `access`、`truncate`、`fsync` 等测的是 tmpfs；ext2/fat32 上的同名调用没有新用例（它们走原来的路径）。
+- 如实说明：①`pread`/`pwrite` 的 tmpfs 路径本来就按 tmpfs 的真实大小读，没有改；②`fcntl` 第三个参数在命令没有参数时读到的是寄存器里残留值，内核对这些命令忽略它；③`access` 用真实 id，没有 `faccessat` 的 `AT_EACCESS`；④这个内核 x86_64 的 `MAX_FDS` 只有 64，`fcntl(F_DUPFD, 70)` 因此是 `EINVAL`（Linux 上限远高于此），我把探针里的最小描述符改成了 40/45，**没有**改内核的 64 上限；⑤只覆盖了读/写/`SEEK_END`/`truncate`；`mmap` 一个 tmpfs 文件之后别的描述符截断它的行为没有测。

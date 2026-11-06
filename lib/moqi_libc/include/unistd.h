@@ -70,6 +70,29 @@ long rmdir(const char *path);
 long pipe(int fds[2]);
 long dup2(int oldfd, int newfd);
 
+/* Descriptor and file operations (src/fdops.c), POSIX/glibc convention: the kernel's value on success, -1 with errno on failure.
+ * Offsets are 64-bit (long). dup3 takes O_CLOEXEC (fcntl.h) and fails with EINVAL when both descriptors are the same; pipe2 takes
+ * O_NONBLOCK and O_CLOEXEC; pread/pwrite use the given offset and leave the descriptor's own offset alone (ESPIPE on a pipe);
+ * truncate/ftruncate extend with zeros or cut; fsync/fdatasync flush the file; access checks the real ids (EINVAL for a mode
+ * outside F_OK | R_OK | W_OK | X_OK); umask sets the file-creation mask and returns the old one; fchdir needs a directory. */
+#define F_OK 0
+#define X_OK 1
+#define W_OK 2
+#define R_OK 4
+
+int dup(int oldfd);
+int dup3(int oldfd, int newfd, int flags);
+long pread(int fd, void *buf, size_t count, long offset);
+long pwrite(int fd, const void *buf, size_t count, long offset);
+int truncate(const char *path, long length);
+int ftruncate(int fd, long length);
+int fsync(int fd);
+int fdatasync(int fd);
+int access(const char *path, int mode);
+unsigned int umask(unsigned int mask);
+int pipe2(int fds[2], int flags);
+int fchdir(int fd);
+
 long yield(void);
 
 void *brk(void *addr);

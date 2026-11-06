@@ -3549,6 +3549,8 @@ fn syscallLseek(fd: u32, offset: u64, whence: u32) i64 {
     }
     const off: i64 = @bitCast(offset);
     var new_off: i64 = 0;
+    // A tmpfs file's size can change through another descriptor (truncate, ftruncate, a write); SEEK_END follows the file.
+    if (whence == 2 and desc.fd_type == .tmpfs_file) desc.file_size = @import("../../fs/tmpfs.zig").tmpfsGetSize(@intCast(desc.tmpfs_idx));
     switch (whence) {
         0 => new_off = off, // SEEK_SET
         1 => new_off = @as(i64, @intCast(desc.offset)) + off, // SEEK_CUR
@@ -4348,6 +4350,8 @@ fn syscallFsync(fd: u32) i64 {
     const wb_type: @import("../../fs/writeback.zig").FsType = switch (desc.fd_type) {
         .ext2_file => .ext2,
         .fat32_file => .fat32,
+        // tmpfs lives in memory: there is nothing to flush, and Linux answers 0 for it.
+        .tmpfs_file => return 0,
         else => return -22, // EINVAL
     };
     if (wb_type != .none) {

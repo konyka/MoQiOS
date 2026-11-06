@@ -356,6 +356,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello236"); /* libc epoll wrappers */
     run_test("hello237"); /* epoll on TCP sockets */
     run_test("hello238"); /* libc pselect and epoll_pwait */
+    run_test("hello239"); /* libc dup/fcntl/pread/truncate/fsync/access/umask/pipe2/fchdir */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */
