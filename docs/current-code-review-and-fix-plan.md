@@ -7041,3 +7041,18 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 附带发现并修复（**CI 失败**）：推送 `339ea2a` 后 CI 的 smoke-qemu SMP=2 里 **hello237 B 失败一次**（`EPOLLET` 计数 `1,1,0,1`，期望 `1,0,0,1`），SMP=1 通过。本地同一二进制 SMP=1/8 冒烟通过，没有复现。我没有拿到失败时的现场数据，**根因是推测**：`processIncomingData` 对重复或乱序报文也会置 `EPOLLIN`，那样会重新触发一个已经报告过数据的边沿触发注册。我让它返回实际缓冲的字节数，三处调用只在大于 0 时通知。这一改动符合 TCP 语义（重复报文没有新的可读数据），但**不能证明就是这次失败的原因**；hello237 B 在 CI 上再出现要继续查。
 - 绿灯：hello250 每个文件系统 5 项全部通过；hello114、hello29 通过；host 1061/1061（新增两条源码形状测试：TCP 只在有字节入环时通知、目录游标算法）。
 - 未验证：①FAT32 目录流没有测（FAT32 只有根目录文件）；②ext2 目录超过 12 个直接块（`addDirEntry` 只用直接块，12 KiB 以上会失败）没有测；③hello237 B 失败的根因（见上）；④tmpfs 目录流在遍历期间有并发创建/删除时，按位图顺序的 `skip` 可能漏项或重复，没有测。
+
+## statfs/fstatfs 按文件系统报告（hello251，已修）
+
+- 起因：翻 `syscallStatfs` 时发现除了 ext4/NTFS 挂载卷之外，所有路径都返回同一块写死的数字——类型 0xEF53（ext2）、4 GiB 的"虚拟盘"、2 GiB 空闲、65536 个 inode。`/tmp`（tmpfs）和 FAT32 根目录名也报 ext2，空闲空间不随写入变化，缺失路径也返回成功。宿主机 Linux 实测 tmpfs：类型 0x01021994，写 40960 字节后 `f_bfree` 正好少 10 块，缺失路径 `ENOENT`，`<文件>/x` 为 `ENOTDIR`。
+- 红灯（修改前）：tmpfs 类型 0xef53，inode 数 65536；FAT32 类型 0xef53；缺失路径返回 0；`<文件>/x` 返回 0。ext2 只有类型碰巧对。
+- 修改：
+  - `syscallStatfs` 先走 ext4/NTFS 的路径（不变），其余路径像 `access` 一样**真的打开一次**（得到 `ENOENT`/`ENOTDIR`/搜索权限错误），按描述符所在的文件系统回答再关闭。`fstatfs` 同样按描述符类型回答。
+  - ext2：直接用超级块计数器（每次分配/释放都维护）。`f_bavail` 扣除保留给 root 的块（实测 16193 空闲、15374 可用）。
+  - FAT32：块 = 簇，空闲数扫描 FAT（FSInfo 在第一次分配后即被标记无效，没有可信计数），只数分配器允许使用的簇，所以与 ext2 共盘时不会多报；FAT 没有 inode 表，`files`/`ffree` 为 0，与 Linux 对 vfat 的行为一致。
+  - tmpfs：上限取物理页数的一半（Linux 默认），已用 = 各条目的数据页加间接页，inode = 条目表（511）；`f_namelen` 报 60，因为这个内核的 tmpfs 在 60 字节处截断名字，报 255 就是说谎。
+  - `FsStat` 新增 `rdonly`（默认 true，保持 ext4/NTFS 不变），可写文件系统清零 `f_flags` 的只读位。
+- 探针一开始的 `fstatfs` 和 `statfs` 比较、写后空闲块数检查都是第一次就绿的（"回归保护"）；真正红的是类型、inode 数、缺失路径。
+- 变异检查：第一次变异（把 `bavail` 改成 `bfree`）**编译失败**（`reserved` 变成未使用的常量），不算数；改成 `bfree - reserved + reserved` 后真编译、行为改变，hello251 的新检查"保留给 root 的块不可用"失败（`free 16193, available 16193`），还原后通过。这个检查是在第一次变异**存活**之后才加的——原先的探针只比较 `blocks >= free >= available`，等号成立，抓不到。
+- 绿灯：hello251 通过；hello114（ext4/NTFS 的 statfs，M 项）通过；host 1062/1062。
+- 未验证：①ext2 的 `f_blocks` 没有扣除元数据开销（Linux 会扣），所以与 `dumpe2fs` 的"Block count"一致而不是与 `df` 的"可用块"一致；②`statfs` 对非磁盘文件系统（`/dev`、`/proc`、管道、ramdisk）仍返回旧的写死数字；③FAT32 的 `statfs` 每次扫描整张 FAT（本夹具 3 万簇，没有计时，大盘上会很慢）；④`bavail` 没有按用户区分（root 也只看到扣除后的数）。

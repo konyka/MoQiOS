@@ -194,6 +194,7 @@ pub const sigaltstack_policy = @import("proc/sigaltstack_policy.zig");
 pub const kill_broadcast_policy = @import("proc/kill_broadcast_policy.zig");
 pub const segment_copy_policy = @import("proc/segment_copy_policy.zig");
 pub const fs_reader = @import("fs/fs_reader.zig");
+pub const fr_alias = @import("fs/fs_reader.zig");
 pub const ext4 = @import("fs/ext4.zig");
 pub const ntfs = @import("fs/ntfs.zig");
 pub const rofs_guard_policy = @import("fs/rofs_guard_policy.zig");

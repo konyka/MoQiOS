@@ -828,6 +828,36 @@ pub fn tmpfsMkdirAuthorized(path: []const u8, requested_mode: u32, umask_val: u3
 }
 
 /// Get file size.
+/// Figures for statfs(2). Linux sizes a tmpfs at half of RAM by default; the same limit is used here, and the pages in use are the data and
+/// indirect pages the entries hold. Free space is the limit minus those pages, with no clamp to free RAM, as on Linux. Inodes are the
+/// entry table (the root is not one of them).
+pub fn statFs() @import("fs_reader.zig").FsStat {
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    var used_pages: u64 = 0;
+    var it = active_bm.iterator();
+    while (it.next()) |bit| {
+        const e = &entries[bit];
+        used_pages += e.page_count;
+        if (e.indirect != 0) used_pages += 1;
+    }
+    const limit: u64 = pmm.totalPages() / 2;
+    const free: u64 = if (limit > used_pages) limit - used_pages else 0;
+    const in_use: u64 = active_bm.count() - @as(u64, if (active_bm.isSet(0)) 1 else 0);
+    const slots: u64 = MAX_FILES - 1;
+    return .{
+        .magic = 0x01021994, // TMPFS_MAGIC
+        .block_size = PAGE_SIZE,
+        .blocks = limit,
+        .bfree = free,
+        .bavail = free,
+        .files = slots,
+        .ffree = if (slots > in_use) slots - in_use else 0,
+        .name_max = MAX_NAME_LEN,
+        .rdonly = false,
+    };
+}
+
 pub fn tmpfsGetSize(idx: Idx) u32 {
     if (idx >= MAX_FILES) return 0;
     const state_held = tmpfs_lock.acquire();

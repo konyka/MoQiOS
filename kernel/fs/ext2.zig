@@ -1131,6 +1131,27 @@ pub fn currentSize(file_idx: u32) u64 {
     return @max(disk, @import("writeback.zig").stagedEnd(inode_id, .ext2));
 }
 
+/// Figures for statfs(2): the superblock's own counters (kept current by every block and inode allocation and free). `bavail` leaves out
+/// the blocks reserved for root. Blocks are not reduced by the metadata overhead, which Linux subtracts from f_blocks.
+pub fn statFs() ?@import("fs_reader.zig").FsStat {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active) return null;
+    const bfree: u64 = sb.free_blocks_count;
+    const reserved: u64 = sb.r_blocks_count;
+    return .{
+        .magic = 0xEF53,
+        .block_size = block_size,
+        .blocks = sb.blocks_count,
+        .bfree = bfree,
+        .bavail = if (bfree > reserved) bfree - reserved else 0,
+        .files = sb.inodes_count,
+        .ffree = sb.free_inodes_count,
+        .name_max = 255,
+        .rdonly = false,
+    };
+}
+
 pub fn closeFile(file_idx: u32) void {
     var flags = fs_lock.acquire();
     defer fs_lock.release(flags);

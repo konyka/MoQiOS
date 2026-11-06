@@ -75,6 +75,8 @@ pub const FsStat = struct {
     ffree: u64 = 0,
     name_max: u32 = 255,
     fsid: u64 = 0,
+    /// The read-only volumes (ext4/NTFS) are always mounted read-only; the writable filesystems clear this.
+    rdonly: bool = true,
 };
 
 pub const ST_RDONLY: u64 = 1;
@@ -94,5 +96,5 @@ pub fn encodeStatfs(st: FsStat, out: *[STATFS_SIZE]u8) void {
     w(u64, out[56..64], st.fsid, .little);
     w(u64, out[64..72], st.name_max, .little);
     w(u64, out[72..80], st.block_size, .little);
-    w(u64, out[80..88], ST_RDONLY, .little);
+    w(u64, out[80..88], if (st.rdonly) ST_RDONLY else 0, .little);
 }

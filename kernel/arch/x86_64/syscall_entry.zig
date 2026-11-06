@@ -4666,15 +4666,37 @@ fn syscallSchedSetaffinity(pid: u32, cpusetsize: u32, mask_ptr: u64) i64 {
     return 0;
 }
 
-/// #276 statfs(path, buf) — return filesystem statistics. Paths on a mounted
-/// ext4/NTFS volume report that volume's real numbers; everything else keeps
-/// the built-in figures.
+/// #276 statfs(path, buf) — return filesystem statistics. Paths on a mounted ext4/NTFS volume report that volume's real numbers; every
+/// other path is opened (so a missing path is ENOENT and "<file>/x" is ENOTDIR, with search permission checked on the way) and answered
+/// for the filesystem the descriptor lives on.
 fn syscallStatfs(path_ptr: u64, buf_ptr: u64) i64 {
     if (buf_ptr == 0 or buf_ptr >= 0x0000_8000_0000_0000) return -14;
     if (path_ptr != 0 and path_ptr < 0x0000_8000_0000_0000 and @import("../../fs/rofs.zig").anyActive()) {
         if (rofsStatfsByPath(path_ptr, buf_ptr)) |r| return r;
     }
-    return writeStatfsBuf(buf_ptr);
+    if (path_ptr == 0 or path_ptr >= 0x0000_8000_0000_0000) return -14;
+    const sched = @import("../../proc/sched.zig");
+    const tm = @import("../../proc/task.zig");
+    var name_buf: [256]u8 = undefined;
+    const name = switch (userPathResult(path_ptr, &name_buf)) {
+        .ok => |p| p,
+        .err => |e| return e,
+    };
+    if (name.len == 0) return -2;
+    const cur_idx = sched.currentTaskIndex() orelse return -1;
+    const cur = tm.getTask(cur_idx) orelse return -1;
+    var joined: [256]u8 = undefined;
+    const use_name = switch (@import("../../fs/at_path.zig").resolve(cur, -100, name, &joined)) {
+        .keep => name,
+        .path => |p| p,
+        .err => |e| return e,
+    };
+    const fd_result = cur.fd_table.openWithCredentials(use_name, 0, cur.euid, cur.egid, cur.effective_caps);
+    if (fd_result < 0) return @import("../../fs/namespace_policy.zig").lookupFailureErrno(fd_result);
+    const fd: u32 = @intCast(fd_result);
+    const kind = cur.fd_table.fds[fd].fd_type;
+    _ = cur.fd_table.close(fd);
+    return writeStatfsFor(kind, buf_ptr);
 }
 
 /// statfs for a path under a rofs mount, or null when it is not on one.
@@ -4734,6 +4756,26 @@ fn syscallFstatfs(fd: u32, buf_ptr: u64) i64 {
         const rofs = @import("../../fs/rofs.zig");
         return rofsStatfsReply(rofs.statFs(d.rofs_mount, d.rofs_gen), buf_ptr);
     }
+    return writeStatfsFor(d.fd_type, buf_ptr);
+}
+
+/// Statistics of the filesystem a descriptor of type `kind` lives on. Descriptors that do not belong to a disk filesystem (devices, /proc,
+/// pipes, the ramdisk) keep the built-in figures.
+fn writeStatfsFor(kind: vfs_mod.FdType, buf_ptr: u64) i64 {
+    const fr = @import("../../fs/fs_reader.zig");
+    const copy = @import("../../mm/copy_from_user.zig");
+    var out: [fr.STATFS_SIZE]u8 = undefined;
+    const st: ?fr.FsStat = switch (kind) {
+        .tmpfs_file => @import("../../fs/tmpfs.zig").statFs(),
+        .ext2_file => @import("../../fs/ext2.zig").statFs(),
+        .fat32_file => @import("../../fs/fat32.zig").statFs(),
+        else => null,
+    };
+    if (st) |stats| {
+        fr.encodeStatfs(stats, &out);
+        return if (copy.copyToUser(@ptrFromInt(buf_ptr), &out, out.len) == out.len) 0 else -14;
+    }
+    if (kind == .fat32_file or kind == .ext2_file) return -5; // EIO: the filesystem could not be read
     return writeStatfsBuf(buf_ptr);
 }
 

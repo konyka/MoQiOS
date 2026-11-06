@@ -586,6 +586,36 @@ pub fn prefetchFilePages(file_idx: u32, start_page: u64, count: u32, state: *@im
     }
 }
 
+/// Figures for statfs(2). A block is a cluster; the free count is a scan of the FAT (there is no trustworthy counter: FSInfo is
+/// invalidated on the first allocation). Only clusters the allocator may hand out are counted, so a disk shared with another filesystem
+/// is not over-reported. FAT keeps no inode table: files and ffree are 0, as Linux reports for vfat. Null when a FAT sector cannot be read.
+pub fn statFs() ?@import("fs_reader.zig").FsStat {
+    const guard = fs_lock.acquire();
+    defer fs_lock.release(guard);
+    if (!fat32_active) return null;
+    const entries_per_sector = @as(u32, fat32_bytes_per_sector) / 4;
+    const total_fat_entries = fat32_fat_size_sectors * entries_per_sector;
+    const by_bpb = fat_util.allocLimitCluster(fat32_data_start, fat32_sectors_per_cluster, fat32_total_data_clusters, shared_disk_foreign_lba);
+    const limit = if (by_bpb < total_fat_entries) by_bpb else total_fat_entries;
+    var free: u64 = 0;
+    var cluster: u32 = 2;
+    while (cluster < limit) : (cluster += 1) {
+        const entry = getFATEntry(cluster) orelse return null;
+        if (entry == 0) free += 1;
+    }
+    return .{
+        .magic = 0x4d44, // MSDOS_SUPER_MAGIC, which Linux uses for vfat too
+        .block_size = @as(u32, fat32_bytes_per_sector) * fat32_sectors_per_cluster,
+        .blocks = if (limit > 2) limit - 2 else 0,
+        .bfree = free,
+        .bavail = free,
+        .files = 0,
+        .ffree = 0,
+        .name_max = 255,
+        .rdonly = false,
+    };
+}
+
 pub fn getFileCount() u32 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);

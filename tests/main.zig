@@ -11213,3 +11213,19 @@ test "directory listings: ext2 cursor math is block-relative and tmpfs lists dot
     try std.testing.expect(std.mem.indexOf(u8, gd, "name = \"..\";") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.tmpfs_source, "pub fn tmpfsListDir(idx: Idx, skip: u32,") != null);
 }
+
+test "statfs: the flags field follows the mount mode and each filesystem answers with its own figures" {
+    // hello251: statfs returned one hard-coded block of numbers (type 0xEF53, a 4 GiB disk) for tmpfs, FAT32 and ext2 alike.
+    const fr = kt.fr_alias;
+    var buf: [fr.STATFS_SIZE]u8 = undefined;
+    fr.encodeStatfs(.{ .magic = 0x4d44, .block_size = 512, .blocks = 8, .bfree = 4, .bavail = 4, .rdonly = false }, &buf);
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, buf[80..88], .little));
+    fr.encodeStatfs(.{ .magic = 0xEF53, .block_size = 1024, .blocks = 8 }, &buf);
+    try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, buf[80..88], .little)); // the read-only volumes stay read-only
+    const sc = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, sc, "return writeStatfsFor(kind, buf_ptr);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sc, ".tmpfs_file => @import(\"../../fs/tmpfs.zig\").statFs(),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sc, ".ext2_file => @import(\"../../fs/ext2.zig\").statFs(),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sc, ".fat32_file => @import(\"../../fs/fat32.zig\").statFs(),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.ext2_source, ".bavail = if (bfree > reserved) bfree - reserved else 0,") != null);
+}
