@@ -1257,7 +1257,8 @@ pub const FdTable = struct {
                 // Linux's order: O_CREAT|O_EXCL, O_NOFOLLOW on a link, then the
                 // directory rules (see namespace_policy.zig).
                 const kind = ext2.openFileKind(idx) orelse .file;
-                const verdict = @import("namespace_policy.zig").openExisting(kind, flags);
+                const np = @import("namespace_policy.zig");
+                const verdict = np.openExistingNamed(kind, flags, np.hasTrailingSlash(name));
                 if (verdict != 0) {
                     ext2.closeFile(idx);
                     self.freeFd(slot);
@@ -1873,10 +1874,9 @@ pub const FdTable = struct {
                     self.slot_locks[i].release(flags);
                     return true;
                 },
-                .tmpfs_file => if (other.tmpfs_idx == desc.tmpfs_idx) {
-                    self.slot_locks[i].release(flags);
-                    return true;
-                },
+                // tmpfs is deliberately absent: every descriptor holds one tmpfs open_count (open takes it, dup and dup2 retain it), so
+                // each close releases exactly its own. Treating "another fd names the same entry" as shared made a second open of the
+                // same file (and statx, which opens internally) skip the release and leak the entry.
                 .devfs_ctrl => if (other.devfs_ctrl_idx == desc.devfs_ctrl_idx) {
                     self.slot_locks[i].release(flags);
                     return true;
@@ -2122,6 +2122,9 @@ pub const FdTable = struct {
         if (source.fd_type == .fat32_file) {
             @import("fat32.zig").retainFile(source.fat32_file_idx);
         }
+        if (source.fd_type == .tmpfs_file) {
+            @import("tmpfs.zig").tmpfsRetain(@intCast(source.tmpfs_idx));
+        }
         var copy = source;
         copy.fd_flags = @import("namespace_policy.zig").dupFdFlags(source.fd_flags, false);
         copy.offset_slot = shareOffsetFor(&self.fds[oldfd]);
@@ -2144,6 +2147,9 @@ pub const FdTable = struct {
         }
         if (self.fds[slot].fd_type == .fat32_file) {
             @import("fat32.zig").retainFile(self.fds[slot].fat32_file_idx);
+        }
+        if (self.fds[slot].fd_type == .tmpfs_file) {
+            @import("tmpfs.zig").tmpfsRetain(@intCast(self.fds[slot].tmpfs_idx));
         }
         self.publishFd(slot);
         return @intCast(slot);

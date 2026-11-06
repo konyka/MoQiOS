@@ -67,10 +67,7 @@ pub fn statx(dirfd: i64, pathname_ptr: u64, flags: u32, mask: u32, statxbuf_ptr:
     }
     const open_flags: u32 = 0;
     const fd_result = cur.fd_table.openWithCredentials(use_name, open_flags, cur.euid, cur.egid, cur.effective_caps);
-    if (fd_result < 0) {
-        // A directory on the path that denies search is EACCES, not ENOENT.
-        return if (fd_result == -13) -13 else -2;
-    }
+    if (fd_result < 0) return @import("namespace_policy.zig").lookupFailureErrno(fd_result);
     const fd: u32 = @intCast(fd_result);
     const common = describe(&cur.fd_table.fds[fd], fd);
     _ = cur.fd_table.close(fd);

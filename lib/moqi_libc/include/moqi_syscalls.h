@@ -57,6 +57,12 @@
 #define SYS_fchdir      234
 #define SYS_umask       239
 #define SYS_fsync       244
+#define SYS_link        86
+#define SYS_symlink     88
+#define SYS_readlink    89
+#define SYS_chmod       90
+#define SYS_fchmod      91
+#define SYS_statx       183
 #define SYS_fdatasync   245
 #define SYS_pipe2       250
 #define SYS_mkdir       123

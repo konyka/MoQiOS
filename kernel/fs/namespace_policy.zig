@@ -48,6 +48,29 @@ pub fn openExisting(k: Kind, flags: u32) i64 {
     }
 }
 
+/// What a failed lookup reports to stat-like calls (statx, access) that open the name only to learn whether it exists. The errors
+/// that describe the path itself pass through (EACCES for a directory that denies search, ENOTDIR for a component that is a regular
+/// file or a trailing slash on a file, ELOOP for a symlink cycle, ENAMETOOLONG); every other failure of the open (no free descriptor,
+/// no memory, a device node that does not exist) is "no such file" as far as these calls are concerned.
+pub fn lookupFailureErrno(open_result: i64) i64 {
+    return switch (open_result) {
+        -13, -20, -40, -36 => open_result,
+        else => -2,
+    };
+}
+
+/// A name that ends in '/' (other than the root itself) must denote a directory.
+pub fn hasTrailingSlash(name: []const u8) bool {
+    return name.len > 1 and name[name.len - 1] == '/';
+}
+
+/// openExisting for a name that may end in '/': that is an implicit O_DIRECTORY, so an existing regular file or a symlink to one is
+/// ENOTDIR (after the O_CREAT|O_EXCL check, which comes first on Linux).
+pub fn openExistingNamed(k: Kind, flags: u32, trailing_slash: bool) i64 {
+    if (trailing_slash and k != .directory and !((flags & O_CREAT) != 0 and (flags & O_EXCL) != 0)) return -20; // ENOTDIR
+    return openExisting(k, flags);
+}
+
 pub fn openMissing(flags: u32) i64 {
     return if ((flags & O_CREAT) != 0) 0 else -2;
 }

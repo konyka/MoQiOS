@@ -60,6 +60,14 @@ pub fn absJoin(base: []const u8, name: []const u8, buf: *[256]u8) CwdJoin {
     @memcpy(tmp[n..][0..name.len], name);
     n += name.len;
     const abs = mount_path.normalizeAbs(tmp[0..n], buf) orelse return .too_long;
+    // A trailing slash on the name still demands a directory ("file/" is ENOTDIR), so it survives the normalisation. The bare-name form
+    // for the flat root filesystems cannot carry it, so such a name stays absolute.
+    const slash = name.len > 0 and name[name.len - 1] == '/' and abs.len > 1;
+    if (slash) {
+        if (abs.len + 1 > buf.len) return .too_long;
+        buf[abs.len] = '/';
+        return .{ .path = buf[0 .. abs.len + 1] };
+    }
     if (abs.len > 1 and isPlain(abs[1..]) and !namesRootTree(abs[1..])) return .{ .path = abs[1..] };
     return .{ .path = abs };
 }

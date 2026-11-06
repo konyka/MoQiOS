@@ -328,7 +328,8 @@ pub fn tmpfsOpenAuthorized(path: []const u8, create: bool, is_dir: bool, euid: u
     if (findEntry(name, parent)) |idx| {
         if (creation_metadata.exclusiveCreateRejectsExisting(create, flags)) return -17;
         const entry = &entries[idx];
-        const rule = @import("namespace_policy.zig").openExisting(if (entry.is_dir) .directory else .file, flags);
+        const np = @import("namespace_policy.zig");
+        const rule = np.openExistingNamed(if (entry.is_dir) .directory else .file, flags, np.hasTrailingSlash(path));
         if (rule != 0) return rule;
         if (!entry.is_dir) {
             const decision = dac.decideExistingOpen(
@@ -744,7 +745,8 @@ pub fn tmpfsRename(old_path: []const u8, new_path: []const u8, m: rename_policy.
 pub fn tmpfsChmod(path: []const u8, new_mode: u32, who: Remover) i64 {
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
-    const idx = lookupLocked(path) orelse return -2;
+    const idx = lookupLocked(path) orelse return resolveErrno(path);
+    if (slashOnFile(path, idx)) return -20; // ENOTDIR
     return chmodLocked(idx, new_mode, who);
 }
 
@@ -768,7 +770,8 @@ fn chmodLocked(idx: u8, new_mode: u32, who: Remover) i64 {
 pub fn tmpfsChown(path: []const u8, uid: ?u32, gid: ?u32, who: Remover) i64 {
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
-    const idx = lookupLocked(path) orelse return -2;
+    const idx = lookupLocked(path) orelse return resolveErrno(path);
+    if (slashOnFile(path, idx)) return -20; // ENOTDIR
     return chownLocked(idx, uid, gid, who);
 }
 
@@ -787,6 +790,11 @@ fn chownLocked(idx: u8, uid: ?u32, gid: ?u32, who: Remover) i64 {
     if (uid) |u| e.uid = u;
     if (gid) |g| e.gid = g;
     return 0;
+}
+
+/// A name that ends in '/' must denote a directory: true when `path` has the trailing slash but entry `idx` is not one.
+fn slashOnFile(path: []const u8, idx: u8) bool {
+    return @import("namespace_policy.zig").hasTrailingSlash(path) and !entries[idx].is_dir;
 }
 
 fn lookupLocked(path: []const u8) ?u8 {
@@ -814,7 +822,9 @@ pub fn tmpfsMkdirAuthorized(path: []const u8, requested_mode: u32, umask_val: u3
     }
     const result = tmpfsOpenAuthorized(path, true, true, euid, egid, effective_caps, 0, requested_mode, umask_val);
     if (result < 0) return result;
-    // tmpfsOpen already created as dir; just return success
+    // The create returned a reference (open_count 1) that mkdir has no descriptor to hand to. Drop it, otherwise rmdir tombstones the
+    // directory but the slot never comes back (it stays pinned by the reference nobody releases).
+    tmpfsClose(@intCast(result));
     return 0;
 }
 

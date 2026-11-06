@@ -3614,6 +3614,7 @@ fn syscallAccessAt(dirfd: i64, pathname_ptr: u64, mode: u32, flags: u32) i64 {
     if (mode != 0) {
         if (tmpfsPath(use_name)) {
             const m = @import("../../fs/tmpfs.zig").tmpfsMetadataByPath(use_name) orelse return -2;
+            if (!m.is_dir and @import("../../fs/namespace_policy.zig").hasTrailingSlash(use_name)) return -20; // ENOTDIR
             return accessVerdictErrno(ap.verdict(.{ .mode = m.mode, .uid = m.uid, .gid = m.gid }, creds, mode));
         }
         const ext2_mod = @import("../../fs/ext2.zig");
@@ -3631,7 +3632,7 @@ fn syscallAccessAt(dirfd: i64, pathname_ptr: u64, mode: u32, flags: u32) i64 {
         _ = cur.fd_table.close(fd);
         return 0;
     }
-    return if (fd_result == -13) -13 else -2; // EACCES (path search) or ENOENT
+    return @import("../../fs/namespace_policy.zig").lookupFailureErrno(fd_result);
 }
 
 fn accessVerdictErrno(v: @import("../../fs/access_policy.zig").Verdict) i64 {

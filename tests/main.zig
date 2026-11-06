@@ -3315,6 +3315,32 @@ test "openat2 dispatch routes both syscall numbers through strict validation" {
     try std.testing.expect(std.mem.indexOf(u8, source, "_ = frame.rdi;\n             _ = frame.rdx;\n             _ = frame.r10;\n             frame.rax = @bitCast(file_io_mod.open(frame.rsi, 0));") == null);
 }
 
+test "tmpfs references: every descriptor owns one open_count, so close never treats a second descriptor as a reason to skip the release" {
+    const src = kt.vfs_source;
+    // hasSharedRef must not list tmpfs: that made the second open of a file (and statx's internal open) leak the entry.
+    const start = std.mem.indexOf(u8, src, "fn hasSharedRef(") orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, src, start, "/// Close a file descriptor.") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, src[start..end], ".tmpfs_file =>") == null);
+    // dup2 and dupFdAtLeast retain the entry, since each copy is closed with its own release.
+    const dup2 = std.mem.indexOf(u8, src, "pub fn dup2(self: *FdTable") orelse return error.TestUnexpectedResult;
+    const dup2_end = std.mem.indexOfPos(u8, src, dup2, "/// Duplicate into the lowest available slot") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, src[dup2..dup2_end], "tmpfsRetain(") != null);
+    const dupat = std.mem.indexOf(u8, src, "pub fn dupFdAtLeast(") orelse return error.TestUnexpectedResult;
+    const dupat_end = std.mem.indexOfPos(u8, src, dupat, "\n};\n") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, src[dupat..dupat_end], "tmpfsRetain(") != null);
+}
+
+test "tmpfs mkdir releases the reference its create took, so rmdir can free the slot" {
+    const source = kt.tmpfs_source;
+    const start = std.mem.indexOf(u8, source, "pub fn tmpfsMkdirAuthorized(") orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, source, start, "\n}\n") orelse return error.TestUnexpectedResult;
+    const body = source[start..end];
+    const create = std.mem.indexOf(u8, body, "const result = tmpfsOpenAuthorized(path, true, true,") orelse return error.TestUnexpectedResult;
+    const close = std.mem.indexOfPos(u8, body, create, "tmpfsClose(@intCast(result));") orelse return error.TestUnexpectedResult;
+    const done = std.mem.indexOfPos(u8, body, create, "return 0;") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(close < done);
+}
+
 test "tmpfs exclusive create rejects before existing-entry mutation" {
     const source = kt.tmpfs_source;
     const existing = std.mem.indexOf(u8, source, "if (findEntry(name, parent)) |idx|") orelse return error.TestUnexpectedResult;
@@ -8070,6 +8096,14 @@ test "relative names join the working directory; plain names from the root stay 
     try std.testing.expectEqualStrings("testdir/x", ap.underCwd("/", "testdir/x", &buf).path[1..]);
     var long: [300]u8 = @splat('a');
     try std.testing.expect(ap.underCwd("/d", long[0..255], &buf) == .too_long);
+    // A trailing slash is kept: "f/" must still demand a directory after the join (Linux: ENOTDIR for a regular file).
+    try std.testing.expectEqualStrings("/tmp/h/f/", ap.underCwd("/tmp/h", "f/", &buf).path);
+    try std.testing.expectEqualStrings("/tmp/h/f/", ap.underCwd("/tmp/h", "./f//", &buf).path);
+    try std.testing.expectEqualStrings("/testdir/f/", ap.underCwd("/testdir", "f/", &buf).path);
+    try std.testing.expectEqualStrings("/testdir/", ap.underCwd("/testdir/d", "../", &buf).path);
+    try std.testing.expectEqualStrings("/", ap.underCwd("/testdir", "..", &buf).path);
+    // Without a trailing slash nothing changes.
+    try std.testing.expectEqualStrings("/testdir/f", ap.underCwd("/testdir", "f", &buf).path);
 }
 
 test "directory-descriptor joins: a stored relative path counts from the root" {
@@ -8358,6 +8392,30 @@ test "namespace errno policy: unlink, rmdir, mkdir and open on an existing objec
     // open of a missing name: ENOENT unless O_CREAT.
     try std.testing.expectEqual(@as(i64, -2), np.openMissing(0));
     try std.testing.expectEqual(@as(i64, 0), np.openMissing(O_CREAT));
+    // A trailing slash on the name demands a directory (Linux, measured: open/stat/access/chmod of "file/" are ENOTDIR for a regular
+    // file or a symlink to one, and fine for a directory).
+    try std.testing.expectEqual(@as(i64, -20), np.openExistingNamed(.file, 0, true));
+    try std.testing.expectEqual(@as(i64, -20), np.openExistingNamed(.file, O_WRONLY, true));
+    try std.testing.expectEqual(@as(i64, -20), np.openExistingNamed(.symlink, O_NOFOLLOW, true));
+    try std.testing.expectEqual(@as(i64, 0), np.openExistingNamed(.directory, 0, true));
+    try std.testing.expectEqual(@as(i64, 0), np.openExistingNamed(.directory, O_DIRECTORY, true));
+    try std.testing.expectEqual(@as(i64, 0), np.openExistingNamed(.file, 0, false));
+    try std.testing.expectEqual(@as(i64, -21), np.openExistingNamed(.directory, O_WRONLY, true));
+    try std.testing.expectEqual(@as(i64, -17), np.openExistingNamed(.file, O_CREAT | O_EXCL, true));
+    // statx / access report the errors that describe the path, and "no such file" for everything else the open can fail with.
+    try std.testing.expectEqual(@as(i64, -13), np.lookupFailureErrno(-13));
+    try std.testing.expectEqual(@as(i64, -20), np.lookupFailureErrno(-20));
+    try std.testing.expectEqual(@as(i64, -40), np.lookupFailureErrno(-40));
+    try std.testing.expectEqual(@as(i64, -36), np.lookupFailureErrno(-36));
+    try std.testing.expectEqual(@as(i64, -2), np.lookupFailureErrno(-2));
+    try std.testing.expectEqual(@as(i64, -2), np.lookupFailureErrno(-24)); // EMFILE
+    try std.testing.expectEqual(@as(i64, -2), np.lookupFailureErrno(-12)); // ENOMEM
+    try std.testing.expectEqual(@as(i64, -2), np.lookupFailureErrno(-21)); // EISDIR
+    try std.testing.expect(np.hasTrailingSlash("f/"));
+    try std.testing.expect(np.hasTrailingSlash("/tmp/d//"));
+    try std.testing.expect(!np.hasTrailingSlash("/tmp/f"));
+    try std.testing.expect(!np.hasTrailingSlash("/"));
+    try std.testing.expect(!np.hasTrailingSlash(""));
     _ = K;
 }
 

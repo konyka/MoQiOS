@@ -150,6 +150,12 @@ $CC $CFLAGS $FD_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/fdops.c -o "$OUT/fdops
 $CC $CFLAGS -o "$OUT/test_fdops_abi" test_fdops_abi.c "$OUT/fdops.o"
 "$OUT/test_fdops_abi" || fail=1
 
+echo "== test_stat_abi =="
+ST_RENAME="-Dstat=moqi_stat -Dlstat=moqi_lstat -Dfstat=moqi_fstat -Dchmod=moqi_chmod -Dfchmod=moqi_fchmod -Dreadlink=moqi_readlink -Dsymlink=moqi_symlink -Dlink=moqi_link"
+$CC $CFLAGS $ST_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/stat.c -o "$OUT/stat.o"
+$CC $CFLAGS -o "$OUT/test_stat_abi" test_stat_abi.c "$OUT/stat.o"
+"$OUT/test_stat_abi" || fail=1
+
 echo "== test_select_abi =="
 $CC $CFLAGS -Dselect=moqi_select -Dpselect=moqi_pselect -DMOQI_HOST_TEST_SYSCALL -c ../src/select.c -o "$OUT/select.o"
 $CC $CFLAGS -o "$OUT/test_select_abi" test_select_abi.c "$OUT/select.o"
