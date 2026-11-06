@@ -368,6 +368,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello249"); /* a shared mapping follows a truncate through another descriptor */
     run_test("hello250"); /* a directory stream follows changes made through other paths */
     run_test("hello251"); /* statfs/fstatfs report each filesystem's own figures */
+    run_test("hello252"); /* a directory grows past the direct blocks */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

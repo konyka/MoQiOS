@@ -7068,3 +7068,16 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：hello250 每个文件系统 8 项（tmpfs、ext2 各 8）通过；host 1063/1063。
 - 块泄漏的测量：hello250 用 `statfs` 的空闲块数（上一节的 hello251 修好后才能读）在建目录之前和删目录之后各读一次，两者必须相等。变异（`freeDirBlocks` 只释放第 0 块）→ ext2 `free blocks 16195 before, 16194 after`，即每个长大过的目录泄漏一块；还原后相等。tmpfs 同样相等（64853）。
 - 未验证：目录超过 12 个直接块仍无法扩张（`addDirEntry` 返回失败），未改。
+
+## ext2 目录增长超过 12 个块（hello252，已修）
+
+- 起因：前两节记录的未验证项"目录超过 12 个直接块仍无法扩张"。`addDirEntry` 在要加第 13 个块时直接 `return false`（注释"only direct blocks for dirs"），于是创建文件返回 -1（`EPERM` 风格的通用失败），目录最多 12 块。宿主机 Linux 实测：56 个 240 字节名字（约 14 KiB 目录记录）全部创建、列出（58 项含点目录项）、打开、删除，清空后 `rmdir` 成功。
+- 红灯（修改前）：ext2 创建到第 47 个时失败（`made 47, error -1`）；我最初用 200/250 字节的名字和 70/60 个文件，ext2 在第 44/45 个失败，**那是夹具的 128 个 inode 用尽（`allocInode` 返回 0，`-36` 之前的 `-1`），不是目录上限**——我先加了临时诊断确认了这一点（`[TEMPORARY] createFile: allocInode failed`），诊断已删除，改为用硬链接绕开 inode 限制，才测到真正的 12 块上限。
+- 修改：
+  - `addDirEntry` 需要新块时改用现成的 `ensureBlock`（它已能寻址直接块、再到一级/二级/三级间接树，自带分配间接块和 `inode.blocks` 记账），不再自己写 `block[next_logical]`。
+  - `dirIsEmpty` 改为按 `size` 遍历所有块并用 `resolveBlock` 取物理块（原来只扫直接块，遇间接块直接判非空）。
+  - `freeDirBlocks` 现在释放直接块，并释放 `block[12]`/`block[13]`/`block[14]` 的整棵间接树及其数据块。
+  - 查找、列表、删除目录项这些路径本来就用 `resolveBlock`，不需要改。
+- 绿灯：hello252 每个文件系统 5 项（tmpfs、ext2）通过；hello250 仍通过；host 1064/1064（新增源码形状测试）。
+- 变异检查：让 `freeDirBlocks` 不释放 `block[12]` 的间接树（真编译）→ `free blocks 16195 before, 16191 after`（泄漏 4 块：一个间接块和它的数据块），其余项仍通过，只有"空闲块数回到创建前"这一项抓住；还原后相等。这一项是和变异**同时**写的，没有先看过它在没有变异时通过，**但**在变异下确实失败，在还原后通过。
+- 未验证：①二级间接（目录超过约 268 个块）和三级没有测，只走了一级间接；②`ensureBlock` 失败（磁盘满）时，已挂到 inode 上但还没写入条目的块会留在 inode 里（大小没增加，下一次重试会复用，`rmdir` 会释放），没有专门测；③`addDirEntry` 的"拆分最后一个条目"快速路径只看最后一块，目录中间被删出的空洞不会被再利用（既有行为，未改）。

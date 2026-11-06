@@ -2532,18 +2532,13 @@ fn addDirEntry(dir_inode_num: u32, target_inode: u32, entry_name: []const u8, fi
         }
     }
 
-    // No space to split — allocate a new block
-    const new_block = allocBlock(0, false);
+    // No space to split — give the directory one more block. ensureBlock addresses the twelve direct blocks and then the indirect trees,
+    // allocates any indirect block it needs and keeps inode.blocks, so a directory is not limited to twelve blocks. It also writes the
+    // inode; the size below is only written once the new block holds its entry, so a failure leaves the block attached but beyond the
+    // size (the next attempt reuses it, rmdir frees it).
+    const next_logical: u32 = dir_size / block_size;
+    const new_block = ensureBlock(&dir_inode, dir_inode_num, next_logical, false);
     if (new_block == 0) return false;
-
-    // Add block to directory inode
-    const next_logical = dir_size / block_size;
-    if (next_logical >= EXT2_INODE_DIRECT) { // only direct blocks for dirs
-        freeBlock(new_block);
-        return false;
-    }
-    dir_inode.block[next_logical] = new_block;
-    dir_inode.blocks += block_size / 512;
     dir_inode.size += block_size;
 
     // Write the new entry into the fresh block
@@ -2555,10 +2550,7 @@ fn addDirEntry(dir_inode_num: u32, target_inode: u32, entry_name: []const u8, fi
     new_entry.file_type = file_type;
     @memcpy(buf[@sizeOf(Ext2DirEntry) .. @sizeOf(Ext2DirEntry) + entry_name.len], entry_name);
 
-    if (!writeBlock(new_block, buf)) {
-        freeBlock(new_block);
-        return false;
-    }
+    if (!writeBlock(new_block, buf)) return false;
     return writeInode(dir_inode_num, &dir_inode);
 }
 
@@ -3155,17 +3147,15 @@ pub fn renameFileMode(old_path: []const u8, new_path: []const u8, who: ?Who, nor
 }
 
 
-/// Empty check: the directory's single data block may contain only "."
-/// and "..". A directory with more blocks is not empty by definition.
-/// A directory is empty when every record in every one of its blocks is free or names "." or "..". Directories only ever use direct
-/// blocks (addDirEntry), and a directory that grew past one block keeps its later blocks after its entries are removed, so all of them
-/// are scanned; an indirect block means a layout this code never builds and is refused.
+/// A directory is empty when every record in every one of its blocks is free or names "." or "..". A directory that grew keeps its later
+/// blocks (direct, then the indirect trees) after its entries are removed, so every block up to its size is scanned.
 fn dirIsEmpty(dir_inode: *const Ext2Inode) bool {
     if (dir_inode.block[0] == 0) return false;
-    if (dir_inode.block[12] != 0 or dir_inode.block[13] != 0 or dir_inode.block[14] != 0) return false;
     const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
-    for (0..EXT2_INODE_DIRECT) |bi| {
-        const blk = dir_inode.block[bi];
+    const nblocks: u32 = (dir_inode.size + block_size - 1) / block_size;
+    var bi: u32 = 0;
+    while (bi < nblocks) : (bi += 1) {
+        const blk = resolveBlock(dir_inode, bi);
         if (blk == 0) continue;
         if (!readBlockUncached(blk, buf)) return false;
         var pos: usize = 0;
@@ -3187,11 +3177,15 @@ fn dirIsEmpty(dir_inode: *const Ext2Inode) bool {
     return true;
 }
 
-/// Give back every block a directory owns (its direct blocks; see dirIsEmpty).
+/// Give back every block a directory owns: the direct blocks and, when it grew past them, the indirect trees with their data blocks.
 fn freeDirBlocks(dir_inode: *const Ext2Inode) void {
     for (0..EXT2_INODE_DIRECT) |bi| {
         if (dir_inode.block[bi] != 0) freeBlock(dir_inode.block[bi]);
     }
+    const ptrs_per_block = block_size / 4;
+    if (dir_inode.block[12] != 0) _ = freeSingleIndirectTree(dir_inode.block[12], ptrs_per_block);
+    if (dir_inode.block[13] != 0) _ = freeDoubleIndirectTree(dir_inode.block[13], ptrs_per_block);
+    if (dir_inode.block[14] != 0) _ = freeTripleIndirectTree(dir_inode.block[14], ptrs_per_block);
 }
 
 /// Directory rename (fs_lock held). An existing destination must be an

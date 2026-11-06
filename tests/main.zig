@@ -11240,3 +11240,13 @@ test "ext2 rmdir: emptiness is judged over every directory block and by the reco
     try std.testing.expect(std.mem.indexOf(u8, src, "freeBlock(dir_inode.block[0]);\n    freeInodeAs(dir_inode_num, true);") == null);
     try std.testing.expect(std.mem.indexOf(u8, src, "freeBlock(vd.block[0]);") == null);
 }
+
+test "ext2 directories are not limited to twelve blocks" {
+    // hello252: addDirEntry refused to add a thirteenth block (EXT2_INODE_DIRECT) so a directory topped out around 44 short names.
+    const src = kt.ext2_source;
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (next_logical >= EXT2_INODE_DIRECT) { // only direct blocks for dirs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const new_block = ensureBlock(&dir_inode, dir_inode_num, next_logical, false);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const blk = resolveBlock(dir_inode, bi);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (dir_inode.block[12] != 0) _ = freeSingleIndirectTree(dir_inode.block[12], ptrs_per_block);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (dir_inode.block[12] != 0 or dir_inode.block[13] != 0 or dir_inode.block[14] != 0) return false;") == null);
+}
