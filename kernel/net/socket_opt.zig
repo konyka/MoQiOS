@@ -652,7 +652,7 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
             const tcp_mod = @import("tcp.zig");
             const o = tcp_mod.tcpGetOptions(idx) orelse return -9;
             stored = storedFromTcp(o);
-            facts = .{ .id = sp.identity(.tcp, tcp_mod.tcpIsV6(idx)), .accepting = tcp_mod.tcpIsListening(idx), .so_error = o.so_error };
+            facts = .{ .id = sp.identity(.tcp, tcp_mod.tcpIsV6(idx)), .accepting = tcp_mod.tcpIsListening(idx), .so_error = tcp_mod.tcpPendingSoError(idx) };
             tcp_idx = idx;
         },
         .udp => |port| {

@@ -12,6 +12,7 @@
 #include "../lib/moqi_libc/include/time.h"
 #include "../lib/moqi_libc/include/epoll.h"
 
+#define SYS_getsockopt 133
 #define SYS_sendto   121
 #define SYS_recvfrom 122
 
@@ -357,6 +358,38 @@ int main(int argc, char **argv, char **envp) {
         close((int)c);
         close((int)c2);
         close((int)ls);
+    }
+
+    /* K: SO_ERROR after a reset. Measured on Linux: getsockopt(SO_ERROR) returns ECONNRESET (104) once and clears it (the next
+     * read is 0), recv then gives 0 and recv gives 0. If send reported the
+     * reset first, SO_ERROR reads 0 (the error was already consumed). */
+    for (int order = 0; order < 2; order++) {
+        if (make_pair(&c, &s) != 0) {
+            check(0, "K: a connected loopback pair could not be made");
+            continue;
+        }
+        char rb[16];
+        write(c, "zz", 2);
+        pump(100);
+        close(s);
+        pump(100);
+        int e1 = -1, e2 = -1;
+        unsigned int l1 = 4, l2 = 4;
+        long r1 = 0, r2 = 0;
+        char what[200];
+        if (order == 0) {
+            syscall5(SYS_getsockopt, c, 1 /* SOL_SOCKET */, 4 /* SO_ERROR */, (long)&e1, (long)&l1);
+            syscall5(SYS_getsockopt, c, 1, 4, (long)&e2, (long)&l2);
+            r1 = syscall6(SYS_recvfrom, c, (long)rb, sizeof rb, 0x40, 0, 0);
+            snprintf(what, sizeof what, "K: SO_ERROR reads ECONNRESET once, then 0, and recv is then 0 (%d, %d, recv %ld)", e1, e2, r1);
+            check(e1 == 104 && e2 == 0 && r1 == 0, what);
+        } else {
+            r1 = syscall6(SYS_sendto, c, (long)"q", 1, 0x4000, 0, 0);
+            syscall5(SYS_getsockopt, c, 1, 4, (long)&e1, (long)&l1);
+            snprintf(what, sizeof what, "K2: send reports the reset first, so SO_ERROR is 0 (send %ld, SO_ERROR %d)", r1, e1);
+            check(r1 == -104 && e1 == 0, what);
+        }
+        close(c);
     }
 
     print(failures == 0 ? "hello237: PASS\n" : "hello237: FAIL\n");

@@ -6907,3 +6907,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 第二版修复：①直接装 `qemu-system-riscv`（有这个包就用它，没有就退回 `qemu-system-misc`），在干净的 26.04 容器里它的下载是 41.6 MB，runner 上 `qemu-system-misc` 路径是 62.9 MB，少下载一部分；②给 `apt-get` 加 `Acquire::http::Timeout=30` 和 `Acquire::Retries=3`，停滞的连接 30 秒就放弃并重试，而不是等满 240 秒；③安装后检查两个二进制都在才算成功。
 - 验证：把工作流里的这段脚本取出来（去掉 `sudo`），在 `ubuntu:26.04` 容器里完整运行得到退出码 0 且两个二进制都在；在 `ubuntu:24.04` 容器里（没有 `qemu-system-riscv` 包，走回退到 `qemu-system-misc` 的分支）也退出 0、两个二进制都在。
 - 如实说明：①这个失败与 TCP 改动无关（`smoke-qemu` 与 `host-tests` 都成功）；②第二版**还没有在 GitHub 上跑过**，要等下一次运行；镜像下载停滞是外部因素，重试选项只能缓解，不能保证；③安装结果以 `command -v` 为准，没有校验模拟器版本。
+
+## TCP：RST 之后 `getsockopt(SO_ERROR)` 要读到 ECONNRESET（hello237 K/K2）
+
+- 缺口：Linux 里连接被对端 RST 后，`getsockopt(SOL_SOCKET, SO_ERROR)` 返回 104（`sk_err`）并清掉，下一次读是 0；之后 `recv` 得 0、`poll` 仍是 `0x11`。如果 `recv` 或 `send` 已经先报告了这次重置，`SO_ERROR` 读到的就是 0。宿主机实测两种顺序都如此。这个内核的 `SO_ERROR` 只看 `options.so_error`（只有 connect 失败才写它），RST 记在另一个标志 `reset_by_peer` 里，所以读 `SO_ERROR` 得 0，随后的 `recv` 还会再报一次 `-ECONNRESET`——程序用"`SO_ERROR` 查错误"的常见写法（非阻塞 `connect` 后、`poll` 报 `POLLERR` 后）看不到原因。
+- 红灯：hello237 K 项在旧内核上 `(0, 0, recv -104)`；K2（`send` 先报告）一开始就对，作为回归保护。
+- 实现：`tcp.zig` 新增 `tcpPendingSoError`（已存的 `so_error`，否则在 `reset_by_peer` 未被报告时是 104）；`sysGetSockopt` 的 TCP 分支用它填 `SO_ERROR`；`tcpClearSoErrorIfEqual` 读到 104 且存的 `so_error` 为 0 时同时清掉 `reset_by_peer`，所以下一次 `SO_ERROR` 和 `recv` 都看不到了。
+- 变异：把清除 `reset_by_peer` 改成空操作，K 项变成 `(104, 104, recv -104)`，被抓住，文件已恢复。
+- 如实说明：①只改了 `sysGetSockopt` 的通用 `SOL_SOCKET` 路径；`SOL_TCP` 分支的 `getTcpSockopt` 自己也读 `SO_ERROR`（`socket_opt.zig` 约 489 行），但那条路径只对 `level == SOL_TCP` 进入，`SO_ERROR` 是 `SOL_SOCKET` 选项，我没有逐点核对是否可达；②"读取"与"清除"是两次加锁，之间若另一个线程的 `recv` 刚好报告了重置，可能出现两边都报告一次，Linux 里这是原子的；窗口很小，没有为它写并发用例；③只测了 IPv4 回环。

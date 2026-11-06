@@ -962,10 +962,27 @@ pub fn tcpClearSoErrorIfEqual(tcb_idx: u32, expected: i32) void {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
     if (tcb_idx < MAX_CONNECTIONS and tcbs[tcb_idx].active) {
-        if (tcbs[tcb_idx].options.so_error == expected) {
-            tcbs[tcb_idx].options.so_error = 0;
+        const tcb = &tcbs[tcb_idx];
+        if (tcb.options.so_error == expected) {
+            tcb.options.so_error = 0;
+        } else if (expected == ECONNRESET and tcb.options.so_error == 0) {
+            // getsockopt(SO_ERROR) reported the pending reset (see tcpPendingSoError): it is consumed like a recv or send would.
+            tcb.reset_by_peer = false;
         }
     }
+}
+
+const ECONNRESET: i32 = 104;
+
+/// The SO_ERROR value getsockopt should report: the stored connect failure, or ECONNRESET while a reset from the peer is still
+/// unreported (Linux keeps both in sk_err). Reading does not consume; tcpClearSoErrorIfEqual does that after the copy-out.
+pub fn tcpPendingSoError(tcb_idx: u32) i32 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return 0;
+    const tcb = &tcbs[tcb_idx];
+    if (tcb.options.so_error != 0) return tcb.options.so_error;
+    return if (tcb.reset_by_peer) ECONNRESET else 0;
 }
 
 fn generateIss() u32 {
