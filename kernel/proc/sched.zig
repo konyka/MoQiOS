@@ -758,7 +758,10 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
         if (task.getTask(ci)) |ct| {
             const cpu: u8 = @intCast(currentCpuId());
             const ct_state = sched_claim.load(&ct.state);
-            if (!force_pick and countActiveOnThisCpu() == 1 and ct_state != .zombie and ct_state != .blocked) {
+            // A lone running task normally skips the pass, but not one that sched_setaffinity pinned to another CPU: it is no longer
+            // counted here and must be switched out so its pin CPU can take it (otherwise the pin waits for an unrelated wake-up).
+            const pinned_away = sched_policy.mustLeaveCpu(ct_state == .running, ct.cpu_affinity, @intCast(cpu));
+            if (!force_pick and !pinned_away and countActiveOnThisCpu() == 1 and ct_state != .zombie and ct_state != .blocked) {
                 return;
             }
             // Blocked parent in waitpid still holds cur_idx — run peers on this CPU.
@@ -831,7 +834,10 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
         const cur_unrunnable = if (getCurrentIdx()) |ci0| blk2: {
             const ct0 = task.getTask(ci0) orelse break :blk2 false;
             const s0 = sched_claim.load(&ct0.state);
-            break :blk2 s0 == .zombie or s0 == .blocked;
+            // A running task that sched_setaffinity pinned to another CPU must leave as well: otherwise, when the pick finds nothing
+            // else to run, it stays here and the pin never takes effect (its entry on the pin CPU's queue is dropped as "not ready").
+            const here0: i16 = @intCast(currentCpuId());
+            break :blk2 s0 == .zombie or s0 == .blocked or sched_policy.mustLeaveCpu(s0 == .running, ct0.cpu_affinity, here0);
         } else false;
         if (!cur_unrunnable) return;
         const k = pickBootstrapKernel() orelse return;
@@ -1025,6 +1031,8 @@ fn publishOldTask(old_task: *task.Task) void {
         // pickNextFg picks it up from the local fast-path. Best-effort —
         // a full queue just falls back to the bitmap scan.
         if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(old_task);
+        // A task that sched_setaffinity pinned to another CPU is only now ready to run there: wake that CPU, which may be idle.
+        if (sched_policy.kickAfterPublish(old_task.cpu_affinity, @intCast(currentCpuId()))) |target_cpu| kickCpu(target_cpu);
     }
 }
 

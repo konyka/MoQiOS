@@ -150,3 +150,19 @@ pub const SlotCursor = struct {
         return idx;
     }
 };
+
+/// A running task that has been pinned to a different CPU than the one it is on must vacate this CPU even when the pick found nothing
+/// better to run: staying would leave it on the wrong CPU for as long as it keeps running (sched_setaffinity could return with the task
+/// still on its old CPU, about 2 times in 100 at SMP=8). `affinity` < 0 means unpinned.
+pub fn mustLeaveCpu(running: bool, affinity: i16, here: i16) bool {
+    return running and affinity >= 0 and affinity != here;
+}
+
+/// After a task has been published back to ready, which CPU (if any) must be kicked so the task actually runs there. A task pinned to a CPU
+/// other than the one that just released it sits on that CPU's queue (or is found there by the bitmap scan), but an idle CPU only looks at
+/// its queue when something wakes it: without this kick a task that sched_setaffinity moved stays unscheduled until an unrelated interrupt.
+/// `affinity` < 0 (unpinned) needs no kick: the releasing CPU picks it up again itself.
+pub fn kickAfterPublish(affinity: i16, here: i16) ?u8 {
+    if (affinity < 0 or affinity == here) return null;
+    return @intCast(affinity);
+}

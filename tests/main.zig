@@ -11091,3 +11091,45 @@ test "no caller squeezes a tmpfs slot number into a byte" {
         }
     }
 }
+
+test "a running task pinned to another CPU must leave this CPU; unpinned, pinned here, or not running must not" {
+    const sp = kt.sched_policy;
+    try std.testing.expect(sp.mustLeaveCpu(true, 3, 0));
+    try std.testing.expect(sp.mustLeaveCpu(true, 0, 5));
+    try std.testing.expect(!sp.mustLeaveCpu(true, -1, 2));
+    try std.testing.expect(!sp.mustLeaveCpu(true, 2, 2));
+    try std.testing.expect(!sp.mustLeaveCpu(false, 3, 0));
+    try std.testing.expect(!sp.mustLeaveCpu(false, -1, 0));
+}
+
+test "the scheduler pass vacates a running task that was pinned to another CPU, even when nothing else is runnable" {
+    const src = kt.sched_source;
+    const fallback = std.mem.indexOf(u8, src, "const next_idx = pickNextFg() orelse blk: {") orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, src, fallback, "break :blk k;") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, src[fallback..end], "mustLeaveCpu(") != null);
+}
+
+test "the lone-task early return does not keep a running task that is pinned to another CPU" {
+    const src = kt.sched_source;
+    const at = std.mem.indexOf(u8, src, "countActiveOnThisCpu() == 1 and ct_state != .zombie") orelse return error.TestUnexpectedResult;
+    const line_start = std.mem.lastIndexOfScalar(u8, src[0..at], '\n') orelse 0;
+    try std.testing.expect(std.mem.indexOf(u8, src[line_start..at], "!pinned_away") != null);
+}
+
+test "publishing a task that is pinned to another CPU kicks that CPU" {
+    const sp = kt.sched_policy;
+    try std.testing.expectEqual(@as(?u8, 3), sp.kickAfterPublish(3, 0));
+    try std.testing.expectEqual(@as(?u8, 0), sp.kickAfterPublish(0, 5));
+    try std.testing.expectEqual(@as(?u8, null), sp.kickAfterPublish(-1, 2));
+    try std.testing.expectEqual(@as(?u8, null), sp.kickAfterPublish(2, 2));
+}
+
+test "publishOldTask kicks the pin CPU after the task is back on its queue" {
+    const src = kt.sched_source;
+    const at = std.mem.indexOf(u8, src, "fn publishOldTask(") orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, src, at, "\n}\n") orelse return error.TestUnexpectedResult;
+    const body = src[at..end];
+    const enq = std.mem.indexOf(u8, body, "per_cpu.enqueueTask(old_task)") orelse return error.TestUnexpectedResult;
+    const kick = std.mem.indexOf(u8, body, "kickAfterPublish(") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(enq < kick);
+}

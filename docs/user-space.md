@@ -241,6 +241,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello242 | `uname`/`gethostname`/`getrandom`/`getentropy`/`getpagesize`/`sysconf` 在真内核上（40 项），含 `sched_getaffinity` 对未固定任务报告全部已配置 CPU，含内核 `getrandom` 的新规则：任意长度（上限 32 MiB/次）整块写满、未知标志与 `RANDOM\|INSECURE` 同用是 `EINVAL`、零长度请求不碰指针、空/未映射/内核地址的缓冲区是 `EFAULT` |
 | hello243 | `sched_setaffinity` 的掩码规则（原生系统调用，对照 `sched_getaffinity`）：大小为 0、空掩码、只有不存在的 CPU（60、64）是 `EINVAL`；坏指针 `EFAULT`、不存在的 pid `ESRCH`；任意非零大小可用（1 字节、200 字节）；把所有 CPU 都点名就解除固定（`getaffinity` 再报告全部）；固定到单个 CPU 后 `getaffinity` 报告的恰好是那个 CPU（任务是否立刻迁到那个 CPU 只打印、不断言：迁移偶尔有延迟，修改前的内核上就存在）；`{0,1}` 这类子集被窄化到最低的那个（这个调度器每个任务只有一个固定位，与 Linux 报告整个子集不同）；`{1,60}` 忽略不存在的 CPU |
 | hello244 | 更大的 `/tmp`（tmpfs 从 63 个条目扩到 511 个）：先测剩余条目数、创建 300 个内容各不相同的文件（超过一个字节能编号的范围）并逐个读回、20 个目录各带一个文件、中间 `unlink` 后槽位可复用且邻居不受影响、把表填满后得到 `ENOSPC`（不崩溃、已有文件完好）、全部删除后剩余条目数回到起点 |
+| hello245 | `sched_setaffinity` 钉住后任务应立刻在目标 CPU 上（8 核，轮流钉到各个 CPU 共 200 次，用 `getcpu` 检查）；输出每次运行的“立刻/稍后/始终没迁”计数；**判定有界而不是零**：最多允许 8 次未立刻迁移（旧内核最坏一次 30 次），因为钉住后偶尔仍会留在原 CPU（已知限制，见计划文档） |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。
