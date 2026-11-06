@@ -7008,3 +7008,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯/绿灯：hello246 15 项，旧内核 7 项失败，新内核全部通过。我第一次修完 `currentSize` 后只剩 5 项失败，加上 `fat32ReadMerged` 后剩 1 项（`fork`），再改 `retainSharedResources` 才全绿——每一步都是单独验证的。
 - **一次回归（已修）**：我第一版 `currentSize` 的调用处写成 `desc.file_size = @max(desc.file_size, currentSize(..))`（和 ext2 的写法一样），完整冒烟 SMP=1 里 **hello114 S 项失败**（`truncate(path, 5)` 之后读回不是 5 字节）：通过另一个描述符把文件截短后，缓存值比真实大小大，`max` 让描述符继续报告旧长度。改为直接赋值 `desc.file_size = currentSize(..)`（5 处：`read`、`write`/`O_APPEND`、`pread` 的合并读、`lseek(SEEK_END)`、`fstat`），hello114 恢复通过；新增 host 测试"FAT32 的描述符大小取自文件，不与描述符的旧缓存做 max"守着这一点。**ext2 的 `refreshSize` 仍是 `max`**，它那边截短后是否有同样的问题我没有查。
 - **仍须说明的事**：①我第一版的 hello246 里 E 项的第二个描述符是只读（`O_RDONLY`），却又拿它去写，那一项失败是**测试写错**，不是内核问题，改成 `O_RDWR`；②我中间做过一次"让 `allow_pending` 跳过目录扫描"的修改，没有任何效果，已还原；③`read` 去掉了 readahead 缓存的快速路径（只保留顺序读的 `checkAndPrefetch` 预取触发），因为那条快速路径返回的是别的描述符写入之前取的旧数据。**这可能降低大文件顺序读的速度，我没有测量**；④FAT32 `write` 之后别的描述符的 readahead 缓存没有失效（read 现在不再读它，所以不影响正确性，但预取出来的页仍占着）。
+
+## ext2：通过另一个描述符截短后的大小一致性（hello248，已修）
+
+- 起因：上一节修 FAT32 时发现 `max(描述符缓存, 磁盘大小)` 会让截短被吞掉，而 ext2 的 `refreshSize` 调用处正是这种写法，当时没有查。hello248 用宿主机 Linux 实测的期望值（`ftruncate(b,5)` 后另一个描述符 `fstat`=5、`SEEK_END`=5、`read` 5 字节；再 `ftruncate(b,12)` 读 12 字节且 [5..11] 为 0；`truncate(path,3)` 后新打开的描述符 `fstat`=3、读 3 字节）对 tmpfs、FAT32、ext2 各测 3 项。
+- 红灯（修改前的内核）：tmpfs 3 项、FAT32 3 项本来就通过（对这些是**回归保护**）；**ext2 3 项全部失败**：`fstat 16, SEEK_END 16, read 16 "01234"`（第一个描述符在被截短到 5 之后仍报告 16）、扩到 12 后 `read 16`、`truncate(path,3)` 后 `fstat 12, read 12`。
+- 根因：ext2 的 `read`/`pread`/`ext2ReadMerged` 用 `desc.file_size = @max(desc.file_size, refreshSize(..))`，`fstat`/`statx` 用 `@max(info.size, desc.file_size)`，`lseek(SEEK_END)` 完全不刷新。`@max` 的目的（v53.51）是不让本描述符暂存在写回缓冲里、尚未落盘的字节被磁盘上较小的旧 inode 大小吞掉；但它同时让缓存的旧长度永远赢过变小后的真实大小。
+- 修改：新增 `ext2.currentSize(file_idx)` = 磁盘 inode 大小与写回缓冲暂存末端（`stagedEnd(0x3000_.. + inode, .ext2)`）取大；`read`、`pread`、`ext2ReadMerged`、`fstat`、`statx`、`lseek(SEEK_END)` 一律直接赋值/使用它，不再与描述符缓存做 `max`。截短到暂存数据以下时 `ext2.truncateFile` 本来就先刷盘并丢弃暂存区间（读过该函数的开头部分），所以暂存末端不会在截断点之后残留。host 测试加了源码形状检查（vfs 里不再有 `ext2.refreshSize` / `@max(desc.file_size, ext2`，至少 3 处 `ext2.currentSize(`，ext2 里有 `currentSize` 且使用 `stagedEnd`）。
+- 绿灯：hello248 9 项全部通过；hello114（FAT32/ext2 的大小语义，上次 FAT32 因同类改动失败过）通过；host 1058/1058。
+- 变异（确认真编译并改变了行为）：把 `lseek(SEEK_END)` 的 ext2 刷新行注释掉 → hello248 ext2 第 1 项失败（`fstat 5` 对、`SEEK_END 16`），其余项仍通过；还原后重新构建。其它调用处（`read`、`fstat`、`statx`）没有逐个做变异，由红灯数据和源码形状 host 测试守着。
+- 未验证：`mmap` 的 ext2 大小（`mmap.zig`）和缺页处理（`idt.zig`）仍用 `refreshSize`，没有改也没有测截短后映射的行为；完整冒烟和 CI 结果见提交之后的记录。

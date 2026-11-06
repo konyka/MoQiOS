@@ -1414,15 +1414,10 @@ pub const FdTable = struct {
             .ext2_file => {
                 const ext2 = @import("ext2.zig");
                 if (@import("namespace_policy.zig").readGate(if (ext2.openFileIsDir(desc.ext2_file_idx)) |d| d else false) != 0) return -21;
-                // Refresh the cached size: another fd may have grown the file
-                // through a different ext2 open slot (each slot keeps its own
-                // inode copy), so this descriptor's file_size can be stale.
-                // Take the max with the on-disk inode size — never shrink:
-                // this fd's own writeback-staged bytes extend file_size past
-                // the on-disk inode (flushed only by the writeback thread),
-                // and letting the stale disk size win turned a write-then-
-                // read into a false EOF (v53.51 regression).
-                desc.file_size = @max(desc.file_size, ext2.refreshSize(desc.ext2_file_idx));
+                // Another fd may have grown or truncated the file through a different ext2 open slot (each slot keeps its own inode
+                // copy), so this descriptor's file_size can be stale in either direction. currentSize is the on-disk inode size or
+                // the end of the staged writes, whichever is larger, so staged bytes are not hidden (v53.51) and a truncate is seen.
+                desc.file_size = ext2.currentSize(desc.ext2_file_idx);
                 if (desc.offset >= desc.file_size) return 0;
                 const n = ext2ReadMerged(desc, buf, count, desc.offset);
                 if (n > 0) desc.offset += @intCast(n);
@@ -1671,12 +1666,12 @@ pub const FdTable = struct {
     /// Used by pread64/preadv to avoid temporary offset mutation.
     /// Read `count` bytes at `offset` of an ext2 file as the process must see
     /// them: the on-disk bytes with every staged (not yet written back) extent
-    /// laid over them. The file size is the larger of the descriptor's and the
-    /// inode's, so bytes staged beyond the on-disk EOF are readable, and a hole
+    /// laid over them. The file size is `ext2.currentSize` (inode size or staged
+    /// end, whichever is larger), so bytes staged beyond the on-disk EOF are readable, and a hole
     /// below EOF reads as zeros.
     fn ext2ReadMerged(desc: *FileDescriptor, buf: [*]u8, count: usize, offset: u64) i64 {
         const ext2 = @import("ext2.zig");
-        desc.file_size = @max(desc.file_size, ext2.refreshSize(desc.ext2_file_idx));
+        desc.file_size = ext2.currentSize(desc.ext2_file_idx);
         if (offset >= desc.file_size) return 0;
         const want: u32 = @intCast(@min(@as(u64, count), @min(desc.file_size - offset, 4096)));
         if (want == 0) return 0;
@@ -1739,9 +1734,7 @@ pub const FdTable = struct {
             },
             .ext2_file => {
                 const ext2 = @import("ext2.zig");
-                // Same max-of-sizes rule as read(): never let the stale
-                // on-disk size hide this fd's staged bytes below EOF.
-                desc.file_size = @max(desc.file_size, ext2.refreshSize(desc.ext2_file_idx));
+                desc.file_size = ext2.currentSize(desc.ext2_file_idx);
                 if (offset >= desc.file_size) return 0;
                 return ext2ReadMerged(desc, buf, count, offset);
             },

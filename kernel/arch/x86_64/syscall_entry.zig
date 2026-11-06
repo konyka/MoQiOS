@@ -3552,6 +3552,7 @@ fn syscallLseek(fd: u32, offset: u64, whence: u32) i64 {
     // A tmpfs file's size can change through another descriptor (truncate, ftruncate, a write); SEEK_END follows the file.
     if (whence == 2 and desc.fd_type == .tmpfs_file) desc.file_size = @import("../../fs/tmpfs.zig").tmpfsGetSize(@intCast(desc.tmpfs_idx));
     if (whence == 2 and desc.fd_type == .fat32_file) desc.file_size = @import("../../fs/fat32.zig").currentSize(desc.fat32_file_idx);
+    if (whence == 2 and desc.fd_type == .ext2_file) desc.file_size = @import("../../fs/ext2.zig").currentSize(desc.ext2_file_idx);
     switch (whence) {
         0 => new_off = off, // SEEK_SET
         1 => new_off = @as(i64, @intCast(desc.offset)) + off, // SEEK_CUR

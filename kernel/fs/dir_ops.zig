@@ -139,7 +139,7 @@ pub fn fstat(fd: u64, stat_ptr: u64) i64 {
             bo.writeU32Le(stat_buf[24..28], info.mode);
             bo.writeU32Le(stat_buf[28..32], info.uid);
             bo.writeU32Le(stat_buf[32..36], info.gid);
-            bo.writeU64Le(stat_buf[48..56], @max(info.size, fdesc.file_size));
+            bo.writeU64Le(stat_buf[48..56], @import("ext2.zig").currentSize(fdesc.ext2_file_idx));
             bo.writeU64Le(stat_buf[56..64], 4096); // st_blksize
             bo.writeU64Le(stat_buf[64..72], info.blocks);
             bo.writeU64Le(stat_buf[72..80], info.atime);

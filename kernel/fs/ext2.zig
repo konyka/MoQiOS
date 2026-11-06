@@ -1103,6 +1103,22 @@ pub fn refreshSize(file_idx: u32) u64 {
     return f.inode.size;
 }
 
+/// The size every descriptor of a file must see: the larger of the on-disk inode size and the end of the furthest write still staged in
+/// the writeback buffer (shared by all descriptors of the inode). Callers assign it to the descriptor's cached size outright, not `max`
+/// with the cache: after a truncate through another descriptor the file is SHORTER than the cache says. A truncate below the staged data
+/// flushes and drops it first (`truncateFile`), so the staged end never outlives the cut.
+pub fn currentSize(file_idx: u32) u64 {
+    const disk = refreshSize(file_idx);
+    const flags = fs_lock.acquire();
+    if (file_idx >= open_count or open_files[file_idx].inode_num == 0) {
+        fs_lock.release(flags);
+        return 0;
+    }
+    const inode_id: u64 = 0x3000_0000_0000_0000 + @as(u64, open_files[file_idx].inode_num);
+    fs_lock.release(flags);
+    return @max(disk, @import("writeback.zig").stagedEnd(inode_id, .ext2));
+}
+
 pub fn closeFile(file_idx: u32) void {
     var flags = fs_lock.acquire();
     defer fs_lock.release(flags);

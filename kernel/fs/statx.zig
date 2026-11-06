@@ -111,7 +111,7 @@ fn describe(d: *const @import("vfs.zig").FileDescriptor, fd: u32) ?@import("stat
         .ext2_file => {
             var info: si.StatInfo = .{};
             if (!@import("ext2.zig").statInode(d.ext2_file_idx, &info)) return null;
-            c = .{ .mode = info.mode, .nlink = info.nlink, .uid = info.uid, .gid = info.gid, .ino = info.ino, .size = @max(info.size, d.file_size), .blocks = info.blocks, .times = .{ .atime = info.atime, .mtime = info.mtime, .ctime = info.ctime } };
+            c = .{ .mode = info.mode, .nlink = info.nlink, .uid = info.uid, .gid = info.gid, .ino = info.ino, .size = @import("ext2.zig").currentSize(d.ext2_file_idx), .blocks = info.blocks, .times = .{ .atime = info.atime, .mtime = info.mtime, .ctime = info.ctime } };
         },
         .fat32_file => {
             const mt = @import("fat32.zig").getMtime(d.fat32_file_idx);

@@ -11155,3 +11155,16 @@ test "FAT32 descriptor sizes are taken from the file, never max()ed with a descr
     }
     try std.testing.expect(seen >= 4);
 }
+
+test "ext2 descriptor sizes are taken from ext2.currentSize, never max()ed with a descriptor's stale cache" {
+    // A truncate through another descriptor shortens the file; refreshSize + @max kept reporting the old length (hello248).
+    const vfs_src = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, vfs_src, "ext2.refreshSize") == null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs_src, "@max(desc.file_size, ext2") == null);
+    var pos: usize = 0;
+    var seen: usize = 0;
+    while (std.mem.indexOfPos(u8, vfs_src, pos, "ext2.currentSize(")) |at| : (pos = at + 1) seen += 1;
+    try std.testing.expect(seen >= 3);
+    try std.testing.expect(std.mem.indexOf(u8, kt.ext2_source, "pub fn currentSize(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.ext2_source, "stagedEnd(inode_id, .ext2)") != null);
+}
