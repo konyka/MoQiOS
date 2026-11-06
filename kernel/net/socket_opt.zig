@@ -353,6 +353,7 @@ fn setTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen
 
 // ─── getsockopt syscall ───────────────────────────────────────────────────
 
+/// SOL_TCP options only: sysGetSockopt sends every SOL_SOCKET option (SO_ERROR included) through the common path below.
 fn getTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen_ptr: u64) i64 {
     const tcp_mod = @import("tcp.zig");
     // v53.14: Work on a locked copy — no raw pointer escape
@@ -376,51 +377,7 @@ fn getTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen
     var val_buf: [16]u8 = undefined;
     var val_len: u32 = 0;
 
-    if (level == SOL_SOCKET) {
-        switch (optname) {
-            SO_REUSEADDR => {
-                val_len = 4;
-                bo.writeU32Le(val_buf[0..4], if (opts.reuse_addr) 1 else 0);
-            },
-            SO_KEEPALIVE => {
-                val_len = 4;
-                bo.writeU32Le(val_buf[0..4], if (opts.keep_alive) 1 else 0);
-            },
-            SO_RCVTIMEO => {
-                // struct timeval: 16 bytes
-                val_len = 16;
-                const sec: i64 = @intCast(opts.rcv_timeout_ms / 1000);
-                const usec: i64 = @intCast((opts.rcv_timeout_ms % 1000) * 1000);
-                bo.writeI64Le(val_buf[0..8], sec);
-                bo.writeI64Le(val_buf[8..16], usec);
-            },
-            SO_SNDTIMEO => {
-                val_len = 16;
-                const sec: i64 = @intCast(opts.snd_timeout_ms / 1000);
-                const usec: i64 = @intCast((opts.snd_timeout_ms % 1000) * 1000);
-                bo.writeI64Le(val_buf[0..8], sec);
-                bo.writeI64Le(val_buf[8..16], usec);
-            },
-            SO_RCVBUF => {
-                val_len = 4;
-                bo.writeU32Le(val_buf[0..4], opts.rcv_buf_size);
-            },
-            SO_SNDBUF => {
-                val_len = 4;
-                bo.writeU32Le(val_buf[0..4], opts.snd_buf_size);
-            },
-            SO_ERROR => {
-                val_len = 4;
-                bo.writeI32Le(val_buf[0..4], opts.so_error);
-            },
-            SO_LINGER => {
-                val_len = 8;
-                bo.writeI32Le(val_buf[0..4], if (opts.linger_on) @as(i32, 1) else @as(i32, 0));
-                bo.writeU32Le(val_buf[4..8], opts.linger_sec);
-            },
-            else => return -92, // ENOPROTOOPT
-        }
-    } else if (level == SOL_TCP) {
+    if (level == SOL_TCP) {
         switch (optname) {
             TCP_NODELAY => {
                 val_len = 4;
@@ -485,10 +442,6 @@ fn getTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen
     var len_out: [4]u8 = undefined;
     bo.writeU32Le(&len_out, val_len);
     if (copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &len_out, 4) != 4) return -14;
-
-    if (level == SOL_SOCKET and optname == SO_ERROR) {
-        tcp_mod.tcpClearSoErrorIfEqual(tcb_idx, opts.so_error);
-    }
 
     return 0;
 }

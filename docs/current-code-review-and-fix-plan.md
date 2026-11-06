@@ -6914,4 +6914,4 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello237 K 项在旧内核上 `(0, 0, recv -104)`；K2（`send` 先报告）一开始就对，作为回归保护。
 - 实现：`tcp.zig` 新增 `tcpPendingSoError`（已存的 `so_error`，否则在 `reset_by_peer` 未被报告时是 104）；`sysGetSockopt` 的 TCP 分支用它填 `SO_ERROR`；`tcpClearSoErrorIfEqual` 读到 104 且存的 `so_error` 为 0 时同时清掉 `reset_by_peer`，所以下一次 `SO_ERROR` 和 `recv` 都看不到了。
 - 变异：把清除 `reset_by_peer` 改成空操作，K 项变成 `(104, 104, recv -104)`，被抓住，文件已恢复。
-- 如实说明：①只改了 `sysGetSockopt` 的通用 `SOL_SOCKET` 路径；`SOL_TCP` 分支的 `getTcpSockopt` 自己也读 `SO_ERROR`（`socket_opt.zig` 约 489 行），但那条路径只对 `level == SOL_TCP` 进入，`SO_ERROR` 是 `SOL_SOCKET` 选项，我没有逐点核对是否可达；②"读取"与"清除"是两次加锁，之间若另一个线程的 `recv` 刚好报告了重置，可能出现两边都报告一次，Linux 里这是原子的；窗口很小，没有为它写并发用例；③只测了 IPv4 回环。
+- 如实说明：①只改了 `sysGetSockopt` 的通用 `SOL_SOCKET` 路径；`getTcpSockopt` 里原来还有一份 `SOL_SOCKET` 的选项表（含另一份 `SO_ERROR`，不认 `reset_by_peer`），但 `getTcpSockopt` 只在 `level == SOL_TCP` 时被调用，那份表是**读码确认的不可达代码**（所有 `SOL_SOCKET` 选项都先走通用路径），后来已经删除（49 行，只剩 `SOL_TCP` 选项），避免以后有人改错那一份；hello143（getsockopt 覆盖面最广的探针）在删除后仍通过；②"读取"与"清除"是两次加锁，之间若另一个线程的 `recv` 刚好报告了重置，可能出现两边都报告一次，Linux 里这是原子的；窗口很小，没有为它写并发用例；③只测了 IPv4 回环。
