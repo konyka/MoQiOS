@@ -6898,3 +6898,10 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 原因（推断，不是直接观察）：`hello151` 的 B 段和 `hello152` 的 C 段用的是同一个端口 18152，而 `servers/init/main.c` 里它们是**连续**运行的（hello151 → hello152）。hello151 刚关掉的连接若还留在 TIME_WAIT / FIN_WAIT 状态，hello152 不带 `SO_REUSEADDR` 的 `bind(18152)` 就会 `EADDRINUSE`（Linux 对同样的情形也是 `EADDRINUSE`，所以这是测试的端口冲突，不是内核缺陷）。是否撞上取决于两个测试之间的时序，所以只是偶发。这也与 5868 行当时对 hello177/hello174 端口冲突的旁证是同一类问题。我在仓库里扫了 `user/*.c` 里所有五位数端口号：被两个以上测试程序使用的，除了 hello152/hello151 的 18152，其余都是不是监听端口的数值常量（如 10000、12345、16384），没有别的监听端口冲突。
 - 处理：hello152 的 C 段改用 18452（仓库里没有其它地方使用）；`make_pair` 现在把 `socket`/`bind`/`listen` 的返回值也记下来，再失败时能直接看到 `-98`。
 - 如实说明：这个结论要靠之后一段时间不再复现来支持；我没有做"修复前后失败率"的对比实验（失败率太低，做不出有意义的样本）。如果之后还出现 `make_pair failed, step 2`，请看输出里的 `last syscall result`。
+
+## CI：Ubuntu 26.04 镜像上 `qemu-system-misc` 不再带 `qemu-system-riscv64`
+
+- 现象：运行 42131972835（`3719fd6`）的 `smoke-cross-arch` 失败：`Install cross-architecture QEMU` 成功，下一步 `Smoke RISC-V 64` 报 `ERROR: qemu-system-riscv64 not found`。此前同一工作流在同样的步骤上是绿的，说明 `ubuntu-latest` 的镜像换成了 Ubuntu 26.04（日志里的包源是 `resolute`）。
+- 原因：在 26.04 上 RISC-V 模拟器的包是 `qemu-system-riscv`，`qemu-system-misc` 不再包含它。我在一个 `ubuntu:26.04` 容器里复现并验证：装 `qemu-system-misc qemu-system-arm ipxe-qemu` 后只有 `qemu-system-aarch64`；再装 `qemu-system-riscv` 后 `qemu-system-riscv64` 也在。
+- 修复：`.github/workflows/test.yml` 的安装步骤在基础安装后检查两个二进制，缺哪个就补装对应的包（`qemu-system-riscv`、`qemu-system-aarch64`），最后仍缺则这次尝试算失败并重试。
+- 如实说明：①这个失败与 TCP 改动无关（`smoke-qemu` 与 `host-tests` 都成功）；②修复只在容器里验证了安装，**还没有在 GitHub 上跑过**，要等下一次运行；③安装结果以 `command -v` 为准，没有校验模拟器版本。

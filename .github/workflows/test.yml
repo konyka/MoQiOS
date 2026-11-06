@@ -72,7 +72,7 @@ jobs:
           curl -sSfL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | sudo tar -xJ -C /opt
           echo "/opt/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
       - name: Install cross-architecture QEMU
-        # Ubuntu ships qemu-system-riscv64 in qemu-system-misc but
+        # Older Ubuntu images ship qemu-system-riscv64 in qemu-system-misc but
         # qemu-system-aarch64 in qemu-system-arm; without the latter the
         # AArch64 step failed on every run ("qemu-system-aarch64 not found").
         # --no-install-recommends keeps the download to the emulators themselves (the recommended packages pull in audio, USB-redirect,
@@ -83,9 +83,20 @@ jobs:
         # limit on two consecutive runs while downloading qemu-system-misc).
         timeout-minutes: 11
         run: |
+          # On the Ubuntu 26.04 runner image qemu-system-misc installs without qemu-system-riscv64 (run 42131972835: install succeeded, then
+          # "qemu-system-riscv64 not found"); the emulator is in the separate package qemu-system-riscv there. So after the base install any
+          # emulator that is still missing is installed from its own package. Images where the base install already provides both
+          # binaries never reach those branches.
           for attempt in 1 2 3; do
             if sudo timeout 240 apt-get update && sudo timeout 240 apt-get install -y --no-install-recommends qemu-system-misc qemu-system-arm ipxe-qemu; then
-              exit 0
+              if ! command -v qemu-system-riscv64 >/dev/null; then
+                sudo timeout 240 apt-get install -y --no-install-recommends qemu-system-riscv || true
+              fi
+              if ! command -v qemu-system-aarch64 >/dev/null; then
+                sudo timeout 240 apt-get install -y --no-install-recommends qemu-system-aarch64 || true
+              fi
+              command -v qemu-system-riscv64 >/dev/null && command -v qemu-system-aarch64 >/dev/null && exit 0
+              echo "emulators still missing after install: riscv64=$(command -v qemu-system-riscv64) aarch64=$(command -v qemu-system-aarch64)" >&2
             fi
             echo "apt attempt $attempt failed or timed out" >&2
             sleep 5
