@@ -4607,32 +4607,21 @@ fn syscallClockGetres(clockid: u32, res_ptr: u64) i64 {
 fn syscallSchedSetaffinity(pid: u32, cpusetsize: u32, mask_ptr: u64) i64 {
     const sched = @import("../../proc/sched.zig");
     const task_mod2 = @import("../../proc/task.zig");
+    const aff_policy = @import("../../proc/sched_getaffinity_policy.zig");
     if (mask_ptr == 0 or mask_ptr >= 0x0000_8000_0000_0000) return -14;
-    if (cpusetsize == 0 or cpusetsize > 128) return -22;
+    if (cpusetsize == 0) return -22;
 
+    // Linux reads the first 128 bytes of the mask at most and treats a short buffer as zero-extended; a mask that names no existing
+    // CPU is EINVAL (see affinityFromMask for how a mask maps to this scheduler's single pin).
     const copy = @import("../../mm/copy_from_user.zig");
-    var mask_buf: [32]u8 = .{0} ** 32;
-    // NOTE: explicit u32 — @min(u32, comptime 32) would narrow to u6, and
-    // `to_copy * 8` below then overflows (panic) for any cpusetsize >= 8.
+    var mask_buf: [128]u8 = @splat(0);
     const to_copy: u32 = @min(cpusetsize, mask_buf.len);
     const copied = copy.copyFromUser(mask_buf[0..to_copy], @ptrFromInt(mask_ptr), to_copy);
     if (copied < to_copy) return -14;
-
-    // Store the lowest selected logical CPU, or -1 for an empty mask.
-    var affinity: i16 = -1;
-    if (to_copy > 0) {
-        // Find lowest set bit in mask
-        var b: u32 = 0;
-        while (b < to_copy * 8) : (b += 1) {
-            const byte_idx = b / 8;
-            const bit_idx: u3 = @intCast(b % 8);
-            if (mask_buf[byte_idx] & (@as(u8, 1) << bit_idx) != 0) {
-                affinity = @intCast(b);
-                break;
-            }
-        }
-    }
-    if (affinity < 0 or @as(u32, @intCast(affinity)) >= @import("../../smp.zig").configured_cpu_count) return -22;
+    const affinity: i16 = switch (aff_policy.affinityFromMask(mask_buf[0..to_copy], @import("../../smp.zig").configured_cpu_count)) {
+        .pin => |p| p,
+        .err => |e| return e,
+    };
 
     // Pin the target after copying user memory. The pin closes the lookup ->
     // mutation gap: reaping cannot free or reuse the slot while migration is
@@ -4646,7 +4635,6 @@ fn syscallSchedSetaffinity(pid: u32, cpusetsize: u32, mask_ptr: u64) i64 {
     const target = target_pin.task;
     if (!maySchedule(target, false)) return -1; // EPERM
     const target_idx = target_pin.slot;
-    const target_cpu = @as(u32, @intCast(affinity));
     const lock_flags = task_mod2.lockTask();
     target.cpu_affinity = affinity;
     const was_running = target.state == .running;
@@ -4662,8 +4650,9 @@ fn syscallSchedSetaffinity(pid: u32, cpusetsize: u32, mask_ptr: u64) i64 {
     // current CPU switch away (to idle if nothing else is runnable) — a bare
     // reschedule is not enough: with no other runnable work the scheduler
     // just keeps the task on the wrong CPU (flaky migration).
-    if ((was_running or was_ready) and old_cpu != target_cpu) {
-        const pin_cpu: u8 = @intCast(target_cpu);
+    // Removing the pin (affinity < 0) needs no migration: the task simply becomes eligible everywhere.
+    if (affinity >= 0 and (was_running or was_ready) and old_cpu != @as(u32, @intCast(affinity))) {
+        const pin_cpu: u8 = @intCast(affinity);
         _ = @import("../../proc/per_cpu.zig").enqueueTask(target);
         sched.kickCpu(pin_cpu);
         if (target_idx == cur_idx) {

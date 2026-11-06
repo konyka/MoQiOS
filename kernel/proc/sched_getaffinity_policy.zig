@@ -62,3 +62,60 @@ test "affinity mask: unpinned covers every configured CPU, pinned only its own" 
     try std.testing.expectEqual(@as(?usize, 8), buildMask(&m, 9, 4, 8));
     try std.testing.expectEqual(@as(u8, 0x0f), m[0]);
 }
+
+pub const SetResult = union(enum) { pin: i16, err: i64 };
+
+/// What sched_setaffinity makes of a user mask for a machine with `cpu_count` CPUs. Measured on Linux (raw syscall, 4 CPUs allowed):
+/// the size may be any non-zero number of bytes (3, 129, 200 all work: only the first 128 are read and missing bytes count as 0),
+/// bits for CPUs that do not exist are ignored when a real CPU is also named, and a mask that names no existing CPU is EINVAL.
+/// The scheduler can only keep one pin per task, so: a mask that names every configured CPU removes the pin (-1: the task may run
+/// anywhere, and sched_getaffinity then reports every CPU, as Linux does); any other non-empty set pins to its lowest CPU. That second
+/// rule is a known limit: a two-CPU subset is narrowed to its first CPU.
+pub fn affinityFromMask(mask: []const u8, cpu_count: u32) SetResult {
+    if (mask.len == 0) return .{ .err = -22 }; // EINVAL
+    const n: u32 = @max(cpu_count, 1);
+    var lowest: i32 = -1;
+    var named: u32 = 0;
+    var cpu: u32 = 0;
+    while (cpu < n) : (cpu += 1) {
+        const byte = cpu / 8;
+        if (byte >= mask.len) break;
+        if ((mask[byte] >> @intCast(cpu % 8)) & 1 != 0) {
+            if (lowest < 0) lowest = @intCast(cpu);
+            named += 1;
+        }
+    }
+    if (named == 0) return .{ .err = -22 };
+    if (named == n) return .{ .pin = -1 };
+    return .{ .pin = @intCast(lowest) };
+}
+
+test "setaffinity mask: all CPUs unpins, a subset pins to its lowest, nothing real is EINVAL" {
+    const std = @import("std");
+    // every one of 4 CPUs (extra high bits are ignored)
+    try std.testing.expectEqual(@as(i16, -1), affinityFromMask(&[_]u8{0x0f}, 4).pin);
+    try std.testing.expectEqual(@as(i16, -1), affinityFromMask(&[_]u8{ 0xff, 0xff }, 4).pin);
+    try std.testing.expectEqual(@as(i16, -1), affinityFromMask(&[_]u8{0xff}, 8).pin);
+    // one CPU of one is "all": the single-CPU machine stays unpinned
+    try std.testing.expectEqual(@as(i16, -1), affinityFromMask(&[_]u8{0x01}, 1).pin);
+    // subsets: the lowest CPU
+    try std.testing.expectEqual(@as(i16, 1), affinityFromMask(&[_]u8{0x02}, 4).pin);
+    try std.testing.expectEqual(@as(i16, 2), affinityFromMask(&[_]u8{0x0c}, 4).pin);
+    try std.testing.expectEqual(@as(i16, 0), affinityFromMask(&[_]u8{0x01}, 4).pin);
+    try std.testing.expectEqual(@as(i16, 0), affinityFromMask(&[_]u8{0x07}, 4).pin);
+    // a CPU that does not exist is ignored when a real one is named too ({1,60} on a 4-CPU machine pins to 1)
+    try std.testing.expectEqual(@as(i16, 1), affinityFromMask(&[_]u8{ 0x02, 0, 0, 0, 0, 0, 0, 0x10 }, 4).pin);
+    // ... and a mask that names no existing CPU is EINVAL (only CPU 60, only CPUs 20..30, only CPU 64)
+    try std.testing.expectEqual(@as(i64, -22), affinityFromMask(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0x10 }, 4).err);
+    try std.testing.expectEqual(@as(i64, -22), affinityFromMask(&[_]u8{ 0, 0, 0xf0, 0xff, 0x07 }, 4).err);
+    try std.testing.expectEqual(@as(i64, -22), affinityFromMask(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 4).err);
+    // empty mask and zero size are EINVAL
+    try std.testing.expectEqual(@as(i64, -22), affinityFromMask(&[_]u8{ 0, 0, 0, 0 }, 4).err);
+    try std.testing.expectEqual(@as(i64, -22), affinityFromMask(&[_]u8{}, 4).err);
+    // a short mask: missing bytes count as 0 ({0,1} in one byte on 4 CPUs is a subset, so it pins to 0)
+    try std.testing.expectEqual(@as(i16, 0), affinityFromMask(&[_]u8{0x03}, 4).pin);
+    // 70 CPUs: all of them (two words) unpin, a missing high word means a subset
+    var full: [9]u8 = @splat(0xff);
+    try std.testing.expectEqual(@as(i16, -1), affinityFromMask(&full, 70).pin);
+    try std.testing.expectEqual(@as(i16, 0), affinityFromMask(full[0..8], 70).pin);
+}
