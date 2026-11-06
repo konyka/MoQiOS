@@ -83,20 +83,20 @@ jobs:
         # limit on two consecutive runs while downloading qemu-system-misc).
         timeout-minutes: 11
         run: |
-          # On the Ubuntu 26.04 runner image qemu-system-misc installs without qemu-system-riscv64 (run 42131972835: install succeeded, then
-          # "qemu-system-riscv64 not found"); the emulator is in the separate package qemu-system-riscv there. So after the base install any
-          # emulator that is still missing is installed from its own package. Images where the base install already provides both
-          # binaries never reach those branches.
+          # On the Ubuntu 26.04 runner image qemu-system-misc installs without qemu-system-riscv64 (run 42131972835: install succeeded,
+          # then "qemu-system-riscv64 not found"); the emulator is in the separate package qemu-system-riscv there, and installing that
+          # one instead of qemu-system-misc is also a smaller download (41.6 MB in a clean 26.04 container against the 62.9 MB the runner reported). Older images only have qemu-system-misc, so the package is
+          # chosen by whether qemu-system-riscv exists. The apt timeout and retry options make a stalled mirror connection give up after
+          # 30 seconds and retry, instead of sitting until the 240 second limit of the whole attempt (run 42134669433 lost all three
+          # attempts to a stalled download of qemu-system-misc).
+          APT="-o Acquire::http::Timeout=30 -o Acquire::Retries=3"
           for attempt in 1 2 3; do
-            if sudo timeout 240 apt-get update && sudo timeout 240 apt-get install -y --no-install-recommends qemu-system-misc qemu-system-arm ipxe-qemu; then
-              if ! command -v qemu-system-riscv64 >/dev/null; then
-                sudo timeout 240 apt-get install -y --no-install-recommends qemu-system-riscv || true
+            if sudo timeout 240 apt-get $APT update; then
+              if apt-cache show qemu-system-riscv >/dev/null 2>&1; then riscv_pkg=qemu-system-riscv; else riscv_pkg=qemu-system-misc; fi
+              if sudo timeout 240 apt-get $APT install -y --no-install-recommends "$riscv_pkg" qemu-system-arm ipxe-qemu &&
+                 command -v qemu-system-riscv64 >/dev/null && command -v qemu-system-aarch64 >/dev/null; then
+                exit 0
               fi
-              if ! command -v qemu-system-aarch64 >/dev/null; then
-                sudo timeout 240 apt-get install -y --no-install-recommends qemu-system-aarch64 || true
-              fi
-              command -v qemu-system-riscv64 >/dev/null && command -v qemu-system-aarch64 >/dev/null && exit 0
-              echo "emulators still missing after install: riscv64=$(command -v qemu-system-riscv64) aarch64=$(command -v qemu-system-aarch64)" >&2
             fi
             echo "apt attempt $attempt failed or timed out" >&2
             sleep 5

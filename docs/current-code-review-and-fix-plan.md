@@ -6903,5 +6903,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 现象：运行 42131972835（`3719fd6`）的 `smoke-cross-arch` 失败：`Install cross-architecture QEMU` 成功，下一步 `Smoke RISC-V 64` 报 `ERROR: qemu-system-riscv64 not found`。此前同一工作流在同样的步骤上是绿的，说明 `ubuntu-latest` 的镜像换成了 Ubuntu 26.04（日志里的包源是 `resolute`）。
 - 原因：在 26.04 上 RISC-V 模拟器的包是 `qemu-system-riscv`，`qemu-system-misc` 不再包含它。我在一个 `ubuntu:26.04` 容器里复现并验证：装 `qemu-system-misc qemu-system-arm ipxe-qemu` 后只有 `qemu-system-aarch64`；再装 `qemu-system-riscv` 后 `qemu-system-riscv64` 也在。
-- 修复：`.github/workflows/test.yml` 的安装步骤在基础安装后检查两个二进制，缺哪个就补装对应的包（`qemu-system-riscv`、`qemu-system-aarch64`），最后仍缺则这次尝试算失败并重试。
-- 如实说明：①这个失败与 TCP 改动无关（`smoke-qemu` 与 `host-tests` 都成功）；②修复只在容器里验证了安装，**还没有在 GitHub 上跑过**，要等下一次运行；③安装结果以 `command -v` 为准，没有校验模拟器版本。
+- 第一版修复（`97ea505`：基础安装后缺哪个补装哪个）**没有解决问题**：运行 42134669433 的 `Install cross-architecture QEMU` 三次尝试都卡在下载 `qemu-system-misc`（"Need to get 57.9 MB/62.9 MB"、"46.5 MB/62.9 MB"，每次尝试到 240 秒上限被 `timeout` 杀掉），步骤被 11 分钟上限取消，根本没走到补装那一步。这是镜像下载停滞，和上一次（`3719fd6`）里一次就装好是两种现象，说明这个镜像源现在偶发慢；我没有查清为什么。
+- 第二版修复：①直接装 `qemu-system-riscv`（有这个包就用它，没有就退回 `qemu-system-misc`），在干净的 26.04 容器里它的下载是 41.6 MB，runner 上 `qemu-system-misc` 路径是 62.9 MB，少下载一部分；②给 `apt-get` 加 `Acquire::http::Timeout=30` 和 `Acquire::Retries=3`，停滞的连接 30 秒就放弃并重试，而不是等满 240 秒；③安装后检查两个二进制都在才算成功。
+- 验证：把工作流里的这段脚本取出来（去掉 `sudo`），在 `ubuntu:26.04` 容器里完整运行得到退出码 0 且两个二进制都在；在 `ubuntu:24.04` 容器里（没有 `qemu-system-riscv` 包，走回退到 `qemu-system-misc` 的分支）也退出 0、两个二进制都在。
+- 如实说明：①这个失败与 TCP 改动无关（`smoke-qemu` 与 `host-tests` 都成功）；②第二版**还没有在 GitHub 上跑过**，要等下一次运行；镜像下载停滞是外部因素，重试选项只能缓解，不能保证；③安装结果以 `command -v` 为准，没有校验模拟器版本。

@@ -541,7 +541,7 @@ boot-to-shell 测试（安装 `qemu-system-x86` 与 `xorriso`）；`smoke-cross-
 `qemu-system-aarch64 not found`，整个工作流因此从未绿过（host-tests 与 smoke-qemu 本身一直通过）。跨架构 job 的标记范围以各自 smoke 脚本及本章命令表为准，
 不将 SK-20+ 等未验证里程碑纳入 CI 声称。
 
-2026-11 起 `ubuntu-latest` 的镜像是 Ubuntu 26.04：在那里 `qemu-system-misc` 装完后没有 `qemu-system-riscv64`（运行 42131972835 的日志：安装成功，随后 `ERROR: qemu-system-riscv64 not found`），模拟器在单独的包 `qemu-system-riscv` 里。安装步骤因此在基础安装后检查两个二进制，缺哪个就补装对应的包（`qemu-system-riscv`、`qemu-system-aarch64`，`|| true` 容错），最后仍缺则本次尝试算失败并重试。
+2026-11 起 `ubuntu-latest` 的镜像是 Ubuntu 26.04：在那里 `qemu-system-misc` 装完后没有 `qemu-system-riscv64`（运行 42131972835 的日志：安装成功，随后 `ERROR: qemu-system-riscv64 not found`），模拟器在单独的包 `qemu-system-riscv` 里。安装步骤因此在有 `qemu-system-riscv` 这个包时装它，没有（旧镜像）就退回 `qemu-system-misc`，并给 `apt-get` 加 `Acquire::http::Timeout=30`、`Acquire::Retries=3` 以便停滞的下载尽早重试；装完检查两个二进制都在才算成功，否则整次尝试重试（最多三次，步骤上限 11 分钟）。
 
 如果被测 decl 因一小处内核改动即可变为纯函数（如把纯 helper 下沉到叶子模块），可以做
 **行为保持**的最小改动；否则放弃该模块，另选纯模块。
