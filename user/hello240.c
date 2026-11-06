@@ -24,12 +24,12 @@ int main(int argc, char **argv, char **envp) {
     char what[200];
     struct stat st;
 
-    /* How many tmpfs entries are free right now (the table holds 63 besides the root); earlier tests leave files behind, and a full
+    /* How many tmpfs entries are free right now (the table holds 511 besides the root); earlier tests leave files behind, and a full
      * table makes creation fail with ENOSPC, which would show up below as a bogus failure of the call under test. */
     int free_slots = 0;
     {
         char nm[32];
-        for (int i = 0; i < 70; i++) {
+        for (int i = 0; i < 700; i++) {
             snprintf(nm, sizeof nm, "/tmp/h240slot%d", i);
             int sfd = (int)open(nm, O_RDWR | O_CREAT, 0600);
             if (sfd < 0) break;
@@ -180,7 +180,7 @@ int main(int argc, char **argv, char **envp) {
     {
         char nm[32];
         int again = 0;
-        for (int i = 0; i < 70; i++) {
+        for (int i = 0; i < 700; i++) {
             snprintf(nm, sizeof nm, "/tmp/h240slot%d", i);
             int sfd = (int)open(nm, O_RDWR | O_CREAT, 0600);
             if (sfd < 0) break;

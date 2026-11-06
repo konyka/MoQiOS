@@ -8,7 +8,12 @@ const creation_metadata = @import("../proc/creation_metadata.zig");
 const dac = @import("dac.zig");
 const rename_policy = @import("rename_policy.zig");
 
-const MAX_FILES = 64;
+/// Entries in the table, the root directory included (slot 0). A slot number is a `Idx` (u16): one past what a single bitmap word could hold,
+/// because /tmp ran out at 63 files and directories (a handful of leaked entries from earlier programs stopped /tmp/kern.log).
+const MAX_FILES = 512;
+const Idx = u16;
+const NO_PARENT: Idx = 0xFFFF;
+const slot_bitmap = @import("slot_bitmap.zig");
 const MAX_NAME_LEN = 60;
 const PAGES_PER_FILE = 64;
 const PAGE_SIZE = 4096;
@@ -22,7 +27,7 @@ const TmpfsEntry = struct {
     name: [MAX_NAME_LEN]u8,
     name_len: u8,
     is_dir: bool,
-    parent_idx: u8, // 255 = root
+    parent_idx: Idx, // NO_PARENT = the root has no parent
     size: u32,
     pages: [PAGES_PER_FILE]?u64, // physical page addresses
     page_count: u16, // 数据页数（不含间接页）；最大 576
@@ -52,28 +57,26 @@ pub const Metadata = struct {
 };
 
 var entries: [MAX_FILES]TmpfsEntry = undefined;
-var active_bm: u64 = 0; // Bitmap: bit i = entries[i].active
+var active_bm: slot_bitmap.SlotBitmap(MAX_FILES / 64) = .{}; // bit i = entries[i].active
 var tmpfs_lock: IrqSpinlock = .{};
 var next_ctime: u64 = 1;
 var initialized: bool = false;
 
-inline fn bmSet(idx: u6) void {
-    active_bm |= @as(u64, 1) << idx;
+inline fn bmSet(idx: Idx) void {
+    active_bm.set(idx);
 }
-inline fn bmClr(idx: u6) void {
-    active_bm &= ~(@as(u64, 1) << idx);
+inline fn bmClr(idx: Idx) void {
+    active_bm.clear(idx);
 }
 
-fn allocEntry() ?u8 {
-    const inv = ~active_bm & ~@as(u64, 1); // skip bit 0 (root), mask free slots
-    if (inv == 0) return null;
-    const i: u8 = @intCast(@ctz(inv));
+fn allocEntry() ?Idx {
+    const i: Idx = @intCast(active_bm.lowestFree(1) orelse return null); // slot 0 is the root
     if (i >= MAX_FILES) return null;
-    bmSet(@intCast(i));
+    bmSet(i);
     return i;
 }
 
-fn freeEntryPages(idx: u8) void {
+fn freeEntryPages(idx: Idx) void {
     const entry = &entries[idx];
     for (0..PAGES_PER_FILE) |p| {
         if (entry.pages[p]) |phys| {
@@ -132,17 +135,15 @@ fn pageAtAlloc(entry: *TmpfsEntry, page_idx: u32) u64 {
     return phys;
 }
 
-fn dirMeta(idx: u8) dac.Metadata {
+fn dirMeta(idx: Idx) dac.Metadata {
     const e = &entries[idx];
     return .{ .mode = e.mode, .uid = e.uid, .gid = e.gid };
 }
 
-fn findEntry(name: []const u8, parent: u8) ?u8 {
-    var bm = active_bm;
-    while (bm != 0) {
-        const bit = @ctz(bm);
-        bm &= bm - 1;
-        const i: u8 = @intCast(bit);
+fn findEntry(name: []const u8, parent: Idx) ?Idx {
+    var it = active_bm.iterator();
+    while (it.next()) |bit| {
+        const i: Idx = @intCast(bit);
         if (entries[i].deleted) continue; // v53.51: unlinked, pending last close
         if (entries[i].parent_idx != parent) continue;
         if (entries[i].name_len != name.len) continue;
@@ -164,7 +165,7 @@ fn stripPrefix(path: []const u8) []const u8 {
 
 /// Split path into components (naive: split by '/').
 /// Returns the final component name and its parent directory index.
-fn resolvePath(path: []const u8, out_name: *[MAX_NAME_LEN]u8, out_name_len: *u8) ?u8 {
+fn resolvePath(path: []const u8, out_name: *[MAX_NAME_LEN]u8, out_name_len: *u8) ?Idx {
     const inner = stripPrefix(path);
     if (inner.len == 0 or (inner.len == 1 and inner[0] == '/')) {
         // root directory
@@ -173,7 +174,7 @@ fn resolvePath(path: []const u8, out_name: *[MAX_NAME_LEN]u8, out_name_len: *u8)
         return 0;
     }
 
-    var parent: u8 = 0;
+    var parent: Idx = 0;
     var start: usize = 0;
     if (inner[0] == '/') start = 1;
 
@@ -212,7 +213,7 @@ fn resolvePath(path: []const u8, out_name: *[MAX_NAME_LEN]u8, out_name_len: *u8)
 /// is a file, ENAMETOOLONG for an over-long final name, otherwise ENOENT.
 fn resolveErrno(path: []const u8) i64 {
     const inner = stripPrefix(path);
-    var parent: u8 = 0;
+    var parent: Idx = 0;
     var start: usize = if (inner.len > 0 and inner[0] == '/') 1 else 0;
     var i = start;
     while (i <= inner.len) : (i += 1) {
@@ -241,7 +242,7 @@ pub fn init() void {
             .name = @splat(0),
             .name_len = 0,
             .is_dir = false,
-            .parent_idx = 255,
+            .parent_idx = NO_PARENT,
             .size = 0,
             .pages = [_]?u64{null} ** PAGES_PER_FILE,
             .page_count = 0,
@@ -259,7 +260,7 @@ pub fn init() void {
         .name = @splat(0),
         .name_len = 1,
         .is_dir = true,
-        .parent_idx = 255,
+        .parent_idx = NO_PARENT,
         .size = 0,
         .pages = [_]?u64{null} ** PAGES_PER_FILE,
         .page_count = 0,
@@ -272,7 +273,8 @@ pub fn init() void {
         .deleted = false,
     };
     entries[0].name[0] = '/';
-    active_bm = 1; // bit 0 = root
+    active_bm = .{};
+    active_bm.set(0); // slot 0 = root
     initialized = true;
 }
 
@@ -282,7 +284,7 @@ pub fn tmpfsOpen(path: []const u8, create: bool, is_dir: bool) i64 {
     return tmpfsOpenAuthorized(path, create, is_dir, 0, 0, .{}, 0, null, creation_metadata.DEFAULT_UMASK);
 }
 
-fn createEntryLocked(name: []const u8, name_len: u8, parent: u8, is_dir: bool, requested_mode: ?u32, umask_val: u32, euid: u32, egid: u32) ?u8 {
+fn createEntryLocked(name: []const u8, name_len: u8, parent: Idx, is_dir: bool, requested_mode: ?u32, umask_val: u32, euid: u32, egid: u32) ?Idx {
     const idx = allocEntry() orelse return null;
     const metadata = creation_metadata.decide(null, if (is_dir) .directory else .regular_file, requested_mode, umask_val, euid, egid).metadata;
     entries[idx] = .{
@@ -354,7 +356,7 @@ pub fn tmpfsOpenAuthorized(path: []const u8, create: bool, is_dir: bool, euid: u
 }
 
 /// Read from a tmpfs file.
-pub fn tmpfsRead(idx: u8, offset: u64, buf: [*]u8, count: u32) i64 {
+pub fn tmpfsRead(idx: Idx, offset: u64, buf: [*]u8, count: u32) i64 {
     if (idx >= MAX_FILES) return -1;
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
@@ -390,7 +392,7 @@ pub fn tmpfsRead(idx: u8, offset: u64, buf: [*]u8, count: u32) i64 {
 }
 
 /// Write to a tmpfs file.
-pub fn tmpfsWrite(idx: u8, offset: u64, data: [*]const u8, count: u32) i64 {
+pub fn tmpfsWrite(idx: Idx, offset: u64, data: [*]const u8, count: u32) i64 {
     if (idx >= MAX_FILES) return -1;
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
@@ -432,7 +434,7 @@ pub fn tmpfsWrite(idx: u8, offset: u64, data: [*]const u8, count: u32) i64 {
 /// Truncate a tmpfs file to `new_size`, freeing pages beyond the new size.
 /// Growing only updates the size — pages are allocated lazily on write and
 /// unallocated pages read back as zeros.
-pub fn tmpfsTruncate(idx: u8, new_size: u32) bool {
+pub fn tmpfsTruncate(idx: Idx, new_size: u32) bool {
     if (idx >= MAX_FILES) return false;
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
@@ -446,7 +448,7 @@ pub fn tmpfsTruncate(idx: u8, new_size: u32) bool {
 
 /// Current seals of a tmpfs file (F_GET_SEALS); null for a directory or a
 /// dead slot.
-pub fn tmpfsGetSeals(idx: u8) ?u32 {
+pub fn tmpfsGetSeals(idx: Idx) ?u32 {
     if (idx >= MAX_FILES) return null;
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
@@ -458,7 +460,7 @@ pub fn tmpfsGetSeals(idx: u8) ?u32 {
 /// F_ADD_SEALS: 0, or -EPERM / -EINVAL / -EBUSY as memfd_policy decides.
 /// `shared_writable_maps` is the caller's count of live MAP_SHARED
 /// PROT_WRITE mappings of this file (taken without tmpfs_lock).
-pub fn tmpfsAddSeals(idx: u8, add: u32, shared_writable_maps: u32) i64 {
+pub fn tmpfsAddSeals(idx: Idx, add: u32, shared_writable_maps: u32) i64 {
     if (idx >= MAX_FILES) return -22;
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
@@ -514,7 +516,7 @@ fn truncateLocked(entry: *TmpfsEntry, new_size: u32) void {
 
 /// Close a tmpfs file: drop one open reference. The file persists until
 /// unlink; an unlinked (deleted) file is freed once its last fd closes.
-pub fn tmpfsClose(idx: u8) void {
+pub fn tmpfsClose(idx: Idx) void {
     if (idx >= MAX_FILES) return;
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
@@ -532,7 +534,7 @@ pub fn tmpfsClose(idx: u8) void {
 /// already `deleted`, so no path lookup can find it and the last close frees
 /// its pages (the unlink-while-open state). Returns the entry index or null
 /// when the table is full. Owner is the creator; mode 0777 like Linux memfds.
-pub fn tmpfsCreateAnonymous(euid: u32, egid: u32) ?u8 {
+pub fn tmpfsCreateAnonymous(euid: u32, egid: u32) ?Idx {
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
     const idx = createEntryLocked("", 0, 0, false, 0o777, 0, euid, egid) orelse return null;
@@ -541,7 +543,7 @@ pub fn tmpfsCreateAnonymous(euid: u32, egid: u32) ?u8 {
 }
 
 /// Set the initial seals of a just-created memfd.
-pub fn tmpfsSetInitialSeals(idx: u8, seals: u32) void {
+pub fn tmpfsSetInitialSeals(idx: Idx, seals: u32) void {
     if (idx >= MAX_FILES) return;
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
@@ -550,7 +552,7 @@ pub fn tmpfsSetInitialSeals(idx: u8, seals: u32) void {
 
 /// Retain one open reference (fork/clone fd-table copy — see
 /// vfs.retainSharedResources).
-pub fn tmpfsRetain(idx: u8) void {
+pub fn tmpfsRetain(idx: Idx) void {
     if (idx >= MAX_FILES) return;
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
@@ -607,11 +609,9 @@ pub fn tmpfsRemove(path: []const u8, who: ?Remover, want: RemoveKind) i64 {
 
     if (entry.is_dir) {
         // directory must be empty — bitmap scan
-        var bm = active_bm;
-        while (bm != 0) {
-            const bit = @ctz(bm);
-            bm &= bm - 1;
-            const ci: u8 = @intCast(bit);
+        var it = active_bm.iterator();
+        while (it.next()) |bit| {
+            const ci: Idx = @intCast(bit);
             if (entries[ci].deleted) continue;
             if (entries[ci].parent_idx == idx) {
                 return -39; // ENOTEMPTY
@@ -631,18 +631,17 @@ pub fn tmpfsRemove(path: []const u8, who: ?Remover, want: RemoveKind) i64 {
     return 0;
 }
 
-fn hasChildren(dir: u8) bool {
-    var bm = active_bm;
-    while (bm != 0) {
-        const ci: u8 = @intCast(@ctz(bm));
-        bm &= bm - 1;
+fn hasChildren(dir: Idx) bool {
+    var it = active_bm.iterator();
+    while (it.next()) |bit| {
+        const ci: Idx = @intCast(bit);
         if (!entries[ci].deleted and ci != dir and entries[ci].parent_idx == dir) return true;
     }
     return false;
 }
 
 /// Whether directory `anc` is `dir` or one of its ancestors.
-fn isAncestorOrSelf(anc: u8, dir: u8) bool {
+fn isAncestorOrSelf(anc: Idx, dir: Idx) bool {
     var d = dir;
     var hops: u32 = 0;
     while (hops <= MAX_FILES) : (hops += 1) {
@@ -655,7 +654,7 @@ fn isAncestorOrSelf(anc: u8, dir: u8) bool {
 
 /// Removing `victim` from `parent` for rename: -13 without write+search on
 /// the directory, -1 (EPERM) when only the sticky rule refuses it.
-fn mayDetach(parent: u8, victim: u8, who: ?Remover) i64 {
+fn mayDetach(parent: Idx, victim: Idx, who: ?Remover) i64 {
     const w = who orelse return 0;
     const creds: dac.Credentials = .{ .euid = w.euid, .egid = w.egid, .cap_dac_override = w.effective_caps.cap_dac_override, .groups = @import("../proc/current_groups.zig").forCaller(w.euid, w.egid) };
     if (!dac.allows(dirMeta(parent), creds, dac.Access.write_search)) return -13;
@@ -751,7 +750,7 @@ pub fn tmpfsChmod(path: []const u8, new_mode: u32, who: Remover) i64 {
 }
 
 /// fchmod on an open tmpfs descriptor (same rules as tmpfsChmod).
-pub fn tmpfsChmodIdx(idx: u8, new_mode: u32, who: Remover) i64 {
+pub fn tmpfsChmodIdx(idx: Idx, new_mode: u32, who: Remover) i64 {
     if (idx >= MAX_FILES) return -9;
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
@@ -759,7 +758,7 @@ pub fn tmpfsChmodIdx(idx: u8, new_mode: u32, who: Remover) i64 {
     return chmodLocked(idx, new_mode, who);
 }
 
-fn chmodLocked(idx: u8, new_mode: u32, who: Remover) i64 {
+fn chmodLocked(idx: Idx, new_mode: u32, who: Remover) i64 {
     const e = &entries[idx];
     if (!dac.mayChmod(e.uid, who.euid, who.effective_caps.cap_fowner)) return -1;
     e.mode = new_mode & 0o7777;
@@ -776,7 +775,7 @@ pub fn tmpfsChown(path: []const u8, uid: ?u32, gid: ?u32, who: Remover) i64 {
 }
 
 /// fchown on an open tmpfs descriptor (same rules as tmpfsChown).
-pub fn tmpfsChownIdx(idx: u8, uid: ?u32, gid: ?u32, who: Remover) i64 {
+pub fn tmpfsChownIdx(idx: Idx, uid: ?u32, gid: ?u32, who: Remover) i64 {
     if (idx >= MAX_FILES) return -9;
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
@@ -784,7 +783,7 @@ pub fn tmpfsChownIdx(idx: u8, uid: ?u32, gid: ?u32, who: Remover) i64 {
     return chownLocked(idx, uid, gid, who);
 }
 
-fn chownLocked(idx: u8, uid: ?u32, gid: ?u32, who: Remover) i64 {
+fn chownLocked(idx: Idx, uid: ?u32, gid: ?u32, who: Remover) i64 {
     const e = &entries[idx];
     if (!dac.mayChownIn(e.uid, e.gid, who.euid, who.egid, @import("../proc/current_groups.zig").forCaller(who.euid, who.egid), who.effective_caps.cap_chown, uid, gid)) return -1;
     if (uid) |u| e.uid = u;
@@ -793,11 +792,11 @@ fn chownLocked(idx: u8, uid: ?u32, gid: ?u32, who: Remover) i64 {
 }
 
 /// A name that ends in '/' must denote a directory: true when `path` has the trailing slash but entry `idx` is not one.
-fn slashOnFile(path: []const u8, idx: u8) bool {
+fn slashOnFile(path: []const u8, idx: Idx) bool {
     return @import("namespace_policy.zig").hasTrailingSlash(path) and !entries[idx].is_dir;
 }
 
-fn lookupLocked(path: []const u8) ?u8 {
+fn lookupLocked(path: []const u8) ?Idx {
     var name_buf: [MAX_NAME_LEN]u8 = undefined;
     var name_len: u8 = 0;
     const parent = resolvePath(path, &name_buf, &name_len) orelse return null;
@@ -829,7 +828,7 @@ pub fn tmpfsMkdirAuthorized(path: []const u8, requested_mode: u32, umask_val: u3
 }
 
 /// Get file size.
-pub fn tmpfsGetSize(idx: u8) u32 {
+pub fn tmpfsGetSize(idx: Idx) u32 {
     if (idx >= MAX_FILES) return 0;
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
@@ -846,9 +845,9 @@ pub fn tmpfsDirPath(idx: u32, out: *[256]u8) union(enum) { ok: []const u8, err: 
     defer tmpfs_lock.release(state_held);
     if (!entries[idx].active or entries[idx].deleted) return .{ .err = -2 };
     if (!entries[idx].is_dir) return .{ .err = -20 };
-    var chain: [MAX_FILES]u8 = undefined;
+    var chain: [MAX_FILES]Idx = undefined;
     var depth: usize = 0;
-    var cur: u8 = @intCast(idx);
+    var cur: Idx = @intCast(idx);
     while (cur != 0) {
         if (depth >= chain.len) return .{ .err = -40 };
         const e = &entries[cur];
@@ -881,7 +880,7 @@ pub fn tmpfsMetadataByPath(path: []const u8) ?Metadata {
     return .{ .mode = e.mode, .uid = e.uid, .gid = e.gid, .is_dir = e.is_dir };
 }
 
-pub fn tmpfsGetMetadata(idx: u8) ?Metadata {
+pub fn tmpfsGetMetadata(idx: Idx) ?Metadata {
     if (idx >= MAX_FILES) return null;
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
@@ -898,7 +897,7 @@ pub fn tmpfsGetMetadata(idx: u8) ?Metadata {
 /// G2: ctime doubles as a generation tag for file-backed mmap regions —
 /// captured at mmap time, revalidated on every fault by tmpfsGetMapPage so a
 /// recycled slot can never serve a stale mapping the wrong file's pages.
-pub fn tmpfsGetCtime(idx: u8) u64 {
+pub fn tmpfsGetCtime(idx: Idx) u64 {
     if (idx >= MAX_FILES) return 0;
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
@@ -911,7 +910,7 @@ pub fn tmpfsGetCtime(idx: u8) u64 {
 /// or ctime tag mismatch). The caller must pmm.addRef() the frame before
 /// mapping it; freeEntryPages' freePage then only drops tmpfs's own
 /// reference and the frame outlives the entry while the mapping holds it.
-pub fn tmpfsGetMapPage(idx: u8, ctime: u64, page_idx: u32) ?u64 {
+pub fn tmpfsGetMapPage(idx: Idx, ctime: u64, page_idx: u32) ?u64 {
     if (idx >= MAX_FILES) return null;
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
@@ -929,7 +928,7 @@ pub fn tmpfsGetMapPage(idx: u8, ctime: u64, page_idx: u32) ?u64 {
 /// Same generation-tag validation and lifetime contract as tmpfsGetMapPage.
 /// Does not grow entry.size: the fault path only ensures pages inside the
 /// mmap-time size snapshot.
-pub fn tmpfsEnsureMapPage(idx: u8, ctime: u64, page_idx: u32) ?u64 {
+pub fn tmpfsEnsureMapPage(idx: Idx, ctime: u64, page_idx: u32) ?u64 {
     if (idx >= MAX_FILES) return null;
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
@@ -951,7 +950,7 @@ pub const TmpfsDirListing = struct {
     count: u32,
 };
 
-pub fn tmpfsCanListDir(idx: u8, euid: u32, egid: u32, effective_caps: capability.SysCap) bool {
+pub fn tmpfsCanListDir(idx: Idx, euid: u32, egid: u32, effective_caps: capability.SysCap) bool {
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
     if (idx >= MAX_FILES) return false;
@@ -971,7 +970,7 @@ pub fn tmpfsCanListDir(idx: u8, euid: u32, egid: u32, effective_caps: capability
 /// a concurrent getdents/unlink corrupted a listing still in use.
 /// `out_entries` receives the entry records; `names_buf`/`names_cap` receives
 /// the name bytes each entry's name slice points into.
-pub fn tmpfsListDir(idx: u8, out_entries: []TmpfsDirEntry, names_buf: [*]u8, names_cap: u32) TmpfsDirListing {
+pub fn tmpfsListDir(idx: Idx, out_entries: []TmpfsDirEntry, names_buf: [*]u8, names_cap: u32) TmpfsDirListing {
     const empty: TmpfsDirListing = .{ .entries = &[_]TmpfsDirEntry{}, .count = 0 };
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
@@ -980,11 +979,9 @@ pub fn tmpfsListDir(idx: u8, out_entries: []TmpfsDirEntry, names_buf: [*]u8, nam
     }
     var count: u32 = 0;
     var names_used: u32 = 0;
-    var bm = active_bm;
-    while (bm != 0) {
-        const bit = @ctz(bm);
-        bm &= bm - 1;
-        const i: u8 = @intCast(bit);
+    var it = active_bm.iterator();
+    while (it.next()) |bit| {
+        const i: Idx = @intCast(bit);
         if (entries[i].deleted) continue;
         if (entries[i].parent_idx != idx) continue;
         if (count >= out_entries.len) break;

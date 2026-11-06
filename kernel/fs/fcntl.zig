@@ -82,7 +82,7 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
             // other file type is EINVAL, as on Linux.
             if (t.fd_table.fds[fd].fd_type != .tmpfs_file) return -22;
             const tmpfs = @import("tmpfs.zig");
-            const idx: u8 = @intCast(t.fd_table.fds[fd].tmpfs_idx);
+            const idx: u16 = @intCast(t.fd_table.fds[fd].tmpfs_idx);
             if (cmd == F_GET_SEALS) return @intCast(tmpfs.tmpfsGetSeals(idx) orelse return -22);
             // Linux: adding seals needs a writable descriptor.
             if (!t.fd_table.fds[fd].writable) return -1;

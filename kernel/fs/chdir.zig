@@ -69,7 +69,7 @@ fn tmpfsDirectory(cur: *task_mod.Task, path: []const u8) i64 {
     const tmpfs = @import("tmpfs.zig");
     const r = tmpfs.tmpfsOpenAuthorized(path, false, false, cur.euid, cur.egid, cur.effective_caps, 0, null, cur.fsctx().umask);
     if (r < 0) return if (r == -13) -13 else -2;
-    const idx: u8 = @intCast(r);
+    const idx: u16 = @intCast(r);
     defer tmpfs.tmpfsClose(idx);
     const meta = tmpfs.tmpfsGetMetadata(idx) orelse return -2;
     if (!meta.is_dir) return -20;

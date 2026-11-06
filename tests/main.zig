@@ -3398,7 +3398,7 @@ test "tmpfs exclusive create rejects before existing-entry mutation" {
 }
 
 test "statx routes tmpfs fields through locked metadata accessor" {
-    try std.testing.expect(std.mem.indexOf(u8, kt.tmpfs_source, "pub fn tmpfsGetMetadata(idx: u8) ?Metadata") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.tmpfs_source, "pub fn tmpfsGetMetadata(idx: Idx) ?Metadata") != null);
     try expectSourceRoute(
         kt.statx_source,
         ".tmpfs_file => {",
@@ -11050,4 +11050,44 @@ test "a new group state starts at / with umask 022" {
     try std.testing.expectEqual(@as(u32, 0o022), st.fs.umask);
     // One default, two spellings: the policy module's and the group state's must agree.
     try std.testing.expectEqual(kt.creation_metadata.DEFAULT_UMASK, gs.DEFAULT_UMASK);
+}
+
+test "tmpfs table holds well past 63 entries, indexed by a 16-bit slot number" {
+    const src = kt.tmpfs_source;
+    const pos = std.mem.indexOf(u8, src, "const MAX_FILES = ") orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, src, pos, ";") orelse return error.TestUnexpectedResult;
+    const n = try std.fmt.parseInt(u32, src[pos + "const MAX_FILES = ".len .. end], 10);
+    try std.testing.expect(n >= 128); // the old table stopped at 64 slots (63 usable)
+    try std.testing.expect(n % 64 == 0); // the slot bitmap is whole 64-bit words
+    // A slot number that does not fit a byte must never be squeezed into one: no entry-index parameter is a u8.
+    try std.testing.expect(std.mem.indexOf(u8, src, "idx: u8") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "?u8 {") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "parent_idx: u8") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const Idx = u16;") != null);
+}
+
+test "no caller squeezes a tmpfs slot number into a byte" {
+    // A tmpfs slot is a u16 (the table has more than 255 entries); `const idx: u8 = @intCast(<slot>)` would trip the safety check, and in
+    // a release build wrap, for slot 256 and up. Every caller that holds a slot in a local must give it a type that fits.
+    const files = [_]struct { name: []const u8, src: []const u8 }{
+        .{ .name = "fcntl.zig", .src = kt.fcntl_source },
+        .{ .name = "chdir.zig", .src = kt.chdir_source },
+        .{ .name = "idt.zig", .src = kt.idt_source },
+        .{ .name = "mprotect.zig", .src = kt.mprotect_source },
+        .{ .name = "sk34.zig", .src = kt.sk34_source },
+    };
+    for (files) |f| {
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, f.src, pos, ": u8 = @intCast(")) |at| {
+            const line_end = std.mem.indexOfPos(u8, f.src, at, "\n") orelse f.src.len;
+            const line = f.src[at..line_end];
+            // the slot-bearing expressions: a tmpfs index, a file mapping's file index, or an open result
+            const bad = std.mem.indexOf(u8, line, "tmpfs_idx") != null or std.mem.indexOf(u8, line, "file_idx") != null or std.mem.indexOf(u8, line, "(r)") != null or std.mem.indexOf(u8, line, "(idx_i)") != null;
+            if (bad) {
+                std.debug.print("{s}: {s}\n", .{ f.name, line });
+                return error.TestUnexpectedResult;
+            }
+            pos = line_end;
+        }
+    }
 }

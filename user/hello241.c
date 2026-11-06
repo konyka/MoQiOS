@@ -1,5 +1,5 @@
 /* hello241: a tmpfs entry comes back when its last descriptor closes, however the descriptors were made. The tmpfs table holds
- * 63 entries; a descriptor that is closed while another descriptor of the same file is still open must still give up its own
+ * 511 entries (it held 63 before hello244); a descriptor that is closed while another descriptor of the same file is still open must still give up its own
  * reference to the entry, otherwise unlink cannot free the slot and the table slowly fills (open+stat leaked one entry per call).
  * The count of free entries is measured by creating files until the table is full. */
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
@@ -21,7 +21,7 @@ static void check(int ok, const char *what) {
 static int free_entries(void) {
     char nm[32];
     int n = 0;
-    for (int i = 0; i < 70; i++) {
+    for (int i = 0; i < 700; i++) {
         snprintf(nm, sizeof nm, "/tmp/h241slot%d", i);
         int s = (int)open(nm, O_RDWR | O_CREAT, 0600);
         if (s < 0) break;

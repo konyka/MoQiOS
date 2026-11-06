@@ -162,6 +162,11 @@ $CC $CFLAGS $SI_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/sysinfo.c -o "$OUT/sys
 $CC $CFLAGS -o "$OUT/test_sysinfo_abi" test_sysinfo_abi.c "$OUT/sysinfo.o"
 "$OUT/test_sysinfo_abi" || fail=1
 
+echo "== test_errno_abi =="
+$CC $CFLAGS -Dstrerror=moqi_strerror -c ../src/strfunc.c -o "$OUT/strfunc_errno.o"
+$CC $CFLAGS -o "$OUT/test_errno_abi" test_errno_abi.c "$OUT/strfunc_errno.o"
+"$OUT/test_errno_abi" || fail=1
+
 echo "== test_select_abi =="
 $CC $CFLAGS -Dselect=moqi_select -Dpselect=moqi_pselect -DMOQI_HOST_TEST_SYSCALL -c ../src/select.c -o "$OUT/select.o"
 $CC $CFLAGS -o "$OUT/test_select_abi" test_select_abi.c "$OUT/select.o"

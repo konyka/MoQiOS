@@ -1132,7 +1132,7 @@ fn currentFileSize(region: anytype) u64 {
         .fat32 => @max(@import("../../fs/fat32.zig").getFileSize(region.file_idx), wb.stagedEnd(region.inode_id, .fat32)),
         .tmpfs => blk: {
             const tmpfs = @import("../../fs/tmpfs.zig");
-            const idx: u8 = @intCast(region.file_idx);
+            const idx: u16 = @intCast(region.file_idx);
             // ctime is the generation tag: a recycled slot is another file.
             if (tmpfs.tmpfsGetCtime(idx) != region.file_data) break :blk 0;
             break :blk tmpfs.tmpfsGetSize(idx);

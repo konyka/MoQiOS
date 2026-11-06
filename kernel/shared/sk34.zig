@@ -17,7 +17,7 @@ pub fn announce() void {
         arch.serial.writeString("[SK-34] FAILED: tmpfsOpen\n");
         return;
     }
-    const idx: u8 = @intCast(idx_i);
+    const idx: u16 = @intCast(idx_i);
     const payload = "SK34";
     const wrote = tmpfs.tmpfsWrite(idx, 0, payload.ptr, payload.len);
     if (wrote != @as(i64, @intCast(payload.len))) {

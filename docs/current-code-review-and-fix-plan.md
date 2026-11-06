@@ -6974,3 +6974,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - **已知限制（如实）**：调度器每个任务只有一个固定位（`cpu_affinity: i16`），所以点名一个真子集（如 `{2,3}`）会被**窄化到最低的 CPU**（这里是 2），`getaffinity` 随后只报告 CPU 2，而 Linux 报告 `{2,3}`。这在 hello243 的 F 项里被如实断言为"报告的 CPU 是被点名的之一"，而不是假装支持整个子集。要完整支持需要在任务里存一个位图并让每个调度决策都查它，我没有做。
 - **既有的迁移延迟（未解决）**：hello243 第一版断言"固定到 CPU 1 之后 `getcpu` 马上就在 CPU 1 上"，SMP=8 冒烟里失败了一次。我在**修改之前**的内核上重复同样的用例 10 次，也有 2 次失败（`getcpu` 一直是 0，连续 200 次 `sched_yield` 之后仍是 0），所以这是 `sched_setaffinity` 之后的迁移偶尔不立刻完成的**既有**问题（代码里 `sched_setaffinity` 的注释也写着 "flaky migration"），不是这次改动引入的。我没有去修它（需要调度器内部的工作），也不能让一条会随机失败的断言守着冒烟，所以这一项改为**只打印**（`hello243: note: ...`）、不判通过失败；掩码本身（`getaffinity` 报告的值）仍然是断言。
 - 如实说明：①SMP=1 的运行没有单独跑 hello243 的 `ncpu > 1` 分支（该分支被跳过）；②`sched_setaffinity` 对别的 pid（不是自己）没有新用例，沿用原来的 `pinTaskByTid` 路径；③hello243 结束时把掩码恢复成全部 CPU，避免影响之后的测试。
+
+## `/tmp` 的容量：63 → 511 个条目（hello244），以及 libc 的 `errno.h` 补全
+
+- 缺口：tmpfs 的表只有 64 个槽（根目录占一个，63 个可用，文件和目录加起来）。Linux 的 tmpfs 没有这个量级的限制。上一轮的实际后果：前面的测试留下的条目（有些是已知泄漏，有些是正常遗留的文件）把表占到只剩 2 个，`syslogd` 因此 `open /tmp/kern.log failed (-28)`，完整冒烟超时。修了泄漏之后空闲数回到 17–28，但这个余量只是"还没再满"，一个正常程序在 `/tmp` 里创建 64 个文件就会得到 `ENOSPC`。
+- 实现：条目表扩到 512 个槽（511 可用，约 580 KB 静态内存，`TmpfsEntry` 每个 1136 字节）。槽号从 `u8` 改成 `u16`（`Idx`），根的 `parent_idx` 哨兵从 255 改成 `0xFFFF`；占用位图从一个 `u64` 改成新模块 `fs/slot_bitmap.zig`（`SlotBitmap(N)`：`lowestFree`、`set`/`clear`、有序迭代器，3 个 host 测试）。`tmpfsListDir` 原来也有一个 `u8` 的下标，已改。
+- **发现的隐患（已修）**：有 5 处调用方（5 个文件各一处）把 tmpfs 的槽号 `@intCast` 进 `u8` 局部变量（`fcntl.zig` 的 seals、`chdir.zig`、`idt.zig` 的映射大小、`mprotect.zig`、`sk34.zig`）。槽号超过 255 时这些会触发 `@intCast` 的安全检查（Debug 下 panic，发布构建下回绕成另一个文件）。我加了一个源码形状 host 测试"没有调用方把 tmpfs 槽号塞进一个字节"，它在修之前正确地找到了 fcntl 那一处，然后依次修完。
+- 红灯：hello244 在旧内核上（上一轮的二进制）A 项 `28 free`（`>= 400` 失败）、B 项 `28 made`（要 300）、C–E 项全部失败（`0 dirs`）；新内核 13 项通过，剩余条目 476。
+- 变异：把表缩回 64 → host 测试失败（"表要有 ≥128 个槽"）；去掉 `lowestFree` 对保留槽的屏蔽（会把根目录当作空闲槽）→ host 编译失败/测试失败；迭代器跳过最后一个字 → 失败。
+- 如实说明：①511 是我选的数，没有依据一个"正确"的上限；②Linux 的 tmpfs 受内存和 `size=` 挂载选项限制，这里是固定数量，满了仍然 `ENOSPC`（hello244 E 项断言了这个行为）；③查找条目是线性扫描位图，条目多了之后每次路径解析是 O(条目数)，没有做性能测量（hello244 里 300 个文件的创建/读回在冒烟里没有明显变慢，但我没有计时）；④riscv64/aarch64 的构建通过，但这两个架构不运行 tmpfs 路径，没有测试覆盖。
+- **连带发现的测试问题（已修）**：hello240 和 hello241 用"创建文件直到失败"数剩余条目，循环上限写死 70（当时表只有 63 个）。表扩大后数不到头，hello241 H2 的 `mid == base - 1` 在完整冒烟（SMP=1）里失败（`70 free, baseline 70`）；两个文件的上限都改成 700。这是**我自己的测试**依赖了旧容量，不是内核回归。
+- libc `errno.h`：原来只有 29 个常量，缺 `ENOSPC`、`EPIPE`、`ELOOP`、`ECONNRESET`、`EADDRINUSE` 等约 55 个。补全到 glibc 的全部常用名字（宿主机逐个测值），并加 host 测试 `test_errno_abi` 检查每个值与 glibc 一致、且 `strerror` 对每个都有文本（不是 "Unknown error N"）。**变异检查如实记录**：我先把 `ENOSPC` 改成 27 去验证，测试没有失败，原因是 `-Werror` 的"macro redefined"先拦下了（主机的 `<errno.h>` 同样定义这些名字），这样的"变异被抓住"不算数。我把测试改成不包含任何宿主头文件，再用 `ELOOP` 改成 41 重做，才被 `CHECK` 本身抓住（`strncmp(moqi_strerror(41), "Unknown error", 13) != 0` 失败，2 项失败）。
