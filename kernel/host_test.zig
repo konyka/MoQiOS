@@ -287,6 +287,7 @@ pub const sched_source = @embedFile("proc/sched.zig");
 pub const vfs_source = @embedFile("fs/vfs.zig");
 pub const fcntl_source = @embedFile("fs/fcntl.zig");
 pub const fcntl_policy = @import("fs/fcntl_policy.zig");
+pub const random_policy = @import("drivers/random_policy.zig");
 pub const task_source = @embedFile("proc/task.zig");
 pub const loader_source = @embedFile("proc/loader.zig");
 pub const execve_source = @embedFile("proc/execve.zig");

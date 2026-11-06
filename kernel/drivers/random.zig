@@ -61,19 +61,30 @@ pub fn getRandomBytes(buf: [*]u8, len: u32) void {
 /// getrandom system call (#318).
 /// buf  = user-space buffer pointer
 /// buflen = number of bytes requested
-/// flags = GRND_RANDOM / GRND_NONBLOCK (ignored)
+/// flags = GRND_NONBLOCK / GRND_RANDOM / GRND_INSECURE; the generator is always ready and never blocks, so the three behave alike.
+/// Argument rules (flags, zero length, pointer errors, per-call cap) are in random_policy.zig.
 pub fn sysGetrandom(buf: u64, buflen: u64, flags: u64) i64 {
-    _ = flags; // GRND_RANDOM/GRND_NONBLOCK ignored (no blocking entropy pool)
-    if (buflen > 256) return -22; // EINVAL, limit to 256 bytes per call
+    const policy = @import("random_policy.zig");
+    const len = switch (policy.check(buflen, flags)) {
+        .ok => |n| n,
+        .err => |e| return e,
+    };
     if (!initialized) return -11; // EAGAIN
-    if (buf == 0 or buf >= 0x0000_8000_0000_0000) return -22; // EINVAL
-
+    if (len == 0) return 0;
     const copy = @import("../mm/copy_from_user.zig");
-    var kernel_buf: [256]u8 = undefined;
-    const count: u32 = @intCast(buflen);
-    getRandomBytes(&kernel_buf, count);
+    const valid = buf != 0 and buf < 0x0000_8000_0000_0000 and copy.validateUserBufferWritable(buf, len);
+    const ptr_rc = policy.pointerErrno(len, valid);
+    if (ptr_rc != 0) return ptr_rc;
 
-    const copied = copy.copyToUser(@ptrFromInt(buf), kernel_buf[0..count], count);
-    if (copied != count) return -14; // EFAULT
-    return @intCast(count);
+    // Fill the user buffer in kernel-stack chunks so a large request does not need a large kernel buffer.
+    var kernel_buf: [256]u8 = undefined;
+    var done: u64 = 0;
+    while (done < len) {
+        const chunk: u32 = @intCast(@min(len - done, kernel_buf.len));
+        getRandomBytes(&kernel_buf, chunk);
+        const copied = copy.copyToUser(@ptrFromInt(buf + done), kernel_buf[0..chunk], chunk);
+        if (copied != chunk) return if (done > 0) @as(i64, @intCast(done)) else -14; // a short count once something was written
+        done += chunk;
+    }
+    return @intCast(done);
 }

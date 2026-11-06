@@ -2903,6 +2903,7 @@ daemon 以 `nanosleep(100ms)` 轮询；现在读本身在最新字节处睡眠�
 `EFAULT`。当前系统为单 CPU 边界：成功调用复制 `min(cpusetsize, 128)` 字节并返回复制长度，
 CPU 0 仅置 bit 0（第一个字节为 `1`，其余为 `0`）；`cpusetsize == 0` 成功但不写入，129 字节
 请求仍只复制/返回 128。hello82 锁定这些 ABI/边界语义，不修改 kernel core 或宣称 SMP affinity 支持。
+  **2026-11 修订**：上述“单 CPU、复制 `min(cpusetsize,128)`”已被取代（见 `docs/current-code-review-and-fix-plan.md` §5.2y 的修订说明）：现在大小须是 8 的倍数且不小于掩码长度（否则 `EINVAL`、不写缓冲区），成功只写并返回掩码长度（8 字节，超过 64 个 CPU 时更多）；未固定的任务报告全部已配置 CPU，固定的只报告自己。
 **`epoll_create1` flags boundary**：raw syscall #146 接受 `flags == 0` 或
 `EPOLL_CLOEXEC (0x80000)`，其它 flags 在 fd 分配前返回 `EINVAL`，不创建 epoll fd。
 `hello83` 覆盖零 flags 与非法 flags；`hello84` 覆盖零 flags/CLOEXEC 创建后关闭，以及非法

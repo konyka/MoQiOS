@@ -1,4 +1,6 @@
-// hello82 - raw sched_getaffinity current-pid and single-CPU mask boundary.
+// hello82 - raw sched_getaffinity: current-pid rule and the mask size rules. Expected values were measured on Linux with the raw call:
+// the size must be a multiple of 8 and not smaller than the kernel mask (0, 1, 4, 7, 9, 127, 129 are EINVAL), 8/16/128/200 return 8
+// and write only 8 bytes; an unpinned task reports every configured CPU, so the first byte is 1 only on a one-CPU system.
 #include <stdint.h>
 
 static inline int64_t syscall1(uint64_t n, uint64_t a) {
@@ -20,6 +22,7 @@ static inline int64_t syscall3(uint64_t n, uint64_t a, uint64_t b, uint64_t c) {
 #define SYS_SCHED_GETAFFINITY 227
 #define EFAULT 14
 #define ESRCH 3
+#define EINVAL 22
 
 static void print(const char *s) {
     uint64_t n = 0;
@@ -44,11 +47,6 @@ static int all_value(const uint8_t *buf, uint8_t value, uint64_t len) {
     return 1;
 }
 
-static int cpu0_mask(const uint8_t *buf, uint64_t len) {
-    if (len == 0 || buf[0] != 1) return 0;
-    return all_value(buf + 1, 0, len - 1);
-}
-
 __attribute__((noreturn)) static void exit_raw(int status) {
     syscall1(SYS_EXIT, (uint64_t)status);
     for (;;) {}
@@ -62,14 +60,19 @@ void _start(void) {
 
     print("hello82: start\n");
     for (uint64_t i = 0; i < sizeof(mask); i++) mask[i] = 0xa5;
-    failures += check(syscall3(SYS_SCHED_GETAFFINITY, 0, 0, (uint64_t)mask) == 0, "pid zero size zero");
-    failures += check(all_value(mask, 0xa5, sizeof(mask)), "size zero preserves mask");
-    failures += check(syscall3(SYS_SCHED_GETAFFINITY, pid, 1, (uint64_t)mask) == 1 && cpu0_mask(mask, 1), "current pid cpu zero");
-    failures += check(syscall3(SYS_SCHED_GETAFFINITY, 0, 127, (uint64_t)mask) == 127 && cpu0_mask(mask, 127), "size 127");
-    failures += check(syscall3(SYS_SCHED_GETAFFINITY, 0, 128, (uint64_t)mask) == 128 && cpu0_mask(mask, 128), "size 128");
-    mask[128] = 0xa5;
-    failures += check(syscall3(SYS_SCHED_GETAFFINITY, 0, 129, (uint64_t)mask) == 128 && cpu0_mask(mask, 128) && mask[128] == 0xa5, "size 129 capped");
-
+    static const uint64_t refused[] = { 0, 1, 4, 7, 9, 15, 127, 129 };
+    for (unsigned k = 0; k < sizeof(refused) / sizeof(refused[0]); k++) {
+        for (uint64_t i = 0; i < sizeof(mask); i++) mask[i] = 0xa5;
+        failures += check(syscall3(SYS_SCHED_GETAFFINITY, 0, refused[k], (uint64_t)mask) == -EINVAL && all_value(mask, 0xa5, sizeof(mask)), "size that is not a multiple of 8, or too small, is EINVAL and writes nothing");
+    }
+    for (uint64_t i = 0; i < sizeof(mask); i++) mask[i] = 0xa5;
+    int64_t own = syscall3(SYS_SCHED_GETAFFINITY, pid, 8, (uint64_t)mask);
+    failures += check(own == 8 && (mask[0] & 1) == 1 && all_value(mask + 8, 0xa5, sizeof(mask) - 8), "current pid, 8 bytes: 8 returned, CPU 0 in the mask, nothing written past it");
+    static const uint64_t accepted[] = { 8, 16, 128 };
+    for (unsigned k = 0; k < sizeof(accepted) / sizeof(accepted[0]); k++) {
+        for (uint64_t i = 0; i < sizeof(mask); i++) mask[i] = 0xa5;
+        failures += check(syscall3(SYS_SCHED_GETAFFINITY, 0, accepted[k], (uint64_t)mask) == 8 && all_value(mask + 8, 0xa5, sizeof(mask) - 8), "a larger multiple of 8 returns 8 and writes only 8 bytes");
+    }
     for (uint64_t i = 0; i < sizeof(sentinel); i++) sentinel[i] = 0x5a;
     failures += check(syscall3(SYS_SCHED_GETAFFINITY, 0x7fffffff, sizeof(sentinel), (uint64_t)sentinel) == -ESRCH && all_value(sentinel, 0x5a, sizeof(sentinel)), "invalid pid no mutation");
     failures += check(syscall3(SYS_SCHED_GETAFFINITY, 1, sizeof(sentinel), (uint64_t)sentinel) == -ESRCH && all_value(sentinel, 0x5a, sizeof(sentinel)), "noncurrent pid no mutation");

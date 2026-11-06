@@ -853,6 +853,7 @@
 - 当前为单 CPU mask 边界：成功调用返回并复制 `min(cpusetsize, 128)` 字节，仅设置 CPU 0 的 bit 0；
   size 0 成功且不写，size 127/128 按请求复制，size 129 仍只复制/返回 128。该门禁不扩大为
   SMP affinity 语义，也不修改 kernel core。
+  **2026-11 修订**：本节的“单 CPU mask、`min(cpusetsize,128)`”已被取代：大小须是 8 的倍数且不小于掩码长度（否则 `EINVAL`），成功只返回掩码长度，未固定任务报告全部已配置 CPU（详见 `docs/current-code-review-and-fix-plan.md` §5.2y 修订）。
 - 接线位置：`build.zig`、PID 1 的 `servers/init/main.c`、`tools/qemu_run.sh` 和
   `tools/qemu_smoke.sh`，均紧随 `hello81`。
 

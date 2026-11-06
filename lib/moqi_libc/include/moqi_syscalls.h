@@ -57,6 +57,9 @@
 #define SYS_fchdir      234
 #define SYS_umask       239
 #define SYS_fsync       244
+#define SYS_sysinfo     99
+#define SYS_sched_getaffinity 227
+#define SYS_getrandom   242
 #define SYS_link        86
 #define SYS_symlink     88
 #define SYS_readlink    89

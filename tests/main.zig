@@ -3330,6 +3330,33 @@ test "tmpfs references: every descriptor owns one open_count, so close never tre
     try std.testing.expect(std.mem.indexOf(u8, src[dupat..dupat_end], "tmpfsRetain(") != null);
 }
 
+test "getrandom argument rules: flags, zero length, pointer errors, per-call cap" {
+    const rp = kt.random_policy;
+    // Valid flags and every combination of them except RANDOM|INSECURE.
+    for ([_]u64{ 0, 1, 2, 4, 1 | 2, 1 | 4 }) |f| {
+        try std.testing.expectEqual(@as(u64, 16), rp.check(16, f).ok);
+    }
+    try std.testing.expectEqual(@as(i64, -22), rp.check(16, 2 | 4).err);
+    try std.testing.expectEqual(@as(i64, -22), rp.check(16, 1 | 2 | 4).err);
+    // Unknown bits are EINVAL, even next to valid ones.
+    try std.testing.expectEqual(@as(i64, -22), rp.check(16, 8).err);
+    try std.testing.expectEqual(@as(i64, -22), rp.check(16, 0x1234).err);
+    try std.testing.expectEqual(@as(i64, -22), rp.check(16, 1 | 0x10).err);
+    try std.testing.expectEqual(@as(i64, -22), rp.check(0, 8).err);
+    // Lengths: 257 and 4096 and 1 MiB are served in full (the old limit was 256); only a very large request is capped.
+    try std.testing.expectEqual(@as(u64, 0), rp.check(0, 0).ok);
+    try std.testing.expectEqual(@as(u64, 257), rp.check(257, 0).ok);
+    try std.testing.expectEqual(@as(u64, 4096), rp.check(4096, 0).ok);
+    try std.testing.expectEqual(@as(u64, 1 << 20), rp.check(1 << 20, 0).ok);
+    try std.testing.expectEqual(rp.MAX_PER_CALL, rp.check(rp.MAX_PER_CALL + 1, 0).ok);
+    try std.testing.expectEqual(rp.MAX_PER_CALL, rp.check(std.math.maxInt(u64), 0).ok);
+    // The pointer: a zero-length request never touches it; otherwise a bad pointer is EFAULT.
+    try std.testing.expectEqual(@as(i64, 0), rp.pointerErrno(0, false));
+    try std.testing.expectEqual(@as(i64, 0), rp.pointerErrno(0, true));
+    try std.testing.expectEqual(@as(i64, 0), rp.pointerErrno(8, true));
+    try std.testing.expectEqual(@as(i64, -14), rp.pointerErrno(8, false));
+}
+
 test "fork retains a tmpfs entry once per descriptor, the same count close releases" {
     const src = kt.vfs_source;
     const start = std.mem.indexOf(u8, src, "pub fn retainSharedResources(") orelse return error.TestUnexpectedResult;

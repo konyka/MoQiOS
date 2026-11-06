@@ -156,6 +156,12 @@ $CC $CFLAGS $ST_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/stat.c -o "$OUT/stat.o
 $CC $CFLAGS -o "$OUT/test_stat_abi" test_stat_abi.c "$OUT/stat.o"
 "$OUT/test_stat_abi" || fail=1
 
+echo "== test_sysinfo_abi =="
+SI_RENAME="-Duname=moqi_uname -Dgethostname=moqi_gethostname -Dgetrandom=moqi_getrandom -Dgetentropy=moqi_getentropy -Dsysconf=moqi_sysconf -Dgetpagesize=moqi_getpagesize -Dutsname=moqi_utsname"
+$CC $CFLAGS $SI_RENAME -DMOQI_HOST_TEST_SYSCALL -c ../src/sysinfo.c -o "$OUT/sysinfo.o"
+$CC $CFLAGS -o "$OUT/test_sysinfo_abi" test_sysinfo_abi.c "$OUT/sysinfo.o"
+"$OUT/test_sysinfo_abi" || fail=1
+
 echo "== test_select_abi =="
 $CC $CFLAGS -Dselect=moqi_select -Dpselect=moqi_pselect -DMOQI_HOST_TEST_SYSCALL -c ../src/select.c -o "$OUT/select.o"
 $CC $CFLAGS -o "$OUT/test_select_abi" test_select_abi.c "$OUT/select.o"

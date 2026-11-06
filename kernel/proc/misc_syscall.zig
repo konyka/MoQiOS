@@ -14,12 +14,12 @@ pub fn schedGetaffinity(pid: u32, cpusetsize: u64, mask_ptr: u64) i64 {
     const target = if (pid == 0) cur.tid else task_mod.findTaskByTid(pid);
     if (sched_getaffinity_policy.validatePid(pid, cur.tid, target != null) != 0) return -3; // -ESRCH
     if (mask_ptr == 0 or mask_ptr >= 0x0000_8000_0000_0000) return -14; // -EFAULT
-    // Return CPU 0 only (single CPU affinity)
+    // The CPU the task is pinned to, or every configured CPU when it is not (see sched_getaffinity_policy.buildMask).
     var mask: [128]u8 = undefined;
-    @memset(&mask, 0);
-    mask[0] = 1; // CPU 0 set
-    const to_copy: usize = @intCast(@min(cpusetsize, 128));
-    return if (copy.copyToUser(@ptrFromInt(mask_ptr), &mask, to_copy) == to_copy) @intCast(to_copy) else -14;
+    // validatePid accepts only the caller itself, so the pin to report is the caller's own.
+    const pinned: i16 = cur.cpu_affinity;
+    const n = sched_getaffinity_policy.buildMask(&mask, pinned, @import("../smp.zig").configured_cpu_count, cpusetsize) orelse return -22; // -EINVAL
+    return if (copy.copyToUser(@ptrFromInt(mask_ptr), mask[0..n], n) == n) @intCast(n) else -14;
 }
 
 /// getcomm(buf_ptr, size) -> bytes copied or -errno.
