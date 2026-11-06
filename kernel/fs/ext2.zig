@@ -3157,25 +3157,41 @@ pub fn renameFileMode(old_path: []const u8, new_path: []const u8, who: ?Who, nor
 
 /// Empty check: the directory's single data block may contain only "."
 /// and "..". A directory with more blocks is not empty by definition.
+/// A directory is empty when every record in every one of its blocks is free or names "." or "..". Directories only ever use direct
+/// blocks (addDirEntry), and a directory that grew past one block keeps its later blocks after its entries are removed, so all of them
+/// are scanned; an indirect block means a layout this code never builds and is refused.
 fn dirIsEmpty(dir_inode: *const Ext2Inode) bool {
     if (dir_inode.block[0] == 0) return false;
-    if (dir_inode.block[1] != 0 or dir_inode.block[12] != 0) return false;
+    if (dir_inode.block[12] != 0 or dir_inode.block[13] != 0 or dir_inode.block[14] != 0) return false;
     const buf: [*]u8 = @ptrFromInt(sector_buf_virt);
-    if (!readBlockUncached(resolveBlock(dir_inode, 0), buf)) return false;
-    var pos: usize = 0;
-    while (pos + 8 <= block_size) {
-        const rec_len = @as(u16, buf[pos + 4]) | (@as(u16, buf[pos + 5]) << 8);
-        if (rec_len < 8) return false;
-        const name_len = buf[pos + 6];
-        if (pos + rec_len > block_size) return false;
-        if (name_len != 0) {
-            const is_dot = name_len == 1 and buf[pos + 8] == '.';
-            const is_dotdot = name_len == 2 and buf[pos + 8] == '.' and buf[pos + 9] == '.';
-            if (!is_dot and !is_dotdot) return false;
+    for (0..EXT2_INODE_DIRECT) |bi| {
+        const blk = dir_inode.block[bi];
+        if (blk == 0) continue;
+        if (!readBlockUncached(blk, buf)) return false;
+        var pos: usize = 0;
+        while (pos + 8 <= block_size) {
+            const rec_len = @as(u16, buf[pos + 4]) | (@as(u16, buf[pos + 5]) << 8);
+            if (rec_len < 8) return false;
+            const name_len = buf[pos + 6];
+            if (pos + rec_len > block_size) return false;
+            // A removed first record of a block keeps its name length; only its inode number is cleared.
+            const rec_inode = @as(u32, buf[pos]) | (@as(u32, buf[pos + 1]) << 8) | (@as(u32, buf[pos + 2]) << 16) | (@as(u32, buf[pos + 3]) << 24);
+            if (rec_inode != 0 and name_len != 0) {
+                const is_dot = name_len == 1 and buf[pos + 8] == '.';
+                const is_dotdot = name_len == 2 and buf[pos + 8] == '.' and buf[pos + 9] == '.';
+                if (!is_dot and !is_dotdot) return false;
+            }
+            pos += rec_len;
         }
-        pos += rec_len;
     }
     return true;
+}
+
+/// Give back every block a directory owns (its direct blocks; see dirIsEmpty).
+fn freeDirBlocks(dir_inode: *const Ext2Inode) void {
+    for (0..EXT2_INODE_DIRECT) |bi| {
+        if (dir_inode.block[bi] != 0) freeBlock(dir_inode.block[bi]);
+    }
 }
 
 /// Directory rename (fs_lock held). An existing destination must be an
@@ -3252,7 +3268,7 @@ fn renameDirUnlocked(old_parent: u32, old_name: []const u8, new_parent: u32, new
         if (readInode(v, &vd)) {
             @import("page_cache.zig").invalidateInode(0x3000_0000_0000_0000 + @as(u64, v));
             dcache.invalidateParent(.ext2, v);
-            freeBlock(vd.block[0]);
+            freeDirBlocks(&vd);
             freeInodeAs(v, true);
             writeGroupDescs();
             writeSuperblock();
@@ -3371,7 +3387,7 @@ pub fn rmdirFile(path: []const u8, who: ?Who) i64 {
         parent_inode.links_count -= 1;
         _ = writeInode(parent_inode_num, &parent_inode);
     }
-    freeBlock(dir_inode.block[0]);
+    freeDirBlocks(&dir_inode);
     freeInodeAs(dir_inode_num, true);
 
     serial.writeString("[ext2] rmdir: ");

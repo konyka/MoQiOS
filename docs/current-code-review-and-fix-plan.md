@@ -7056,3 +7056,15 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异检查：第一次变异（把 `bavail` 改成 `bfree`）**编译失败**（`reserved` 变成未使用的常量），不算数；改成 `bfree - reserved + reserved` 后真编译、行为改变，hello251 的新检查"保留给 root 的块不可用"失败（`free 16193, available 16193`），还原后通过。这个检查是在第一次变异**存活**之后才加的——原先的探针只比较 `blocks >= free >= available`，等号成立，抓不到。
 - 绿灯：hello251 通过；hello114（ext4/NTFS 的 statfs，M 项）通过；host 1062/1062。
 - 未验证：①ext2 的 `f_blocks` 没有扣除元数据开销（Linux 会扣），所以与 `dumpe2fs` 的"Block count"一致而不是与 `df` 的"可用块"一致；②`statfs` 对非磁盘文件系统（`/dev`、`/proc`、管道、ramdisk）仍返回旧的写死数字；③FAT32 的 `statfs` 每次扫描整张 FAT（本夹具 3 万簇，没有计时，大盘上会很慢）；④`bavail` 没有按用户区分（root 也只看到扣除后的数）。
+
+## ext2：长大过的目录删不掉（hello250 续，已修）
+
+- 发现方式：hello250 创建了 44 个文件把目录撑到两个块，再全部 `unlink`，列表只剩点目录项——这时目录显然是空的——再对它 `rmdir`，返回 `ENOTEMPTY`（-39），同名 `mkdir` 返回 `EEXIST`（-17）。宿主机 Linux 上这是成功的。
+- 根因两个，**第一个修了之后探针仍然红，第二个是继续看才找到的**：
+  1. `dirIsEmpty` 开头 `if (dir_inode.block[1] != 0 ...) return false`，只读第 0 块；`addDirEntry` 长出的后续块在条目删光后仍挂在 inode 上，目录因此永远判为非空。改为扫描所有直接块，间接块（这份代码从不建）仍拒绝。
+  2. 第 0 块的第一条记录被删除时（`removeDirEntry` 的"块首条目只清 inode"分支）只把 inode 号清零，**名字长度保留**；`dirIsEmpty` 只看名字长度，把这条已删除的记录当成真文件。改为 `rec_inode != 0 and name_len != 0` 才算占用。
+- 连带修复：`rmdirFile` 和目录替换式 `rename` 在释放目录时只 `freeBlock(block[0])`，现在目录有两个块时第二个块会泄漏；新增 `freeDirBlocks` 释放全部直接块，两处都改用它。
+- 变异检查：把 `rec_inode != 0 and name_len != 0` 改成 `or`（真编译，行为变了）→ hello250 ext2 的 `rmdir` 回到 -39；还原后通过。第一个根因没有单独做变异，由那条 host 源码形状测试守着。
+- 绿灯：hello250 每个文件系统 8 项（tmpfs、ext2 各 8）通过；host 1063/1063。
+- 块泄漏的测量：hello250 用 `statfs` 的空闲块数（上一节的 hello251 修好后才能读）在建目录之前和删目录之后各读一次，两者必须相等。变异（`freeDirBlocks` 只释放第 0 块）→ ext2 `free blocks 16195 before, 16194 after`，即每个长大过的目录泄漏一块；还原后相等。tmpfs 同样相等（64853）。
+- 未验证：目录超过 12 个直接块仍无法扩张（`addDirEntry` 返回失败），未改。

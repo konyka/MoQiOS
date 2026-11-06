@@ -11,6 +11,15 @@
 #include "../lib/moqi_libc/include/string.h"
 #include "../lib/moqi_libc/include/errno.h"
 
+#define SYS_STATFS 276
+struct kstatfs { unsigned long w[15]; };
+static long free_blocks(const char *path) {
+    struct kstatfs f;
+    memset(&f, 0, sizeof f);
+    if (syscall2(SYS_STATFS, (long)path, (long)&f) != 0) return -1;
+    return (long)f.w[3];
+}
+
 static int failures;
 static void check(int ok, const char *what) {
     print(ok ? "hello250:   ok   " : "hello250:   FAIL ");
@@ -39,6 +48,7 @@ static void name_of(char *out, size_t cap, const char *dir, int i) {
 static void run(const char *label, const char *dir) {
     char what[200];
     char path[96];
+    long free_before = free_blocks(dir[0] == '/' ? "/tmp" : "testdir");
     if (mkdir(dir, 0755) != 0) { snprintf(what, sizeof what, "%s: mkdir %s failed", label, dir); check(0, what); return; }
     DIR *d = opendir(dir);
     if (d == (DIR *)0) { snprintf(what, sizeof what, "%s: opendir failed (%d)", label, errno); check(0, what); rmdir(dir); return; }
@@ -99,7 +109,16 @@ static void run(const char *label, const char *dir) {
     check(n == base, what);
 
     closedir(d);
-    rmdir(dir);
+    long rr = rmdir(dir);
+    snprintf(what, sizeof what, "%s: the emptied directory can be removed (rmdir %ld)", label, rr);
+    check(rr == 0, what);
+    long mk = mkdir(dir, 0755);
+    snprintf(what, sizeof what, "%s: and its name can be made again (mkdir %ld)", label, mk);
+    check(mk == 0, what);
+    if (mk == 0) rmdir(dir);
+    long free_after = free_blocks(dir[0] == '/' ? "/tmp" : "testdir");
+    snprintf(what, sizeof what, "%s: removing the directory returns every block it used (free blocks %ld before, %ld after)", label, free_before, free_after);
+    check(free_before >= 0 && free_after == free_before, what);
 }
 
 int main(int argc, char **argv, char **envp) {

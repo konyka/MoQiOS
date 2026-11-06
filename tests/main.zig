@@ -11229,3 +11229,14 @@ test "statfs: the flags field follows the mount mode and each filesystem answers
     try std.testing.expect(std.mem.indexOf(u8, sc, ".fat32_file => @import(\"../../fs/fat32.zig\").statFs(),") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.ext2_source, ".bavail = if (bfree > reserved) bfree - reserved else 0,") != null);
 }
+
+test "ext2 rmdir: emptiness is judged over every directory block and by the record's inode, and every block is freed" {
+    // hello250: a directory that grew past one block was never removable (ENOTEMPTY after all entries were unlinked): dirIsEmpty read only
+    // block 0 and refused when block[1] was set, and a removed first record keeps its name length (only its inode is cleared).
+    const src = kt.ext2_source;
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (dir_inode.block[1] != 0 or dir_inode.block[12] != 0) return false;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (rec_inode != 0 and name_len != 0) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "fn freeDirBlocks(dir_inode: *const Ext2Inode) void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "freeBlock(dir_inode.block[0]);\n    freeInodeAs(dir_inode_num, true);") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "freeBlock(vd.block[0]);") == null);
+}
