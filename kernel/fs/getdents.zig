@@ -218,23 +218,38 @@ fn getdents64Tmpfs(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64, e
     var kbuf: [4096]u8 = undefined;
     var written: u64 = 0;
     var emitted: u32 = 0;
-    const entries = tmpfs.tmpfsListDir(@intCast(desc.tmpfs_idx), &entries_buf, names_buf, 4096);
+    // The listing is "." and ".." followed by the children, and the cursor counts entries from its start. The children are fetched
+    // from the cursor's position on (skip), at most one table-sized batch per call, so a directory is not capped at one batch.
     const start: u32 = policy.clampOffset(desc.offset);
-    var idx: u32 = start;
-    while (idx < entries.count) : (idx += 1) {
-        const e = entries.entries[idx];
-        const name_len = e.name.len;
+    const child_skip: u32 = if (start > 2) start - 2 else 0;
+    const entries = tmpfs.tmpfsListDir(@intCast(desc.tmpfs_idx), child_skip, &entries_buf, names_buf, 4096);
+    const available: u32 = (if (start < 2) 2 - start else 0) + entries.count;
+    var step: u32 = 0;
+    while (step < available) : (step += 1) {
+        const pos: u32 = start + step;
+        var name: []const u8 = undefined;
+        var is_dir = true;
+        if (pos == 0) {
+            name = ".";
+        } else if (pos == 1) {
+            name = "..";
+        } else {
+            const e = entries.entries[pos - 2 - child_skip];
+            name = e.name;
+            is_dir = e.is_dir;
+        }
+        const name_len = name.len;
         const reclen: u16 = @intCast(19 + name_len + 1);
         const padded_reclen: u16 = (reclen + 7) & ~@as(u16, 7);
         if (written + padded_reclen > @min(buf_size, 4096)) break;
         const base = @as(usize, @intCast(written));
         const ino: u64 = 1;
         bo.writeU64Le(kbuf[base .. base + 8], ino);
-        const doff: u64 = idx + 1;
+        const doff: u64 = @as(u64, pos) + 1;
         bo.writeU64Le(kbuf[base + 8 .. base + 16], doff);
         bo.writeU16Le(kbuf[base + 16 .. base + 18], padded_reclen);
-        kbuf[base + 18] = if (e.is_dir) @as(u8, 4) else @as(u8, 8);
-        @memcpy(kbuf[base + 19 .. base + 19 + name_len], e.name.ptr[0..name_len]);
+        kbuf[base + 18] = if (is_dir) @as(u8, 4) else @as(u8, 8);
+        @memcpy(kbuf[base + 19 .. base + 19 + name_len], name.ptr[0..name_len]);
         kbuf[base + 19 + name_len] = 0;
         written += padded_reclen;
         emitted += 1;
@@ -242,7 +257,7 @@ fn getdents64Tmpfs(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64, e
     if (emitted == 0) {
         // Nothing emitted is end of directory only if there was nothing left to
         // emit; otherwise the buffer was too small for the next entry.
-        return if (start >= entries.count) 0 else -22;
+        return if (available == 0) 0 else -22;
     }
     const n: usize = @intCast(written);
     if (copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..n], n) != n) return -14;

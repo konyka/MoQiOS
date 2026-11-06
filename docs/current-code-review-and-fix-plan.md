@@ -7028,3 +7028,16 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - **变异检查与我自己测试的漏洞（如实）**：第一版"别人的数据不被破坏"的检查在去掉 `writeFile` 里的 `syncSlotInode` 后**仍然通过**——因为描述符 `d` 是在数据落盘之前打开的，它的 inode 副本里没有块指针，写入会自己分配新块。加 `fsync(a)` 并把 `d` 放在它之后打开，使 `d` 持有真实的旧块指针；之后同一变异被抓住（`8 bytes damaged`），还原后通过。
 - 绿灯：hello249 每个文件系统 6 项，全部通过；host 1059/1059（新增一条源码形状测试，覆盖缺页的双向刷新、`mmap` 的三处大小和 `syncSlotInode` 至少 3 处调用）。
 - 未验证：①`readDirEntries` 等其它使用槽位 inode 副本块指针的 ext2 路径（目录读取、符号链接）没有加 `syncSlotInode`，只改了读、预取、写这三处；目录被另一个描述符改动后的行为没测；②`truncateFile`/`stampModified` 等仍在槽位副本上改动再写盘，其它槽位在下一次读写时才会重载，写入前不会；③MAP_SHARED 可写映射上的页被截断后，已脏的缓存页是否被丢弃没有测（只测了只读映射）。
+
+## 目录流：ext2 游标算错、tmpfs 只列 64 项且没有点目录项（hello250，已修）
+
+- 起因：上一节给 ext2 读写加了 `syncSlotInode`，`readDirEntries`（目录读取）还在用槽位里可能过期的 inode 副本，没有检查过。hello250 用 libc 的 `opendir`/`readdir`/`rewinddir` 打开一个空目录，再创建一批文件、删除一半、删除全部。宿主机 Linux 实测：2、102、52、2（点目录项算在内）。
+- 红灯（修改前）：
+  - **tmpfs**：空目录列出 0 项（没有 `.` 和 `..`，Linux 有）；创建 100 个文件后只列出 64 项（`getdents` 每次最多取 64 个孩子，游标又按"批内下标"算，所以第二次调用拿到的还是同一批）。
+  - **ext2**：创建 44 个文件后只列出 29 项，最后一项 `d_off` 是 14320，而目录只有 2048 字节。
+- ext2 根因一（游标算错，**与槽位 inode 无关**）：`readDirEntries` 里 `offset` 在内层循环每个条目后都推进，而 `next_off` 又是 `offset - pos_in_block + pos + rec_len` 再加 `pos`，于是第一个条目之后的每个 `d_off` 都重复累加；一个块里条目数不足 `max_entries` 时游标越过目录末尾，列表在第一个块就结束。改为所有位置相对于块起点（`block_base + pos + rec_len`），`offset` 只在块边界或批满时重算。
+- ext2 根因二（槽位 inode 副本过期）：`readDirEntries` 用打开槽位里缓存的目录大小和块指针，目录在别处增长后这个槽位看不到新块。开头加 `syncSlotInode(f)`。变异检查：去掉它之后 ext2 回到 29 项（`create error -1` 是夹具 inode 用完，不是 bug），还原后 46 项。
+- tmpfs 修复：`tmpfsListDir` 新增 `skip` 参数（从游标位置起取下一批孩子），`getdents64Tmpfs` 把游标当成"`.`、`..`、孩子"的统一序列，`.` 和 `..` 作为位置 0 和 1，其后的孩子从 `skip = cursor - 2` 取；每次调用仍最多一批（64），目录不再被一批封顶。
+- 附带发现并修复（**CI 失败**）：推送 `339ea2a` 后 CI 的 smoke-qemu SMP=2 里 **hello237 B 失败一次**（`EPOLLET` 计数 `1,1,0,1`，期望 `1,0,0,1`），SMP=1 通过。本地同一二进制 SMP=1/8 冒烟通过，没有复现。我没有拿到失败时的现场数据，**根因是推测**：`processIncomingData` 对重复或乱序报文也会置 `EPOLLIN`，那样会重新触发一个已经报告过数据的边沿触发注册。我让它返回实际缓冲的字节数，三处调用只在大于 0 时通知。这一改动符合 TCP 语义（重复报文没有新的可读数据），但**不能证明就是这次失败的原因**；hello237 B 在 CI 上再出现要继续查。
+- 绿灯：hello250 每个文件系统 5 项全部通过；hello114、hello29 通过；host 1061/1061（新增两条源码形状测试：TCP 只在有字节入环时通知、目录游标算法）。
+- 未验证：①FAT32 目录流没有测（FAT32 只有根目录文件）；②ext2 目录超过 12 个直接块（`addDirEntry` 只用直接块，12 KiB 以上会失败）没有测；③hello237 B 失败的根因（见上）；④tmpfs 目录流在遍历期间有并发创建/删除时，按位图顺序的 `skip` 可能漏项或重复，没有测。

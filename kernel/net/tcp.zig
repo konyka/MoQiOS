@@ -2595,10 +2595,13 @@ fn driveTcbStateMachine(
 
             // Process incoming data
             if (payload_len > 0) {
-                processIncomingData(tcb, data + payload_offset, payload_len, seq_num);
-                // v53.41: Defer epoll notification outside tcp_lock
-                pending_events.* |= epoll.EPOLLIN;
-                pending_idx.* = tcbIdx(tcb);
+                // Only bytes that reached the receive ring are readiness: a duplicate or out-of-order segment is answered with an ACK
+                // and must not re-arm an edge-triggered registration that has already reported the data.
+                if (processIncomingData(tcb, data + payload_offset, payload_len, seq_num) > 0) {
+                    // v53.41: Defer epoll notification outside tcp_lock
+                    pending_events.* |= epoll.EPOLLIN;
+                    pending_idx.* = tcbIdx(tcb);
+                }
             }
 
             // Handle FIN — v53.4: only accept FIN after all data is buffered
@@ -2681,9 +2684,10 @@ fn driveTcbStateMachine(
                 return;
             }
             if (payload_len > 0) {
-                processIncomingData(tcb, data + payload_offset, payload_len, seq_num);
-                pending_events.* |= epoll.EPOLLIN;
-                pending_idx.* = tcbIdx(tcb);
+                if (processIncomingData(tcb, data + payload_offset, payload_len, seq_num) > 0) {
+                    pending_events.* |= epoll.EPOLLIN;
+                    pending_idx.* = tcbIdx(tcb);
+                }
             }
             if (flags & FIN != 0) {
                 // Same exact-sequence rule as fin_wait_1: ignore a blind or
@@ -2712,9 +2716,10 @@ fn driveTcbStateMachine(
         },
         .close_wait => {
             if (payload_len > 0) {
-                processIncomingData(tcb, data + payload_offset, payload_len, seq_num);
-                pending_events.* |= epoll.EPOLLIN;
-                pending_idx.* = tcbIdx(tcb);
+                if (processIncomingData(tcb, data + payload_offset, payload_len, seq_num) > 0) {
+                    pending_events.* |= epoll.EPOLLIN;
+                    pending_idx.* = tcbIdx(tcb);
+                }
             }
             // Bytes queued before the peer's FIN still need ACK progress and
             // window updates to drain ahead of our (possibly deferred) FIN.
@@ -2877,7 +2882,9 @@ fn sendLoopbackResetV6(src_ip: [16]u8, dst_ip: [16]u8, src_port: u16, dst_port: 
     _ = lo_dev.sendPacket(&pkt, frame_len);
 }
 
-fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) void {
+/// Accept an in-order data segment into the receive ring. Returns the number of bytes buffered: 0 for a duplicate, out-of-order or
+/// SHUT_RD-discarded segment, which carries no new readiness.
+fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) u32 {
     // Check if this is the expected sequence
     if (seq != tcb.rcv_nxt) {
         if (tcb.sack_permitted and len > 0) {
@@ -2894,7 +2901,7 @@ fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) void
         }
         // Send ACK with expected seq (and SACK/DSACK blocks if available)
         _ = sendSegment(tcb, ACK, undefined, 0);
-        return;
+        return 0;
     }
 
     // shutdown(SHUT_RD): the data is acknowledged (so the peer does not
@@ -2904,7 +2911,7 @@ fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) void
         tcb.delayed_ack_pending = false;
         tcb.delayed_ack_ms = 0;
         _ = sendSegment(tcb, ACK, undefined, 0);
-        return;
+        return 0;
     }
 
     // Copy to receive ring buffer (batched @memcpy)
@@ -2936,6 +2943,7 @@ fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) void
         tcb.delayed_ack_pending = true;
         tcb.delayed_ack_ms = 0;
     }
+    return to_copy;
 }
 
 // ─── Public API (called from syscalls) ────────────────────────────────────

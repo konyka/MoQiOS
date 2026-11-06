@@ -279,6 +279,7 @@ pub const rtc = @import("drivers/rtc.zig");
 pub const dac = @import("fs/dac.zig");
 pub const statx_source = @embedFile("fs/statx.zig");
 pub const tmpfs_source = @embedFile("fs/tmpfs.zig");
+pub const getdents_source = @embedFile("fs/getdents.zig");
 pub const syscall_entry_source = @embedFile("arch/x86_64/syscall_entry.zig");
 pub const idt_source = @embedFile("arch/x86_64/idt.zig");
 pub const moqi_syscalls_header = @embedFile("moqi_syscalls_header");

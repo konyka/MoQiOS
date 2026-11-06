@@ -1319,6 +1319,7 @@ pub fn readDirEntries(file_idx: u32, start_offset: u32, names: [*][256]u8, name_
     if (file_idx >= open_count) return .{ .count = 0, .new_offset = start_offset };
     const f = &open_files[file_idx];
     if (f.inode_num == 0) return .{ .count = 0, .new_offset = start_offset };
+    syncSlotInode(f);
     if (!eu.isDirectory(f.inode.mode)) return .{ .count = 0, .new_offset = start_offset };
 
     const dir_size = f.inode.size;
@@ -1346,10 +1347,19 @@ pub fn readDirEntries(file_idx: u32, start_offset: u32, names: [*][256]u8, name_
             buf = cacheLookupPtr(phys_block) orelse break;
         }
 
-        const pos_in_block = offset % block_size;
-        var pos: u32 = pos_in_block;
+        // Every position below is relative to the start of this block; `offset` is only recomputed from it, never advanced inside the
+        // loop. Advancing it per entry while also adding `pos` double counted every entry after the first: the d_off values were far
+        // past the real ones, and a block holding fewer than max_entries entries sent the cursor beyond the end of the directory, so
+        // listing stopped after the first block.
+        const block_base: u32 = (offset / block_size) * block_size;
+        var pos: u32 = offset - block_base;
+        var stopped_mid_block = false;
 
-        while (pos < block_size and count < max_entries) {
+        while (pos < block_size) {
+            if (count >= max_entries) {
+                stopped_mid_block = true;
+                break;
+            }
             const entry = eu.readDirEntry(buf, pos, block_size) orelse break;
 
             if (entry.inode != 0 and entry.name_len > 0) {
@@ -1359,19 +1369,19 @@ pub fn readDirEntries(file_idx: u32, start_offset: u32, names: [*][256]u8, name_
                 name_lens[count] = entry.name_len;
                 inodes[count] = entry.inode;
                 file_types[count] = entry.file_type;
-                const next_off = offset - pos_in_block + pos + entry.rec_len;
-                next_offsets[count] = next_off;
+                next_offsets[count] = block_base + pos + entry.rec_len;
                 count += 1;
             }
 
-            const new_pos = pos + entry.rec_len;
-            offset = offset - pos_in_block + new_pos;
-            pos = new_pos;
-            if (pos >= block_size) break;
+            pos += entry.rec_len;
         }
 
-        // Move to next block boundary
-        offset = (offset / block_size + 1) * block_size;
+        if (stopped_mid_block) {
+            offset = block_base + pos;
+            break;
+        }
+        // Move to the next block boundary
+        offset = block_base + block_size;
     }
 
     return .{ .count = count, .new_offset = offset };

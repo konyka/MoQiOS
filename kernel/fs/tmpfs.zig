@@ -970,7 +970,7 @@ pub fn tmpfsCanListDir(idx: Idx, euid: u32, egid: u32, effective_caps: capabilit
 /// a concurrent getdents/unlink corrupted a listing still in use.
 /// `out_entries` receives the entry records; `names_buf`/`names_cap` receives
 /// the name bytes each entry's name slice points into.
-pub fn tmpfsListDir(idx: Idx, out_entries: []TmpfsDirEntry, names_buf: [*]u8, names_cap: u32) TmpfsDirListing {
+pub fn tmpfsListDir(idx: Idx, skip: u32, out_entries: []TmpfsDirEntry, names_buf: [*]u8, names_cap: u32) TmpfsDirListing {
     const empty: TmpfsDirListing = .{ .entries = &[_]TmpfsDirEntry{}, .count = 0 };
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
@@ -979,11 +979,16 @@ pub fn tmpfsListDir(idx: Idx, out_entries: []TmpfsDirEntry, names_buf: [*]u8, na
     }
     var count: u32 = 0;
     var names_used: u32 = 0;
+    var skipped: u32 = 0;
     var it = active_bm.iterator();
     while (it.next()) |bit| {
         const i: Idx = @intCast(bit);
         if (entries[i].deleted) continue;
         if (entries[i].parent_idx != idx) continue;
+        if (skipped < skip) {
+            skipped += 1;
+            continue;
+        }
         if (count >= out_entries.len) break;
         const nlen: u32 = entries[i].name_len;
         if (names_used + nlen > names_cap) break;

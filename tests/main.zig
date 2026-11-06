@@ -11186,3 +11186,30 @@ test "a file mapping takes the file's live size in both directions, and ext2 slo
     while (std.mem.indexOfPos(u8, src, pos, "syncSlotInode(f);")) |at| : (pos = at + 1) seen += 1;
     try std.testing.expect(seen >= 3); // readFile, prefetchFilePages, writeFile
 }
+
+test "TCP raises EPOLLIN only for bytes that reached the receive ring" {
+    // A retransmitted duplicate is ACKed but carries no new readiness; notifying for it re-armed an edge-triggered registration that had
+    // already reported the data (hello237 B failed once in CI with counts 1,1,0,1).
+    const src = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, src, "fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) u32 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "    return to_copy;\n}") != null);
+    var pos: usize = 0;
+    var gated: usize = 0;
+    while (std.mem.indexOfPos(u8, src, pos, "if (processIncomingData(tcb, data + payload_offset, payload_len, seq_num) > 0)")) |at| : (pos = at + 1) gated += 1;
+    try std.testing.expectEqual(@as(usize, 3), gated);
+    try std.testing.expect(std.mem.indexOf(u8, src, "                processIncomingData(tcb, data + payload_offset") == null);
+}
+
+test "directory listings: ext2 cursor math is block-relative and tmpfs lists dot entries past one batch" {
+    // hello250: ext2 advanced `offset` per entry while also adding `pos`, so every d_off after the first was too large and a listing
+    // stopped after the first directory block; tmpfs listed at most 64 children and no "." / "..".
+    const ext2_src = kt.ext2_source;
+    try std.testing.expect(std.mem.indexOf(u8, ext2_src, "offset = offset - pos_in_block + new_pos;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ext2_src, "next_offsets[count] = block_base + pos + entry.rec_len;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ext2_src, "syncSlotInode(f);\n    if (!eu.isDirectory(f.inode.mode))") != null);
+    const gd = kt.getdents_source;
+    try std.testing.expect(std.mem.indexOf(u8, gd, "tmpfsListDir(@intCast(desc.tmpfs_idx), child_skip,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gd, "name = \".\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gd, "name = \"..\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.tmpfs_source, "pub fn tmpfsListDir(idx: Idx, skip: u32,") != null);
+}
