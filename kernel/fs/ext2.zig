@@ -947,12 +947,23 @@ fn resolveBlock(inode: *const Ext2Inode, logical_block: u32) u32 {
 
 // ─── File read ─────────────────────────────────────────────────────────────
 
+/// Reload an open slot's inode copy from disk. Every open slot keeps its own copy, including the block pointers, and every change
+/// to an inode is written to disk at once, so the disk copy is the current one. A slot that is not reloaded keeps pointing at blocks
+/// another descriptor's truncate has freed: it reads their old contents instead of zeros, and a write through it lands in blocks that
+/// may already belong to another file. Callers hold fs_lock. Keeps the cached copy when the read fails.
+fn syncSlotInode(f: *Ext2File) void {
+    var disk_inode: Ext2Inode = undefined;
+    if (readInode(f.inode_num, &disk_inode)) f.inode = disk_inode;
+}
+
+
 pub fn readFile(file_idx: u32, offset: u32, buf: [*]u8, count: u32) i64 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
     if (file_idx >= open_count) return -1;
     const f = &open_files[file_idx];
     if (f.inode_num == 0) return -1;
+    syncSlotInode(f);
 
     const file_size = f.inode.size;
     if (offset >= file_size) return 0;
@@ -1058,6 +1069,7 @@ pub fn prefetchFilePages(file_idx: u32, start_page: u64, count: u32) void {
     if (file_idx >= open_count) return;
     const f = &open_files[file_idx];
     if (f.inode_num == 0) return;
+    syncSlotInode(f);
     prefetchPages(&f.inode, 0x3000_0000_0000_0000 + @as(u64, f.inode_num), start_page, count);
 }
 
@@ -2081,6 +2093,7 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
     if (file_idx >= open_count) return -1;
     const f = &open_files[file_idx];
     if (f.inode_num == 0) return -1;
+    syncSlotInode(f);
 
     var written: u32 = 0;
     var current_offset = offset;

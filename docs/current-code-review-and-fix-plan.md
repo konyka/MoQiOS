@@ -7018,3 +7018,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：hello248 9 项全部通过；hello114（FAT32/ext2 的大小语义，上次 FAT32 因同类改动失败过）通过；host 1058/1058。
 - 变异（确认真编译并改变了行为）：把 `lseek(SEEK_END)` 的 ext2 刷新行注释掉 → hello248 ext2 第 1 项失败（`fstat 5` 对、`SEEK_END 16`），其余项仍通过；还原后重新构建。其它调用处（`read`、`fstat`、`statx`）没有逐个做变异，由红灯数据和源码形状 host 测试守着。
 - 未验证：`mmap` 的 ext2 大小（`mmap.zig`）和缺页处理（`idt.zig`）仍用 `refreshSize`，没有改也没有测截短后映射的行为；完整冒烟和 CI 结果见提交之后的记录。
+
+## 文件映射与截短（hello249，已修）
+
+- 起因：上一节把 `read`/`fstat` 等的大小改成"当前大小"后，`mmap` 和缺页处理里的 ext2 大小（`mmap.zig`、`idt.zig` 的 `currentFileSize`）还在用旧写法，没有测过。宿主机 Linux 实测（8192 字节文件映射两页，只读 `MAP_SHARED`，通过第二个描述符截到 100）：从未触碰的第二页访问是 SIGBUS；第一页保持可读，页内 100 之后的字节读为 0；扩回 8192 后第二页读为 0。
+- 红灯（修改前）：**tmpfs 和 FAT32 第二页不是 SIGBUS 而是读到一页 0**（子进程正常退出）；ext2 的 SIGBUS 是对的，但**扩回后第二页读到 `'A'`（旧内容，65）**，而不是 0。
+- 根因一（缺页处理只会增大）：`idt.zig` 在计划缺页前只有 `if (fresh > region.file_size)` 才刷新，映射建立时记录的大小在文件被截短后永远偏大；`currentFileSize` 对 tmpfs/FAT32 的 `mmap` 又根本没记录大小（`desc.file_size` 的快照），ext2 用 `refreshSize`。改为每次缺页都 `region.file_size = currentFileSize(region)`（双向），`currentFileSize` 对 ext2/FAT32 用各自的 `currentSize`，tmpfs 用 `tmpfsGetSize`；`mmap` 建立映射时三种文件系统都改用同一个"当前大小"。
+- 根因二（ext2，更严重，**会破坏别的文件的数据**）：ext2 的每个打开槽位保留一份自己的 inode 副本，**包括块指针**。别的描述符截短并释放块之后，这份副本仍指向已释放的块：读到的是旧数据（上面的 `'A'`），写入落在可能已经分给另一个文件的块上。修复：新增 `syncSlotInode`，`readFile`、`prefetchFilePages`、`writeFile` 开头都从磁盘重载本槽位的 inode（每次 inode 改动本来就立即写盘，磁盘副本是最新的）。
+- **变异检查与我自己测试的漏洞（如实）**：第一版"别人的数据不被破坏"的检查在去掉 `writeFile` 里的 `syncSlotInode` 后**仍然通过**——因为描述符 `d` 是在数据落盘之前打开的，它的 inode 副本里没有块指针，写入会自己分配新块。加 `fsync(a)` 并把 `d` 放在它之后打开，使 `d` 持有真实的旧块指针；之后同一变异被抓住（`8 bytes damaged`），还原后通过。
+- 绿灯：hello249 每个文件系统 6 项，全部通过；host 1059/1059（新增一条源码形状测试，覆盖缺页的双向刷新、`mmap` 的三处大小和 `syncSlotInode` 至少 3 处调用）。
+- 未验证：①`readDirEntries` 等其它使用槽位 inode 副本块指针的 ext2 路径（目录读取、符号链接）没有加 `syncSlotInode`，只改了读、预取、写这三处；目录被另一个描述符改动后的行为没测；②`truncateFile`/`stampModified` 等仍在槽位副本上改动再写盘，其它槽位在下一次读写时才会重载，写入前不会；③MAP_SHARED 可写映射上的页被截断后，已脏的缓存页是否被丢弃没有测（只测了只读映射）。

@@ -11168,3 +11168,21 @@ test "ext2 descriptor sizes are taken from ext2.currentSize, never max()ed with 
     try std.testing.expect(std.mem.indexOf(u8, kt.ext2_source, "pub fn currentSize(") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.ext2_source, "stagedEnd(inode_id, .ext2)") != null);
 }
+
+test "a file mapping takes the file's live size in both directions, and ext2 slots reload their inode before using block pointers" {
+    // hello249: a truncate through another descriptor must turn a not-yet-faulted page past the new end into SIGBUS (not a zero page),
+    // and a slot whose inode copy predates the truncate must not read or write the blocks the truncate freed.
+    const idt = kt.idt_source;
+    try std.testing.expect(std.mem.indexOf(u8, idt, "if (fresh > region.file_size)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, idt, "region.file_size = currentFileSize(region);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, idt, "ext2.zig\").currentSize(region.file_idx)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, idt, "fat32.zig\").currentSize(region.file_idx)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.mmap_source, "m.size = ext2.currentSize(desc.ext2_file_idx);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.mmap_source, "m.size = @import(\"../fs/fat32.zig\").currentSize(desc.fat32_file_idx);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.mmap_source, "m.size = tmpfs.tmpfsGetSize(@intCast(desc.tmpfs_idx));") != null);
+    const src = kt.ext2_source;
+    var seen: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, src, pos, "syncSlotInode(f);")) |at| : (pos = at + 1) seen += 1;
+    try std.testing.expect(seen >= 3); // readFile, prefetchFilePages, writeFile
+}

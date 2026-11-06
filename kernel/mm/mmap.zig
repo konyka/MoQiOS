@@ -1241,6 +1241,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot_raw: u64, flags: u64, fd: i64, off
                 const seals = tmpfs.tmpfsGetSeals(@intCast(desc.tmpfs_idx)) orelse 0;
                 if (!@import("../fs/memfd_policy.zig").mmapAllowed(seals, shared, (prot & 2) != 0)) return -1;
                 m.idx = desc.tmpfs_idx;
+                m.size = tmpfs.tmpfsGetSize(@intCast(desc.tmpfs_idx));
                 // ctime doubles as a generation tag: after unlink+close the
                 // entry is freed and a recycled slot gets a fresh ctime, so a
                 // stale region can never be served the wrong file's pages.
@@ -1249,9 +1250,8 @@ pub fn mmap(addr_hint: u64, length: u64, prot_raw: u64, flags: u64, fd: i64, off
             .ext2 => {
                 m.idx = desc.ext2_file_idx;
                 m.inode = desc.inode_id;
-                // Refresh the size like the read path does — another fd may
-                // have grown the file through a different ext2 open slot.
-                m.size = ext2.refreshSize(desc.ext2_file_idx);
+                // The live size like the read path takes it: another fd may have grown or truncated the file, and writes may still be staged.
+                m.size = ext2.currentSize(desc.ext2_file_idx);
                 // NOTE: the open slot is retained only once the mapping is
                 // known to succeed (see below), so early ENOMEM returns do
                 // not leak the reference.
@@ -1259,6 +1259,7 @@ pub fn mmap(addr_hint: u64, length: u64, prot_raw: u64, flags: u64, fd: i64, off
             .fat32 => {
                 m.idx = desc.fat32_file_idx;
                 m.inode = desc.inode_id;
+                m.size = @import("../fs/fat32.zig").currentSize(desc.fat32_file_idx);
                 // NOTE: like ext2, the open slot is retained only once the
                 // mapping is known to succeed (see below) — fat32 slots ARE
                 // reclaimed once the last reference drops after an unlink,

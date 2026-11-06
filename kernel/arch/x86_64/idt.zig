@@ -1116,31 +1116,31 @@ fn handleFileFault(current: anytype, page_addr: u64) bool {
     return true;
 }
 
+/// Live size of a file region's backing file. A region whose backing cannot change (ramdisk) or can no longer be identified (a recycled
+/// tmpfs slot) keeps the size recorded at mmap time.
+fn currentFileSize(region: anytype) u64 {
+    const filemap = @import("../../mm/filemap.zig");
+    const kind: filemap.FsKind = @enumFromInt(region.file_kind);
+    return switch (kind) {
+        .ext2 => @import("../../fs/ext2.zig").currentSize(region.file_idx),
+        .fat32 => @import("../../fs/fat32.zig").currentSize(region.file_idx),
+        .tmpfs => blk: {
+            const tmpfs = @import("../../fs/tmpfs.zig");
+            const idx: u16 = @intCast(region.file_idx);
+            // ctime is the generation tag: a recycled slot is another file.
+            if (tmpfs.tmpfsGetCtime(idx) != region.file_data) break :blk region.file_size;
+            break :blk tmpfs.tmpfsGetSize(idx);
+        },
+        .ramdisk, .none => region.file_size,
+    };
+}
+
 /// Serve one not-present file-backed page (swap-in first, then per-kind
 /// backing). Returns false for a page wholly past EOF, a PROT_NONE region
 /// (planFault refuses it — a never-faulted page is a zero PTE whose only
 /// protection record is the region metadata), or an exhausted allocator —
 /// the caller turns the faulting page's false into SIGSEGV and treats a
 /// prefault page's false as "stop the window".
-/// Live size of a file region's backing file (0 when unknown/stale).
-fn currentFileSize(region: anytype) u64 {
-    const filemap = @import("../../mm/filemap.zig");
-    const wb = @import("../../fs/writeback.zig");
-    const kind: filemap.FsKind = @enumFromInt(region.file_kind);
-    return switch (kind) {
-        .ext2 => @max(@import("../../fs/ext2.zig").refreshSize(region.file_idx), wb.stagedEnd(region.inode_id, .ext2)),
-        .fat32 => @max(@import("../../fs/fat32.zig").getFileSize(region.file_idx), wb.stagedEnd(region.inode_id, .fat32)),
-        .tmpfs => blk: {
-            const tmpfs = @import("../../fs/tmpfs.zig");
-            const idx: u16 = @intCast(region.file_idx);
-            // ctime is the generation tag: a recycled slot is another file.
-            if (tmpfs.tmpfsGetCtime(idx) != region.file_data) break :blk 0;
-            break :blk tmpfs.tmpfsGetSize(idx);
-        },
-        .ramdisk, .none => 0,
-    };
-}
-
 fn serveFilePage(current: anytype, page_addr: u64) bool {
     const pmm = @import("../../mm/pmm.zig");
     const hhdm = @import("../../mm/hhdm.zig");
@@ -1188,17 +1188,11 @@ fn serveFilePage(current: anytype, page_addr: u64) bool {
     const ri = filemap.findFileRegion(task_mod.MmapRegion, current.vma().regions, page_addr) orelse return false;
     const region = &current.vma().regions[ri];
 
-    var plan = filemap.planFault(task_mod.MmapRegion, region, page_addr);
-    if (plan.action == .segv) {
-        // file_size is a snapshot from mmap time; the file may have grown
-        // since (write/ftruncate through another fd). Refresh and replan
-        // before declaring the page past EOF.
-        const fresh = currentFileSize(region);
-        if (fresh > region.file_size) {
-            region.file_size = fresh;
-            plan = filemap.planFault(task_mod.MmapRegion, region, page_addr);
-        }
-    }
+    // file_size is a snapshot from mmap time; the file may have grown or been truncated since (write/ftruncate/truncate through
+    // another descriptor). Take the live size in both directions before planning: a page that is wholly past the new end must be SIGBUS,
+    // not a zero page.
+    region.file_size = currentFileSize(region);
+    const plan = filemap.planFault(task_mod.MmapRegion, region, page_addr);
     if (plan.action == .segv) {
         // Linux: an access to a page wholly past EOF of a file mapping is
         // SIGBUS, not SIGSEGV. The user #PF path reads this marker.
