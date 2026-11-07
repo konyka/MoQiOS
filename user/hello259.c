@@ -245,6 +245,41 @@ int main(int argc, char **argv, char **envp) {
     check(stopped && srv == 0 && sms >= 590, what);
     check(got, "and keeps running after the continue: it was not stopped a second time");
 
+    /* A process that is computing (never blocked) stops too, and stays stopped until SIGCONT: it must make no progress while stopped. */
+    int bp[2];
+    pipe2(bp, O_NONBLOCK);
+    long bk = fork();
+    if (bk == 0) {
+        volatile unsigned long spin = 0;
+        for (;;) {
+            spin++;
+            if ((spin & 0xFFFFF) == 0) write(bp[1], "t", 1);
+        }
+    }
+    char tick[64];
+    int started = 0;
+    for (int i = 0; i < 300 && !started; i++) {
+        started = read(bp[0], tick, sizeof tick) > 0;
+        if (!started) pause_ms(10);
+    }
+    kill(bk, SIGSTOP);
+    int bstopped = wait_state(bk, "T (stopped)");
+    while (read(bp[0], tick, sizeof tick) > 0) {}
+    pause_ms(300);
+    int progress = read(bp[0], tick, sizeof tick) > 0;
+    kill(bk, SIGCONT);
+    int resumed = 0;
+    for (int i = 0; i < 300 && !resumed; i++) {
+        resumed = read(bp[0], tick, sizeof tick) > 0;
+        if (!resumed) pause_ms(10);
+    }
+    kill(bk, SIGKILL);
+    waitpid(bk, &st, 0);
+    snprintf(what, sizeof what, "a computing process: SIGSTOP shows T (started %d, stopped %d)", started, bstopped);
+    check(started && bstopped, what);
+    check(!progress, "and it makes no progress while stopped");
+    check(resumed, "and runs again after SIGCONT");
+
     print(failures == 0 ? "hello259: PASS\n" : "hello259: FAIL\n");
     return failures;
 }
