@@ -133,6 +133,31 @@ static int get_int(int fd, int name) {
     if (syscall5(SYS_GETSOCKOPT, (uint64_t)fd, SOL_SOCKET, (uint64_t)name, (uint64_t)&v, (uint64_t)&l) != 0) return -99999;
     return v;
 }
+/* The sender's view of the connection (getsockopt TCP_INFO, Linux struct tcp_info offsets): printed only when the drain below fails, to tell a
+ * stalled sender (zero window, retransmit backoff, an exhausted congestion window) from a slow one. */
+#define SOL_TCP 6
+#define TCP_INFO_OPT 11
+static uint32_t info_u32(const uint8_t *b, int off) {
+    return (uint32_t)b[off] | ((uint32_t)b[off + 1] << 8) | ((uint32_t)b[off + 2] << 16) | ((uint32_t)b[off + 3] << 24);
+}
+static void print_tcp_info(const char *who, int fd) {
+    uint8_t b[104];
+    uint32_t l = sizeof b;
+    for (unsigned i = 0; i < sizeof b; i++) b[i] = 0;
+    if (syscall5(SYS_GETSOCKOPT, (uint64_t)fd, SOL_TCP, TCP_INFO_OPT, (uint64_t)b, (uint64_t)&l) != 0) {
+        print("hello174:   .. "); print(who); print(" tcp_info unavailable\n");
+        return;
+    }
+    print("hello174:   .. "); print(who);
+    print(" tcp_info: state="); print_dec(b[0]);
+    print(" retransmits="); print_dec(b[2]);
+    print(" rto_us="); print_dec(info_u32(b, 8));
+    print(" unacked="); print_dec(info_u32(b, 24));
+    print(" rtt_us="); print_dec(info_u32(b, 68));
+    print(" ssthresh="); print_dec(info_u32(b, 76));
+    print(" cwnd="); print_dec(info_u32(b, 80));
+    print("\n");
+}
 static int ioctl_int(int fd, uint64_t cmd) {
     int v = -1;
     if (syscall3(SYS_IOCTL, (uint64_t)fd, cmd, (uint64_t)&v) != 0) return -99999;
@@ -279,6 +304,8 @@ void _start(void) {
             note("drain_stalled_for_ms", now_ms() - last_progress); note("drain_reads", reads); note("drain_empty_reads", empty_reads);
             note("drain_receiver_fionread", ioctl_int(s, FIONREAD)); note("drain_sender_outq", ioctl_int(c, TIOCOUTQ));
             note("drain_longest_gap_ms", longest_gap);
+            print_tcp_info("sender", c);
+            print_tcp_info("receiver", s);
             for (int k = 0; k < 11; k++) { print("hello174:   .. drain_got_by_second_"); print_dec(k); print("="); print_dec(got_at_sec[k]); print("\n"); }
         }
         print_lostats(drained ? "after the drain" : "at the failed drain");
