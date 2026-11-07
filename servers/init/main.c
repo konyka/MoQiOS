@@ -371,6 +371,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello252"); /* a directory grows past the direct blocks */
     run_test("hello253"); /* /proc/self names the calling process */
     run_test("hello254"); /* /proc as a directory */
+    run_test("hello255"); /* the root directory */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

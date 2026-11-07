@@ -250,6 +250,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello252 | 目录增长超过 12 个块（tmpfs、ext2 各 5 项）：56 个条目（ext2 用 240 字节名字，约 14 KiB 目录记录，超过 1 KiB 块下 inode 的 12 个直接块；因夹具只有 128 个 inode，ext2 条目是指向同一个文件的硬链接）全部创建、列出（加点目录项共 59）、按名字打开、删除，清空后目录可 `rmdir`，`statfs` 空闲块数回到创建前（抓间接块泄漏）。名字用 `chdir` 进目录后的相对名，因为路径上限 255 字节 |
 | hello253 | `/proc/self` 指调用者自己：`/proc/self/status` 能打开且其 `Pid` 行等于 `getpid()`、与按数字 pid 打开的同一文件一致；`/proc/self/cmdline` 能打开；`/proc/self` 下的未知文件、`/proc/selfx/status`、`/proc` 下的未知名字都返回 `-ENOENT`（原来返回 `-1`，即 `EPERM`）；`fork` 出的子进程里 `/proc/self` 是子进程自己，不是父进程；以 root 启动的探针里降到 uid 1000 的子进程读不了父进程的 `/proc/<pid>/maps`（`EACCES`），但能读它的 `status` 和自己的 `maps`（共 8 项） |
 | hello254 | `/proc` 作为目录（12 项）：`stat("/proc")` 和 `stat("/proc/<pid>")`、`stat("/proc/self")` 是目录，`stat("/proc/meminfo")` 是普通文件；`opendir("/proc")` 列出 `.`、`..`、各个文件（`DT_REG`）、`self`（`DT_LNK`）和每个存活进程的数字目录（`DT_DIR`，线程不单独列出）；`opendir("/proc/<pid>")` 列出 `status` 等；`opendir("/proc/meminfo")` 为 `ENOTDIR`；已回收进程没有 `/proc/<pid>`；`statfs("/proc")` 为 `PROC_SUPER_MAGIC` |
+| hello255 | 根目录列表（6 项）：`opendir("/")` 列出 `.`、`..`、ext2 的条目（含 `testdir`）以及 `tmp`、`dev`、`proc`（各一次，`DT_DIR`）；`rewinddir` 后第二遍列表与第一遍相同；从 `/` 出发的 `opendir(".")` 与 `/` 相同；`stat("/")` 是目录 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。

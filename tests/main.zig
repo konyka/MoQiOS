@@ -11295,3 +11295,12 @@ test "procfs: /proc and /proc/<pid> are directories listed from the live task ta
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "str.eql(name, \"/proc\") or str.eql(name, \"/proc/\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "readGate(procfs.isDir(desc.proc_file_type))") != null);
 }
+
+test "the root directory lists tmp, dev and proc after its ext2 entries, on a cursor range above any ext2 offset" {
+    // hello255: opendir("/") showed only the ext2 root, so ls / hid the directories that hang off it.
+    const gd = kt.getdents_source;
+    try std.testing.expect(std.mem.indexOf(u8, gd, "const root_virtual_names = [_][]const u8{ \"tmp\", \"dev\", \"proc\" };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gd, "const ROOT_VIRTUAL_BASE: u64 = 0x4000_0000;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gd, "if (is_root and desc.offset >= ROOT_VIRTUAL_BASE) return getdents64RootVirtual(desc, buf_ptr, buf_size);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gd, "kbuf[base + 18] = 4; // DT_DIR") != null);
+}

@@ -7162,3 +7162,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 做了什么：**只记录，没有改内核。** 没有能区分上面三条的数据，凭推测改 TCP 重传/窗口逻辑的风险大于收益。下一步最有价值的是让 `hello174` 在这条断言失败时多打印发送方的 TCP 状态（`snd_wnd`、`cwnd`、`rto`、`persist_rto_ms`、重传计数、是否 `in_recovery`），这需要内核提供一个只读的查询（例如 `TCP_INFO` 的 `getsockopt`，或 `/proc/net/tcp` 一类），**更正：内核已经有 `TCP_INFO`（`getsockopt(SOL_TCP, 11)`）**，我写这句话之前没有查。
 - 如实说明：①文档里记录过这条断言在 CI 上失败（`883739d` 那次，以及上面"CI 上出现的 hello174 偶发失败"一段，两处可能是同一次，我没有核对），所以这至少是又一次，**不是**我能给出准确次数的事；本地定向复现（上面记录的 16 次以上）从未命中，所以无法用"修复前失败、修复后通过"证明任何改动；这次现场是目前唯一一个显示**完全停滞**的样本；②这一轮的提交与这次失败无关（`07ab4f0` 只改 `fstatfs` 的类型映射）。
 - **后续（同一轮，已做）**：`hello174` 的 C 组在排空断言失败时，现在多打印发送方和接收方各自的 `TCP_INFO`：`state`、`retransmits`、`rto_us`、`unacked`、`rtt_us`、`ssthresh`、`cwnd`。验证方式：临时让断言恒失败（改完已还原，`grep TEMPORARY` 为空）跑一次 SMP=1，输出为 `sender tcp_info: state=1 retransmits=0 rto_us=200000 unacked=0 rtt_us=0 ssthresh=3630 cwnd=2` 和 `receiver tcp_info: state=1 retransmits=0 rto_us=2000000 unacked=0 rtt_us=0 ssthresh=65535 cwnd=1`——诊断可用。下次 CI 再出现完全停滞，这些数据能区分候选 2（`retransmits` 非零、`rto_us` 在退避）和候选 3（`retransmits=0` 且 `unacked` 为 0 却仍有数据排队）。注意 `TCP_INFO` 没有 `snd_wnd` 和 `persist_rto`，所以候选 1（零窗口）只能间接判断。
+
+## 根目录列表缺少 tmp、dev、proc（hello255，已修）
+
+- 起因：上一节让 `/proc` 能列出之后想到：用户眼里的 `/` 下面有 `tmp`、`dev`、`proc`，但 `ls /` 只会看到 ext2 根目录的 8 项（`lost+found`、`testdir`、`anotherdir`、`writetest.txt` 等），这三个挂载点不在 ext2 里，是按路径前缀路由的虚拟树。宿主机 Linux 实测 `opendir("/")` 列出这三项且都是 `DT_DIR`。
+- 红灯（修改前）：`opendir("/")` 共 8 项，`tmp 0/-1, dev 0/-1, proc 0/-1`；其余 4 项（能打开、`testdir` 在、`.` 与 `/` 相同、`stat("/")`）本来就对。
+- 修改：`getdents.zig` 的 ext2 分支在**根目录**（inode 2）的 ext2 条目列完后，把游标切到 `ROOT_VIRTUAL_BASE`（0x4000_0000，远高于任何 ext2 字节偏移），由 `getdents64RootVirtual` 返回 `tmp`、`dev`、`proc`（`DT_DIR`，`d_off` 为游标加 1，inode 号取 0x7FFF0000 起的占位值）；游标在这个范围时直接走这个函数，列完返回 0，`rewinddir`（`lseek` 到 0）回到 ext2 条目。缓冲区放不下一项时返回 `EINVAL`。
+- 绿灯：hello255 6 项通过（含后加的 `rewinddir` 第二遍与第一遍相同，11 对 11）；host 1071/1071。
+- 变异：把名字表去掉 `proc`（真编译）→ `proc 0/-1` 失败；还原后通过。
+- 未验证：①如果 ext2 根目录里将来有同名的 `tmp`/`dev`/`proc` 条目，会列出两次，这里没有去重；②虚拟条目的 inode 号是占位值，`stat` 到这些路径得到的 inode 号与列表里的不一致；③只处理了 ext2 根；FAT32 根下的文件（裸文件名）不在 `/` 的列表里（FAT32 的 `getdents` 不存在），这是另一个差异；④ext4/NTFS 挂载点（`/mnt/...`）也没有出现在 `/` 的列表里。

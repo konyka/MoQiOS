@@ -189,6 +189,41 @@ fn getdents64Rofs(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i6
     return @intCast(written);
 }
 
+/// Cursor values from here up index the root's virtual entries; ext2 directory offsets are byte positions below the directory size.
+const ROOT_VIRTUAL_BASE: u64 = 0x4000_0000;
+/// The mount points that hang off "/" and are not entries of the ext2 root. An ext2 entry with the same name would be listed twice.
+const root_virtual_names = [_][]const u8{ "tmp", "dev", "proc" };
+
+/// The tail of the root listing: tmp, dev and proc as directories.
+fn getdents64RootVirtual(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i64 {
+    var kbuf: [4096]u8 = undefined;
+    var written: u64 = 0;
+    var emitted: u32 = 0;
+    var k: u64 = desc.offset - ROOT_VIRTUAL_BASE;
+    while (k < root_virtual_names.len) : (k += 1) {
+        const name = root_virtual_names[@intCast(k)];
+        const reclen: u16 = @intCast(19 + name.len + 1);
+        const padded_reclen: u16 = (reclen + 7) & ~@as(u16, 7);
+        if (written + padded_reclen > @min(buf_size, 4096)) break;
+        const base = @as(usize, @intCast(written));
+        bo.writeU64Le(kbuf[base .. base + 8], 0x7FFF_0000 + k);
+        bo.writeU64Le(kbuf[base + 8 .. base + 16], ROOT_VIRTUAL_BASE + k + 1);
+        bo.writeU16Le(kbuf[base + 16 .. base + 18], padded_reclen);
+        kbuf[base + 18] = 4; // DT_DIR
+        @memcpy(kbuf[base + 19 .. base + 19 + name.len], name);
+        kbuf[base + 19 + name.len] = 0;
+        var pad = base + 19 + name.len + 1;
+        while (pad < base + padded_reclen) : (pad += 1) kbuf[pad] = 0;
+        written += padded_reclen;
+        emitted += 1;
+    }
+    if (emitted == 0) return if (k >= root_virtual_names.len) 0 else -22; // end of directory, or a buffer too small for one entry
+    const n: usize = @intCast(written);
+    if (copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..n], n) != n) return -14;
+    desc.offset = ROOT_VIRTUAL_BASE + k;
+    return @intCast(written);
+}
+
 fn getdents64Ext2(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i64 {
     // v53.4: dynamically allocate names array to avoid 16KB stack usage
     // 64 entries × 256 bytes = 16384 bytes = 4 pages
@@ -203,9 +238,17 @@ fn getdents64Ext2(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i6
     var inodes_arr: [64]u32 = undefined;
     var ftypes: [64]u8 = undefined;
     var next_offs: [64]u32 = undefined;
+    // The root of the tree lists the directories that hang off it besides its own entries (tmp, dev, proc), after the ext2 entries. They
+    // use their own cursor range, far above any ext2 byte offset.
+    const is_root = ext2.getInodeNum(desc.ext2_file_idx) == 2;
+    if (is_root and desc.offset >= ROOT_VIRTUAL_BASE) return getdents64RootVirtual(desc, buf_ptr, buf_size);
     const off32: u32 = @intCast(@min(desc.offset, 0xFFFFFFFF));
     const result = ext2.readDirEntries(desc.ext2_file_idx, off32, names, &name_lens, &inodes_arr, &ftypes, &next_offs, 64);
-    if (result.count == 0) return 0;
+    if (result.count == 0) {
+        if (!is_root) return 0;
+        desc.offset = ROOT_VIRTUAL_BASE;
+        return getdents64RootVirtual(desc, buf_ptr, buf_size);
+    }
 
     var written: u64 = 0;
     var emitted: u32 = 0;
