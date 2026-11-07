@@ -409,6 +409,7 @@ pub fn clone(
     child.permitted_caps = parent.permitted_caps;
     child.inheritable_caps = parent.inheritable_caps;
     child.no_new_privs = parent.no_new_privs;
+    child.comm = parent.comm;
     child.initial_init = false;
 
     // Set up child's execution context

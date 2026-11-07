@@ -1189,6 +1189,8 @@ pub const FdTable = struct {
                         pfile = .pid_cmdline;
                     } else if (str.eql(file_part, "rss")) {
                         pfile = .pid_rss;
+                    } else if (str.eql(file_part, "comm")) {
+                        pfile = .pid_comm;
                     } else {
                         self.freeFd(slot);
                         return -2; // ENOENT

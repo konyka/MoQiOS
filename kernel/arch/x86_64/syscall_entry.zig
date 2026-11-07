@@ -4254,9 +4254,8 @@ fn syscallPrctl(option: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) i64 {
             if (arg2 == 0 or arg2 >= 0x0000_8000_0000_0000) return -14;
             var name_buf: [16]u8 = @splat(0);
             const n = copy.copyPathFromUser(&name_buf, arg2, 15);
-            if (n > 0) {
-                @memcpy(cur.comm[0..@intCast(@min(n, 15))], name_buf[0..@intCast(@min(n, 15))]);
-            }
+            if (n == 0) return -14; // -EFAULT: nothing readable at the pointer (an empty name still copies its NUL)
+            cur.comm = @import("../../proc/comm_policy.zig").fromBytes(name_buf[0..n]);
             return 0;
         },
         16 => { // PR_GET_NAME

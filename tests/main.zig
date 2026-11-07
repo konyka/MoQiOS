@@ -11369,3 +11369,18 @@ test "the writeback thread is woken by task slot, not through a stack WaitNode l
     try std.testing.expect(std.mem.indexOf(u8, vfs, "task_mod.blockTask(idx);\n        sched.rescheduleAfterBlock();") != null);
     try std.testing.expect(std.mem.indexOf(u8, vfs, "if (idx != NO_WB_THREAD) @import(\"../proc/task.zig\").unblockTask(idx);") != null);
 }
+
+test "a process's name (comm) is set by the loader, exec, clone and PR_SET_NAME, and /proc reports it" {
+    // hello258: /proc/<pid>/status said "Name: process" for everyone and exec never changed the name; PR_SET_NAME ignored a bad pointer and left
+    // bytes of a longer previous name behind.
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "if (n == 0) return -14;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "cur.comm = @import(\"../../proc/comm_policy.zig\").fromBytes(name_buf[0..n]);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "cur.comm = @import(\"comm_policy.zig\").fromProgram(name);") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.loader_source, "t.comm = @import(\"comm_policy.zig\").fromProgram(name);"));
+    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "child.comm = parent.comm;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, "\"Name:\\t\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, "\"Name:\\t\\tprocess") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, "\" (process) \"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".pid_comm => generatePidComm(pid, buf, max_len),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "str.eql(file_part, \"comm\")") != null);
+}

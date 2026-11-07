@@ -206,6 +206,8 @@ pub fn prepareExecName(name: []const u8, argv_ptr: u64, envp_ptr: u64) Prepared 
     // scheduler, so the stale base would otherwise survive into the new image.
     cur.tls_base = 0;
     syscall_entry.setUserTlsBase(0);
+    // The new image's name is its program file name (Linux), not argv[0] and not the replaced image's name.
+    cur.comm = @import("comm_policy.zig").fromProgram(name);
     commitSignalStateForExec(cur, result.pml4, old_mm);
     @import("credentials.zig").applyExec(cur);
 

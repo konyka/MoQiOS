@@ -12,6 +12,8 @@ pub const ProcFile = enum(u8) {
     pid_stat,
     pid_cmdline,
     pid_rss,
+    /// /proc/<pid>/comm: the process name and a newline.
+    pid_comm,
     version,
     loadavg,
     filesystems,
@@ -58,7 +60,7 @@ const DT_LNK: u8 = 10;
 /// The files /proc lists besides the per-process directories, in listing order.
 const root_files = [_][]const u8{ "meminfo", "cpuinfo", "uptime", "version", "loadavg", "filesystems", "stat", "sched_stats", "vma_stats", "irqtime", "irqwindow", "lostats" };
 /// What a /proc/<pid> directory lists.
-const pid_files = [_][]const u8{ "status", "maps", "stat", "cmdline", "rss", "fd" };
+const pid_files = [_][]const u8{ "status", "maps", "stat", "cmdline", "rss", "comm", "fd" };
 
 /// The entry at position `pos` of /proc ("." and "..", the files, self, then one directory per live process), or null past the end. A
 /// thread is part of its process and is not listed on its own, as on Linux.
@@ -150,6 +152,7 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
         .pid_stat => generatePidStat(pid, buf, max_len),
         .pid_cmdline => generatePidCmdline(pid, buf, max_len),
         .pid_rss => generatePidRss(pid, buf, max_len),
+        .pid_comm => generatePidComm(pid, buf, max_len),
         .version => generateVersion(buf, max_len),
         .loadavg => generateLoadavg(buf, max_len),
         .filesystems => generateFilesystems(buf, max_len),
@@ -225,15 +228,27 @@ fn generatePidStatus(pid: u32, buf: [*]u8, max_len: u32) u32 {
     };
 
     var pos: u32 = 0;
-    pos = appendStr(buf, pos, max_len, "Name:\t\tprocess\n");
-    pos = appendStr(buf, pos, max_len, "State:\t\t");
+    pos = appendStr(buf, pos, max_len, "Name:\t");
+    pos = appendStr(buf, pos, max_len, commText(t));
+    pos = appendStr(buf, pos, max_len, "\nState:\t");
     pos = appendStr(buf, pos, max_len, stateStr(t.state));
-    pos = appendStr(buf, pos, max_len, "\nPid:\t\t");
+    pos = appendStr(buf, pos, max_len, "\nPid:\t");
     pos = appendDec(buf, pos, max_len, t.tid);
-    pos = appendStr(buf, pos, max_len, "\nPPid:\t\t");
+    pos = appendStr(buf, pos, max_len, "\nPPid:\t");
     pos = appendDec(buf, pos, max_len, t.parent_tid);
     pos = appendStr(buf, pos, max_len, "\n");
     return pos;
+}
+
+/// The process name of `t` as text (its comm up to the first NUL).
+fn commText(t: *const @import("../proc/task.zig").Task) []const u8 {
+    const cp = @import("../proc/comm_policy.zig");
+    return t.comm[0..cp.textLen(&t.comm)];
+}
+
+fn generatePidComm(pid: u32, buf: [*]u8, max_len: u32) u32 {
+    const t = findTaskByPid(pid) orelse return 0;
+    return appendChar(buf, appendStr(buf, 0, max_len, commText(t)), max_len, '\n');
 }
 
 fn generatePidMaps(pid: u32, buf: [*]u8, max_len: u32) u32 {
@@ -321,7 +336,9 @@ fn generatePidStat(pid: u32, buf: [*]u8, max_len: u32) u32 {
     };
     var pos: u32 = 0;
     pos = appendDec(buf, pos, max_len, @intCast(pid));
-    pos = appendStr(buf, pos, max_len, " (process) ");
+    pos = appendStr(buf, pos, max_len, " (");
+    pos = appendStr(buf, pos, max_len, commText(t));
+    pos = appendStr(buf, pos, max_len, ") ");
     // State character
     pos = appendChar(buf, pos, max_len, stateChar(t.state));
     pos = appendStr(buf, pos, max_len, " ");

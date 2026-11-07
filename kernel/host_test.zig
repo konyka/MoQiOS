@@ -122,6 +122,7 @@ pub const nice_policy = @import("proc/nice_policy.zig");
 pub const cred_policy = @import("proc/cred_policy.zig");
 pub const group_policy = @import("proc/group_policy.zig");
 pub const prctl_policy = @import("proc/prctl_policy.zig");
+pub const comm_policy = @import("proc/comm_policy.zig");
 pub const syslog_policy = @import("proc/syslog_policy.zig");
 pub const memfd_policy = @import("fs/memfd_policy.zig");
 pub const rename_policy = @import("fs/rename_policy.zig");
@@ -325,6 +326,7 @@ pub const readv_source = @embedFile("fs/readv.zig");
 test {
     _ = @import("proc/syscall_restart_policy.zig");
     _ = @import("proc/exec_policy.zig");
+    _ = @import("proc/comm_policy.zig");
     _ = @import("proc/user_stack.zig");
     _ = @import("arch/x86_64/irq_time_policy.zig");
     _ = @import("mm/munmap_policy.zig");

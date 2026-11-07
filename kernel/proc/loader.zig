@@ -255,6 +255,7 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
     // Set initial brk to just after the highest loaded segment
     if (task.getTask(new_task)) |t| {
         if (t.mm) |m| m.setBreak(highest_addr);
+        t.comm = @import("comm_policy.zig").fromProgram(name);
     }
 
     task.publishRunnable(new_task);
@@ -359,6 +360,7 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32, 
     const heap_start = user_space.USER_CODE_BASE + allocated * paging.PAGE_SIZE;
     if (task.getTask(new_task)) |t| {
         if (t.mm) |m| m.setBreak(heap_start);
+        t.comm = @import("comm_policy.zig").fromProgram(name);
     }
 
     task.publishRunnable(new_task);
