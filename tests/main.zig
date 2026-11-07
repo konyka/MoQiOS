@@ -11257,3 +11257,21 @@ test "statfs answers /proc with PROC_SUPER_MAGIC and /dev with TMPFS_MAGIC inste
     try std.testing.expect(std.mem.indexOf(u8, sc, ".proc_file => .{ .magic = 0x9fa0, .block_size = 4096, .name_max = 255, .rdonly = false },") != null);
     try std.testing.expect(std.mem.indexOf(u8, sc, ".devfs, .devfs_ctrl => .{ .magic = 0x01021994, .block_size = 4096, .name_max = 255, .rdonly = false },") != null);
 }
+
+test "procfs: /proc/self is the caller's pid and every procfs miss is ENOENT" {
+    // hello253: /proc/self/<file> was not opened at all, and a missing /proc name returned -1 (EPERM) instead of ENOENT.
+    const src = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, src, "const is_self = rest.len > 5 and str.eql(rest[0..5], \"self/\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "pid = @intCast(@max(@import(\"../proc/process_mgmt.zig\").getpid(), 0));") != null);
+    const a = std.mem.indexOf(u8, src, "// ---- procfs paths ----").?;
+    const b = std.mem.indexOfPos(u8, src, a, ".fd_type = .proc_file,").?;
+    try std.testing.expect(std.mem.indexOf(u8, src[a..b], "return -1;") == null);
+}
+
+test "procfs: another user's maps needs ptrace access and the open path enforces it" {
+    // hello253: any process could read any other process's /proc/<pid>/maps (its memory layout).
+    const src = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (pfile == .pid_maps) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "@import(\"procfs_policy.zig\").pidFile(true, same_user, effective_caps.cap_sys_ptrace) == .deny") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "return -13; // EACCES") != null);
+}

@@ -7107,3 +7107,22 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - `.github/workflows/test.yml` 把两个冒烟步骤的 `MOQI_SMOKE_TIMEOUT` 从 600 改为 900（脚本自己的默认值），job 上限从 30 分钟改为 45 分钟。这只是给慢 runner 余量；如果是真的卡住，900 秒后同样失败。
   - 新增 `if: failure()` 步骤，失败时打印保留下来的串口日志：已完成的探针个数、最后启动的探针、最后 40 行。
 - 没做：没有复现；没有证据表明本轮的 `statfs` 改动（libc 头文件和三个探针的取值方式）会让启动变慢——探针行为在本地不变。
+
+## /proc/self 与 procfs 的错误码（hello253，已修）
+
+- 起因：上一节测 `/proc` 的 `statfs` 时，`/proc/self/status` 返回 `ENOENT`——这个内核没有 `/proc/self`，只认数字 pid。`/proc/self/...` 是 C 库、脚本和调试器最常用的路径（`/proc/self/exe`、`fd`、`maps`、`status`），所以值得补。宿主机 Linux 实测：`/proc/self/status` 能打开、`Pid:` 行等于 `getpid()`、与数字路径一致；`/proc/self` 下未知文件、`/proc/selfx/status`、`/proc/nonesuch` 都是 `ENOENT`。
+- 红灯（修改前）：`/proc/self/status` 打不开（`self -1, numeric 8003`），`/proc/self/cmdline` 打不开，子进程项失败。**两个本来就对的项**（未知文件、`/proc/selfx/status` 打不开）最初也"通过"了，但那只是因为我的探针只检查了 `fd < 0`；改成检查 `-ENOENT` 后它们失败了——**procfs 的所有未命中都返回 `-1`（`EPERM`），而不是 `ENOENT`**。这是第二个缺陷，也一并修了。
+- 修改：`vfs.zig` 的 procfs 打开分支把 `self/` 前缀解析成 `getpid()` 的值（线程返回所属进程，与 `getpid` 一致），其后的文件名走和数字 pid 同一套；该分支里 4 处 `return -1` 全部改成 `-2`（`ENOENT`）。
+- 绿灯：hello253 6 项通过；host 1066/1066（加一条源码形状测试，含"procfs 分支里不再有 `return -1`"）。
+- 变异：把 `self` 的 pid 加 1（真编译；第一个变异写法没编译，不算）→ `Pid` 项（`self 0`）和 fork 子进程项失败，其余 4 项通过；还原后全过。
+- 未验证：①`/proc/self/exe`、`/proc/self/fd/N` 不是走这条路径（`readlink` 里单独处理），`open("/proc/self/fd")` 目录和 `/proc/self` 本身（不带文件名）仍打不开；②`/proc/thread-self`、`/proc/self/task` 没有；③数字 pid 的权限检查——见下一段（`maps` 已处理，其余文件按 Linux 本来就是公开的）。
+
+### 其他用户进程的 /proc/<pid>/maps（hello253 续，已修）
+
+- 发现方式：写 `/proc/self` 的文档时记下"任何进程能读任何进程的 `maps`"，随后核对：宿主机 Linux 实测，非特权用户读 root 进程的 `/proc/1/maps` 是 `EACCES`（读内存布局需要对目标的 ptrace 访问权），而 `status`、`stat`、`cmdline` 能打开；自己的进程全部能打开。这个内核没有任何检查，等于把每个进程的地址空间布局（ASLR 位置、堆栈、库映射）泄露给所有用户。
+- 修改：新增纯策略 `fs/procfs_policy.zig`（`pidFile(names_maps, same_user, ptrace_cap)`，只有"别的用户的 `maps` 且没有 `CAP_SYS_PTRACE`"才拒绝，加一个 host 单元测试）；`vfs.zig` 的 procfs 打开分支在 `pfile == .pid_maps` 时按目标 `tid == pid` 找到任务比较有效 uid，拒绝时返回 `-13`（`EACCES`）。
+- 红灯：hello253 新增两项，第一项（root 父进程、`setuid(1000)` 的子进程读父进程的 `maps`）修改前 `denied 0`。
+- **探针设计上踩的两个坑（如实）**：①这个内核里普通探针本来就是 uid 1000，没有 `CAP_SETUID`，子进程 `setuid(1000)` 之后和父进程是**同一个用户**，所以"另一个用户"的场景造不出来——我加了一段临时串口诊断才看清（`same_user=yes`，目标 euid 与调用者都是 1000），诊断已删除；正确做法是仿照 hello115/119/123/126，在 `capability_profile.zig` 里让 hello253 以 root + 仅 `CAP_SETUID` 启动，子进程再降到 1000。②第一次我写的诊断用了不存在的 `serial.writeDecimal`，编译失败，改用 `lib/fmt.zig` 的函数。
+- 绿灯：hello253 共 8 项通过（拒绝项 `denied 1`，同用户的 `status`/自己的 `maps` 仍能打开）；host 1068/1068。
+- 变异：把策略改成"maps 一律允许"（真编译）→ 拒绝项 `denied 0` 失败，其余通过；还原后通过。
+- 未验证：①`CAP_SYS_PTRACE` 持有者能读别人的 `maps` 这一分支只有 host 单元测试，没有运行时用例；②比较的是有效 uid，Linux 用的是 ptrace 访问检查（包含真实/保存 uid、dumpable 标志、LSM）；③`/proc/<pid>/mem`、`fd`、`environ` 等不存在，所以没有对应检查；④`status` 里的 `Pid`、`PPid` 对所有人可见，和 Linux 一致。

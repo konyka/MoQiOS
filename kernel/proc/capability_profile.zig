@@ -111,8 +111,8 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
     // hello119 (rename) uses it the same way: a root-owned /tmp file, then a
     // child dropping to uid 1000 meets the sticky-directory rule. hello123
     // (utimensat) drops to uid 1000 in a child to check who may set times; hello126
-    // (access) splits real and effective ids in a child.
-    if (std.mem.eql(u8, name, "hello115") or std.mem.eql(u8, name, "hello119") or std.mem.eql(u8, name, "hello123") or std.mem.eql(u8, name, "hello126")) {
+    // (access) splits real and effective ids in a child. hello253 (/proc/<pid>/maps) is root with a child that drops to uid 1000 to read root's map.
+    if (std.mem.eql(u8, name, "hello115") or std.mem.eql(u8, name, "hello119") or std.mem.eql(u8, name, "hello123") or std.mem.eql(u8, name, "hello126") or std.mem.eql(u8, name, "hello253")) {
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_setuid = true, .cap_setgid = true }, .initial_init = false };
     }
     // Socket-option acceptance test: holds CAP_NET_ADMIN (SO_MARK, SO_PRIORITY > 6) as uid 0 so that

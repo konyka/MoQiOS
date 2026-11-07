@@ -248,6 +248,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello250 | 打开的目录流看得到其它路径对目录的修改（tmpfs、ext2 各 8 项）：空目录列出 `.` 和 `..`；创建一批文件后同一个流（`rewinddir` 后）列出全部；按名字逐个打开都成功；删除一半后列出剩下的；全部删除后只剩点目录项；清空后的目录可以 `rmdir`，同名可以重新 `mkdir`；删除后空闲块数回到创建前的值（用 `statfs` 读，抓目录块泄漏）。ext2 夹具只有 128 个 inode，所以能建的文件数不固定（实测 44），判定相对于实际创建数 |
 | hello251 | `statfs`/`fstatfs` 按文件系统报告各自的数字（tmpfs、FAT32、ext2；每个 7–9 项）：类型码（tmpfs 0x01021994、FAT 0x4d44、ext2 0xEF53）、块大小/块数/空闲/可用、`f_namelen`（tmpfs 为 60，其余 255）、ext2 保留给 root 的块不计入可用、inode 总数与空闲数、`fstatfs` 与 `statfs` 一致、写 40960 字节后空闲块数按各文件系统的块大小下降（tmpfs 10 块、ext2 41 块含一个间接块、FAT32 79–80 簇）、不存在的路径 `ENOENT`、`<文件>/x` 为 `ENOTDIR`；`/proc` 文件报 `PROC_SUPER_MAGIC`（0x9fa0）且块数和 inode 数为 0，`/dev` 节点报 `TMPFS_MAGIC`（devtmpfs）而不是 ext2 |
 | hello252 | 目录增长超过 12 个块（tmpfs、ext2 各 5 项）：56 个条目（ext2 用 240 字节名字，约 14 KiB 目录记录，超过 1 KiB 块下 inode 的 12 个直接块；因夹具只有 128 个 inode，ext2 条目是指向同一个文件的硬链接）全部创建、列出（加点目录项共 59）、按名字打开、删除，清空后目录可 `rmdir`，`statfs` 空闲块数回到创建前（抓间接块泄漏）。名字用 `chdir` 进目录后的相对名，因为路径上限 255 字节 |
+| hello253 | `/proc/self` 指调用者自己：`/proc/self/status` 能打开且其 `Pid` 行等于 `getpid()`、与按数字 pid 打开的同一文件一致；`/proc/self/cmdline` 能打开；`/proc/self` 下的未知文件、`/proc/selfx/status`、`/proc` 下的未知名字都返回 `-ENOENT`（原来返回 `-1`，即 `EPERM`）；`fork` 出的子进程里 `/proc/self` 是子进程自己，不是父进程；以 root 启动的探针里降到 uid 1000 的子进程读不了父进程的 `/proc/<pid>/maps`（`EACCES`），但能读它的 `status` 和自己的 `maps`（共 8 项） |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。

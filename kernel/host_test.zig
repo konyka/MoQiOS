@@ -333,6 +333,7 @@ test {
     _ = @import("drivers/nvme_flush_policy.zig");
     _ = @import("proc/sched_getaffinity_policy.zig");
     _ = @import("fs/slot_bitmap.zig");
+    _ = @import("fs/procfs_policy.zig");
     _ = @import("proc/close_range_policy.zig");
     _ = @import("proc/move_pages_policy.zig");
     _ = @import("proc/time_set_policy.zig");

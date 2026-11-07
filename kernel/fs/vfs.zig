@@ -1133,11 +1133,18 @@ pub const FdTable = struct {
                 while (digit_end < rest.len and rest[digit_end] >= '0' and rest[digit_end] <= '9') {
                     digit_end += 1;
                 }
-                if (digit_end > 0 and digit_end < rest.len and rest[digit_end] == '/') {
-                    pid = parseU32(rest[0..digit_end]) orelse {
-                        self.freeFd(slot);
-                        return -1;
-                    };
+                // "/proc/self/<file>" is the calling process: the same id getpid() returns (a thread reports its process).
+                const is_self = rest.len > 5 and str.eql(rest[0..5], "self/");
+                if (is_self or (digit_end > 0 and digit_end < rest.len and rest[digit_end] == '/')) {
+                    if (is_self) {
+                        pid = @intCast(@max(@import("../proc/process_mgmt.zig").getpid(), 0));
+                        digit_end = 4;
+                    } else {
+                        pid = parseU32(rest[0..digit_end]) orelse {
+                            self.freeFd(slot);
+                            return -2; // ENOENT
+                        };
+                    }
                     const file_part = rest[digit_end + 1 ..];
                     if (str.eql(file_part, "status")) {
                         pfile = .pid_status;
@@ -1151,15 +1158,34 @@ pub const FdTable = struct {
                         pfile = .pid_rss;
                     } else {
                         self.freeFd(slot);
-                        return -1;
+                        return -2; // ENOENT
                     }
                 } else {
                     self.freeFd(slot);
-                    return -1;
+                    return -2; // ENOENT
                 }
             } else {
                 self.freeFd(slot);
-                return -1;
+                return -2; // ENOENT
+            }
+
+            // The memory map of another user's process needs ptrace access to it (EACCES otherwise); see procfs_policy.zig.
+            if (pfile == .pid_maps) {
+                const task_mod = @import("../proc/task.zig");
+                var same_user = false;
+                var i: u32 = 0;
+                while (i < task_mod.MAX_TASKS) : (i += 1) {
+                    if (task_mod.getTask(i)) |t| {
+                        if (t.tid == pid) {
+                            same_user = t.euid == euid;
+                            break;
+                        }
+                    }
+                }
+                if (@import("procfs_policy.zig").pidFile(true, same_user, effective_caps.cap_sys_ptrace) == .deny) {
+                    self.freeFd(slot);
+                    return -13; // EACCES
+                }
             }
 
             self.fds[slot] = .{
