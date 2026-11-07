@@ -7081,3 +7081,10 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：hello252 每个文件系统 5 项（tmpfs、ext2）通过；hello250 仍通过；host 1064/1064（新增源码形状测试）。
 - 变异检查：让 `freeDirBlocks` 不释放 `block[12]` 的间接树（真编译）→ `free blocks 16195 before, 16191 after`（泄漏 4 块：一个间接块和它的数据块），其余项仍通过，只有"空闲块数回到创建前"这一项抓住；还原后相等。这一项是和变异**同时**写的，没有先看过它在没有变异时通过，**但**在变异下确实失败，在还原后通过。
 - 未验证：①二级间接（目录超过约 268 个块）和三级没有测，只走了一级间接；②`ensureBlock` 失败（磁盘满）时，已挂到 inode 上但还没写入条目的块会留在 inode 里（大小没增加，下一次重试会复用，`rmdir` 会释放），没有专门测；③`addDirEntry` 的"拆分最后一个条目"快速路径只看最后一块，目录中间被删出的空洞不会被再利用（既有行为，未改）。
+
+## libc 的 statfs/fstatfs（hello251/250/252 改用）
+
+- 之前 libc 没有 `statfs`，三个探针各自写了一份 `struct kstatfs { unsigned long w[15]; }` 和裸系统调用。现在 `stat.h` 提供 glibc 布局的 `struct statfs`（宿主机实测 120 字节，各偏移 0/8/16/24/32/40/48/56/64/72/80/88）、`statfs`/`fstatfs` 和 `TMPFS_MAGIC`/`MSDOS_SUPER_MAGIC`/`EXT2_SUPER_MAGIC`/`ST_RDONLY`；`moqi_syscalls.h` 补上 `SYS_statfs`（276）、`SYS_fstatfs`（277）。
+- 宿主机 `test_stat_abi`：布局偏移全部与 glibc 一致，参数转发（`SYS_statfs`、缓冲区指针）、`ENOENT`/`ENOTDIR`/`EBADF`/`EFAULT` 的 -1 加 `errno` 转换。变异（`statfs` 误调 `SYS_fstatfs`）→ `test_stat_abi.c:174` 失败，还原后通过。
+- hello251 改为用 `struct statfs` 的命名字段（原来是 `w[3]` 这样的下标）和库的 `statfs`/`fstatfs`；hello250、hello252 的 `free_blocks` 改调库函数。三个探针在真内核上仍然全部通过（hello251 PASS，hello250 的 tmpfs/ext2 空闲块数 64853/16195 不变，hello252 同）。
+- 未验证：`f_fsid` 在内核里恒为 0；libc 没有 `statvfs`（glibc 的 `statvfs` 是另一个结构），没做。

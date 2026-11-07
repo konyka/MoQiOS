@@ -9,6 +9,11 @@
  * errno (ENOENT, ENOTDIR, EBADF, EFAULT, EACCES, ...). chmod and fchmod set the permission bits (07777), readlink fills the buffer
  * without a terminating NUL and returns the length (EINVAL when the file is not a link), symlink and link create a symbolic and a
  * hard link (EEXIST when the name exists). unistd.h declares nothing of these.
+ *
+ * statfs and fstatfs fill struct statfs, glibc's x86-64 layout (120 bytes, measured): f_type 0, f_bsize 8, f_blocks 16, f_bfree 24,
+ * f_bavail 32, f_files 40, f_ffree 48, f_fsid 56, f_namelen 64, f_frsize 72, f_flags 80, then four spare words. They return 0, or -1 with
+ * errno (ENOENT, ENOTDIR, EACCES, EBADF, EFAULT, EIO). The kernel reports each filesystem's own type, sizes and inode counts: f_type is
+ * TMPFS_MAGIC, MSDOS_SUPER_MAGIC or EXT2_SUPER_MAGIC below, and FAT has no inode table (f_files and f_ffree are 0).
  */
 #ifndef MOQI_STAT_H
 #define MOQI_STAT_H
@@ -76,5 +81,28 @@ int fchmod(int fd, unsigned int mode);
 long readlink(const char *path, char *buf, size_t size);
 int symlink(const char *target, const char *linkpath);
 int link(const char *oldpath, const char *newpath);
+
+struct statfs {
+    long f_type;
+    long f_bsize;
+    unsigned long f_blocks;
+    unsigned long f_bfree;
+    unsigned long f_bavail;
+    unsigned long f_files;
+    unsigned long f_ffree;
+    int f_fsid[2];
+    long f_namelen;
+    long f_frsize;
+    long f_flags;
+    long f_spare[4];
+};
+
+#define TMPFS_MAGIC        0x01021994
+#define MSDOS_SUPER_MAGIC  0x4d44
+#define EXT2_SUPER_MAGIC   0xEF53
+#define ST_RDONLY          1
+
+int statfs(const char *path, struct statfs *buf);
+int fstatfs(int fd, struct statfs *buf);
 
 #endif

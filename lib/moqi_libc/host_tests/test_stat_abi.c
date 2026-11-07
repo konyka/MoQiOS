@@ -16,9 +16,11 @@
 /* The host's names are not wanted: the library's are compiled under moqi_ names. */
 #define stat moqi_stat_struct
 #define timespec moqi_timespec
+#define statfs moqi_statfs_struct
 #include "../include/stat.h"
 #undef stat
 #undef timespec
+#undef statfs
 
 int moqi_stat(const char *, struct moqi_stat_struct *);
 int moqi_lstat(const char *, struct moqi_stat_struct *);
@@ -28,6 +30,8 @@ int moqi_fchmod(int, unsigned int);
 long moqi_readlink(const char *, char *, size_t);
 int moqi_symlink(const char *, const char *);
 int moqi_link(const char *, const char *);
+int moqi_statfs(const char *, struct moqi_statfs_struct *);
+int moqi_fstatfs(int, struct moqi_statfs_struct *);
 
 static int bad;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); bad++; } } while (0)
@@ -156,6 +160,28 @@ int main(void) {
     CHECK(moqi_link("/tmp/f", "/tmp/hl") == 0 && c_nr == SYS_link);
     arm(-2);
     CHECK(moqi_link("/tmp/nope", "/tmp/hl") == -1 && errno_slot == ENOENT);
+
+    /* statfs / fstatfs: glibc's struct statfs (measured: 120 bytes, f_type 0, f_bsize 8, f_blocks 16, f_bfree 24, f_bavail 32, f_files 40,
+     * f_ffree 48, f_fsid 56, f_namelen 64, f_frsize 72, f_flags 80, f_spare 88) is the kernel's layout, so the wrappers pass it through. */
+    CHECK(sizeof(struct moqi_statfs_struct) == 120);
+    CHECK(offsetof(struct moqi_statfs_struct, f_type) == 0 && offsetof(struct moqi_statfs_struct, f_bsize) == 8 && offsetof(struct moqi_statfs_struct, f_blocks) == 16);
+    CHECK(offsetof(struct moqi_statfs_struct, f_bfree) == 24 && offsetof(struct moqi_statfs_struct, f_bavail) == 32 && offsetof(struct moqi_statfs_struct, f_files) == 40);
+    CHECK(offsetof(struct moqi_statfs_struct, f_ffree) == 48 && offsetof(struct moqi_statfs_struct, f_fsid) == 56 && offsetof(struct moqi_statfs_struct, f_namelen) == 64);
+    CHECK(offsetof(struct moqi_statfs_struct, f_frsize) == 72 && offsetof(struct moqi_statfs_struct, f_flags) == 80 && offsetof(struct moqi_statfs_struct, f_spare) == 88);
+    CHECK(TMPFS_MAGIC == 0x01021994 && MSDOS_SUPER_MAGIC == 0x4d44 && EXT2_SUPER_MAGIC == 0xEF53 && ST_RDONLY == 1);
+    struct moqi_statfs_struct sf;
+    arm(0);
+    CHECK(moqi_statfs("/tmp", &sf) == 0 && c_nr == SYS_statfs && c_a2 == (long)&sf);
+    arm(-2);
+    CHECK(moqi_statfs("/tmp/nope", &sf) == -1 && errno_slot == ENOENT);
+    arm(-20);
+    CHECK(moqi_statfs("/tmp/f/x", &sf) == -1 && errno_slot == ENOTDIR);
+    arm(0);
+    CHECK(moqi_fstatfs(5, &sf) == 0 && c_nr == SYS_fstatfs && c_a1 == 5 && c_a2 == (long)&sf);
+    arm(-9);
+    CHECK(moqi_fstatfs(999, &sf) == -1 && errno_slot == EBADF);
+    arm(-14);
+    CHECK(moqi_statfs("/tmp", (struct moqi_statfs_struct *)0) == -1 && errno_slot == EFAULT);
 
     if (bad) { fprintf(stderr, "%d check(s) failed\n", bad); return 1; }
     printf("test_stat_abi: ok\n");

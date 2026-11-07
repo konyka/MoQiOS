@@ -1,4 +1,4 @@
-/* stat.c -- stat, lstat, fstat, chmod, fchmod, readlink, symlink and link (see include/stat.h). */
+/* stat.c -- stat, lstat, fstat, chmod, fchmod, readlink, symlink, link, statfs and fstatfs (see include/stat.h). */
 #include <string.h>
 
 #include "../include/stat.h"
@@ -74,3 +74,6 @@ long readlink(const char *path, char *buf, size_t size) {
 
 int symlink(const char *target, const char *linkpath) { return __moqi_ret(MSYS2(SYS_symlink, target, linkpath)); }
 int link(const char *oldpath, const char *newpath) { return __moqi_ret(MSYS2(SYS_link, oldpath, newpath)); }
+
+int statfs(const char *path, struct statfs *buf) { return __moqi_ret(MSYS2(SYS_statfs, path, buf)); }
+int fstatfs(int fd, struct statfs *buf) { return __moqi_ret(MSYS2(SYS_fstatfs, fd, buf)); }

@@ -66,6 +66,8 @@
 #define SYS_chmod       90
 #define SYS_fchmod      91
 #define SYS_statx       183
+#define SYS_statfs      276
+#define SYS_fstatfs     277
 #define SYS_fdatasync   245
 #define SYS_pipe2       250
 #define SYS_mkdir       123

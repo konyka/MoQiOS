@@ -12,15 +12,12 @@
 #include "../lib/moqi_libc/include/string.h"
 #include "../lib/moqi_libc/include/errno.h"
 
-#define SYS_STATFS 276
-struct kstatfs { unsigned long w[15]; };
 static long free_blocks(const char *path) {
-    struct kstatfs f;
+    struct statfs f;
     memset(&f, 0, sizeof f);
-    if (syscall2(SYS_STATFS, (long)path, (long)&f) != 0) return -1;
-    return (long)f.w[3];
+    if (statfs(path, &f) != 0) return -1;
+    return (long)f.f_bfree;
 }
-
 static int failures;
 static void check(int ok, const char *what) {
     print(ok ? "hello252:   ok   " : "hello252:   FAIL ");
