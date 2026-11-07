@@ -66,7 +66,14 @@ pub fn statx(dirfd: i64, pathname_ptr: u64, flags: u32, mask: u32, statxbuf_ptr:
         }
     }
     const open_flags: u32 = 0;
-    const fd_result = cur.fd_table.openWithCredentials(use_name, open_flags, cur.euid, cur.egid, cur.effective_caps);
+    // stat("/proc/self/fd/N") describes the file descriptor N is open on (Linux follows the magic link); lstat describes the link itself.
+    var fd_link: [256]u8 = undefined;
+    const stat_name: []const u8 = if (args.follow) switch (@import("fd_target.zig").resolveMagicLink(cur, use_name, &fd_link)) {
+        .same => use_name,
+        .path => |p| p,
+        .err => |e| return e,
+    } else use_name;
+    const fd_result = cur.fd_table.openWithCredentials(stat_name, open_flags, cur.euid, cur.egid, cur.effective_caps);
     if (fd_result < 0) return @import("namespace_policy.zig").lookupFailureErrno(fd_result);
     const fd: u32 = @intCast(fd_result);
     const common = describe(&cur.fd_table.fds[fd], fd);

@@ -109,6 +109,28 @@ int main(int argc, char **argv, char **envp) {
     snprintf(what, sizeof what, "opendir(/proc/self/fd) lists . and .. and every open descriptor by number (opened %d, dots %d, file %d, ext2 %d, pipe %d, non-numeric %d)", d != (DIR *)0, dots, saw_f, saw_e, saw_p0, bad);
     check(d != (DIR *)0 && dots == 2 && saw_f && saw_e && saw_p0 && bad == 0, what);
 
+    /* Opening /proc/self/fd/N opens the same file again, with its own offset (Linux: a new open file description). stat sees the file. */
+    {
+        char link[48], rb[16];
+        memset(rb, 0, sizeof rb);
+        write(f, "hello", 5);
+        snprintf(link, sizeof link, "/proc/self/fd/%d", f);
+        long g = open(link, O_RDONLY, 0);
+        long rn = g >= 0 ? read((int)g, rb, 5) : -1;
+        long off = lseek(f, 0, SEEK_CUR);
+        snprintf(what, sizeof what, "open(/proc/self/fd/N) opens the same file again: reads the 5 bytes from its own offset 0 (open %ld, read %ld \"%s\"), the original keeps offset 5 (%ld)", g, rn, rb, off);
+        check(g >= 0 && rn == 5 && memcmp(rb, "hello", 5) == 0 && off == 5, what);
+        if (g >= 0) close((int)g);
+        struct stat st;
+        memset(&st, 0, sizeof st);
+        long sr = stat(link, &st);
+        snprintf(what, sizeof what, "stat(/proc/self/fd/N) describes the file (rc %ld, regular %d, size %ld)", sr, S_ISREG(st.st_mode), (long)st.st_size);
+        check(sr == 0 && S_ISREG(st.st_mode) && st.st_size == 5, what);
+        long gone = open("/proc/self/fd/900", O_RDONLY, 0);
+        snprintf(what, sizeof what, "open of a number that is not a descriptor is ENOENT (%ld)", gone);
+        check(gone == -ENOENT, what);
+    }
+
     /* Closing a descriptor removes it from the listing and from readlink. */
     close(f);
     n = link_of(f, got, sizeof got);

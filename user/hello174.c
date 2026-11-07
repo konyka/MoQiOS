@@ -156,6 +156,8 @@ static void print_tcp_info(const char *who, int fd) {
     print(" rtt_us="); print_dec(info_u32(b, 68));
     print(" ssthresh="); print_dec(info_u32(b, 76));
     print(" cwnd="); print_dec(info_u32(b, 80));
+    print(" snd_mss="); print_dec(info_u32(b, 16));
+    print(" rcv_space="); print_dec(info_u32(b, 96));
     print("\n");
 }
 static int ioctl_int(int fd, uint64_t cmd) {

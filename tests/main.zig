@@ -3585,7 +3585,7 @@ test "user metadata probes forward effective DAC credentials" {
     // statx and access resolve their paths through at_path (a volume directory
     // fd or cwd may rewrite the name) but must retain the caller's credentials.
     const forwarding = "openWithCredentials(use_name, 0, cur.euid, cur.egid, cur.effective_caps)";
-    try std.testing.expect(std.mem.indexOf(u8, kt.statx_source, "openWithCredentials(use_name, open_flags, cur.euid, cur.egid, cur.effective_caps)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.statx_source, "openWithCredentials(stat_name, open_flags, cur.euid, cur.egid, cur.effective_caps)") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, forwarding) != null);
 }
 
@@ -11328,12 +11328,25 @@ test "directories above mount points exist and list the mount points one level d
 
 test "/proc/self/fd: readlink reports what each descriptor is open on, and the directory lists the open descriptors" {
     // hello257: readlink returned the words "file"/"pipe"/"socket" and a closed number was EINVAL; /proc/self/fd could not be listed.
-    const rl = kt.readlink_source;
-    try std.testing.expect(std.mem.indexOf(u8, rl, "readlink_policy.numberedLink(\"pipe\", d.pipe_idx, &text)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rl, "readlink_policy.numberedLink(\"socket\", d.tcb_idx, &text)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rl, "tmpfsEntryPath(d.tmpfs_idx, &text)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rl, "t.fd_table.fds[fd_val].fd_type == .none) return -2; // ENOENT") != null);
+    const ft = kt.fd_target_source;
+    try std.testing.expect(std.mem.indexOf(u8, ft, "readlink_policy.numberedLink(\"pipe\", d.pipe_idx, text)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ft, "readlink_policy.numberedLink(\"socket\", d.tcb_idx, text)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ft, "tmpfsEntryPath(d.tmpfs_idx, text)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ft, "t.fd_table.fds[fd_val].fd_type == .none) return .{ .err = -2 };") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "fn getdents64FdDir(") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "str.eql(file_part, \"fd\") or str.eql(file_part, \"fd/\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "if (pfile == .pid_maps or pfile == .fd_dir) {") != null);
+}
+
+test "open and stat of /proc/self/fd/N act on the file the descriptor is open on, through one shared resolver" {
+    // hello257: open("/proc/self/fd/N") was ENOENT and stat of it failed, so a descriptor could not be reopened or described by that name.
+    const fio = kt.file_io_source;
+    const sx = kt.statx_source;
+    const ft = kt.fd_target_source;
+    try std.testing.expect(std.mem.indexOf(u8, fio, "fd_target.zig\").resolveMagicLink(cur, use_name, &fd_link)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sx, "if (args.follow) switch (@import(\"fd_target.zig\").resolveMagicLink(cur, use_name, &fd_link))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ft, "pub fn resolveMagicLink(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ft, "pub fn describe(") != null);
+    // readlink and the resolver agree because both call describe().
+    try std.testing.expect(std.mem.indexOf(u8, kt.readlink_source, "@import(\"fd_target.zig\").describe(t, fd_val, &text)") != null);
 }

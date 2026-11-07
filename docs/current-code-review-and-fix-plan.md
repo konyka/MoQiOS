@@ -7230,3 +7230,19 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - **一个已有探针被我改坏了（如实）**：完整冒烟 SMP=2 报 `hello86: FAIL readlink invalid fd returns EINVAL`。hello86 一直断言"不是打开描述符的数字 → `EINVAL`"，而宿主机 Linux 的答案是 `ENOENT`；我按 Linux 改了内核，所以把 hello86 的期望改成 `ENOENT`（探针头部加了一行说明）。顺带测了 Linux 对其它名字的答案：`/proc/self/fd/abc`、`/proc/self/fd/-1`、`/proc/self/fd/99999999999` 都是 `ENOENT`，只有空名字是 `EINVAL`；内核照此改了（非数字开头和超出范围的数字都返回 `ENOENT`），hello257 加了一项断言这三种名字。这是**改变了既有行为并改了既有测试**，不是内核回归：被改的断言本来就与 Linux 不一致。
 - 变异：把 TCP 套接字的文本改成 `pipe:[...]`（真编译）→ "套接字读回 socket:[inode]" 失败（`"pipe:[0]"`），其余通过；还原后通过。
 - 未验证：①管道和套接字的编号是**内核里的数组下标**，不是 Linux 那样的 inode 号，数字本身没有意义，只保证"同一对象相同、不同对象不同"，管道槽位复用后编号会重复；②`open("/proc/self/fd/N")`（重新打开同一个文件）没有做，`stat` 这些路径也没有；③被 `unlink` 的 tmpfs 文件读回 `ENOENT`，Linux 是路径加 ` (deleted)`；④ext2 的路径取的是**打开时的名字**，文件被 `rename` 之后仍是旧名字（目录描述符那边是按 inode 重建的，文件这边没有）；⑤只测了自己的进程，别的用户进程的 `fd` 目录的 `EACCES` 没有单独用例（共用 `maps` 的策略，策略有单元测试）。
+
+### `/proc/self/fd/N` 作为路径：`open` 与 `stat`（hello257 续，已修）
+
+- 宿主机 Linux 实测：`open("/proc/self/fd/N")` 打开描述符 N 所指的文件，得到新的打开文件描述（自己的偏移，原描述符偏移不变）；`stat` 描述该文件（`lstat` 描述链接本身）；`stat` 一个管道得 FIFO；不是描述符的数字 `ENOENT`。
+- 红灯：`open` 返回 `-2`（`ENOENT`，路径不存在），`stat` 失败；"不是描述符的数字 ENOENT" 本来就对。
+- 修改：把上一段 `readlink.zig` 里按描述符类型拼目标文本的那一大段**抽成独立模块 `fd_target.zig`**（`describe`），`readlink`、`open`、`stat` 共用同一份；新增 `resolveMagicLink`：名字是 `/proc/self/fd/N` 时换成描述符读回的路径，没有路径的（管道、套接字、event 对象）返回 `ENXIO`。FAT32 文件原来在 `readlink` 里落到 "file"，现在读回 `/<名字>`。`file_io.openAt` 和 `statx` 各加一处调用（`statx` 只在跟随链接时换名）。
+- 绿灯：hello257 现在 13 项（实际运行计数）通过；host 1077/1077。变异：让 `resolveMagicLink` 永远返回 `.same`（真编译）→ `open` 和 `stat` 两项失败（`open -2`、`rc -1`），其余通过；还原后通过。
+- 过程说明（如实）：①中间我在 `file_io.zig` 里加了 `const std`，抽出之后用不到，已删，`git diff` 里不再出现；②`host_test.zig` 里 `file_io_source`/`statx_source` 已存在，我重复添加被编译器拒绝，去掉了重复；③两条 host 形状测试因代码移动需要同步：`statx` 的 `openWithCredentials` 调用变量名变了（`stat_name`），readlink 形状测试改为检查 `fd_target.zig`——断言的是同样的意图。
+- 未验证：①`lstat("/proc/self/fd/N")` 是否返回符号链接没有测（这里 `lstat` 不换名，会按名字找，多半 `ENOENT`）；②`O_CREAT|O_EXCL` 等标志经过这个名字的行为；③`open` 到 `ENXIO` 的情形（管道）没有运行时用例；④描述符指向的文件被 `rename` 后 ext2 仍用旧名字。
+
+### hello174 排空完全停滞：第一次拿到收发两端的 TCP_INFO（本地 SMP=2 门禁里复现）
+
+- 现象：在本轮门禁里 SMP=2 的完整冒烟又一次出现 `hello174: FAIL C: reading drains everything that was accepted within 10 s`，这次是**本地**复现，且上一轮加的诊断起了作用。与 CI 那次（`07ab4f0`）的形状几乎一样：`drain_got=34464`（同一个数），第 1 秒起到第 10 秒累计读取**一个字节都不再增加**，`drain_stalled_for_ms=8951`，接收方已读空（`fionread=0`），发送方还压着 47455 字节（`outq=47455`，同一个数）。回环队列没有丢帧（`dropped=0`）。
+- **新的数据（TCP_INFO）**：发送方 `state=1 retransmits=0 rto_us=211000 unacked=0 rtt_us=11000 ssthresh=23168 cwnd=15`；接收方 `retransmits=0 unacked=0`。解读（推断，不是直接观察到原因）：发送方**没有任何在途未确认数据**（`unacked=0`），**没有重传**（`retransmits=0`），拥塞窗口是开的（15 个段），RTT 和 RTO 正常（11 ms、211 ms）——但环里仍有 47 KB 没有发出。这排除了我之前的两个候选：①"RTO 退避/重传"（没有重传，RTO 只有 211 ms）；②"拥塞窗口耗尽"（`unacked=0`，`cwnd` 有 15 段）。剩下的候选是：发送窗口 `snd_wnd` 为 0 且靠持续探测恢复（探测首次 2 s 之后翻倍，累计 2+4+8 = 14 s，与"10 秒内没恢复"吻合），或者发送被节拍（pacing）挡住而没有定时器再唤醒。`TCP_INFO` 里没有 `snd_wnd`，所以这两个仍无法区分。
+- 又加了一步诊断：`hello174` 的失败输出再加 `snd_mss` 和 `rcv_space`（接收方通告的窗口，在 `TCP_INFO` 里）。若接收方 `rcv_space` 为 0 或很小，就指向"接收方窗口没有重新打开"；若很大而发送方仍不发，就指向发送方的节拍/定时器。
+- 没有改内核：数据只排除了两个候选，仍不能指向一处具体的代码，凭推测改窗口或节拍逻辑风险大于收益。这条失败现在至少有两次留有同形状的现场（CI 的 `07ab4f0` 和这次本地），但根因仍未知；文档里还记着其它根因未知的偶发失败（`hello152`、`hello176` D、本轮的 `hello237` G 和 `hello227` B17），我没有统计哪个最频繁。
