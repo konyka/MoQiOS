@@ -64,6 +64,35 @@ int main(int argc, char **argv, char **envp) {
     snprintf(what, sizeof what, "rewinddir gives the same list again (first %d, second %d)", first, second);
     check(first == a.n && second == a.n, what);
 
+    /* A file created by a bare name lives on the FAT32 volume and is an entry of "/": it must be listed, once, as a regular file, and be gone
+     * from the list after unlink. */
+    int fd = (int)open("h255fat", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) {
+        write(fd, "x", 1);
+        close(fd);
+    }
+    int found = 0, ftype = -1;
+    DIR *fd_dir = opendir("/");
+    if (fd_dir) {
+        struct dirent *e;
+        while ((e = readdir(fd_dir)) != (struct dirent *)0) {
+            if (!strcmp(e->d_name, "h255fat")) { found++; ftype = e->d_type; }
+        }
+        closedir(fd_dir);
+    }
+    snprintf(what, sizeof what, "a FAT32 file created by a bare name is listed once, as DT_REG (created %d, found %d, d_type %d)", fd >= 0, found, ftype);
+    check(fd >= 0 && found == 1 && ftype == DT_REG, what);
+    unlink("h255fat");
+    found = 0;
+    fd_dir = opendir("/");
+    if (fd_dir) {
+        struct dirent *e;
+        while ((e = readdir(fd_dir)) != (struct dirent *)0) if (!strcmp(e->d_name, "h255fat")) found++;
+        closedir(fd_dir);
+    }
+    snprintf(what, sizeof what, "and it is gone from the list after unlink (found %d)", found);
+    check(found == 0, what);
+
     char cwd[128];
     getcwd(cwd, sizeof cwd);
     chdir("/");

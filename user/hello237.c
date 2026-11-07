@@ -43,14 +43,26 @@ static void mk_addr(unsigned char *a, int port) {
 
 static int port_next = 18237;
 
-/* A connected loopback pair: *cli is the client end, *srv the accepted end. */
+/* Why the last make_pair failed: the step that failed and the value it returned (printed by the caller, so a CI log shows which call it was). */
+static int mp_step;
+static long mp_value;
+
+/* A connected loopback pair: *cli is the client end, *srv the accepted end. On failure the step is in mp_step (1 socket, 2 bind, 3 listen,
+ * 4 client socket, 5 connect, 6 accept) and the failing call's result in mp_value. */
 static int make_pair(int *cli, int *srv) {
     unsigned char sa[16];
     int port = port_next++;
     mk_addr(sa, port);
+    mp_step = 0;
+    mp_value = 0;
     long ls = syscall3(SYS_socket, 2, 1, 0);
-    if (ls < 0 || syscall3(SYS_bind, ls, (long)sa, 16) != 0 || syscall3(SYS_listen, ls, 4, 0) != 0) return -1;
+    if (ls < 0) { mp_step = 1; mp_value = ls; return -1; }
+    long br = syscall3(SYS_bind, ls, (long)sa, 16);
+    if (br != 0) { mp_step = 2; mp_value = br; close((int)ls); return -1; }
+    long lr = syscall3(SYS_listen, ls, 4, 0);
+    if (lr != 0) { mp_step = 3; mp_value = lr; close((int)ls); return -1; }
     long c = syscall3(SYS_socket, 2, 1, 0);
+    if (c < 0) { mp_step = 4; mp_value = c; close((int)ls); return -1; }
     long r = syscall3(SYS_connect, c, (long)sa, 16);
     for (int i = 0; i < 100 && r < 0 && r != -106 /* EISCONN */; i++) {
         pump(20);
@@ -63,10 +75,17 @@ static int make_pair(int *cli, int *srv) {
         if (s < 0) pump(20);
     }
     close((int)ls);
-    if (c < 0 || s < 0) return -1;
+    if (r < 0 && r != -106) { mp_step = 5; mp_value = r; close((int)c); if (s >= 0) close((int)s); return -1; }
+    if (s < 0) { mp_step = 6; mp_value = s; close((int)c); return -1; }
     *cli = (int)c;
     *srv = (int)s;
     return 0;
+}
+
+static void report_pair_failure(const char *what) {
+    char line[120];
+    snprintf(line, sizeof line, "%s: make_pair failed at step %d (1 socket, 2 bind, 3 listen, 4 socket, 5 connect, 6 accept), result %ld", what, mp_step, mp_value);
+    check(0, line);
 }
 
 static int wait_ev(int ep, struct epoll_event *o, int ms) {
@@ -87,7 +106,7 @@ int main(int argc, char **argv, char **envp) {
 
     int c, s;
     if (make_pair(&c, &s) != 0) {
-        check(0, "A: a connected loopback pair could not be made");
+        report_pair_failure("A");
         print("hello237: FAIL\n");
         return 1;
     }
@@ -135,7 +154,7 @@ int main(int argc, char **argv, char **envp) {
         close(c);
         close(ep);
     } else {
-        check(0, "C: a connected loopback pair could not be made");
+        report_pair_failure("C");
     }
 
     /* a close that leaves unread data behind: RST */
@@ -155,7 +174,7 @@ int main(int argc, char **argv, char **envp) {
         close(c);
         close(ep);
     } else {
-        check(0, "D: a connected loopback pair could not be made");
+        report_pair_failure("D");
     }
 
     /* What the reset does to recv and send on the side that received it. Measured on Linux (two orders): the reset is reported ONCE,
@@ -174,7 +193,7 @@ int main(int argc, char **argv, char **envp) {
         check(r1 == -104 && r2 == -32 && r3 == 0, what);
         close(c);
     } else {
-        check(0, "E: a connected loopback pair could not be made");
+        report_pair_failure("E");
     }
 
     if (make_pair(&c, &s) == 0) {
@@ -191,7 +210,7 @@ int main(int argc, char **argv, char **envp) {
         check(r1 == -104 && r2 == -32 && r3 == 0, what);
         close(c);
     } else {
-        check(0, "E2: a connected loopback pair could not be made");
+        report_pair_failure("E2");
     }
 
     if (make_pair(&c, &s) == 0) {
@@ -209,7 +228,7 @@ int main(int argc, char **argv, char **envp) {
         check(r1 == 5 && r2 == -104 && r3 == 0, what);
         close(c);
     } else {
-        check(0, "F: a connected loopback pair could not be made");
+        report_pair_failure("F");
     }
 
     /* POLLERR is the pending error: it is there until the ECONNRESET has been read, then it goes (Linux: revents 0x19 before, 0x11 after:
@@ -232,7 +251,7 @@ int main(int argc, char **argv, char **envp) {
         check(before == 0x19 && after == 0x11, what);
         close(c);
     } else {
-        check(0, "G: a connected loopback pair could not be made");
+        report_pair_failure("G");
     }
 
     /* A recv that is already asleep when the reset arrives: it wakes with -ECONNRESET (about 120 ms in), and the next recv is 0. The
@@ -271,7 +290,7 @@ int main(int argc, char **argv, char **envp) {
         waitpid(kid, (int *)0, 0);
         close(c);
     } else {
-        check(0, "H: a connected loopback pair could not be made");
+        report_pair_failure("H");
     }
 
     /* I: a connection that completed the handshake but was never accepted is reset when the listener closes (Linux tcp_close on a
@@ -365,7 +384,7 @@ int main(int argc, char **argv, char **envp) {
      * reset first, SO_ERROR reads 0 (the error was already consumed). */
     for (int order = 0; order < 2; order++) {
         if (make_pair(&c, &s) != 0) {
-            check(0, "K: a connected loopback pair could not be made");
+            report_pair_failure("K");
             continue;
         }
         char rb[16];

@@ -7170,4 +7170,28 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修改：`getdents.zig` 的 ext2 分支在**根目录**（inode 2）的 ext2 条目列完后，把游标切到 `ROOT_VIRTUAL_BASE`（0x4000_0000，远高于任何 ext2 字节偏移），由 `getdents64RootVirtual` 返回 `tmp`、`dev`、`proc`（`DT_DIR`，`d_off` 为游标加 1，inode 号取 0x7FFF0000 起的占位值）；游标在这个范围时直接走这个函数，列完返回 0，`rewinddir`（`lseek` 到 0）回到 ext2 条目。缓冲区放不下一项时返回 `EINVAL`。
 - 绿灯：hello255 6 项通过（含后加的 `rewinddir` 第二遍与第一遍相同，11 对 11）；host 1071/1071。
 - 变异：把名字表去掉 `proc`（真编译）→ `proc 0/-1` 失败；还原后通过。
-- 未验证：①如果 ext2 根目录里将来有同名的 `tmp`/`dev`/`proc` 条目，会列出两次，这里没有去重；②虚拟条目的 inode 号是占位值，`stat` 到这些路径得到的 inode 号与列表里的不一致；③只处理了 ext2 根；FAT32 根下的文件（裸文件名）不在 `/` 的列表里（FAT32 的 `getdents` 不存在），这是另一个差异；④ext4/NTFS 挂载点（`/mnt/...`）也没有出现在 `/` 的列表里。
+- 未验证：①如果 ext2 根目录里将来有同名的 `tmp`/`dev`/`proc` 条目，会列出两次，这里没有去重；②虚拟条目的 inode 号是占位值，`stat` 到这些路径得到的 inode 号与列表里的不一致；③FAT32 根下的文件见下一段（已处理）；④ext4/NTFS 挂载点（`/mnt/...`）仍没有出现在 `/` 的列表里。
+
+### 根目录列表：FAT32 卷根下的文件（hello255 续，已修）
+
+- 起因：上一段的"未验证"里记着 FAT32 根下的文件不在 `/` 的列表里。这个内核里**根目录下的裸文件名在创建时落在 FAT32**（`vfs` 先试 FAT32），所以 `open("foo", O_CREAT)` 创建的文件在 Linux 的语义里就是 `/foo`，`ls /` 应该看到它；而 FAT32 没有任何目录读取路径。
+- 红灯：新增两项里"裸文件名创建的文件被列出一次且是 `DT_REG`"失败（`created 1, found 0`）；"unlink 后消失"第一次就绿（它是红灯同一原因的另一面，算回归保护）。
+- 修改：`fat32.rootEntryAt(skip)` 返回第 `skip` 个存活条目（跳过墓碑和 `unlink_pending` 的槽，名字在锁内拷出）；根目录虚拟尾部（`tmp`、`dev`、`proc` 之后）继续列 FAT32 条目，类型按 `is_dir` 取 `DT_DIR`/`DT_REG`，游标沿用 `ROOT_VIRTUAL_BASE` 范围。
+- 绿灯：hello255 共 8 项（实际运行计数）通过，根目录条目从 11 增加到 18；host 1072/1072（更新了一条因函数重写而过时的断言，不是放宽：新断言检查 `var dtype: u8 = 4; // DT_DIR` 和 FAT32 接线）。
+- 变异：把所有 FAT32 条目的类型报成 `DT_REG`，同时让 FAT32 枚举在 `k > 1000` 时才工作（两处真编译的改动一起做）→ FAT32 项失败（`found 0`）。**这两个变异是一起做的，所以这次没有单独证明"类型取自 `is_dir`"那一行**；FAT32 只有根目录文件（`is_dir` 本来就几乎总是假），类型分支没有运行时用例。
+- 未验证：①FAT32 的子目录条目（若有）以 `DT_DIR` 列出，但 FAT32 不支持带目录的路径，所以无法进入；②列表期间 FAT32 条目被创建或删除会让游标后的位置移位；③条目的 inode 号是占位值；④`d_off` 跨越 ext2 与虚拟范围的边界时 `seekdir` 到旧 `telldir` 的位置只在同一遍列表内有意义。
+
+## CI：hello237 G 在 591808f 的 SMP=1 上"回环对建立失败"，原因未知
+
+- 现象：`591808f`（只改了 `getdents` 的根目录列表，没有碰 TCP）的 smoke-qemu **SMP=1** 里 `hello237: FAIL G: a connected loopback pair could not be made`，是唯一的失败；SMP=2 没有跑到（job 在 SMP=1 失败后停止），host-tests 和 smoke-cross-arch 通过。同一个运行里 hello237 的其余 15 项（A–F、H–K2）全部通过，包括同样用 `make_pair` 的 A、C、D、E、E2、F。
+- 这是 `hello237` 的第 2 种偶发形态：此前 `339ea2a` 的 SMP=2 上 B 项的 `EPOLLET` 计数是 `1,1,0,1`（已让 `processIncomingData` 只对入环字节通知，是推测性的修复）；这次是 `make_pair` 本身失败，且失败码没有被打印（旧的 `make_pair` 只返回 -1）。
+- 我能说的：①`make_pair` 在这个运行里别处都成功，所以不是端口一次性被占（端口是 `port_next++` 逐个递增，G 用的是 18243 附近的新端口，仓库里没有别的测试使用）；②失败发生在 SMP=1，不是多核竞争；③和 `hello152` 的"make_pair 失败"（已确认是端口冲突，`bind` 的 `EADDRINUSE`）形状相同，但这里端口是独占的，所以**不能套用那个结论**。
+- 我做了什么（只加诊断，没有改内核）：`hello237` 的 `make_pair` 现在记录失败的步骤（1 socket、2 bind、3 listen、4 客户端 socket、5 connect、6 accept）和那一步的返回值，九处失败报告都改成打印 `make_pair failed at step N ... result R`；失败路径上还补了 `close`，原来会漏掉监听套接字。改动后 hello237 本地仍 16 项通过。下一次失败就能看到具体是哪一步、返回什么。
+- 没有做：没有复现（本地 SMP=1/2/8 冒烟多次都通过）；没有改 TCP。
+
+## 本地 SMP=8 冒烟里 hello227 B17 失败一次：没复现，加了诊断
+
+- 现象：对 hello255 的第二版内核跑完整 `qemu_smoke.sh 8` 时，`hello227: FAIL B: and 'wait' returned only after both slow jobs outside the table were done`，其余 hello227 的项都通过；同一份二进制的 SMP=1 和 SMP=2 冒烟通过。这条是 `hello233` 当作"慢后台任务"的 300 毫秒睡眠对比"`wait` 之后那行"的**输出顺序**断言（文件内容必须是 `x\nx\ny\n`）。
+- 复现：单独在 SMP=8 启动 hello227 两次，都通过；所以不是确定性的。失败时留下的串口日志里只有 PASS/FAIL 行，**文件当时的实际内容没有打印**，所以我不知道是 `y` 排到了某个 `x` 前面（`wait` 提前返回），还是文件里少了一行（某个慢任务没写到，例如被调度到 `wait` 返回之后的竞争），还是别的。
+- 我没有改 shell 或内核：没有证据说明是 `wait` 的实现错了；`hello233` 的 300 毫秒与 `wait` 返回之间是否有 `waitpid(-1)` 漏收的路径，我没有读到。已知的相关背景：这个断言在 `裸 wait 不再依赖作业表` 一节里是用变异（`wait` 什么都不做）验证过的，所以它**能**抓住真的 `wait` 缺陷；但那不排除 SMP=8 下的偶发竞争。
+- 只加了诊断：断言失败时，`hello227` 会多打印 `/tmp/h227_jobs held "..." (want "x\nx\ny\n")`，下次失败就能看到实际顺序。验证：临时让断言恒失败跑一次 SMP=1，打印出 `held "x\nx\ny\n"`（临时改动已撤回，`grep TEMPORARY` 为空，真正的断言恢复后 hello227 PASS）。

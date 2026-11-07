@@ -510,7 +510,21 @@ int main(int argc, char **argv, char **envp) {
     f = fopen("/tmp/h227_jobs", "r");
     if (f) { fread(jb2, 1, 15, f); fclose(f); }
     check(exited(st, 0), "B: a script with 18 background jobs on one line and a bare 'wait' ends with status 0");
-    check(strcmp(jb2, "x\nx\ny\n") == 0, "B: and 'wait' returned only after both slow jobs outside the table were done (their lines come before the line after 'wait')");
+    int order_ok = strcmp(jb2, "x\nx\ny\n") == 0;
+    check(order_ok, "B: and 'wait' returned only after both slow jobs outside the table were done (their lines come before the line after 'wait')");
+    if (!order_ok) {
+        /* What the file really held: x is a slow job finishing, y the line after 'wait'. */
+        char shown[32];
+        size_t k = 0;
+        for (size_t i = 0; jb2[i] && k + 2 < sizeof shown; i++) {
+            if (jb2[i] == '\n') { shown[k++] = '\\'; shown[k++] = 'n'; }
+            else shown[k++] = jb2[i];
+        }
+        shown[k] = 0;
+        char line[96];
+        snprintf(line, sizeof line, "hello227:   .. /tmp/h227_jobs held \"%s\" (want \"x\\nx\\ny\\n\")\n", shown);
+        fputs(line, stdout);
+    }
     unlink("/tmp/h227_jobscript");
     unlink("/tmp/h227_jobs");
 

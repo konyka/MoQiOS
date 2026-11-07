@@ -622,6 +622,32 @@ pub fn getFileCount() u32 {
     return file_count;
 }
 
+/// The `skip`-th live entry of the root directory (tombstoned and unlink-pending slots are not entries), as its name and whether it is a
+/// directory. Null past the last one. Names are copied out because the slot may be reused once the lock is released.
+pub const RootEntry = struct { name: [MAX_FILENAME]u8 = undefined, len: u16 = 0, is_dir: bool = false, size: u32 = 0 };
+
+pub fn rootEntryAt(skip: u32) ?RootEntry {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    var seen: u32 = 0;
+    var i: u32 = 0;
+    while (i < file_count) : (i += 1) {
+        const f = &files[i];
+        if (!f.active or f.unlink_pending or f.name_len == 0) continue;
+        if (seen == skip) {
+            var e: RootEntry = .{};
+            const n: usize = f.name_len;
+            @memcpy(e.name[0..n], f.name[0..n]);
+            e.len = @intCast(n);
+            e.is_dir = f.is_dir;
+            e.size = f.size;
+            return e;
+        }
+        seen += 1;
+    }
+    return null;
+}
+
 pub fn getFileName(idx: u32) ?[]const u8 {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);

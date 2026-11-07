@@ -194,22 +194,39 @@ const ROOT_VIRTUAL_BASE: u64 = 0x4000_0000;
 /// The mount points that hang off "/" and are not entries of the ext2 root. An ext2 entry with the same name would be listed twice.
 const root_virtual_names = [_][]const u8{ "tmp", "dev", "proc" };
 
-/// The tail of the root listing: tmp, dev and proc as directories.
+/// The tail of the root listing: tmp, dev and proc as directories, then the FAT32 volume's root entries (bare file names live there).
 fn getdents64RootVirtual(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i64 {
+    const fat32 = @import("fat32.zig");
     var kbuf: [4096]u8 = undefined;
     var written: u64 = 0;
     var emitted: u32 = 0;
     var k: u64 = desc.offset - ROOT_VIRTUAL_BASE;
-    while (k < root_virtual_names.len) : (k += 1) {
-        const name = root_virtual_names[@intCast(k)];
+    var exhausted = false;
+    while (true) : (k += 1) {
+        var name_buf: [256]u8 = undefined;
+        var name: []const u8 = undefined;
+        var dtype: u8 = 4; // DT_DIR
+        var ino: u64 = 0x7FFF_0000 + k;
+        if (k < root_virtual_names.len) {
+            name = root_virtual_names[@intCast(k)];
+        } else {
+            const fe = (if (fat32.isActive()) fat32.rootEntryAt(@intCast(k - root_virtual_names.len)) else null) orelse {
+                exhausted = true;
+                break;
+            };
+            @memcpy(name_buf[0..fe.len], fe.name[0..fe.len]);
+            name = name_buf[0..fe.len];
+            dtype = if (fe.is_dir) 4 else 8; // DT_DIR or DT_REG
+            ino = 0x7FFE_0000 + k;
+        }
         const reclen: u16 = @intCast(19 + name.len + 1);
         const padded_reclen: u16 = (reclen + 7) & ~@as(u16, 7);
         if (written + padded_reclen > @min(buf_size, 4096)) break;
         const base = @as(usize, @intCast(written));
-        bo.writeU64Le(kbuf[base .. base + 8], 0x7FFF_0000 + k);
+        bo.writeU64Le(kbuf[base .. base + 8], ino);
         bo.writeU64Le(kbuf[base + 8 .. base + 16], ROOT_VIRTUAL_BASE + k + 1);
         bo.writeU16Le(kbuf[base + 16 .. base + 18], padded_reclen);
-        kbuf[base + 18] = 4; // DT_DIR
+        kbuf[base + 18] = dtype;
         @memcpy(kbuf[base + 19 .. base + 19 + name.len], name);
         kbuf[base + 19 + name.len] = 0;
         var pad = base + 19 + name.len + 1;
@@ -217,7 +234,7 @@ fn getdents64RootVirtual(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: 
         written += padded_reclen;
         emitted += 1;
     }
-    if (emitted == 0) return if (k >= root_virtual_names.len) 0 else -22; // end of directory, or a buffer too small for one entry
+    if (emitted == 0) return if (exhausted) 0 else -22; // end of directory, or a buffer too small for one entry
     const n: usize = @intCast(written);
     if (copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..n], n) != n) return -14;
     desc.offset = ROOT_VIRTUAL_BASE + k;

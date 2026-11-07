@@ -11302,5 +11302,13 @@ test "the root directory lists tmp, dev and proc after its ext2 entries, on a cu
     try std.testing.expect(std.mem.indexOf(u8, gd, "const root_virtual_names = [_][]const u8{ \"tmp\", \"dev\", \"proc\" };") != null);
     try std.testing.expect(std.mem.indexOf(u8, gd, "const ROOT_VIRTUAL_BASE: u64 = 0x4000_0000;") != null);
     try std.testing.expect(std.mem.indexOf(u8, gd, "if (is_root and desc.offset >= ROOT_VIRTUAL_BASE) return getdents64RootVirtual(desc, buf_ptr, buf_size);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gd, "kbuf[base + 18] = 4; // DT_DIR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gd, "var dtype: u8 = 4; // DT_DIR") != null);
+}
+
+test "the root listing continues with the FAT32 volume's root entries after tmp, dev and proc" {
+    // hello255: a file created by a bare name lives on FAT32 and was missing from opendir("/").
+    try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "fat32.rootEntryAt(@intCast(k - root_virtual_names.len))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "dtype = if (fe.is_dir) 4 else 8; // DT_DIR or DT_REG") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.fat32_source, "pub fn rootEntryAt(skip: u32) ?RootEntry {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.fat32_source, "if (!f.active or f.unlink_pending or f.name_len == 0) continue;") != null);
 }
