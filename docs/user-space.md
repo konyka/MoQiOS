@@ -251,6 +251,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello253 | `/proc/self` 指调用者自己：`/proc/self/status` 能打开且其 `Pid` 行等于 `getpid()`、与按数字 pid 打开的同一文件一致；`/proc/self/cmdline` 能打开；`/proc/self` 下的未知文件、`/proc/selfx/status`、`/proc` 下的未知名字都返回 `-ENOENT`（原来返回 `-1`，即 `EPERM`）；`fork` 出的子进程里 `/proc/self` 是子进程自己，不是父进程；以 root 启动的探针里降到 uid 1000 的子进程读不了父进程的 `/proc/<pid>/maps`（`EACCES`），但能读它的 `status` 和自己的 `maps`（共 8 项） |
 | hello254 | `/proc` 作为目录（12 项）：`stat("/proc")` 和 `stat("/proc/<pid>")`、`stat("/proc/self")` 是目录，`stat("/proc/meminfo")` 是普通文件；`opendir("/proc")` 列出 `.`、`..`、各个文件（`DT_REG`）、`self`（`DT_LNK`）和每个存活进程的数字目录（`DT_DIR`，线程不单独列出）；`opendir("/proc/<pid>")` 列出 `status` 等；`opendir("/proc/meminfo")` 为 `ENOTDIR`；已回收进程没有 `/proc/<pid>`；`statfs("/proc")` 为 `PROC_SUPER_MAGIC` |
 | hello255 | 根目录列表（8 项）：`opendir("/")` 列出 `.`、`..`、ext2 的条目（含 `testdir`）以及 `tmp`、`dev`、`proc`（各一次，`DT_DIR`）和 FAT32 卷根目录里的文件（裸文件名创建的文件，`DT_REG`，`unlink` 后消失）；`rewinddir` 后第二遍列表与第一遍相同；从 `/` 出发的 `opendir(".")` 与 `/` 相同；`stat("/")` 是目录 |
+| hello256 | TCP 连接拆除（8 项，状态号取自 `TCP_INFO`，Linux 编号）：对端先关闭后本端是 `CLOSE_WAIT`（8）且读得 0；`CLOSE_WAIT` 的套接字仍占着端口（`bind` 为 `EADDRINUSE`），本端也关闭后端口释放；客户端 `SHUT_WR` 后客户端 `FIN_WAIT2`（5）、服务端 `CLOSE_WAIT`，半关闭的客户端仍能收到服务端发来的数据，`SHUT_WR` 之后写为 `EPIPE`（探针忽略 `SIGPIPE`，否则像 Linux 一样以状态 141 被杀）；服务端也 `SHUT_WR` 后两端读都是 0，客户端离开 `FIN_WAIT2`、服务端离开 `CLOSE_WAIT` |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。

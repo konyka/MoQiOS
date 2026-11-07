@@ -7195,3 +7195,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 复现：单独在 SMP=8 启动 hello227 两次，都通过；所以不是确定性的。失败时留下的串口日志里只有 PASS/FAIL 行，**文件当时的实际内容没有打印**，所以我不知道是 `y` 排到了某个 `x` 前面（`wait` 提前返回），还是文件里少了一行（某个慢任务没写到，例如被调度到 `wait` 返回之后的竞争），还是别的。
 - 我没有改 shell 或内核：没有证据说明是 `wait` 的实现错了；`hello233` 的 300 毫秒与 `wait` 返回之间是否有 `waitpid(-1)` 漏收的路径，我没有读到。已知的相关背景：这个断言在 `裸 wait 不再依赖作业表` 一节里是用变异（`wait` 什么都不做）验证过的，所以它**能**抓住真的 `wait` 缺陷；但那不排除 SMP=8 下的偶发竞争。
 - 只加了诊断：断言失败时，`hello227` 会多打印 `/tmp/h227_jobs held "..." (want "x\nx\ny\n")`，下次失败就能看到实际顺序。验证：临时让断言恒失败跑一次 SMP=1，打印出 `held "x\nx\ny\n"`（临时改动已撤回，`grep TEMPORARY` 为空，真正的断言恢复后 hello227 PASS）。
+
+## TCP 拆除：`CLOSE_WAIT`/`FIN_WAIT2` 的行为（hello256，回归保护，没有发现缺陷）
+
+- 起因：文档里反复列着"`closing`/`last_ack` 状态的 `tcpClose` 行为未验证"。先对宿主机 Linux 测了几种拆除顺序（用 `TCP_INFO` 读状态号：`FIN_WAIT2` 5、`TIME_WAIT` 6、`CLOSE` 7、`CLOSE_WAIT` 8）：对端先关闭后本端 `CLOSE_WAIT` 且读 0；`CLOSE_WAIT` 的套接字仍占着端口（`bind` → `EADDRINUSE`），本端也关闭后端口释放；客户端 `SHUT_WR` 后客户端 `FIN_WAIT2`、服务端 `CLOSE_WAIT`；两端都 `SHUT_WR` 后读都是 0。
+- 结果：hello256 共 8 项，**第一次运行除一个探针自己的问题外全部通过**。唯一的失败现象是进程以 `kill code=141` 被杀——那是探针在 `SHUT_WR` 之后写入触发了 `SIGPIPE`（我在宿主机上同样测到状态 141），不是内核缺陷；探针现在忽略 `SIGPIPE` 并断言写返回 `-EPIPE`。所以这一节**没有发现内核缺陷**，是回归保护。
+- 变异检查：第一个变异（`SHUT_WR` 对 `established` 和 `close_wait` 都不发 FIN）那次运行**作废了**——日志里没有 `hello256` 的结果行，因为遗留的 QEMU 与新运行冲突（见下），所以我**没有**得到这个变异的有效结果，也不声称它被抓住或存活。第二个变异（只让 `close_wait` 的 `SHUT_WR` 不发 FIN）**存活了**：C 项"两端读都是 0"仍通过，加的 `FIN_WAIT2` 检查也通过（客户端状态是 7）。原因：探针原来没有检查服务端本身的状态。加上服务端状态检查（`ss2 != 8`，即离开 `CLOSE_WAIT`）后，同一个变异被抓住（`client 7, server 8`），还原后通过。
+- 过程说明（如实）：①中途发现一个上一次 `one.sh` 遗留的 QEMU 进程仍在运行，抢占了磁盘镜像，那一次的结果作废，我杀掉它并重跑；②之后每次变异前后都核对了没有残留 QEMU；③`tcp.zig` 与 HEAD 相同（`git diff` 为空），所以这轮没有改内核。
+- 未验证：`closing`（双方同时关闭）和 `last_ack` 状态下 `close()` 的行为；同时关闭需要两端同一时刻发 FIN，回环上用 `netpoll` 的单线程探针构造不出来。`TIME_WAIT` 套接字的状态号也没有断言（探针只确认离开了 `FIN_WAIT2`）。
