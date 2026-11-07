@@ -11283,3 +11283,15 @@ test "statfs names pipefs, sockfs and anon_inode for pipes, sockets and event ob
     try std.testing.expect(std.mem.indexOf(u8, sc, ".tcp_socket, .udp_socket, .unix_socket, .raw_socket => .{ .magic = 0x534f434b,") != null);
     try std.testing.expect(std.mem.indexOf(u8, sc, ".epoll, .eventfd, .timerfd, .inotify, .pidfd => .{ .magic = 0x09041934,") != null);
 }
+
+test "procfs: /proc and /proc/<pid> are directories listed from the live task table" {
+    // hello254: stat("/proc") and opendir("/proc") failed; only individual files could be opened.
+    const pf = kt.procfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, pf, "root_dir,") != null and std.mem.indexOf(u8, pf, "pid_dir,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, "pub fn rootEntryAt(pos: u32) ?DirEntry {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, "e.set(\"self\", DT_LNK);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, "if (t.is_thread) continue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "fn getdents64Proc(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "str.eql(name, \"/proc\") or str.eql(name, \"/proc/\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "readGate(procfs.isDir(desc.proc_file_type))") != null);
+}

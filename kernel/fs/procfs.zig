@@ -22,7 +22,104 @@ pub const ProcFile = enum(u8) {
     irqwindow,
     /// Loopback queue counters: frames queued, delivered, dropped (queue full) and the queue's high-water mark.
     lostats,
+    /// The /proc directory itself and /proc/<pid> (also reached as /proc/self): directories, listed by getdents64.
+    root_dir,
+    pid_dir,
 };
+
+pub fn isDir(file: ProcFile) bool {
+    return file == .root_dir or file == .pid_dir;
+}
+
+/// One directory entry for getdents64: a name and its DT_* type.
+pub const DirEntry = struct {
+    name: [20]u8 = undefined,
+    len: u8 = 0,
+    dtype: u8 = 0,
+
+    fn set(self: *DirEntry, text: []const u8, dtype: u8) void {
+        @memcpy(self.name[0..text.len], text);
+        self.len = @intCast(text.len);
+        self.dtype = dtype;
+    }
+};
+
+const DT_DIR: u8 = 4;
+const DT_REG: u8 = 8;
+const DT_LNK: u8 = 10;
+
+/// The files /proc lists besides the per-process directories, in listing order.
+const root_files = [_][]const u8{ "meminfo", "cpuinfo", "uptime", "version", "loadavg", "filesystems", "stat", "sched_stats", "vma_stats", "irqtime", "irqwindow", "lostats" };
+/// What a /proc/<pid> directory lists.
+const pid_files = [_][]const u8{ "status", "maps", "stat", "cmdline", "rss" };
+
+/// The entry at position `pos` of /proc ("." and "..", the files, self, then one directory per live process), or null past the end. A
+/// thread is part of its process and is not listed on its own, as on Linux.
+pub fn rootEntryAt(pos: u32) ?DirEntry {
+    var e: DirEntry = .{};
+    if (pos == 0) {
+        e.set(".", DT_DIR);
+        return e;
+    }
+    if (pos == 1) {
+        e.set("..", DT_DIR);
+        return e;
+    }
+    const files: u32 = root_files.len;
+    if (pos - 2 < files) {
+        e.set(root_files[pos - 2], DT_REG);
+        return e;
+    }
+    if (pos - 2 == files) {
+        e.set("self", DT_LNK);
+        return e;
+    }
+    var want: u32 = pos - 3 - files;
+    const task_mod = @import("../proc/task.zig");
+    var i: u32 = 0;
+    while (i < task_mod.MAX_TASKS) : (i += 1) {
+        const t = task_mod.getTask(i) orelse continue;
+        if (t.is_thread) continue;
+        if (want > 0) {
+            want -= 1;
+            continue;
+        }
+        var digits: [12]u8 = undefined;
+        var n: usize = 0;
+        var v: u32 = t.tid;
+        if (v == 0) {
+            digits[0] = '0';
+            n = 1;
+        }
+        while (v > 0) : (v /= 10) {
+            digits[n] = '0' + @as(u8, @intCast(v % 10));
+            n += 1;
+        }
+        var out: [12]u8 = undefined;
+        for (0..n) |k| out[k] = digits[n - 1 - k];
+        e.set(out[0..n], DT_DIR);
+        return e;
+    }
+    return null;
+}
+
+/// The entry at position `pos` of /proc/<pid>, or null past the end.
+pub fn pidEntryAt(pos: u32) ?DirEntry {
+    var e: DirEntry = .{};
+    if (pos == 0) {
+        e.set(".", DT_DIR);
+        return e;
+    }
+    if (pos == 1) {
+        e.set("..", DT_DIR);
+        return e;
+    }
+    if (pos - 2 < pid_files.len) {
+        e.set(pid_files[pos - 2], DT_REG);
+        return e;
+    }
+    return null;
+}
 
 /// Files whose content is consumed by generating it (a read starts a new
 /// window). vfs.read must generate them only for the first read of a
@@ -54,6 +151,7 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
         .irqtime => generateIrqTime(buf, max_len),
         .irqwindow => generateIrqWindow(buf, max_len),
         .lostats => generateLoStats(buf, max_len),
+        .root_dir, .pid_dir => 0,
     };
 }
 

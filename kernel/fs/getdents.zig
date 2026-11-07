@@ -42,6 +42,12 @@ pub fn getdents64(fd: u32, buf_ptr: u64, buf_size: u64) i64 {
         return getdents64Tmpfs(desc, buf_ptr, buf_size, cur.euid, cur.egid, cur.effective_caps);
     }
 
+    // procfs directories (/proc and /proc/<pid>)
+    if (desc.fd_type == .proc_file) {
+        if (!@import("procfs.zig").isDir(desc.proc_file_type)) return -20; // ENOTDIR
+        return getdents64Proc(desc, buf_ptr, buf_size);
+    }
+
     // devfs directory (/dev)
     if (desc.fd_type == .devfs) {
         const devfs = @import("devfs.zig");
@@ -50,6 +56,44 @@ pub fn getdents64(fd: u32, buf_ptr: u64, buf_size: u64) i64 {
     }
 
     return -20; // ENOTDIR
+}
+
+/// List /proc or /proc/<pid>. The descriptor offset is the position in the listing (the entries are produced on demand from the live task
+/// table, so a process that starts or exits between two calls can shift later positions).
+fn getdents64Proc(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i64 {
+    const procfs = @import("procfs.zig");
+    var kbuf: [4096]u8 = undefined;
+    var written: u64 = 0;
+    var emitted: u32 = 0;
+    const start: u32 = policy.clampOffset(desc.offset);
+    var pos: u32 = start;
+    var exhausted = false;
+    while (true) : (pos += 1) {
+        const e = (if (desc.proc_file_type == .root_dir) procfs.rootEntryAt(pos) else procfs.pidEntryAt(pos)) orelse {
+            exhausted = true;
+            break;
+        };
+        const name_len: usize = e.len;
+        const reclen: u16 = @intCast(19 + name_len + 1);
+        const padded_reclen: u16 = (reclen + 7) & ~@as(u16, 7);
+        if (written + padded_reclen > @min(buf_size, 4096)) break;
+        const base = @as(usize, @intCast(written));
+        bo.writeU64Le(kbuf[base .. base + 8], 1);
+        bo.writeU64Le(kbuf[base + 8 .. base + 16], @as(u64, pos) + 1);
+        bo.writeU16Le(kbuf[base + 16 .. base + 18], padded_reclen);
+        kbuf[base + 18] = e.dtype;
+        @memcpy(kbuf[base + 19 .. base + 19 + name_len], e.name[0..name_len]);
+        kbuf[base + 19 + name_len] = 0;
+        var pad = base + 19 + name_len + 1;
+        while (pad < base + padded_reclen) : (pad += 1) kbuf[pad] = 0;
+        written += padded_reclen;
+        emitted += 1;
+    }
+    if (emitted == 0) return if (exhausted) 0 else -22; // end of directory, or a buffer too small for even one entry
+    const n: usize = @intCast(written);
+    if (copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..n], n) != n) return -14;
+    desc.offset = policy.nextOffset(start, emitted);
+    return @intCast(written);
 }
 
 /// Enumerate registered devfs nodes. The descriptor offset is simply the

@@ -7133,3 +7133,31 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：三项全部失败（`type 0xef53, blocks 1048576`）。修改：`writeStatfsFor` 加三个分支——`pipe_read`/`pipe_write`，`tcp_socket`/`udp_socket`/`unix_socket`/`raw_socket`，`epoll`/`eventfd`/`timerfd`/`inotify`/`pidfd`。
 - 绿灯：hello251 再加 3 项通过；host 加一条源码形状测试。变异：去掉 `tcp_socket` 那一项 → socket 项失败（`type 0xef53`），pipe 和 epoll 仍通过；还原后通过。
 - 未验证：只测了 TCP 套接字、pipe 的读端和 epoll；`udp`/`unix`/`raw`/`eventfd`/`timerfd`/`inotify`/`pidfd` 走同一个 `switch` 但没有各自的运行时用例；控制台（`special`）和 ramdisk 文件仍是写死数字。
+
+## /proc 目录（hello254，已修）
+
+- 起因：前两轮留下的未验证项"`/proc` 目录和 `/proc/self` 目录本身打不开"。宿主机 Linux 实测：`stat("/proc")` 是目录（0555），`stat("/proc/meminfo")` 是普通文件，`stat("/proc/<pid>")`、`stat("/proc/self")` 成功；`opendir("/proc")` 列出 `.`、`..`、各文件（`DT_REG`）、`self`（`DT_LNK`）和每个进程的数字目录（`DT_DIR`）；`opendir("/proc/meminfo")` 是 `ENOTDIR`。没有目录，`ls /proc`、`ps` 这类工具和 `opendir`/`readdir` 都用不了。
+- 红灯（修改前）：`stat("/proc")`、`stat("/proc/<pid>")`、`stat("/proc/self")` 均 -1，`opendir("/proc")` 打不开，`opendir("/proc/<pid>")` 打不开；两个本来就对的项是 `stat("/proc/meminfo")` 和 `opendir("/proc/meminfo")`（`ENOTDIR`）。
+- 修改：
+  - `procfs.zig` 新增 `root_dir`、`pid_dir` 两种 `ProcFile`，`isDir()`，以及按位置产生目录项的 `rootEntryAt`（`.`、`..`、12 个文件、`self`、再按任务表枚举每个存活**进程**的数字目录，线程不单列）和 `pidEntryAt`（`.`、`..`、`status`/`maps`/`stat`/`cmdline`/`rss`）。
+  - `vfs.zig` 打开 `/proc`、`/proc/`、`/proc/<pid>`、`/proc/self`（及带尾斜杠）得到目录描述符；`procDirPid` 在任务表里确认进程存在（已回收的进程没有目录）；两条 `read` 路径对目录返回 `EISDIR`。
+  - `dir_ops.zig` 的 `descriptorKind` 把这类描述符报成目录，所以 `stat`/`fstat`/`statx` 给出目录模式；`getdents.zig` 新增 `getdents64Proc`，游标是列表中的位置，缓冲区放不下一项时 `EINVAL`，列表结束返回 0。
+- 绿灯：hello254 共 12 项（实际运行计数）全部通过；host 1070/1070（加一条源码形状测试）。红灯那次运行有 11 项，其中 2 项本来就对（`stat("/proc/meminfo")`、`opendir("/proc/meminfo")` 的 `ENOTDIR`）；后加的"已回收进程没有目录"和"`statfs("/proc")`"两项第一次就绿（前面改动的自然结果，算回归保护）。
+- 变异：`self` 条目改名为 `selfx`（真编译）→ "列出 self 为 DT_LNK" 失败（`found 0`），其余通过；还原后通过。
+- 未验证：①目录项的 inode 号恒为 1，`d_off` 是位置加 1；②进程在两次 `getdents` 之间启动或退出会让后面的位置移位（Linux 的 `/proc` 也有类似的竞争，但这里没有锁任务表）；③`/proc/<pid>` 目录列出的文件只有这个内核实现的五个，没有 `fd`、`exe`、`task`、`environ` 等；④权限：`/proc` 目录的 `stat` 模式是通用的 0444（`fd_stat_policy` 对目录的默认），Linux 是 0555，没有改；⑤线程自己的 id 打不开（`/proc/<tid>`）。
+
+## CI：hello174 C 组"排空"在 07ab4f0 的 SMP=2 又失败一次——这次是**完全停滞**，不是慢速
+
+- 现象：`07ab4f0`（只改了 `fstatfs` 的类型映射，没有碰 TCP）的 smoke-qemu SMP=2 里 `hello174: FAIL C: reading drains everything that was accepted within 10 s, and the window reopens`，是唯一的失败；host-tests 和 smoke-cross-arch 通过。我加在 CI 里的"失败时打印串口日志"那一步（`b234cc4`）这次起了作用，留下了失败现场。
+- **现场数据（与之前记录的所有样本都不同）**：
+  - `drain_got=34464`，`drain_total_plus_1=81919`，`drain_elapsed_ms=10022`，**`drain_stalled_for_ms=9016`**；
+  - 每秒累计已读：第 0 秒 33016，第 1 秒 34464，**第 2 到第 10 秒全部是 34464**——只多读了一个段（1448 字节）就**一个字节都没再收到**，持续约 9 秒；
+  - `drain_reads=11`，`drain_empty_reads=406`；接收方 `FIONREAD=0`（已经读空），发送方 `TIOCOUTQ=47455`（还压着 47 KB）；
+  - 回环队列：`queued=2182 delivered=2182 dropped=0 high_water=10 depth=16`，没有丢帧。
+- 与旧样本对比：之前"发送节拍被低速率估计锁死"那一次（`drain_got=55232`，`stalled` 不长，平均约 5.5 kB/s）是**持续慢速**，已用 `pacedRate` 下限加固；这一次是**突然完全停住**，接收方窗口是开的（缓冲区已读空），发送方有数据，但 9 秒没有任何数据到达。节拍下限解释不了完全停滞：下限只会让发送更快，不会让它停。
+- 我推断的候选（**都没有验证**，只作线索）：
+  1. 发送方陷入零窗口，而恢复靠持续探测（首次 2 s，之后 4 s、8 s…）：第一次探测的 ACK 应当带回非零窗口并立刻恢复，所以单纯的"窗口更新丢失"不足以解释 9 秒；
+  2. 接收方对"超出已通告窗口"的段只收下一部分，剩余部分靠发送方重传（RTO 退避：200 ms、400 ms、800 ms、1.6 s、3.2 s，累计约 6 s）才能补上——这条与"只多读一个段然后停住"形状吻合，但我没有看到重传计数；
+  3. 发送方的下一次发送只由 ACK 到达、应用写入或定时器触发，而某个状态下这三者都没有——例如发送被 cwnd/节拍/PRR 挡住且没有定时器会再次唤醒 `flushSendBuffer`。
+- 做了什么：**只记录，没有改内核。** 没有能区分上面三条的数据，凭推测改 TCP 重传/窗口逻辑的风险大于收益。下一步最有价值的是让 `hello174` 在这条断言失败时多打印发送方的 TCP 状态（`snd_wnd`、`cwnd`、`rto`、`persist_rto_ms`、重传计数、是否 `in_recovery`），这需要内核提供一个只读的查询（例如 `TCP_INFO` 的 `getsockopt`，或 `/proc/net/tcp` 一类），目前这个内核没有。
+- 如实说明：①文档里记录过这条断言在 CI 上失败（`883739d` 那次，以及上面"CI 上出现的 hello174 偶发失败"一段，两处可能是同一次，我没有核对），所以这至少是又一次，**不是**我能给出准确次数的事；本地定向复现（上面记录的 16 次以上）从未命中，所以无法用"修复前失败、修复后通过"证明任何改动；这次现场是目前唯一一个显示**完全停滞**的样本；②这一轮的提交与这次失败无关（`07ab4f0` 只改 `fstatfs` 的类型映射）。

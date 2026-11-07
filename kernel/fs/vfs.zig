@@ -1094,6 +1094,20 @@ pub const FdTable = struct {
             return result;
         }
 
+        // The /proc directory itself.
+        if (str.eql(name, "/proc") or str.eql(name, "/proc/")) {
+            self.fds[slot] = .{
+                .fd_type = .proc_file,
+                .offset = 0,
+                .inode_id = 0x4000_0000_0000_0000 + @as(u64, @intFromEnum(@import("procfs.zig").ProcFile.root_dir)),
+                .proc_file_type = .root_dir,
+                .proc_pid = 0,
+                .status_flags = status,
+            };
+            self.publishFd(slot);
+            return @intCast(slot);
+        }
+
         // ---- procfs paths ----
         if (name.len > 6 and name[0] == '/' and name[1] == 'p' and name[2] == 'r' and
             name[3] == 'o' and name[4] == 'c' and name[5] == '/')
@@ -1127,6 +1141,10 @@ pub const FdTable = struct {
                 pfile = .irqwindow;
             } else if (rest.len == 7 and str.eql(rest, "lostats")) {
                 pfile = .lostats;
+            } else if (procDirPid(rest)) |dir_pid| {
+                // /proc/<pid>, /proc/<pid>/ and /proc/self: the process's directory.
+                pfile = .pid_dir;
+                pid = dir_pid;
             } else if (rest.len > 0) {
                 // /proc/[pid]/status or /proc/[pid]/maps
                 var digit_end: usize = 0;
@@ -1351,6 +1369,31 @@ pub const FdTable = struct {
         return ext2_errno; // ENOENT, or the errno the ext2 lookup reported (ENOTDIR, ELOOP, ...)
     }
 
+    /// The pid a "/proc/<pid>", "/proc/<pid>/" or "/proc/self" name stands for, or null when the name is not one of those or no such process
+    /// exists (a thread is part of its process: its own id is not a directory).
+    fn procDirPid(rest: []const u8) ?u32 {
+        var body = rest;
+        if (body.len > 1 and body[body.len - 1] == '/') body = body[0 .. body.len - 1];
+        var pid: u32 = 0;
+        if (str.eql(body, "self")) {
+            pid = @intCast(@max(@import("../proc/process_mgmt.zig").getpid(), 0));
+        } else {
+            if (body.len == 0) return null;
+            for (body) |c| {
+                if (c < '0' or c > '9') return null;
+            }
+            pid = parseU32(body) orelse return null;
+        }
+        const task_mod = @import("../proc/task.zig");
+        var i: u32 = 0;
+        while (i < task_mod.MAX_TASKS) : (i += 1) {
+            if (task_mod.getTask(i)) |t| {
+                if (t.tid == pid and !t.is_thread) return pid;
+            }
+        }
+        return null;
+    }
+
     // Parse a proc task ID without wrapping it onto another task.
     fn parseU32(s: []const u8) ?u32 {
         var v: u32 = 0;
@@ -1504,6 +1547,7 @@ pub const FdTable = struct {
             },
             .proc_file => {
                 const procfs = @import("procfs.zig");
+                if (@import("namespace_policy.zig").readGate(procfs.isDir(desc.proc_file_type)) != 0) return -21; // EISDIR
                 var scratch: [4096]u8 = undefined;
                 const generated = if (procfs.consumesOnRead(desc.proc_file_type) and desc.offset != 0) 0 else procfs.procRead(desc.proc_file_type, desc.proc_pid, &scratch, 4096);
                 if (desc.offset >= generated) return 0;
@@ -1770,6 +1814,7 @@ pub const FdTable = struct {
             },
             .proc_file => {
                 const procfs = @import("procfs.zig");
+                if (@import("namespace_policy.zig").readGate(procfs.isDir(desc.proc_file_type)) != 0) return -21; // EISDIR
                 var scratch: [4096]u8 = undefined;
                 const generated = if (procfs.consumesOnRead(desc.proc_file_type) and desc.offset != 0) 0 else procfs.procRead(desc.proc_file_type, desc.proc_pid, &scratch, 4096);
                 if (offset >= generated) return 0;

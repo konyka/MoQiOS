@@ -36,6 +36,7 @@ pub fn descriptorKind(d: *const vfs_mod.FileDescriptor) @import("fd_stat_policy.
         .tcp_socket, .udp_socket, .unix_socket, .raw_socket => .socket,
         .eventfd, .epoll, .timerfd, .inotify, .pidfd, .devfs_ctrl => .anon,
         .devfs => if (d.devfs_idx == @import("devfs.zig").DIR_IDX) .directory else .char_device,
+        .proc_file => if (@import("procfs.zig").isDir(d.proc_file_type)) .directory else .regular,
         else => .regular,
     };
 }
