@@ -84,7 +84,7 @@ static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_CAPSET_   307
 #define SYS_SETGROUPS 488
 #define KEEP          0xFFFFFFFFull
-#define CAP_SETUID_BIT (1u << 5)
+#define CAP_SETUID_BIT (1u << 7)
 #define CAP_SETGID_BIT (1u << 6)
 
 static void print(const char *s) {

@@ -125,6 +125,7 @@ pub const cred_policy = @import("proc/cred_policy.zig");
 pub const group_policy = @import("proc/group_policy.zig");
 pub const prctl_policy = @import("proc/prctl_policy.zig");
 pub const comm_policy = @import("proc/comm_policy.zig");
+pub const cap_abi = @import("proc/cap_abi.zig");
 pub const syslog_policy = @import("proc/syslog_policy.zig");
 pub const memfd_policy = @import("fs/memfd_policy.zig");
 pub const rename_policy = @import("fs/rename_policy.zig");
@@ -341,6 +342,7 @@ test {
     _ = @import("fs/slot_bitmap.zig");
     _ = @import("fs/procfs_policy.zig");
     _ = @import("fs/pid_status.zig");
+    _ = @import("proc/cap_abi.zig");
     _ = @import("fs/readlink_policy.zig");
     _ = @import("proc/close_range_policy.zig");
     _ = @import("proc/move_pages_policy.zig");

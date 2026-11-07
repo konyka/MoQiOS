@@ -11420,3 +11420,17 @@ test "mount targets and the directories above them share one length limit (MOUNT
     try std.testing.expect(std.mem.indexOf(u8, v, "target: [MOUNT_TARGET_MAX]u8 = @splat(0),") != null);
     try std.testing.expect(std.mem.indexOf(u8, v, "if (target.len > MOUNT_TARGET_MAX or source.len > 64") != null);
 }
+
+test "capget/capset speak Linux's header versions and capability numbers, and status shows the Cap* sets" {
+    // hello260: capget returned the kernel's internal bit order (CAP_SETUID at bit 5, which is CAP_KILL on Linux), ignored the header version and
+    // returned success for an unknown one; capset likewise; status had no Cap lines.
+    const se = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, se, "const words = abi.wordsFor(version) orelse {") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, se, "bo.writeU32Le(hdr[0..4], abi.V3);"));
+    try std.testing.expect(std.mem.indexOf(u8, se, "if (target_pid < 0) return -22; // EINVAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "const bytes = words * 12;\n        if (copy.copyToUser(@ptrFromInt(data_ptr), cap_data[0..bytes], bytes) != bytes) return -14;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "cur.permitted_caps = abi.decode(new_per, old_per_flags);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".cap_eff = cap_abi.encode(tt.effective_caps),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".cap_bnd = cap_abi.BOUNDING,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.pid_status_source, "o.str(\"\\nCapAmb:\\t0000000000000000\\n\");") != null);
+}

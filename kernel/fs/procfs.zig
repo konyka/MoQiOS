@@ -225,6 +225,7 @@ fn generateUptime(buf: [*]u8, max_len: u32) u32 {
 fn generatePidStatus(pid: u32, buf: [*]u8, max_len: u32) u32 {
     const task_mod = @import("../proc/task.zig");
     const ps = @import("pid_status.zig");
+    const cap_abi = @import("../proc/cap_abi.zig");
     var name: [16]u8 = undefined;
     var groups: [@import("../proc/group_policy.zig").NGROUPS_MAX]u32 = undefined;
     var st: ps.Status = undefined;
@@ -271,6 +272,10 @@ fn generatePidStatus(pid: u32, buf: [*]u8, max_len: u32) u32 {
         .groups = groups[0..ng],
         .threads = threads,
         .no_new_privs = tt.no_new_privs,
+        .cap_inh = cap_abi.encode(tt.inheritable_caps),
+        .cap_prm = cap_abi.encode(tt.permitted_caps),
+        .cap_eff = cap_abi.encode(tt.effective_caps),
+        .cap_bnd = cap_abi.BOUNDING,
     };
     task_mod.unlockTask(flags);
     st.name = name[0..@import("../proc/comm_policy.zig").textLen(&name)];

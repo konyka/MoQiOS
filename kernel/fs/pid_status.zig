@@ -1,6 +1,6 @@
 //! The text of /proc/<pid>/status. Linux (measured with gcc probes) prints one "Key:\tvalue" line per field in a fixed order: Name, Umask
 //! (four octal digits), State, Tgid, Ngid, Pid, PPid, TracerPid, Uid and Gid (real, effective, saved and filesystem id, tab separated),
-//! FDSize, Groups (every group followed by a space), Threads and NoNewPrivs. A runnable process is "R (running)", a blocked one
+//! FDSize, Groups (every group followed by a space), Threads, NoNewPrivs and the capability sets CapInh, CapPrm, CapEff, CapBnd and CapAmb (16 hex digits each). A runnable process is "R (running)", a blocked one
 //! "S (sleeping)", a stopped one "T (stopped)" and one that exited but was not waited for "Z (zombie)".
 const std = @import("std");
 
@@ -51,6 +51,11 @@ pub const Status = struct {
     groups: []const u32,
     threads: u32,
     no_new_privs: bool,
+    /// Capability sets as Linux bitmasks (proc/cap_abi.zig).
+    cap_inh: u64,
+    cap_prm: u64,
+    cap_eff: u64,
+    cap_bnd: u64,
 };
 
 const Out = struct {
@@ -96,6 +101,14 @@ const Out = struct {
         self.str(tmp[i..]);
     }
 
+    fn hex16(self: *Out, value: u64) void {
+        var i: u6 = 60;
+        while (true) : (i -= 4) {
+            self.char("0123456789abcdef"[@intCast((value >> i) & 0xf)]);
+            if (i == 0) break;
+        }
+    }
+
     fn ids(self: *Out, v: [4]u32) void {
         for (v, 0..) |id, k| {
             if (k != 0) self.char('\t');
@@ -134,7 +147,15 @@ pub fn render(buf: [*]u8, max_len: u32, s: Status) u32 {
     o.dec(s.threads);
     o.str("\nNoNewPrivs:\t");
     o.char(if (s.no_new_privs) '1' else '0');
-    o.char('\n');
+    o.str("\nCapInh:\t");
+    o.hex16(s.cap_inh);
+    o.str("\nCapPrm:\t");
+    o.hex16(s.cap_prm);
+    o.str("\nCapEff:\t");
+    o.hex16(s.cap_eff);
+    o.str("\nCapBnd:\t");
+    o.hex16(s.cap_bnd);
+    o.str("\nCapAmb:\t0000000000000000\n");
     return o.pos;
 }
 
@@ -152,6 +173,10 @@ fn sample() Status {
         .groups = &.{ 10, 1000 },
         .threads = 1,
         .no_new_privs = false,
+        .cap_inh = 0x0000000800000000,
+        .cap_prm = 0xc0,
+        .cap_eff = 0x80,
+        .cap_bnd = 0x1ffffffffff,
     };
 }
 
@@ -160,7 +185,8 @@ test "status text: every field in Linux order, tab separated" {
     const n = render(&buf, buf.len, sample());
     try std.testing.expectEqualStrings(
         "Name:\tcat\nUmask:\t0022\nState:\tR (running)\nTgid:\t42\nNgid:\t0\nPid:\t42\nPPid:\t7\nTracerPid:\t0\n" ++
-            "Uid:\t1000\t1001\t1002\t1001\nGid:\t1000\t1000\t1000\t1000\nFDSize:\t64\nGroups:\t10 1000 \nThreads:\t1\nNoNewPrivs:\t0\n",
+            "Uid:\t1000\t1001\t1002\t1001\nGid:\t1000\t1000\t1000\t1000\nFDSize:\t64\nGroups:\t10 1000 \nThreads:\t1\nNoNewPrivs:\t0\n" ++
+            "CapInh:\t0000000800000000\nCapPrm:\t00000000000000c0\nCapEff:\t0000000000000080\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n",
         buf[0..n],
     );
 }
@@ -183,7 +209,7 @@ test "status text: umask is four octal digits, groups may be none, a thread has 
     s.no_new_privs = true;
     n = render(&buf, buf.len, s);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "Tgid:\t42\nNgid:\t0\nPid:\t43\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "Groups:\t\nThreads:\t2\nNoNewPrivs:\t1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "Groups:\t\nThreads:\t2\nNoNewPrivs:\t1\nCapInh:") != null);
 }
 
 test "status text: the output is cut at the buffer size and never overruns it" {

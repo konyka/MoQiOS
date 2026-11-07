@@ -5576,79 +5576,87 @@ fn syscallKcmp(pid1: u32, pid2: u32, kcmp_type: u32, idx1: u64, idx2: u64) i64 {
     }
 }
 
-/// capget(hdr_ptr, data_ptr) — get process capabilities.
-/// struct __user_cap_header_struct { u32 version; u32 pid; }
-/// struct __user_cap_data_struct[2] { u32 effective; u32 permitted; u32 inheritable; } × 2
+/// capget(hdr_ptr, data_ptr) — get process capabilities, in Linux's numbering and header-version layout (proc/cap_abi.zig).
+/// struct __user_cap_header_struct { u32 version; i32 pid; }
+/// struct __user_cap_data_struct { u32 effective; u32 permitted; u32 inheritable; } — one for V1, two (low, high words) for V2 and V3.
 fn syscallCapget(hdr_ptr: u64, data_ptr: u64) i64 {
     const copy = @import("../../mm/copy_from_user.zig");
     const bo = @import("../../lib/byte_order.zig");
     const sched_local = @import("../../proc/sched.zig");
+    const abi = @import("../../proc/cap_abi.zig");
 
-    // Read header (version + pid)
     var hdr: [8]u8 = undefined;
-    if (hdr_ptr != 0) {
-        const copied = copy.copyFromUser(&hdr, @ptrFromInt(hdr_ptr), 8);
-        if (copied != 8) return -14;
-    }
-    const target_pid: u32 = if (hdr_ptr != 0)
-        (@as(u32, hdr[4]) | (@as(u32, hdr[5]) << 8) | (@as(u32, hdr[6]) << 16) | (@as(u32, hdr[7]) << 24))
-    else
-        0;
+    if (hdr_ptr == 0 or copy.copyFromUser(&hdr, @ptrFromInt(hdr_ptr), 8) != 8) return -14; // EFAULT
+    const version = bo.readU32Le(hdr[0..4]);
+    const words = abi.wordsFor(version) orelse {
+        // An unknown version is EINVAL, and the preferred one is written back so the caller can retry; with no data pointer that is the
+        // "probe" and it succeeds.
+        bo.writeU32Le(hdr[0..4], abi.V3);
+        if (copy.copyToUser(@ptrFromInt(hdr_ptr), &hdr, 4) != 4) return -14;
+        return if (data_ptr == 0) 0 else -22;
+    };
+    const target_pid: i32 = @bitCast(bo.readU32Le(hdr[4..8]));
+    if (target_pid < 0) return -22; // EINVAL
 
-    // Resolve target task: pid==0 means "current".
     var target_idx: u32 = 0;
     if (target_pid == 0) {
         target_idx = sched_local.currentTaskIndex() orelse return -3; // ESRCH
     } else {
-        target_idx = task_mod_caps.findTaskByTid(target_pid) orelse return -3; // ESRCH
+        target_idx = task_mod_caps.findTaskByTid(@intCast(target_pid)) orelse return -3; // ESRCH
     }
     const t = task_mod_caps.getTask(target_idx) orelse return -3;
 
     if (data_ptr != 0) {
-        var cap_data: [24]u8 = undefined;
-        const eff: u32 = @bitCast(t.effective_caps);
-        const per: u32 = @bitCast(t.permitted_caps);
-        const inh: u32 = @bitCast(t.inheritable_caps);
-        bo.writeU32Le(cap_data[0..4], eff);
-        bo.writeU32Le(cap_data[4..8], per);
-        bo.writeU32Le(cap_data[8..12], inh);
-        // Second 32-bit set (caps 32-63): unused.
-        @memset(cap_data[12..24], 0);
-        const written = copy.copyToUser(@ptrFromInt(data_ptr), &cap_data, 24);
-        if (written != 24) return -14;
+        const eff = abi.encode(t.effective_caps);
+        const per = abi.encode(t.permitted_caps);
+        const inh = abi.encode(t.inheritable_caps);
+        var cap_data: [24]u8 = @splat(0);
+        bo.writeU32Le(cap_data[0..4], abi.low(eff));
+        bo.writeU32Le(cap_data[4..8], abi.low(per));
+        bo.writeU32Le(cap_data[8..12], abi.low(inh));
+        bo.writeU32Le(cap_data[12..16], abi.high(eff));
+        bo.writeU32Le(cap_data[16..20], abi.high(per));
+        bo.writeU32Le(cap_data[20..24], abi.high(inh));
+        const bytes = words * 12;
+        if (copy.copyToUser(@ptrFromInt(data_ptr), cap_data[0..bytes], bytes) != bytes) return -14;
     }
     return 0;
 }
 
 /// capset(hdr_ptr, data_ptr) — set process capabilities.
-/// Enforces the POSIX rule: new effective \subseteq new permitted \subseteq old permitted.
-/// Only the calling process (pid==0 or pid==self) may have its caps modified.
+/// Enforces the POSIX rule: new effective \subseteq new permitted \subseteq old permitted. Only the calling process (pid==0 or pid==self)
+/// may have its capabilities modified. A V1 header carries one 32-bit set (the high words are zero).
 fn syscallCapset(hdr_ptr: u64, data_ptr: u64) i64 {
     const copy = @import("../../mm/copy_from_user.zig");
     const bo = @import("../../lib/byte_order.zig");
     const sched_local = @import("../../proc/sched.zig");
+    const abi = @import("../../proc/cap_abi.zig");
 
     var hdr: [8]u8 = undefined;
-    if (hdr_ptr == 0) return -14;
-    const hcopied = copy.copyFromUser(&hdr, @ptrFromInt(hdr_ptr), 8);
-    if (hcopied != 8) return -14;
-    const target_pid: u32 = (@as(u32, hdr[4]) | (@as(u32, hdr[5]) << 8) | (@as(u32, hdr[6]) << 16) | (@as(u32, hdr[7]) << 24));
+    if (hdr_ptr == 0 or copy.copyFromUser(&hdr, @ptrFromInt(hdr_ptr), 8) != 8) return -14;
+    const version = bo.readU32Le(hdr[0..4]);
+    const words = abi.wordsFor(version) orelse {
+        bo.writeU32Le(hdr[0..4], abi.V3);
+        if (copy.copyToUser(@ptrFromInt(hdr_ptr), &hdr, 4) != 4) return -14;
+        return -22;
+    };
+    const target_pid: i32 = @bitCast(bo.readU32Le(hdr[4..8]));
 
     const cur_idx = sched_local.currentTaskIndex() orelse return -1;
     const cur = task_mod_caps.getTask(cur_idx) orelse return -1;
-    if (target_pid != 0 and target_pid != cur.tid) return -1; // EPERM — cannot set other tasks
+    if (target_pid != 0 and (target_pid < 0 or @as(u32, @intCast(target_pid)) != cur.tid)) return -1; // EPERM — cannot set other tasks
 
     if (data_ptr == 0) return -14;
-    var cap_data: [24]u8 = undefined;
-    const dcopied = copy.copyFromUser(&cap_data, @ptrFromInt(data_ptr), 24);
-    if (dcopied != 24) return -14;
-    const new_eff: u32 = bo.readU32Le(cap_data[0..4]);
-    const new_per: u32 = bo.readU32Le(cap_data[4..8]);
-    const new_inh: u32 = bo.readU32Le(cap_data[8..12]);
+    var cap_data: [24]u8 = @splat(0);
+    const bytes = words * 12;
+    if (copy.copyFromUser(cap_data[0..bytes], @ptrFromInt(data_ptr), bytes) != bytes) return -14;
+    const new_eff = @as(u64, bo.readU32Le(cap_data[0..4])) | (@as(u64, bo.readU32Le(cap_data[12..16])) << 32);
+    const new_per = @as(u64, bo.readU32Le(cap_data[4..8])) | (@as(u64, bo.readU32Le(cap_data[16..20])) << 32);
+    const new_inh = @as(u64, bo.readU32Le(cap_data[8..12])) | (@as(u64, bo.readU32Le(cap_data[20..24])) << 32);
 
-    const old_per: u32 = @bitCast(cur.permitted_caps);
-    const old_inh: u32 = @bitCast(cur.inheritable_caps);
-
+    // What the caller holds now, in Linux numbers. A capability the kernel does not model can never be requested.
+    const old_per = abi.encode(cur.permitted_caps);
+    const old_inh = abi.encode(cur.inheritable_caps);
     // Cannot grant what we don't already have in permitted.
     if ((new_per & ~old_per) != 0) return -1; // EPERM
     // Effective must be a subset of new permitted.
@@ -5656,9 +5664,11 @@ fn syscallCapset(hdr_ptr: u64, data_ptr: u64) i64 {
     // Inheritable must be a subset of (old_per | old_inh).
     if ((new_inh & ~(old_per | old_inh)) != 0) return -1; // EPERM
 
-    cur.permitted_caps = @bitCast(new_per);
-    cur.effective_caps = @bitCast(new_eff);
-    cur.inheritable_caps = @bitCast(new_inh);
+    const old_per_flags = cur.permitted_caps;
+    const old_inh_flags = cur.inheritable_caps;
+    cur.permitted_caps = abi.decode(new_per, old_per_flags);
+    cur.effective_caps = abi.decode(new_eff, old_per_flags);
+    cur.inheritable_caps = abi.decode(new_inh, abi.union_(old_per_flags, old_inh_flags));
     return 0;
 }
 

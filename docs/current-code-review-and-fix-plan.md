@@ -7290,3 +7290,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 代价（如实）：`FileDescriptor` 每个多 64 字节，一共 64 张表 × 64 个描述符，内核映像大了约 0.26 MB（31065816 与 30795336 字节之差）。
 - 绿灯：K2 的 10 项通过，hello114 现在 324 项（实际运行计数）全部通过；host 1089/1089。变异：把打开时的上限改回 64（真编译）→ 两个祖先的"opens and lists"和"fstat"共 4 项失败，其余通过；还原后通过。
 - 局限：①挂载表里的 `target` 本来就是 128 字节，没有变；②超过 128 字节的路径本身无法作为挂载目标（`ENAMETOOLONG`），这和 Linux 的 4096 不同；③没有测深度更大的祖先链或同一祖先下多个挂载。
+
+### `capget`/`capset` 用内核内部的位序、忽略头部版本；status 没有 `Cap*` 行（hello260，已修）
+
+- 宿主机 Linux 实测（gcc 探针）：能力用 Linux 编号（CAP_CHOWN 0、CAP_KILL 5、CAP_SETGID 6、CAP_SETUID 7、CAP_NET_RAW 13、CAP_SYS_ADMIN 21…）；头部版本决定数据大小（V1 一组 12 字节，V2/V3 两组，V1 不碰高位字）；未知版本是 `EINVAL`，并把首选版本 V3 写回头部，数据指针为 NULL 时这是"探测"，返回 0；负 pid 对 `capget` 是 `EINVAL`，不存在的 pid 是 `ESRCH`；头部为 NULL 是 `EFAULT`；`capset` 对别的进程（含 pid -1）是 `EPERM`，要求没有持有的能力是 `EPERM`；`/proc/<pid>/status` 有 `CapInh`/`CapPrm`/`CapEff`/`CapBnd`/`CapAmb`，各 16 位十六进制。
+- 红灯：hello260 第一次对旧内核运行，29 项里 16 项失败、13 项通过。`capget` 把 CAP_SETUID 报在第 5 位（Linux 的 CAP_KILL），未知版本返回 0 且不回写头部，V1 也写两组，负 pid 得 `ESRCH` 而不是 `EINVAL`，NULL 头部返回 0，高位字里的能力不被拒绝；status 完全没有 `Cap*` 行。
+- 修改：新增纯函数模块 `kernel/proc/cap_abi.zig`（`encode`/`decode`/`wordsFor`/`BOUNDING`，宿主机测试 4 条）把内核的 `SysCap` 标志映射到 Linux 编号；`syscallCapget`/`syscallCapset` 按头部版本读写字数，未知版本回写 V3，`capset` 的"不能要没有的能力"检查改在 Linux 编号上做；`pid_status.zig` 输出 `Cap*` 五行；`procfs` 填入真实值。`CapBnd` 恒为 `000001ffffffffff`（内核没有 bounding set，这是 Linux 未裁剪时的值），`CapAmb` 恒为 0（没有 ambient 能力）。
+- 受影响的旧用例：hello115 的 `CAP_SETUID_BIT` 写死了内部位序（1<<5，即 Linux 的 CAP_KILL），改为 `1<<7`；hello198/199/200 只用 `capset` 丢弃全部能力，不受影响。
+- **一个内部细节**：`cap_sys_mount` 是内核对 Linux `CAP_SYS_ADMIN` 的拆分（mount 需要 CAP_SYS_ADMIN），所以和 `cap_sys_admin` 一样报第 21 位。反向（`capset` 写回第 21 位）时 `decode` 只恢复调用者**已经持有**的那些标志，所以只持有 mount 标志的进程不能靠写回把它变成 `cap_sys_admin`。该规则有宿主机单元测试，没有运行时用例。
+- 绿灯：hello260 29 项（实际运行计数）通过；host 1094/1094。变异检查三次（真编译、行为改变）：①把 `cap_setuid` 的编号从 7 改成 8 → A、B（CapEff/CapPrm）、K 共 6 项失败；②让 V1 也写两组 → 只有 D 失败；③第一次试这条变异时我写了越界的 `words * 12 + 12`，内核直接 panic（`index out of bounds: index 36, len 24`）——那是我的变异写错，不是内核缺陷，已换成合法的 `bytes = 24`；均已还原。
+- 如实的局限：①`capset` 对 `inheritable` 的规则沿用原来的"新 inheritable ⊆ 旧 permitted ∪ 旧 inheritable"，没有 Linux 的 `CAP_SETPCAP` 分支；②内核没有的能力（`CAP_SETPCAP`、`CAP_FSETID`、`CAP_DAC_READ_SEARCH`、`CAP_SYS_CHROOT` 等）既不会报告也不能被请求，所以 `CapBnd` 里它们的位看起来"可用"但 `capset` 要它们会得到 `EPERM`；③ambient、`prctl(PR_CAPBSET_*)` 和文件能力（`security.capability`）仍不存在；④`capget` 对别的进程的读取不检查权限（Linux 也不检查）。
