@@ -7300,3 +7300,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - **一个内部细节**：`cap_sys_mount` 是内核对 Linux `CAP_SYS_ADMIN` 的拆分（mount 需要 CAP_SYS_ADMIN），所以和 `cap_sys_admin` 一样报第 21 位。反向（`capset` 写回第 21 位）时 `decode` 只恢复调用者**已经持有**的那些标志，所以只持有 mount 标志的进程不能靠写回把它变成 `cap_sys_admin`。该规则有宿主机单元测试，没有运行时用例。
 - 绿灯：hello260 29 项（实际运行计数）通过；host 1094/1094。变异检查三次（真编译、行为改变）：①把 `cap_setuid` 的编号从 7 改成 8 → A、B（CapEff/CapPrm）、K 共 6 项失败；②让 V1 也写两组 → 只有 D 失败；③第一次试这条变异时我写了越界的 `words * 12 + 12`，内核直接 panic（`index out of bounds: index 36, len 24`）——那是我的变异写错，不是内核缺陷，已换成合法的 `bytes = 24`；均已还原。
 - 如实的局限：①`capset` 对 `inheritable` 的规则沿用原来的"新 inheritable ⊆ 旧 permitted ∪ 旧 inheritable"，没有 Linux 的 `CAP_SETPCAP` 分支；②内核没有的能力（`CAP_SETPCAP`、`CAP_FSETID`、`CAP_DAC_READ_SEARCH`、`CAP_SYS_CHROOT` 等）既不会报告也不能被请求，所以 `CapBnd` 里它们的位看起来"可用"但 `capset` 要它们会得到 `EPERM`；③ambient、`prctl(PR_CAPBSET_*)` 和文件能力（`security.capability`）仍不存在；④`capget` 对别的进程的读取不检查权限（Linux 也不检查）。
+
+### 给已停止的进程发 SIGTERM 立刻杀死它（hello261，已修）
+
+- 宿主机 Linux 实测（gcc 探针，`/tmp/stp.c`）：①带 handler 的 `SIGTSTP` 发给睡眠中的进程，handler 运行、阻塞的 `read` 得到 `EINTR`，进程不会停止；②被屏蔽或被忽略的 `SIGTSTP` 让睡眠者继续睡（`S`）；③`SIGTERM` 发给**已停止**的进程，它仍是 `T`，信号保持 pending，`SIGCONT` 之后默认动作才生效（进程以信号 15 死亡），有 handler 时 `SIGCONT` 之后 handler 才运行、`read` 得到 `EINTR`；④只有 `SIGKILL` 会立刻结束已停止的进程。
+- 红灯：hello261 第一次对当前内核运行，8 项里 4 项失败：`SIGTERM` 发给停止的进程后它立刻变成 `Z`（`sendSignalInfo` 和进程组广播里都有"致命信号先解除停止态"），带 handler 的版本里 handler 在 `SIGCONT` 之前就已运行（早到的报告），之后的 `SIGCONT` 检查读不到。A 项（带 handler 的 `SIGTSTP`）一开始也失败，但那是我的用例按 glibc 的习惯检查 `errno == EINTR`，而本 libc 的 `read` 直接返回 `-EINTR`、不设 `errno`；改为检查返回值 `-EINTR` 后通过，不是内核问题。
+- 修改：`signal.zig` 里两处"`defaultAction == .terminate` 且已停止则清除停止"改为只对 `SIGKILL`。`SIGCONT` 原本就立即继续；其它信号保持 pending，由 `continueTask` 的唤醒路径在继续后投递。
+- 绿灯：hello261 8 项（实际运行计数）通过；host 见门禁。变异（真编译）：把条件改回"任何致命信号"→ D、F 共 3 项失败，其余通过；还原后通过。
+- 如实的局限：①进程组广播（`kill(-pgid)`、终端产生的 `SIGINT`/`SIGHUP`）走另一份代码（`sendSignalToPgrpFiltered`），本次同步改了它的条件但没有为它单独写运行用例；孤儿进程组的 `SIGHUP`+`SIGCONT` 路径（hello58）靠它们自己的 `continueTask` 工作，门禁里 hello58 通过；②`SIGINT` 等从键盘送给**前台停止**进程组的信号，现在也要等 `SIGCONT`，与 Linux 一致，但没有用终端测试；③`SIGSTOP` 发给已停止的进程、`SIGTTIN`/`SIGTTOU` 的停止语义没有新用例。

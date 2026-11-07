@@ -11434,3 +11434,10 @@ test "capget/capset speak Linux's header versions and capability numbers, and st
     try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".cap_bnd = cap_abi.BOUNDING,") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.pid_status_source, "o.str(\"\\nCapAmb:\\t0000000000000000\\n\");") != null);
 }
+
+test "only SIGKILL takes a task out of the stopped state at once; other fatal or handled signals wait for SIGCONT" {
+    // hello261: SIGTERM sent to a stopped process cleared the stop and killed it on the spot; on Linux it stays T until SIGCONT.
+    const sg = kt.signal_source;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, sg, "if (signum == SIGKILL and t.stopped) t.stopped = false;"));
+    try std.testing.expect(std.mem.indexOf(u8, sg, "defaultAction(signum) == .terminate and t.stopped") == null);
+}

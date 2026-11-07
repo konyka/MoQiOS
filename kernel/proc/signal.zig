@@ -127,9 +127,10 @@ pub fn sendSignalInfo(target_tid: u32, signum: u32, info: siginfo.Info) bool {
         const t = task.getTask(@intCast(i)) orelse continue;
         if (t.tid == target_tid and t.state != .zombie) {
             // POSIX: SIGCONT 立即继续（阻塞/忽略亦生效），pending 位照置以便
-            // handler 在恢复后投递；致命信号必须先解除停止态否则杀不死。
+            // handler 在恢复后投递。Only SIGKILL (and SIGCONT) act on a stopped task at once; any other signal, fatal or handled, stays pending
+            // until SIGCONT (Linux, measured: SIGTERM leaves a stopped process in T, then it dies or runs its handler after the continue).
             if (signum == SIGCONT) continueTask(t);
-            if (defaultAction(signum) == .terminate and t.stopped) t.stopped = false;
+            if (signum == SIGKILL and t.stopped) t.stopped = false;
             t.sig_info[signum - 1] = info;
             // A default stop reaches a task that is asleep right away: a blocked task would otherwise stay in its wait (a stop signal is
             // not "actionable" for kickIfBlocked) and only stop once something woke it. The bit is not left pending, or the SIGCONT wake
@@ -235,8 +236,8 @@ pub fn sendSignalToPgrpFiltered(pgid: u16, signum: u32, sender: ?*task.Task) u32
             },
             else => {
                 _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
-                // 致命信号必须能终止已停止的任务：先解除停止态再唤醒。
-                if (defaultAction(signum) == .terminate and t.stopped) t.stopped = false;
+                // Only SIGKILL ends a stopped task at once; the rest wait for SIGCONT (see sendSignalInfo).
+                if (signum == SIGKILL and t.stopped) t.stopped = false;
                 kickIfBlocked(@intCast(i));
             },
         }
