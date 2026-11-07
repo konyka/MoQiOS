@@ -46,6 +46,7 @@ pub fn getdents64(fd: u32, buf_ptr: u64, buf_size: u64) i64 {
     if (desc.fd_type == .proc_file) {
         if (!@import("procfs.zig").isDir(desc.proc_file_type)) return -20; // ENOTDIR
         if (desc.proc_file_type == .mount_dir) return getdents64MountDir(desc, buf_ptr, buf_size);
+        if (desc.proc_file_type == .fd_dir) return getdents64FdDir(desc, buf_ptr, buf_size);
         return getdents64Proc(desc, buf_ptr, buf_size);
     }
 
@@ -57,6 +58,88 @@ pub fn getdents64(fd: u32, buf_ptr: u64, buf_size: u64) i64 {
     }
 
     return -20; // ENOTDIR
+}
+
+/// List /proc/<pid>/fd: "." and "..", then the number of each open descriptor of the process, in order. The descriptor table is read live,
+/// so a descriptor opened or closed between two calls shifts the positions after it.
+fn getdents64FdDir(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i64 {
+    var kbuf: [4096]u8 = undefined;
+    var written: u64 = 0;
+    var emitted: u32 = 0;
+    const start: u32 = policy.clampOffset(desc.offset);
+    var pos: u32 = start;
+    var exhausted = false;
+    // The target process's descriptor table (a thread shares its process's table).
+    var target: ?*task_mod.Task = null;
+    var ti: u32 = 0;
+    while (ti < task_mod.MAX_TASKS) : (ti += 1) {
+        if (task_mod.getTask(ti)) |t| {
+            if (t.tid == desc.proc_pid and !t.is_thread) {
+                target = t;
+                break;
+            }
+        }
+    }
+    while (true) : (pos += 1) {
+        var num_buf: [12]u8 = undefined;
+        var name: []const u8 = undefined;
+        if (pos == 0) {
+            name = ".";
+        } else if (pos == 1) {
+            name = "..";
+        } else {
+            // The (pos - 2)-th open descriptor.
+            var want: u32 = pos - 2;
+            var found: ?u32 = null;
+            if (target) |t| {
+                var fdn: u32 = 0;
+                while (fdn < vfs_mod.MAX_FDS) : (fdn += 1) {
+                    if (t.fd_table.fds[fdn].fd_type == .none) continue;
+                    if (want == 0) {
+                        found = fdn;
+                        break;
+                    }
+                    want -= 1;
+                }
+            }
+            const fdn = found orelse {
+                exhausted = true;
+                break;
+            };
+            var digits: [12]u8 = undefined;
+            var n: usize = 0;
+            var v: u32 = fdn;
+            if (v == 0) {
+                digits[0] = '0';
+                n = 1;
+            }
+            while (v > 0) : (v /= 10) {
+                digits[n] = '0' + @as(u8, @intCast(v % 10));
+                n += 1;
+            }
+            for (0..n) |k| num_buf[k] = digits[n - 1 - k];
+            name = num_buf[0..n];
+        }
+        const reclen: u16 = @intCast(19 + name.len + 1);
+        const padded_reclen: u16 = (reclen + 7) & ~@as(u16, 7);
+        if (written + padded_reclen > @min(buf_size, 4096)) break;
+        const base = @as(usize, @intCast(written));
+        bo.writeU64Le(kbuf[base .. base + 8], 0x7FFB_0000 + pos);
+        bo.writeU64Le(kbuf[base + 8 .. base + 16], @as(u64, pos) + 1);
+        bo.writeU16Le(kbuf[base + 16 .. base + 18], padded_reclen);
+        kbuf[base + 18] = if (pos < 2) 4 else 10; // DT_DIR for the dot entries, DT_LNK for a descriptor (they are symlinks on Linux)
+        @memcpy(kbuf[base + 19 .. base + 19 + name.len], name);
+        kbuf[base + 19 + name.len] = 0;
+        var pad = base + 19 + name.len + 1;
+        while (pad < base + padded_reclen) : (pad += 1) kbuf[pad] = 0;
+        written += padded_reclen;
+        emitted += 1;
+    }
+    if (emitted == 0) return if (exhausted) 0 else -22;
+    const n: usize = @intCast(written);
+    if (copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..n], n) != n) return -14;
+    desc.offset = policy.nextOffset(start, emitted);
+    return @intCast(written);
 }
 
 /// List a directory that exists only above mount points: "." and "..", then the one-level-down name of each mount below it.

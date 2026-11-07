@@ -12,6 +12,7 @@ static inline int64_t syscall3(uint64_t n, uint64_t a, uint64_t b, uint64_t c) {
 #define O_RDONLY 0
 #define EFAULT 14
 #define EINVAL 22
+#define ENOENT 2
 
 static void print(const char *s) { uint64_t n=0; while(s[n]) n++; syscall3(SYS_WRITE,1,(uint64_t)s,n); }
 static int check(int ok,const char *s){if(!ok){print("hello86: FAIL ");print(s);print("\n");return 1;}return 0;}
@@ -46,8 +47,9 @@ void _start(void) {
     failures += check(syscall3(SYS_READLINK, (uint64_t)fd_path, (uint64_t)target, 0) == -EFAULT,
                       "readlink zero bufsiz returns EFAULT");
     char invalid_fd[] = "/proc/self/fd/63";
-    failures += check(syscall3(SYS_READLINK, (uint64_t)invalid_fd, (uint64_t)target, sizeof(target)) == -EINVAL,
-                      "readlink invalid fd returns EINVAL");
+    /* Measured on Linux: a number that is not an open descriptor is ENOENT (EINVAL was this kernel's old answer). */
+    failures += check(syscall3(SYS_READLINK, (uint64_t)invalid_fd, (uint64_t)target, sizeof(target)) == -ENOENT,
+                      "readlink invalid fd returns ENOENT");
 
     if (!failures) print("hello86: PASS\nhello86 done\n");
     else print("hello86: FAIL\nhello86 done\n");

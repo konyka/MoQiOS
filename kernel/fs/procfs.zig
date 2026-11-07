@@ -1,6 +1,8 @@
 /// procfs — virtual filesystem providing process and system information.
 ///
 /// Dynamically generates content for /proc files on each read.
+const std = @import("std");
+
 pub const ProcFile = enum(u8) {
     meminfo,
     cpuinfo,
@@ -28,10 +30,12 @@ pub const ProcFile = enum(u8) {
     /// A directory that exists only because volumes are mounted below it (for example /mnt for a volume at /mnt/e). It has no storage of
     /// its own; the descriptor keeps its path and getdents64 lists the mount points one level below.
     mount_dir,
+    /// /proc/self/fd (or /proc/<pid>/fd): one entry per open descriptor of the process, named by its number.
+    fd_dir,
 };
 
 pub fn isDir(file: ProcFile) bool {
-    return file == .root_dir or file == .pid_dir or file == .mount_dir;
+    return file == .root_dir or file == .pid_dir or file == .mount_dir or file == .fd_dir;
 }
 
 /// One directory entry for getdents64: a name and its DT_* type.
@@ -54,7 +58,7 @@ const DT_LNK: u8 = 10;
 /// The files /proc lists besides the per-process directories, in listing order.
 const root_files = [_][]const u8{ "meminfo", "cpuinfo", "uptime", "version", "loadavg", "filesystems", "stat", "sched_stats", "vma_stats", "irqtime", "irqwindow", "lostats" };
 /// What a /proc/<pid> directory lists.
-const pid_files = [_][]const u8{ "status", "maps", "stat", "cmdline", "rss" };
+const pid_files = [_][]const u8{ "status", "maps", "stat", "cmdline", "rss", "fd" };
 
 /// The entry at position `pos` of /proc ("." and "..", the files, self, then one directory per live process), or null past the end. A
 /// thread is part of its process and is not listed on its own, as on Linux.
@@ -118,7 +122,8 @@ pub fn pidEntryAt(pos: u32) ?DirEntry {
         return e;
     }
     if (pos - 2 < pid_files.len) {
-        e.set(pid_files[pos - 2], DT_REG);
+        const name = pid_files[pos - 2];
+        e.set(name, if (std.mem.eql(u8, name, "fd")) DT_DIR else DT_REG);
         return e;
     }
     return null;
@@ -154,7 +159,7 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
         .irqtime => generateIrqTime(buf, max_len),
         .irqwindow => generateIrqWindow(buf, max_len),
         .lostats => generateLoStats(buf, max_len),
-        .root_dir, .pid_dir, .mount_dir => 0,
+        .root_dir, .pid_dir, .mount_dir, .fd_dir => 0,
     };
 }
 

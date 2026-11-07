@@ -8393,8 +8393,9 @@ test "the ramdisk file-count limit leaves room to grow" {
     const k_pos = std.mem.indexOf(u8, rd, "pub const MAX_FILES: u32 = ").?;
     const k_end = std.mem.indexOfScalarPos(u8, rd, k_pos, ';').?;
     const kernel_limit = try std.fmt.parseInt(u32, rd[k_pos + "pub const MAX_FILES: u32 = ".len .. k_end], 10);
-    // 121+ programs are packed today; a limit with no headroom stops the next test program.
-    try std.testing.expect(kernel_limit >= 256);
+    // About 250 programs are packed today and the limit was reached once already (the 257th probe could not be packed); a limit with no
+    // headroom stops the next test program.
+    try std.testing.expect(kernel_limit >= 512);
 }
 
 test "namespace errno policy: unlink, rmdir, mkdir and open on an existing object" {
@@ -11271,7 +11272,7 @@ test "procfs: /proc/self is the caller's pid and every procfs miss is ENOENT" {
 test "procfs: another user's maps needs ptrace access and the open path enforces it" {
     // hello253: any process could read any other process's /proc/<pid>/maps (its memory layout).
     const src = kt.vfs_source;
-    try std.testing.expect(std.mem.indexOf(u8, src, "if (pfile == .pid_maps) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (pfile == .pid_maps or pfile == .fd_dir) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "@import(\"procfs_policy.zig\").pidFile(true, same_user, effective_caps.cap_sys_ptrace) == .deny") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "return -13; // EACCES") != null);
 }
@@ -11323,4 +11324,16 @@ test "directories above mount points exist and list the mount points one level d
     try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "if (desc.proc_file_type == .mount_dir) return getdents64MountDir(desc, buf_ptr, buf_size);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "vfs_mod.mountChildAt(\"/\", mount_index, &name_buf)") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, "mount_dir,") != null);
+}
+
+test "/proc/self/fd: readlink reports what each descriptor is open on, and the directory lists the open descriptors" {
+    // hello257: readlink returned the words "file"/"pipe"/"socket" and a closed number was EINVAL; /proc/self/fd could not be listed.
+    const rl = kt.readlink_source;
+    try std.testing.expect(std.mem.indexOf(u8, rl, "readlink_policy.numberedLink(\"pipe\", d.pipe_idx, &text)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rl, "readlink_policy.numberedLink(\"socket\", d.tcb_idx, &text)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rl, "tmpfsEntryPath(d.tmpfs_idx, &text)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rl, "t.fd_table.fds[fd_val].fd_type == .none) return -2; // ENOENT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "fn getdents64FdDir(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "str.eql(file_part, \"fd\") or str.eql(file_part, \"fd/\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "if (pfile == .pid_maps or pfile == .fd_dir) {") != null);
 }

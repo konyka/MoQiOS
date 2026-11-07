@@ -869,12 +869,26 @@ pub fn tmpfsGetSize(idx: Idx) u32 {
 /// Absolute path ("/tmp/a/b") of the tmpfs directory `idx`, for a directory
 /// descriptor used as an *at() dirfd or by fchdir. ENOTDIR for a file,
 /// ENOENT once the directory (or an ancestor) has been removed.
-pub fn tmpfsDirPath(idx: u32, out: *[256]u8) union(enum) { ok: []const u8, err: i64 } {
+pub const PathResult = union(enum) { ok: []const u8, err: i64 };
+
+pub fn tmpfsDirPath(idx: u32, out: *[256]u8) PathResult {
+    if (idx >= MAX_FILES) return .{ .err = -9 };
+    {
+        const state_held = tmpfs_lock.acquire();
+        defer tmpfs_lock.release(state_held);
+        if (!entries[idx].active or entries[idx].deleted) return .{ .err = -2 };
+        if (!entries[idx].is_dir) return .{ .err = -20 };
+    }
+    return tmpfsEntryPath(idx, out);
+}
+
+/// Absolute path ("/tmp/a/b") of any live tmpfs entry, file or directory, for /proc/self/fd/N. ENOENT once the entry (or an ancestor) was
+/// unlinked (Linux appends " (deleted)"; this reports the entry as gone instead).
+pub fn tmpfsEntryPath(idx: u32, out: *[256]u8) PathResult {
     if (idx >= MAX_FILES) return .{ .err = -9 };
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
     if (!entries[idx].active or entries[idx].deleted) return .{ .err = -2 };
-    if (!entries[idx].is_dir) return .{ .err = -20 };
     var chain: [MAX_FILES]Idx = undefined;
     var depth: usize = 0;
     var cur: Idx = @intCast(idx);

@@ -1177,7 +1177,9 @@ pub const FdTable = struct {
                         };
                     }
                     const file_part = rest[digit_end + 1 ..];
-                    if (str.eql(file_part, "status")) {
+                    if (str.eql(file_part, "fd") or str.eql(file_part, "fd/")) {
+                        pfile = .fd_dir;
+                    } else if (str.eql(file_part, "status")) {
                         pfile = .pid_status;
                     } else if (str.eql(file_part, "maps")) {
                         pfile = .pid_maps;
@@ -1200,8 +1202,9 @@ pub const FdTable = struct {
                 return -2; // ENOENT
             }
 
-            // The memory map of another user's process needs ptrace access to it (EACCES otherwise); see procfs_policy.zig.
-            if (pfile == .pid_maps) {
+            // The memory map and the descriptor table of another user's process need ptrace access to it (EACCES otherwise); see
+            // procfs_policy.zig.
+            if (pfile == .pid_maps or pfile == .fd_dir) {
                 const task_mod = @import("../proc/task.zig");
                 var same_user = false;
                 var i: u32 = 0;

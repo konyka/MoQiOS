@@ -23,7 +23,7 @@ else
     bad "packer limit '$script_limit' differs from the kernel's '$kernel_limit'"
 fi
 if [ "${kernel_limit:-0}" -ge 256 ]; then
-    ok "the limit leaves headroom beyond the current ~130 programs"
+    ok "the limit leaves headroom beyond the current ~250 programs"
 else
     bad "limit $kernel_limit leaves no headroom"
 fi

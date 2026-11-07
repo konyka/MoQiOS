@@ -281,6 +281,7 @@ pub const dac = @import("fs/dac.zig");
 pub const statx_source = @embedFile("fs/statx.zig");
 pub const tmpfs_source = @embedFile("fs/tmpfs.zig");
 pub const getdents_source = @embedFile("fs/getdents.zig");
+pub const readlink_source = @embedFile("fs/readlink.zig");
 pub const syscall_entry_source = @embedFile("arch/x86_64/syscall_entry.zig");
 pub const idt_source = @embedFile("arch/x86_64/idt.zig");
 pub const moqi_syscalls_header = @embedFile("moqi_syscalls_header");
@@ -334,6 +335,7 @@ test {
     _ = @import("proc/sched_getaffinity_policy.zig");
     _ = @import("fs/slot_bitmap.zig");
     _ = @import("fs/procfs_policy.zig");
+    _ = @import("fs/readlink_policy.zig");
     _ = @import("proc/close_range_policy.zig");
     _ = @import("proc/move_pages_policy.zig");
     _ = @import("proc/time_set_policy.zig");

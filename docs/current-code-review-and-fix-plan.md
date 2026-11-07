@@ -7216,3 +7216,17 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：`hello114`（C 段新增 2 项，其余原有检查不受影响）通过；`hello255` 仍通过；host 1074/1074。变异：让 `mountChildAt` 只列第一个子项（真编译）→ `/mnt lists ... e and n` 失败，其余通过；还原后通过。
 - 过程说明（如实）：①我的 `hello255` 源码形状测试钉住了刚被我重写的 FAT32 调用文本，需要同步更新（更新后断言的是同一意图，不是放宽）；②第一版用 `open(/mnt)` 的返回值直接排查（`returned 2`），确认了根因在打开路径而不是列表。
 - 未验证：①`stat("/mnt")` 对这类目录得到的模式是 `fd_stat_policy` 的目录默认值，没有单独测；②`mount_dir` 描述符的路径最长 64 字节，更深的挂载点祖先打不开（返回 `ENOENT`）；③卸载后 `/mnt` 随之消失（因为每次都按挂载表现算），没有测；④hello114 的 H/K 段里的非法挂载不会留下祖先，没有逐一核对。
+
+## /proc/self/fd：`readlink` 的内容、错误码和目录（hello257，已修）
+
+- 起因：上几轮的"下一轮候选"里一直挂着 `/proc/self/fd`。宿主机 Linux 实测：`readlink("/proc/self/fd/N")` 对文件给绝对路径，管道给 `pipe:[inode]`，套接字 `socket:[inode]`，epoll/eventfd/timerfd 给 `anon_inode:[eventpoll]` 等；不是打开描述符的数字是 `ENOENT`；`opendir("/proc/self/fd")` 列出 `.`、`..` 和每个打开描述符的编号。
+- 红灯（修改前）：`readlink` 只返回**类型词**——文件 `"file"`、管道 `"pipe"`、套接字 `"socket"`；不是打开描述符的数字返回 `EINVAL`（Linux 是 `ENOENT`）；`opendir("/proc/self/fd")` 打不开。只有 epoll 的文本本来就对，"关闭后读不到"本来就是失败（-1）。
+- 修改：
+  - 纯函数 `readlink_policy.numberedLink`（`pipe:[n]`、`socket:[n]`，缓冲区放不下返回空）和 `anonLink`，各有 host 测试；
+  - `readlink.zig` 的 `/proc/self/fd/N` 改按描述符类型给出真实目标：tmpfs 文件走新的 `tmpfsEntryPath`（`tmpfsDirPath` 改为检查目录后调用它，两份路径拼接合成一份），ext2 文件取打开时的路径并补前导 `/`，管道和套接字用对象编号（两个管道不同、同一管道两端相同——测试里直接断言了这一点），event 类对象用固定的 `anon_inode:[...]`，`/dev` 节点给 `/dev/<名字>`；数字不是打开描述符返回 `ENOENT`；
+  - `procfs` 新增 `fd_dir`：`open("/proc/self/fd")`、`/proc/<pid>/fd` 得到目录描述符，`getdents64FdDir` 列出目标进程的打开描述符编号（`DT_LNK`，Linux 里它们是符号链接）；`/proc/<pid>` 目录里也出现 `fd`；对别的用户的进程，`fd` 目录和 `maps` 一样需要 ptrace 权限（`EACCES`）。
+- **一个意外的阻塞（如实）**：写好 hello257 并接入后，`mkramdisk.sh` 报 `Error: too many files (257 > 256)`——**ramdisk 的 256 个文件上限已经用满**，第 257 个探针打不进镜像。这个上限同时写在 `kernel/fs/ramdisk.zig` 和 `tools/mkramdisk.sh` 里（之前有一个测试守着两者一致），文档里 128→256 那次改动之后又用到了头。我把两处都改为 512，更新守卫测试 `tools/tests/test_mkramdisk.sh`（4 项通过）和 host 测试（要求上限 ≥ 512）。这是**在内核里只是一个健全性边界**（镜像里的索引本身在 blob 里），改大的成本是每个文件 80 字节镜像。启动后确认：镜像 58 MB，`Ramdisk initialized`，hello257 照常启动。
+- 绿灯：hello257 共 10 项（实际运行计数）通过（含后加的"两个管道编号不同、同一管道两端相同"，它第一次就绿，是对编号取自对象索引的回归保护）；host 1076/1076（中途两处失败：`readlink_policy.zig` 里的新内联测试没登记进 `host_test.zig`，被仓库自己的守卫抓到；以及我前一个 `maps` 形状测试里的那行因为加了 `.fd_dir` 要同步）。
+- **一个已有探针被我改坏了（如实）**：完整冒烟 SMP=2 报 `hello86: FAIL readlink invalid fd returns EINVAL`。hello86 一直断言"不是打开描述符的数字 → `EINVAL`"，而宿主机 Linux 的答案是 `ENOENT`；我按 Linux 改了内核，所以把 hello86 的期望改成 `ENOENT`（探针头部加了一行说明）。顺带测了 Linux 对其它名字的答案：`/proc/self/fd/abc`、`/proc/self/fd/-1`、`/proc/self/fd/99999999999` 都是 `ENOENT`，只有空名字是 `EINVAL`；内核照此改了（非数字开头和超出范围的数字都返回 `ENOENT`），hello257 加了一项断言这三种名字。这是**改变了既有行为并改了既有测试**，不是内核回归：被改的断言本来就与 Linux 不一致。
+- 变异：把 TCP 套接字的文本改成 `pipe:[...]`（真编译）→ "套接字读回 socket:[inode]" 失败（`"pipe:[0]"`），其余通过；还原后通过。
+- 未验证：①管道和套接字的编号是**内核里的数组下标**，不是 Linux 那样的 inode 号，数字本身没有意义，只保证"同一对象相同、不同对象不同"，管道槽位复用后编号会重复；②`open("/proc/self/fd/N")`（重新打开同一个文件）没有做，`stat` 这些路径也没有；③被 `unlink` 的 tmpfs 文件读回 `ENOENT`，Linux 是路径加 ` (deleted)`；④ext2 的路径取的是**打开时的名字**，文件被 `rename` 之后仍是旧名字（目录描述符那边是按 inode 重建的，文件这边没有）；⑤只测了自己的进程，别的用户进程的 `fd` 目录的 `EACCES` 没有单独用例（共用 `maps` 的策略，策略有单元测试）。
