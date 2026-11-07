@@ -11250,3 +11250,10 @@ test "ext2 directories are not limited to twelve blocks" {
     try std.testing.expect(std.mem.indexOf(u8, src, "if (dir_inode.block[12] != 0) _ = freeSingleIndirectTree(dir_inode.block[12], ptrs_per_block);") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "if (dir_inode.block[12] != 0 or dir_inode.block[13] != 0 or dir_inode.block[14] != 0) return false;") == null);
 }
+
+test "statfs answers /proc with PROC_SUPER_MAGIC and /dev with TMPFS_MAGIC instead of the ext2 fallback" {
+    // hello251: statfs of a /proc file or a device node used to report ext2 (0xEF53) with a made-up 4 GiB disk.
+    const sc = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, sc, ".proc_file => .{ .magic = 0x9fa0, .block_size = 4096, .name_max = 255, .rdonly = false },") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sc, ".devfs, .devfs_ctrl => .{ .magic = 0x01021994, .block_size = 4096, .name_max = 255, .rdonly = false },") != null);
+}

@@ -79,12 +79,26 @@ static void run(const char *label, const char *path, const char *missing, int di
     }
 }
 
+/* /proc and /dev are not disk filesystems (this kernel opens the /proc files, not the /proc directory, so the file is what is asked). Measured on Linux: /proc is type 0x9fa0 (PROC_SUPER_MAGIC) with no blocks and no inodes, name max 255;
+ * /dev is a devtmpfs, which reports TMPFS_MAGIC. Neither is the ext2 the kernel used to claim for every path. */
+static void run_virtual(void) {
+    char what[200];
+    struct statfs p, d;
+    long r = do_statfs("/proc/meminfo", &p);
+    snprintf(what, sizeof what, "proc: statfs reports PROC_SUPER_MAGIC 0x9fa0 with no blocks or inodes (rc %ld, type 0x%lx, blocks %lu, files %lu)", r, (unsigned long)p.f_type, p.f_blocks, p.f_files);
+    check(r == 0 && p.f_type == 0x9fa0 && p.f_blocks == 0 && p.f_bfree == 0 && p.f_files == 0 && p.f_ffree == 0 && p.f_namelen == 255, what);
+    r = do_statfs("/dev/null", &d);
+    snprintf(what, sizeof what, "dev: statfs reports a tmpfs-type devtmpfs, not ext2 (rc %ld, type 0x%lx)", r, (unsigned long)d.f_type);
+    check(r == 0 && d.f_type == 0x01021994, what);
+}
+
 int main(int argc, char **argv, char **envp) {
     (void)argc; (void)argv; (void)envp;
     print("hello251: statfs / fstatfs per filesystem\n");
     run("tmpfs", "/tmp/h251t", "/tmp/h251-missing", 1, 0x01021994UL, 1, 60);
     run("FAT32", "h251f", "h251-missing", 0, 0x4d44UL, 0, 255);
     run("ext2", "testdir/h251e", "testdir/h251-missing", 1, 0xEF53UL, 1, 255);
+    run_virtual();
     print(failures == 0 ? "hello251: PASS\n" : "hello251: FAIL\n");
     return failures;
 }

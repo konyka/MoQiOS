@@ -4759,8 +4759,8 @@ fn syscallFstatfs(fd: u32, buf_ptr: u64) i64 {
     return writeStatfsFor(d.fd_type, buf_ptr);
 }
 
-/// Statistics of the filesystem a descriptor of type `kind` lives on. Descriptors that do not belong to a disk filesystem (devices, /proc,
-/// pipes, the ramdisk) keep the built-in figures.
+/// Statistics of the filesystem a descriptor of type `kind` lives on. Descriptors that belong to no filesystem of their own (pipes, sockets,
+/// the ramdisk) keep the built-in figures.
 fn writeStatfsFor(kind: vfs_mod.FdType, buf_ptr: u64) i64 {
     const fr = @import("../../fs/fs_reader.zig");
     const copy = @import("../../mm/copy_from_user.zig");
@@ -4769,6 +4769,9 @@ fn writeStatfsFor(kind: vfs_mod.FdType, buf_ptr: u64) i64 {
         .tmpfs_file => @import("../../fs/tmpfs.zig").statFs(),
         .ext2_file => @import("../../fs/ext2.zig").statFs(),
         .fat32_file => @import("../../fs/fat32.zig").statFs(),
+        // /proc has no storage: Linux reports its magic and zero blocks and inodes. /dev is a devtmpfs, which reports TMPFS_MAGIC.
+        .proc_file => .{ .magic = 0x9fa0, .block_size = 4096, .name_max = 255, .rdonly = false },
+        .devfs, .devfs_ctrl => .{ .magic = 0x01021994, .block_size = 4096, .name_max = 255, .rdonly = false },
         else => null,
     };
     if (st) |stats| {

@@ -26,7 +26,7 @@ jobs:
   # commit 克隆构建；disk.img 是跟踪在库的规范 fixture（manifest 校验）。
   smoke-qemu:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       # v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -48,14 +48,29 @@ jobs:
             sleep 5
           done
           exit 1
+      # 900 s is the smoke script's own default. Each step (build included) took 616-763 s for SMP=1 and 431-530 s for SMP=2 over the last
+      # fourteen runs; one SMP=2 run hit the 600 s limit with no test reporting FAIL. Whether that boot was slow or stuck is not known (the
+      # serial log was not kept), which is what the step below is for.
       - name: Smoke SMP=1
         run: zig build smoke
         env:
-          MOQI_SMOKE_TIMEOUT: 600
+          MOQI_SMOKE_TIMEOUT: 900
       - name: Smoke SMP=2
         run: zig build smoke-smp
         env:
-          MOQI_SMOKE_TIMEOUT: 600
+          MOQI_SMOKE_TIMEOUT: 900
+      # The serial log of a failed smoke is copied to /tmp by the script but the runner is thrown away; print what a timeout needs to be
+      # told apart from a hang: how far the boot got and the last lines.
+      - name: Show the failing serial log
+        if: failure()
+        run: |
+          for f in /tmp/moqios-smoke-last-failure-smp*.log; do
+            [ -f "$f" ] || continue
+            echo "=== $f ($(wc -l < "$f") lines)"
+            echo "--- hello probes that finished:"; grep -a -cE "^hello[0-9]+ done" "$f" || true
+            echo "--- last hello started:"; grep -a -E "^spawned hello|^\[spawn\] loading" "$f" | tail -n 2 || true
+            echo "--- last 40 lines:"; tail -n 40 "$f"
+          done
 
   # Cross-ISA skeleton smoke gates. These are intentionally separate from the
   # x86 ISO smoke: they boot raw ELF images under OpenSBI/QEMU virt and do not

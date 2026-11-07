@@ -7088,3 +7088,22 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 宿主机 `test_stat_abi`：布局偏移全部与 glibc 一致，参数转发（`SYS_statfs`、缓冲区指针）、`ENOENT`/`ENOTDIR`/`EBADF`/`EFAULT` 的 -1 加 `errno` 转换。变异（`statfs` 误调 `SYS_fstatfs`）→ `test_stat_abi.c:174` 失败，还原后通过。
 - hello251 改为用 `struct statfs` 的命名字段（原来是 `w[3]` 这样的下标）和库的 `statfs`/`fstatfs`；hello250、hello252 的 `free_blocks` 改调库函数。三个探针在真内核上仍然全部通过（hello251 PASS，hello250 的 tmpfs/ext2 空闲块数 64853/16195 不变，hello252 同）。
 - 未验证：`f_fsid` 在内核里恒为 0；libc 没有 `statvfs`（glibc 的 `statvfs` 是另一个结构），没做。
+
+## statfs：/proc 和 /dev（hello251 续，已修）
+
+- 起因：上一节把 tmpfs/FAT32/ext2 的 `statfs` 修好后，"未验证"里记着 `/dev`、`/proc` 仍返回旧的写死数字（ext2 类型 0xEF53、4 GiB）。宿主机 Linux 实测：`/proc` 是类型 0x9fa0（`PROC_SUPER_MAGIC`），块数、空闲、inode 全为 0，`f_namelen` 255；`/dev` 是 devtmpfs，报 `TMPFS_MAGIC`（0x01021994）。
+- 红灯（修改前）：`/dev/null` 报 0xef53；`/proc/...` 在这个内核里 **返回 `ENOENT`**——我先用 `/proc/self/status` 测，失败是因为这个内核没有 `/proc/self`，也不能打开 `/proc` 目录本身，只能打开具体文件（`/proc/meminfo` 等）。这是探针期望的错误，不是 statfs 的问题；改用 `/proc/meminfo`。**`/proc/self` 和 `/proc` 目录不存在是另一个既有差异，这一轮没处理。**
+- 修改：`writeStatfsFor` 对 `.proc_file` 返回 `PROC_SUPER_MAGIC` 且块数/inode 为 0，对 `.devfs`/`.devfs_ctrl` 返回 `TMPFS_MAGIC`。两者块大小 4096、`f_namelen` 255、不带只读标志。
+- 绿灯：hello251 再加 2 项（`/proc/meminfo`、`/dev/null`）全部通过；host 1065/1065（加一条源码形状测试）。
+- 变异：去掉 `.devfs` 那个分支（只留 `.devfs_ctrl`）→ `dev` 项失败（`type 0xef53`），`proc` 项仍通过；还原后通过。
+- 未验证：①`/dev` 目录本身的 `statfs`（`DIR_IDX` 那个特殊节点）没单独测；②`/proc` 的 `f_flags`（Linux 报 `nosuid|nodev|noexec|relatime`）没有；③管道、套接字、ramdisk 文件仍返回旧的写死数字（Linux 对管道/套接字的 `fstatfs` 报 pipefs/sockfs，各自的魔数，这里没做）。
+
+## CI：SMP=2 冒烟在 4fe5011 上超时（600 秒），原因未知
+
+- 现象：`4fe5011`（libc `statfs`，没有改内核）的 smoke-qemu **SMP=2 在 600 秒上限处超时**，`ERROR: timed out after 600s waiting for smoke markers`，没有任何探针报 FAIL；SMP=1 通过（675 秒）。host-tests、smoke-cross-arch 通过。
+- 我查了什么：本地同一份源码 SMP=1、2、8 冒烟全部通过；最近 14 次 CI 的冒烟步骤耗时（含构建）SMP=1 为 616–763 秒、SMP=2 为 431–530 秒；这是第 2 次 CI 的 smoke-qemu 在 SMP=2 失败（另一次 `339ea2a` 是 hello237 B 的断言失败，509 秒，已在 `da77076` 处理）。`4fe5011` 的 600 秒超出历史范围约 70 秒。
+- **我不知道**这次是 runner 慢还是某个测试卡住：失败的串口日志被脚本复制到 `/tmp` 后随 runner 一起销毁，CI 里没有留下任何输出。所以我没有声称找到了原因。
+- 做了两件事（不是修复，是让下一次能看清）：
+  - `.github/workflows/test.yml` 把两个冒烟步骤的 `MOQI_SMOKE_TIMEOUT` 从 600 改为 900（脚本自己的默认值），job 上限从 30 分钟改为 45 分钟。这只是给慢 runner 余量；如果是真的卡住，900 秒后同样失败。
+  - 新增 `if: failure()` 步骤，失败时打印保留下来的串口日志：已完成的探针个数、最后启动的探针、最后 40 行。
+- 没做：没有复现；没有证据表明本轮的 `statfs` 改动（libc 头文件和三个探针的取值方式）会让启动变慢——探针行为在本地不变。
