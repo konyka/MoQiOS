@@ -7096,7 +7096,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修改：`writeStatfsFor` 对 `.proc_file` 返回 `PROC_SUPER_MAGIC` 且块数/inode 为 0，对 `.devfs`/`.devfs_ctrl` 返回 `TMPFS_MAGIC`。两者块大小 4096、`f_namelen` 255、不带只读标志。
 - 绿灯：hello251 再加 2 项（`/proc/meminfo`、`/dev/null`）全部通过；host 1065/1065（加一条源码形状测试）。
 - 变异：去掉 `.devfs` 那个分支（只留 `.devfs_ctrl`）→ `dev` 项失败（`type 0xef53`），`proc` 项仍通过；还原后通过。
-- 未验证：①`/dev` 目录本身的 `statfs`（`DIR_IDX` 那个特殊节点）没单独测；②`/proc` 的 `f_flags`（Linux 报 `nosuid|nodev|noexec|relatime`）没有；③管道、套接字、ramdisk 文件仍返回旧的写死数字（Linux 对管道/套接字的 `fstatfs` 报 pipefs/sockfs，各自的魔数，这里没做）。
+- 未验证：①`/dev` 目录本身的 `statfs`（`DIR_IDX` 那个特殊节点）没单独测；②`/proc` 的 `f_flags`（Linux 报 `nosuid|nodev|noexec|relatime`）没有；③管道、套接字、事件对象已在下一段处理，ramdisk 文件和控制台仍返回旧的写死数字。
 
 ## CI：SMP=2 冒烟在 4fe5011 上超时（600 秒），原因未知
 
@@ -7126,3 +7126,10 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：hello253 共 8 项通过（拒绝项 `denied 1`，同用户的 `status`/自己的 `maps` 仍能打开）；host 1068/1068。
 - 变异：把策略改成"maps 一律允许"（真编译）→ 拒绝项 `denied 0` 失败，其余通过；还原后通过。
 - 未验证：①`CAP_SYS_PTRACE` 持有者能读别人的 `maps` 这一分支只有 host 单元测试，没有运行时用例；②比较的是有效 uid，Linux 用的是 ptrace 访问检查（包含真实/保存 uid、dumpable 标志、LSM）；③`/proc/<pid>/mem`、`fd`、`environ` 等不存在，所以没有对应检查；④`status` 里的 `Pid`、`PPid` 对所有人可见，和 Linux 一致。
+
+### statfs：管道、套接字、事件对象（hello251 续，已修）
+
+- 宿主机 Linux 实测：管道是 pipefs（0x50495045），套接字是 sockfs（0x534f434b），epoll/eventfd 是 anon_inode（0x09041934）；块数和 inode 数为 0，块大小 4096，`f_namelen` 255。修改前这里全部报 ext2 的 0xEF53 和写死的 4 GiB。
+- 红灯：三项全部失败（`type 0xef53, blocks 1048576`）。修改：`writeStatfsFor` 加三个分支——`pipe_read`/`pipe_write`，`tcp_socket`/`udp_socket`/`unix_socket`/`raw_socket`，`epoll`/`eventfd`/`timerfd`/`inotify`/`pidfd`。
+- 绿灯：hello251 再加 3 项通过；host 加一条源码形状测试。变异：去掉 `tcp_socket` 那一项 → socket 项失败（`type 0xef53`），pipe 和 epoll 仍通过；还原后通过。
+- 未验证：只测了 TCP 套接字、pipe 的读端和 epoll；`udp`/`unix`/`raw`/`eventfd`/`timerfd`/`inotify`/`pidfd` 走同一个 `switch` 但没有各自的运行时用例；控制台（`special`）和 ramdisk 文件仍是写死数字。

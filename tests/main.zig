@@ -11275,3 +11275,11 @@ test "procfs: another user's maps needs ptrace access and the open path enforces
     try std.testing.expect(std.mem.indexOf(u8, src, "@import(\"procfs_policy.zig\").pidFile(true, same_user, effective_caps.cap_sys_ptrace) == .deny") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "return -13; // EACCES") != null);
 }
+
+test "statfs names pipefs, sockfs and anon_inode for pipes, sockets and event objects" {
+    // hello251: fstatfs of a pipe, socket or epoll descriptor used to report the ext2 fallback (0xEF53, 4 GiB).
+    const sc = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, sc, ".pipe_read, .pipe_write => .{ .magic = 0x50495045,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sc, ".tcp_socket, .udp_socket, .unix_socket, .raw_socket => .{ .magic = 0x534f434b,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sc, ".epoll, .eventfd, .timerfd, .inotify, .pidfd => .{ .magic = 0x09041934,") != null);
+}

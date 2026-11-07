@@ -4759,7 +4759,7 @@ fn syscallFstatfs(fd: u32, buf_ptr: u64) i64 {
     return writeStatfsFor(d.fd_type, buf_ptr);
 }
 
-/// Statistics of the filesystem a descriptor of type `kind` lives on. Descriptors that belong to no filesystem of their own (pipes, sockets,
+/// Statistics of the filesystem a descriptor of type `kind` lives on. Descriptors with no filesystem to name (the console and
 /// the ramdisk) keep the built-in figures.
 fn writeStatfsFor(kind: vfs_mod.FdType, buf_ptr: u64) i64 {
     const fr = @import("../../fs/fs_reader.zig");
@@ -4772,6 +4772,10 @@ fn writeStatfsFor(kind: vfs_mod.FdType, buf_ptr: u64) i64 {
         // /proc has no storage: Linux reports its magic and zero blocks and inodes. /dev is a devtmpfs, which reports TMPFS_MAGIC.
         .proc_file => .{ .magic = 0x9fa0, .block_size = 4096, .name_max = 255, .rdonly = false },
         .devfs, .devfs_ctrl => .{ .magic = 0x01021994, .block_size = 4096, .name_max = 255, .rdonly = false },
+        // Pipes, sockets and the event objects live on kernel-internal filesystems with no blocks or inodes (pipefs, sockfs, anon_inode).
+        .pipe_read, .pipe_write => .{ .magic = 0x50495045, .block_size = 4096, .name_max = 255, .rdonly = false },
+        .tcp_socket, .udp_socket, .unix_socket, .raw_socket => .{ .magic = 0x534f434b, .block_size = 4096, .name_max = 255, .rdonly = false },
+        .epoll, .eventfd, .timerfd, .inotify, .pidfd => .{ .magic = 0x09041934, .block_size = 4096, .name_max = 255, .rdonly = false },
         else => null,
     };
     if (st) |stats| {

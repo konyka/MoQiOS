@@ -8,6 +8,7 @@
 #include "../lib/moqi_libc/include/stat.h"
 #include "../lib/moqi_libc/include/string.h"
 #include "../lib/moqi_libc/include/errno.h"
+#include "../lib/moqi_libc/include/epoll.h"
 
 static int failures;
 static void check(int ok, const char *what) {
@@ -92,6 +93,33 @@ static void run_virtual(void) {
     check(r == 0 && d.f_type == 0x01021994, what);
 }
 
+/* Descriptors that belong to no disk filesystem. Measured on Linux: a pipe is pipefs (0x50495045), a socket is sockfs (0x534f434b), and
+ * epoll/eventfd/timerfd/inotify are anon_inode (0x09041934); all have no blocks and no inodes, block size 4096, name max 255. */
+static void run_anonymous(void) {
+    char what[200];
+    struct statfs f;
+    int p[2];
+    pipe(p);
+    memset(&f, 0, sizeof f);
+    long r = fstatfs(p[0], &f) == 0 ? 0 : -(long)errno;
+    snprintf(what, sizeof what, "pipe: fstatfs reports pipefs 0x50495045 with no blocks or inodes (rc %ld, type 0x%lx, blocks %lu, files %lu)", r, (unsigned long)f.f_type, f.f_blocks, f.f_files);
+    check(r == 0 && f.f_type == 0x50495045 && f.f_blocks == 0 && f.f_files == 0 && f.f_bsize == 4096 && f.f_namelen == 255, what);
+    close(p[0]);
+    close(p[1]);
+    long so = syscall3(SYS_socket, 2, 1, 0);
+    memset(&f, 0, sizeof f);
+    r = so >= 0 && fstatfs((int)so, &f) == 0 ? 0 : -(long)errno;
+    snprintf(what, sizeof what, "socket: fstatfs reports sockfs 0x534f434b with no blocks (rc %ld, type 0x%lx, blocks %lu)", r, (unsigned long)f.f_type, f.f_blocks);
+    check(r == 0 && f.f_type == 0x534f434b && f.f_blocks == 0, what);
+    if (so >= 0) close((int)so);
+    long ep = epoll_create1(0);
+    memset(&f, 0, sizeof f);
+    r = ep >= 0 && fstatfs((int)ep, &f) == 0 ? 0 : -(long)errno;
+    snprintf(what, sizeof what, "epoll: fstatfs reports anon_inode 0x9041934 (rc %ld, type 0x%lx)", r, (unsigned long)f.f_type);
+    check(r == 0 && f.f_type == 0x9041934, what);
+    if (ep >= 0) close((int)ep);
+}
+
 int main(int argc, char **argv, char **envp) {
     (void)argc; (void)argv; (void)envp;
     print("hello251: statfs / fstatfs per filesystem\n");
@@ -99,6 +127,7 @@ int main(int argc, char **argv, char **envp) {
     run("FAT32", "h251f", "h251-missing", 0, 0x4d44UL, 0, 255);
     run("ext2", "testdir/h251e", "testdir/h251-missing", 1, 0xEF53UL, 1, 255);
     run_virtual();
+    run_anonymous();
     print(failures == 0 ? "hello251: PASS\n" : "hello251: FAIL\n");
     return failures;
 }
