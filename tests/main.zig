@@ -11409,3 +11409,14 @@ test "a default stop signal stops a sleeping target at once, without leaving the
     try std.testing.expect(std.mem.indexOf(u8, sg, "if (cur == idx) return false;") != null);
     try std.testing.expect(std.mem.indexOf(u8, sg, "return t.sigact().handlers[signum - 1] == 0 and (t.signal_mask & bit) == 0;") != null);
 }
+
+test "mount targets and the directories above them share one length limit (MOUNT_TARGET_MAX)" {
+    // hello114 K2: mount() accepted a 100-byte target, but a .mount_dir descriptor kept only 64 bytes of path, so every ancestor longer than that
+    // was ENOENT to open.
+    const v = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, v, "pub const MOUNT_TARGET_MAX: usize = 128;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "mount_dir_path: [MOUNT_TARGET_MAX]u8 = @splat(0),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "if (path.len == 1 or path.len > MOUNT_TARGET_MAX) return null;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "target: [MOUNT_TARGET_MAX]u8 = @splat(0),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "if (target.len > MOUNT_TARGET_MAX or source.len > 64") != null);
+}

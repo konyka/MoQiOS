@@ -7216,7 +7216,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：`hello114`（C 段新增 2 项，其余原有检查不受影响）通过；`hello255` 仍通过；host 1074/1074。变异：让 `mountChildAt` 只列第一个子项（真编译）→ `/mnt lists ... e and n` 失败，其余通过；还原后通过。
 - 过程说明（如实）：①我的 `hello255` 源码形状测试钉住了刚被我重写的 FAT32 调用文本，需要同步更新（更新后断言的是同一意图，不是放宽）；②第一版用 `open(/mnt)` 的返回值直接排查（`returned 2`），确认了根因在打开路径而不是列表。
 - 后续核对（本轮追加，均为**回归保护**，第一次运行就通过，没有发现缺陷）：对一个打开的 `/mnt` 做 `fstat` 是目录；`chdir("/mnt")` 成功；卸载最后一个卷之后 `open("/mnt")` 是 `ENOENT`、`/` 的列表里不再有 `mnt`。这几项在上面的实现里是自然的结果（目录按挂载表现算），所以没有红灯；它们让"未验证"清单里的①③两项变成已验证。
-- 仍未验证：`mount_dir` 描述符的路径最长 64 字节，更深的挂载点祖先打不开（返回 `ENOENT`）；hello114 的 H/K 段里的非法挂载不会留下祖先，没有逐一核对。
+- 仍未验证：（`mount_dir` 描述符路径 64 字节的上限已在下一节取消）；hello114 的 H/K 段里的非法挂载不会留下祖先，没有逐一核对。
 
 ## /proc/self/fd：`readlink` 的内容、错误码和目录（hello257，已修）
 
@@ -7281,3 +7281,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - **顺带发现并修了一个真实的信号缺陷**：`kill(pid, SIGSTOP)` 发给一个阻塞在等待里的进程时，只是置位 pending，而 `kickIfBlocked` 认为停止信号"不可操作"，不会唤醒它，进程继续留在原来的等待里，直到别的原因把它唤醒才停止——所以 `status` 里看不到 `T`。现在 `sendSignalInfo` 对"默认动作是停止、目标有 handler 之外且未屏蔽、正在睡眠、且不是调用者自己"的情形直接 `stopTask`，并且**不再留下 pending 位**（否则 `SIGCONT` 唤醒时会第二次停止它）。`SIGSTOP` 不能被屏蔽也不能有 handler，所以对它无条件适用。
 - 绿灯：hello259 25 项（实际运行计数）通过；host 1088/1088。变异：①让 `stopsBlockedTarget` 永远返回 false（真编译）→ "after SIGSTOP it is T" 和 "a sleeper stopped and continued…" 失败；②停止之后仍留下 pending 位（真编译）→ **第一次存活**：当时的测试没有断言"继续后不被第二次停止"；我加了两处断言（子进程在睡眠后再忙算 300 ms 并报告，父进程等不到就杀掉），再次变异后 "sleeps its 600 ms" 和 "keeps running after the continue" 都失败，还原后通过。该变异的失败是靠测试变强才抓到的，不是第一版测试就有的保护。
 - 如实的局限：①`Uid`/`Gid` 的"文件系统"一栏取有效 id（本内核没有独立的 fsuid）；②`FDSize` 报告 `MAX_FDS`（x86_64 为 64），Linux 是当前描述符表的容量，会随打开的描述符增长（我在宿主机上看到 64 变 256）；③`Threads` 不统计已退出但未回收的线程；④`State` 里没有 `D`（磁盘睡眠）、`I`（空闲）、`t`（被跟踪停止）；`TracerPid` 恒为 0（没有 ptrace 跟踪关系的查询）；⑤`Name` 不转义特殊字符；⑥对"带 handler 的停止信号"和"被屏蔽的 SIGTSTP/SIGTTIN/SIGTTOU"仍走原来的 pending 路径，没有单独的运行用例；⑦对**另一个正在运行**的目标发 `SIGSTOP`，仍然是 pending，下一次调度点才停止，`status` 在这之前可能还是 `R`（测试里目标都是在睡眠）。
+
+### 挂载点的祖先目录超过 64 字节打不开（hello114 K2，已修）
+
+- 问题：`mount()` 接受最长 128 字节的目标，但 `.mount_dir` 描述符只存 64 字节路径，`mountDirDescriptor` 对更长的祖先直接返回 null，于是挂载点之上的目录（Linux 上都是普通目录）`open` 得 `ENOENT`。这是之前文档里"仍未验证"的一条，这次用测试证实了。
+- 红灯：hello114 新增 K2 段（在 100 字节目标 `/mnt/aaa…/bbb…/ccc…/vol` 上挂载，它的 66 字节和 97 字节祖先）：挂载成功，但两个祖先 `open` 返回 -2，列目录和 `fstat` 失败；`chdir` 本来就成功（它走 `isMountAncestor`，没有长度限制）。
+- 修改：`vfs.zig` 新增 `MOUNT_TARGET_MAX = 128`，`mount()` 的目标长度检查、挂载表的 `target` 数组和 `mount_dir_path` 都用它，所以任何能挂载的目标的祖先一定放得进描述符。
+- 代价（如实）：`FileDescriptor` 每个多 64 字节，一共 64 张表 × 64 个描述符，内核映像大了约 0.26 MB（31065816 与 30795336 字节之差）。
+- 绿灯：K2 的 10 项通过，hello114 现在 324 项（实际运行计数）全部通过；host 1089/1089。变异：把打开时的上限改回 64（真编译）→ 两个祖先的"opens and lists"和"fstat"共 4 项失败，其余通过；还原后通过。
+- 局限：①挂载表里的 `target` 本来就是 128 字节，没有变；②超过 128 字节的路径本身无法作为挂载目标（`ENAMETOOLONG`），这和 Linux 的 4096 不同；③没有测深度更大的祖先链或同一祖先下多个挂载。

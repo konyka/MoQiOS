@@ -578,6 +578,46 @@ void _start(void) {
     check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/x/../k1/", 0) == 0, "K: umount accepts an equivalent spelling");
     check(syscall2(SYS_OPEN, (uint64_t)"/mnt/k1/small.txt", O_RDONLY) < 0, "K: the volume is gone after umount");
 
+    /* K2: a mount point deep enough that its ancestors are longer than 64 bytes. mount() takes targets up to 128 bytes, so every
+     * directory on the way to one has to open, list, stat and chdir like "/mnt" does. */
+    {
+        static const char deep[] = "/mnt/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/cccccccccccccccccccccccccccccc/vol";
+        static const char anc1[] = "/mnt/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        static const char anc2[] = "/mnt/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/cccccccccccccccccccccccccccccc";
+        check(syscall4(SYS_MOUNT, (uint64_t)"/dev/vblk1p1", (uint64_t)deep, (uint64_t)"ext4", 0) == 0, "K2: mount at a 100-byte target");
+        const char *dirs[2] = { anc1, anc2 };
+        const char *want[2] = { "cccccccccccccccccccccccccccccc", "vol" };
+        for (int di = 0; di < 2; di++) {
+            static char dbuf[1024];
+            int found = 0, dots = 0;
+            int64_t dfd = syscall2(SYS_OPEN, (uint64_t)dirs[di], O_RDONLY);
+            for (;;) {
+                if (dfd < 0) break;
+                int64_t got = syscall3(SYS_GETDENTS, (uint64_t)dfd, (uint64_t)dbuf, sizeof(dbuf));
+                if (got <= 0) break;
+                for (int64_t o = 0; o < got;) {
+                    struct dirent64 *de = (struct dirent64 *)(dbuf + o);
+                    if (streq(de->name, want[di])) found++;
+                    else if (streq(de->name, ".") || streq(de->name, "..")) dots++;
+                    o += de->reclen;
+                }
+            }
+            if (dfd >= 0) syscall1(SYS_CLOSE, (uint64_t)dfd);
+            print("hello114:   .. open of a "); print_u64(strlen_(dirs[di])); print(" byte ancestor returned "); print_u64((uint64_t)(dfd < 0 ? -dfd : dfd)); print(dfd < 0 ? " (negative)\n" : "\n");
+            check(dfd >= 0 && found == 1 && dots == 2, "K2: an ancestor longer than 64 bytes opens and lists the next component");
+            struct kstat_t dst;
+            int64_t sfd = syscall2(SYS_OPEN, (uint64_t)dirs[di], O_RDONLY);
+            int64_t sr = sfd >= 0 ? syscall2(SYS_FSTAT, (uint64_t)sfd, (uint64_t)&dst) : sfd;
+            if (sfd >= 0) syscall1(SYS_CLOSE, (uint64_t)sfd);
+            check(sr == 0 && (dst.w[3] & 0170000) == 0040000, "K2: and fstat of the open ancestor says it is a directory");
+            check(syscall1(SYS_CHDIR, (uint64_t)dirs[di]) == 0, "K2: and chdir into it works");
+            syscall1(SYS_CHDIR, (uint64_t)"/");
+        }
+        check(slurp("/mnt/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/cccccccccccccccccccccccccccccc/vol/small.txt", small, sizeof(small)) == 9, "K2: the volume itself reads");
+        check(syscall2(SYS_UMOUNT2, (uint64_t)deep, 0) == 0, "K2: umount");
+        check(syscall2(SYS_OPEN, (uint64_t)anc1, O_RDONLY) == -ENOENT, "K2: and the ancestors are gone");
+    }
+
     /* L: permissions. The process is uid/gid 1000 and unprivileged. */
     check(syscall4(SYS_MOUNT, (uint64_t)"/dev/vblk1p1", (uint64_t)"/mnt/p", (uint64_t)"ext4", 0) == 0, "L: mount for the permission checks");
     check(syscall2(SYS_OPEN, (uint64_t)"/mnt/p/perm/world.txt", O_RDONLY) >= 0, "L: world-readable file owned by someone else opens");

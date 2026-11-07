@@ -666,6 +666,9 @@ fn releaseOffsetSlot(slot: u16) void {
 }
 
 /// Open file descriptor.
+/// Longest mount target mount() accepts; every ancestor of a mount point is shorter, so a .mount_dir descriptor's path fits in this many bytes.
+pub const MOUNT_TARGET_MAX: usize = 128;
+
 pub const FileDescriptor = struct {
     fd_type: FdType = .none,
     offset: u64 = 0,
@@ -713,7 +716,7 @@ pub const FileDescriptor = struct {
     proc_file_type: @import("procfs.zig").ProcFile = .meminfo,
     proc_pid: u32 = 0,
     /// Path of a .mount_dir descriptor (the directory above one or more mount points), normalised, with its length.
-    mount_dir_path: [64]u8 = @splat(0),
+    mount_dir_path: [MOUNT_TARGET_MAX]u8 = @splat(0),
     mount_dir_len: u8 = 0,
 };
 
@@ -1391,7 +1394,7 @@ pub const FdTable = struct {
     fn mountDirDescriptor(name: []const u8) ?FileDescriptor {
         var norm: [256]u8 = undefined;
         const path = normalizeAbs(name, &norm) orelse return null;
-        if (path.len == 1 or path.len > 64) return null; // "/" is the ext2 root
+        if (path.len == 1 or path.len > MOUNT_TARGET_MAX) return null; // "/" is the ext2 root
         if (!isMountAncestor(path)) return null;
         const ext2 = @import("ext2.zig");
         if (ext2.isActive()) {
@@ -2701,7 +2704,7 @@ pub const MountPoint = struct {
     source: [64]u8 = @splat(0),
     source_len: u32 = 0,
     /// Mount target path (e.g. "/mnt", "/tmp")
-    target: [128]u8 = @splat(0),
+    target: [MOUNT_TARGET_MAX]u8 = @splat(0),
     target_len: u32 = 0,
     /// Filesystem type string (e.g. "ext2", "tmpfs", "ramfs", "proc")
     fs_type: [16]u8 = @splat(0),
@@ -2910,7 +2913,7 @@ fn rofsResolveSource(source: []const u8) ?struct { dev: u8, base: u64, len: u64 
 /// mount(source, target, fs_type, flags) -> 0 or -errno
 pub fn mountFs(source: []const u8, target: []const u8, fs_type: []const u8, flags: u64) i64 {
     if (target.len == 0) return -22; // -EINVAL
-    if (target.len > 128 or source.len > 64 or fs_type.len > 16) return -36; // -ENAMETOOLONG
+    if (target.len > MOUNT_TARGET_MAX or source.len > 64 or fs_type.len > 16) return -36; // -ENAMETOOLONG
 
     // One mount/umount at a time. The operation lock is a sleeping lock; the
     // table spinlock below is only held for the short reads and the final
