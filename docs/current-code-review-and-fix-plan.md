@@ -7307,4 +7307,10 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello261 第一次对当前内核运行，8 项里 4 项失败：`SIGTERM` 发给停止的进程后它立刻变成 `Z`（`sendSignalInfo` 和进程组广播里都有"致命信号先解除停止态"），带 handler 的版本里 handler 在 `SIGCONT` 之前就已运行（早到的报告），之后的 `SIGCONT` 检查读不到。A 项（带 handler 的 `SIGTSTP`）一开始也失败，但那是我的用例按 glibc 的习惯检查 `errno == EINTR`，而本 libc 的 `read` 直接返回 `-EINTR`、不设 `errno`；改为检查返回值 `-EINTR` 后通过，不是内核问题。
 - 修改：`signal.zig` 里两处"`defaultAction == .terminate` 且已停止则清除停止"改为只对 `SIGKILL`。`SIGCONT` 原本就立即继续；其它信号保持 pending，由 `continueTask` 的唤醒路径在继续后投递。
 - 绿灯：hello261 8 项（实际运行计数）通过；host 见门禁。变异（真编译）：把条件改回"任何致命信号"→ D、F 共 3 项失败，其余通过；还原后通过。
-- 如实的局限：①进程组广播（`kill(-pgid)`、终端产生的 `SIGINT`/`SIGHUP`）走另一份代码（`sendSignalToPgrpFiltered`），本次同步改了它的条件但没有为它单独写运行用例；孤儿进程组的 `SIGHUP`+`SIGCONT` 路径（hello58）靠它们自己的 `continueTask` 工作，门禁里 hello58 通过；②`SIGINT` 等从键盘送给**前台停止**进程组的信号，现在也要等 `SIGCONT`，与 Linux 一致，但没有用终端测试；③`SIGSTOP` 发给已停止的进程、`SIGTTIN`/`SIGTTOU` 的停止语义没有新用例。
+- 如实的局限：①进程组广播（`kill(-pgid)`）走另一份代码（`sendSignalToPgrpFiltered`），本次同步改了它的条件；运行用例见下一节 hello262，终端产生的 `SIGINT`/`SIGHUP` 仍没有单独测；孤儿进程组的 `SIGHUP`+`SIGCONT` 路径（hello58）靠它们自己的 `continueTask` 工作，门禁里 hello58 通过；②`SIGINT` 等从键盘送给**前台停止**进程组的信号，现在也要等 `SIGCONT`，与 Linux 一致，但没有用终端测试；③`SIGSTOP` 发给已停止的进程、`SIGTTIN`/`SIGTTOU` 的停止语义没有新用例。
+
+### 进程组广播给已停止成员发信号（hello262，回归保护）
+
+- 上一节把 `sendSignalToPgrpFiltered` 里的"致命信号先解除停止态"也改成只对 `SIGKILL`，但当时没有运行用例。这次补上，先在宿主机 Linux 上测期望值：`kill(-pg, SIGSTOP)` 停止所有成员；`SIGTERM` 发给已停止的组后全员仍是 `T`，`SIGCONT` 之后以信号 15 死亡；`SIGKILL` 立刻结束已停止的组（信号 9）；默认 `SIGTSTP` 停止睡眠中的成员。
+- 结果：hello262 6 项（实际运行计数）**第一次运行就全部通过**——所以这是回归保护，不是修复，没有红灯。变异（真编译）：把进程组路径的条件改回"任何致命信号"→ 只有 "C: SIGTERM to a stopped group leaves it stopped"（成员变成 `Z`）失败，其余通过，说明这条用例确实走的是进程组那份代码；还原后通过。
+- 局限：组里只有 2 个成员，没有测跨会话的组、`kill(0, ...)`、`kill(-1, ...)`；终端产生的 `SIGINT`（键盘）仍没有测。
