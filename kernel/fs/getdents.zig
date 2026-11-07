@@ -42,9 +42,10 @@ pub fn getdents64(fd: u32, buf_ptr: u64, buf_size: u64) i64 {
         return getdents64Tmpfs(desc, buf_ptr, buf_size, cur.euid, cur.egid, cur.effective_caps);
     }
 
-    // procfs directories (/proc and /proc/<pid>)
+    // procfs directories (/proc and /proc/<pid>) and the synthetic directories above mount points
     if (desc.fd_type == .proc_file) {
         if (!@import("procfs.zig").isDir(desc.proc_file_type)) return -20; // ENOTDIR
+        if (desc.proc_file_type == .mount_dir) return getdents64MountDir(desc, buf_ptr, buf_size);
         return getdents64Proc(desc, buf_ptr, buf_size);
     }
 
@@ -56,6 +57,50 @@ pub fn getdents64(fd: u32, buf_ptr: u64, buf_size: u64) i64 {
     }
 
     return -20; // ENOTDIR
+}
+
+/// List a directory that exists only above mount points: "." and "..", then the one-level-down name of each mount below it.
+fn getdents64MountDir(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i64 {
+    var kbuf: [4096]u8 = undefined;
+    var written: u64 = 0;
+    var emitted: u32 = 0;
+    const dir = desc.mount_dir_path[0..desc.mount_dir_len];
+    const start: u32 = policy.clampOffset(desc.offset);
+    var pos: u32 = start;
+    var exhausted = false;
+    while (true) : (pos += 1) {
+        var name_buf: [64]u8 = undefined;
+        var name: []const u8 = undefined;
+        if (pos == 0) {
+            name = ".";
+        } else if (pos == 1) {
+            name = "..";
+        } else {
+            name = vfs_mod.mountChildAt(dir, pos - 2, &name_buf) orelse {
+                exhausted = true;
+                break;
+            };
+        }
+        const reclen: u16 = @intCast(19 + name.len + 1);
+        const padded_reclen: u16 = (reclen + 7) & ~@as(u16, 7);
+        if (written + padded_reclen > @min(buf_size, 4096)) break;
+        const base = @as(usize, @intCast(written));
+        bo.writeU64Le(kbuf[base .. base + 8], 0x7FFD_0000 + pos);
+        bo.writeU64Le(kbuf[base + 8 .. base + 16], @as(u64, pos) + 1);
+        bo.writeU16Le(kbuf[base + 16 .. base + 18], padded_reclen);
+        kbuf[base + 18] = 4; // DT_DIR
+        @memcpy(kbuf[base + 19 .. base + 19 + name.len], name);
+        kbuf[base + 19 + name.len] = 0;
+        var pad = base + 19 + name.len + 1;
+        while (pad < base + padded_reclen) : (pad += 1) kbuf[pad] = 0;
+        written += padded_reclen;
+        emitted += 1;
+    }
+    if (emitted == 0) return if (exhausted) 0 else -22;
+    const n: usize = @intCast(written);
+    if (copy.copyToUser(@ptrFromInt(buf_ptr), kbuf[0..n], n) != n) return -14;
+    desc.offset = policy.nextOffset(start, emitted);
+    return @intCast(written);
 }
 
 /// List /proc or /proc/<pid>. The descriptor offset is the position in the listing (the entries are produced on demand from the live task
@@ -202,6 +247,11 @@ fn getdents64RootVirtual(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: 
     var emitted: u32 = 0;
     var k: u64 = desc.offset - ROOT_VIRTUAL_BASE;
     var exhausted = false;
+    // How many FAT32 entries the root has, counted once for this call (it changes as files come and go).
+    var fat_total: u32 = 0;
+    if (fat32.isActive()) {
+        while (fat32.rootEntryAt(fat_total) != null) fat_total += 1;
+    }
     while (true) : (k += 1) {
         var name_buf: [256]u8 = undefined;
         var name: []const u8 = undefined;
@@ -210,14 +260,24 @@ fn getdents64RootVirtual(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: 
         if (k < root_virtual_names.len) {
             name = root_virtual_names[@intCast(k)];
         } else {
-            const fe = (if (fat32.isActive()) fat32.rootEntryAt(@intCast(k - root_virtual_names.len)) else null) orelse {
-                exhausted = true;
-                break;
-            };
-            @memcpy(name_buf[0..fe.len], fe.name[0..fe.len]);
-            name = name_buf[0..fe.len];
-            dtype = if (fe.is_dir) 4 else 8; // DT_DIR or DT_REG
-            ino = 0x7FFE_0000 + k;
+            const fat_index: u32 = @intCast(k - root_virtual_names.len);
+            if (fat32.isActive() and fat32.rootEntryAt(fat_index) != null) {
+                const fe = fat32.rootEntryAt(fat_index).?;
+                @memcpy(name_buf[0..fe.len], fe.name[0..fe.len]);
+                name = name_buf[0..fe.len];
+                dtype = if (fe.is_dir) 4 else 8; // DT_DIR or DT_REG
+                ino = 0x7FFE_0000 + k;
+            } else {
+                // After the FAT32 entries come the directories that exist only because a volume is mounted below them ("mnt" for
+                // /mnt/e).
+                const mount_index: u32 = @intCast(k - root_virtual_names.len - fat_total);
+                const mc = vfs_mod.mountChildAt("/", mount_index, &name_buf) orelse {
+                    exhausted = true;
+                    break;
+                };
+                name = mc;
+                ino = 0x7FFC_0000 + k;
+            }
         }
         const reclen: u16 = @intCast(19 + name.len + 1);
         const padded_reclen: u16 = (reclen + 7) & ~@as(u16, 7);

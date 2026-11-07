@@ -7203,3 +7203,16 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异检查：第一个变异（`SHUT_WR` 对 `established` 和 `close_wait` 都不发 FIN）那次运行**作废了**——日志里没有 `hello256` 的结果行，因为遗留的 QEMU 与新运行冲突（见下），所以我**没有**得到这个变异的有效结果，也不声称它被抓住或存活。第二个变异（只让 `close_wait` 的 `SHUT_WR` 不发 FIN）**存活了**：C 项"两端读都是 0"仍通过，加的 `FIN_WAIT2` 检查也通过（客户端状态是 7）。原因：探针原来没有检查服务端本身的状态。加上服务端状态检查（`ss2 != 8`，即离开 `CLOSE_WAIT`）后，同一个变异被抓住（`client 7, server 8`），还原后通过。
 - 过程说明（如实）：①中途发现一个上一次 `one.sh` 遗留的 QEMU 进程仍在运行，抢占了磁盘镜像，那一次的结果作废，我杀掉它并重跑；②之后每次变异前后都核对了没有残留 QEMU；③`tcp.zig` 与 HEAD 相同（`git diff` 为空），所以这轮没有改内核。
 - 未验证：`closing`（双方同时关闭）和 `last_ack` 状态下 `close()` 的行为；同时关闭需要两端同一时刻发 FIN，回环上用 `netpoll` 的单线程探针构造不出来。`TIME_WAIT` 套接字的状态号也没有断言（探针只确认离开了 `FIN_WAIT2`）。
+
+## 挂载点之上的目录：`/mnt` 打不开、`/` 不列 `mnt`（hello114 C，已修）
+
+- 起因：上一段"根目录列表"的未验证项记着"ext4/NTFS 挂载点（`/mnt/...`）也没有出现在 `/` 的列表里"。核对时发现更根本的一点：在 `hello114` 里把卷挂在 `/mnt/e` 和 `/mnt/n` 之后，**`open("/mnt")` 本身返回 `-2`（`ENOENT`）**——`/mnt` 不在 ext2 里，`rofsOpen` 对挂载点的祖先"让别的文件系统去回答"，而别的文件系统都不认识它（`chdir` 倒是特意放行了，见 `isMountAncestor`）。所以 `ls /mnt` 不可能，`/` 也不列 `mnt`。
+- 红灯：`hello114` C 段新增两项，都失败：`/mnt 列出挂载点 e 和 n`（打开就是 `ENOENT`）、`/ 列出一次 mnt`。
+- 修改：
+  - `mount_path_policy.nextChild(dir, target)`（纯函数，host 测试 8 个断言）：`dir` 是 `target` 的真祖先时，返回 `target` 在 `dir` 之下的第一个路径分量（`/` 与 `/mnt/e/x` 得 `mnt`，`/mnt` 与 `/mnt/e` 得 `e`，`/mnt` 与 `/mntx/e` 得空）。
+  - `vfs.mountChildAt(dir, skip, out)`：按挂载表枚举 `dir` 之下互不相同的第一级名字（同一子目录下两个挂载只算一次）。
+  - `open`：路径是某个挂载点的真祖先，且 **ext2 里没有同名目录**时，返回一个 `proc_file` 型描述符，类型 `mount_dir`（`dir_ops.descriptorKind` 把它报成目录），描述符里存规范化后的路径；`getdents64MountDir` 列出 `.`、`..` 和 `mountChildAt` 的各项。
+  - `/` 的虚拟尾部：在 `tmp`/`dev`/`proc` 和 FAT32 条目之后，再追加 `mountChildAt("/")`（`mnt`）；FAT32 条目数在每次调用里数一次，避免每项重数。
+- 绿灯：`hello114`（C 段新增 2 项，其余原有检查不受影响）通过；`hello255` 仍通过；host 1074/1074。变异：让 `mountChildAt` 只列第一个子项（真编译）→ `/mnt lists ... e and n` 失败，其余通过；还原后通过。
+- 过程说明（如实）：①我的 `hello255` 源码形状测试钉住了刚被我重写的 FAT32 调用文本，需要同步更新（更新后断言的是同一意图，不是放宽）；②第一版用 `open(/mnt)` 的返回值直接排查（`returned 2`），确认了根因在打开路径而不是列表。
+- 未验证：①`stat("/mnt")` 对这类目录得到的模式是 `fd_stat_policy` 的目录默认值，没有单独测；②`mount_dir` 描述符的路径最长 64 字节，更深的挂载点祖先打不开（返回 `ENOENT`）；③卸载后 `/mnt` 随之消失（因为每次都按挂载表现算），没有测；④hello114 的 H/K 段里的非法挂载不会留下祖先，没有逐一核对。

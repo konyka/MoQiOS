@@ -712,6 +712,9 @@ pub const FileDescriptor = struct {
     // procfs fields
     proc_file_type: @import("procfs.zig").ProcFile = .meminfo,
     proc_pid: u32 = 0,
+    /// Path of a .mount_dir descriptor (the directory above one or more mount points), normalised, with its length.
+    mount_dir_path: [64]u8 = @splat(0),
+    mount_dir_len: u8 = 0,
 };
 
 const TRANSFER_HOLD_MASK: u32 = 0x3FFF_FFFF;
@@ -1094,6 +1097,16 @@ pub const FdTable = struct {
             return result;
         }
 
+        // A directory that exists only because a volume is mounted below it ("/mnt" for a volume at "/mnt/e"). It is a directory with
+        // nothing in it but the mount points; a real ext2 directory of the same name wins, so this only applies when ext2 has none.
+        if (mountDirDescriptor(name)) |md| {
+            var dstate = md;
+            dstate.status_flags = status;
+            self.fds[slot] = dstate;
+            self.publishFd(slot);
+            return @intCast(slot);
+        }
+
         // The /proc directory itself.
         if (str.eql(name, "/proc") or str.eql(name, "/proc/")) {
             self.fds[slot] = .{
@@ -1367,6 +1380,32 @@ pub const FdTable = struct {
 
         self.freeFd(slot);
         return ext2_errno; // ENOENT, or the errno the ext2 lookup reported (ENOTDIR, ELOOP, ...)
+    }
+
+    /// A .mount_dir descriptor for `name` when it is a proper ancestor of a mount target and ext2 holds no directory of that name.
+    fn mountDirDescriptor(name: []const u8) ?FileDescriptor {
+        var norm: [256]u8 = undefined;
+        const path = normalizeAbs(name, &norm) orelse return null;
+        if (path.len == 1 or path.len > 64) return null; // "/" is the ext2 root
+        if (!isMountAncestor(path)) return null;
+        const ext2 = @import("ext2.zig");
+        if (ext2.isActive()) {
+            const fi = ext2.openFileFollow(path, .{ .euid = 0, .egid = 0, .cap_dac_override = true, .groups = &[_]u32{} }, true);
+            if (fi >= 0) {
+                ext2.closeFile(@intCast(fi));
+                return null;
+            }
+        }
+        var d: FileDescriptor = .{
+            .fd_type = .proc_file,
+            .offset = 0,
+            .inode_id = 0x4000_0000_0000_0000 + @as(u64, @intFromEnum(@import("procfs.zig").ProcFile.mount_dir)),
+            .proc_file_type = .mount_dir,
+            .proc_pid = 0,
+        };
+        @memcpy(d.mount_dir_path[0..path.len], path);
+        d.mount_dir_len = @intCast(path.len);
+        return d;
     }
 
     /// The pid a "/proc/<pid>", "/proc/<pid>/" or "/proc/self" name stands for, or null when the name is not one of those or no such process
@@ -2713,6 +2752,40 @@ pub fn isMountAncestor(path: []const u8) bool {
         if (t.len > path.len and mount_path.under(t, path)) return true;
     }
     return false;
+}
+
+/// The `skip`-th distinct name a mount adds to the listing of `dir` (an ancestor of one or more mount targets): "mnt" for "/" when
+/// something is mounted below /mnt, "e" and "n" for "/mnt". Two mounts under the same child give that child once. Copied into `out`.
+pub fn mountChildAt(dir: []const u8, skip: u32, out: []u8) ?[]const u8 {
+    const lf = mount_lock.acquire();
+    defer mount_lock.release(lf);
+    var seen: u32 = 0;
+    var i: usize = 0;
+    while (i < mount_table.len) : (i += 1) {
+        const mp = &mount_table[i];
+        if (!mp.active) continue;
+        const child = mount_path.nextChild(dir, mp.target[0..mp.target_len]) orelse continue;
+        // The first mount that names this child counts it; later ones with the same child are repeats.
+        var repeat = false;
+        var j: usize = 0;
+        while (j < i) : (j += 1) {
+            const earlier = &mount_table[j];
+            if (!earlier.active) continue;
+            const ec = mount_path.nextChild(dir, earlier.target[0..earlier.target_len]) orelse continue;
+            if (std.mem.eql(u8, ec, child)) {
+                repeat = true;
+                break;
+            }
+        }
+        if (repeat) continue;
+        if (seen == skip) {
+            if (child.len > out.len) return null;
+            @memcpy(out[0..child.len], child);
+            return out[0..child.len];
+        }
+        seen += 1;
+    }
+    return null;
 }
 
 /// Mount target of rofs mount `slot`, copied into `out`; null if not mounted.

@@ -25,10 +25,13 @@ pub const ProcFile = enum(u8) {
     /// The /proc directory itself and /proc/<pid> (also reached as /proc/self): directories, listed by getdents64.
     root_dir,
     pid_dir,
+    /// A directory that exists only because volumes are mounted below it (for example /mnt for a volume at /mnt/e). It has no storage of
+    /// its own; the descriptor keeps its path and getdents64 lists the mount points one level below.
+    mount_dir,
 };
 
 pub fn isDir(file: ProcFile) bool {
-    return file == .root_dir or file == .pid_dir;
+    return file == .root_dir or file == .pid_dir or file == .mount_dir;
 }
 
 /// One directory entry for getdents64: a name and its DT_* type.
@@ -151,7 +154,7 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
         .irqtime => generateIrqTime(buf, max_len),
         .irqwindow => generateIrqWindow(buf, max_len),
         .lostats => generateLoStats(buf, max_len),
-        .root_dir, .pid_dir => 0,
+        .root_dir, .pid_dir, .mount_dir => 0,
     };
 }
 

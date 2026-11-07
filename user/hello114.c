@@ -369,6 +369,42 @@ void _start(void) {
     check(r == 0 && numbered == 300 && has_sub == 1 && dot == 1 && dotdot == 1 && total == 303, "C: ext4 htree dir lists 300 files + sub + . + ..");
     r = list_dir("/mnt/n", &has_sub, &numbered, &total, &dot, &dotdot);
     check(r == 0 && dot == 1 && dotdot == 1, "C: ntfs root lists . and ..");
+    /* The directories leading to a mount point: Linux lists "mnt" in "/", and "/mnt" holds the mount points e and n. */
+    {
+        static char mbuf[2048];
+        int e_seen = 0, n_seen = 0, mdot = 0, mdotdot = 0, mtype_e = -1;
+        int64_t mfd = syscall2(SYS_OPEN, (uint64_t)"/mnt", O_RDONLY);
+        for (;;) {
+            if (mfd < 0) break;
+            int64_t got = syscall3(SYS_GETDENTS, (uint64_t)mfd, (uint64_t)mbuf, sizeof(mbuf));
+            if (got <= 0) break;
+            for (int64_t o = 0; o < got;) {
+                struct dirent64 *md = (struct dirent64 *)(mbuf + o);
+                if (streq(md->name, "e")) { e_seen++; mtype_e = md->type; }
+                else if (streq(md->name, "n")) n_seen++;
+                else if (streq(md->name, ".")) mdot++;
+                else if (streq(md->name, "..")) mdotdot++;
+                o += md->reclen;
+            }
+        }
+        if (mfd >= 0) syscall1(SYS_CLOSE, (uint64_t)mfd);
+        print("hello114:   .. open(/mnt) returned "); print_u64((uint64_t)(mfd < 0 ? -mfd : mfd)); print(mfd < 0 ? " (negative)\n" : "\n");
+        check(mfd >= 0 && e_seen == 1 && n_seen == 1 && mdot == 1 && mdotdot == 1 && mtype_e == 4, "C: /mnt lists the mount points e and n as directories");
+        int mnt_in_root = 0, mnt_type = -1;
+        int64_t rfd = syscall2(SYS_OPEN, (uint64_t)"/", O_RDONLY);
+        for (;;) {
+            if (rfd < 0) break;
+            int64_t got = syscall3(SYS_GETDENTS, (uint64_t)rfd, (uint64_t)mbuf, sizeof(mbuf));
+            if (got <= 0) break;
+            for (int64_t o = 0; o < got;) {
+                struct dirent64 *rd = (struct dirent64 *)(mbuf + o);
+                if (streq(rd->name, "mnt")) { mnt_in_root++; mnt_type = rd->type; }
+                o += rd->reclen;
+            }
+        }
+        if (rfd >= 0) syscall1(SYS_CLOSE, (uint64_t)rfd);
+        check(mnt_in_root == 1 && mnt_type == 4, "C: / lists mnt, the directory above the mount points, once");
+    }
     n = slurp("/mnt/e/dir/sub/n.txt", small, sizeof(small));
     check(n == 7 && small[0] == 'n', "C: ext4 nested path");
     n = slurp("/mnt/e/dir/file_217.txt", small, sizeof(small));

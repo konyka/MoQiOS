@@ -56,3 +56,14 @@ test "nested or identical mount targets overlap" {
     try std.testing.expect(!p.overlaps("/mnt/e", "/mnt/n"));
     try std.testing.expect(!p.overlaps("/mnt/e", "/mnt/ex"));
 }
+
+test "mount path: nextChild names the one component a mount adds to an ancestor's listing" {
+    try std.testing.expectEqualStrings("mnt", p.nextChild("/", "/mnt/e/x").?);
+    try std.testing.expectEqualStrings("mnt", p.nextChild("/", "/mnt").?);
+    try std.testing.expectEqualStrings("e", p.nextChild("/mnt", "/mnt/e").?);
+    try std.testing.expectEqualStrings("e", p.nextChild("/mnt", "/mnt/e/deep").?);
+    try std.testing.expect(p.nextChild("/mnt", "/mnt") == null);
+    try std.testing.expect(p.nextChild("/mnt", "/mntx/e") == null);
+    try std.testing.expect(p.nextChild("/mnt/e", "/mnt") == null);
+    try std.testing.expect(p.nextChild("/other", "/mnt/e") == null);
+}

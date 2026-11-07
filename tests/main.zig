@@ -11307,8 +11307,20 @@ test "the root directory lists tmp, dev and proc after its ext2 entries, on a cu
 
 test "the root listing continues with the FAT32 volume's root entries after tmp, dev and proc" {
     // hello255: a file created by a bare name lives on FAT32 and was missing from opendir("/").
-    try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "fat32.rootEntryAt(@intCast(k - root_virtual_names.len))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "const fat_index: u32 = @intCast(k - root_virtual_names.len);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "fat32.rootEntryAt(fat_index)") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "dtype = if (fe.is_dir) 4 else 8; // DT_DIR or DT_REG") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.fat32_source, "pub fn rootEntryAt(skip: u32) ?RootEntry {") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.fat32_source, "if (!f.active or f.unlink_pending or f.name_len == 0) continue;") != null);
+}
+
+test "directories above mount points exist and list the mount points one level down" {
+    // hello114 C: with volumes at /mnt/e and /mnt/n, "/mnt" could not be opened and "/" did not list "mnt".
+    const vfs = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "pub fn mountChildAt(dir: []const u8, skip: u32, out: []u8) ?[]const u8 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "if (mountDirDescriptor(name)) |md| {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "if (!isMountAncestor(path)) return null;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "if (desc.proc_file_type == .mount_dir) return getdents64MountDir(desc, buf_ptr, buf_size);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "vfs_mod.mountChildAt(\"/\", mount_index, &name_buf)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, "mount_dir,") != null);
 }

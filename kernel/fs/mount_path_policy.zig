@@ -72,3 +72,14 @@ pub fn rest(path: []const u8, target: []const u8) []const u8 {
 pub fn overlaps(a: []const u8, b: []const u8) bool {
     return under(a, b) or under(b, a);
 }
+
+/// The first path component of `target` below the directory `dir`, when `dir` is a proper ancestor of `target` ("/" and "/mnt/e/x" give
+/// "mnt"; "/mnt" and "/mnt/e" give "e"; "/mnt" and "/mnt" or "/other" give null). This is the one name a mount point adds to the listing of
+/// an ancestor directory.
+pub fn nextChild(dir: []const u8, target: []const u8) ?[]const u8 {
+    if (target.len <= dir.len or !under(target, dir)) return null;
+    const below = rest(target, dir);
+    if (below.len == 0) return null;
+    const end = std.mem.indexOfScalar(u8, below, '/') orelse below.len;
+    return below[0..end];
+}
