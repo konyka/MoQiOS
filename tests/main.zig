@@ -11378,9 +11378,34 @@ test "a process's name (comm) is set by the loader, exec, clone and PR_SET_NAME,
     try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "cur.comm = @import(\"comm_policy.zig\").fromProgram(name);") != null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.loader_source, "t.comm = @import(\"comm_policy.zig\").fromProgram(name);"));
     try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "child.comm = parent.comm;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, "\"Name:\\t\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.pid_status_source, "o.str(\"Name:\\t\");\n    o.str(s.name);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, "st.name = name[0..@import(\"../proc/comm_policy.zig\").textLen(&name)];") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, "\"Name:\\t\\tprocess") == null);
     try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, "\" (process) \"") == null);
     try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".pid_comm => generatePidComm(pid, buf, max_len),") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "str.eql(file_part, \"comm\")") != null);
+}
+
+test "/proc/<pid>/status is rendered by pid_status.zig from one snapshot of the task, and stat uses the same state mapping" {
+    // hello259: status printed only Name, State, Pid and PPid (with doubled tabs), no Tgid/Uid/Gid/Groups/Umask/Threads/..., and a thread's PPid was its
+    // leader's tid. Stopped processes showed as sleeping.
+    const ps = kt.procfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, ps, "return ps.render(buf, max_len, st);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ps, ".umask = tt.fsctx().umask,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ps, ".uid = .{ tt.uid, tt.euid, tt.suid, tt.euid },") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ps, "if (tt.is_thread and m.tid == tgid and !m.is_thread) ppid = m.parent_tid;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ps, "ps.stateOf(tt.state == .zombie, tt.stopped, tt.state == .blocked)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ps, "pid_status.zig\").stateOf(t.state == .zombie, t.stopped, t.state == .blocked).letter()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ps, "fn stateStr(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ps, "fn stateChar(") == null);
+}
+
+test "a default stop signal stops a sleeping target at once, without leaving the signal pending" {
+    // hello259: kill(pid, SIGSTOP) on a process blocked in a wait left it in that wait (a stop signal is not "actionable"), so /proc/<pid>/status
+    // never showed T. Leaving the bit pending as well would stop the task a second time when SIGCONT woke it.
+    const sg = kt.signal_source;
+    try std.testing.expect(std.mem.indexOf(u8, sg, "fn stopsBlockedTarget(t: *task.Task, signum: u32, idx: u32) bool {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sg, "if (stopsBlockedTarget(t, signum, @intCast(i))) {\n                stopTask(t);\n                return true;\n            }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sg, "if (cur == idx) return false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sg, "return t.sigact().handlers[signum - 1] == 0 and (t.signal_mask & bit) == 0;") != null);
 }

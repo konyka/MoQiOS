@@ -35,6 +35,8 @@ pub const fat32_source = @embedFile("fs/fat32.zig");
 pub const chdir_source = @embedFile("fs/chdir.zig");
 pub const sk34_source = @embedFile("shared/sk34.zig");
 pub const procfs_source = @embedFile("fs/procfs.zig");
+pub const pid_status_source = @embedFile("fs/pid_status.zig");
+pub const signal_source = @embedFile("proc/signal.zig");
 pub const ext2_source = @embedFile("fs/ext2.zig");
 pub const page_cache_source = @embedFile("fs/page_cache.zig");
 pub const splice_source = @embedFile("fs/splice.zig");
@@ -338,6 +340,7 @@ test {
     _ = @import("proc/sched_getaffinity_policy.zig");
     _ = @import("fs/slot_bitmap.zig");
     _ = @import("fs/procfs_policy.zig");
+    _ = @import("fs/pid_status.zig");
     _ = @import("fs/readlink_policy.zig");
     _ = @import("proc/close_range_policy.zig");
     _ = @import("proc/move_pages_policy.zig");

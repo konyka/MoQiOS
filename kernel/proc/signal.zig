@@ -131,6 +131,13 @@ pub fn sendSignalInfo(target_tid: u32, signum: u32, info: siginfo.Info) bool {
             if (signum == SIGCONT) continueTask(t);
             if (defaultAction(signum) == .terminate and t.stopped) t.stopped = false;
             t.sig_info[signum - 1] = info;
+            // A default stop reaches a task that is asleep right away: a blocked task would otherwise stay in its wait (a stop signal is
+            // not "actionable" for kickIfBlocked) and only stop once something woke it. The bit is not left pending, or the SIGCONT wake
+            // would deliver it and stop the task a second time. A running task (including the caller itself) takes the pending path.
+            if (stopsBlockedTarget(t, signum, @intCast(i))) {
+                stopTask(t);
+                return true;
+            }
             _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
             kickIfBlocked(@intCast(i));
             return true;
@@ -148,6 +155,20 @@ pub fn kickIfBlocked(idx: u32) void {
     if (t.state == .blocked and pendingActionable(t)) {
         task.unblockTask(idx);
     }
+}
+
+/// Whether `signum` sent to `t` stops it on the spot: the signal's default action is to stop, `t` has no handler for it (SIGSTOP never has
+/// one) and does not block it (SIGSTOP cannot be blocked), and `t` is asleep and is not the task running this call.
+fn stopsBlockedTarget(t: *task.Task, signum: u32, idx: u32) bool {
+    if (defaultAction(signum) != .stop) return false;
+    if (t.stopped or t.state != .blocked) return false;
+    const sched = @import("sched.zig");
+    if (sched.currentTaskIndex()) |cur| {
+        if (cur == idx) return false;
+    }
+    if (signum == SIGSTOP) return true;
+    const bit = @as(u64, 1) << @intCast(signum - 1);
+    return t.sigact().handlers[signum - 1] == 0 and (t.signal_mask & bit) == 0;
 }
 
 /// Job control: stop a task (SIGSTOP/SIGTTIN/SIGTTOU default). Running/ready

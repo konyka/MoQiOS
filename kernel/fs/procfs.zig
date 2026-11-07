@@ -223,21 +223,58 @@ fn generateUptime(buf: [*]u8, max_len: u32) u32 {
 }
 
 fn generatePidStatus(pid: u32, buf: [*]u8, max_len: u32) u32 {
-    const t = findTaskByPid(pid) orelse {
+    const task_mod = @import("../proc/task.zig");
+    const ps = @import("pid_status.zig");
+    var name: [16]u8 = undefined;
+    var groups: [@import("../proc/group_policy.zig").NGROUPS_MAX]u32 = undefined;
+    var st: ps.Status = undefined;
+    // One consistent snapshot under the task lock: the thread count and the leader's parent come from other task slots.
+    const flags = task_mod.lockTask();
+    var target: ?u32 = null;
+    var i: u32 = 0;
+    while (i < task_mod.MAX_TASKS) : (i += 1) {
+        const t = task_mod.getTask(i) orelse continue;
+        if (t.tid == pid) {
+            target = i;
+            break;
+        }
+    }
+    const t = if (target) |idx| (task_mod.getTask(idx) orelse null) else null;
+    if (t == null) {
+        task_mod.unlockTask(flags);
         return appendStr(buf, 0, max_len, "Pid: 0\nState: X (dead)\n");
+    }
+    const tt = t.?;
+    const tgid: u32 = if (tt.is_thread and tt.parent_tid != 0) tt.parent_tid else tt.tid;
+    var ppid: u32 = tt.parent_tid;
+    var threads: u32 = 0;
+    var j: u32 = 0;
+    while (j < task_mod.MAX_TASKS) : (j += 1) {
+        const m = task_mod.getTask(j) orelse continue;
+        const member_of = if (m.is_thread and m.parent_tid != 0) m.parent_tid else m.tid;
+        if (member_of == tgid and m.state != .zombie) threads += 1;
+        if (tt.is_thread and m.tid == tgid and !m.is_thread) ppid = m.parent_tid;
+    }
+    @memcpy(&name, &tt.comm);
+    const ng: usize = @min(@as(usize, tt.ngroups), groups.len);
+    @memcpy(groups[0..ng], tt.groups[0..ng]);
+    st = .{
+        .name = "",
+        .state = ps.stateOf(tt.state == .zombie, tt.stopped, tt.state == .blocked),
+        .tgid = tgid,
+        .pid = tt.tid,
+        .ppid = ppid,
+        .umask = tt.fsctx().umask,
+        .uid = .{ tt.uid, tt.euid, tt.suid, tt.euid },
+        .gid = .{ tt.gid, tt.egid, tt.sgid, tt.egid },
+        .fd_size = @import("vfs.zig").MAX_FDS,
+        .groups = groups[0..ng],
+        .threads = threads,
+        .no_new_privs = tt.no_new_privs,
     };
-
-    var pos: u32 = 0;
-    pos = appendStr(buf, pos, max_len, "Name:\t");
-    pos = appendStr(buf, pos, max_len, commText(t));
-    pos = appendStr(buf, pos, max_len, "\nState:\t");
-    pos = appendStr(buf, pos, max_len, stateStr(t.state));
-    pos = appendStr(buf, pos, max_len, "\nPid:\t");
-    pos = appendDec(buf, pos, max_len, t.tid);
-    pos = appendStr(buf, pos, max_len, "\nPPid:\t");
-    pos = appendDec(buf, pos, max_len, t.parent_tid);
-    pos = appendStr(buf, pos, max_len, "\n");
-    return pos;
+    task_mod.unlockTask(flags);
+    st.name = name[0..@import("../proc/comm_policy.zig").textLen(&name)];
+    return ps.render(buf, max_len, st);
 }
 
 /// The process name of `t` as text (its comm up to the first NUL).
@@ -340,20 +377,11 @@ fn generatePidStat(pid: u32, buf: [*]u8, max_len: u32) u32 {
     pos = appendStr(buf, pos, max_len, commText(t));
     pos = appendStr(buf, pos, max_len, ") ");
     // State character
-    pos = appendChar(buf, pos, max_len, stateChar(t.state));
+    pos = appendChar(buf, pos, max_len, @import("pid_status.zig").stateOf(t.state == .zombie, t.stopped, t.state == .blocked).letter());
     pos = appendStr(buf, pos, max_len, " ");
     pos = appendDec(buf, pos, max_len, @intCast(t.parent_tid));
     pos = appendStr(buf, pos, max_len, " 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n");
     return pos;
-}
-
-fn stateChar(state: @import("../proc/task.zig").TaskState) u8 {
-    return switch (state) {
-        .running => 'R',
-        .ready => 'S',
-        .blocked => 'D',
-        .zombie => 'Z',
-    };
 }
 
 /// Generate /proc/PID/cmdline
@@ -576,15 +604,6 @@ fn findTaskByPid(pid: u32) ?*const @import("../proc/task.zig").Task {
         }
     }
     return null;
-}
-
-fn stateStr(state: @import("../proc/task.zig").TaskState) []const u8 {
-    return switch (state) {
-        .ready => "S (sleeping)",
-        .running => "R (running)",
-        .blocked => "S (sleeping)",
-        .zombie => "Z (zombie)",
-    };
 }
 
 fn appendStr(buf: [*]u8, pos: u32, max_len: u32, s: []const u8) u32 {
