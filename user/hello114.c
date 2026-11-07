@@ -404,6 +404,14 @@ void _start(void) {
         }
         if (rfd >= 0) syscall1(SYS_CLOSE, (uint64_t)rfd);
         check(mnt_in_root == 1 && mnt_type == 4, "C: / lists mnt, the directory above the mount points, once");
+        /* stat("/mnt") is a directory (Linux), and the cwd can be set to it. */
+        struct kstat_t mst;
+        int64_t mdir_fd = syscall2(SYS_OPEN, (uint64_t)"/mnt", O_RDONLY);
+        int64_t msr = mdir_fd >= 0 ? syscall2(SYS_FSTAT, (uint64_t)mdir_fd, (uint64_t)&mst) : mdir_fd;
+        check(msr == 0 && (mst.w[3] & 0170000) == 0040000, "C: fstat of an open /mnt is a directory");
+        if (mdir_fd >= 0) syscall1(SYS_CLOSE, (uint64_t)mdir_fd);
+        check(syscall1(SYS_CHDIR, (uint64_t)"/mnt") == 0, "C: chdir to the directory above the mount points works");
+        syscall1(SYS_CHDIR, (uint64_t)"/");
     }
     n = slurp("/mnt/e/dir/sub/n.txt", small, sizeof(small));
     check(n == 7 && small[0] == 'n', "C: ext4 nested path");
@@ -532,6 +540,27 @@ void _start(void) {
     check(n == 9, "G: the remounted volume works");
     check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/again", 0) == 0, "G: final umount");
     check(syscall2(SYS_UMOUNT2, (uint64_t)"/mnt/again", 0) < 0, "G: umount of a non-mount fails");
+    {
+        /* With nothing mounted below it any more, /mnt is gone again (it only existed as the directory above the mount points). */
+        int64_t gone = syscall2(SYS_OPEN, (uint64_t)"/mnt", O_RDONLY);
+        check(gone == -ENOENT, "G: once the last volume is unmounted /mnt no longer exists");
+        if (gone >= 0) syscall1(SYS_CLOSE, (uint64_t)gone);
+        static char ubuf[2048];
+        int mnt_left = 0;
+        int64_t rfd2 = syscall2(SYS_OPEN, (uint64_t)"/", O_RDONLY);
+        for (;;) {
+            if (rfd2 < 0) break;
+            int64_t got = syscall3(SYS_GETDENTS, (uint64_t)rfd2, (uint64_t)ubuf, sizeof(ubuf));
+            if (got <= 0) break;
+            for (int64_t o = 0; o < got;) {
+                struct dirent64 *ud = (struct dirent64 *)(ubuf + o);
+                if (streq(ud->name, "mnt")) mnt_left++;
+                o += ud->reclen;
+            }
+        }
+        if (rfd2 >= 0) syscall1(SYS_CLOSE, (uint64_t)rfd2);
+        check(mnt_left == 0, "G: and / no longer lists mnt");
+    }
 
     /* K: mount-point rules */
     check(mount_expect("/dev/vblk1p1", "/", "ext4", -EBUSY), "K: mounting over / is refused");
