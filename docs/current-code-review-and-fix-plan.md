@@ -7239,7 +7239,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修改：把上一段 `readlink.zig` 里按描述符类型拼目标文本的那一大段**抽成独立模块 `fd_target.zig`**（`describe`），`readlink`、`open`、`stat` 共用同一份；新增 `resolveMagicLink`：名字是 `/proc/self/fd/N` 时换成描述符读回的路径，没有路径的（管道、套接字、event 对象）返回 `ENXIO`。FAT32 文件原来在 `readlink` 里落到 "file"，现在读回 `/<名字>`。`file_io.openAt` 和 `statx` 各加一处调用（`statx` 只在跟随链接时换名）。
 - 绿灯：hello257 现在 13 项（实际运行计数）通过；host 1077/1077。变异：让 `resolveMagicLink` 永远返回 `.same`（真编译）→ `open` 和 `stat` 两项失败（`open -2`、`rc -1`），其余通过；还原后通过。
 - 过程说明（如实）：①中间我在 `file_io.zig` 里加了 `const std`，抽出之后用不到，已删，`git diff` 里不再出现；②`host_test.zig` 里 `file_io_source`/`statx_source` 已存在，我重复添加被编译器拒绝，去掉了重复；③两条 host 形状测试因代码移动需要同步：`statx` 的 `openWithCredentials` 调用变量名变了（`stat_name`），readlink 形状测试改为检查 `fd_target.zig`——断言的是同样的意图。
-- 未验证：①`lstat("/proc/self/fd/N")` 是否返回符号链接没有测（这里 `lstat` 不换名，会按名字找，多半 `ENOENT`）；②`O_CREAT|O_EXCL` 等标志经过这个名字的行为；③`open` 到 `ENXIO` 的情形（管道）没有运行时用例；④描述符指向的文件被 `rename` 后 ext2 仍用旧名字。
+- `lstat` 一项见下一段（已处理）。未验证：①（已处理，见下）；②`O_CREAT|O_EXCL` 等标志经过这个名字的行为；③`open` 到 `ENXIO` 的情形（管道）没有运行时用例；④描述符指向的文件被 `rename` 后 ext2 仍用旧名字。
 
 ### hello174 排空完全停滞：第一次拿到收发两端的 TCP_INFO（本地 SMP=2 门禁里复现）
 
@@ -7247,3 +7247,20 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - **新的数据（TCP_INFO）**：发送方 `state=1 retransmits=0 rto_us=211000 unacked=0 rtt_us=11000 ssthresh=23168 cwnd=15`；接收方 `retransmits=0 unacked=0`。解读（推断，不是直接观察到原因）：发送方**没有任何在途未确认数据**（`unacked=0`），**没有重传**（`retransmits=0`），拥塞窗口是开的（15 个段），RTT 和 RTO 正常（11 ms、211 ms）——但环里仍有 47 KB 没有发出。这排除了我之前的两个候选：①"RTO 退避/重传"（没有重传，RTO 只有 211 ms）；②"拥塞窗口耗尽"（`unacked=0`，`cwnd` 有 15 段）。剩下的候选是：发送窗口 `snd_wnd` 为 0 且靠持续探测恢复（探测首次 2 s 之后翻倍，累计 2+4+8 = 14 s，与"10 秒内没恢复"吻合），或者发送被节拍（pacing）挡住而没有定时器再唤醒。`TCP_INFO` 里没有 `snd_wnd`，所以这两个仍无法区分。
 - 又加了一步诊断：`hello174` 的失败输出再加 `snd_mss` 和 `rcv_space`（接收方通告的窗口，在 `TCP_INFO` 里）。若接收方 `rcv_space` 为 0 或很小，就指向"接收方窗口没有重新打开"；若很大而发送方仍不发，就指向发送方的节拍/定时器。
 - 没有改内核：数据只排除了两个候选，仍不能指向一处具体的代码，凭推测改窗口或节拍逻辑风险大于收益。这条失败现在至少有两次留有同形状的现场（CI 的 `07ab4f0` 和这次本地），但根因仍未知；文档里还记着其它根因未知的偶发失败（`hello152`、`hello176` D、本轮的 `hello237` G 和 `hello227` B17），我没有统计哪个最频繁。
+
+#### `lstat("/proc/self/fd/N")`（hello257 续，已修）
+
+- 宿主机 Linux 实测：`lstat` 它得到符号链接，模式 0700，**大小恒为 64**（文件、管道、fd 0 都是 64，不是目标文本的长度）；不是描述符的数字失败；`lstat("/proc/self/fd")` 是目录。
+- 红灯：`lstat` 失败（-1，当作普通路径查找）。我第一版想报"目标文本的长度"作为大小，写之前先在宿主机上测了三种描述符，发现都是 64，所以按 64 实现（`MAGIC_LINK_SIZE`），没有写出错的版本。
+- 修改：`statx` 在不跟随链接时先问 `fd_target.isMagicLink`（名字是 `/proc/self/fd/N` 且 N 是打开的描述符），是则直接返回符号链接模式 `0o120700`、大小 64。
+- 绿灯：hello257 共 15 项（实际运行计数，含这两项）通过；host 1078/1078。变异：把模式改成普通文件 `0o100700`（真编译）→ "symlink 0" 失败，其余通过；还原后通过。
+- 未验证：①这个链接的 inode 号恒为 0、时间戳未设；②`fstatat(..., AT_SYMLINK_NOFOLLOW)` 走同一条路径但没有单独用例；③`lstat("/proc/self/fd")` 目录本身是否为目录没有测。
+
+### SMP=8 下 hello192 卡死：回写线程的等待节点成环（已改，验证见末尾）
+
+- 现象：SMP=8 的完整冒烟（或单独跑 hello192）概率性地卡在 hello192 里直到 900 秒超时，日志停在 `[kill] tid=N code=137`。对已推送的 `ae03047` 同样复现（本地三次卡死、一次通过，另有对照树上的卡死），所以与 lstat 改动无关。SMP=1/SMP=2（CI 跑的两档）一直稳定。
+- 证据（gdb 接到 QEMU，三次停滞现场，原始输出存于 `~/.cache/moqi-scratch/evidence/`，不在仓库里）：每次都是 0 号 CPU 在定时器中断里（IRQ 关闭）死循环于 `wakeOne(&wb_wait_queue)`，调用链 `writebackTimerTick` ← `bspSlowMaintenance` ← `timerTickFg`；其它 CPU 全部空闲；另一颗 CPU 在 `waitpid` 里自旋等一个僵尸，而僵尸要靠 0 号 CPU 继续往前走才能被收，于是整机停住。第三次转储直接看到队列里的节点 `next` 指向它自己（`node.next == node`），`wakeOne` 沿 `next` 找"最老的等待者"永远走不到头。
+- 根因（**直接观察到的是自环；成因路径是推理**）：`writebackThreadMain` 每圈在栈上重新声明 `var node: WaitNode`（每次同一个地址），再 `sleepOn` → `blockOn` 做 `node.next = queue.*; queue.* = node`。如果上一圈的睡眠没有被 `wakeOne` 摘除节点就返回（睡眠后没有切换、或被别的路径唤醒），节点仍挂在队列头，下一圈再推入时 `queue.* == &node`，于是 `node.next = &node`。`reaper.zig` 里早就有同样的防御（睡前把 `reaper_wq` 清空，注释写的正是"否则会把同一个节点链到自己"），回写线程当时没有。
+- 修改：回写线程是这个队列里**唯一**的等待者，不需要等待链表。去掉 `wb_wait_queue`，线程启动时把自己的任务槽号写进 `wb_thread_idx`（原子，release），循环里改成 `task.blockTask(idx)` + `sched.rescheduleAfterBlock()`；定时器 tick 用 `task.unblockTask(idx)` 唤醒（只在槽位是 `.blocked` 时才变为就绪，线程正在刷盘时唤醒是空操作）。链表没有了，也就没有可以成环的东西。丢唤醒的语义不变：最坏只是把刷盘推迟到下一次到期扫描（约 1 秒），到期的缓冲仍然可见，不会丢数据；多余的唤醒只会多做一次空扫描。
+- 测试：宿主机形状测试钉住"不再有 `wb_wait_queue`、有 `wb_thread_idx`/`NO_WB_THREAD`、tick 用 `unblockTask`"（host 1079/1079）。**这条测试证明不了卡死消失**，它只防止改回链表。
+- 其它栈上 `WaitNode` 使用点的审计（读代码，没有逐个加运行用例）：`futex`、`sysv_sem`、`timerfd`、`eventfd`、`devfs_proxy`、`devfs_nodes`（kmsg 与 watch）、`vfs` 管道（用任务里的固定节点，每次睡眠后都 `unlink`）、`task_sleep_lock`/`SleepLock`（唤醒没有授权时先 `unlinkLocked`）、`nvme`（`linked` 标志保证只链一次）、`klog` 都在醒来后摘除自己的节点或只链一次；只有 `reaper` 与（已改的）回写线程属于"每圈新节点、同址重推"的形状，`reaper` 已有防御。`sk19`/`sk20` 是启动自检，只睡一次。这是读代码的结论，不是证明；`wakeAll` 会让被摘下的节点彼此仍相连（`vfs` 的注释已指出，已在醒来后清 `next`），其它用 `wakeAll` 的地方没有逐一核对这个细节。

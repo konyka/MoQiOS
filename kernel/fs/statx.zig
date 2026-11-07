@@ -49,6 +49,13 @@ pub fn statx(dirfd: i64, pathname_ptr: u64, flags: u32, mask: u32, statxbuf_ptr:
         .path => |p| p,
         .err => |e| return e,
     };
+    // lstat("/proc/self/fd/N") describes the magic link itself: a symlink, mode 0700, size 64 (what Linux reports for all of them).
+    if (!args.follow) {
+        if (@import("fd_target.zig").isMagicLink(cur, use_name)) {
+            si.packStatx(&out, .{ .mode = 0o120700, .nlink = 1, .uid = cur.euid, .gid = cur.egid, .ino = 0, .size = @import("fd_target.zig").MAGIC_LINK_SIZE });
+            return if (copy.copyToUser(@ptrFromInt(statxbuf_ptr), &out, out.len) != out.len) -14 else 0;
+        }
+    }
     // AT_SYMLINK_NOFOLLOW on an ext2 symlink: describe the link inode itself
     // (a normal open would follow it).
     if (!args.follow) {

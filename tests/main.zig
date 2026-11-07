@@ -11350,3 +11350,22 @@ test "open and stat of /proc/self/fd/N act on the file the descriptor is open on
     // readlink and the resolver agree because both call describe().
     try std.testing.expect(std.mem.indexOf(u8, kt.readlink_source, "@import(\"fd_target.zig\").describe(t, fd_val, &text)") != null);
 }
+
+test "lstat of /proc/self/fd/N describes a symlink of size 64, as Linux does" {
+    // hello257: lstat of the magic link failed (it was looked up as a path); Linux reports a symlink, mode 0700, size 64 for every one.
+    try std.testing.expect(std.mem.indexOf(u8, kt.fd_target_source, "pub const MAGIC_LINK_SIZE: u64 = 64;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.fd_target_source, "pub fn isMagicLink(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.statx_source, ".mode = 0o120700, .nlink = 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.statx_source, "isMagicLink(cur, use_name)") != null);
+}
+
+test "the writeback thread is woken by task slot, not through a stack WaitNode list (SMP=8 hello192 hang)" {
+    // gdb showed wakeOne(&wb_wait_queue) spinning in the timer ISR on a node whose next pointed at itself: the thread re-declared its stack node at
+    // the same address every loop and relinked it while it was still queued.
+    const vfs = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "wb_wait_queue") == null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "var wb_thread_idx: u32 = NO_WB_THREAD;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "@atomicStore(u32, &wb_thread_idx, idx, .release);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "task_mod.blockTask(idx);\n        sched.rescheduleAfterBlock();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "if (idx != NO_WB_THREAD) @import(\"../proc/task.zig\").unblockTask(idx);") != null);
+}

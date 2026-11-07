@@ -126,6 +126,14 @@ int main(int argc, char **argv, char **envp) {
         long sr = stat(link, &st);
         snprintf(what, sizeof what, "stat(/proc/self/fd/N) describes the file (rc %ld, regular %d, size %ld)", sr, S_ISREG(st.st_mode), (long)st.st_size);
         check(sr == 0 && S_ISREG(st.st_mode) && st.st_size == 5, what);
+        struct stat ls;
+        memset(&ls, 0, sizeof ls);
+        long lr = lstat(link, &ls);
+        snprintf(what, sizeof what, "lstat(/proc/self/fd/N) describes the link itself: a symlink of mode 0700 and size 64 (rc %ld, symlink %d, size %ld, mode %o)", lr, S_ISLNK(ls.st_mode), (long)ls.st_size, ls.st_mode & 0777);
+        check(lr == 0 && S_ISLNK(ls.st_mode) && !S_ISREG(ls.st_mode) && ls.st_size == 64 && (ls.st_mode & 0777) == 0700, what);
+        long lgone = lstat("/proc/self/fd/900", &ls);
+        snprintf(what, sizeof what, "lstat of a number that is not a descriptor fails (%ld)", lgone);
+        check(lgone < 0, what);
         long gone = open("/proc/self/fd/900", O_RDONLY, 0);
         snprintf(what, sizeof what, "open of a number that is not a descriptor is ENOENT (%ld)", gone);
         check(gone == -ENOENT, what);

@@ -2570,7 +2570,13 @@ pub fn flushMappedInode(inode_id: u64) bool {
 
 /// Wait queue the writeback thread sleeps on; woken from the scheduler tick
 /// when expired dirty buffers exist.
-var wb_wait_queue: ?*@import("../proc/task.zig").WaitNode = null;
+/// Task slot of the writeback kernel thread, set by the thread itself before its first sleep; NO_WB_THREAD until then. The timer tick wakes the
+/// thread by slot (task.unblockTask), not through a wait list: the thread is the only waiter, and a list node that lives on its stack and is
+/// re-declared at the same address every iteration was left linked when the sleep returned without a wake, then linked to itself on the next
+/// iteration; wakeOne walked that cycle forever in the timer interrupt with IRQs off (an SMP=8 hang in hello192, gdb showed
+/// `node.next == node`).
+const NO_WB_THREAD: u32 = 0xFFFF_FFFF;
+var wb_thread_idx: u32 = NO_WB_THREAD;
 /// 1 once the writeback kernel thread exists (atomic — written from boot
 /// context, read from the timer ISR).
 var wb_thread_created: u8 = 0;
@@ -2592,9 +2598,13 @@ fn flushExpired() void {
 fn writebackThreadMain() callconv(.c) void {
     const sched = @import("../proc/sched.zig");
     const task_mod = @import("../proc/task.zig");
+    const idx = sched.currentTaskIndex() orelse return;
+    @atomicStore(u32, &wb_thread_idx, idx, .release);
     while (true) {
-        var node: task_mod.WaitNode = .{ .task_idx = 0 };
-        _ = sched.sleepOn(&wb_wait_queue, &node);
+        // Sleep until the tick unblocks this slot. A wake that arrives while the flush below runs finds the task running and does nothing, and
+        // a sleep that resumes without a wake just runs an early (empty) flush pass; neither leaves anything behind to corrupt.
+        task_mod.blockTask(idx);
+        sched.rescheduleAfterBlock();
         flushExpired();
     }
 }
@@ -2620,8 +2630,8 @@ pub fn writebackTimerTick() bool {
     const expired = writeback.writebackTimerTick();
     if (expired) {
         if (@atomicLoad(u8, &wb_thread_created, .acquire) != 0) {
-            const sched = @import("../proc/sched.zig");
-            _ = sched.wakeOne(&wb_wait_queue);
+            const idx = @atomicLoad(u32, &wb_thread_idx, .acquire);
+            if (idx != NO_WB_THREAD) @import("../proc/task.zig").unblockTask(idx);
         } else {
             // Early boot / thread creation failed: keep the old behaviour.
             flushExpired();

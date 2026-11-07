@@ -99,3 +99,21 @@ pub fn resolveMagicLink(t: *task_mod.Task, name: []const u8, buf: *[256]u8) Reso
         },
     }
 }
+
+/// Size lstat reports for a /proc/self/fd/N link. Linux gives 64 for every one of them, whatever it points at (measured), not the length of the
+/// target text.
+pub const MAGIC_LINK_SIZE: u64 = 64;
+
+/// True when `name` is "/proc/self/fd/N" and N is an open descriptor of `t`: the name of a magic link that lstat describes as a symlink.
+pub fn isMagicLink(t: *task_mod.Task, name: []const u8) bool {
+    const prefix = "/proc/self/fd/";
+    if (name.len <= prefix.len or !std.mem.startsWith(u8, name, prefix)) return false;
+    const rest = name[prefix.len..];
+    var fdn: u32 = 0;
+    var digits: usize = 0;
+    while (digits < rest.len and rest[digits] >= '0' and rest[digits] <= '9' and digits < 9) : (digits += 1) {
+        fdn = fdn * 10 + (rest[digits] - '0');
+    }
+    if (digits == 0 or digits != rest.len) return false;
+    return fdn < vfs_mod.MAX_FDS and t.fd_table.fds[fdn].fd_type != .none;
+}
