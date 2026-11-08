@@ -264,9 +264,6 @@ int main(int argc, char **argv, char **envp) {
     }
     kill(bk, SIGSTOP);
     int bstopped = wait_state(bk, "T (stopped)");
-    /* A process running on another CPU is marked stopped at once but only leaves its CPU at that CPU's next scheduler tick, so it may still tick the
-     * pipe for a moment after status says T (seen once in six runs at SMP=8). Let that tick pass, drain, and only then require silence. */
-    pause_ms(120);
     while (read(bp[0], tick, sizeof tick) > 0) {}
     pause_ms(300);
     int progress = read(bp[0], tick, sizeof tick) > 0;
@@ -276,12 +273,35 @@ int main(int argc, char **argv, char **envp) {
         resumed = read(bp[0], tick, sizeof tick) > 0;
         if (!resumed) pause_ms(10);
     }
+    /* The moment /proc says T the process must be off its CPU. A stop that only sets the state and lets the target resume user mode until the
+     * next scheduler tick (up to 10 ms) lets it write again after T is visible. Eight rounds, polling status without sleeping so the window is not
+     * hidden; each round drains the pipe at once and requires silence afterwards. A stop that waits for the tick fails nearly every round (8 of 8 measured); a host that has descheduled the target's vCPU can delay the IPI in an occasional round, so up to 3 late rounds are tolerated. */
+    int late_rounds = 0;
+    for (int round = 0; round < 8; round++) {
+        int again = 0;
+        for (int i = 0; i < 300 && !again; i++) {
+            again = read(bp[0], tick, sizeof tick) > 0;
+            if (!again) pause_ms(10);
+        }
+        kill(bk, SIGSTOP);
+        char spath[48], sv[64];
+        snprintf(spath, sizeof spath, "/proc/%ld/status", bk);
+        for (int i = 0; i < 20000; i++) {
+            if (field_of(spath, "State", sv, sizeof sv) && strncmp(sv, "T (stopped)", 11) == 0) break;
+        }
+        while (read(bp[0], tick, sizeof tick) > 0) {}
+        pause_ms(60);
+        if (read(bp[0], tick, sizeof tick) > 0) late_rounds++;
+        kill(bk, SIGCONT);
+    }
     kill(bk, SIGKILL);
     waitpid(bk, &st, 0);
     snprintf(what, sizeof what, "a computing process: SIGSTOP shows T (started %d, stopped %d)", started, bstopped);
     check(started && bstopped, what);
     check(!progress, "and it makes no progress while stopped");
     check(resumed, "and runs again after SIGCONT");
+    snprintf(what, sizeof what, "and once status shows T the process is off its CPU (%d of 8 rounds wrote afterwards)", late_rounds);
+    check(late_rounds <= 3, what);
 
     print(failures == 0 ? "hello259: PASS\n" : "hello259: FAIL\n");
     return failures;

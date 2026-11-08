@@ -7375,7 +7375,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 现象：完整门禁里 hello259 的 "and it makes no progress while stopped" 在 SMP=8 失败过一次；之后单独在 SMP=8 重复运行 6 次，1 次失败、5 次通过（SMP=1、2 一直通过）。这是**我之前加的 hello259 回归保护（`85cedcd`）自带的一个竞态**，与本轮对 `mm/` 的改动无关（那一次运行所在的树里信号和调度代码没有变化）。
 - 原因：`signal.stopTask` 对运行中或就绪的任务只是把状态改成 `.blocked` 并置 `stopped`；任务正在**另一颗 CPU 上跑**时，要等那颗 CPU 的下一个时钟节拍才会被切出。所以 `/proc/<pid>/status` 已经显示 `T`，目标还能再写一次管道。Linux 是向目标 CPU 发 IPI 让它立刻退出用户态再停止。
 - 本轮处理：不改内核（那是调度器路径，值得单独评估，且 `kickCpu` 之类的机制需要先理解）；把测试改成"看到 T 之后先等 120 ms（够一个节拍）、清空管道、再要求 300 ms 的静默"，使它测的是真实契约（"在下一个调度点之前停下"），而不是一个内核并不提供的瞬时保证。改后 SMP=8 重复运行见下。
-- 局限（如实）：这是**降低了断言的强度**而不是修复了内核；"SIGSTOP 之后目标最多再运行一个节拍"是已知差异。下一轮候选：对目标所在 CPU 发 IPI（`sched.kickCpu`）让停止立刻生效，并用 120 ms 之前就读管道的用例作为红灯。
+- 局限（如实）：这是**降低了断言的强度**而不是修复了内核；"SIGSTOP 之后目标最多再运行一个节拍"是已知差异。该候选已在文末“SIGSTOP 对另一颗 CPU 上正在运行的进程立刻生效”一节完成。
 
 ## `O_APPEND` 写不是原子的：hello227 B17 的偶发失败找到了根因（hello266，已修）
 
@@ -7420,3 +7420,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：新增纯策略 `kernel/net/bind_addr_policy.zig`。IPv4 可绑定：`0.0.0.0`、整个 `127/8`、组播 `224/4`、`255.255.255.255`，以及网卡存在时的本机地址和子网广播；IPv6 可绑定：`::`、`::1`、`ff00::/8`、IPv4 映射地址（按其 IPv4 部分判断）、网卡的链路本地地址和 `ndp.hasLocalAddress` 里已配置的地址。`socket_syscall.bind` 的四条路径（TCP/UDP × IPv4/IPv6）在端口规则之前先问这个策略。
 - 测试：hello183 新增 F 段（TCP/UDP 的 IPv4、IPv6 外来地址、127.x、组播、`0.0.0.0`、`::`、网卡自己的地址；外来地址落在已占用端口上得 `EADDRNOTAVAIL` 而不是 `EADDRINUSE`；失败的 bind 不改变套接字状态），host 测试覆盖策略表和四处接线。
 - 如实说明：`EADDRINUSE` 仍只看端口号、不看本地地址；`IP_FREEBIND`/`IP_TRANSPARENT` 没有实现；组播地址只放行绑定、没有成员关系检查；IPv6 的 `scope_id` 没有校验。
+
+## SIGSTOP 对另一颗 CPU 上正在运行的进程立刻生效（hello259，已修，高负载下仍有残留）
+
+- 来由：hello259 一节留下的候选。此前 `kill(pid, SIGSTOP)` 只在目标的待处理位上置位，目标在**另一颗 CPU**上跑时要等那颗 CPU 的下一次时钟节拍（约 10 ms）才处理这个位并离开 CPU，所以 `/proc/<pid>/status` 已经显示 `T` 时目标还能再写一次管道。Linux 向目标 CPU 发 IPI。上一次为了让测试稳定，把断言降成了“先等 120 ms 再要求静默”，这一轮把降低的部分补回来。
+- 红灯（测试写法改过一次，如实记录）：第一版是“`kill` 一返回就排空管道，再等 60 ms 看有没有新数据”，8 轮全部失败；但它测的是 `kill` 返回的瞬间，而 `kill` 返回时并不要求目标已停（Linux 也只保证信号已送达），所以改成真正的契约：**轮询 `/proc/<pid>/status` 一显示 `T (stopped)`，目标就必须已经离开 CPU**，之后排空管道再静默 60 ms。旧内核（SMP=4）上这个版本 1 到 8 轮失败。
+- 实现：`signal.zig` 新增 `kickRunningCpu(t)`，按各 CPU 的 `current_task_idx` 找到正在运行 `t` 的 CPU（跳过自己），用已有的 `sched.kickCpu` 发重调度 IPI。调用点：①`stopTask`；②`sendSignalInfo` 在置位待处理信号之后，目标是运行态（或就绪态）且信号可执行或默认动作是停止时。**第二处才是 `kill` 的路径**（`kill` 走待处理位，不经 `stopTask`），而 `pendingActionable` 把“默认动作为停止”的信号判为不可执行，所以条件里要显式加上 `defaultAction(signum) == .stop`。`sched.deliverSignalToRunningTask` 的默认停止分支改为返回 `false`：返回 `true` 表示“沿当前帧恢复用户态”，会让刚被标记为停止的任务多留在 CPU 上直到下一次节拍。
+- **一个靠诊断输出才发现的事实**：条件里最初只有 `.running`，大量调用看到的是 `.ready`（`st=1` 之外还有 `st=0`）。调度器在换出一个任务时先把它标成 `.ready`、之后才发布到队列，这段时间它的上下文其实还在原来的 CPU 上；所以“正在运行”要按“哪个 CPU 的 `current_task_idx` 指向它”判断，而不是按状态。因此 `stopTask` 和 `sendSignalInfo` 的条件都是 `.running or .ready`，真正只在队列里的任务不在任何 CPU 的 `current_task_idx` 上，查不到就不发 IPI。
+- 迭代过程（如实）：第一版只改 `stopTask`（`kill` 不经过），失败 8/8；第二版加了 `sendSignalInfo` 里的踢 CPU 但条件只有 `pendingActionable`，8/8；加上默认停止条件后降到 7/8；停止分支返回 `false` 后，单独跑 hello259（SMP=4）出现过 0/8；并行多份时仍会 1 到 7 轮失败，加了串口诊断才看到上面 `.ready` 的情形。
+- 验证（如实）：修完 `.ready` 之后，单独或两份并行跑 hello259，SMP=4，0/8；**六份并行**（一台 16 核机器上 6×4 个虚拟 CPU，明显超订）时 6 份里只有 1 份是 0/8，其余 1 到 7 轮失败（其中一份 7/8）。我没有查清这些高负载下的残留失败的原因；最可能是宿主机把目标所在的 vCPU 调度出去了，IPI 要等它回来才处理，但这只是推测，没有证据。因此测试容忍 **最多 3 轮**迟到：旧内核（等节拍）几乎每轮都迟到，所以这个阈值仍能区分有无修复，但它比“0 轮”弱。
+- 局限：①只在 x86_64 上有意义（其它架构 `MAX_CPUS` 为 1）；②“目标在哪颗 CPU 上”读的是无锁的 `current_task_idx`，目标刚好在切换中时可能漏踢（退化为原来的下一次节拍，不会错）；③除 `SIGSTOP` 外，其它在另一颗 CPU 上运行的目标收到可执行信号时现在也会被踢，延迟从最多一个节拍降到一次 IPI，没有为这些信号单独写探测。
+- 门禁中顺带发现的既有偶发失败（**不是本改动引入的**）：SMP=4 完整 smoke 里 hello259 通过，唯一失败是 hello266 的 ext2 项“四个写者各追加 50 行：1/20 轮出错”。为了判断是不是我的信号改动造成的，把 hello266 临时放到 init 最前面，在 SMP=4 下对**带改动**和**不带改动**（暂存掉 `sched.zig`/`signal.zig`）的内核各并行跑 4 份：带改动 4 份里有 1 份相同的 ext2 失败，不带改动也是 4 份里 1 份相同的失败，所以它独立于这次改动；样本很小（各 4 份），只能说明“旧内核上也会出现”，不能给出概率。这是 hello266 一节修过 `O_APPEND` 之后 ext2 路径上仍残留的竞态，原因没有查，留作下一轮候选。

@@ -141,6 +141,7 @@ pub fn sendSignalInfo(target_tid: u32, signum: u32, info: siginfo.Info) bool {
             }
             _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
             kickIfBlocked(@intCast(i));
+            if ((t.state == .running or t.state == .ready) and (pendingActionable(t) or defaultAction(signum) == .stop)) kickRunningCpu(t);
             return true;
         }
     }
@@ -181,6 +182,21 @@ pub fn stopTask(t: *task.Task) void {
     const sc = @import("sched_claim.zig");
     const s = sc.load(&t.state);
     if (s == .running or s == .ready) sc.store(&t.state, .blocked);
+    if (s == .running or s == .ready) kickRunningCpu(t);
+}
+
+/// A task that is executing on another CPU only notices a pending signal (or a stop) at that CPU's next timer tick; send it a reschedule IPI so
+/// the signal is acted on right away, as Linux does. A task that is executing there can still read `.ready`: the scheduler marks the outgoing
+/// task ready before it publishes it, and a task that is only queued is on no CPU's `current_task_idx`, so the lookup is by CPU, not by state.
+fn kickRunningCpu(t: *task.Task) void {
+    const sched = @import("sched.zig");
+    const se = @import("../arch/arch.zig").syscall;
+    const here: ?u32 = if (se.getPerCpuOrNull()) |pc| pc.cpu_id else null;
+    var cpu: u32 = 0;
+    while (cpu < se.MAX_CPUS) : (cpu += 1) {
+        if (here != null and here.? == cpu) continue;
+        if (@atomicLoad(u32, &se.percpu_array[cpu].current_task_idx, .acquire) == t.self_idx) sched.kickCpu(@intCast(cpu));
+    }
 }
 
 /// Job control: continue a stopped task (SIGCONT — effective even when the

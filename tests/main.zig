@@ -11632,3 +11632,16 @@ test "bind(): an address the host does not have is EADDRNOTAVAIL, checked before
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;\n        if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port)") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (bindAddrNotAvail4(.{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] })) return bind_addr_policy.EADDRNOTAVAIL;\n    if (net_mod.tcp_port_policy.bindNeedsPrivilege(port)") != null);
 }
+
+test "SIGSTOP on a task running on another CPU kicks that CPU instead of waiting for its next tick" {
+    const sig = kt.signal_source;
+    const start = std.mem.indexOf(u8, sig, "pub fn stopTask(t: *task.Task) void {") orelse return error.TestUnexpectedResult;
+    const body = sig[start..][0..std.mem.indexOf(u8, sig[start..], "\n}\n").?];
+    // A task marked ready can still be executing on its CPU (the scheduler marks the outgoing task ready before publishing it); the kick comes after the state change.
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (s == .running or s == .ready) sc.store(&t.state, .blocked);\n    if (s == .running or s == .ready) kickRunningCpu(t);") != null);
+    // The helper finds the CPU by the per-CPU current task index, skips the caller's own CPU, and sends the reschedule IPI.
+    try std.testing.expect(std.mem.indexOf(u8, sig, "se.percpu_array[cpu].current_task_idx, .acquire) == t.self_idx) sched.kickCpu(@intCast(cpu));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sig, "if (here != null and here.? == cpu) continue;") != null);
+    // A signal queued for a running target (the kill() path, where SIGSTOP is only pending) kicks it too.
+    try std.testing.expect(std.mem.indexOf(u8, sig, "kickIfBlocked(@intCast(i));\n            if ((t.state == .running or t.state == .ready) and (pendingActionable(t) or defaultAction(signum) == .stop)) kickRunningCpu(t);") != null);
+}
