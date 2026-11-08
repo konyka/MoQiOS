@@ -1,6 +1,6 @@
 //! The text of /proc/<pid>/status. Linux (measured with gcc probes) prints one "Key:\tvalue" line per field in a fixed order: Name, Umask
 //! (four octal digits), State, Tgid, Ngid, Pid, PPid, TracerPid, Uid and Gid (real, effective, saved and filesystem id, tab separated),
-//! FDSize, Groups (every group followed by a space), Threads, NoNewPrivs and the capability sets CapInh, CapPrm, CapEff, CapBnd and CapAmb (16 hex digits each). A runnable process is "R (running)", a blocked one
+//! FDSize, Groups (every group followed by a space), VmSize and VmRSS (kB, right-aligned in eight columns; absent for a kernel thread), Threads, NoNewPrivs and the capability sets CapInh, CapPrm, CapEff, CapBnd and CapAmb (16 hex digits each). A runnable process is "R (running)", a blocked one
 //! "S (sleeping)", a stopped one "T (stopped)" and one that exited but was not waited for "Z (zombie)".
 const std = @import("std");
 
@@ -56,6 +56,9 @@ pub const Status = struct {
     cap_prm: u64,
     cap_eff: u64,
     cap_bnd: u64,
+    /// Address-space size and resident size in kB; null for a task without a user address space (Linux prints no Vm lines for kernel threads).
+    vm_size_kb: ?u64 = null,
+    vm_rss_kb: ?u64 = null,
 };
 
 const Out = struct {
@@ -109,6 +112,25 @@ const Out = struct {
         }
     }
 
+    /// Linux prints these sizes right-aligned in eight columns: "VmSize:\t  231788 kB".
+    fn kb8(self: *Out, value: u64) void {
+        var tmp: [20]u8 = undefined;
+        var i: usize = tmp.len;
+        var v = value;
+        if (v == 0) {
+            i -= 1;
+            tmp[i] = '0';
+        }
+        while (v > 0) : (v /= 10) {
+            i -= 1;
+            tmp[i] = @intCast('0' + v % 10);
+        }
+        var width = tmp.len - i;
+        while (width < 8) : (width += 1) self.char(' ');
+        self.str(tmp[i..]);
+        self.str(" kB");
+    }
+
     fn ids(self: *Out, v: [4]u32) void {
         for (v, 0..) |id, k| {
             if (k != 0) self.char('\t');
@@ -142,6 +164,14 @@ pub fn render(buf: [*]u8, max_len: u32, s: Status) u32 {
     for (s.groups) |g| {
         o.dec(g);
         o.char(' ');
+    }
+    if (s.vm_size_kb) |size| {
+        o.str("\nVmSize:\t");
+        o.kb8(size);
+    }
+    if (s.vm_rss_kb) |rss| {
+        o.str("\nVmRSS:\t");
+        o.kb8(rss);
     }
     o.str("\nThreads:\t");
     o.dec(s.threads);
@@ -177,6 +207,8 @@ fn sample() Status {
         .cap_prm = 0xc0,
         .cap_eff = 0x80,
         .cap_bnd = 0x1ffffffffff,
+        .vm_size_kb = 231788,
+        .vm_rss_kb = 2780,
     };
 }
 
@@ -185,7 +217,7 @@ test "status text: every field in Linux order, tab separated" {
     const n = render(&buf, buf.len, sample());
     try std.testing.expectEqualStrings(
         "Name:\tcat\nUmask:\t0022\nState:\tR (running)\nTgid:\t42\nNgid:\t0\nPid:\t42\nPPid:\t7\nTracerPid:\t0\n" ++
-            "Uid:\t1000\t1001\t1002\t1001\nGid:\t1000\t1000\t1000\t1000\nFDSize:\t64\nGroups:\t10 1000 \nThreads:\t1\nNoNewPrivs:\t0\n" ++
+            "Uid:\t1000\t1001\t1002\t1001\nGid:\t1000\t1000\t1000\t1000\nFDSize:\t64\nGroups:\t10 1000 \nVmSize:\t  231788 kB\nVmRSS:\t    2780 kB\nThreads:\t1\nNoNewPrivs:\t0\n" ++
             "CapInh:\t0000000800000000\nCapPrm:\t00000000000000c0\nCapEff:\t0000000000000080\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n",
         buf[0..n],
     );
@@ -209,7 +241,7 @@ test "status text: umask is four octal digits, groups may be none, a thread has 
     s.no_new_privs = true;
     n = render(&buf, buf.len, s);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "Tgid:\t42\nNgid:\t0\nPid:\t43\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "Groups:\t\nThreads:\t2\nNoNewPrivs:\t1\nCapInh:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "Groups:\t\nVmSize:\t  231788 kB\nVmRSS:\t    2780 kB\nThreads:\t2\nNoNewPrivs:\t1\nCapInh:") != null);
 }
 
 test "status text: the output is cut at the buffer size and never overruns it" {
@@ -226,4 +258,17 @@ test "status state: stopped beats blocked, zombie beats everything, a ready task
     try std.testing.expectEqual(State.zombie, stateOf(true, true, true));
     try std.testing.expectEqual(@as(u8, 'T'), State.stopped.letter());
     try std.testing.expectEqualStrings("S (sleeping)", State.sleeping.text());
+}
+
+test "status text: Vm lines are right-aligned in eight columns and absent for a kernel thread" {
+    var s = sample();
+    var buf: [640]u8 = undefined;
+    s.vm_size_kb = 0;
+    s.vm_rss_kb = 123456789;
+    var n = render(&buf, buf.len, s);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "VmSize:\t       0 kB\nVmRSS:\t123456789 kB\nThreads:") != null);
+    s.vm_size_kb = null;
+    s.vm_rss_kb = null;
+    n = render(&buf, buf.len, s);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "Vm") == null);
 }

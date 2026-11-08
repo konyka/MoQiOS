@@ -226,6 +226,7 @@ fn generatePidStatus(pid: u32, buf: [*]u8, max_len: u32) u32 {
     const task_mod = @import("../proc/task.zig");
     const ps = @import("pid_status.zig");
     const cap_abi = @import("../proc/cap_abi.zig");
+    const user_space = @import("../mm/user_space.zig");
     var name: [16]u8 = undefined;
     var groups: [@import("../proc/group_policy.zig").NGROUPS_MAX]u32 = undefined;
     var st: ps.Status = undefined;
@@ -256,6 +257,11 @@ fn generatePidStatus(pid: u32, buf: [*]u8, max_len: u32) u32 {
         if (member_of == tgid and m.state != .zombie) threads += 1;
         if (tt.is_thread and m.tid == tgid and !m.is_thread) ppid = m.parent_tid;
     }
+    const root = tt.page_table_phys;
+    if (root != 0) user_space.retainUserSpace(root);
+    // The program image (up to the initial break) plus what the address space has been charged for since: heap, mappings and demand-faulted stack.
+    const image: u64 = if (tt.mm) |m| (if (m.brk_start > user_space.USER_CODE_BASE) m.brk_start - user_space.USER_CODE_BASE else 0) else 0;
+    const charged: u64 = if (tt.mm) |m| @atomicLoad(u64, &m.as_used, .monotonic) else 0;
     @memcpy(&name, &tt.comm);
     const ng: usize = @min(@as(usize, tt.ngroups), groups.len);
     @memcpy(groups[0..ng], tt.groups[0..ng]);
@@ -278,6 +284,11 @@ fn generatePidStatus(pid: u32, buf: [*]u8, max_len: u32) u32 {
         .cap_bnd = cap_abi.BOUNDING,
     };
     task_mod.unlockTask(flags);
+    defer if (root != 0) user_space.destroyUserSpace(root);
+    if (root != 0 and comptime @import("builtin").cpu.arch == .x86_64) {
+        st.vm_rss_kb = @import("../arch/x86_64/paging.zig").residentUserPages(root) * 4;
+        st.vm_size_kb = (image + charged) / 1024;
+    }
     st.name = name[0..@import("../proc/comm_policy.zig").textLen(&name)];
     return ps.render(buf, max_len, st);
 }

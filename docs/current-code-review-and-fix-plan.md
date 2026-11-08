@@ -7321,3 +7321,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 结果：hello263 10 项（实际运行计数）**第一次运行就全部通过**，是回归保护，没有红灯。变异检查：第一次的变异写得无法编译（"未使用的常量"），那次运行跑的是未变异的内核，结果无效，已丢弃；改成能编译的变异（`kill(-1)` 把调用者自己也算作目标）后，"C: but not the caller itself" 失败（handler 收到 12），其余通过；已还原。
 - 过程说明（如实）：宿主机探针的第一版因为子进程继承了我设的 handler 且 `signal()` 会重启 `read`，没有任何子进程死亡，结果无效；我清理了残留进程（3 个 `k0`，是上一个被中断的探针留下的），在子进程里恢复默认动作后重测。
 - 局限：①`kill(-1)` 在这个内核里没有"不同用户"的成员，所以"调用者无权发送的进程被跳过"的分支没有运行用例；②`kill(0, sig)` 对前台进程组、孤儿组没有单独测；③没有测 `kill(-1)` 对 init 的豁免。
+
+### `/proc/<pid>/status` 的 `VmSize` 与 `VmRSS`（hello264，已加）
+
+- 宿主机 Linux 实测（gcc 探针）：`mmap` 1 MiB 后 `VmSize` +1024 kB、`VmRSS` +0；逐页触碰后 `VmRSS` +1024 kB、`VmSize` 不变；`munmap` 两者各 -1024 kB；`sbrk(1 MiB)` 使 `VmSize` +1024 kB；`VmRSS` 不超过 `VmSize`；两行格式是 `VmSize:\t<n 右对齐 8 列> kB`；`Seccomp: 0` 和 `Seccomp_filters: 0` 也在 status 里（本内核没有 seccomp，这两行**没有加**）。
+- 红灯：hello264 第一次对当前内核运行，6 项里 5 项失败（两行都读回 -1，因为不存在）。
+- 修改：`pid_status.zig` 新增可选字段 `vm_size_kb`/`vm_rss_kb` 和 8 列右对齐的 `kb8`；`procfs.generatePidStatus` 在持有页表引用（`retainUserSpace`）时用 `residentUserPages` 算 `VmRSS`，`VmSize` 取"程序映像（初始 break 减 `USER_CODE_BASE`）加 `Mm.as_used`（堆、mmap 区域、按需增长的栈）"。没有用户地址空间的任务（内核线程）不输出 Vm 行，与 Linux 一致。`VmSize` 之所以要加映像：`as_used` 是 RLIMIT_AS 的计费，不含加载的程序段，只用它会出现 `VmSize < VmRSS`。
+- 第一版用例的问题（如实）：我按 Linux 的行为断言"`mmap` 之后 `VmRSS` 不变"，结果失败（+1024 kB）——本内核在 `mmap` 时就急切地填充匿名页（`mmap.zig` 注释里写明），Linux 是惰性的。这是已知的实现差异，不是这次引入的；我把用例改成检查总量（触碰后比 mmap 前多 1024 kB、`munmap` 后回到起点附近）并打印一行说明，而不是在断言里假装一致。
+- 绿灯：hello264 7 项（实际运行计数）通过；host 1096/1096。变异（真编译，各一次）：①`VmSize` 只算一半计费 → B、D、E 三项失败；②`VmRSS` 乘 2 而不是 4 → C、D 失败；均已还原。
+- 局限：①`VmSize` 是估算：映像大小取到初始 break，不含 `PT_TLS`、vdso/信号跳板页等；与 Linux 的绝对数值不可比，只有增减量可靠；②`VmRSS` 没有拆成 `RssAnon`/`RssFile`/`RssShmem`，也没有 `VmPeak`/`VmHWM`/`VmData`/`VmStk`/`VmExe`/`VmLib` 等行；③非 x86_64 构建不输出 Vm 行（`residentUserPages` 只在 x86_64 可用）；④急切填充使 `VmRSS` 在 `mmap` 瞬间就上升，与 Linux 不同；⑤`Seccomp` 行仍没有。

@@ -11441,3 +11441,13 @@ test "only SIGKILL takes a task out of the stopped state at once; other fatal or
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, sg, "if (signum == SIGKILL and t.stopped) t.stopped = false;"));
     try std.testing.expect(std.mem.indexOf(u8, sg, "defaultAction(signum) == .terminate and t.stopped") == null);
 }
+
+test "status VmSize is the program image plus the address space's charged bytes, and VmRSS the resident pages" {
+    // hello264: status had no Vm lines, so ps/top showed nothing for memory use.
+    const ps = kt.procfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, ps, "const image: u64 = if (tt.mm) |m| (if (m.brk_start > user_space.USER_CODE_BASE) m.brk_start - user_space.USER_CODE_BASE else 0) else 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ps, "@atomicLoad(u64, &m.as_used, .monotonic)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ps, "st.vm_size_kb = (image + charged) / 1024;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ps, "st.vm_rss_kb = @import(\"../arch/x86_64/paging.zig\").residentUserPages(root) * 4;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ps, "defer if (root != 0) user_space.destroyUserSpace(root);") != null);
+}
