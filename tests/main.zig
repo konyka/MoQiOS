@@ -11544,3 +11544,12 @@ test "an O_APPEND write to tmpfs finds the end and writes under one hold of the 
     defer std.testing.allocator.free(sh);
     try std.testing.expect(std.mem.indexOf(u8, sh, "write(g_out_fd, text, tl + 1);") != null);
 }
+
+test "O_APPEND writes to ext2 and FAT32 find the end and stage the data under one append lock" {
+    // hello266: with a tmpfs-only fix, four appenders on ext2 or FAT32 still lost lines (10 and 4 of 20 rounds); Linux loses none.
+    const v = kt.vfs_source;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, v, "if (appending) append_lock.lock();\n                defer if (appending) append_lock.unlock();"));
+    try std.testing.expect(std.mem.indexOf(u8, v, "var append_lock: @import(\"../sync/task_sleep_lock.zig\").SleepLock = .{};") != null);
+    // ext2 takes the end from currentSize (disk size or the end still staged by another appender), not from this descriptor's cached size.
+    try std.testing.expect(std.mem.indexOf(u8, v, "desc.file_size = @import(\"ext2.zig\").currentSize(desc.ext2_file_idx);\n                    desc.offset = desc.file_size;") != null);
+}

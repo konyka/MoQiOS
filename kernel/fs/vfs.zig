@@ -1697,8 +1697,11 @@ pub const FdTable = struct {
             .pipe_read => return -1,
             .fat32_file => {
                 // O_APPEND: every sequential write goes to the current end of the file, which another descriptor may have moved.
+                const appending = (desc.status_flags & 0x400) != 0;
+                if (appending) append_lock.lock();
+                defer if (appending) append_lock.unlock();
                 desc.file_size = @import("fat32.zig").currentSize(desc.fat32_file_idx);
-                if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
+                if (appending) desc.offset = desc.file_size;
                 const gate = fsizeGate(desc.offset, count);
                 if (gate < 0) return gate;
                 // Use writeback for delayed write coalescing
@@ -1709,7 +1712,14 @@ pub const FdTable = struct {
             .ramdisk_file => return -1,
             .rofs_file => return -30, // EROFS
             .ext2_file => {
-                if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
+                const appending = (desc.status_flags & 0x400) != 0;
+                if (appending) append_lock.lock();
+                defer if (appending) append_lock.unlock();
+                if (appending) {
+                    // The end of the file as every descriptor sees it: the disk size or the end of data still staged by another appender.
+                    desc.file_size = @import("ext2.zig").currentSize(desc.ext2_file_idx);
+                    desc.offset = desc.file_size;
+                }
                 const gate = fsizeGate(desc.offset, count);
                 if (gate < 0) return gate;
                 // Use writeback for delayed write coalescing
@@ -2734,6 +2744,10 @@ var mount_lock: IrqSpinlock = .{};
 /// Because only the holder changes which slots are in use, the free-slot and
 /// overlap checks stay valid after mount_lock is dropped for the device I/O.
 var mount_op_lock: @import("../sync/task_sleep_lock.zig").SleepLock = .{};
+
+/// Serialises O_APPEND writes to ext2 and FAT32 files: finding the end of the file and staging the data behind it have to happen as one step, or two
+/// appenders pick the same end and one overwrites the other. A sleeping lock because staging can flush to disk. Only appenders take it.
+var append_lock: @import("../sync/task_sleep_lock.zig").SleepLock = .{};
 
 const mount_path = @import("mount_path_policy.zig");
 

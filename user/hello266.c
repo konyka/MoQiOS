@@ -64,16 +64,26 @@ static int run(const char *path, int two_writes) {
 int main(int argc, char **argv, char **envp) {
     (void)argc; (void)argv; (void)envp;
     print("hello266: simultaneous O_APPEND writers\n");
-    char what[160];
-    int single_bad = 0, two_bad = 0;
-    for (int round = 0; round < 20; round++) {
-        if (!run("/tmp/h266_a", 0)) single_bad++;
-        if (!run("/tmp/h266_b", 1)) two_bad++;
+    char what[200];
+    /* The same test on each filesystem a program can write to: tmpfs, the FAT32 root (bare names) and ext2 (testdir/). */
+    static const struct { const char *label; const char *a; const char *b; } fs[3] = {
+        { "tmpfs", "/tmp/h266_a", "/tmp/h266_b" },
+        { "FAT32", "h266a", "h266b" },
+        { "ext2", "testdir/h266a", "testdir/h266b" },
+    };
+    for (int f = 0; f < 3; f++) {
+        int single_bad = 0, two_bad = 0;
+        for (int round = 0; round < 20; round++) {
+            if (!run(fs[f].a, 0)) single_bad++;
+            if (!run(fs[f].b, 1)) two_bad++;
+        }
+        snprintf(what, sizeof what, "%s: four writers each appending 50 two-byte lines with one write: exactly 400 bytes, every line whole (%d of 20 rounds wrong)", fs[f].label, single_bad);
+        check(single_bad == 0, what);
+        snprintf(what, sizeof what, "%s: the same with two writes per line loses no bytes (%d of 20 rounds wrong)", fs[f].label, two_bad);
+        check(two_bad == 0, what);
+        unlink(fs[f].a);
+        unlink(fs[f].b);
     }
-    snprintf(what, sizeof what, "A: four writers each appending 50 two-byte lines with one write: the file is exactly the 400 bytes, every line whole (%d of 20 rounds wrong)", single_bad);
-    check(single_bad == 0, what);
-    snprintf(what, sizeof what, "B: the same with two writes per line loses no bytes (%d of 20 rounds wrong)", two_bad);
-    check(two_bad == 0, what);
     print(failures == 0 ? "hello266: PASS\n" : "hello266: FAIL\n");
     return failures;
 }

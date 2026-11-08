@@ -7384,4 +7384,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello266（新增，2 项）在 SMP=8 上 20 轮里单次 `write` 版本出错 5 轮、两次 `write` 版本出错 4 轮。出错的是**内核**：tmpfs 的 `write` 先读文件大小设为偏移（`desc.offset = desc.file_size`），再另起一个临界区写入，两个追加者读到同一个末尾，后写的覆盖先写的。
 - 修改：①`tmpfs.zig` 新增 `tmpfsAppend`（在**同一次持有 tmpfs 锁**里取末尾并写入，把写入起点返回给调用者），`tmpfsWrite` 拆出 `writeLocked`；②`vfs.zig` 的 tmpfs `write` 在带 `O_APPEND` 时走 `tmpfsAppend`；③`sh.c` 的 `echo` 内建把文本和换行放进一次 `write`（不是根因，但减少一次与另一个写者交错的机会，也更接近真实 shell）。
 - 绿灯：hello266 两项通过（20 轮全对）；host 1107/1107。hello227 在这之前我也加了 30 轮两个同时追加的 `echo` 的用例；在**未修复**的内核上它那次**通过**（0 轮出错）——也就是说 hello227 里那个"三个进程、一次 `wait`"的结构没能复现竞争，只有 hello266 的直接构造才复现。所以 hello227 这条新增检查能防止回归，但并不是它抓到了缺陷。
-- 如实的局限：①**ext2 和 FAT32 的 `O_APPEND` 有同样的结构**（先设 `desc.offset = desc.file_size`，再 `bufferedWrite`），我没有修，也没有测它们——这是同类缺陷，下一轮候选；②fsize 限额检查仍用读到的旧偏移，只用来限制长度；③`tmpfsAppend` 解决的是两个写者同时追加；同一个描述符被多个线程共享偏移的情形没有单独测。
+- 如实的局限：①~~ext2 和 FAT32 的 `O_APPEND` 有同样的结构~~（已在下一小节修复）；②fsize 限额检查仍用读到的旧偏移，只用来限制长度；③`tmpfsAppend` 解决的是两个写者同时追加；同一个描述符被多个线程共享偏移的情形没有单独测。
+
+### ext2 与 FAT32 的 `O_APPEND` 同样不是原子的（hello266 扩展，已修）
+
+- 上一节留下的候选：这两个文件系统的追加写入结构相同（先取大小当偏移，再 `bufferedWrite` 暂存到回写缓冲）。把 hello266 扩展到三个文件系统（tmpfs `/tmp`、FAT32 根目录的裸名字、ext2 `testdir/`，路径沿用 hello248）。
+- 红灯：tmpfs 两项通过（上一节的修复）；FAT32 单次写 4/20 轮出错、两次写 16/20 轮出错；ext2 单次写 10/20、两次写 19/20。两次写版本更糟，因为两个追加者更容易读到同一个末尾。
+- 修改：`vfs.zig` 新增 `append_lock`（睡眠锁，因为暂存可能刷盘），ext2 与 FAT32 的 `write` 在带 `O_APPEND` 时持有它，一次完成"取末尾＋暂存数据"。ext2 的末尾改成 `ext2.currentSize`（磁盘大小或回写缓冲里别的追加者暂存的数据末尾，FAT32 本来就用它），而不是这个描述符缓存的 `file_size`。
+- 绿灯：hello266 六项全部通过（每个文件系统 0 轮出错）。变异（真编译，各一次）：去掉 ext2 的锁 → ext2 两项失败（5/20、20/20），tmpfs 与 FAT32 仍通过；去掉 FAT32 的锁 → FAT32 两项失败（6/20、18/20）；说明两处修复各自都必要。
+- 局限：①`append_lock` 是一个全局锁，所有 ext2/FAT32 的追加者排队（不同文件之间也互斥）；追加写入通常很短，我没有测量争用；②只有带 `O_APPEND` 的写入走这个锁，同一个文件上的非追加写（`pwrite`、普通偏移写）与追加者之间没有互斥——Linux 同样不保证它们之间的顺序；③**`writev` 不是原子的（读代码确认，没有运行用例）**：`readv.zig` 的 `writev` 对每个 iovec 的每个 4 KiB 块各调用一次 `fd_table.write`，所以一个带多个 iovec 的 `writev` 会被另一个追加者夹在中间；Linux 把整个 `writev` 当成一次原子追加。这是单独的缺陷，下一轮候选；④被 `fsizeGate` 限制长度的追加（RLIMIT_FSIZE）用锁内读到的偏移，行为不变。
