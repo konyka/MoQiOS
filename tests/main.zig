@@ -11491,3 +11491,10 @@ test "docs/user-space.md and moqios-architecture-current.md name the real last p
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, arch, ar_phrase));
     try std.testing.expect(std.mem.indexOf(u8, arch, "hello2–hello2") == null or std.mem.count(u8, arch, "hello2–hello2") == std.mem.count(u8, arch, ar_phrase));
 }
+
+test "status VmData is the address space's RLIMIT_DATA charge (heap and writable private mappings)" {
+    // hello264 G: VmData follows Mm.data_used, which excludes read-only and shared mappings, as Linux's data_vm does.
+    const ps = kt.procfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, ps, "@atomicLoad(u64, &m.data_used, .monotonic)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ps, "st.vm_data_kb = data_charged / 1024;") != null);
+}

@@ -259,7 +259,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello261 | 停止信号对睡眠进程、致命或有 handler 的信号对已停止进程（8 项）：带 handler 的 `SIGTSTP` 运行 handler 且 `read` 得 `-EINTR`、进程不停止；被屏蔽或忽略的 `SIGTSTP` 让睡眠者继续睡；`SIGTERM` 发给已停止的进程后它仍是 `T`，`SIGCONT` 之后才以信号 15 死亡；带 handler 的 `SIGTERM` 在 `SIGCONT` 之后才运行 handler；`SIGKILL` 立刻结束已停止的进程 |
 | hello262 | 发给整个进程组的信号 `kill(-pgid, sig)`（6 项）：两个睡眠成员同组；`SIGSTOP` 停止全员；`SIGTERM` 发给已停止的组后全员仍是 `T`，`SIGCONT` 之后以信号 15 死亡；`SIGKILL` 立刻结束已停止的组（信号 9）；默认 `SIGTSTP` 停止睡眠中的成员 |
 | hello263 | `kill(0, sig)` 与 `kill(-1, sig)`（10 项）：`kill(0)` 发给调用者所在进程组全员包括调用者自己、不碰其它组；`kill(0, 0)` 为 0；信号号 130 `EINVAL`；不存在的组或 pid `ESRCH`；`kill(-1)` 发给所有其它可发送的进程、不含调用者 |
-| hello264 | `/proc/<pid>/status` 的 `VmSize`/`VmRSS`（7 项）：两行存在且 `VmRSS` 不超过 `VmSize`；`mmap` 1 MiB 使 `VmSize` +1024 kB；逐页触碰后 `VmRSS` 比 `mmap` 前多 1024 kB 而 `VmSize` 不变；`munmap` 两者各 -1024 kB 且 `VmRSS` 回到起点附近；`sbrk` 1 MiB 使 `VmSize` +1024 kB；`/proc/<pid>/status` 与 `/proc/self/status` 一致。本内核在 `mmap` 时就填充匿名页，所以 `VmRSS` 在 `mmap` 瞬间就上升（Linux 是惰性的），用例打印这一差异而不断言它 |
+| hello264 | `/proc/<pid>/status` 的 `VmSize`/`VmRSS`/`VmData`（11 项）：两行存在且 `VmRSS` 不超过 `VmSize`；`mmap` 1 MiB 使 `VmSize` +1024 kB；逐页触碰后 `VmRSS` 比 `mmap` 前多 1024 kB 而 `VmSize` 不变；`munmap` 两者各 -1024 kB 且 `VmRSS` 回到起点附近；`sbrk` 1 MiB 使 `VmSize` +1024 kB；`/proc/<pid>/status` 与 `/proc/self/status` 一致；`VmData` 只计堆和可写私有映射（私有只读、共享映射不计，`sbrk` +1024 kB，`munmap` 可写私有映射 -1024 kB；`mprotect` 后 `VmData` 是否变化**没有**断言，本内核的数据账本不跟随 `mprotect`）。本内核在 `mmap` 时就填充匿名页，所以 `VmRSS` 在 `mmap` 瞬间就上升（Linux 是惰性的），用例打印这一差异而不断言它 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。

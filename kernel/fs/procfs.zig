@@ -262,6 +262,7 @@ fn generatePidStatus(pid: u32, buf: [*]u8, max_len: u32) u32 {
     // The program image (up to the initial break) plus what the address space has been charged for since: heap, mappings and demand-faulted stack.
     const image: u64 = if (tt.mm) |m| (if (m.brk_start > user_space.USER_CODE_BASE) m.brk_start - user_space.USER_CODE_BASE else 0) else 0;
     const charged: u64 = if (tt.mm) |m| @atomicLoad(u64, &m.as_used, .monotonic) else 0;
+    const data_charged: u64 = if (tt.mm) |m| @atomicLoad(u64, &m.data_used, .monotonic) else 0;
     @memcpy(&name, &tt.comm);
     const ng: usize = @min(@as(usize, tt.ngroups), groups.len);
     @memcpy(groups[0..ng], tt.groups[0..ng]);
@@ -288,6 +289,7 @@ fn generatePidStatus(pid: u32, buf: [*]u8, max_len: u32) u32 {
     if (root != 0 and comptime @import("builtin").cpu.arch == .x86_64) {
         st.vm_rss_kb = @import("../arch/x86_64/paging.zig").residentUserPages(root) * 4;
         st.vm_size_kb = (image + charged) / 1024;
+        st.vm_data_kb = data_charged / 1024;
     }
     st.name = name[0..@import("../proc/comm_policy.zig").textLen(&name)];
     return ps.render(buf, max_len, st);

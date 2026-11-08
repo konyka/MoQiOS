@@ -7338,3 +7338,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修改：5 处 `hello229` 改成 `hello264`；新增宿主机测试，从 `servers/init/main.c` 读最大编号，断言两份文档里的区间终点与它一致。测试对旧文本失败（我把那一句临时改回 hello229，得到 1097/1098），改回后通过。
 - 局限：守卫只管这两份文档里的"序列终点"这一个数字；其它文档里写死的项数、通过计数（例如各 hello 行里的"N 项"）仍靠人工核对，没有自动化。
 - 补充核对（只读，没有改动）：把 `docs/user-space.md` 里带"（N 项）"的 14 行逐个和 `user/helloN.c` 里的 `check(` 调用数对照。12 行一致；`hello248`（文档 9，源码 4 个调用点）是因为同一个 `run()` 对 tmpfs/FAT32/ext2 各执行一次，3×3=9，文档对；`hello256`（文档 8，源码 10 个调用点）是因为其中 2 个只在"回环对建不起来"的失败分支里，正常路径 8 项，文档对。所以没有发现错误的项数；这种启发式会误报，不适合做成自动守卫。
+
+### `VmData`，以及 `mprotect` 不更新数据账本的缺陷（hello264 G，部分已修、一处缺陷未修）
+
+- 宿主机 Linux 实测：`VmData` 只计堆和**可写的私有映射**；私有只读映射、共享映射都不计；`sbrk` 1 MiB +1024 kB；`munmap` 可写私有映射 -1024 kB；`mprotect` 把只读私有映射改成可写 +1024 kB，改回只读则减掉。在 `RLIMIT_DATA` 为 3 MiB 时，可写 2 MiB 成功、只读 2 MiB 成功，再 `mprotect` 成可写（合计 4 MiB）失败 `ENOMEM`。
+- 红灯：hello264 新增的 G 组 5 项在当前内核上全失败（`VmData` 读回 -1）。
+- 修改：`pid_status.zig` 增加可选 `vm_data_kb`；`procfs` 用 `Mm.data_used`（内核已有的 RLIMIT_DATA 计费）输出。可写私有映射 +1024、只读/共享 0、`sbrk` +1024、`munmap` -1024 都和 Linux 一致。
+- 绿灯：hello264 现在 11 项（实际运行计数）通过；host 1098/1098。变异（真编译）：让 `VmData` 读 `as_used` 而不是 `data_used` → "私有可写 +1024、只读 0、共享 0" 失败（读到 1024、1024、1024），其余通过；还原后通过。第一次的变异写得无法编译（未使用常量），那次 PASS 无效，已丢弃重做。
+- **未修的真实缺陷**：`mprotect` 完全不更新 `data_used`（`mprotect.zig` 里没有任何 `dataUsed`/`asUsed` 引用），所以①只读映射改成可写不增加 `VmData`，也**不会触发 `RLIMIT_DATA` 的 `ENOMEM`**（上面 Linux 实测会失败）；②可写改成只读后账本不减，`VmData` 偏高，之后 `munmap` 时按区域**当前记录**的 `prot`（匿名区域创建时记下，`mprotect` 只对文件区域更新）退款，所以账本可能多退或少退。我先写了 mprotect 的 G 项，红灯确认了它失败，然后因为修复需要让匿名区域记录和更新 `prot`、处理区域拆分、并做 RLIMIT_DATA 的 `ENOMEM` 预检，范围明显大于这一轮，**把那一项从用例里移出并在用例注释里写明未断言**，没有假装通过。这是下一轮的候选。
+- 其它局限：`VmStk`/`VmExe`/`VmLib`/`VmPeak`/`VmHWM`/`VmPTE`/`VmSwap` 等行仍没有。
