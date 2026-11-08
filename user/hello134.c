@@ -284,7 +284,6 @@ void _start(void) {
             int64_t c = syscall3(SYS_SOCKET, AF_UNIX, SOCK_STREAM, 0);
             int ok = syscall3(SYS_CONNECT, (uint64_t)c, (uint64_t)&ab, la) == 0;
             ok = ok && sendto0(c, "abs", 3) == 3;
-            sleep_ms(150);
             syscall1(SYS_CLOSE, (uint64_t)c);
             syscall1(SYS_EXIT, ok ? 0 : 1);
             for (;;) {}
@@ -311,6 +310,57 @@ void _start(void) {
         check(recvfrom0(d2, db, 8) == 3 && db[0] == 'h' && db[2] == 'y', "F: the datagram arrived");
         syscall1(SYS_CLOSE, (uint64_t)d1); syscall1(SYS_CLOSE, (uint64_t)d2); syscall1(SYS_CLOSE, (uint64_t)nob);
         syscall1(SYS_CLOSE, (uint64_t)srv); syscall1(SYS_CLOSE, (uint64_t)dupb); syscall1(SYS_CLOSE, (uint64_t)fsock);
+    }
+
+    /* G: a stream client that sends and closes while still waiting in the listener's queue: the connection and its bytes are still there to accept (Linux),
+     * followed by EOF. */
+    {
+        const char *pg = "/tmp/h134g.sock";
+        struct sockaddr_un ag;
+        uint64_t lg = mkaddr(&ag, pg);
+        syscall1(SYS_UNLINK, (uint64_t)pg);
+        int64_t lsn = syscall3(SYS_SOCKET, AF_UNIX, SOCK_STREAM, 0);
+        check(syscall3(SYS_BIND, (uint64_t)lsn, (uint64_t)&ag, lg) == 0 && syscall3(SYS_LISTEN, (uint64_t)lsn, 4, 0) == 0, "G: bind and listen");
+        int64_t cl = syscall3(SYS_SOCKET, AF_UNIX, SOCK_STREAM, 0);
+        check(syscall3(SYS_CONNECT, (uint64_t)cl, (uint64_t)&ag, lg) == 0, "G: connect (queued, not yet accepted)");
+        check(sendto0(cl, "quick", 5) == 5, "G: send while queued");
+        syscall1(SYS_CLOSE, (uint64_t)cl);
+        int64_t acc = syscall3(SYS_ACCEPT, (uint64_t)lsn, 0, 0);
+        check(acc >= 0, "G: the connection is still accepted after the client closed");
+        char gb[16] = {0};
+        check(acc >= 0 && syscall3(SYS_READ, (uint64_t)acc, (uint64_t)gb, 16) == 5 && gb[0] == 'q' && gb[4] == 'k', "G: and its bytes are readable");
+        check(acc >= 0 && syscall3(SYS_READ, (uint64_t)acc, (uint64_t)gb, 16) == 0, "G: then EOF");
+        check(acc >= 0 && sendto0(acc, "x", 1) == -EPIPE_, "G: and writing to it is EPIPE");
+        if (acc >= 0) syscall1(SYS_CLOSE, (uint64_t)acc);
+        /* A connector that closes without sending is still a connection to accept, with EOF at once. */
+        int64_t cl2 = syscall3(SYS_SOCKET, AF_UNIX, SOCK_STREAM, 0);
+        check(syscall3(SYS_CONNECT, (uint64_t)cl2, (uint64_t)&ag, lg) == 0, "G: connect again");
+        syscall1(SYS_CLOSE, (uint64_t)cl2);
+        int64_t acc2 = syscall3(SYS_ACCEPT, (uint64_t)lsn, 0, 0);
+        check(acc2 >= 0 && syscall3(SYS_READ, (uint64_t)acc2, (uint64_t)gb, 16) == 0, "G: a client that closed without sending is accepted and reads EOF");
+        if (acc2 >= 0) syscall1(SYS_CLOSE, (uint64_t)acc2);
+        /* Leak check: orphaned connections whose listener closes before accepting must not fill the socket table. */
+        syscall1(SYS_CLOSE, (uint64_t)lsn);
+        int leaked = 0;
+        for (int round = 0; round < 40; round++) {
+            int64_t l3 = syscall3(SYS_SOCKET, AF_UNIX, SOCK_STREAM, 0);
+            if (l3 < 0) { leaked = 1; break; }
+            syscall3(SYS_BIND, (uint64_t)l3, (uint64_t)&ag, lg);
+            syscall3(SYS_LISTEN, (uint64_t)l3, 4, 0);
+            for (int k = 0; k < 3; k++) {
+                int64_t c3 = syscall3(SYS_SOCKET, AF_UNIX, SOCK_STREAM, 0);
+                if (c3 < 0) { leaked = 1; break; }
+                syscall3(SYS_CONNECT, (uint64_t)c3, (uint64_t)&ag, lg);
+                sendto0(c3, "z", 1);
+                syscall1(SYS_CLOSE, (uint64_t)c3);
+            }
+            syscall1(SYS_CLOSE, (uint64_t)l3);
+            if (leaked) break;
+        }
+        int64_t probe = syscall3(SYS_SOCKET, AF_UNIX, SOCK_STREAM, 0);
+        check(!leaked && probe >= 0, "G: 120 orphaned connections whose listener closed do not exhaust the socket table");
+        if (probe >= 0) syscall1(SYS_CLOSE, (uint64_t)probe);
+        syscall1(SYS_UNLINK, (uint64_t)pg);
     }
 
     print(failures == 0 ? "hello134: PASS\n" : "hello134: FAIL\n");

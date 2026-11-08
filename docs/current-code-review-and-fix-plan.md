@@ -7453,5 +7453,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 来由：hello180/hello181 记录的已知差异“不支持抽象命名空间地址（以 NUL 开头的路径）——`bind` 本来就按 NUL 截断路径”。实际效果：`bind(\0name)` 的路径长度算成 0，被当成无效地址，D-Bus、systemd 的 notify 套接字、很多测试程序用的就是这种地址。
 - 红灯：hello134 新增 F 段 13 项；旧内核（SMP=2）上 `bind`、重复绑定、尾部多一个 NUL 的不同名字、`getsockname`、`connect`、数据报 `sendto` 等 10 项失败。
 - 实现：`socket_address_policy.zig` 新增 `unixNameLen`（路径名取到第一个 NUL；抽象名取 `addr_len - 2` 的全部字节、NUL 也算，所以 `\0a` 与 `\0a\0` 是不同的名字）、`unixIsAbstract`；`unixNameEncode` 对抽象名不追加结尾 NUL（长度 = 2 + 名字长度，与 Linux 的 `getsockname` 一致）。`bind`、`connect`、`unixDestPath`（`sendto`/`sendmsg` 的目的地）三处统一使用它。内核里的名字表本来就是“按长度比较字节”，所以抽象名和路径名不会相撞（路径名不会以 NUL 开头也不会为空）。
-- 绿灯：hello134 全部通过（SMP=2，两份）。其中一次调试教训：客户端 `connect` + `send` 之后立刻 `close`，服务端 `accept` 到的连接读不到数据（hello134 C 段的原有写法有同样的先后），所以 F 段客户端在关闭前先睡 150 ms；这是**测试写法的绕行，没有查清**为什么已建立连接的客户端提前关闭会让服务端读到 0 字节（Linux 上数据仍可读）——这可能是另一个缺陷，留作候选。
+- 绿灯：hello134 全部通过（SMP=2，两份）。其中一次调试教训：客户端 `connect` + `send` 之后立刻 `close`，服务端 `accept` 到的连接读不到数据（hello134 C 段的原有写法有同样的先后），所以 F 段客户端在关闭前先睡 150 ms；这个绕行在下一节查清并修复了（流式客户端在被 accept 之前 close 会丢连接和数据），F 段的睡眠已去掉。
 - 局限：①抽象套接字不存在于文件系统，本内核里普通路径名同样只是内核表里的名字而不是文件，所以“路径名要在文件系统里创建节点”这个差异仍然存在；②自动绑定（`bind` 只带 family，长度 2）没有实现；③`SO_PEERCRED` 等对抽象地址没有额外处理。
+
+## 流式客户端在被 `accept` 之前 `close`：连接和已发送的数据都丢了（hello134 G 段，已修）
+
+- 现象：上一节的 F 段客户端必须在 `close` 前睡一会儿才能让服务端读到数据，否则服务端 `accept` 挂住或读到 0 字节。hello134 C 段原有的写法也有同样的先后。
+- 根因：`unixClose` 对一个还在监听者队列里、没有被 `accept` 的连接者，先 `purgeFromBacklogsLocked` 把它从所有队列里摘掉再释放槽位——连接和它在 `pending` 里暂存的字节一起消失。Linux 里这个连接留在监听者的 accept 队列里，`accept` 仍能拿到，读到已发送的数据，然后是 EOF，写则是 `EPIPE`。
+- 红灯：把 F 段客户端的 150 ms 睡眠去掉后，旧内核上 hello134 在 F 段的 `accept` 处不再前进（日志停在 F 段第 6 项）；G 段另写 10 项覆盖了发送后立刻关闭、连接后不发送就关闭、以及泄漏检查。
+- 修改：`UnixSocket` 新增 `closed_queued`。`unixClose` 遇到“面向连接、未连接、不是监听者、仍在某个监听者队列里”的套接字，不再摘队列，而是把槽位标成 `closed_queued`（清掉绑定信息，保留 `pending` 里的字节），描述符关闭但槽位留着。`unixAccept` 取到这样的槽位时，建一个没有对端、环里放着 `pending` 字节的已接受套接字（读完后是 EOF，写是 `EPIPE`，`was_connected` 为真）并释放那个槽位。监听者自己关闭时，把队列里还残留的 `closed_queued` 槽位一并释放，避免套接字表被占满。
+- 绿灯：hello134 两份（SMP=2）全部 PASS，G 段里“120 个孤儿连接（监听者在 accept 前关闭）之后还能新建套接字”也过了——套接字表只有 32 个槽位，这一项如果泄漏会失败；host 测试是源码顺序/接线守卫。
+- 局限（如实）：①队列满（`UNIX_BACKLOG_MAX` = 4）时本来就 `EAGAIN`，关闭的连接者仍占队列位置直到被 accept 或监听者关闭，没有超时；②`closed_queued` 槽位对 `poll`/`epoll` 不可见（没有描述符），监听者的 `POLLIN` 仍然报告连接就绪，这与 Linux 一致；③只覆盖流套接字，SEQPACKET 走的是同一个 `connectionOriented` 判断，没有单独测；④`SO_PEERCRED` 对这样的已接受套接字取不到对端信息（没有对端），Linux 仍能取到关闭前的凭据，这个差异没处理。

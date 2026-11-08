@@ -99,6 +99,9 @@ pub const UnixSocket = struct {
     // they wait here and move to the accepted socket's ring at accept().
     pending: [UNIX_PENDING_MAX]u8 = @splat(0),
     pending_len: u16 = 0,
+    /// A stream client that close()d while still waiting in a listener's queue: the slot is kept (descriptor gone) with its bytes in `pending`, so
+    /// accept() still hands out the connection and the server reads the data, then EOF.
+    closed_queued: bool = false,
     /// Credentials of whoever sent the bytes now in this socket's ring (the
     /// latest sender); delivered by recvmsg when SO_PASSCRED is set.
     sender_cred: @import("sockopt_policy.zig").Cred = .{},
@@ -656,6 +659,30 @@ pub fn unixAccept(idx: u32) i32 {
     }
     if (new_idx >= MAX_UNIX_SOCKETS) return -24; // EMFILE
 
+    // The client closed while queued: the accepted socket has no peer. Its ring holds what the client sent, then it reads EOF and a write is EPIPE.
+    if (unix_sockets[conn_idx].closed_queued) {
+        const dead = &unix_sockets[conn_idx];
+        const n: usize = dead.pending_len;
+        unix_sockets[new_idx] = .{
+            .active = true,
+            .sock_type = sock.sock_type,
+            .connected = false,
+            .was_connected = true,
+            .name_only = true,
+            .path_len = sock.path_len,
+        };
+        @memcpy(unix_sockets[new_idx].path[0..sock.path_len], sock.path[0..sock.path_len]);
+        const nsock = &unix_sockets[new_idx];
+        if (n > 0) {
+            ringWrite(&nsock.buffer, nsock.buf_write, &dead.pending, n);
+            nsock.buf_write = (nsock.buf_write + @as(u32, @intCast(n))) % UNIX_SOCK_BUF_SIZE;
+            nsock.buf_count += @as(u32, @intCast(n));
+            wake.in |= EpollWake.bit(new_idx);
+        }
+        unix_sockets[conn_idx] = .{};
+        return @intCast(new_idx);
+    }
+
     // Initialize the new accepted socket
     unix_sockets[new_idx] = .{
         .active = true,
@@ -1135,10 +1162,25 @@ pub fn unixClose(idx: u32) void {
     }
     // Connectors still queued on this listener can never be accepted now.
     if (sock.listening) {
-        for (sock.backlog[0..sock.backlog_count]) |queued| wake.hup |= EpollWake.bit(queued);
+        for (sock.backlog[0..sock.backlog_count]) |queued| {
+            wake.hup |= EpollWake.bit(queued);
+            // A client that had already closed was only kept for this listener to accept: free its slot.
+            if (queued < MAX_UNIX_SOCKETS and unix_sockets[queued].closed_queued) unix_sockets[queued] = .{};
+        }
     }
     // DGRAM senders aimed at this socket now fail instead of blocking.
     wake.out |= sendersIntoLocked(idx);
+
+    // A stream client that connect()ed, is still waiting to be accepted and closes keeps its place in the queue (Linux): the listener can still
+    // accept it and read what it sent. Nothing else can use the slot meanwhile.
+    if (connectionOriented(sock.sock_type) and !sock.connected and !sock.listening and queuedOnBacklogLocked(idx)) {
+        sock.closed_queued = true;
+        sock.bound = false;
+        sock.path_len = 0;
+        sock.name_only = false;
+        sock.ref_count = 1;
+        return;
+    }
 
     // Drop this socket from every listener's backlog: its slot is about to be
     // reusable, and a stale entry would let accept() rewire an unrelated socket.

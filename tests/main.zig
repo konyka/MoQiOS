@@ -11695,3 +11695,16 @@ test "AF_UNIX abstract name vs pathname policies" {
     try std.testing.expectEqual(@as(u8, 0), out[2]);
     try std.testing.expectEqual(@as(u8, 0xaa), out[7]); // no NUL after
 }
+
+test "AF_UNIX: a stream client that closes while queued stays acceptable with its bytes" {
+    const us = kt.unix_socket_source;
+    // close(): a connector still sitting in a listener's queue is parked (closed_queued), not freed and not purged.
+    const park = std.mem.indexOf(u8, us, "if (connectionOriented(sock.sock_type) and !sock.connected and !sock.listening and queuedOnBacklogLocked(idx)) {\n        sock.closed_queued = true;") orelse return error.TestUnexpectedResult;
+    const purge = std.mem.indexOf(u8, us, "    purgeFromBacklogsLocked(idx);\n\n    // Notify peer that we closed") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(park < purge);
+    // accept(): such a slot yields a peerless socket holding the pending bytes, and the parked slot is released.
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (unix_sockets[conn_idx].closed_queued) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "        unix_sockets[conn_idx] = .{};\n        return @intCast(new_idx);") != null);
+    // The listener closing frees parked connectors it still queues, so the table cannot fill up.
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (queued < MAX_UNIX_SOCKETS and unix_sockets[queued].closed_queued) unix_sockets[queued] = .{};") != null);
+}
