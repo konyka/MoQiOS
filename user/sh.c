@@ -451,10 +451,13 @@ static int execute_pipeline(const char *line) {
             int idx = 0;
             while (rest[idx] && rest[idx] != ' ') idx++;
             while (rest[idx] == ' ') idx++;
-            char text[256];
-            unprotect(text, rest + idx, sizeof(text));
-            out_str(text);
-            out_str("\n");
+            char text[258];
+            unprotect(text, rest + idx, sizeof(text) - 2);
+            // One write for the text and its newline: two writers appending to one file (O_APPEND) must not interleave "x", "x", "\n", "\n".
+            size_t tl = 0;
+            while (text[tl]) tl++;
+            text[tl] = '\n';
+            write(g_out_fd, text, tl + 1);
             goto builtin_done;
         }
         if (strcmp(cmd, "export") == 0) {

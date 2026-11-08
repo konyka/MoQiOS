@@ -1763,7 +1763,7 @@ fn mergeIfAdjacent(task: *task_mod.Task, a: usize, b: usize) void {
 pub fn coalesceAnonymousAround(task: *task_mod.Task, addr: u64, len_pages: u64) void {
     const page = user_space.PAGE_SIZE;
     const lo = if (addr > page) addr - page else 0;
-    const hi = addr + len_pages * page + page;
+    const hi = (addr +| (len_pages *| page)) +| page;
     var progress = true;
     while (progress) {
         progress = false;
@@ -1825,8 +1825,14 @@ fn unmapTailOfMapping(cur: *task_mod.Task, cut_base: u64, cut_pages: u64) bool {
 /// Whether [addr, +pages) is covered end to end by tracked anonymous regions that touch each other (mprotect leaves one record per protection).
 fn coveredByAnonymousRegions(task: *task_mod.Task, addr: u64, pages: u64) bool {
     const page = user_space.PAGE_SIZE;
+    if (pages == 0) return false;
+    // Hostile sizes reach here (the hostile-argument sweep): a range that wraps the address space is never covered.
+    const span = @mulWithOverflow(pages, page);
+    if (span[1] != 0) return false;
+    const end_sum = @addWithOverflow(addr, span[0]);
+    if (end_sum[1] != 0) return false;
     var at = addr;
-    const end = addr + pages * page;
+    const end = end_sum[0];
     while (at < end) {
         var found = false;
         var bits = task.vma().active_bm;
@@ -1845,17 +1851,73 @@ fn coveredByAnonymousRegions(task: *task_mod.Task, addr: u64, pages: u64) bool {
     return true;
 }
 
+/// MREMAP_FIXED | MREMAP_MAYMOVE of a range of the same size that covers several anonymous records (after mprotect): each record is cut out at its own
+/// boundaries and moved to its place in the destination, so every piece keeps the protection it had. The checks that can refuse run first, for
+/// the destination as a whole, before anything changes.
+fn moveSpanningRecords(cur: *task_mod.Task, old_addr: u64, pages: u64, new_base: u64) i64 {
+    const PAGE: u64 = 4096;
+    if (new_base % PAGE != 0) return -22;
+    if (new_base < user_space.PAGE_SIZE or new_base >= user_space.USER_ADDR_MAX or
+        pages > (user_space.USER_ADDR_MAX - new_base) / user_space.PAGE_SIZE) return -22;
+    if (rangesOverlap(old_addr, pages, new_base, pages)) return -22;
+    if (!fixedReplaceable(cur, new_base, pages)) return -12;
+    // Pieces are split off first (this only edits the table), then each one is moved whole. The caller has checked that the range is covered by
+    // tracked records, so it cannot wrap; the sum is still done checked.
+    var at = old_addr;
+    const end_sum = @addWithOverflow(old_addr, pages *% PAGE);
+    if (end_sum[1] != 0) return -22;
+    const end = end_sum[0];
+    while (at < end) {
+        const idx = regionContaining(cur, at, 1) orelse return -14;
+        const r = &cur.vma().regions[idx];
+        at = r.base + r.num_pages * PAGE;
+    }
+    // Slots: the destination may need two to cut what it replaces (fixedReplaceable counted those), and a range that starts or ends inside a record
+    // needs one more per cut end (at most two). Every whole record moves in place and needs none.
+    const free_slots: u32 = @intCast(cur.vma().regions.len - @popCount(cur.vma().active_bm));
+    if (free_slots < 2) return -12;
+    // Make room: whatever the destination held goes away exactly as for a single-record fixed move.
+    unmapRange(cur, new_base, pages);
+    untrackMmapRange(cur, new_base, pages);
+    if (cur.mm) |m| m.locks.releaseLossy(new_base / PAGE, pages);
+    @import("../drivers/fbdev.zig").noteUnmap(cur, new_base, pages);
+    at = old_addr;
+    while (at < end) {
+        const idx = regionContaining(cur, at, 1) orelse return -14;
+        const r = &cur.vma().regions[idx];
+        const take = @min(r.base + r.num_pages * PAGE, end) - at;
+        const piece_pages = take / PAGE;
+        const split_idx = if (at == r.base and take == r.num_pages * PAGE) idx else blk: {
+            const plan = mremap_policy.plan(r.base / PAGE, r.num_pages, r.huge_pages, at / PAGE, piece_pages) orelse return -22;
+            const pieces = splitRegionForRange(cur, idx, plan, at);
+            break :blk pieces.mid;
+        };
+        const to = new_base + (at - old_addr);
+        const moved = moveMapping(cur, &cur.vma().regions[split_idx], to, piece_pages, piece_pages);
+        if (moved < 0) return moved;
+        at += take;
+    }
+    coalesceAnonymousAround(cur, new_base, pages);
+    return @bitCast(new_base);
+}
+
 /// The part of mremap that runs under the VM lock once the arguments are validated. A range that is only part of a
 /// tracked region is first split off as a region of its own (Linux splits the vma the same way), the whole-region code
 /// then moves or resizes it, and the pieces that end up adjacent again are merged back.
 fn mremapRegion(cur: *task_mod.Task, old_addr: u64, old_pages: u64, new_pages: u64, mflags: u32, new_addr_hint: u64) i64 {
     const PAGE: u64 = 4096;
-    // A shrink whose range crosses protection boundaries (several records after an mprotect): Linux unmaps the tail whatever vmas it spans.
-    if (old_addr % PAGE == 0 and new_pages < old_pages and (mflags & MREMAP_FIXED) == 0 and regionContaining(cur, old_addr, old_pages) == null and
-        coveredByAnonymousRegions(cur, old_addr, old_pages))
-    {
-        if (!unmapTailOfMapping(cur, old_addr + new_pages * PAGE, old_pages - new_pages)) return -12;
-        return @bitCast(old_addr);
+    // A range that crosses protection boundaries (several records after an mprotect). Linux (measured): shrinking unmaps the tail whatever vmas it
+    // spans; growing it is EFAULT, with or without MAYMOVE; moving it with MREMAP_FIXED and the same size carries every piece along.
+    if (old_addr % PAGE == 0 and regionContaining(cur, old_addr, old_pages) == null and coveredByAnonymousRegions(cur, old_addr, old_pages)) {
+        if (new_pages < old_pages and (mflags & MREMAP_FIXED) == 0) {
+            // covered end to end by tracked records, so old_addr + old_pages * PAGE does not wrap and new_pages < old_pages keeps this inside it.
+            if (!unmapTailOfMapping(cur, old_addr + new_pages * PAGE, old_pages - new_pages)) return -12;
+            return @bitCast(old_addr);
+        }
+        if (new_pages > old_pages) return -14; // EFAULT
+        if (new_pages == old_pages and (mflags & MREMAP_FIXED) != 0 and (mflags & MREMAP_MAYMOVE) != 0) {
+            return moveSpanningRecords(cur, old_addr, old_pages, new_addr_hint);
+        }
     }
     if (old_addr % PAGE == 0) if (regionContaining(cur, old_addr, old_pages)) |idx| {
         const r = &cur.vma().regions[idx];

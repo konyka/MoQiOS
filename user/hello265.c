@@ -136,6 +136,57 @@ int main(int argc, char **argv, char **envp) {
     snprintf(what, sizeof what, "J: and the ledger afterwards is what is left (page 0 is PROT_NONE, page 1 was cut, pages 2 and 3 are data: %ld)", j1 - j0);
     check(j1 - j0 == -8, what);
 
+    /* mremap across a protection boundary, the cases beyond the shrink above (Linux, measured): growing a range that spans two mappings is EFAULT
+     * (with or without MAYMOVE); a same-size move to a free address works and the pieces keep their own protections; a shrink to 3 of 4 pages works. */
+    {
+        char *g = (char *)anon(4 * 4096, RW, 0);
+        mprotect(g + 4096, 4096, PROT_READ);
+        errno = 0;
+        void *gr = mremap(g, 4 * 4096, 8 * 4096, MREMAP_MAYMOVE);
+        int ge = errno;
+        snprintf(what, sizeof what, "K: growing a range that spans two mappings is EFAULT (%p, errno %d)", gr, ge);
+        check(gr == (void *)-1 && ge == EFAULT, what);
+
+        char *s3 = (char *)anon(4 * 4096, RW, 0);
+        mprotect(s3 + 4096, 4096, PROT_READ);
+        void *sr = mremap(s3, 4 * 4096, 3 * 4096, MREMAP_MAYMOVE);
+        snprintf(what, sizeof what, "K: shrinking 4 pages to 3 across the boundary works in place (%p)", sr);
+        check(sr == (void *)s3, what);
+
+        char *mv = (char *)anon(4 * 4096, RW, 0);
+        mv[3 * 4096] = 7;
+        mprotect(mv + 4096, 4096, PROT_READ);
+        char *dest = (char *)0x300000000UL;
+        void *mr = mremap(mv, 4 * 4096, 4 * 4096, MREMAP_MAYMOVE | MREMAP_FIXED, dest);
+        snprintf(what, sizeof what, "K: a same-size fixed move across the boundary works and the data comes along (%p)", mr);
+        check(mr == (void *)dest && dest[3 * 4096] == 7, what);
+        long k0 = vmdata();
+        munmap(dest, 4 * 4096);
+        long k1 = vmdata();
+        snprintf(what, sizeof what, "K: and the moved pieces keep their protections: unmapping them gives back the writable pages only (%ld)", k1 - k0);
+        check(k1 - k0 == -12, what);
+        munmap(g, 4 * 4096);
+        munmap(s3, 3 * 4096);
+
+        /* Forty mappings that mprotect split and joined again, each moved on and kept alive at its own address, fit the 64-record table. This pins
+         * the first-page round trip (the join after mprotect); it does NOT pin the join after a spanning move, which no observable here depends on. */
+        int loop_ok = 1;
+        char *dests[40];
+        int moved_n = 0;
+        for (int n = 0; n < 40; n++) {
+            char *q = (char *)anon(3 * 4096, RW, 0);
+            if (q == (char *)-1) { loop_ok = 0; break; }
+            if (mprotect(q + 4096, 4096, PROT_READ) != 0 || mprotect(q + 4096, 4096, RW) != 0) { loop_ok = 0; munmap(q, 3 * 4096); break; }
+            char *want = (char *)0x310000000UL + (unsigned long)n * 0x10000UL;
+            void *qm = mremap(q, 3 * 4096, 3 * 4096, MREMAP_MAYMOVE | MREMAP_FIXED, want);
+            if (qm != (void *)want) { loop_ok = 0; munmap(q, 3 * 4096); break; }
+            dests[moved_n++] = want;
+        }
+        snprintf(what, sizeof what, "K: forty split-and-rejoined mappings, moved on and kept alive, fit the region table (%d moved)", moved_n);
+        check(loop_ok && moved_n == 40, what);
+        for (int n = 0; n < moved_n; n++) munmap(dests[n], 3 * 4096);
+    }
+
     /* MAP_FIXED over an exact private region has its own fast path (hello65), which only swaps read-write regions in place. A region mprotect made
      * read-only used to be taken for read-write by it (the region never recorded the change); it must take the general path and still succeed. */
     char *h = (char *)anon(MB, RW, 0);

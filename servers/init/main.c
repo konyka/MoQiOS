@@ -382,6 +382,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello263"); /* kill(0) and kill(-1) */
     run_test("hello264"); /* VmSize / VmRSS */
     run_test("hello265"); /* mprotect and the RLIMIT_DATA ledger */
+    run_test("hello266"); /* simultaneous O_APPEND writers */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

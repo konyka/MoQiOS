@@ -264,6 +264,9 @@ int main(int argc, char **argv, char **envp) {
     }
     kill(bk, SIGSTOP);
     int bstopped = wait_state(bk, "T (stopped)");
+    /* A process running on another CPU is marked stopped at once but only leaves its CPU at that CPU's next scheduler tick, so it may still tick the
+     * pipe for a moment after status says T (seen once in six runs at SMP=8). Let that tick pass, drain, and only then require silence. */
+    pause_ms(120);
     while (read(bp[0], tick, sizeof tick) > 0) {}
     pause_ms(300);
     int progress = read(bp[0], tick, sizeof tick) > 0;

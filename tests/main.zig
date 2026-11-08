@@ -2744,7 +2744,7 @@ test "mlock is wired into reclaim, madvise and every path that removes or moves 
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "(advice == 4 or advice == 8) and @import(\"../../mm/mm.zig\").Mm.locked(") != null);
     // munmap, MAP_FIXED (two paths), mremap shrink and mremap move all adjust the table.
     const mm_src = kt.mmap_mlock_source;
-    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, mm_src, "m.locks.releaseLossy(")); // + the MREMAP_FIXED destination
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, mm_src, "m.locks.releaseLossy(")); // + the MREMAP_FIXED destination, + the destination of a move that spans several records
     try std.testing.expect(std.mem.indexOf(u8, mm_src, "base_table.moved(") != null);
     try std.testing.expect(std.mem.indexOf(u8, mm_src, "m.locks = t;") != null);
 }
@@ -11511,4 +11511,36 @@ test "mprotect records the new protection on anonymous regions and keeps the RLI
     try std.testing.expect(std.mem.indexOf(u8, mp, "if (aplan.overlap != .none and r.prot != new_prot_u8) slots_needed += aplan.slots_needed;") != null);
     // The fast path for MAP_FIXED over an exact region only takes regions that are still read-write.
     try std.testing.expect(std.mem.indexOf(u8, kt.mmap_source, "and !r.no_free and (r.prot & 3) == 3;") != null);
+}
+
+test "mremap across several anonymous records: shrink unmaps the tail, grow is EFAULT, a same-size fixed move carries every piece" {
+    // hello265 J/K: after mprotect a mapping is several records; mremap used to demand a single one and answered EINVAL.
+    const m = kt.mmap_mlock_source;
+    try std.testing.expect(std.mem.indexOf(u8, m, "fn coveredByAnonymousRegions(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "if (new_pages > old_pages) return -14; // EFAULT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "return moveSpanningRecords(cur, old_addr, old_pages, new_addr_hint);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "fn unmapTailOfMapping(") != null);
+    // The shrink and the cross-record shrink share one preflight-and-cleanup function.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, m, "unmapTailOfMapping(cur,"));
+}
+
+test "mremap's cross-record helpers never overflow on a hostile size (hello192's sweep panicked on 'integer overflow' here)" {
+    // coveredByAnonymousRegions computed addr + pages * page in plain u64; the hostile-argument sweep passes sizes up to 2^64 - 4096.
+    const m = kt.mmap_mlock_source;
+    try std.testing.expect(std.mem.indexOf(u8, m, "const span = @mulWithOverflow(pages, page);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "const end_sum = @addWithOverflow(addr, span[0]);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "const hi = (addr +| (len_pages *| page)) +| page;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "const end_sum = @addWithOverflow(old_addr, pages *% PAGE);") != null);
+}
+
+test "an O_APPEND write to tmpfs finds the end and writes under one hold of the tmpfs lock" {
+    // hello266: two appenders each read the file size, then wrote at it, so one overwrote the other (host Linux: 0 wrong rounds; here up to 5 of 20).
+    try std.testing.expect(std.mem.indexOf(u8, kt.tmpfs_source, "pub fn tmpfsAppend(idx: Idx, data: [*]const u8, count: u32, end_out: *u64) i64 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.tmpfs_source, "return writeLocked(idx, entry.size, data, count);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "tmpfs.tmpfsAppend(@intCast(desc.tmpfs_idx), buf, @intCast(gate), &began_at)") != null);
+    // The shell's echo builtin writes the text and its newline with one call.
+    const io = std.testing.io;
+    const sh = try std.Io.Dir.cwd().readFileAlloc(io, "user/sh.c", std.testing.allocator, .limited(4 * 1024 * 1024));
+    defer std.testing.allocator.free(sh);
+    try std.testing.expect(std.mem.indexOf(u8, sh, "write(g_out_fd, text, tl + 1);") != null);
 }

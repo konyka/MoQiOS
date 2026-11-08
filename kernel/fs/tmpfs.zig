@@ -396,6 +396,23 @@ pub fn tmpfsWrite(idx: Idx, offset: u64, data: [*]const u8, count: u32) i64 {
     if (idx >= MAX_FILES) return -1;
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
+    return writeLocked(idx, offset, data, count);
+}
+
+/// O_APPEND write: the end of the file is read and the data is written under ONE hold of the tmpfs lock, so two appenders can never pick the same end
+/// and overwrite each other (Linux makes an O_APPEND write atomic with respect to other appenders). Returns the bytes written, or a negative errno
+/// as tmpfsWrite does; `end_out` receives the offset the write began at.
+pub fn tmpfsAppend(idx: Idx, data: [*]const u8, count: u32, end_out: *u64) i64 {
+    if (idx >= MAX_FILES) return -1;
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    const entry = &entries[idx];
+    if (!entry.active or entry.is_dir) return -1;
+    end_out.* = entry.size;
+    return writeLocked(idx, entry.size, data, count);
+}
+
+fn writeLocked(idx: Idx, offset: u64, data: [*]const u8, count: u32) i64 {
 
     const entry = &entries[idx];
     if (!entry.active or entry.is_dir) return -1;

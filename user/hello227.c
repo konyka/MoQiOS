@@ -512,6 +512,27 @@ int main(int argc, char **argv, char **envp) {
     check(exited(st, 0), "B: a script with 18 background jobs on one line and a bare 'wait' ends with status 0");
     int order_ok = strcmp(jb2, "x\nx\ny\n") == 0;
     check(order_ok, "B: and 'wait' returned only after both slow jobs outside the table were done (their lines come before the line after 'wait')");
+
+    /* Two builtin echoes appending to one file at the same moment must not interleave: each line is written whole. Linux's O_APPEND makes every
+     * write() atomic, but a shell that writes "x" and "\n" separately lets the other's bytes land in between ("xx\n\n"). 30 rounds of two
+     * background echoes. */
+    int interleave_bad = 0;
+    for (int round = 0; round < 30; round++) {
+        unlink("/tmp/h227_ap");
+        f = fopen("/tmp/h227_apscript", "w");
+        if (!f) { interleave_bad = 1; break; }
+        fputs("echo x>>/tmp/h227_ap&\necho x>>/tmp/h227_ap&\nwait\n", f);
+        fclose(f);
+        system("sh /tmp/h227_apscript");
+        char got[16];
+        memset(got, 0, sizeof got);
+        f = fopen("/tmp/h227_ap", "r");
+        if (f) { fread(got, 1, sizeof got - 1, f); fclose(f); }
+        if (strcmp(got, "x\nx\n") != 0) interleave_bad++;
+    }
+    char msg[160];
+    snprintf(msg, sizeof msg, "B: 30 rounds of two simultaneous appending echoes always give exactly 'x\\nx\\n' (%d rounds were wrong)", interleave_bad);
+    check(interleave_bad == 0, msg);
     if (!order_ok) {
         /* What the file really held: x is a slow job finishing, y the line after 'wait'. */
         char shown[32];

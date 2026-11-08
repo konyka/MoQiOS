@@ -1751,11 +1751,18 @@ pub const FdTable = struct {
             .tmpfs_file => {
                 const tmpfs = @import("tmpfs.zig");
                 desc.file_size = tmpfs.tmpfsGetSize(@intCast(desc.tmpfs_idx));
-                if ((desc.status_flags & 0x400) != 0) desc.offset = desc.file_size;
+                const appending = (desc.status_flags & 0x400) != 0;
+                if (appending) desc.offset = desc.file_size;
                 const gate = fsizeGate(desc.offset, count);
                 if (gate < 0) return gate;
-                const n = tmpfs.tmpfsWrite(@intCast(desc.tmpfs_idx), desc.offset, buf, @intCast(gate));
+                // An appending write finds the end and writes in one critical section; the offset read above only feeds the RLIMIT_FSIZE gate.
+                var began_at: u64 = desc.offset;
+                const n = if (appending)
+                    tmpfs.tmpfsAppend(@intCast(desc.tmpfs_idx), buf, @intCast(gate), &began_at)
+                else
+                    tmpfs.tmpfsWrite(@intCast(desc.tmpfs_idx), desc.offset, buf, @intCast(gate));
                 if (n > 0) {
+                    if (appending) desc.offset = began_at;
                     desc.offset += @intCast(n);
                     desc.file_size = tmpfs.tmpfsGetSize(@intCast(desc.tmpfs_idx));
                 }
