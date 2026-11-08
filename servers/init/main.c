@@ -379,6 +379,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello260"); /* capget / capset */
     run_test("hello261"); /* stop and fatal signals vs sleeping and stopped processes */
     run_test("hello262"); /* signals to a process group */
+    run_test("hello263"); /* kill(0) and kill(-1) */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

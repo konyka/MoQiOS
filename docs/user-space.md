@@ -258,6 +258,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello260 | `capget`/`capset` 遵循 Linux ABI（29 项）：能力用 Linux 编号（CAP_SETGID 6、CAP_SETUID 7），V3/V2 返回两组、V1 只写一组并保留高位字；未知版本 `EINVAL` 且头部回写 V3，数据指针为 NULL 时的探测返回 0；负 pid `EINVAL`、不存在的 pid `ESRCH`、NULL 头部 `EFAULT`；`capset` 对别的进程（含 -1）`EPERM`、要没有持有的能力（包括高位字）`EPERM`、没有数据指针 `EFAULT`；丢弃 CAP_SETGID 后不能再要回；`/proc/self/status` 的 `CapInh`/`CapPrm`/`CapEff`/`CapBnd`/`CapAmb` 各 16 位十六进制并随 `capset` 变化 |
 | hello261 | 停止信号对睡眠进程、致命或有 handler 的信号对已停止进程（8 项）：带 handler 的 `SIGTSTP` 运行 handler 且 `read` 得 `-EINTR`、进程不停止；被屏蔽或忽略的 `SIGTSTP` 让睡眠者继续睡；`SIGTERM` 发给已停止的进程后它仍是 `T`，`SIGCONT` 之后才以信号 15 死亡；带 handler 的 `SIGTERM` 在 `SIGCONT` 之后才运行 handler；`SIGKILL` 立刻结束已停止的进程 |
 | hello262 | 发给整个进程组的信号 `kill(-pgid, sig)`（6 项）：两个睡眠成员同组；`SIGSTOP` 停止全员；`SIGTERM` 发给已停止的组后全员仍是 `T`，`SIGCONT` 之后以信号 15 死亡；`SIGKILL` 立刻结束已停止的组（信号 9）；默认 `SIGTSTP` 停止睡眠中的成员 |
+| hello263 | `kill(0, sig)` 与 `kill(-1, sig)`（10 项）：`kill(0)` 发给调用者所在进程组全员包括调用者自己、不碰其它组；`kill(0, 0)` 为 0；信号号 130 `EINVAL`；不存在的组或 pid `ESRCH`；`kill(-1)` 发给所有其它可发送的进程、不含调用者 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。
