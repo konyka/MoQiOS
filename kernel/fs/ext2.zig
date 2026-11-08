@@ -1120,7 +1120,9 @@ pub fn refreshSize(file_idx: u32) u64 {
 /// with the cache: after a truncate through another descriptor the file is SHORTER than the cache says. A truncate below the staged data
 /// flushes and drops it first (`truncateFile`), so the staged end never outlives the cut.
 pub fn currentSize(file_idx: u32) u64 {
-    const disk = refreshSize(file_idx);
+    // Staged end FIRST, disk size second. A flush writes the data (which updates the inode size) and only then retires the staged buffer, so
+    // a staged end that is already gone means the disk size already includes it. The other order can read the old disk size, then find the
+    // buffer retired, and report a size that is short by the flushed data: an appender then overwrites it.
     const flags = fs_lock.acquire();
     if (file_idx >= open_count or open_files[file_idx].inode_num == 0) {
         fs_lock.release(flags);
@@ -1128,7 +1130,9 @@ pub fn currentSize(file_idx: u32) u64 {
     }
     const inode_id: u64 = 0x3000_0000_0000_0000 + @as(u64, open_files[file_idx].inode_num);
     fs_lock.release(flags);
-    return @max(disk, @import("writeback.zig").stagedEnd(inode_id, .ext2));
+    const staged = @import("writeback.zig").stagedEnd(inode_id, .ext2);
+    const disk = refreshSize(file_idx);
+    return @max(disk, staged);
 }
 
 /// Figures for statfs(2): the superblock's own counters (kept current by every block and inode allocation and free). `bavail` leaves out

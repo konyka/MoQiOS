@@ -560,10 +560,15 @@ pub fn currentSize(idx: u32) u64 {
         fs_lock.release(flags);
         return 0;
     }
-    const recorded: u64 = files[idx].size;
     const inode_id: u64 = 0x2000_0000_0000_0000 + @as(u64, files[idx].first_cluster);
     fs_lock.release(flags);
-    return @max(recorded, @import("writeback.zig").stagedEnd(inode_id, .fat32));
+    // Staged end FIRST, recorded size second: a flush updates the recorded size before it retires the staged buffer, so a buffer that has
+    // already gone means the size already includes it (the other order can miss the flushed data on both reads).
+    const staged = @import("writeback.zig").stagedEnd(inode_id, .fat32);
+    const flags2 = fs_lock.acquire();
+    const recorded: u64 = if (idx < file_count and files[idx].active) files[idx].size else 0;
+    fs_lock.release(flags2);
+    return @max(recorded, staged);
 }
 
 /// Best-effort prefetch of aligned 4 KiB pages into a descriptor's readahead

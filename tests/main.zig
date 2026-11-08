@@ -11645,3 +11645,18 @@ test "SIGSTOP on a task running on another CPU kicks that CPU instead of waiting
     // A signal queued for a running target (the kill() path, where SIGSTOP is only pending) kicks it too.
     try std.testing.expect(std.mem.indexOf(u8, sig, "kickIfBlocked(@intCast(i));\n            if ((t.state == .running or t.state == .ready) and (pendingActionable(t) or defaultAction(signum) == .stop)) kickRunningCpu(t);") != null);
 }
+
+test "currentSize reads the staged end before the recorded size so a concurrent flush cannot make both reads short" {
+    const e = kt.ext2_source;
+    const es = std.mem.indexOf(u8, e, "pub fn currentSize(file_idx: u32) u64 {") orelse return error.TestUnexpectedResult;
+    const eb = e[es..][0..std.mem.indexOf(u8, e[es..], "\n}\n").?];
+    const e_staged = std.mem.indexOf(u8, eb, "stagedEnd(inode_id, .ext2)") orelse return error.TestUnexpectedResult;
+    const e_disk = std.mem.indexOf(u8, eb, "refreshSize(file_idx)") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(e_staged < e_disk);
+    const f = kt.fat32_source;
+    const fs_ = std.mem.indexOf(u8, f, "pub fn currentSize(idx: u32) u64 {") orelse return error.TestUnexpectedResult;
+    const fb = f[fs_..][0..std.mem.indexOf(u8, f[fs_..], "\n}\n").?];
+    const f_staged = std.mem.indexOf(u8, fb, "stagedEnd(inode_id, .fat32)") orelse return error.TestUnexpectedResult;
+    const f_rec = std.mem.indexOf(u8, fb, "files[idx].size else 0") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(f_staged < f_rec);
+}
