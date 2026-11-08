@@ -5819,7 +5819,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 问题：①`TIOCOUTQ`/`SIOCOUTQ` 对套接字返回 `ENOTTY`；②（探测发现）TCP 交付速率采样接受任何“有时间流逝”的确认，小写入加延迟 ACK 产生的极低速率样本被发送节拍当成路径带宽，连接被节拍到几乎停住且无法恢复。
 - 排查过程（如实）：先把 hello173 的 TCP 排空检查写成“settle 200 ms 后队列为 0”，红灯；我先怀疑是 100 ms 延迟 ACK，把等待放宽后小写入通过，但大块仍无法排空。打印得到：写入阶段结束时对端只收到 1548 字节，发送方队列 64087；对端以 10 ms 间隔不停地读，却每约 1.3 秒才收到一个段（共 20 秒只到 24728 字节）。我先试了“读后窗口更新”（`windowUpdateWanted`），无效，已撤回（窗口并没有关闭）。最后沿着“每个段间隔 1.3 秒”找到 `bbrPacedRate`：`delivery_rate` 来自 `noteDelivery`，而第一次小写入（100 B / 约 400 ms）给出约 250 B/s，1460 / 250 ≈ 5.8 s 一段，且是 EWMA 只向下缓慢收敛。这是一个与 SIOCOUTQ 无关的、早就存在的 TCP 缺陷，之前的大块传输测试之所以没暴露，是因为它们建立连接后立即发送大量数据（第一个样本就是大样本）。
 - 修复：见 `docs/kernel-subsystems.md` 的 hello173 条：`TIOCOUTQ` 的 TCP/AF_UNIX/UDP 分支；`deliverySampleUsable` 过滤应用受限与空闲间隔的样本。
-- 已知差异：`SIOCINQ`（=FIONREAD）本就支持；`SIOCOUTQNSD`（0x894B，未发送字节）未实现；TCP 的 `SIOCOUTQ` 含“已发送未确认”，与 Linux 一致；AF_UNIX 数据报的长度前缀字节计入了队列（Linux 按 skb 真实大小计，同样大于载荷）。
+- 已知差异：`SIOCINQ`（=FIONREAD）本就支持；`SIOCOUTQNSD`（0x894B，未发送字节）已在 hello173 E 段补上（见文末对应一节）；TCP 的 `SIOCOUTQ` 含“已发送未确认”，与 Linux 一致；AF_UNIX 数据报的长度前缀字节计入了队列（Linux 按 skb 真实大小计，同样大于载荷）。
 - TDD：host 新增 2 个测试（`TIOCOUTQ` 不是终端请求、各描述符类型的分支与夹取、`tcpSendQueued`/`unixSendQueued` 的形状；`deliverySampleUsable` 的六种边界与接线）；hello173（A AF_UNIX 流、B AF_UNIX 数据报、C TCP：空闲为 0、小写入排空、对端不读时 >0 且不超过写入量、对端读完在 20 秒内收齐并排空，D UDP 回答 0、stdout 为 `ENOTTY`）在旧内核上 14 项 FAIL（其中 TCP 大块排空 20 秒超时），新内核 PASS。
 - **hello136 E 段的一次偶发失败（探测自身的竞态，已修）**：门禁的 SMP=8 冒烟里出现一次 `hello136: FAIL E: the lowest-numbered pending signal is delivered first`（其余 PASS）。原因在探测程序：三个信号 10/33/35 的处理函数没有互相屏蔽，处理函数里非原子地写 `order[got_count]`，若一个信号在处理函数内被时钟中断再投递，两个处理函数会交错。内核的“最低编号先投递”（`dequeueSignal` 用 `@ctz`）没有问题。随后在同一棵树上 SMP=8 连跑 4 次全部通过；我把三个 `sigact` 的 `sa_mask` 设为这三个信号，使处理函数互斥，之后 hello136 PASS。**这是对一次失败的推断式解释**（没有抓到失败现场），但该修改消除了已知的交错可能，且不改变被测的内核行为。
 - 变异（具名测试核对）：非套接字也回答 0、不夹取到非负 int、TCP 报告接收侧、把 `TIOCOUTQ` 当终端请求、AF_UNIX 不校验反向引用、AF_UNIX 报告自己的环、速率样本接受空闲间隔、接受不超过一个 MSS 的样本、采样器绕过规则，共 9 个，全部被 `ioctl(TIOCOUTQ)…` 或 `TCP delivery-rate samples…` 抓住（“接受小样本”那个第一次因未使用参数编译失败，改成等价可编译形式后抓住）；恢复后 `grep -c MUTATION` 为 0。
@@ -7405,3 +7405,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 同类排查：内核里其余的 `asm volatile ("sti")`（`userdrv.zig` 等待循环、`waitpid.zig`、`jobctl.zig`、`task.zig` 的 reap 自旋）都在释放 `irq_lock` / `task_lock` 之后才开中断，不在持锁期间；`cli` 只剩 `smp.zig` 的两处（核停机路径）。没有第二处同类缺陷。
 - CI：`4e41a85` 的 Test 工作流整体通过（18 分 57 秒，含此前超时的 Smoke SMP=2）。
 - hello210 `pthread_exit` 崩溃（`r8 == 0`，见上文“门禁里的一次用户态崩溃”）的追加排查，仍未找到原因：①`futex_call` 不会丢 `r8`——syscall 入口（`syscall_entry.zig`）整套 GPR 压栈/弹栈，futex 分发只读 `frame.r8`，全仓只有 sigreturn/clone/fork 三处写 `frame.r8`；②中断入口 `commonStub`（`idt.zig`）同样保存并恢复 `r8`。所以“内核在返回用户态时改了 `r8`”这条路排除了；剩下的是 `fs:0` 本身读到了 0（TCB 指针丢失）或 TCB 块被复用，仍待复现。
+
+## `SIOCOUTQNSD`（0x894B）：TCP 套接字里“已写入但还没发出”的字节数（hello173 E 段，已补）
+
+- 来由：上面 hello170 一节把 `SIOCOUTQNSD` 记成“未实现”。Linux 的行为很窄：只有 TCP 回答（`write_seq - snd_nxt`），UDP、AF_UNIX 和其他描述符都是 `ENOTTY`，这一点和 `SIOCOUTQ` 不同（`SIOCOUTQ` 对 UDP 回 0、对 AF_UNIX 回未读字节数）。
+- 红灯：hello173 新增 E 段 9 项，在旧内核上 5 项失败（请求是未知号，TCP 的 4 项都得 `ENOTTY`/`EINVAL`），3 项 `ENOTTY` 的恰好通过——它们对任何未知请求都成立，所以不能当作覆盖。
+- 实现：`tcp.tcpSendUnsent` 返回发送环从发送游标 `send_unacked` 到 `send_tail` 的字节数（与 `tcpSendQueued` 同样无锁读）；`ioctl.zig` 新增 `SIOCOUTQNSD` 分支：参数空/内核地址 `EFAULT`，非 TCP 描述符 `ENOTTY`，结果按非负 `int` 封顶后写回。
+- 绿灯：hello173 全部 PASS（E 段 9 项，其中 TCP 5 项由红转绿）；SMP=1 完整 smoke 通过；host 测试通过（新增一个源码连线测试）；aarch64、riscv64 构建通过。SMP=2 没有再单独跑。
+- 如实说明：E 段只断言“未发送 ≤ 已排队”和“空闲/读空后为 0”，**没有**断言某个具体的非零未发送值——回环上发送游标推进得很快，一个具体数字会依赖时序。所以这个调用的“非零时对不对”目前只靠 `未发送 ≤ SIOCOUTQ` 这一条不变量。

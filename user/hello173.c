@@ -66,6 +66,7 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define F_SETFL 4
 #define O_NONBLOCK 0x800
 #define TIOCOUTQ 0x5411
+#define SIOCOUTQNSD 0x894B
 #define FIONREAD 0x541B
 #define EAGAIN_ 11
 #define ENOTTY_ 25
@@ -133,7 +134,7 @@ static int outq(int fd) {
 }
 
 void _start(void) {
-    print("hello173: ioctl(TIOCOUTQ) on sockets\n");
+    print("hello173: ioctl(TIOCOUTQ, SIOCOUTQNSD) on sockets\n");
     static char buf[4096];
     for (int i = 0; i < 4096; i++) buf[i] = (char)i;
 
@@ -212,6 +213,47 @@ void _start(void) {
         syscall1(SYS_CLOSE, u);
         v = -1;
         check(syscall3(SYS_IOCTL, 1, TIOCOUTQ, (uint64_t)&v) == -ENOTTY_, "D: stdout is ENOTTY");
+    }
+
+    /* E: SIOCOUTQNSD: bytes written but not yet sent (TCP only; Linux answers ENOTTY for everything else) */
+    {
+        int c, s2;
+        int v = -1;
+        check(make_pair(18174, &c, &s2) == 0, "E: loopback connection");
+        check(syscall3(SYS_IOCTL, (uint64_t)c, SIOCOUTQNSD, (uint64_t)&v) == 0 && v == 0, "E: an idle TCP socket has nothing unsent");
+        syscall3(SYS_FCNTL, (uint64_t)c, F_SETFL, O_NONBLOCK);
+        long total = 0;
+        for (int i = 0; i < 400; i++) {
+            int64_t w = syscall3(SYS_WRITE, c, (uint64_t)buf, 4096);
+            if (w <= 0) break;
+            total += w;
+        }
+        int unsent = -1, queued = outq(c);
+        check(syscall3(SYS_IOCTL, (uint64_t)c, SIOCOUTQNSD, (uint64_t)&unsent) == 0, "E: the request is accepted on a TCP socket");
+        check(unsent >= 0 && unsent <= queued, "E: unsent never exceeds what SIOCOUTQ reports as queued");
+        check(syscall3(SYS_IOCTL, (uint64_t)c, SIOCOUTQNSD, 0) == -14, "E: a null argument is EFAULT");
+        syscall3(SYS_FCNTL, (uint64_t)s2, F_SETFL, O_NONBLOCK);
+        long got = 0;
+        int64_t t0 = now_ms();
+        while (got < total && now_ms() - t0 < 20000) {
+            int64_t r = syscall3(SYS_READ, s2, (uint64_t)buf, 4096);
+            if (r > 0) got += r; else pump(10);
+        }
+        for (int i = 0; i < 40 && outq(c) != 0; i++) pump(50);
+        v = -1;
+        check(syscall3(SYS_IOCTL, (uint64_t)c, SIOCOUTQNSD, (uint64_t)&v) == 0 && v == 0, "E: nothing unsent once the peer read everything");
+        syscall1(SYS_CLOSE, c);
+        syscall1(SYS_CLOSE, s2);
+        int sv[2];
+        syscall4(SYS_SOCKETPAIR, AF_UNIX, SOCK_STREAM, 0, (uint64_t)sv);
+        v = -1;
+        check(syscall3(SYS_IOCTL, (uint64_t)sv[0], SIOCOUTQNSD, (uint64_t)&v) == -ENOTTY_, "E: an AF_UNIX socket is ENOTTY (Linux)");
+        syscall1(SYS_CLOSE, sv[0]);
+        syscall1(SYS_CLOSE, sv[1]);
+        int64_t u = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+        check(syscall3(SYS_IOCTL, (uint64_t)u, SIOCOUTQNSD, (uint64_t)&v) == -ENOTTY_, "E: a UDP socket is ENOTTY (Linux)");
+        syscall1(SYS_CLOSE, u);
+        check(syscall3(SYS_IOCTL, 1, SIOCOUTQNSD, (uint64_t)&v) == -ENOTTY_, "E: stdout is ENOTTY");
     }
 
     print(failures == 0 ? "hello173: PASS\n" : "hello173: FAIL\n");

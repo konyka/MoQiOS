@@ -10038,6 +10038,19 @@ test "ioctl(TIOCOUTQ): socket send-queue reporting and its wiring" {
     try std.testing.expect(std.mem.indexOf(u8, us, "if (!peer.active or peer.peer_idx != @as(u8, @intCast(idx))) return 0;\n    return peer.buf_count;") != null);
 }
 
+test "ioctl(SIOCOUTQNSD): unsent bytes, TCP only" {
+    const src = kt.ioctl_source;
+    try std.testing.expect(std.mem.indexOf(u8, src, "pub const SIOCOUTQNSD = 0x894B;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "SIOCOUTQNSD => {") != null);
+    // Every descriptor that is not a TCP socket is ENOTTY, as on Linux (UDP and AF_UNIX included, unlike SIOCOUTQ).
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (desc.fd_type != .tcp_socket) return -25; // ENOTTY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "tcpSendUnsent(desc.tcb_idx), 0x7FFF_FFFF") != null);
+    // The count is the ring past the send cursor: queued minus what is in flight.
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "pub fn tcpSendUnsent(tcb_idx: u32) u32 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "return ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);\n}\n\n/// poll/epoll readiness of a TCP socket") != null);
+}
+
 test "TCP delivery-rate samples: only bulk, recent acknowledgements measure the path" {
     const tu = kt.tcp_util;
     // A lone small write acknowledged after the delayed-ACK interval says nothing about bandwidth.

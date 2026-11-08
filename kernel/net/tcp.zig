@@ -4326,6 +4326,15 @@ pub fn tcpSendSpace(tcb_idx: u32) u32 {
     return tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb));
 }
 
+/// Bytes written to the send ring that have not been sent yet (SIOCOUTQNSD): the part of the ring past the send cursor.
+/// Lock-free, like tcpSendQueued.
+pub fn tcpSendUnsent(tcb_idx: u32) u32 {
+    if (tcb_idx >= MAX_CONNECTIONS) return 0;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active) return 0;
+    return ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
+}
+
 /// poll/epoll readiness of a TCP socket (lock-free snapshot, like the other status queries).
 pub fn tcpReadiness(tcb_idx: u32) u32 {
     const ready = @import("tcp_ready_policy.zig");
