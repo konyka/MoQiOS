@@ -69,6 +69,7 @@ pub const futex_key = @import("sync/futex_key.zig");
 pub const mlock_policy = @import("mm/mlock_policy.zig");
 pub const mlock_source = @embedFile("mm/mlock.zig");
 pub const mprotect_policy = @import("mm/mprotect_policy.zig");
+pub const mprotect_ledger = @import("mm/mprotect_ledger.zig");
 pub const mseal_policy = @import("mm/mseal_policy.zig");
 pub const msync_policy = @import("mm/msync_policy.zig");
 pub const mmap_policy = @import("mm/mmap_policy.zig");
@@ -342,6 +343,7 @@ test {
     _ = @import("fs/slot_bitmap.zig");
     _ = @import("fs/procfs_policy.zig");
     _ = @import("fs/pid_status.zig");
+    _ = @import("mm/mprotect_ledger.zig");
     _ = @import("proc/cap_abi.zig");
     _ = @import("fs/readlink_policy.zig");
     _ = @import("proc/close_range_policy.zig");

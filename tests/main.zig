@@ -11498,3 +11498,17 @@ test "status VmData is the address space's RLIMIT_DATA charge (heap and writable
     try std.testing.expect(std.mem.indexOf(u8, ps, "@atomicLoad(u64, &m.data_used, .monotonic)") != null);
     try std.testing.expect(std.mem.indexOf(u8, ps, "st.vm_data_kb = data_charged / 1024;") != null);
 }
+
+test "mprotect records the new protection on anonymous regions and keeps the RLIMIT_DATA ledger and its limit" {
+    // hello265: mprotect never touched Mm.data_used and never updated an anonymous region's recorded prot, so VmData ignored it, RLIMIT_DATA was not
+    // enforced by it, and munmap refunded by the creation-time prot.
+    const mp = kt.mprotect_source;
+    try std.testing.expect(std.mem.indexOf(u8, mp, "commitAnonymousProt(cur, addr, len_pages, new_prot);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mp, "cur.dataUsed().* = ledger.apply(cur.dataUsed().*, d, page);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mp, "if (!ledger.fits(cur.dataUsed().*, add_pages, release_pages, paging.PAGE_SIZE, cur.lim().data.cur, rlimit_mod.RLIM_INFINITY)) return ENOMEM;") != null);
+    // The limit is checked before the first page-table write (the ledger preflight sits ahead of the PTE rewrite).
+    try std.testing.expect(std.mem.indexOf(u8, mp, "!ledger.fits(").? < std.mem.indexOf(u8, mp, "protectHugeOverlapsReserved(").?);
+    try std.testing.expect(std.mem.indexOf(u8, mp, "if (aplan.overlap != .none and r.prot != new_prot_u8) slots_needed += aplan.slots_needed;") != null);
+    // The fast path for MAP_FIXED over an exact region only takes regions that are still read-write.
+    try std.testing.expect(std.mem.indexOf(u8, kt.mmap_source, "and !r.no_free and (r.prot & 3) == 3;") != null);
+}

@@ -785,7 +785,9 @@ fn exactAnonymousRegion(task: *task_mod.Task, base: u64, num_pages: u64) bool {
         const i: u6 = @truncate(@ctz(bits));
         bits &= bits - 1;
         const r = &task.vma().regions[i];
-        if (r.base == base and r.num_pages == num_pages) return r.file_kind == 0 and !r.shared and !r.no_free;
+        // The atomic path swaps the pages of a read-write private region in place. A region mprotect has since made read-only, read+exec or
+        // inaccessible takes the general path (unmap, then map the replacement), as does any replacement that is not read-write.
+        if (r.base == base and r.num_pages == num_pages) return r.file_kind == 0 and !r.shared and !r.no_free and (r.prot & 3) == 3;
     }
     return false;
 }
@@ -1755,6 +1757,41 @@ fn mergeIfAdjacent(task: *task_mod.Task, a: usize, b: usize) void {
     if (task.vma().count > 0) task.vma().count -= 1;
 }
 
+/// Merge neighbouring anonymous regions that now agree on everything (mprotect splits a region around the range it changes and Linux joins the
+/// pieces again when the protections match). Only regions touching [addr - 1 page, end + 1 page) can have become mergeable, so only those are
+/// looked at. Pure bookkeeping: pages and charges are untouched.
+pub fn coalesceAnonymousAround(task: *task_mod.Task, addr: u64, len_pages: u64) void {
+    const page = user_space.PAGE_SIZE;
+    const lo = if (addr > page) addr - page else 0;
+    const hi = addr + len_pages * page + page;
+    var progress = true;
+    while (progress) {
+        progress = false;
+        var bits = task.vma().active_bm;
+        while (bits != 0) {
+            const i: usize = @intCast(@ctz(bits));
+            bits &= bits - 1;
+            const a = &task.vma().regions[i];
+            if (!a.active) continue;
+            const a_end = a.base + a.num_pages * page;
+            if (a_end < lo or a.base > hi) continue;
+            var inner = task.vma().active_bm;
+            while (inner != 0) {
+                const j: usize = @intCast(@ctz(inner));
+                inner &= inner - 1;
+                if (j == i) continue;
+                const b = &task.vma().regions[j];
+                if (!b.active or b.base != a_end) continue;
+                if (!mremap_policy.canCoalesce(regionTraits(a), regionTraits(b))) continue;
+                mergeIfAdjacent(task, i, j);
+                progress = true;
+                break;
+            }
+            if (progress) break;
+        }
+    }
+}
+
 /// After the operation (successful or not), re-merge the pieces of a split that ended up next to each other again.
 fn coalesceAround(cur: *task_mod.Task, pieces: SplitPieces) void {
     if (pieces.head) |h| mergeIfAdjacent(cur, h, pieces.mid);
@@ -1764,11 +1801,62 @@ fn coalesceAround(cur: *task_mod.Task, pieces: SplitPieces) void {
     }
 }
 
+/// The mremap shrink: unmap [cut_base, +cut_pages) and drop its bookkeeping. False (nothing changed) when the cut lands mid-range and the table has
+/// no free slot for the tail piece, the same preflight as munmap.
+fn unmapTailOfMapping(cur: *task_mod.Task, cut_base: u64, cut_pages: u64) bool {
+    const PAGE: u64 = 4096;
+    var split_slots: u32 = 0;
+    var untrack_bits = cur.vma().active_bm;
+    while (untrack_bits != 0) {
+        const r_i: usize = @intCast(@ctz(untrack_bits));
+        untrack_bits &= untrack_bits - 1;
+        const r2 = &cur.vma().regions[r_i];
+        if (munmap_policy.needsSplitSlot(r2.base, r2.num_pages, cut_base, cut_pages)) split_slots += 1;
+    }
+    const free_slots: u32 = @intCast(cur.vma().regions.len - @popCount(cur.vma().active_bm));
+    if (!munmap_policy.canUntrack(split_slots, free_slots)) return false;
+    unmapRange(cur, cut_base, cut_pages);
+    untrackMmapRange(cur, cut_base, cut_pages);
+    if (cur.mm) |m| m.locks.releaseLossy(cut_base / PAGE, cut_pages);
+    @import("../drivers/fbdev.zig").noteUnmap(cur, cut_base, cut_pages);
+    return true;
+}
+
+/// Whether [addr, +pages) is covered end to end by tracked anonymous regions that touch each other (mprotect leaves one record per protection).
+fn coveredByAnonymousRegions(task: *task_mod.Task, addr: u64, pages: u64) bool {
+    const page = user_space.PAGE_SIZE;
+    var at = addr;
+    const end = addr + pages * page;
+    while (at < end) {
+        var found = false;
+        var bits = task.vma().active_bm;
+        while (bits != 0) {
+            const i: usize = @intCast(@ctz(bits));
+            bits &= bits - 1;
+            const r = &task.vma().regions[i];
+            if (!r.active or at < r.base or at >= r.base + r.num_pages * page) continue;
+            if (r.file_kind != 0 or r.no_free) return false;
+            at = r.base + r.num_pages * page;
+            found = true;
+            break;
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
 /// The part of mremap that runs under the VM lock once the arguments are validated. A range that is only part of a
 /// tracked region is first split off as a region of its own (Linux splits the vma the same way), the whole-region code
 /// then moves or resizes it, and the pieces that end up adjacent again are merged back.
 fn mremapRegion(cur: *task_mod.Task, old_addr: u64, old_pages: u64, new_pages: u64, mflags: u32, new_addr_hint: u64) i64 {
     const PAGE: u64 = 4096;
+    // A shrink whose range crosses protection boundaries (several records after an mprotect): Linux unmaps the tail whatever vmas it spans.
+    if (old_addr % PAGE == 0 and new_pages < old_pages and (mflags & MREMAP_FIXED) == 0 and regionContaining(cur, old_addr, old_pages) == null and
+        coveredByAnonymousRegions(cur, old_addr, old_pages))
+    {
+        if (!unmapTailOfMapping(cur, old_addr + new_pages * PAGE, old_pages - new_pages)) return -12;
+        return @bitCast(old_addr);
+    }
     if (old_addr % PAGE == 0) if (regionContaining(cur, old_addr, old_pages)) |idx| {
         const r = &cur.vma().regions[idx];
         if (r.file_kind == 0 and !r.no_free) {
@@ -1811,25 +1899,7 @@ fn mremapExact(cur: *task_mod.Task, old_addr: u64, old_pages: u64, new_pages: u6
                 if (new_pages < old_pages) {
                     const cut_base = old_addr + new_pages * PAGE;
                     const cut_pages = old_pages - new_pages;
-                    // Same preflight as munmap: when the tracked region
-                    // outlives old_size the cut lands mid-range and the tail
-                    // piece needs a free region-table slot — with the table
-                    // full untrackMmapRange would silently drop it. Fail
-                    // before the first mutation (unmapRange).
-                    var split_slots: u32 = 0;
-                    var untrack_bits = cur.vma().active_bm;
-                    while (untrack_bits != 0) {
-                        const r_i: usize = @intCast(@ctz(untrack_bits));
-                        untrack_bits &= untrack_bits - 1;
-                        const r2 = &cur.vma().regions[r_i];
-                        if (munmap_policy.needsSplitSlot(r2.base, r2.num_pages, cut_base, cut_pages)) split_slots += 1;
-                    }
-                    const free_slots: u32 = @intCast(cur.vma().regions.len - @popCount(cur.vma().active_bm));
-                    if (!munmap_policy.canUntrack(split_slots, free_slots)) return -12;
-                    unmapRange(cur, cut_base, cut_pages);
-                    untrackMmapRange(cur, cut_base, cut_pages);
-                    if (cur.mm) |m| m.locks.releaseLossy(cut_base / PAGE, cut_pages);
-                    @import("../drivers/fbdev.zig").noteUnmap(cur, cut_base, cut_pages);
+                    if (!unmapTailOfMapping(cur, cut_base, cut_pages)) return -12;
                 }
                 return @bitCast(old_addr);
             }

@@ -18,6 +18,9 @@ const filemap = @import("filemap.zig");
 const huge_impl = @import("huge_user_impl.zig");
 const policy = @import("mprotect_policy.zig");
 const mm_mod = @import("mm.zig");
+const ledger = @import("mprotect_ledger.zig");
+const huge_user = @import("huge_user.zig");
+const rlimit_mod = @import("../proc/rlimit.zig");
 
 pub const PROT_NONE: u64 = 0;
 pub const PROT_READ: u64 = 1;
@@ -63,6 +66,76 @@ fn insertRegionPiece(cur: *task.Task, base: u64, num_pages: u64, proto: *const t
         }
     }
     unreachable; // slot capacity is checked before any PTE is touched
+}
+
+/// Pages of [r_base, +r_pages) that fall inside [addr, +len_pages).
+fn overlapPages(r_base: u64, r_pages: u64, addr: u64, len_pages: u64) u64 {
+    const page = paging.PAGE_SIZE;
+    const lo = @max(r_base, addr);
+    const hi = @min(r_base + r_pages * page, addr + len_pages * page);
+    return if (hi > lo) (hi - lo) / page else 0;
+}
+
+/// Anonymous regions: record the new protection on the part of each region the range covers (splitting a region the range only partly covers) and
+/// move the RLIMIT_DATA ledger by the pages that became or stopped being writable private data. Region slots were reserved by the preflight, so this
+/// cannot fail. File regions are handled by the metadata pass that follows.
+fn commitAnonymousProt(cur: *task.Task, addr: u64, len_pages: u64, new_prot: u8) void {
+    const page = paging.PAGE_SIZE;
+    var bits = cur.vma().active_bm;
+    while (bits != 0) {
+        const i: usize = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const r = &cur.vma().regions[i];
+        if (!r.active or r.file_kind != 0 or r.no_free) continue;
+        const plan = filemap.planProtUpdate(r.base, r.num_pages, addr, len_pages);
+        if (plan.overlap == .none) continue;
+        const d = ledger.delta(r.prot, new_prot, r.shared, plan.mid_pages);
+        cur.dataUsed().* = ledger.apply(cur.dataUsed().*, d, page);
+        if (r.prot == new_prot) continue;
+        const old_prot = r.prot;
+        switch (plan.overlap) {
+            .none => unreachable,
+            .cover => r.prot = new_prot,
+            .head => {
+                insertAnonPiece(cur, r.base + plan.mid_pages * page, plan.tail_pages, r, old_prot);
+                r.num_pages = plan.mid_pages;
+                r.prot = new_prot;
+                r.huge_pages = @intCast(@min(r.huge_pages, r.num_pages / huge_user.HUGE_PAGES));
+            },
+            .tail => {
+                insertAnonPiece(cur, r.base + plan.head_pages * page, plan.mid_pages, r, new_prot);
+                r.num_pages = plan.head_pages;
+                r.huge_pages = @intCast(@min(r.huge_pages, r.num_pages / huge_user.HUGE_PAGES));
+            },
+            .middle => {
+                insertAnonPiece(cur, addr + plan.mid_pages * page, plan.tail_pages, r, old_prot);
+                insertAnonPiece(cur, addr, plan.mid_pages, r, new_prot);
+                r.num_pages = plan.head_pages;
+                r.huge_pages = @intCast(@min(r.huge_pages, r.num_pages / huge_user.HUGE_PAGES));
+            },
+        }
+    }
+}
+
+/// A region cloned from `proto` with another protection, covering [base, +pages). Anonymous, so there is no file backing to retain; a split piece
+/// never keeps a huge block count (the page-table-driven paths handle any huge block that stays mapped).
+fn insertAnonPiece(cur: *task.Task, base: u64, num_pages: u64, proto: *const task.MmapRegion, prot: u8) void {
+    for (cur.vma().regions, 0..) |*slot, idx| {
+        if (slot.active) continue;
+        slot.* = .{
+            .base = base,
+            .num_pages = num_pages,
+            .active = true,
+            .locked = proto.locked,
+            .shared = proto.shared,
+            .may_write = proto.may_write,
+            .prot = prot,
+        };
+        cur.vma().count += 1;
+        cur.vma().active_bm |= @as(u64, 1) << @intCast(idx);
+        return;
+    }
+    unreachable; // the preflight reserved the slots
 }
 
 /// sysMprotect(addr, len, prot) → 0 on success, negative errno on failure.
@@ -125,13 +198,21 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     // PTE rewrite would leave metadata and page tables describing different
     // permissions.
     var slots_needed: u32 = 0;
+    const new_prot_u8: u8 = @intCast(prot & 7);
     const free_slots: u32 = @intCast(cur.vma().regions.len - @popCount(cur.vma().active_bm));
     var bits = cur.vma().active_bm;
     while (bits != 0) {
         const i: usize = @intCast(@ctz(bits));
         bits &= bits - 1;
         const r = &cur.vma().regions[i];
-        if (r.file_kind == 0) continue; // anonymous faults never read prot
+        if (r.file_kind == 0) {
+            // Anonymous faults never read prot, but the region records it for the RLIMIT_DATA ledger and for MAP_FIXED, so a partial overlap needs
+            // the same split as a file region.
+            if (!r.active or r.no_free) continue;
+            const aplan = filemap.planProtUpdate(r.base, r.num_pages, addr, len_pages);
+            if (aplan.overlap != .none and r.prot != new_prot_u8) slots_needed += aplan.slots_needed;
+            continue;
+        }
         const plan = filemap.planProtUpdate(r.base, r.num_pages, addr, len_pages);
         // A shared mapping of a read-only fd can never become writable:
         // the write would land in the file the caller cannot write.
@@ -147,6 +228,26 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
         slots_needed += plan.slots_needed;
     }
     if (slots_needed > free_slots) return ENOMEM;
+
+    // RLIMIT_DATA: the call may turn private pages writable (they join the data ledger) and others read-only (they leave it). The net growth has to
+    // fit the limit before anything changes, as Linux's mprotect does.
+    {
+        var add_pages: u64 = 0;
+        var release_pages: u64 = 0;
+        var lb = cur.vma().active_bm;
+        while (lb != 0) {
+            const i: usize = @intCast(@ctz(lb));
+            lb &= lb - 1;
+            const r = &cur.vma().regions[i];
+            if (!r.active or r.no_free) continue;
+            const overlap = overlapPages(r.base, r.num_pages, addr, len_pages);
+            if (overlap == 0) continue;
+            const d = ledger.delta(r.prot, new_prot_u8, r.shared, overlap);
+            add_pages += d.add;
+            release_pages += d.release;
+        }
+        if (!ledger.fits(cur.dataUsed().*, add_pages, release_pages, paging.PAGE_SIZE, cur.lim().data.cur, rlimit_mod.RLIM_INFINITY)) return ENOMEM;
+    }
 
     // 5. Preflight every resource which commit can consume. Partial huge
     // demotions need one PT page each; writable COW entries need one data page
@@ -311,6 +412,8 @@ pub fn sysMprotect(addr: u64, len: u64, prot: u64) i64 {
     // H1: update the file regions' prot metadata (splitting on partial
     // overlaps) so later demand faults grant the new permissions.
     const new_prot: u8 = @intCast(prot & 7);
+    commitAnonymousProt(cur, addr, len_pages, new_prot);
+    @import("mmap.zig").coalesceAnonymousAround(cur, addr, len_pages);
     for (cur.vma().regions) |*r| {
         if (!r.active or r.file_kind == 0) continue;
         const plan = filemap.planProtUpdate(r.base, r.num_pages, addr, len_pages);
