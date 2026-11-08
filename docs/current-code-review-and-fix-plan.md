@@ -7402,3 +7402,5 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修复：改为保存并恢复中断标志（`arch.irq.saveAndDisable` / `restore`），不再强制 `sti`。
 - 验证：修复前 6 份里 2 份、8 份里 2 份卡死；修复后 8 份并行全部 PASS；host 测试与三个架构的构建通过。
 - 附带：CI 的 smoke 超时从 900 s 提到 1500 s 并不是这次问题的解法（那次超时是真卡死），保留作余量。
+- 同类排查：内核里其余的 `asm volatile ("sti")`（`userdrv.zig` 等待循环、`waitpid.zig`、`jobctl.zig`、`task.zig` 的 reap 自旋）都在释放 `irq_lock` / `task_lock` 之后才开中断，不在持锁期间；`cli` 只剩 `smp.zig` 的两处（核停机路径）。没有第二处同类缺陷。
+- CI：`4e41a85` 的 Test 工作流整体通过（18 分 57 秒，含此前超时的 Smoke SMP=2）。
