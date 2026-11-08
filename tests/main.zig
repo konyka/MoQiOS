@@ -11660,3 +11660,22 @@ test "currentSize reads the staged end before the recorded size so a concurrent 
     const f_rec = std.mem.indexOf(u8, fb, "files[idx].size else 0") orelse return error.TestUnexpectedResult;
     try std.testing.expect(f_staged < f_rec);
 }
+
+test "write() and writev() on an O_APPEND file hold one lock across all their pieces" {
+    const v = kt.vfs_source;
+    // Regular files only, opened for append and writing.
+    try std.testing.expect(std.mem.indexOf(u8, v, "pub fn isAppendFile(self: *FdTable, fd: u32) bool {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "return d.fd_type == .tmpfs_file or d.fd_type == .fat32_file or d.fd_type == .ext2_file;") != null);
+    // write(): the lock covers the 4 KiB piece loop; writev(): it covers every iovec.
+    const w = kt.file_io_source;
+    const wl = std.mem.indexOf(u8, w, "if (append_call) vfs_mod.FdTable.lockAppendCall();") orelse return error.TestUnexpectedResult;
+    const wp = std.mem.indexOf(u8, w, "const result = cur.fd_table.write(fdIndex(fd), &kbuf, copied);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(wl < wp);
+    const r = kt.readv_source;
+    const rs = std.mem.indexOf(u8, r, "pub fn writev(") orelse return error.TestUnexpectedResult;
+    const rl = std.mem.indexOf(u8, r[rs..], "lockAppendCall()") orelse return error.TestUnexpectedResult;
+    const rp = std.mem.indexOf(u8, r[rs..], "cur.fd_table.write(fd, &kbuf, from_user)") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rl < rp);
+    // Order: the call lock is the outer one, taken before the per-piece append_lock.
+    try std.testing.expect(std.mem.indexOf(u8, v, "Outer lock of an O_APPEND write()/writev() as a whole") != null);
+}

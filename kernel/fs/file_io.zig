@@ -52,6 +52,9 @@ pub fn write(fd: u64, buf: u64, count: u64) i64 {
                 if (copy.copyFromUser(mbuf[0..n], @ptrFromInt(buf), n) != n) return -14;
                 return cur.fd_table.write(fdIndex(fd), &mbuf, n);
             }
+            const append_call = cur.fd_table.isAppendFile(fdIndex(fd));
+            if (append_call) vfs_mod.FdTable.lockAppendCall();
+            defer if (append_call) vfs_mod.FdTable.unlockAppendCall();
             var pos: usize = 0;
             while (pos < n) {
                 const chunk = @min(n - pos, 4096);

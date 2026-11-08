@@ -61,6 +61,55 @@ static int run(const char *path, int two_writes) {
     return n == 2 * KIDS * LINES && lines_ok;
 }
 
+/* One O_APPEND write larger than a page, or one writev, is a single atomic append on Linux: another appender's record never lands inside it.
+ * Each kid appends RECS records of REC bytes, all the same letter (its own); the file must come out as whole records, each of one letter. */
+#define REC 5000
+#define RECS 5
+static int run_big(const char *path, int use_writev) {
+    unlink(path);
+    int creat_fd = (int)open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    close(creat_fd);
+    long pids[KIDS];
+    for (int k = 0; k < KIDS; k++) {
+        long p = fork();
+        if (p == 0) {
+            static char rec[REC];
+            memset(rec, 'a' + k, sizeof rec);
+            int fd = (int)open(path, O_WRONLY | O_APPEND, 0644);
+            for (int i = 0; i < RECS; i++) {
+                if (use_writev) {
+                    struct { void *base; unsigned long len; } iov[2] = { { rec, 3000 }, { rec + 3000, REC - 3000 } };
+                    syscall3(20 /* writev */, fd, (long)iov, 2);
+                } else {
+                    write(fd, rec, REC);
+                }
+            }
+            _exit(0);
+        }
+        pids[k] = p;
+    }
+    for (int k = 0; k < KIDS; k++) {
+        int st;
+        waitpid(pids[k], &st, 0);
+    }
+    static char blk[REC];
+    int fd = (int)open(path, O_RDONLY, 0);
+    int ok = 1;
+    long total = 0;
+    for (;;) {
+        long n = 0, r;
+        while (n < REC && (r = read(fd, blk + n, REC - n)) > 0) n += r;
+        total += n;
+        if (n == 0) break;
+        if (n != REC) { ok = 0; break; }
+        for (int i = 1; i < REC; i++)
+            if (blk[i] != blk[0]) { ok = 0; break; }
+        if (!ok) break;
+    }
+    close(fd);
+    return ok && total == (long)REC * KIDS * RECS;
+}
+
 int main(int argc, char **argv, char **envp) {
     (void)argc; (void)argv; (void)envp;
     print("hello266: simultaneous O_APPEND writers\n");
@@ -81,6 +130,15 @@ int main(int argc, char **argv, char **envp) {
         check(single_bad == 0, what);
         snprintf(what, sizeof what, "%s: the same with two writes per line loses no bytes (%d of 20 rounds wrong)", fs[f].label, two_bad);
         check(two_bad == 0, what);
+        int big_bad = 0, wv_bad = 0;
+        for (int round = 0; round < 6; round++) {
+            if (!run_big(fs[f].a, 0)) big_bad++;
+            if (!run_big(fs[f].b, 1)) wv_bad++;
+        }
+        snprintf(what, sizeof what, "%s: four writers each appending 5000-byte records with one write(): every record whole (%d of 6 rounds wrong)", fs[f].label, big_bad);
+        check(big_bad == 0, what);
+        snprintf(what, sizeof what, "%s: the same with one writev of two parts per record (%d of 6 rounds wrong)", fs[f].label, wv_bad);
+        check(wv_bad == 0, what);
         unlink(fs[f].a);
         unlink(fs[f].b);
     }

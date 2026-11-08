@@ -1665,6 +1665,24 @@ pub const FdTable = struct {
         return @intCast(n);
     }
 
+    /// True for a regular file (tmpfs, FAT32, ext2) opened with O_APPEND: its write()/writev() must land as one block at the end of the file.
+    pub fn isAppendFile(self: *FdTable, fd: u32) bool {
+        if (fd >= MAX_FDS) return false;
+        const d = &self.fds[fd];
+        if ((d.status_flags & 0x400) == 0 or !d.writable) return false;
+        return d.fd_type == .tmpfs_file or d.fd_type == .fat32_file or d.fd_type == .ext2_file;
+    }
+
+    /// Held across a whole write()/writev() on an append file. The syscall layer cuts a large write into 4 KiB pieces (and writev into one piece
+    /// per iovec); without this another appender's piece lands between ours, where Linux keeps one write or one writev contiguous.
+    pub fn lockAppendCall() void {
+        append_call_lock.lock();
+    }
+
+    pub fn unlockAppendCall() void {
+        append_call_lock.unlock();
+    }
+
     /// Write to a file descriptor from a kernel buffer.
     /// Returns number of bytes written, -1 on error.
     pub fn write(self: *FdTable, fd: u32, buf: [*]const u8, count: usize) i64 {
@@ -2748,6 +2766,9 @@ var mount_op_lock: @import("../sync/task_sleep_lock.zig").SleepLock = .{};
 /// Serialises O_APPEND writes to ext2 and FAT32 files: finding the end of the file and staging the data behind it have to happen as one step, or two
 /// appenders pick the same end and one overwrites the other. A sleeping lock because staging can flush to disk. Only appenders take it.
 var append_lock: @import("../sync/task_sleep_lock.zig").SleepLock = .{};
+
+/// Outer lock of an O_APPEND write()/writev() as a whole (see FdTable.lockAppendCall); always taken before `append_lock`.
+var append_call_lock: @import("../sync/task_sleep_lock.zig").SleepLock = .{};
 
 const mount_path = @import("mount_path_policy.zig");
 

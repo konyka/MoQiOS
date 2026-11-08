@@ -5,6 +5,7 @@ const copy = @import("../mm/copy_from_user.zig");
 const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const bo = @import("../lib/byte_order.zig");
+const vfs_mod = @import("vfs.zig");
 
 const EBADF: i64 = -9;
 const EFAULT: i64 = 14;
@@ -61,6 +62,9 @@ pub fn writev(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
+    const append_call = cur.fd_table.isAppendFile(fd);
+    if (append_call) vfs_mod.FdTable.lockAppendCall();
+    defer if (append_call) vfs_mod.FdTable.unlockAppendCall();
     var total: usize = 0;
     for (0..iovcnt) |i| {
         var iov_buf: [16]u8 = undefined;
