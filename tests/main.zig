@@ -11679,3 +11679,19 @@ test "write() and writev() on an O_APPEND file hold one lock across all their pi
     // Order: the call lock is the outer one, taken before the per-piece append_lock.
     try std.testing.expect(std.mem.indexOf(u8, v, "Outer lock of an O_APPEND write()/writev() as a whole") != null);
 }
+
+test "AF_UNIX abstract name vs pathname policies" {
+    const sa = kt.socket_address_policy;
+    const name_abs = "\x00h134";
+    const name_path = "/tmp/h134";
+    try std.testing.expect(sa.unixIsAbstract(name_abs));
+    try std.testing.expect(!sa.unixIsAbstract(name_path));
+    try std.testing.expectEqual(@as(usize, 5), sa.unixNameLen(name_abs));
+    try std.testing.expectEqual(@as(usize, 9), sa.unixNameLen(name_path));
+    var out: [120]u8 = undefined;
+    @memset(&out, 0xaa);
+    // Abstract name: no trailing NUL in encoding, length is 2 + name.len.
+    try std.testing.expectEqual(@as(u32, 2 + 5), sa.unixNameEncode(name_abs, &out));
+    try std.testing.expectEqual(@as(u8, 0), out[2]);
+    try std.testing.expectEqual(@as(u8, 0xaa), out[7]); // no NUL after
+}

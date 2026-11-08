@@ -231,11 +231,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         const to_copy = @min(@as(usize, addr_len), sock_addr_buf.len);
         const copied = copy.copyFromUser(sock_addr_buf[0..to_copy], @ptrFromInt(addr_ptr), to_copy);
         if (copied <= SOCKADDR_UN_PATH_OFFSET) return -22; // EINVAL
-        var path_len: usize = 0;
-        for (2..copied) |j| {
-            if (sock_addr_buf[j] == 0) break;
-            path_len += 1;
-        }
+        const path_len = @import("socket_address_policy.zig").unixNameLen(sock_addr_buf[2..copied]);
         const result = net_mod.unix_socket.unixBind(unix_idx, @ptrCast(sock_addr_buf[2 .. 2 + path_len].ptr), path_len);
         return @as(i64, result);
     }
@@ -413,8 +409,7 @@ fn unixDestPath(addr_ptr: u64, addr_len: u32, out: *[110]u8) UnixDest {
     const copied = copy.copyFromUser(out[0..to_copy], @ptrFromInt(addr_ptr), to_copy);
     if (copied != to_copy) return .{ .err = -14 };
     if (bo.readU16Le(out[0..2]) != 1) return .{ .err = -97 }; // EAFNOSUPPORT (AF_UNIX, little endian)
-    var n: usize = 0;
-    while (2 + n < copied and out[2 + n] != 0) n += 1;
+    const n = ap.unixNameLen(out[2..copied]);
     if (n == 0) return .{ .err = -22 };
     return .{ .ok = n };
 }
@@ -759,11 +754,7 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         const to_copy = @min(@as(usize, addr_len), sock_addr_buf.len);
         const copied = copy.copyFromUser(sock_addr_buf[0..to_copy], @ptrFromInt(addr_ptr), to_copy);
         if (copied <= SOCKADDR_UN_PATH_OFFSET) return -22; // EINVAL
-        var path_len: usize = 0;
-        for (2..copied) |j| {
-            if (sock_addr_buf[j] == 0) break;
-            path_len += 1;
-        }
+        const path_len = @import("socket_address_policy.zig").unixNameLen(sock_addr_buf[2..copied]);
         const result = net_mod.unix_socket.unixConnect(unix_idx, @ptrCast(sock_addr_buf[2 .. 2 + path_len].ptr), path_len);
         return @as(i64, result);
     }

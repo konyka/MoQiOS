@@ -5897,7 +5897,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 问题：两个调用对 AF_UNIX 套接字都是 `ENOTSOCK`。
 - 修复：见 `docs/kernel-subsystems.md` 的 hello180 条。
-- 已知差异：不支持抽象命名空间地址（以 NUL 开头的路径）——`bind` 本来就按 NUL 截断路径；`SO_PEERSEC` 没有；没有 `getsockname` 对已删除的文件系统节点的特殊处理（本内核的 AF_UNIX 地址不对应文件系统节点，只是内核表里的名字）。
+- 已知差异：~~不支持抽象命名空间地址（以 NUL 开头的路径）~~（已在文末 hello134 F 段补上）；`SO_PEERSEC` 没有；没有 `getsockname` 对已删除的文件系统节点的特殊处理（本内核的 AF_UNIX 地址不对应文件系统节点，只是内核表里的名字）。
 - 过程说明（如实）：①红灯 17 项 FAIL 里有一部分是我自己的探测错误——`accept` 的系统调用号我写成了 130（那是 `recvmsg`），导致 C 段 `accept` 失败，红灯数据不可靠；改成 43 后重跑得到 16 项 FAIL，红灯才可信。②实现过程中连续碰到三个"目标不止一种"的问题：客户端已 `connect` 但监听者还没 `accept` 时，对端地址是什么（答：它连接的路径，所以要在 `connect` 时就记下）；accept 出来的套接字是否算"已绑定"（答：不算，所以新增 `name_only`，否则对它 `bind` 会得到错误的结果、路径占用检查也会误判）；数据报 `connect` 是单向的，不能像流那样检查互指（答：检查目标槽位是否仍绑定在当初解析的路径上）。每一个都是先在 hello180 里失败，再改实现。③写 host 测试时还发现 `socket_address_policy.zig` 里有一个内联 `test` 块（从没跑过），为了给文件加 `std` 导入而删掉了它——它的内容（`inetLengthValid` 等）已经被 `tests/main.zig` 里的 `socket()` 与 `connect` 测试覆盖。④hello169 的一条 host 断言编码了旧的嵌套形状（`if (connectionOriented) { if (!peer.listening) ...`），因我把监听检查提到前面（为了无论流还是数据报都先记下地址）而失败；行为（非监听的流目标 `ECONNREFUSED`）没变，已改断言到新形状。
 - TDD：host 新增 1 个测试（未命名/命名/最大长度地址的编码，接线形状：accept 出来的套接字的 `name_only`、`connect` 记下路径、排队中客户端的对端、流与数据报的不同校验、没有存活对端时 `ENOTCONN`）；hello180（A 未绑定套接字的未命名地址与 `ENOTCONN`，B 绑定后的路径与长度与短缓冲，C 连接对：客户端的对端是服务路径、accept 出来的套接字自己的名字是监听者路径、其对端是未命名客户端，D `socketpair` 与对端关闭后的 `ENOTCONN`，E 数据报）在旧内核上 16 项 FAIL，新内核 PASS。
 - 变异（具名测试核对）：未命名地址长度错、长度漏掉 NUL、没有 NUL 终止符、accept 出来的套接字不是 `name_only`、accept 出来的套接字可以 `bind`、`connect` 不记下地址、未被接受的客户端不检查是否排在队里、流式反向引用不检查、数据报目标槽位被复用不检查、已关闭的对端也应答、`getpeername` 永不返回 `ENOTCONN`，共 11 个。**第一轮有 1 个变异没被抓住**（"已关闭的对端也应答"，即去掉 `!peer.active` 判断）：我的 host 断言没钉住这一行，hello180 也没有构造"数据报目标已关闭"的场景；我补了探测（目标关闭后 `ENOTCONN`，以及新建套接字复用槽位后不会被当作对端）和一条 host 断言，之后 11 个全部被 `AF_UNIX getsockname / getpeername…` 抓住；恢复后 `grep -c MUTATION` 为 0。
@@ -7447,3 +7447,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修改：`vfs.zig` 新增 `FdTable.isAppendFile`（tmpfs/FAT32/ext2 且带 `O_APPEND`、可写）和外层锁 `append_call_lock`（睡眠锁，永远先于每块一取的 `append_lock`）；`file_io.write` 与 `readv.writev` 在这类描述符上整次调用持有它。其它描述符（管道、套接字、设备）不受影响。
 - 绿灯：hello266 现在 12 项，4 份并行（SMP=4）全部 PASS。host 测试是源码顺序守卫（锁在块循环之前，且是外层锁）。
 - 局限（如实）：①这是一个**全局**锁，一个慢的大追加会让所有别的追加者等；②tmpfs 在红灯里没有失败，所以这两项对 tmpfs 的覆盖力是未知的，没有做变异验证；③`pwritev`、`sendfile`、`splice` 到追加文件、`aio` 的写都没有走这个锁；④`write` 在持有锁期间可能睡眠（暂存刷盘），所以持有者被信号打断时会提前返回已写入的部分，这与 Linux 对大写入被打断的语义一致，但没有专门测。
+
+## AF_UNIX 抽象地址（`sun_path[0] == 0`）（hello134 F 段，已补）
+
+- 来由：hello180/hello181 记录的已知差异“不支持抽象命名空间地址（以 NUL 开头的路径）——`bind` 本来就按 NUL 截断路径”。实际效果：`bind(\0name)` 的路径长度算成 0，被当成无效地址，D-Bus、systemd 的 notify 套接字、很多测试程序用的就是这种地址。
+- 红灯：hello134 新增 F 段 13 项；旧内核（SMP=2）上 `bind`、重复绑定、尾部多一个 NUL 的不同名字、`getsockname`、`connect`、数据报 `sendto` 等 10 项失败。
+- 实现：`socket_address_policy.zig` 新增 `unixNameLen`（路径名取到第一个 NUL；抽象名取 `addr_len - 2` 的全部字节、NUL 也算，所以 `\0a` 与 `\0a\0` 是不同的名字）、`unixIsAbstract`；`unixNameEncode` 对抽象名不追加结尾 NUL（长度 = 2 + 名字长度，与 Linux 的 `getsockname` 一致）。`bind`、`connect`、`unixDestPath`（`sendto`/`sendmsg` 的目的地）三处统一使用它。内核里的名字表本来就是“按长度比较字节”，所以抽象名和路径名不会相撞（路径名不会以 NUL 开头也不会为空）。
+- 绿灯：hello134 全部通过（SMP=2，两份）。其中一次调试教训：客户端 `connect` + `send` 之后立刻 `close`，服务端 `accept` 到的连接读不到数据（hello134 C 段的原有写法有同样的先后），所以 F 段客户端在关闭前先睡 150 ms；这是**测试写法的绕行，没有查清**为什么已建立连接的客户端提前关闭会让服务端读到 0 字节（Linux 上数据仍可读）——这可能是另一个缺陷，留作候选。
+- 局限：①抽象套接字不存在于文件系统，本内核里普通路径名同样只是内核表里的名字而不是文件，所以“路径名要在文件系统里创建节点”这个差异仍然存在；②自动绑定（`bind` 只带 family，长度 2）没有实现；③`SO_PEERCRED` 等对抽象地址没有额外处理。

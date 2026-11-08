@@ -55,6 +55,7 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_RECVFROM  45
 #define SYS_SHUTDOWN  48
 #define SYS_BIND      49
+#define SYS_GETSOCKNAME 51
 #define SYS_LISTEN    50
 #define SYS_SOCKETPAIR 53
 #define SYS_UNLINK    87
@@ -253,6 +254,63 @@ void _start(void) {
         int sv[2] = { -1, -1 };
         check(syscall4(SYS_SOCKETPAIR, AF_INET, SOCK_STREAM, 0, (uint64_t)sv) < 0, "E: socketpair of AF_INET is refused");
         check(syscall4(SYS_SOCKETPAIR, AF_UNIX, SOCK_STREAM, 0, 0) == -14, "E: socketpair with a NULL result pointer is EFAULT");
+    }
+
+    /* F: abstract addresses (sun_path[0] == 0): the name is the addr_len - 2 bytes after the family, NULs included, and is not a file */
+    {
+        struct sockaddr_un ab, ab2;
+        ab.family = AF_UNIX; ab2.family = AF_UNIX;
+        for (int i = 0; i < 108; i++) { ab.path[i] = 0; ab2.path[i] = 0; }
+        ab.path[1] = 'h'; ab.path[2] = '1'; ab.path[3] = '3'; ab.path[4] = '4';
+        uint64_t la = 2 + 5; /* "\0h134" */
+        int64_t srv = syscall3(SYS_SOCKET, AF_UNIX, SOCK_STREAM, 0);
+        check(syscall3(SYS_BIND, (uint64_t)srv, (uint64_t)&ab, la) == 0, "F: bind an abstract name");
+        int64_t dupb = syscall3(SYS_SOCKET, AF_UNIX, SOCK_STREAM, 0);
+        check(syscall3(SYS_BIND, (uint64_t)dupb, (uint64_t)&ab, la) == -EADDRINUSE_, "F: the same abstract name twice is EADDRINUSE");
+        ab2.path[1] = 'h'; ab2.path[2] = '1'; ab2.path[3] = '3'; ab2.path[4] = '4'; ab2.path[5] = 0;
+        check(syscall3(SYS_BIND, (uint64_t)dupb, (uint64_t)&ab2, la + 1) == 0, "F: a name that only differs by a trailing NUL is a different name");
+        struct sockaddr_un fsn;
+        uint64_t lf = mkaddr(&fsn, "h134");
+        int64_t fsock = syscall3(SYS_SOCKET, AF_UNIX, SOCK_STREAM, 0);
+        check(syscall3(SYS_BIND, (uint64_t)fsock, (uint64_t)&fsn, lf) == 0, "F: the pathname \"h134\" does not collide with the abstract name \"\\0h134\"");
+        check(syscall3(SYS_LISTEN, (uint64_t)srv, 4, 0) == 0, "F: listen on the abstract socket");
+        struct sockaddr_un got;
+        uint32_t glen = sizeof got;
+        for (unsigned i = 0; i < sizeof got; i++) ((char *)&got)[i] = 0x7f;
+        check(syscall3(SYS_GETSOCKNAME, (uint64_t)srv, (uint64_t)&got, (uint64_t)&glen) == 0 && glen == 7 && got.family == AF_UNIX && got.path[0] == 0 && got.path[1] == 'h' && got.path[4] == '4',
+              "F: getsockname gives family + the 5 name bytes, no trailing NUL (length 7)");
+        int64_t kid = syscall1(SYS_FORK, 0);
+        if (kid == 0) {
+            int64_t c = syscall3(SYS_SOCKET, AF_UNIX, SOCK_STREAM, 0);
+            int ok = syscall3(SYS_CONNECT, (uint64_t)c, (uint64_t)&ab, la) == 0;
+            ok = ok && sendto0(c, "abs", 3) == 3;
+            sleep_ms(150);
+            syscall1(SYS_CLOSE, (uint64_t)c);
+            syscall1(SYS_EXIT, ok ? 0 : 1);
+            for (;;) {}
+        }
+        int64_t cn = syscall3(SYS_ACCEPT, (uint64_t)srv, 0, 0);
+        char ib[8] = {0};
+        check(cn >= 0 && syscall3(SYS_READ, (uint64_t)cn, (uint64_t)ib, 8) == 3 && ib[0] == 'a' && ib[2] == 's', "F: a client connected by abstract name and its data arrived");
+        int stk = -1;
+        syscall3(SYS_WAITPID, (uint64_t)kid, (uint64_t)&stk, 0);
+        check(((stk >> 8) & 0xff) == 0, "F: the client ran to completion");
+        if (cn >= 0) syscall1(SYS_CLOSE, (uint64_t)cn);
+        int64_t nob = syscall3(SYS_SOCKET, AF_UNIX, SOCK_STREAM, 0);
+        struct sockaddr_un nx; nx.family = AF_UNIX;
+        for (int i = 0; i < 108; i++) nx.path[i] = 0;
+        nx.path[1] = 'n'; nx.path[2] = 'o';
+        check(syscall3(SYS_CONNECT, (uint64_t)nob, (uint64_t)&nx, 2 + 3) == -ECONNREFUSED_, "F: connecting to an abstract name nobody bound is ECONNREFUSED");
+        int64_t d1 = syscall3(SYS_SOCKET, AF_UNIX, SOCK_DGRAM, 0), d2 = syscall3(SYS_SOCKET, AF_UNIX, SOCK_DGRAM, 0);
+        struct sockaddr_un dn; dn.family = AF_UNIX;
+        for (int i = 0; i < 108; i++) dn.path[i] = 0;
+        dn.path[1] = 'd'; dn.path[2] = 'g';
+        check(syscall3(SYS_BIND, (uint64_t)d2, (uint64_t)&dn, 2 + 3) == 0, "F: bind a datagram socket to an abstract name");
+        check(syscall6(SYS_SENDTO, (uint64_t)d1, (uint64_t)"hey", 3, 0, (uint64_t)&dn, 2 + 3) == 3, "F: sendto an abstract name");
+        char db[8] = {0};
+        check(recvfrom0(d2, db, 8) == 3 && db[0] == 'h' && db[2] == 'y', "F: the datagram arrived");
+        syscall1(SYS_CLOSE, (uint64_t)d1); syscall1(SYS_CLOSE, (uint64_t)d2); syscall1(SYS_CLOSE, (uint64_t)nob);
+        syscall1(SYS_CLOSE, (uint64_t)srv); syscall1(SYS_CLOSE, (uint64_t)dupb); syscall1(SYS_CLOSE, (uint64_t)fsock);
     }
 
     print(failures == 0 ? "hello134: PASS\n" : "hello134: FAIL\n");
