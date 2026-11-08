@@ -58,6 +58,9 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_ACCEPT4   131
 #define SYS_SETSOCKOPT 132
 #define SYS_SETUID    174
+#define SYS_IOCTL     165
+#define SIOCGIFADDR   0x8915
+#define EADDRNOTAVAIL_ 99
 #define AF_INET 2
 #define AF_INET6 10
 #define SOCK_STREAM 1
@@ -187,6 +190,53 @@ void _start(void) {
         check(syscall3(SYS_BIND, (uint64_t)x, (uint64_t)s6a, 28) == -EINVAL_, "E: rebinding an IPv6 socket is EINVAL");
         syscall1(SYS_CLOSE, x);
         syscall1(SYS_CLOSE, y);
+    }
+
+    /* F: binding an address this host does not have is EADDRNOTAVAIL, checked before the port (so before EADDRINUSE and EACCES) */
+    {
+        uint8_t fa[16];
+        int64_t t4 = sock4();
+        mk_addr(fa, 18390); fa[4] = 192; fa[5] = 0; fa[6] = 2; fa[7] = 1; /* 192.0.2.1: TEST-NET-1, never assigned here */
+        check(syscall3(SYS_BIND, (uint64_t)t4, (uint64_t)fa, 16) == -EADDRNOTAVAIL_, "F: TCP bind to a foreign address is EADDRNOTAVAIL");
+        mk_addr(fa, 18390); fa[4] = 0; fa[5] = 0; fa[6] = 0; fa[7] = 0;
+        check(syscall3(SYS_BIND, (uint64_t)t4, (uint64_t)fa, 16) == 0, "F: the failed bind left the socket unbound: 0.0.0.0 works");
+        int64_t t5 = sock4();
+        mk_addr(fa, 18390); fa[4] = 192; fa[5] = 0; fa[6] = 2; fa[7] = 1;
+        check(syscall3(SYS_BIND, (uint64_t)t5, (uint64_t)fa, 16) == -EADDRNOTAVAIL_, "F: a foreign address on a taken port is EADDRNOTAVAIL, not EADDRINUSE");
+        mk_addr(fa, 18391); fa[4] = 127; fa[7] = 2;
+        check(syscall3(SYS_BIND, (uint64_t)t5, (uint64_t)fa, 16) == 0, "F: any 127.x.y.z address is local");
+        int64_t u4 = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+        mk_addr(fa, 24390); fa[4] = 192; fa[5] = 0; fa[6] = 2; fa[7] = 1;
+        check(syscall3(SYS_BIND, (uint64_t)u4, (uint64_t)fa, 16) == -EADDRNOTAVAIL_, "F: UDP bind to a foreign address is EADDRNOTAVAIL");
+        mk_addr(fa, 24390); fa[4] = 224; fa[5] = 0; fa[6] = 0; fa[7] = 251;
+        check(syscall3(SYS_BIND, (uint64_t)u4, (uint64_t)fa, 16) == 0, "F: a multicast address may be bound (Linux allows it)");
+        {
+            uint8_t req[40];
+            for (int i = 0; i < 40; i++) req[i] = 0;
+            req[0] = 'e'; req[1] = 't'; req[2] = 'h'; req[3] = '0';
+            if (syscall3(SYS_IOCTL, (uint64_t)t4, SIOCGIFADDR, (uint64_t)req) == 0) {
+                int64_t u5 = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+                mk_addr(fa, 24391);
+                for (int i = 0; i < 4; i++) fa[4 + i] = req[20 + i];
+                check(syscall3(SYS_BIND, (uint64_t)u5, (uint64_t)fa, 16) == 0, "F: the NIC's own address is local");
+                syscall1(SYS_CLOSE, u5);
+            }
+        }
+        uint8_t f6[28];
+        int64_t t6 = syscall3(SYS_SOCKET, AF_INET6, SOCK_STREAM, 0);
+        mk_addr6(f6, 18392);
+        for (int i = 0; i < 16; i++) f6[8 + i] = 0;
+        f6[8] = 0x20; f6[9] = 0x01; f6[10] = 0x0d; f6[11] = 0xb8; f6[23] = 1; /* 2001:db8::1 documentation prefix */
+        check(syscall3(SYS_BIND, (uint64_t)t6, (uint64_t)f6, 28) == -EADDRNOTAVAIL_, "F: IPv6 TCP bind to a foreign address is EADDRNOTAVAIL");
+        int64_t u6 = syscall3(SYS_SOCKET, AF_INET6, SOCK_DGRAM, 0);
+        mk_addr6(f6, 24392);
+        for (int i = 0; i < 16; i++) f6[8 + i] = 0;
+        f6[8] = 0x20; f6[9] = 0x01; f6[10] = 0x0d; f6[11] = 0xb8; f6[23] = 1;
+        check(syscall3(SYS_BIND, (uint64_t)u6, (uint64_t)f6, 28) == -EADDRNOTAVAIL_, "F: IPv6 UDP bind to a foreign address is EADDRNOTAVAIL");
+        for (int i = 0; i < 16; i++) f6[8 + i] = 0;
+        check(syscall3(SYS_BIND, (uint64_t)u6, (uint64_t)f6, 28) == 0, "F: :: (any) is fine");
+        syscall1(SYS_CLOSE, t4); syscall1(SYS_CLOSE, t5); syscall1(SYS_CLOSE, u4);
+        syscall1(SYS_CLOSE, t6); syscall1(SYS_CLOSE, u6);
     }
 
     syscall1(SYS_CLOSE, b);

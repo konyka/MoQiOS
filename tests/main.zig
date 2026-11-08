@@ -11566,3 +11566,69 @@ test "O_APPEND writes to ext2 and FAT32 find the end and stage the data under on
     // ext2 takes the end from currentSize (disk size or the end still staged by another appender), not from this descriptor's cached size.
     try std.testing.expect(std.mem.indexOf(u8, v, "desc.file_size = @import(\"ext2.zig\").currentSize(desc.ext2_file_idx);\n                    desc.offset = desc.file_size;") != null);
 }
+
+test "bind(): an address the host does not have is EADDRNOTAVAIL, checked before the port rules" {
+    const bp = kt.bind_addr_policy;
+    const down: bp.Nic = .{};
+    const up: bp.Nic = .{ .active = true, .ip = .{ 10, 0, 2, 15 }, .netmask = .{ 255, 255, 255, 0 }, .link_local6 = .{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x52, 0x54, 0, 0xff, 0xfe, 0x12, 0x34, 0x56 } };
+    try std.testing.expectEqual(@as(i64, -99), bp.EADDRNOTAVAIL);
+    // IPv4: wildcard, all of 127/8, multicast and limited broadcast are always bindable.
+    for ([_]bp.Nic{ down, up }) |n| {
+        try std.testing.expect(bp.inet4Bindable(.{ 0, 0, 0, 0 }, n));
+        try std.testing.expect(bp.inet4Bindable(.{ 127, 0, 0, 1 }, n));
+        try std.testing.expect(bp.inet4Bindable(.{ 127, 9, 8, 7 }, n));
+        try std.testing.expect(bp.inet4Bindable(.{ 224, 0, 0, 251 }, n));
+        try std.testing.expect(bp.inet4Bindable(.{ 239, 255, 255, 250 }, n));
+        try std.testing.expect(bp.inet4Bindable(.{ 255, 255, 255, 255 }, n));
+        try std.testing.expect(!bp.inet4Bindable(.{ 192, 0, 2, 1 }, n));
+        try std.testing.expect(!bp.inet4Bindable(.{ 240, 0, 0, 1 }, n));
+    }
+    // The NIC's own address and its subnet broadcast only exist while the NIC does.
+    try std.testing.expect(bp.inet4Bindable(.{ 10, 0, 2, 15 }, up));
+    try std.testing.expect(bp.inet4Bindable(.{ 10, 0, 2, 255 }, up));
+    try std.testing.expect(!bp.inet4Bindable(.{ 10, 0, 2, 16 }, up));
+    try std.testing.expect(!bp.inet4Bindable(.{ 10, 0, 2, 15 }, down));
+    // IPv6: ::, ::1, multicast, the link-local address and configured addresses; v4-mapped follows IPv4.
+    const any6: [16]u8 = @splat(0);
+    var lo6: [16]u8 = @splat(0);
+    lo6[15] = 1;
+    var two: [16]u8 = @splat(0);
+    two[15] = 2;
+    var doc: [16]u8 = @splat(0);
+    doc[0] = 0x20;
+    doc[1] = 0x01;
+    doc[2] = 0x0d;
+    doc[3] = 0xb8;
+    doc[15] = 1;
+    var mc: [16]u8 = @splat(0);
+    mc[0] = 0xff;
+    mc[1] = 0x02;
+    mc[15] = 1;
+    var mapped_lo: [16]u8 = @splat(0);
+    mapped_lo[10] = 0xff;
+    mapped_lo[11] = 0xff;
+    mapped_lo[12] = 127;
+    mapped_lo[15] = 1;
+    var mapped_foreign = mapped_lo;
+    mapped_foreign[12] = 192;
+    mapped_foreign[13] = 0;
+    mapped_foreign[14] = 2;
+    for ([_]bp.Nic{ down, up }) |n| {
+        try std.testing.expect(bp.inet6Bindable(any6, n, false));
+        try std.testing.expect(bp.inet6Bindable(lo6, n, false));
+        try std.testing.expect(bp.inet6Bindable(mc, n, false));
+        try std.testing.expect(bp.inet6Bindable(mapped_lo, n, false));
+        try std.testing.expect(!bp.inet6Bindable(mapped_foreign, n, false));
+        try std.testing.expect(!bp.inet6Bindable(two, n, false));
+        try std.testing.expect(!bp.inet6Bindable(doc, n, false));
+    }
+    try std.testing.expect(bp.inet6Bindable(up.link_local6, up, false));
+    try std.testing.expect(!bp.inet6Bindable(up.link_local6, down, false));
+    try std.testing.expect(bp.inet6Bindable(doc, up, true));
+    // Wiring: every bind path (TCP/UDP x IPv4/IPv6) asks the policy before the port rules.
+    const ss = kt.socket_syscall_source;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "if (bindAddrNotAvail4("));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;"));
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;\n        if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (bindAddrNotAvail4(.{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] })) return bind_addr_policy.EADDRNOTAVAIL;\n    if (net_mod.tcp_port_policy.bindNeedsPrivilege(port)") != null);
+}

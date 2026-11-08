@@ -188,6 +188,7 @@ pub const poll_policy = @import("fs/poll_policy.zig");
 pub const poll_wake_policy = @import("fs/poll_wake_policy.zig");
 pub const ioctl_policy = @import("fs/ioctl_policy.zig");
 pub const ifreq_policy = @import("net/ifreq_policy.zig");
+pub const bind_addr_policy = @import("net/bind_addr_policy.zig");
 pub const tcp_info_policy = @import("net/tcp_info_policy.zig");
 pub const ip_opt_policy = @import("net/ip_opt_policy.zig");
 pub const scm_policy = @import("net/scm_policy.zig");

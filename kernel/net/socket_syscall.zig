@@ -20,6 +20,8 @@ const bo = @import("../lib/byte_order.zig");
 const socketpair_policy = @import("socketpair_policy.zig");
 const message_batch_policy = @import("message_batch_policy.zig");
 const accept4_policy = @import("accept4_policy.zig");
+const bind_addr_policy = @import("bind_addr_policy.zig");
+const nic_mod = @import("nic.zig");
 
 const ENOTCONN: i64 = -107;
 const SOCKADDR_UN_PATH_OFFSET: u32 = 2;
@@ -192,6 +194,25 @@ fn socketCreate(domain: u32, sock_type: u32) i64 {
     return fd;
 }
 
+fn bindAddrNotAvail4(addr: [4]u8) bool {
+    var nic: bind_addr_policy.Nic = .{ .active = nic_mod.isActive() };
+    if (nic.active) {
+        nic.ip = netif.getOurIp();
+        nic.netmask = netif.getNetmask();
+    }
+    return !bind_addr_policy.inet4Bindable(addr, nic);
+}
+
+fn bindAddrNotAvail6(addr: [16]u8) bool {
+    var nic: bind_addr_policy.Nic = .{ .active = nic_mod.isActive() };
+    if (nic.active) {
+        nic.ip = netif.getOurIp();
+        nic.netmask = netif.getNetmask();
+        nic.link_local6 = ndp.generateLinkLocal(netif.getMac());
+    }
+    return !bind_addr_policy.inet6Bindable(addr, nic, ndp.hasLocalAddress(addr));
+}
+
 /// bind(fd, addr_ptr, addr_len) → 0 or -errno
 pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
@@ -229,6 +250,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
             const n = copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN);
             if (n < sa.SOCKADDR_IN6_LEN) return -22; // EINVAL
             const parsed = sa.parseInet6(&sa6) orelse return -97; // EAFNOSUPPORT
+            if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;
             if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
             const cur_port = t.fd_table.fds[fd].udp_port;
             if (parsed.port != cur_port) {
@@ -246,6 +268,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         if (n4 < SOCKADDR_IN_MIN_LEN) return -22;
         // Accept legacy callers that only filled port+addr; family may be unset.
         const new_port = bo.readU16BeAt(&sock_addr, 2);
+        if (bindAddrNotAvail4(.{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] })) return bind_addr_policy.EADDRNOTAVAIL;
         if (net_mod.tcp_port_policy.bindNeedsPrivilege(new_port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
         const cur_port = t.fd_table.fds[fd].udp_port;
         if (new_port != cur_port) {
@@ -270,6 +293,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN)
             return -22;
         const parsed = sa.parseInet6(&sa6) orelse return -97; // EAFNOSUPPORT
+        if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;
         if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
         return net_mod.tcp.tcpBind(tcb_idx, parsed.port);
     }
@@ -279,6 +303,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     if (copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), SOCKADDR_IN_MIN_LEN) != SOCKADDR_IN_MIN_LEN) return -14;
     if (!@import("socket_address_policy.zig").inet4FamilyValid(bo.readU16Le(sock_addr[0..2]))) return -97; // EAFNOSUPPORT
     const port = bo.readU16BeAt(&sock_addr, 2);
+    if (bindAddrNotAvail4(.{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] })) return bind_addr_policy.EADDRNOTAVAIL;
     if (net_mod.tcp_port_policy.bindNeedsPrivilege(port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
     return net_mod.tcp.tcpBind(tcb_idx, port);
 }
