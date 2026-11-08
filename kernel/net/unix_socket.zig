@@ -522,6 +522,36 @@ pub fn unixBind(idx: u32, path: [*]const u8, path_len: usize) i32 {
     return 0;
 }
 
+var autobind_next: u32 = 0;
+
+/// bind() with only the address family (Linux "autobind"): the socket gets a kernel-chosen abstract name, NUL + five hex digits. A socket that
+/// already has an address keeps it (returns 0, like Linux).
+pub fn unixAutobind(idx: u32) i32 {
+    if (idx >= MAX_UNIX_SOCKETS) return -9; // EBADF
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    const sock = &unix_sockets[idx];
+    if (!sock.active) return -9; // EBADF
+    if (sock.bound) return 0;
+    if (sock.name_only) return -22; // EINVAL — an accepted socket
+    const hex = "0123456789abcdef";
+    var tries: u32 = 0;
+    while (tries < 0x100000) : (tries += 1) {
+        const n = autobind_next & 0xFFFFF;
+        autobind_next +%= 1;
+        var name: [6]u8 = undefined;
+        name[0] = 0;
+        var k: usize = 0;
+        while (k < 5) : (k += 1) name[1 + k] = hex[(n >> @intCast((4 - k) * 4)) & 0xF];
+        if (findBoundLocked(&name) != null) continue;
+        @memcpy(sock.path[0..6], &name);
+        sock.path_len = 6;
+        sock.bound = true;
+        return 0;
+    }
+    return -98; // EADDRINUSE — every name taken
+}
+
 /// Listen for connections on a STREAM socket.
 /// Returns 0 on success, negative errno on failure.
 pub fn unixListen(idx: u32, backlog: u32) i32 {

@@ -225,8 +225,14 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     if (t.fd_table.fds[fd].fd_type == .unix_socket) {
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
         if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -14;
+        // An address that is only the family asks for an automatically chosen abstract name.
+        if (addr_len == SOCKADDR_UN_PATH_OFFSET) {
+            var fam: [2]u8 = undefined;
+            if (copy.copyFromUser(&fam, @ptrFromInt(addr_ptr), 2) != 2) return -14;
+            if (bo.readU16Le(&fam) != 1) return -97; // EAFNOSUPPORT
+            return @as(i64, net_mod.unix_socket.unixAutobind(unix_idx));
+        }
         if (!@import("socket_address_policy.zig").unixLengthValid(addr_len, SOCKADDR_UN_PATH_OFFSET)) return -22;
-        if (addr_len <= SOCKADDR_UN_PATH_OFFSET) return -22; // EINVAL: family plus at least one path byte
         var sock_addr_buf: [110]u8 = undefined;
         const to_copy = @min(@as(usize, addr_len), sock_addr_buf.len);
         const copied = copy.copyFromUser(sock_addr_buf[0..to_copy], @ptrFromInt(addr_ptr), to_copy);

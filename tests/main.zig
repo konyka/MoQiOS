@@ -11708,3 +11708,19 @@ test "AF_UNIX: a stream client that closes while queued stays acceptable with it
     // The listener closing frees parked connectors it still queues, so the table cannot fill up.
     try std.testing.expect(std.mem.indexOf(u8, us, "if (queued < MAX_UNIX_SOCKETS and unix_sockets[queued].closed_queued) unix_sockets[queued] = .{};") != null);
 }
+
+test "AF_UNIX autobind: a family-only bind() takes a kernel-chosen abstract name" {
+    const us = kt.unix_socket_source;
+    // A bound socket keeps its address (returns 0); an accepted (name-only) socket is EINVAL.
+    try std.testing.expect(std.mem.indexOf(u8, us, "pub fn unixAutobind(idx: u32) i32 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    if (sock.bound) return 0;\n    if (sock.name_only) return -22;") != null);
+    // The name is NUL + five hex digits, skipped while another socket owns it.
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (findBoundLocked(&name) != null) continue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "sock.path_len = 6;") != null);
+    // bind(): exactly two bytes (the family) is the autobind request, checked before the "at least one path byte" rule.
+    const ss = kt.socket_syscall_source;
+    const auto = std.mem.indexOf(u8, ss, "if (addr_len == SOCKADDR_UN_PATH_OFFSET) {") orelse return error.TestUnexpectedResult;
+    const rule = std.mem.indexOf(u8, ss[auto..], "unixLengthValid(addr_len, SOCKADDR_UN_PATH_OFFSET)") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rule > 0);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "net_mod.unix_socket.unixAutobind(unix_idx)") != null);
+}

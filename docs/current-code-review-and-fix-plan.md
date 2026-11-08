@@ -7464,3 +7464,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修改：`UnixSocket` 新增 `closed_queued`。`unixClose` 遇到“面向连接、未连接、不是监听者、仍在某个监听者队列里”的套接字，不再摘队列，而是把槽位标成 `closed_queued`（清掉绑定信息，保留 `pending` 里的字节），描述符关闭但槽位留着。`unixAccept` 取到这样的槽位时，建一个没有对端、环里放着 `pending` 字节的已接受套接字（读完后是 EOF，写是 `EPIPE`，`was_connected` 为真）并释放那个槽位。监听者自己关闭时，把队列里还残留的 `closed_queued` 槽位一并释放，避免套接字表被占满。
 - 绿灯：hello134 两份（SMP=2）全部 PASS，G 段里“120 个孤儿连接（监听者在 accept 前关闭）之后还能新建套接字”也过了——套接字表只有 32 个槽位，这一项如果泄漏会失败；host 测试是源码顺序/接线守卫。
 - 局限（如实）：①队列满（`UNIX_BACKLOG_MAX` = 4）时本来就 `EAGAIN`，关闭的连接者仍占队列位置直到被 accept 或监听者关闭，没有超时；②`closed_queued` 槽位对 `poll`/`epoll` 不可见（没有描述符），监听者的 `POLLIN` 仍然报告连接就绪，这与 Linux 一致；③只覆盖流套接字，SEQPACKET 走的是同一个 `connectionOriented` 判断，没有单独测；④`SO_PEERCRED` 对这样的已接受套接字取不到对端信息（没有对端），Linux 仍能取到关闭前的凭据，这个差异没处理。
+
+## AF_UNIX 自动绑定（`bind` 只带地址族）（hello134 H 段，已补）
+
+- 来由：上面抽象地址一节的局限②。Linux 里 `bind(fd, {AF_UNIX}, 2)`（地址长度恰为 2）让内核分配一个抽象名：一个 NUL 加 5 位十六进制数，`getsockname` 的地址长度是 8；已经绑定过的套接字再次自动绑定返回 0 且名字不变。我在本机 Linux（7.2.15）上用 Python 的 `bind('')` 实测确认了这两点。此前这里 `addr_len <= 2` 一律 `EINVAL`。
+- 红灯：hello134 新增 H 段 13 项，旧内核上 9 项失败（自动绑定本身、名字格式、第二个套接字、不同名字、已绑定再绑定、显式绑定的 `EINVAL`、连接到自动名、数据报自动绑定、`sendto` 到自动名）。
+- 实现：`unix_socket.unixAutobind(idx)`：已绑定返回 0，已接受套接字（只有名字）`EINVAL`，否则取一个递增计数器的低 20 位生成 `\0xxxxx`，与已有绑定冲突就换下一个（最多试遍全部 2^20 个）。`socket_syscall.bind` 在“至少一个路径字节”的规则之前处理 `addr_len == 2`（地址族不是 `AF_UNIX` 返回 `EAFNOSUPPORT`）。长度小于 2 仍是 `EINVAL`。
+- 绿灯：hello134 两份（SMP=2）全部 PASS；host 测试是源码守卫（顺序和关键语句）；三个架构构建通过。
+- 局限（如实）：①计数器从 0 开始顺序分配，Linux 是随机起点，名字可预测——这里没有安全含义（抽象名本来就不是机密），但与 Linux 的“看起来随机”不同；②没有在 `connect`/`sendto` 时给未绑定的数据报发送者自动绑定（Linux 的 `SOCK_DGRAM` 在设置 `SO_PASSCRED` 后发送时会自动绑定）；③`unixAutobind` 持有 `unix_lock` 做线性扫描，最坏情形（2^20 次冲突）理论上很长，实际表只有 32 个槽位，最多 32 次冲突。
+- **门禁里抓到的回归（已修）**：完整 smoke 一直不通过，不报错，只是不退出。原因是 hello39 的旧断言 “`bind` 地址长度 2 → `EINVAL`” 在自动绑定之后变成 `0`，hello39 打印 FAIL，而 smoke 脚本等的是它的 PASS 标记，所以只会超时。我先花了不少时间在查日志（我杀掉脚本时它会清掉工作目录，日志跟着没了；之后改用 `MOQI_SMOKE_WORK_DIR` 保留）。在本机 Linux 上用 `ctypes` 调 `bind` 确认：长度 1 → `EINVAL`，长度 2 → 自动绑定。所以 hello39 改成测长度 1（“比地址族还短”），这才是 Linux 的 `EINVAL` 条件；这不是放宽断言，而是把一个本来就错的测试点（长度 2）改对。
+

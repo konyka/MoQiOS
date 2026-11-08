@@ -363,6 +363,55 @@ void _start(void) {
         syscall1(SYS_UNLINK, (uint64_t)pg);
     }
 
+    /* H: autobind. bind() with only the family (addr_len == 2) gives the socket a kernel-chosen abstract name: NUL + 5 hex digits (address length 8). */
+    {
+        struct sockaddr_un fam, got;
+        fam.family = AF_UNIX;
+        uint32_t glen;
+        int64_t a1 = syscall3(SYS_SOCKET, AF_UNIX, SOCK_STREAM, 0);
+        int64_t a2 = syscall3(SYS_SOCKET, AF_UNIX, SOCK_STREAM, 0);
+        check(syscall3(SYS_BIND, (uint64_t)a1, (uint64_t)&fam, 2) == 0, "H: bind with only the family autobinds");
+        glen = sizeof got;
+        for (unsigned i = 0; i < sizeof got; i++) ((char *)&got)[i] = 0x7f;
+        int ok = syscall3(SYS_GETSOCKNAME, (uint64_t)a1, (uint64_t)&got, (uint64_t)&glen) == 0 && glen == 8 && got.family == AF_UNIX && got.path[0] == 0;
+        for (int i = 1; i <= 5 && ok; i++) {
+            char c = got.path[i];
+            ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        }
+        check(ok, "H: the name is NUL + 5 hex digits (length 8)");
+        struct sockaddr_un first = got;
+        check(syscall3(SYS_BIND, (uint64_t)a2, (uint64_t)&fam, 2) == 0, "H: a second socket autobinds too");
+        glen = sizeof got;
+        syscall3(SYS_GETSOCKNAME, (uint64_t)a2, (uint64_t)&got, (uint64_t)&glen);
+        int same = 1;
+        for (int i = 1; i <= 5; i++) if (got.path[i] != first.path[i]) same = 0;
+        check(!same, "H: and gets a different name");
+        check(syscall3(SYS_BIND, (uint64_t)a1, (uint64_t)&fam, 2) == 0, "H: autobinding an already bound socket is 0 (Linux)");
+        glen = sizeof got;
+        syscall3(SYS_GETSOCKNAME, (uint64_t)a1, (uint64_t)&got, (uint64_t)&glen);
+        same = 1;
+        for (int i = 1; i <= 5; i++) if (got.path[i] != first.path[i]) same = 0;
+        check(same, "H: and its name does not change");
+        struct sockaddr_un named;
+        uint64_t ln = mkaddr(&named, "/tmp/h134h.sock");
+        check(syscall3(SYS_BIND, (uint64_t)a1, (uint64_t)&named, ln) == -EINVAL_, "H: an explicit bind after the autobind is EINVAL");
+        check(syscall3(SYS_BIND, (uint64_t)a1, (uint64_t)&fam, 1) == -EINVAL_, "H: an address shorter than the family is EINVAL");
+        /* the autobound name is a real address: a client can connect to it */
+        check(syscall3(SYS_LISTEN, (uint64_t)a1, 4, 0) == 0, "H: listen on the autobound socket");
+        int64_t cc = syscall3(SYS_SOCKET, AF_UNIX, SOCK_STREAM, 0);
+        check(syscall3(SYS_CONNECT, (uint64_t)cc, (uint64_t)&first, 8) == 0, "H: a client connects to the autobound name");
+        syscall1(SYS_CLOSE, (uint64_t)cc);
+        int64_t da = syscall3(SYS_SOCKET, AF_UNIX, SOCK_DGRAM, 0), db = syscall3(SYS_SOCKET, AF_UNIX, SOCK_DGRAM, 0);
+        check(syscall3(SYS_BIND, (uint64_t)db, (uint64_t)&fam, 2) == 0, "H: a datagram socket autobinds");
+        glen = sizeof got;
+        syscall3(SYS_GETSOCKNAME, (uint64_t)db, (uint64_t)&got, (uint64_t)&glen);
+        check(syscall6(SYS_SENDTO, (uint64_t)da, (uint64_t)"dg", 2, 0, (uint64_t)&got, glen) == 2, "H: sendto reaches it");
+        char rb[8] = {0};
+        check(recvfrom0(db, rb, 8) == 2 && rb[0] == 'd' && rb[1] == 'g', "H: and the datagram arrives");
+        syscall1(SYS_CLOSE, (uint64_t)a1); syscall1(SYS_CLOSE, (uint64_t)a2);
+        syscall1(SYS_CLOSE, (uint64_t)da); syscall1(SYS_CLOSE, (uint64_t)db);
+    }
+
     print(failures == 0 ? "hello134: PASS\n" : "hello134: FAIL\n");
     print("hello134 done\n");
     syscall1(SYS_EXIT, failures == 0 ? 0 : 1);

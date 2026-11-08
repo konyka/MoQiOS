@@ -97,7 +97,8 @@ void _start(void) {
     const int64_t unix_fd = syscall3(SYS_SOCKET, AF_UNIX, SOCK_STREAM, 0);
     if (unix_fd < 0) fail("UNIX socket");
     uint8_t unix_addr[3] = { 1, 0, 'x' };
-    if (syscall3(SYS_BIND, unix_fd, (uint64_t)unix_addr, 2) != -22) {
+    /* Linux: an address shorter than the family is EINVAL; exactly the family (length 2) is an autobind request (hello134 H). */
+    if (syscall3(SYS_BIND, unix_fd, (uint64_t)unix_addr, 1) != -22) {
         fail("AF_UNIX short addr_len EINVAL");
     }
     syscall1(SYS_CLOSE, (uint64_t)unix_fd);
