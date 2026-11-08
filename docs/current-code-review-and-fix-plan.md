@@ -7393,3 +7393,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修改：`vfs.zig` 新增 `append_lock`（睡眠锁，因为暂存可能刷盘），ext2 与 FAT32 的 `write` 在带 `O_APPEND` 时持有它，一次完成"取末尾＋暂存数据"。ext2 的末尾改成 `ext2.currentSize`（磁盘大小或回写缓冲里别的追加者暂存的数据末尾，FAT32 本来就用它），而不是这个描述符缓存的 `file_size`。
 - 绿灯：hello266 六项全部通过（每个文件系统 0 轮出错）。变异（真编译，各一次）：去掉 ext2 的锁 → ext2 两项失败（5/20、20/20），tmpfs 与 FAT32 仍通过；去掉 FAT32 的锁 → FAT32 两项失败（6/20、18/20）；说明两处修复各自都必要。
 - 局限：①`append_lock` 是一个全局锁，所有 ext2/FAT32 的追加者排队（不同文件之间也互斥）；追加写入通常很短，我没有测量争用；②只有带 `O_APPEND` 的写入走这个锁，同一个文件上的非追加写（`pwrite`、普通偏移写）与追加者之间没有互斥——Linux 同样不保证它们之间的顺序；③**`writev` 不是原子的（读代码确认，没有运行用例）**：`readv.zig` 的 `writev` 对每个 iovec 的每个 4 KiB 块各调用一次 `fd_table.write`，所以一个带多个 iovec 的 `writev` 会被另一个追加者夹在中间；Linux 把整个 `writev` 当成一次原子追加。这是单独的缺陷，下一轮候选；④被 `fsizeGate` 限制长度的追加（RLIMIT_FSIZE）用锁内读到的偏移，行为不变。
+
+## FAT32 写扇区会无条件开中断：CI 上 smoke 偶发卡死的根因（已修）
+
+- 现象：CI 的 `Smoke SMP=2` 在 hello266 之后 900 s 与 1500 s 都超时，串口日志停住、没有 FAIL。本机并行跑 6–8 份 SMP=2 smoke，每批有 2 份卡死（卡在 hello266 或 hello114）。
+- 现场：QEMU monitor 的 `info registers -a` 显示一个核在 `pause` 里自旋、关着中断，另一个核 `hlt`；自旋核的栈经 `FdTable.writeInner → fat32.currentSize` 停在 `fat32.fs_lock` 的 `Ticket.lock` 上。
+- 根因：`fat32.safeWriteSectors` 用 `cli` … `sti` 包住 `virtio_blk.writeSectors`，而它的所有调用方已经持有 `fs_lock`（`IrqSpinlock`，会关中断）。写完那条无条件的 `sti` 把中断重新打开，定时器 tick 就可能在持锁期间把持有者切走；同一个核上的下一个 FAT32 访问者在关中断状态下自旋等锁，持有者再也没机会运行。
+- 修复：改为保存并恢复中断标志（`arch.irq.saveAndDisable` / `restore`），不再强制 `sti`。
+- 验证：修复前 6 份里 2 份、8 份里 2 份卡死；修复后 8 份并行全部 PASS；host 测试与三个架构的构建通过。
+- 附带：CI 的 smoke 超时从 900 s 提到 1500 s 并不是这次问题的解法（那次超时是真卡死），保留作余量。

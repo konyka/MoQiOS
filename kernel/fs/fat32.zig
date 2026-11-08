@@ -5,6 +5,7 @@
 ///   - FAT32 filesystem: BPB parsing, cluster chain traversal, file listing
 ///   - Falls back to raw FAT32 if no MBR partition table found
 const serial = @import("../arch/arch.zig").serial;
+const arch_irq = @import("../arch/arch.zig").irq;
 const virtio_blk = @import("../drivers/virtio_blk.zig");
 const block_dev = @import("../drivers/block_dev.zig");
 const trim_ranges = @import("../lib/trim_ranges.zig");
@@ -668,10 +669,13 @@ pub fn setFileSize(idx: u32, size: u32) void {
 /// the write. Without CLI/STI, writeSectors called from syscall context
 /// prevents sysretq from returning to user space — the virtio-blk write
 /// completion triggers an interrupt that corrupts the syscall return path.
+///
+/// The interrupt flag is saved and restored, not forced back on: every caller holds fs_lock (an IRQ-masking spinlock), and an unconditional
+/// `sti` let a timer tick switch away from the lock holder. The next FAT32 user on that CPU then spun on fs_lock with interrupts off for good.
 fn safeWriteSectors(lba: u64, count: u32, buf: [*]const u8) i64 {
-    asm volatile ("cli" ::: .{ .memory = true });
+    const saved = arch_irq.saveAndDisable();
     const ret = virtio_blk.writeSectors(lba, count, buf);
-    asm volatile ("sti" ::: .{ .memory = true });
+    arch_irq.restore(saved);
     return ret;
 }
 
