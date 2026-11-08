@@ -11451,3 +11451,43 @@ test "status VmSize is the program image plus the address space's charged bytes,
     try std.testing.expect(std.mem.indexOf(u8, ps, "st.vm_rss_kb = @import(\"../arch/x86_64/paging.zig\").residentUserPages(root) * 4;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ps, "defer if (root != 0) user_space.destroyUserSpace(root);") != null);
 }
+
+test "docs/user-space.md and moqios-architecture-current.md name the real last program of init's auto-test sequence" {
+    // The sequence grows by a probe or two every round and these sentences went stale again and again (they said hello229 when the last run_test was
+    // hello264). The highest number is read from servers/init/main.c, so the docs cannot drift silently.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    const init_src = try cwd.readFileAlloc(io, "servers/init/main.c", allocator, .limited(1024 * 1024));
+    defer allocator.free(init_src);
+    var highest: u32 = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, init_src, from, "run_test")) |at| {
+        from = at + 8;
+        const open = std.mem.indexOfPos(u8, init_src, at, "(\"hello") orelse break;
+        // Only a direct call: "run_test(" or "run_test_quiet(" with nothing between the name and the parenthesis.
+        const gap = open - at;
+        if (gap != 8 and gap != 14) continue;
+        var end = open + 7;
+        var n: u32 = 0;
+        while (end < init_src.len and init_src[end] >= '0' and init_src[end] <= '9') : (end += 1) n = n * 10 + (init_src[end] - '0');
+        if (n > highest) highest = n;
+    }
+    try std.testing.expect(highest > 200);
+    var want_buf: [32]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, "hello{d}", .{highest});
+
+    const us = try cwd.readFileAlloc(io, "docs/user-space.md", allocator, .limited(4 * 1024 * 1024));
+    defer allocator.free(us);
+    var up_buf: [64]u8 = undefined;
+    const us_phrase = try std.fmt.bufPrint(&up_buf, "当前从 `hello2` 到 `{s}`", .{want});
+    try std.testing.expect(std.mem.indexOf(u8, us, us_phrase) != null);
+
+    const arch = try cwd.readFileAlloc(io, "docs/moqios-architecture-current.md", allocator, .limited(4 * 1024 * 1024));
+    defer allocator.free(arch);
+    var ar_buf: [64]u8 = undefined;
+    const ar_phrase = try std.fmt.bufPrint(&ar_buf, "hello2–{s}", .{want});
+    // Every mention of the range ends at the real last program (four sentences in this file).
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, arch, ar_phrase));
+    try std.testing.expect(std.mem.indexOf(u8, arch, "hello2–hello2") == null or std.mem.count(u8, arch, "hello2–hello2") == std.mem.count(u8, arch, ar_phrase));
+}

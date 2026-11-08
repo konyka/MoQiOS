@@ -7330,3 +7330,10 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 第一版用例的问题（如实）：我按 Linux 的行为断言"`mmap` 之后 `VmRSS` 不变"，结果失败（+1024 kB）——本内核在 `mmap` 时就急切地填充匿名页（`mmap.zig` 注释里写明），Linux 是惰性的。这是已知的实现差异，不是这次引入的；我把用例改成检查总量（触碰后比 mmap 前多 1024 kB、`munmap` 后回到起点附近）并打印一行说明，而不是在断言里假装一致。
 - 绿灯：hello264 7 项（实际运行计数）通过；host 1096/1096。变异（真编译，各一次）：①`VmSize` 只算一半计费 → B、D、E 三项失败；②`VmRSS` 乘 2 而不是 4 → C、D 失败；均已还原。
 - 局限：①`VmSize` 是估算：映像大小取到初始 break，不含 `PT_TLS`、vdso/信号跳板页等；与 Linux 的绝对数值不可比，只有增减量可靠；②`VmRSS` 没有拆成 `RssAnon`/`RssFile`/`RssShmem`，也没有 `VmPeak`/`VmHWM`/`VmData`/`VmStk`/`VmExe`/`VmLib` 等行；③非 x86_64 构建不输出 Vm 行（`residentUserPages` 只在 x86_64 可用）；④急切填充使 `VmRSS` 在 `mmap` 瞬间就上升，与 Linux 不同；⑤`Seccomp` 行仍没有。
+
+### 文档里"自动序列到 hello229"早已过时（已修，加了守卫测试）
+
+- 发现方式：写 hello264 的文档时注意到 `docs/user-space.md` 和 `docs/moqios-architecture-current.md` 里"自动序列 hello2–hello229"的说法（共 5 处）没有随着新增的探针更新，而 `servers/init/main.c` 的序列已经到 hello264。
+- 核对（用脚本对 `servers/init/main.c` 和 `user/hello*.c` 做集合差，不凭印象）：序列里共 250 个 `run_test`/`run_test_quiet` 调用，最大 264；有源码但不在序列里的是 6、11、28、116、149、230、231、232、233（文档写的这几个是对的）；序列里有一个 `hello3` 没有对应的 `user/hello3.c`（它在别处构建）。我第一次用的正则漏了 `run_test_quiet`（hello13–16），把它们误报为"不在序列里"，发现后改正。
+- 修改：5 处 `hello229` 改成 `hello264`；新增宿主机测试，从 `servers/init/main.c` 读最大编号，断言两份文档里的区间终点与它一致。测试对旧文本失败（我把那一句临时改回 hello229，得到 1097/1098），改回后通过。
+- 局限：守卫只管这两份文档里的"序列终点"这一个数字；其它文档里写死的项数、通过计数（例如各 hello 行里的"N 项"）仍靠人工核对，没有自动化。
