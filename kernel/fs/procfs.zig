@@ -26,6 +26,8 @@ pub const ProcFile = enum(u8) {
     irqwindow,
     /// Loopback queue counters: frames queued, delivered, dropped (queue full) and the queue's high-water mark.
     lostats,
+    /// TCB table snapshot: connections per state, unreferenced leftovers, SYNs dropped for lack of a slot, TIME_WAIT slots given away.
+    tcpstats,
     /// The /proc directory itself and /proc/<pid> (also reached as /proc/self): directories, listed by getdents64.
     root_dir,
     pid_dir,
@@ -58,7 +60,7 @@ const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
 
 /// The files /proc lists besides the per-process directories, in listing order.
-const root_files = [_][]const u8{ "meminfo", "cpuinfo", "uptime", "version", "loadavg", "filesystems", "stat", "sched_stats", "vma_stats", "irqtime", "irqwindow", "lostats" };
+const root_files = [_][]const u8{ "meminfo", "cpuinfo", "uptime", "version", "loadavg", "filesystems", "stat", "sched_stats", "vma_stats", "irqtime", "irqwindow", "lostats", "tcpstats" };
 /// What a /proc/<pid> directory lists.
 const pid_files = [_][]const u8{ "status", "maps", "stat", "cmdline", "rss", "comm", "fd" };
 
@@ -162,6 +164,7 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
         .irqtime => generateIrqTime(buf, max_len),
         .irqwindow => generateIrqWindow(buf, max_len),
         .lostats => generateLoStats(buf, max_len),
+        .tcpstats => generateTcpStats(buf, max_len),
         .root_dir, .pid_dir, .mount_dir, .fd_dir => 0,
     };
 }
@@ -587,6 +590,11 @@ fn generateIrqWindow(buf: [*]u8, max_len: u32) u32 {
         pos = appendStr(buf, pos, max_len, "\n");
     }
     return pos;
+}
+
+fn generateTcpStats(buf: [*]u8, max_len: u32) u32 {
+    const tcp = @import("../net/tcp.zig");
+    return @intCast(@import("../net/tcp_stats.zig").format(tcp.tcpStatsSnapshot(), buf[0..max_len]));
 }
 
 fn generateLoStats(buf: [*]u8, max_len: u32) u32 {

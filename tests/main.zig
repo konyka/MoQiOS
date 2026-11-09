@@ -11851,3 +11851,35 @@ test "tcp: a full TCB table gives a new connection the oldest unreferenced TIME_
     try std.testing.expectEqual(@as(?usize, 2), p.pickTimeWaitVictim(&[_]bool{ false, false, true }, &[_]u32{ 99, 99, 0 }));
     try std.testing.expectEqual(@as(?usize, null), p.pickTimeWaitVictim(&[_]bool{}, &[_]u32{}));
 }
+
+test "tcp_stats: /proc/tcpstats lists every state in enum order, then the table-pressure counters" {
+    const ts = kt.tcp_stats;
+    var st: ts.Stats = .{ .orphans = 39, .active = 64, .capacity = 64, .syn_dropped = 7, .time_wait_evicted = 12 };
+    st.per_state[3] = 22;
+    st.per_state[7] = 33;
+    st.per_state[9] = 6;
+    var buf: [400]u8 = undefined;
+    const n = ts.format(st, &buf);
+    try std.testing.expectEqualStrings("closed=0 syn_sent=0 syn_received=0 established=22 fin_wait_1=0 fin_wait_2=0 closing=0 time_wait=33 close_wait=0 last_ack=6 listen=0 orphans=39 active=64 capacity=64 syn_dropped=7 time_wait_evicted=12\n", buf[0..n]);
+    // The output is cut off at the buffer's end, never past it.
+    var small: [20]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 20), ts.format(st, &small));
+    // The state order matches TcpState so index i is @intFromEnum(state).
+    try std.testing.expectEqualStrings("time_wait", ts.state_names[7]);
+    try std.testing.expectEqualStrings("listen", ts.state_names[10]);
+}
+
+test "tcp ephemeral ports: after one is handed out the next pick moves on, and a whole cycle never repeats a port" {
+    const p = kt.tcp_port_policy;
+    var cur: u16 = p.EPHEMERAL_FIRST;
+    var seen = std.bit_set.ArrayBitSet(u64, 65536).initEmpty();
+    var i: u32 = 0;
+    while (i < p.EPHEMERAL_COUNT) : (i += 1) {
+        const port = p.pickEphemeralPort(cur, &[_]u16{}).?;
+        try std.testing.expect(!seen.isSet(port));
+        seen.set(port);
+        cur = p.nextEphemeralPort(port);
+    }
+    // After the full range the first port comes round again.
+    try std.testing.expectEqual(p.EPHEMERAL_FIRST, p.pickEphemeralPort(cur, &[_]u16{}).?);
+}

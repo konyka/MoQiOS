@@ -30,6 +30,7 @@ const tcp_util = @import("tcp_util.zig");
 const tcp_info_policy = @import("tcp_info_policy.zig");
 const ip_opt_policy = @import("ip_opt_policy.zig");
 const tcp_recv_policy = @import("tcp_recv_policy.zig");
+const tcp_stats = @import("tcp_stats.zig");
 const tcp_port_policy = @import("tcp_port_policy.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
@@ -769,6 +770,26 @@ var next_ephemeral_port: u16 = 49152;
 
 // ─── Utilities ────────────────────────────────────────────────────────────
 
+/// SYNs dropped because the table had no free slot, and TIME_WAIT slots given away on a full table (/proc/tcpstats).
+var syn_dropped_no_slot: u64 = 0;
+var time_wait_evicted_count: u64 = 0;
+
+/// A consistent copy of the table's state counts (taken under tcp_lock) for /proc/tcpstats.
+pub fn tcpStatsSnapshot() tcp_stats.Stats {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    var st: tcp_stats.Stats = .{ .capacity = MAX_CONNECTIONS, .syn_dropped = syn_dropped_no_slot, .time_wait_evicted = time_wait_evicted_count };
+    var bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
+    while (bm != 0) {
+        const i = @ctz(bm);
+        bm &= bm - 1;
+        st.active += 1;
+        st.per_state[@min(@as(usize, @intFromEnum(tcbs[i].state)), tcp_stats.STATE_COUNT - 1)] += 1;
+        if (tcbs[i].ref_count == 0) st.orphans += 1;
+    }
+    return st;
+}
+
 /// Free the TIME_WAIT TCB that has waited longest (tcp_port_policy.pickTimeWaitVictim) when the table has no free slot. Caller holds
 /// tcp_lock. Returns false when no TIME_WAIT slot qualifies.
 fn evictOldestTimeWait() bool {
@@ -785,6 +806,7 @@ fn evictOldestTimeWait() bool {
     }
     const victim = tcp_port_policy.pickTimeWaitVictim(&waiting, &age) orelse return false;
     deactivateTcb(&tcbs[victim]);
+    time_wait_evicted_count +%= 1;
     return true;
 }
 
@@ -2093,7 +2115,10 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
     if (ls.pending_tail -% ls.pending_head >= LISTEN_BACKLOG) return;
 
     // Allocate a new TCB for this connection
-    const new_tcb = allocTcb() orelse return;
+    const new_tcb = allocTcb() orelse {
+        syn_dropped_no_slot +%= 1;
+        return;
+    };
     new_tcb.local_port = dst_port;
     new_tcb.remote_port = src_port;
     new_tcb.remote_ip = src_ip;
@@ -2189,7 +2214,10 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
 
     if (ls.pending_tail -% ls.pending_head >= LISTEN_BACKLOG) return;
 
-    const new_tcb = allocTcb() orelse return;
+    const new_tcb = allocTcb() orelse {
+        syn_dropped_no_slot +%= 1;
+        return;
+    };
     new_tcb.local_port = dst_port;
     new_tcb.remote_port = src_port;
     new_tcb.is_v6 = true;

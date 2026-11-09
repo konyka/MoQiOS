@@ -1164,6 +1164,8 @@ pub const FdTable = struct {
                 pfile = .irqwindow;
             } else if (rest.len == 7 and str.eql(rest, "lostats")) {
                 pfile = .lostats;
+            } else if (rest.len == 8 and str.eql(rest, "tcpstats")) {
+                pfile = .tcpstats;
             } else if (procDirPid(rest)) |dir_pid| {
                 // /proc/<pid>, /proc/<pid>/ and /proc/self: the process's directory.
                 pfile = .pid_dir;

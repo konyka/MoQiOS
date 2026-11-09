@@ -7520,7 +7520,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello268 在改动之前的内核上，三个文件系统各有 3 项失败（`pwrite`/`pwritev` 把数据覆盖在偏移 0 上，文件仍是 8 字节；四个进程并发写，记录互相覆盖），共 9 项；`copy_file_range` 和 `splice` 的两项是后加的，在改动前也失败（返回成功的字节数）。
 - 实现：`vfs.zig` 的 `writeAtOffset` 对 `O_APPEND` 描述符把偏移换成文件当前末尾——ext2/FAT32 在 `append_lock` 之内取 `currentSize` 再暂存，tmpfs 走 `tmpfsAppend`（取末尾和写入在一次持锁里）；`file_io.pwrite` 和 `readv.pwritev` 像 `write`/`writev` 一样整次调用持有 `append_call_lock`；`splicePipeToFile` 对 `O_APPEND` 目的返回 `EINVAL`，`copyFileRange` 对 `O_APPEND` 目的返回 `EBADF`。
 - 绿灯：hello268 在三个文件系统上通过（含 6 轮四进程并发 `pwrite`/`pwritev`）；host 1124/1124，其中新增一条源码形状测试，并把 `O_APPEND` 的锁位置计数由 2 改为 4（`write` 与 `writeAtOffset` 各占 ext2/FAT32 两处）。
-- 局限（如实）：①`aio` 的写（`io_submit` 的 `PWRITE`）没有检查，没有 `O_APPEND` 用例；②`pwritev2` 的 `RWF_APPEND` 标志没有实现；③全局 `append_call_lock` 的争用仍没有测量；④`sendfile` 到 `O_APPEND` 的普通文件：本内核本来就拒绝（`EINVAL`），与 Linux 一致，但没有为它写用例。
+- 局限（如实）：①~~`aio` 的 `PWRITE`~~、~~`sendfile` 到 `O_APPEND`~~ 已在下一节补了用例；②`pwritev2`/`preadv2` 这个内核根本没有实现（不在系统调用表里），所以 `RWF_APPEND`/`RWF_NOAPPEND` 也不存在；③全局 `append_call_lock` 的争用仍没有测量。
 
 ## TCB 表被已结束连接的 TIME_WAIT 占满：`socket()`/`connect` 失败（hello269，已修；这是 CI 上 hello183 G / hello184 D 偶发失败的根因）
 
@@ -7529,4 +7529,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 查因过程（如实）：先猜是 SYN 丢了要等 2 秒重传，把等待放宽到 3 秒，本地照样失败，猜测错误，放宽已撤回。加临时诊断后得到证据：失败时第 12 个客户端的 `socket()` 返回 `-1`（所以第 12 个 `connect` 得 `-88 ENOTSOCK`，只 accept 到 11 个）；再在 `tcpSocket` 里打印表占用（失败那一次）：64 个槽里 CLOSED 1 个、ESTABLISHED 22 个、**TIME_WAIT 33 个、LAST_ACK 6 个**、LISTEN 2 个，其中 39 个槽 `ref_count == 0`（没有任何描述符引用）——恰好等于 TIME_WAIT 加 LAST_ACK。也就是说表被前面几十个测试留下的、已经结束的连接占满了，`allocTcb` 找不到空槽就返回失败。我只抓到这一次表占用，没有统计其它失败次数里的构成；表在 hello183 时刻是否恰好满取决于前面测试的快慢，这和“偶发”相符。
 - 复现：hello269（新增）：一个本机监听者，100 轮 `connect`/`accept`/双向 `close`，每轮留下一个 15 秒的 TIME_WAIT。修复前每满 31 轮就有一轮卡约 78 秒，100 轮共 237 秒；`socket()` 与 `connect` 本身仍然返回成功。我的推测（没有验证）是服务端收到 SYN 时 `allocTcb` 失败而丢弃，客户端的 SYN 重传退避到 TIME_WAIT 到期才成功，约 78 秒与这个解释相符。修复后 100 轮共 2.6 秒，最慢一轮 38 毫秒。
 - 修改：`tcp_port_policy.pickTimeWaitVictim`（纯函数，host 测试）；`tcp.zig` 的 `allocTcb` 在表满时调用 `evictOldestTimeWait`：在 TIME_WAIT 且 `ref_count == 0` 的槽里选等得最久的释放给新连接。活跃连接、监听者、仍被描述符引用的 TCB 从不被拿走。
-- 风险与局限（如实）：①驱逐 TIME_WAIT 提前放弃了 2MSL 保护（Linux 在表满时也会提前回收 TIME_WAIT，但会保留序号检查），本内核的 TIME_WAIT 本来就缩短到 15 秒，迟到的重复段可能被新连接误收的窗口比以前大；②只处理 TIME_WAIT；LAST_ACK、FIN_WAIT 等状态的孤儿 TCB 仍然占槽，直到它们自己的定时器到期；③CI 上是否从此不再失败要看之后的 CI 结果，本地只是 4 份并行运行没有再看到；④`MAX_CONNECTIONS` 仍是 64，没有改。
+- 风险与局限（如实，后续核实见下一节）：①驱逐 TIME_WAIT 提前放弃了 2MSL 保护（Linux 在表满时也会提前回收 TIME_WAIT，但会保留序号检查），本内核的 TIME_WAIT 本来就缩短到 15 秒，迟到的重复段可能被新连接误收的窗口比以前大；②只处理 TIME_WAIT；LAST_ACK、FIN_WAIT 等状态的孤儿 TCB 仍然占槽，直到它们自己的定时器到期；③CI 上是否从此不再失败要看之后的 CI 结果，本地只是 4 份并行运行没有再看到；④`MAX_CONNECTIONS` 仍是 64，没有改。
+
+## 上一节“没有验证”的几项：逐项核实（hello268/hello269 扩展，`/proc/tcpstats`）
+
+- **hello269 修复前卡 78 秒的机制（已证实）**：临时关掉 TIME_WAIT 驱逐，在两处 SYN 处理（IPv4/IPv6）的 `allocTcb` 失败点打印诊断，再单独跑 hello269：100 轮共 238.5 秒，最慢一轮 78.7 秒，诊断恰好打印 12 次“SYN dropped: allocTcb failed”。所以确实是服务端收到 SYN 时没有空槽而丢弃、客户端靠 SYN 重传退避等到 TIME_WAIT 到期才连上。诊断与关闭驱逐的改动已撤回。
+- **能从用户态观察表的压力（新增 `/proc/tcpstats`）**：一行 `closed=N syn_sent=N … listen=N orphans=N active=N capacity=N syn_dropped=N time_wait_evicted=N`。各状态计数按 `TcpState` 的顺序，`orphans` 是没有描述符引用的槽，`syn_dropped` 是因没有空槽而丢弃的 SYN 总数，`time_wait_evicted` 是表满时让出的 TIME_WAIT 槽总数。格式化是纯模块 `net/tcp_stats.zig`（host 测试锁定输出），快照在 `tcp_lock` 下取。hello269 现在断言 100 轮期间 `syn_dropped` 增量为 0：实测两次都是 0，驱逐 137 次，结束时 TIME_WAIT 63 个（每轮两端各一个，共 200 个 = 137 + 63，账对得上）。
+- **2MSL 的风险（部分核实）**：被驱逐的 TIME_WAIT 槽的 4 元组会不会很快被新连接重用？hello269 记录每轮客户端 `getsockname` 得到的本地端口：100 轮里没有一个端口重复；host 测试证明临时端口在整个 16384 个端口的周期内不会重复。所以在这个负载下，被驱逐的 4 元组在新连接里不会马上再次出现，迟到的重复段落入新连接的风险需要端口用完一整圈才可能发生。**没有核实的**：服务端被驱逐的 TIME_WAIT（服务端端口固定，靠客户端端口区分 4 元组）同样依赖客户端端口不重复；外部对端主动选择端口的情形没有测。
+- **`O_APPEND` 的其余写路径（已补用例）**：本机 Linux 实测：`io_submit` 的 `PWRITE` 在 `O_APPEND` 描述符上忽略偏移、写在末尾；`sendfile` 输出到普通文件可以，输出到 `O_APPEND` 文件是 `EINVAL`。本内核：aio 的 `PWRITE` 经 `fd_table.write`，本来就走 `O_APPEND` 路径（hello268 新增用例三个文件系统都通过，**这不是先红后绿**，代码没改）；`sendfile` 只接受套接字和管道作输出，到 `O_APPEND` 文件同样是 `EINVAL`（用例通过，代码没改）。`pwritev2` 本内核没有实现，不做。
+- 仍然开放：LAST_ACK、FIN_WAIT 等状态的孤儿 TCB 仍占槽，没有驱逐（hello269 里 `syn_dropped` 为 0，说明在这个负载下只驱逐 TIME_WAIT 已经足够，但更重的负载没有测）；`MAX_CONNECTIONS` 仍是 64。
+

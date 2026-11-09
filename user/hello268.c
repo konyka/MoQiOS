@@ -9,6 +9,33 @@
 #include "../lib/moqi_libc/include/string.h"
 
 #define SYS_PWRITEV_ 141
+#define SYS_SENDFILE_ 40
+#define SYS_IO_SETUP_ 213
+#define SYS_IO_DESTROY_ 214
+#define SYS_IO_SUBMIT_ 215
+#define SYS_IO_GETEVENTS_ 216
+struct kiocb { unsigned long long data; unsigned key; unsigned rw_flags; unsigned short opcode; short prio; unsigned fd; unsigned long long buf, nbytes; long long offset; unsigned long long res2; unsigned flags, resfd; };
+struct kioev { unsigned long long data, obj; long long res, res2; };
+/* One IOCB_CMD_PWRITE through io_submit; returns the completion's res (bytes or -errno), or -1000 when submit itself failed. */
+static long aio_pwrite(int fd, const char *data, unsigned long n, long long off) {
+    unsigned long ctx = 0;
+    if (syscall2(SYS_IO_SETUP_, 4, (long)&ctx) != 0) return -1001;
+    struct kiocb cb;
+    memset(&cb, 0, sizeof cb);
+    cb.opcode = 1;
+    cb.fd = (unsigned)fd;
+    cb.buf = (unsigned long long)(unsigned long)data;
+    cb.nbytes = n;
+    cb.offset = off;
+    struct kiocb *list[1] = { &cb };
+    long sub = syscall3(SYS_IO_SUBMIT_, (long)ctx, 1, (long)list);
+    struct kioev ev;
+    memset(&ev, 0, sizeof ev);
+    long got = syscall5(SYS_IO_GETEVENTS_, (long)ctx, 1, 1, (long)&ev, 0);
+    syscall1(SYS_IO_DESTROY_, (long)ctx);
+    if (sub != 1 || got != 1) return -1000;
+    return (long)ev.res;
+}
 #define SYS_SPLICE_ 145
 #define SYS_COPY_FILE_RANGE_ 184
 
@@ -105,6 +132,24 @@ static void one_fs(const char *label, const char *path) {
         snprintf(what, sizeof what, "%s: splice from a pipe into an O_APPEND file is EINVAL (got %ld)", label, sp);
         check(sp == -22, what);
         close(pp[0]); close(pp[1]); close(sfd); close(afd);
+    }
+    {
+        int afd = (int)open(path, O_WRONLY | O_APPEND, 0644);
+        long ar = aio_pwrite(afd, "aio", 3, 0);
+        close(afd);
+        int rfd2 = (int)open(path, O_RDONLY, 0);
+        char ab[40];
+        long rr = read(rfd2, ab, sizeof ab);
+        close(rfd2);
+        snprintf(what, sizeof what, "%s: io_submit PWRITE at offset 0 on an O_APPEND fd appends (res %ld, file %ld bytes)", label, ar, rr);
+        check(ar == 3 && rr == 17 && memcmp(ab, "AAAAAAAAXY1234aio", 17) == 0, what);
+        int sfd = (int)open(path, O_RDONLY, 0);
+        afd = (int)open(path, O_WRONLY | O_APPEND, 0644);
+        long sf = syscall4(SYS_SENDFILE_, afd, sfd, 0, 4);
+        close(sfd);
+        close(afd);
+        snprintf(what, sizeof what, "%s: sendfile into an O_APPEND file is EINVAL as on Linux (got %ld)", label, sf);
+        check(sf == -22, what);
     }
     int ok = 1;
     for (int round = 0; round < 6; round++) {
