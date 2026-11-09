@@ -7503,7 +7503,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：`net/udp_port_policy.zig`（`mayShare`、`pickReceiver`，纯函数）；`udp.zig` 的槽位键由端口号改为 32 位（低 16 位端口，高 16 位区分同端口的多个套接字，`FileDescriptor.udp_disc` / `udpKey()`），每槽记录 uid、绑定顺序、地址族；新增 `udp.rebind`（原位移动并保留选项，按策略检查所有持有者）；`enqueue` 在同一临界区里选出接收者；`notifyUnreachable` 通知所有匹配的套接字；vfs 的引用计数、epoll、`FIONREAD`、`getsockopt`/`setsockopt`、`recvmsg` 全部改用 `udpKey()`。
 - 绿灯：hello183 在 SMP=2 的多份运行里 PASS；host 测试覆盖策略（单边不行、uid 不同不行、哈希稳定且 3 个套接字都会被选到、无 `SO_REUSEPORT` 时选最新绑定者）和接线；三个架构构建通过。
 - 过程说明（如实）：哈希第一版只用 FNV，12 个发送方全部落在同一个套接字，“两边都分到”那一项失败；加了一步混合，并把测试里的发送方改成 12 个不同的套接字（此前每轮新建关闭，可能复用同一个端口）。
-- 局限：①槽位表仍是 16 个，同端口共享也占槽位；②IPv4 与 IPv6 的套接字不互相共享端口（沿用原来的接口：判断只看端口号，地址族只用于投递时的过滤）；③只有 `SO_REUSEADDR` 的共享在 Linux 上对组播/广播有不同语义，这里没有区分；④`connect` 过的套接字（已固定对端）在共享端口上仍按选择规则接收，Linux 会优先交给匹配四元组的已连接套接字，没有实现；⑤`SO_REUSEPORT` 的 BPF 选择器没有。
+- 局限：①槽位表仍是 16 个，同端口共享也占槽位；②IPv4 与 IPv6 的套接字不互相共享端口（沿用原来的接口：判断只看端口号，地址族只用于投递时的过滤）；③只有 `SO_REUSEADDR` 的共享在 Linux 上对组播/广播有不同语义，这里没有区分；④~~`connect` 过的套接字优先~~（已实现，见文末）；⑤`SO_REUSEPORT` 的 BPF 选择器没有。
 
 ## TCP `SO_REUSEPORT`：监听者关闭时迁移尚未 `accept` 的连接（hello267，已补）
 
@@ -7512,7 +7512,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：`tcp.zig` 的 `stopListening` 先把监听槽标为不活动，再对队列里的每个连接调用 `migrateToSiblingListener`：找同端口、同地址族、还有空位的另一个监听槽，追加到它的队列并更新 `owner_task`；没有兄弟可接才按原来的方式复位。
 - 绿灯：hello267 在完整 smoke（SMP=1、SMP=2）通过；host 测试是源码顺序守卫（先停用本槽，再迁移，最后才丢弃）。
 - **门禁里抓到的问题（CI 先抓到，如实记录）**：这个场景最初是 hello183 的 I 段。推送后 CI 的 SMP=2 冒烟失败：hello183 G 段（12 个连接）和紧随其后的 hello184 D（`accept4`）失败；本地 SMP=2 同样 3 次里 2 次失败。对照：改动前的内核 3/3 通过；HEAD 的 UDP 改动加旧 `tcp.zig` 4/4 失败（失败的仍是 I 段，其中一次还有 G 和 hello184 D），所以不是 TCP 迁移代码造成的；去掉 I 段后 4 次里 3 次通过，1 次失败的是 hello174 C（`SO_RCVBUF` 缓冲量），这是文档里早已记录的偶发项；把场景移到独立的 hello267（排在 init 序列末尾）后 4/4 通过。我的推测是这些连接留下的 TCB（表只有 64 个槽，TIME_WAIT 15 秒）挤占了紧随其后的 hello184；**但 G 段在 I 段之前运行，它为什么也失败，我没有查清**，也没有直接检查过 TCB 表的占用。样本很小，只能说明“移出后没有再看到”，不能证明原因。
-- 局限：①迁移的连接绕过哈希分发，进的是第一个有空位的兄弟；②兄弟队列满了的连接仍被复位；③已经建立但没有被 `accept` 的连接的 `owner_task` 改成兄弟的所有者，没有测多进程所有者不同的情形。
+- 局限：①~~迁移进的是第一个有空位的兄弟~~（已改为按哈希，见文末）；②兄弟队列满了的连接仍被复位；③已经建立但没有被 `accept` 的连接的 `owner_task` 改成兄弟的所有者，没有测多进程所有者不同的情形。
 
 ## `O_APPEND` 描述符上的 `pwrite`/`pwritev`/`copy_file_range`/`splice`（hello268，已修）
 
@@ -7557,5 +7557,19 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - **`O_APPEND` 锁的争用（已测量并修复）**：新增 hello270：四个进程各向**自己的**文件写 200 次 4 KiB，普通写与 `O_APPEND` 写各一遍。改动前 SMP=4 上 `O_APPEND` 慢得多：tmpfs 156 → 4636 ms、FAT32 2374 → 36263 ms、ext2 593 → 34632 ms（不同文件之间也互相等，因为两把锁都是全局的）。修改：`append_lock`/`append_call_lock` 改为 16 个分片（`fs/append_lock_policy.zig` 的 `stripeOf`，host 测试），按文件取键：ext2 用 inode 号，tmpfs 用条目号，FAT32 用打开文件槽（**不能用 `inode_id`**：新建的空文件首簇都是 0，四个新文件的 `inode_id` 相同，第一次改完 FAT32 仍慢 11 倍就是这个原因）。改后 tmpfs 164/160 ms、FAT32 2521/2549 ms、ext2 681/630 ms；hello266/hello268 的原子性用例仍通过。hello270 断言 `O_APPEND` 不超过普通写的 3 倍加 300 毫秒；变异（所有文件都映射到同一分片）后 FAT32、ext2 两行失败，**tmpfs 一行仍通过**——tmpfs 的写从不睡眠，外层锁几乎不被持有，所以 tmpfs 那一行只是测量，不是守卫（已在程序注释里写明）。
 - **服务端 TIME_WAIT 上的同端口重连（真缺陷，已修）**：本机 Linux 实测：客户端每轮 `bind` 同一个端口、服务端先关，下一轮的 `connect` 立即成功（Linux 的 TIME_WAIT 接受序号更新的 SYN）。hello269 新增这一段：8 轮都连上了，但**最慢一轮要 78.7 秒**——临时诊断显示：新 SYN 按 4 元组找到了服务端那个 TIME_WAIT 的 TCB，进入状态机的 `.time_wait` 分支被直接忽略（28 次），客户端靠 SYN 重传等到 TIME_WAIT 15 秒到期后才连上（8 次“找不到 TCB”）。`handleIncomingSyn` 里早就有一段 T17“TIME_WAIT 复用”代码，但它**从来到不了**（SYN 先被状态机截走）；而且即使到了，它也没有把复用的 TCB 放进监听队列，`accept` 永远拿不到。修改：`handlePacket` 对“命中 TIME_WAIT、只带 SYN、序号比旧连接新”的段跳过 TCB，交给监听者；T17 复用路径检查监听队列容量、把 TCB 的所有者改成监听者的、并把它排进监听队列。修复后最慢一轮 56 毫秒，8 轮没有一个字节串到下一轮。（hello269 前一版只看“8 轮都连上”，旧内核上也通过；加了“不超过 1.5 秒”之后才红。我起初还用“关掉 T17 代码”做变异来证明这一段有守卫，结果仍然通过——当时这段代码根本没被执行，变异无效。）
 - host 1133/1133；三个架构构建；完整 smoke（SMP=1 一次、SMP=2 三次）全部通过。
-- 仍开放（如实）：①UDP 共享端口上“已 `connect` 的套接字优先收它对端的数据报”还没做（下一节）；②`SO_REUSEPORT` 迁移进的是第一个有空位的兄弟而不是按哈希；③`MAX_CONNECTIONS` 仍是 64；④`SO_REUSEPORT` 的 BPF 选择器不做（本内核没有 BPF）；⑤`RWF_HIPRI` 只是被接受。
+- 仍开放（如实）：①~~UDP 已连接套接字优先~~、②~~迁移按哈希~~（均见下一节）；③`MAX_CONNECTIONS` 仍是 64；④`SO_REUSEPORT` 的 BPF 选择器不做（本内核没有 BPF）；⑤`RWF_HIPRI` 只是被接受。
+
+## UDP 已连接套接字优先收对端的数据报；`SO_REUSEPORT` 监听者关闭时按哈希迁移（hello183 H、hello267）
+
+- **UDP（已实现）**：本机 Linux 实测：两个 `SO_REUSEPORT` 套接字共享端口，其中一个 `connect` 到某个对端后，来自该对端的数据报 5/5 都到这个已连接的套接字，来自别人的 8/8 都到另一个；`SO_REUSEADDR` 共享时也一样（已连接的旧套接字收对端的，新绑定的收别人的）。红灯：hello183 H 新增 5 项，“对端来的全部到已连接的套接字”在改动前失败（按哈希分走了一部分）。实现：`connect` 在注册表里记下对端地址（`udp.setPeer`，此前只记端口）；`udp_port_policy.pickReceiverConnected`（纯函数，host 测试）先找连接到这个发送方（地址加端口）的套接字，没有就只在未连接的套接字里按原规则选，已连接到别人的套接字不收。
+- **TCP 迁移按哈希（已实现）**：本机 Linux 实测（`tcp_migrate_req=0`）：三个监听者里关闭一个，它队列里的连接会被复位，12 个里只接到 10 个；本内核打开迁移，所以没有拿 Linux 的数字作期望，期望的是“和新 SYN 一样按对端哈希分给存活的监听者”。红灯：hello267 新增一段，三个套接字共享端口、只有第一个先监听、12 个客户端都排在它的队列里，然后另外两个开始监听、第一个关闭：改动前 12 个全部进了第一个有空位的兄弟（12/0）。实现：`migrateToSiblingListener` 先收集有空位的兄弟，再用 `tcp_port_policy.pickListener` 按子连接的对端地址和端口选一个。改后 6/6。
+- host 1136/1136；完整 smoke 见提交记录。
+- 局限：①迁移时兄弟队列满了的连接仍被复位；②UDP 的已连接优先只看地址和端口，不看本地地址（本内核的 UDP 绑定本来就不区分本地地址）；③`MAX_CONNECTIONS` 64、`RWF_HIPRI`、BPF 选择器同上一节。
+
+## CI：hello270 的 tmpfs 一行在 `994fb29` 的 SMP=2 上失败（`O_APPEND` 3001 ms 对普通写 198 ms），分片改为按低位
+
+- 现象：上一节推送后 CI（TCG）的 SMP=2 冒烟里 hello270 的 tmpfs 一行超出了“3 倍加 300 毫秒”；FAT32 和 ext2 两行正常。本地 SMP=2/4 的多次运行从没出现过。
+- 推测（如实，没有在本地复现）：分片键是 tmpfs 条目号，分片号是它的哈希模 16；四个连续条目号有约 28% 的起点让其中两个落在同一分片上（宿主机上算的）。同一分片上的两个写者里，持锁的那个若在持锁期间被抢占（TCG 上更容易发生），另一个只能等它重新被调度。这能解释“偶发、只在慢机器上、只在 tmpfs 上”（tmpfs 的写本身最快，等待的比例最显眼），但我没有直接证据。
+- 修改：分片数 16 → 64，分片号直接取键的低位（`key % 64`）。键都是小的顺序编号（条目号、inode 号、打开文件槽），所以先后创建的文件在 64 个以内一定落在不同分片上。host 测试改为“任意起点的 4 个连续键各占一个分片”。
+- 验证：host 1136/1136；本地 6 份并行 SMP=2、每份跑两遍 hello270，tmpfs 一行 `O_APPEND` 120–227 ms，对应普通写 130–239 ms，没有一行超标；hello266 的原子性用例仍通过。由于原来的失败在本地就没出现过，这只能说明“改后在本地没有看到”，CI 是否不再失败要看之后的运行。
 

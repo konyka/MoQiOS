@@ -58,6 +58,8 @@ var port_opts: [MAX_PORTS]@import("sockopt_policy.zig").Stored = @splat(.{});
 /// positive errno) and the peer port a connect() fixed, 0 when unconnected.
 var port_err: [MAX_PORTS]i32 = @splat(0);
 var port_peer: [MAX_PORTS]u16 = @splat(0);
+/// Peer address a connect() fixed (IPv4 in the first 4 bytes), meaningful when port_peer is nonzero.
+var port_peer_ip: [MAX_PORTS][16]u8 = @splat(@splat(0));
 
 /// Options of the socket bound to `port`, or null if it is not registered.
 pub fn getPortOpts(port: u32) ?@import("sockopt_policy.zig").Stored {
@@ -76,11 +78,13 @@ pub fn setPortOpts(port: u32, opts: @import("sockopt_policy.zig").Stored) bool {
 }
 
 /// connect() fixed the peer port of the socket bound to `port`.
-pub fn setPeerPort(port: u32, peer_port: u16) void {
+/// connect() fixed the peer (address and port) of the socket with registry key `port`.
+pub fn setPeer(port: u32, peer_port: u16, peer_ip: [16]u8) void {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const i = findPortIdxLocked(port) orelse return;
     port_peer[i] = peer_port;
+    port_peer_ip[i] = peer_ip;
     port_err[i] = 0;
 }
 
@@ -167,6 +171,7 @@ fn newSlotLocked(key: u32, is_v6: bool, uid: u32) u16 {
     port_opts[idx] = .{};
     port_err[idx] = 0;
     port_peer[idx] = 0;
+    port_peer_ip[idx] = @splat(0);
     port_uid[idx] = uid;
     port_seq[idx] = next_seq;
     next_seq +%= 1;
@@ -262,6 +267,7 @@ fn releaseLocked(port: u32) void {
             port_opts[i] = port_opts[num_ports];
             port_err[i] = port_err[num_ports];
             port_peer[i] = port_peer[num_ports];
+            port_peer_ip[i] = port_peer_ip[num_ports];
             port_uid[i] = port_uid[num_ports];
             port_seq[i] = port_seq[num_ports];
             port_v6[i] = port_v6[num_ports];
@@ -327,14 +333,12 @@ fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, payload: []c
 
         const policy = @import("udp_port_policy.zig");
         var cand: [MAX_PORTS]u16 = undefined;
-        var flags: [MAX_PORTS]u16 = undefined;
-        var seqs: [MAX_PORTS]u32 = undefined;
+        var info: [MAX_PORTS]policy.Candidate = undefined;
         var n: usize = 0;
         for (0..num_ports) |i| {
             if (portNumber(ports[i]) == port and port_v6[i] == is_v6) {
                 cand[n] = @intCast(i);
-                flags[n] = port_opts[i].flags;
-                seqs[n] = port_seq[i];
+                info[n] = .{ .flags = port_opts[i].flags, .seq = port_seq[i], .peer_port = port_peer[i], .peer_ip = port_peer_ip[i] };
                 n += 1;
             }
         }
@@ -342,14 +346,15 @@ fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, payload: []c
             for (0..num_ports) |i| {
                 if (portNumber(ports[i]) == port) {
                     cand[n] = @intCast(i);
-                    flags[n] = port_opts[i].flags;
-                    seqs[n] = port_seq[i];
+                    info[n] = .{ .flags = port_opts[i].flags, .seq = port_seq[i], .peer_port = port_peer[i], .peer_ip = port_peer_ip[i] };
                     n += 1;
                 }
             }
         }
         if (n == 0) break :blk false;
-        const port_idx = cand[policy.pickReceiver(flags[0..n], seqs[0..n], src_ip, src_port)];
+        // A connected socket whose peer is not this sender has no claim; one connected to it wins (see pickReceiverConnected).
+        const pick = policy.pickReceiverConnected(info[0..n], src_ip, src_port) orelse break :blk false;
+        const port_idx = cand[pick];
         const actual = @min(payload.len, MAX_UDP_PAYLOAD);
         for (0..QUEUE_DEPTH) |i| {
             if (!queues[port_idx][i].valid) {

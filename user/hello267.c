@@ -153,6 +153,38 @@ void _start(void) {
         syscall1(SYS_CLOSE, (uint64_t)l2);
     }
 
+    /* With three listeners, the closed one's queued connections are spread over BOTH survivors (by the peer's hash, like a new SYN), not all
+     * pushed onto the first sibling with room. Only m1 listens while the 12 clients connect, so they all queue on it; m2 and m3 start
+     * listening afterwards and m1 closes. */
+    {
+        int64_t m1 = sock4(), m2 = sock4(), m3 = sock4();
+        reuseport(m1); reuseport(m2); reuseport(m3);
+        check(bind4(m1, 18411) == 0 && bind4(m2, 18411) == 0 && bind4(m3, 18411) == 0, "three sockets share a port");
+        check(syscall2(SYS_LISTEN, (uint64_t)m1, 32) == 0, "the first one listens alone");
+        uint8_t ma[16];
+        mk_addr(ma, 18411);
+        int64_t mc[12];
+        for (int k = 0; k < 12; k++) { mc[k] = sock4(); syscall3(SYS_CONNECT, (uint64_t)mc[k], (uint64_t)ma, 16); }
+        pump(200);
+        check(syscall2(SYS_LISTEN, (uint64_t)m2, 32) == 0 && syscall2(SYS_LISTEN, (uint64_t)m3, 32) == 0, "then the other two listen");
+        syscall1(SYS_CLOSE, (uint64_t)m1);
+        pump(50);
+        int g2 = 0, g3 = 0;
+        for (int round = 0; round < 60 && g2 + g3 < 12; round++) {
+            syscall1(SYS_NETPOLL, 0);
+            int64_t a2 = syscall4(SYS_ACCEPT4, (uint64_t)m2, 0, 0, 0x800);
+            if (a2 >= 0) { g2++; syscall1(SYS_CLOSE, (uint64_t)a2); }
+            int64_t a3 = syscall4(SYS_ACCEPT4, (uint64_t)m3, 0, 0, 0x800);
+            if (a3 >= 0) { g3++; syscall1(SYS_CLOSE, (uint64_t)a3); }
+            sleep_ms(5);
+        }
+        { char d[48] = "hello267: migrated to m2 NN, to m3 NN\n"; d[25] = (char)('0' + g2 / 10); d[26] = (char)('0' + g2 % 10); d[35] = (char)('0' + g3 / 10); d[36] = (char)('0' + g3 % 10); print(d); }
+        check(g2 + g3 == 12, "all 12 connections queued on the closed listener are accepted by a survivor");
+        check(g2 > 0 && g3 > 0, "and they are spread over both survivors, not all given to one");
+        for (int k = 0; k < 12; k++) syscall1(SYS_CLOSE, (uint64_t)mc[k]);
+        syscall1(SYS_CLOSE, (uint64_t)m2); syscall1(SYS_CLOSE, (uint64_t)m3);
+    }
+
     print(failures == 0 ? "hello267: PASS\n" : "hello267: FAIL\n");
     print("hello267 done\n");
     syscall1(SYS_EXIT, failures == 0 ? 0 : 1);

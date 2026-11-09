@@ -522,6 +522,9 @@ fn dropUnacceptedChild(child: *TcpTcb) void {
 /// A backlog child of a closing SO_REUSEPORT listener moves to another listener on the same port that still has room (Linux migrates
 /// requests the same way); false when no sibling can take it, and the child is dropped as before.
 fn migrateToSiblingListener(from: *const ListenSlot, child_idx: u32) bool {
+    // The siblings with room, in bitmap order; the child goes to the one the peer's hash picks among them (as a new SYN would be spread).
+    var sibs: [MAX_CONNECTIONS]*ListenSlot = undefined;
+    var n: u32 = 0;
     var lbm = listen_active_bitmap;
     while (lbm != 0) {
         const i = @ctz(lbm);
@@ -529,12 +532,16 @@ fn migrateToSiblingListener(from: *const ListenSlot, child_idx: u32) bool {
         const sib = &listen_slots[i];
         if (sib == from or sib.local_port != from.local_port or sib.is_v6 != from.is_v6) continue;
         if (sib.pending_tail -% sib.pending_head >= LISTEN_BACKLOG) continue;
-        sib.pending_tpbs[sib.pending_tail % LISTEN_BACKLOG] = child_idx;
-        sib.pending_tail += 1;
-        tcbs[child_idx].owner_task = sib.owner_task;
-        return true;
+        sibs[n] = sib;
+        n += 1;
     }
-    return false;
+    if (n == 0) return false;
+    const child = &tcbs[child_idx];
+    const sib = sibs[tcp_port_policy.pickListener(n, child.remote_ip, child.remote_port)];
+    sib.pending_tpbs[sib.pending_tail % LISTEN_BACKLOG] = child_idx;
+    sib.pending_tail += 1;
+    child.owner_task = sib.owner_task;
+    return true;
 }
 
 /// Stop a listener: clear its listen slot so the port stops answering SYNs, and reset or free the backlog children nobody can

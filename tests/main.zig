@@ -9602,7 +9602,7 @@ test "icmp port unreachable: reply decision, quote length and matching" {
 test "udp: the pending error is consulted by recv, SO_ERROR and readiness" {
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "udp.takePendingError(sock_key)") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.epoll_source, "peekPendingError(@intCast(resource_idx))") != null);
-    try std.testing.expect(std.mem.count(u8, kt.socket_syscall_source, "udp.setPeerPort(") >= 2);
+    try std.testing.expect(std.mem.count(u8, kt.socket_syscall_source, "udp.setPeer(") >= 2);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "pending_send_err = udp.takePendingError(t.fd_table.fds[fd].udpKey())") != null);
 }
 
@@ -11817,7 +11817,7 @@ test "udp: bind moves the registration with its options and sharing goes through
     try std.testing.expect(std.mem.indexOf(u8, us, "pub fn rebind(old_key: u32, new_port: u16, uid: u32, out_disc: *u16) i64") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "@import(\"udp_port_policy.zig\").mayShare(mine.flags, port_opts[j].flags, uid, port_uid[j])") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "port_opts[ni] = mine;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "policy.pickReceiver(flags[0..n], seqs[0..n], src_ip, src_port)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "policy.pickReceiverConnected(info[0..n], src_ip, src_port)") != null);
     const ss = kt.socket_syscall_source;
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "return udpRebind(t, fd,"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ss, "udp.ensurePortExclusive(parsed.port)"));
@@ -11924,27 +11924,23 @@ test "pwritev2 RWF_DSYNC / RWF_SYNC flush the file and the disk cache before ret
     try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, "\" kB\\nDirty:          \"") != null);
 }
 
-test "O_APPEND lock stripes: one file always maps to one stripe, different files spread over all of them" {
+test "O_APPEND lock stripes: one file always maps to one stripe, consecutive files never share one" {
     const p = kt.append_lock_policy;
     try std.testing.expectEqual(p.stripeOf(0x3000_0000_0000_0000 + 12), p.stripeOf(0x3000_0000_0000_0000 + 12));
-    var hit = [_]u32{0} ** p.STRIPES;
-    // Consecutive ext2 inode numbers, consecutive FAT32 clusters and consecutive tmpfs slots each spread over every stripe.
+    // Up to STRIPES consecutive ext2 inodes, FAT32 slots or tmpfs slots each get their own stripe, whatever the first one is.
     for ([_]u64{ 0x3000_0000_0000_0000, 0x2000_0000_0000_0000, 0x1000_0000_0000_0000 }) |tag| {
-        @memset(&hit, 0);
-        var i: u64 = 0;
-        while (i < 256) : (i += 1) hit[p.stripeOf(tag + i)] += 1;
-        for (hit) |h| {
-            try std.testing.expect(h > 0);
-            try std.testing.expect(h < 40); // no stripe gets more than ~2.5x its share of 16
+        var start: u64 = 0;
+        while (start < 200) : (start += 1) {
+            var seen = std.bit_set.IntegerBitSet(64).initEmpty();
+            var k: u64 = 0;
+            while (k < 4) : (k += 1) {
+                const st = p.stripeOf(tag + start + k);
+                try std.testing.expect(!seen.isSet(st));
+                seen.set(st);
+            }
         }
     }
-    // Four files from the probes (four consecutive ext2 inodes) do not all fall on one stripe.
-    const a = p.stripeOf(0x3000_0000_0000_0000 + 20);
-    var same: u32 = 0;
-    for ([_]u64{ 21, 22, 23 }) |n| {
-        if (p.stripeOf(0x3000_0000_0000_0000 + n) == a) same += 1;
-    }
-    try std.testing.expect(same < 3);
+    try std.testing.expect(p.stripeOf(0x1000_0000_0000_0000 + 5) < p.STRIPES);
 }
 
 test "O_APPEND locks are keyed per file: FAT32 by its open-file slot, tmpfs by its slot, ext2 by inode" {
@@ -11968,4 +11964,42 @@ test "tcp: a newer SYN for a 4-tuple in TIME_WAIT goes to the listener, which re
     const q = std.mem.indexOfPos(u8, ts, tw, "ls.pending_tpbs[ls.pending_tail % LISTEN_BACKLOG] = @intCast(i);") orelse return error.TestUnexpectedResult;
     try std.testing.expect(q - tw < 300);
     try std.testing.expect(std.mem.indexOf(u8, ts, "reuse_tcb.owner_task = ls.owner_task;") != null);
+}
+
+test "udp port sharing: a connected socket takes every datagram from its peer and none from anyone else" {
+    const p = kt.udp_port_policy;
+    var peer: [16]u8 = @splat(0);
+    peer[0] = 127;
+    peer[3] = 1;
+    var stranger = peer;
+    stranger[3] = 2;
+    const cands = [_]p.Candidate{
+        .{ .flags = 8, .seq = 1 },
+        .{ .flags = 8, .seq = 2, .peer_port = 18404, .peer_ip = peer },
+    };
+    var port: u16 = 1000;
+    while (port < 1100) : (port += 1) {
+        try std.testing.expectEqual(@as(?usize, 0), p.pickReceiverConnected(&cands, stranger, port));
+    }
+    try std.testing.expectEqual(@as(?usize, 1), p.pickReceiverConnected(&cands, peer, 18404));
+    // Same address, other port: not the connected peer.
+    try std.testing.expectEqual(@as(?usize, 0), p.pickReceiverConnected(&cands, peer, 18405));
+    // Only connected sockets, datagram from a stranger: nobody takes it.
+    const only = [_]p.Candidate{.{ .flags = 8, .seq = 2, .peer_port = 18404, .peer_ip = peer }};
+    try std.testing.expectEqual(@as(?usize, null), p.pickReceiverConnected(&only, stranger, 7));
+}
+
+test "udp: connect records the peer address and enqueue chooses the receiver with it" {
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "const pick = policy.pickReceiverConnected(info[0..n], src_ip, src_port) orelse break :blk false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "port_peer_ip[i] = peer_ip;") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "udp.setPeer(t.fd_table.fds[fd].udpKey(), parsed.port, parsed.addr);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "udp.setPeer(t.fd_table.fds[fd].udpKey(), dst_port, peer16);") != null);
+}
+
+test "tcp: a closing SO_REUSEPORT listener spreads its queued children over the siblings by the peer hash" {
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const sib = sibs[tcp_port_policy.pickListener(n, child.remote_ip, child.remote_port)];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (sib.pending_tail -% sib.pending_head >= LISTEN_BACKLOG) continue;\n        sibs[n] = sib;") != null);
 }

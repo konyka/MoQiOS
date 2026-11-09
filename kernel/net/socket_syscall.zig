@@ -773,7 +773,7 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
             t.fd_table.fds[fd].udp_connected = true;
             t.fd_table.fds[fd].udp_dst_ip6 = parsed.addr;
             t.fd_table.fds[fd].udp_dst_port = parsed.port;
-            udp.setPeerPort(t.fd_table.fds[fd].udpKey(), parsed.port);
+            udp.setPeer(t.fd_table.fds[fd].udpKey(), parsed.port, parsed.addr);
             return 0;
         }
         if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, false)) return -22;
@@ -785,7 +785,9 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         t.fd_table.fds[fd].udp_connected = true;
         t.fd_table.fds[fd].udp_dst_ip = dst_ip;
         t.fd_table.fds[fd].udp_dst_port = dst_port;
-        udp.setPeerPort(t.fd_table.fds[fd].udpKey(), dst_port);
+        var peer16: [16]u8 = @splat(0);
+        @memcpy(peer16[0..4], &dst_ip);
+        udp.setPeer(t.fd_table.fds[fd].udpKey(), dst_port, peer16);
         return 0;
     }
 

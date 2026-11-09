@@ -121,6 +121,16 @@ static void reuse(int64_t s) {
     syscall5(SYS_SETSOCKOPT, (uint64_t)s, SOL_SOCKET, SO_REUSEADDR, (uint64_t)&one, 4);
 }
 
+static void dump_tcpstats(void) {
+    char raw[400];
+    int64_t fd = syscall3(9, (uint64_t)"/proc/tcpstats", 0, 0);
+    if (fd < 0) return;
+    int64_t n = syscall3(10, (uint64_t)fd, (uint64_t)raw, 390);
+    syscall1(SYS_CLOSE, (uint64_t)fd);
+    if (n <= 0) return;
+    raw[n] = 0;
+    print("hello183: tcpstats "); print(raw);
+}
 void _start(void) {
     print("hello183: TCP bind errors and SO_REUSEADDR\n");
 
@@ -270,8 +280,10 @@ void _start(void) {
         mk_addr(sa, 18395);
         int got1 = 0, got2 = 0, conn_ok = 0;
         int64_t clients[12];
+        int64_t sk_fail = 0;
         for (int i = 0; i < 12; i++) {
             clients[i] = sock4();
+            if (clients[i] < 0) sk_fail++;
             syscall3(SYS_CONNECT, (uint64_t)clients[i], (uint64_t)sa, 16);
         }
         for (int round = 0; round < 40 && got1 + got2 < 12; round++) {
@@ -283,6 +295,14 @@ void _start(void) {
             sleep_ms(5);
         }
         conn_ok = got1 + got2 == 12;
+        if (!conn_ok) {
+            char d[48] = "hello183: G accepted NN, socket() failed NN\n";
+            int t = got1 + got2;
+            d[21] = (char)('0' + t / 10); d[22] = (char)('0' + t % 10);
+            d[41] = (char)('0' + sk_fail / 10); d[42] = (char)('0' + sk_fail % 10);
+            print(d);
+            dump_tcpstats();
+        }
         check(conn_ok, "G: all 12 connections to the shared port are accepted by one of the two listeners");
         check(got1 > 0 && got2 > 0, "G: and both listeners get some of them (spread, not all to one)");
         for (int i = 0; i < 12; i++) syscall1(SYS_CLOSE, (uint64_t)clients[i]);
@@ -375,6 +395,35 @@ void _start(void) {
             int g2 = (int)syscall6(SYS_RECVFROM, (uint64_t)r2, (uint64_t)rb, 4, MSG_DONTWAIT, 0, 0);
             check(g2 == 1 && g1 != 1, "H: with SO_REUSEADDR the most recently bound socket receives the datagram");
             syscall1(SYS_CLOSE, (uint64_t)snd);
+        }
+        /* a connect()ed socket on a shared port receives every datagram from its peer, and nothing from anyone else (Linux, measured) */
+        {
+            int64_t k1 = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0), k2 = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+            reuseport(k1); reuseport(k2);
+            check(bind4(k1, 18403) == 0 && bind4(k2, 18403) == 0, "H: two SO_REUSEPORT sockets for the connected-socket rule");
+            int64_t peer = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0), stranger = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+            check(bind4(peer, 18404) == 0 && bind4(stranger, 18405) == 0, "H: a peer and a stranger");
+            uint8_t pa[16], ka[16];
+            mk_addr(pa, 18404);
+            mk_addr(ka, 18403);
+            check(syscall3(SYS_CONNECT, (uint64_t)k2, (uint64_t)pa, 16) == 0, "H: the second socket connects to the peer");
+            int from_peer_k2 = 0, from_peer_k1 = 0, from_stranger_k2 = 0, from_stranger_k1 = 0;
+            char rb[4];
+            for (int i = 0; i < 6; i++) {
+                char m = 'p';
+                syscall6(SYS_SENDTO, (uint64_t)peer, (uint64_t)&m, 1, 0, (uint64_t)ka, 16);
+                pump(10);
+                if (syscall6(SYS_RECVFROM, (uint64_t)k2, (uint64_t)rb, 4, MSG_DONTWAIT, 0, 0) == 1) from_peer_k2++;
+                if (syscall6(SYS_RECVFROM, (uint64_t)k1, (uint64_t)rb, 4, MSG_DONTWAIT, 0, 0) == 1) from_peer_k1++;
+                m = 's';
+                syscall6(SYS_SENDTO, (uint64_t)stranger, (uint64_t)&m, 1, 0, (uint64_t)ka, 16);
+                pump(10);
+                if (syscall6(SYS_RECVFROM, (uint64_t)k2, (uint64_t)rb, 4, MSG_DONTWAIT, 0, 0) == 1) from_stranger_k2++;
+                if (syscall6(SYS_RECVFROM, (uint64_t)k1, (uint64_t)rb, 4, MSG_DONTWAIT, 0, 0) == 1) from_stranger_k1++;
+            }
+            check(from_peer_k2 == 6 && from_peer_k1 == 0, "H: every datagram from the peer goes to the socket connected to it");
+            check(from_stranger_k2 == 0 && from_stranger_k1 == 6, "H: and a datagram from anyone else never reaches the connected socket");
+            syscall1(SYS_CLOSE, (uint64_t)k1); syscall1(SYS_CLOSE, (uint64_t)k2); syscall1(SYS_CLOSE, (uint64_t)peer); syscall1(SYS_CLOSE, (uint64_t)stranger);
         }
         /* a socket that closes frees its share; the port is released with the last one */
         syscall1(SYS_CLOSE, (uint64_t)r1); syscall1(SYS_CLOSE, (uint64_t)r2);

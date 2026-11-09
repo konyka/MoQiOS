@@ -1,6 +1,7 @@
 //! Pure UDP port-sharing policy: when two sockets may hold the same local port, and which of them receives a datagram that arrives for it.
 //! Host-testable (no arch deps); callers in udp.zig hold udp_lock and pass snapshots of the per-slot options.
 
+const std = @import("std");
 const tcp_port_policy = @import("tcp_port_policy.zig");
 
 pub const REUSEADDR_FLAG: u16 = 1;
@@ -55,3 +56,36 @@ pub fn pickReceiver(flags: []const u16, seqs: []const u32, src_ip: [16]u8, src_p
     }
     return nthByBindOrder(seqs, n - 1);
 }
+
+/// One socket on the shared port, as the receiver choice sees it.
+pub const Candidate = struct {
+    flags: u16,
+    seq: u32,
+    /// Peer fixed by connect(): port 0 when the socket is unconnected.
+    peer_port: u16 = 0,
+    peer_ip: [16]u8 = @splat(0),
+};
+
+/// Which candidate takes a datagram from (src_ip, src_port), or null when none may. A socket connect()ed to exactly that sender wins outright
+/// (Linux scores the full match highest); a connected socket never takes a datagram from anyone else; among the unconnected ones the
+/// SO_REUSEPORT hash / newest-bound rule of pickReceiver applies.
+pub fn pickReceiverConnected(cands: []const Candidate, src_ip: [16]u8, src_port: u16) ?usize {
+    for (cands, 0..) |c, i| {
+        if (c.peer_port != 0 and c.peer_port == src_port and std.mem.eql(u8, &c.peer_ip, &src_ip)) return i;
+    }
+    var flags: [64]u16 = undefined;
+    var seqs: [64]u32 = undefined;
+    var map: [64]usize = undefined;
+    var n: usize = 0;
+    for (cands, 0..) |c, i| {
+        if (c.peer_port != 0) continue;
+        if (n == flags.len) break;
+        flags[n] = c.flags;
+        seqs[n] = c.seq;
+        map[n] = i;
+        n += 1;
+    }
+    if (n == 0) return null;
+    return map[pickReceiver(flags[0..n], seqs[0..n], src_ip, src_port)];
+}
+
