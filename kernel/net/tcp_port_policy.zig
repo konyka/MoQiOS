@@ -55,6 +55,25 @@ pub fn reuseMayShare(new_has_reuseaddr: bool, holder_is_time_wait: bool) bool {
     return new_has_reuseaddr and holder_is_time_wait;
 }
 
+/// SO_REUSEPORT (socket_opt flag bit 8): two sockets may bind the same port only when BOTH set it before binding and have the same owner uid
+/// (Linux additionally requires the same effective uid so another user cannot hijack the port).
+pub const REUSEPORT_FLAG: u16 = 8;
+
+pub fn reusePortMayShare(new_extra_flags: u16, holder_extra_flags: u16, new_uid: u32, holder_uid: u32) bool {
+    return (new_extra_flags & REUSEPORT_FLAG) != 0 and (holder_extra_flags & REUSEPORT_FLAG) != 0 and new_uid == holder_uid;
+}
+
+/// Which of `count` same-port listeners takes a connection from this peer: a stable hash of the peer's address and port, so a given client
+/// always reaches the same listener (Linux hashes the 4-tuple the same way).
+pub fn pickListener(count: u32, src_ip: [4]u8, src_port: u16) u32 {
+    if (count <= 1) return 0;
+    var h: u32 = 2166136261;
+    for (src_ip) |b| h = (h ^ b) *% 16777619;
+    h = (h ^ (src_port & 0xff)) *% 16777619;
+    h = (h ^ (src_port >> 8)) *% 16777619;
+    return h % count;
+}
+
 /// connect() keeps the TCB's local port only when bind() set it; any other
 /// nonzero value is left over from a previous occupant of the slot.
 pub fn connectNeedsEphemeral(local_port: u16, bound_explicitly: bool) bool {

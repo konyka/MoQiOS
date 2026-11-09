@@ -526,7 +526,7 @@ fn stopListening(tcb: *TcpTcb) void {
         const i = @ctz(lbm);
         lbm &= lbm - 1;
         const ls = &listen_slots[i];
-        if (ls.local_port == tcb.local_port and ls.is_v6 == tcb.is_v6) {
+        if (ls.tcb_idx == tcbIdx(tcb)) {
             while (ls.pending_head != ls.pending_tail) {
                 const pidx = ls.pending_tpbs[ls.pending_head % LISTEN_BACKLOG];
                 ls.pending_head += 1;
@@ -537,6 +537,30 @@ fn stopListening(tcb: *TcpTcb) void {
             break;
         }
     }
+}
+
+/// The listener a SYN for `port` goes to. With several sockets listening on the port (SO_REUSEPORT) the peer's address and port pick one, so
+/// a client always reaches the same listener; with one it is that one.
+fn pickListenSlot(port: u16, is_v6: bool, src_ip: [4]u8, src_port: u16) ?*ListenSlot {
+    var count: u32 = 0;
+    var lbm = listen_active_bitmap;
+    while (lbm != 0) {
+        const i = @ctz(lbm);
+        lbm &= lbm - 1;
+        if (listen_slots[i].local_port == port and listen_slots[i].is_v6 == is_v6) count += 1;
+    }
+    if (count == 0) return null;
+    var want = tcp_port_policy.pickListener(count, src_ip, src_port);
+    lbm = listen_active_bitmap;
+    while (lbm != 0) {
+        const i = @ctz(lbm);
+        lbm &= lbm - 1;
+        if (listen_slots[i].local_port == port and listen_slots[i].is_v6 == is_v6) {
+            if (want == 0) return &listen_slots[i];
+            want -= 1;
+        }
+    }
+    return null;
 }
 
 /// Marker for a backlog ring entry whose handshake died (never a real TCB
@@ -1972,17 +1996,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
     _ = _w;
     const peer_ecn = probeEcnPeerSetup(flags);
     // Find listen slot for this port (bitmap-driven)
-    var slot: ?*ListenSlot = null;
-    var lbm = listen_active_bitmap;
-    while (lbm != 0) {
-        const i = @ctz(lbm);
-        lbm &= lbm - 1;
-        if (listen_slots[i].local_port == dst_port and !listen_slots[i].is_v6) {
-            slot = &listen_slots[i];
-            break;
-        }
-    }
-    const ls = slot orelse return;
+    const ls = pickListenSlot(dst_port, false, src_ip, src_port) orelse return;
 
     // T17: Allow TCB reuse for TIME_WAIT connections (if ISN is larger)
     var tw_bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
@@ -2087,17 +2101,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
 fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions, flags: u8) void {
     _ = _w;
     const peer_ecn = probeEcnPeerSetup(flags);
-    var slot: ?*ListenSlot = null;
-    var lbm = listen_active_bitmap;
-    while (lbm != 0) {
-        const i = @ctz(lbm);
-        lbm &= lbm - 1;
-        if (listen_slots[i].local_port == dst_port and listen_slots[i].is_v6) {
-            slot = &listen_slots[i];
-            break;
-        }
-    }
-    const ls = slot orelse return;
+    const ls = pickListenSlot(dst_port, true, .{ src_ip[12], src_ip[13], src_ip[14], src_ip[15] }, src_port) orelse return;
 
     var tw_bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
     while (tw_bm != 0) {
@@ -4020,6 +4024,8 @@ const LISTEN_BACKLOG: u32 = 32;
 
 const ListenSlot = struct {
     active: bool = false,
+    /// The listening TCB this slot belongs to: sockets sharing a port through SO_REUSEPORT each have their own slot.
+    tcb_idx: u32 = 0xFFFF_FFFF,
     local_port: u16 = 0,
     owner_task: u32 = 0,
     is_v6: bool = false,
@@ -4031,6 +4037,7 @@ const ListenSlot = struct {
 
 var listen_slots: [MAX_CONNECTIONS]ListenSlot = @splat(.{
     .active = false,
+    .tcb_idx = 0xFFFF_FFFF,
     .local_port = 0,
     .owner_task = 0,
     .is_v6 = false,
@@ -4065,6 +4072,13 @@ pub fn tcpSetIpv6(tcb_idx: u32) i64 {
     return 0;
 }
 
+/// Real uid of the task that owns a TCB (0 when the owner is gone), for the SO_REUSEPORT same-user rule.
+fn tcbOwnerUid(tcb: *const TcpTcb) u32 {
+    const task_mod = @import("../proc/task.zig");
+    const t = task_mod.getTask(tcb.owner_task) orelse return 0;
+    return t.euid;
+}
+
 /// Bind a TCB to a local port.
 /// Returns 0 on success, -1 on failure.
 pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
@@ -4085,6 +4099,9 @@ pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
         if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict
         if (tcbs[i].local_port == port and port != 0) {
             if (tcp_port_policy.reuseMayShare(tcb.options.reuse_addr, @intFromEnum(tcbs[i].state) == @intFromEnum(TcpState.time_wait))) {
+                continue;
+            }
+            if (tcp_port_policy.reusePortMayShare(tcb.options.extra_flags, tcbs[i].options.extra_flags, tcbOwnerUid(tcb), tcbOwnerUid(&tcbs[i]))) {
                 continue;
             }
             return tcp_port_policy.BIND_EADDRINUSE;
@@ -4119,6 +4136,7 @@ pub fn tcpListen(tcb_idx: u32) i64 {
     const i: u6 = @intCast(@ctz(free_mask));
     listen_active_bitmap |= @as(u64, 1) << i;
     listen_slots[i].active = true;
+    listen_slots[i].tcb_idx = tcbIdx(tcb);
     listen_slots[i].local_port = tcb.local_port;
     listen_slots[i].owner_task = tcb.owner_task;
     listen_slots[i].is_v6 = tcb.is_v6;
@@ -4199,7 +4217,7 @@ pub fn tcpAccept(tcb_idx: u32, owner_task: u32) i64 {
     while (lbm != 0) {
         const i = @ctz(lbm);
         lbm &= lbm - 1;
-        if (listen_slots[i].local_port == tcb.local_port and listen_slots[i].is_v6 == tcb.is_v6) {
+        if (listen_slots[i].tcb_idx == tcb_idx) {
             slot = &listen_slots[i];
             break;
         }

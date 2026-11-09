@@ -67,6 +67,7 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SOCK_DGRAM 2
 #define SOL_SOCKET 1
 #define SO_REUSEADDR 2
+#define SO_REUSEPORT 15
 #define EACCES_ 13
 #define EINVAL_ 22
 #define EADDRINUSE_ 98
@@ -106,6 +107,10 @@ static int64_t bind4(int64_t s, int port) {
     uint8_t sa[16];
     mk_addr(sa, port);
     return syscall3(SYS_BIND, (uint64_t)s, (uint64_t)sa, 16);
+}
+static void reuseport(int64_t s) {
+    int one = 1;
+    syscall5(SYS_SETSOCKOPT, (uint64_t)s, SOL_SOCKET, SO_REUSEPORT, (uint64_t)&one, 4);
 }
 static void reuse(int64_t s) {
     int one = 1;
@@ -237,6 +242,56 @@ void _start(void) {
         check(syscall3(SYS_BIND, (uint64_t)u6, (uint64_t)f6, 28) == 0, "F: :: (any) is fine");
         syscall1(SYS_CLOSE, t4); syscall1(SYS_CLOSE, t5); syscall1(SYS_CLOSE, u4);
         syscall1(SYS_CLOSE, t6); syscall1(SYS_CLOSE, u6);
+    }
+
+    /* G: SO_REUSEPORT lets sockets that all set it share one port, each with its own listener; connections are spread over them */
+    {
+        int64_t p1 = sock4(), p2 = sock4(), p3 = sock4(), plain = sock4();
+        reuseport(p1); reuseport(p2);
+        check(bind4(p1, 18395) == 0, "G: first SO_REUSEPORT socket binds");
+        check(bind4(p2, 18395) == 0, "G: a second SO_REUSEPORT socket binds the same port");
+        check(bind4(plain, 18395) == -EADDRINUSE_, "G: a socket without SO_REUSEPORT cannot join the port");
+        reuseport(plain);
+        check(bind4(plain, 18395) == 0, "G: once it sets SO_REUSEPORT it can");
+        check(syscall2(SYS_LISTEN, (uint64_t)p1, 8) == 0 && syscall2(SYS_LISTEN, (uint64_t)p2, 8) == 0, "G: both listen on the shared port");
+        int64_t other = sock4();
+        check(bind4(other, 18396) == 0, "G: a different port is unaffected");
+        int64_t late = sock4();
+        check(bind4(late, 18395) == -EADDRINUSE_, "G: a socket that sets SO_REUSEPORT only after trying to bind is still refused");
+        reuseport(late);
+        check(bind4(late, 18395) == 0, "G: and joins when it set the option first");
+        syscall1(SYS_CLOSE, late); syscall1(SYS_CLOSE, other); syscall1(SYS_CLOSE, plain);
+        /* connections: 12 clients, each accepted by exactly one of the two listeners; every client is accepted somewhere */
+        uint8_t sa[16];
+        mk_addr(sa, 18395);
+        int got1 = 0, got2 = 0, conn_ok = 0;
+        int64_t clients[12];
+        for (int i = 0; i < 12; i++) {
+            clients[i] = sock4();
+            syscall3(SYS_CONNECT, (uint64_t)clients[i], (uint64_t)sa, 16);
+        }
+        for (int round = 0; round < 40 && got1 + got2 < 12; round++) {
+            syscall1(SYS_NETPOLL, 0);
+            int64_t a1 = syscall4(SYS_ACCEPT4, (uint64_t)p1, 0, 0, 0x800);
+            if (a1 >= 0) { got1++; syscall1(SYS_CLOSE, (uint64_t)a1); }
+            int64_t a2 = syscall4(SYS_ACCEPT4, (uint64_t)p2, 0, 0, 0x800);
+            if (a2 >= 0) { got2++; syscall1(SYS_CLOSE, (uint64_t)a2); }
+            sleep_ms(5);
+        }
+        conn_ok = got1 + got2 == 12;
+        check(conn_ok, "G: all 12 connections to the shared port are accepted by one of the two listeners");
+        check(got1 > 0 && got2 > 0, "G: and both listeners get some of them (spread, not all to one)");
+        for (int i = 0; i < 12; i++) syscall1(SYS_CLOSE, (uint64_t)clients[i]);
+        /* closing one listener leaves the other serving the port */
+        syscall1(SYS_CLOSE, p1);
+        pump(100);
+        int64_t c2 = sock4();
+        int64_t cr = syscall3(SYS_CONNECT, (uint64_t)c2, (uint64_t)sa, 16);
+        int64_t acc = -1;
+        for (int i = 0; i < 40 && acc < 0; i++) { syscall1(SYS_NETPOLL, 0); acc = syscall4(SYS_ACCEPT4, (uint64_t)p2, 0, 0, 0x800); sleep_ms(5); }
+        check((cr == 0 || cr == -115 || cr == -106) && acc >= 0, "G: after one listener closes, the other still accepts new connections");
+        if (acc >= 0) syscall1(SYS_CLOSE, (uint64_t)acc);
+        syscall1(SYS_CLOSE, c2); syscall1(SYS_CLOSE, p2); syscall1(SYS_CLOSE, p3);
     }
 
     syscall1(SYS_CLOSE, b);

@@ -5927,7 +5927,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 问题：TCP `bind` 所有失败都返回 `-1`（EPERM）：端口被占用应是 `EADDRINUSE`，特权端口无权限应是 `EACCES`，重复绑定应是 `EINVAL`。程序依赖这些错误码来决定“换个端口重试”还是“放弃”。
 - 修复：见 `docs/kernel-subsystems.md` 的 hello183 条。
-- 已知差异：UDP 的特权端口无权限在后续小改动里也改为 `EACCES`（见本节末尾的补充）；`SO_REUSEPORT` 不参与 TCP 端口共享判断；`bind` 到非本机地址的 `EADDRNOTAVAIL` 已补（见文末 hello183 F 段一节）；`EADDRINUSE` 只看端口号，不看本地地址（不同本地地址、同一端口也算冲突）。
+- 已知差异：UDP 的特权端口无权限在后续小改动里也改为 `EACCES`（见本节末尾的补充）；~~`SO_REUSEPORT` 不参与 TCP 端口共享判断~~（已在文末 hello183 G 段补上）；`bind` 到非本机地址的 `EADDRNOTAVAIL` 已补（见文末 hello183 F 段一节）；`EADDRINUSE` 只看端口号，不看本地地址（不同本地地址、同一端口也算冲突）。
 - 过程说明（如实）：红灯 8 项 FAIL，其中 C 段“a connection to the listener”在旧内核上失败、新内核上通过，但它测的是 connect/accept 而不是 bind 的错误码，**我没有查它在旧内核上失败的原因**（可能与 A/B 段里旧内核返回 `-1` 后探测的后续状态有关，只是猜测），所以这一项不应当被算作 bind 错误码修复的证据。D 段给 hello183 配了“uid 0 + 仅 `CAP_SETUID`”的启动档案以便子进程 `setuid(1000)` 后观察 `EACCES`。
 - TDD：host 新增 1 个测试（三个错误码、特权端口边界 0/1/1023/1024、`reuseMayShare` 的四种组合、`tcpBind` 的判定形状、两条路径的 `EACCES`、hello183 的能力档案）；hello183（A 占用/重复绑定/换端口，B 监听端口即使双方 `SO_REUSEADDR` 也不可共享，C 监听者关闭后在旧连接残留时仍可重新绑定，D 非特权用户绑 80 得 `EACCES`，E IPv6 同样）在旧内核上 8 项 FAIL，新内核 PASS。
 - 变异（具名测试核对）：端口 0 也算特权、特权端口上限差一、`SO_REUSEADDR` 可与非 TIME_WAIT 占用者共享、`EACCES` 改回 `-1`、重复绑定被允许、`EADDRINUSE` 改回 `-1`、与自己槽位里的旧端口冲突、端口 0 参与冲突判断、IPv6 与 IPv4 各自去掉特权检查，共 10 个，全部被 `TCP bind errors and SO_REUSEADDR sharing` 抓住（“可与非 TIME_WAIT 占用者共享”第一次因未使用参数编译失败，改成可编译形式后抓住）；恢复后 `grep -c MUTATION` 为 0。
@@ -7473,4 +7473,15 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：hello134 两份（SMP=2）全部 PASS；host 测试是源码守卫（顺序和关键语句）；三个架构构建通过。
 - 局限（如实）：①计数器从 0 开始顺序分配，Linux 是随机起点，名字可预测——这里没有安全含义（抽象名本来就不是机密），但与 Linux 的“看起来随机”不同；②没有在 `connect`/`sendto` 时给未绑定的数据报发送者自动绑定（Linux 的 `SOCK_DGRAM` 在设置 `SO_PASSCRED` 后发送时会自动绑定）；③`unixAutobind` 持有 `unix_lock` 做线性扫描，最坏情形（2^20 次冲突）理论上很长，实际表只有 32 个槽位，最多 32 次冲突。
 - **门禁里抓到的回归（已修）**：完整 smoke 一直不通过，不报错，只是不退出。原因是 hello39 的旧断言 “`bind` 地址长度 2 → `EINVAL`” 在自动绑定之后变成 `0`，hello39 打印 FAIL，而 smoke 脚本等的是它的 PASS 标记，所以只会超时。我先花了不少时间在查日志（我杀掉脚本时它会清掉工作目录，日志跟着没了；之后改用 `MOQI_SMOKE_WORK_DIR` 保留）。在本机 Linux 上用 `ctypes` 调 `bind` 确认：长度 1 → `EINVAL`，长度 2 → 自动绑定。所以 hello39 改成测长度 1（“比地址族还短”），这才是 Linux 的 `EINVAL` 条件；这不是放宽断言，而是把一个本来就错的测试点（长度 2）改对。
+
+## TCP `SO_REUSEPORT`：多个套接字共享一个端口，连接分散到各自的监听者（hello183 G 段，已补）
+
+- 来由：hello183 一节的已知差异“`SO_REUSEPORT` 不参与 TCP 端口共享判断”。此前这个选项只存取，`bind` 到已被占用的端口一律 `EADDRINUSE`，多进程服务（nginx、各类 worker 模型）常用的“多个监听者共享一个端口”做不到。
+- Linux 语义：两个套接字都在 `bind` 之前设了 `SO_REUSEPORT`、且有效 uid 相同，才能共享端口（只有一方设置仍是 `EADDRINUSE`，不同用户不行，避免别人劫持端口）；每个套接字各自 `listen`；内核按连接的四元组哈希把新连接分给其中一个监听者。
+- 红灯：hello183 新增 G 段 11 项，旧内核上 6 项失败（第二个设了选项的套接字 `bind`、后来补设选项再 `bind`、同端口两个监听者、延后设置选项再加入、连接分散到两个监听者、一个监听者关闭后另一个继续接收）。
+- 实现：
+  - `tcp_port_policy.zig` 新增 `reusePortMayShare`（两边都有标志位 8 且 uid 相同）和 `pickListener`（对对端 IP 和端口做 FNV 哈希，对监听者数取模，同一个对端总是到同一个监听者）。
+  - `tcp.zig`：`ListenSlot` 新增 `tcb_idx`——此前监听槽按“端口加地址族”识别，两个监听者会撞在同一个槽里；现在每个监听 TCB 一个槽。`stopListening` 和 `tcpAccept` 改按 TCB 找槽；IPv4/IPv6 的 SYN 都通过新函数 `pickListenSlot` 选槽（只有一个监听者时行为与以前完全相同）。`tcpBind` 在 `SO_REUSEADDR`/`TIME_WAIT` 规则之外再问 `reusePortMayShare`；owner uid 取自拥有任务的 `euid`。
+- 绿灯：hello183 在 SMP=2 的两份运行里全部 PASS（12 个连接全部被两个监听者接走且两边都分到了；关闭一个监听者后另一个继续接收）；host 测试覆盖策略（单边不行、uid 不同不行、哈希稳定且在范围内、60 个对端会用到全部 3 个监听者）和接线；三个架构构建通过。
+- 局限（如实）：①分发只按对端地址和端口哈希，没有 Linux 的 `SO_ATTACH_REUSEPORT_*` BPF 选择器；②一个监听者关闭时，它队列里还没被 `accept` 的连接被复位（沿用 `stopListening` 的原有行为），Linux 会把它们迁移到同组的其它监听者（`net.ipv4.tcp_migrate_req` 打开时）——这里没有实现迁移；③连接分散的“均匀度”只测了“两边都分到”，没有测比例；④UDP 的 `SO_REUSEPORT`（多个套接字共享一个 UDP 端口并按哈希分发）没有做，UDP 的端口表仍是独占的；⑤owner uid 取自任务的 `euid`，任务退出后读到的是 0。
 

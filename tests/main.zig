@@ -11724,3 +11724,33 @@ test "AF_UNIX autobind: a family-only bind() takes a kernel-chosen abstract name
     try std.testing.expect(rule > 0);
     try std.testing.expect(std.mem.indexOf(u8, ss, "net_mod.unix_socket.unixAutobind(unix_idx)") != null);
 }
+
+test "TCP SO_REUSEPORT: shared ports need both sides to opt in, same user; connections are spread by peer hash" {
+    const tp = kt.tcp_port_policy;
+    const RP = tp.REUSEPORT_FLAG;
+    try std.testing.expectEqual(@as(u16, 8), RP);
+    try std.testing.expect(tp.reusePortMayShare(RP, RP, 1000, 1000));
+    try std.testing.expect(!tp.reusePortMayShare(RP, 0, 1000, 1000));
+    try std.testing.expect(!tp.reusePortMayShare(0, RP, 1000, 1000));
+    try std.testing.expect(!tp.reusePortMayShare(RP, RP, 1000, 1001));
+    // Other flag bits do not matter.
+    try std.testing.expect(tp.reusePortMayShare(RP | 4, RP | 16, 0, 0));
+    // pickListener: stable for a peer, in range, and uses every listener across many peers.
+    try std.testing.expectEqual(@as(u32, 0), tp.pickListener(1, .{ 1, 2, 3, 4 }, 5));
+    try std.testing.expectEqual(tp.pickListener(3, .{ 10, 0, 2, 2 }, 40000), tp.pickListener(3, .{ 10, 0, 2, 2 }, 40000));
+    var seen = [_]bool{ false, false, false };
+    var port: u16 = 49152;
+    while (port < 49152 + 60) : (port += 1) {
+        const k = tp.pickListener(3, .{ 127, 0, 0, 1 }, port);
+        try std.testing.expect(k < 3);
+        seen[k] = true;
+    }
+    try std.testing.expect(seen[0] and seen[1] and seen[2]);
+    // Wiring: a listener owns its slot (by TCB), bind consults the rule, SYNs pick through pickListenSlot.
+    const t = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, t, "listen_slots[i].tcb_idx = tcbIdx(tcb);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t, "tcp_port_policy.reusePortMayShare(tcb.options.extra_flags, tcbs[i].options.extra_flags, tcbOwnerUid(tcb), tcbOwnerUid(&tcbs[i]))") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, t, "pickListenSlot(dst_port, "));
+    try std.testing.expect(std.mem.indexOf(u8, t, "if (listen_slots[i].tcb_idx == tcb_idx) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t, "if (ls.tcb_idx == tcbIdx(tcb)) {") != null);
+}
