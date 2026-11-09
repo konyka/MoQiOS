@@ -183,3 +183,12 @@ test "bits the registration did not ask for, other than ERR and HUP, do not make
     try std.testing.expectEqual(@as(u32, 0), notifyMatch(EPOLLIN, EPOLLOUT));
     try std.testing.expectEqual(@as(u32, EPOLLIN), notifyMatch(EPOLLIN | EPOLLOUT, EPOLLIN));
 }
+
+/// Linux EP_MAX_NESTS: the longest chain of epoll-in-epoll registrations. Adding epoll B to epoll A is ELOOP when
+/// (levels below B) + 1 + (levels above A) would exceed it.
+pub const EP_MAX_NESTS: u32 = 4;
+
+pub fn nestDepthExceeded(levels_below_added: u32, levels_above_receiver: u32) bool {
+    return levels_below_added + 1 + levels_above_receiver > EP_MAX_NESTS;
+}
+

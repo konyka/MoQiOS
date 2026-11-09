@@ -270,6 +270,37 @@ int main(int argc, char **argv, char **envp) {
     errno = 0;
     check(epoll_create1(0x7777) == -1 && errno == EINVAL, "F: unknown epoll_create1 flags are -1 / EINVAL");
 
+    /* G: epoll nesting depth. Linux allows a chain of at most EP_MAX_NESTS = 4 epoll-in-epoll edges (measured on the host): a registration that would make the
+     * chain longer, counting the levels already below the added epoll and above the receiving one, is ELOOP. */
+    {
+        int c[5], q[5];
+        for (int i = 0; i < 5; i++) { c[i] = epoll_create1(0); q[i] = epoll_create1(0); }
+        struct epoll_event e2; e2.events = EPOLLIN; e2.data.u64 = 0;
+        int ok = 1;
+        for (int i = 0; i < 4; i++) ok = ok && epoll_ctl(c[i + 1], EPOLL_CTL_ADD, c[i], &e2) == 0; /* c4 > c3 > c2 > c1 > c0: four edges */
+        check(ok, "G: a chain of four epoll-in-epoll registrations is allowed");
+        errno = 0;
+        check(epoll_ctl(q[0], EPOLL_CTL_ADD, c[4], &e2) == -1 && errno == ELOOP, "G: adding a four-deep tree under another epoll makes five levels: -1 / ELOOP");
+        errno = 0;
+        check(epoll_ctl(c[0], EPOLL_CTL_ADD, q[1], &e2) == -1 && errno == ELOOP, "G: adding a plain epoll at the bottom of a four-deep chain (c0) is ELOOP too");
+        check(epoll_ctl(c[2], EPOLL_CTL_ADD, q[2], &e2) == 0, "G: adding a plain epoll in the middle of the chain is fine (two levels above)");
+        check(epoll_ctl(q[4], EPOLL_CTL_ADD, c[3], &e2) == 0, "G: a three-deep tree under a plain epoll is exactly four edges: allowed");
+        int c2[3], p2[3];
+        for (int i = 0; i < 3; i++) { c2[i] = epoll_create1(0); p2[i] = epoll_create1(0); }
+        epoll_ctl(c2[1], EPOLL_CTL_ADD, c2[0], &e2); epoll_ctl(c2[2], EPOLL_CTL_ADD, c2[1], &e2);
+        epoll_ctl(p2[1], EPOLL_CTL_ADD, p2[0], &e2); epoll_ctl(p2[2], EPOLL_CTL_ADD, p2[1], &e2);
+        errno = 0;
+        check(epoll_ctl(p2[0], EPOLL_CTL_ADD, c2[2], &e2) == -1 && errno == ELOOP, "G: two levels below plus two above is five: ELOOP");
+        int p3[2];
+        p3[0] = epoll_create1(0); p3[1] = epoll_create1(0);
+        epoll_ctl(p3[1], EPOLL_CTL_ADD, p3[0], &e2);
+        check(epoll_ctl(p3[0], EPOLL_CTL_ADD, c2[2], &e2) == 0, "G: two below plus one above is four: allowed");
+        /* deleting an edge frees the depth again */
+        check(epoll_ctl(c[1], EPOLL_CTL_DEL, c[0], (struct epoll_event *)0) == 0, "G: deleting one edge works");
+        int fresh = epoll_create1(0);
+        check(epoll_ctl(fresh, EPOLL_CTL_ADD, c[4], &e2) == 0, "G: and the tree is now short enough to nest again");
+    }
+
     close(p[0]);
     close(ep);
     print(failures == 0 ? "hello236: PASS\n" : "hello236: FAIL\n");

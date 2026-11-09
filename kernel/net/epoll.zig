@@ -282,6 +282,12 @@ pub fn epollCtl(epfd: u32, op: i32, fd: i32, event_ptr: u64) i64 {
             cycle_borrow.release();
             return ELOOP;
         }
+        // Linux also bounds the chain length (EP_MAX_NESTS): the levels hanging below the added epoll plus the levels above the receiver.
+        if (epoll_policy.nestDepthExceeded(nestedDepthBelow(target.instance), nestedDepthAbove(epfd_idx))) {
+            var deep_borrow = target;
+            deep_borrow.release();
+            return ELOOP;
+        }
         var target_borrow = target;
         target_borrow.release();
     }
@@ -665,6 +671,77 @@ fn nestedChainReaches(start: *EpollInstance, epfd_idx: u32) bool {
         pending |= found & ~visited;
     }
     return false;
+}
+
+/// Edges on the longest epoll-in-epoll path that starts at `start` and goes down (bounded: a cycle cannot exist, and the walk stops past the limit).
+fn nestedDepthBelow(start: *EpollInstance) u32 {
+    return depthBelowFrom(epollSlotOf(start), 0);
+}
+
+fn depthBelowFrom(slot: u32, depth_so_far: u32) u32 {
+    if (depth_so_far > epoll_policy.EP_MAX_NESTS) return depth_so_far;
+    var child = acquireInstance(slot) orelse return 0;
+    var children: u32 = 0;
+    {
+        const saved = child.instance.spin.acquire();
+        defer child.instance.spin.release(saved);
+        for (0..2) |w| {
+            var bits = child.instance.in_use_bm[w];
+            while (bits != 0) {
+                const bit = @ctz(bits);
+                bits &= bits - 1;
+                const i: u8 = @intCast(w * 64 + @as(u32, bit));
+                const item = &child.instance.items[i];
+                if (item.fd_type == .epoll and !item.is_disabled) children |= @as(u32, 1) << @intCast(item.resource_idx);
+            }
+        }
+    }
+    child.release();
+    var best: u32 = 0;
+    while (children != 0) {
+        const c: u32 = @ctz(children);
+        children &= children - 1;
+        const d = 1 + depthBelowFrom(c, depth_so_far + 1);
+        if (d > best) best = d;
+        if (depth_so_far + best > epoll_policy.EP_MAX_NESTS) break;
+    }
+    return best;
+}
+
+/// Edges on the longest path that goes up from `slot`: epoll instances that have it registered, and theirs in turn.
+fn nestedDepthAbove(slot: u32) u32 {
+    return depthAboveFrom(slot, 0);
+}
+
+fn depthAboveFrom(slot: u32, depth_so_far: u32) u32 {
+    if (depth_so_far > epoll_policy.EP_MAX_NESTS) return depth_so_far;
+    var best: u32 = 0;
+    var idx: u32 = 0;
+    while (idx < MAX_EPOLL_INSTANCES) : (idx += 1) {
+        if (idx == slot) continue;
+        var parent = acquireInstance(idx) orelse continue;
+        var holds = false;
+        {
+            const saved = parent.instance.spin.acquire();
+            defer parent.instance.spin.release(saved);
+            for (0..2) |w| {
+                var bits = parent.instance.in_use_bm[w];
+                while (bits != 0 and !holds) {
+                    const bit = @ctz(bits);
+                    bits &= bits - 1;
+                    const i: u8 = @intCast(w * 64 + @as(u32, bit));
+                    const item = &parent.instance.items[i];
+                    if (item.fd_type == .epoll and !item.is_disabled and item.resource_idx == slot) holds = true;
+                }
+            }
+        }
+        parent.release();
+        if (!holds) continue;
+        const d = 1 + depthAboveFrom(idx, depth_so_far + 1);
+        if (d > best) best = d;
+        if (depth_so_far + best > epoll_policy.EP_MAX_NESTS) break;
+    }
+    return best;
 }
 
 /// Propagate child-epoll readiness while pool_lock is already held. Keeping

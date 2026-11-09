@@ -11754,3 +11754,21 @@ test "TCP SO_REUSEPORT: shared ports need both sides to opt in, same user; conne
     try std.testing.expect(std.mem.indexOf(u8, t, "if (listen_slots[i].tcb_idx == tcb_idx) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, t, "if (ls.tcb_idx == tcbIdx(tcb)) {") != null);
 }
+
+test "epoll nesting depth: EP_MAX_NESTS = 4 edges counted below the added epoll and above the receiver" {
+    const ep = kt.epoll_policy;
+    try std.testing.expectEqual(@as(u32, 4), ep.EP_MAX_NESTS);
+    // (below, above): total edges = below + 1 + above.
+    try std.testing.expect(!ep.nestDepthExceeded(0, 0));
+    try std.testing.expect(!ep.nestDepthExceeded(3, 0)); // a three-deep tree under a plain epoll: four edges
+    try std.testing.expect(!ep.nestDepthExceeded(2, 1)); // two below, one above: four
+    try std.testing.expect(!ep.nestDepthExceeded(0, 3));
+    try std.testing.expect(ep.nestDepthExceeded(4, 0)); // a four-deep tree under a plain epoll: five
+    try std.testing.expect(ep.nestDepthExceeded(2, 2)); // five
+    try std.testing.expect(ep.nestDepthExceeded(0, 4)); // a plain epoll added at the bottom of a four-deep chain: five
+    // Wiring: the check follows the cycle check and uses both walks.
+    const es = kt.epoll_source;
+    const cyc = std.mem.indexOf(u8, es, "if (nestedChainReaches(target.instance, epfd_idx)) {") orelse return error.TestUnexpectedResult;
+    const dep = std.mem.indexOf(u8, es, "epoll_policy.nestDepthExceeded(nestedDepthBelow(target.instance), nestedDepthAbove(epfd_idx))") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cyc < dep);
+}

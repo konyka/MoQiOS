@@ -5961,7 +5961,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 问题：①`EpollEvent` 在内核里是 16 字节（`data` 对齐到偏移 8），Linux x86_64 的 `struct epoll_event` 是 packed 的 12 字节（`data` 在偏移 4）；单个事件的 `events` 恰好在同一位置；早先的 hello 探测里 hello157–160/182/105 用 `__attribute__((packed))` 的 12 字节结构，hello89 与 hello112 却用未 packed 的 16 字节结构，它们的 `data` 是“注册时写入、返回时读出”，两侧用同一种错位，所以靠巧合读回了原值（内核改成 12 字节布局后它们依然通过；随后把这两个探测的结构也改成 `__attribute__((packed))`，SMP=2 冒烟 hello89/hello112 PASS、0 个 FAIL）。但 `epoll_wait` 一次返回多个事件时，第二个事件起全部错位，glibc/musl 程序读到的是垃圾。②`epoll_ctl`/`epoll_wait` 的错误码与 Linux 不一致，共约 33 项（见 `docs/kernel-subsystems.md` 的 hello186 条）。
 - 方法：先在宿主机编译运行对照程序取 67 项真实 Linux 返回值（`/tmp/lx`，用完删除），再用同一份表生成 hello186，逐项对照。旧内核约 33 项 FAIL，34 项本来一致。
 - 修复：纯策略放进 `net/epoll_policy.zig`（`ctlPrecheck`、`waitErrno`、`pollable`、`MAX_WAIT_EVENTS`、`EVENT_SIZE`，host 可测）；`net/epoll.zig` 新增 `epfdKind`（epfd 是关闭/非 epoll/epoll）与 `epollWaitFd`，`epollCtl` 的入口先读事件、钉住目标描述符、调 `ctlPrecheck`，再借用实例；`syscall_entry.zig` 的 `epollCtlFd`/`epollWaitFd` 直接转给 `net/epoll.zig`，`maxevents` 以 `i32` 传（以前截成 `u32`，`-1` 变成 4294967295）；删掉不再使用的 `epollFdIndex`。
-- 已知差异：`EPOLLWAKEUP` 没有特殊处理（Linux 对没有 `CAP_BLOCK_SUSPEND` 的进程悄悄清掉）；`EPOLLPRI` 没有任何描述符会报（带外数据仍未实现）；嵌套深度上限（Linux `EP_MAX_NESTS = 4`）没有实现，环检测保留原有的链式检查；`epoll_wait` 对无事件时的缓冲区只做范围检查，和 Linux 一致，但有事件时写入失败仍是 `EFAULT`，Linux 在已经消费了边沿触发事件后才报错，这个差异没有对照。
+- 已知差异：`EPOLLWAKEUP` 没有特殊处理（Linux 对没有 `CAP_BLOCK_SUSPEND` 的进程悄悄清掉）；`EPOLLPRI` 没有任何描述符会报（带外数据仍未实现）；嵌套深度上限（Linux `EP_MAX_NESTS = 4`）~~没有实现~~（已在文末 hello236 G 段补上）；`epoll_wait` 对无事件时的缓冲区只做范围检查，和 Linux 一致，但有事件时写入失败仍是 `EFAULT`，Linux 在已经消费了边沿触发事件后才报错，这个差异没有对照。
 - TDD：host 新增 1 个测试（`ctlPrecheck` 的全部顺序、`EPOLLEXCLUSIVE` 各种组合、`pollable` 的穷举、`waitErrno` 的顺序与 `maxevents` 边界、事件布局常量与接线形状），并更新了旧的 "epoll MOD … self cycles" 测试（旧断言“自己加自己返回 `ELOOP`”与 Linux 不符）；hello186（67 项）在旧内核上约 33 项 FAIL，新内核 PASS。
 
 - 变异（具名测试核对）：`ctlPrecheck` 里 EFAULT/两处 EBADF/EPERM/EINVAL（自己、非 epoll）/`EPOLLEXCLUSIVE` 的三个条件/`EXCLUSIVE_OK_BITS` 少一位/`ctlHasEvent` 改成只看 ADD 与 MOD、`pollable` 的 6 个类型各去掉一个、`waitErrno` 的 EBADF/`maxevents` 下界/上界改成 128/缓冲区范围/非 epoll 检查、事件大小与偏移常量、`EpollEvent` 去掉 `align(1)`、`epollCtl` 不读事件、MOD 的 `EPOLLEXCLUSIVE` 检查、`.same_file` 恒为假、`epollWaitFd` 接线、`syscall_entry` 里 `maxevents` 被替换，共 29 个，其中 27 个被具名测试 `epoll errnos follow Linux's order…`（或更新后的 `epoll MOD advances…`）抓住，另有 2 个是等价变异：`events_ptr > USER_LIMIT` 与 `>=` 的差别只在恰好等于上限时，而那时 `bytes > USER_LIMIT - events_ptr` 已经返回 `EFAULT`；`ADD` 里的 `event orelse return …` 在 `ctlPrecheck` 已经对不可读事件返回 `EFAULT` 之后不可达。3 个变异第一次因编译失败/未使用参数被换成可编译形式后重跑并抓住；恢复后 `grep -c MUTATION` 为 0。
@@ -7484,4 +7484,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - `tcp.zig`：`ListenSlot` 新增 `tcb_idx`——此前监听槽按“端口加地址族”识别，两个监听者会撞在同一个槽里；现在每个监听 TCB 一个槽。`stopListening` 和 `tcpAccept` 改按 TCB 找槽；IPv4/IPv6 的 SYN 都通过新函数 `pickListenSlot` 选槽（只有一个监听者时行为与以前完全相同）。`tcpBind` 在 `SO_REUSEADDR`/`TIME_WAIT` 规则之外再问 `reusePortMayShare`；owner uid 取自拥有任务的 `euid`。
 - 绿灯：hello183 在 SMP=2 的两份运行里全部 PASS（12 个连接全部被两个监听者接走且两边都分到了；关闭一个监听者后另一个继续接收）；host 测试覆盖策略（单边不行、uid 不同不行、哈希稳定且在范围内、60 个对端会用到全部 3 个监听者）和接线；三个架构构建通过。
 - 局限（如实）：①分发只按对端地址和端口哈希，没有 Linux 的 `SO_ATTACH_REUSEPORT_*` BPF 选择器；②一个监听者关闭时，它队列里还没被 `accept` 的连接被复位（沿用 `stopListening` 的原有行为），Linux 会把它们迁移到同组的其它监听者（`net.ipv4.tcp_migrate_req` 打开时）——这里没有实现迁移；③连接分散的“均匀度”只测了“两边都分到”，没有测比例；④UDP 的 `SO_REUSEPORT`（多个套接字共享一个 UDP 端口并按哈希分发）没有做，UDP 的端口表仍是独占的；⑤owner uid 取自任务的 `euid`，任务退出后读到的是 0。
+
+## epoll 嵌套深度上限 `EP_MAX_NESTS = 4`（hello236 G 段，已补）
+
+- 来由：hello164 一节的已知差异。此前只检测环（`nestedChainReaches`），不限制链长；链再深也能一直加。Linux 把“epoll 里套 epoll”的链长限制在 4 条边以内，超过返回 `ELOOP`。
+- 实测依据（本机 Linux 7.2.15，Python `select.epoll`）：一条 c4>c3>c2>c1>c0 的链（4 条边）可以建成，再往下接一个空 epoll 得 `ELOOP`；把 4 层的树加到另一个空 epoll 下得 `ELOOP`；两层下方加两层上方（共 5 条边）是 `ELOOP`，两层下方加一层上方（4 条边）可以；把一个空 epoll 加到链中间（上方 2 层）可以。所以规则是“被加入者下方的层数 + 1 + 接收者上方的层数 > 4 → `ELOOP`”。
+- 红灯：hello236 新增 G 段 9 项，旧内核上 3 项失败（四层树加到别的 epoll 下、往四层链最底下加、两层加两层）。
+- 实现：`epoll_policy.zig` 新增 `EP_MAX_NESTS` 与纯函数 `nestDepthExceeded(below, above)`；`epoll.zig` 新增 `nestedDepthBelow`（向下沿被加入 epoll 的 epoll 成员做深度优先，最长路径）与 `nestedDepthAbove`（扫描所有 epoll 实例，找登记了它的父实例，向上取最长路径），在环检测之后检查；两个遍历在深度越过上限后提前返回，所以不会因为大图而长时间持锁。
+- 过程中一个测试写错（如实）：我最初把“往链底端加空 epoll”写成了往 `c[4]`（链的顶端）加，实际应是 `c[0]`（最底端）；Linux 实测顶端可以加（`top ok`）、底端 `ELOOP`。改对测试点后两份 SMP=2 都 PASS。
+- 局限：①`nestedDepthAbove` 对每个实例逐个 `acquireInstance` 并持锁扫描，最多 32 个实例，但在深度较大时是指数级的最坏情形（每个实例可能有多个父），被提前返回的上限截断；②深度只在 `EPOLL_CTL_ADD` 时检查，已经存在的链之后因 `EPOLL_CTL_MOD` 重新启用被禁用的条目不会重新检查；③非 epoll 成员（管道、套接字）不计入深度，与 Linux 一致。
 
