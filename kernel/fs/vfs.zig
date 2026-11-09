@@ -1682,6 +1682,14 @@ pub const FdTable = struct {
         return d.fd_type == .tmpfs_file or d.fd_type == .fat32_file or d.fd_type == .ext2_file;
     }
 
+    /// True for a writable regular file (tmpfs, FAT32, ext2): the target an RWF_APPEND pwritev2 appends to.
+    pub fn isRegularWritableFile(self: *FdTable, fd: u32) bool {
+        if (fd >= MAX_FDS) return false;
+        const d = &self.fds[fd];
+        if (!d.writable) return false;
+        return d.fd_type == .tmpfs_file or d.fd_type == .fat32_file or d.fd_type == .ext2_file;
+    }
+
     /// Held across a whole write()/writev() on an append file. The syscall layer cuts a large write into 4 KiB pieces (and writev into one piece
     /// per iovec); without this another appender's piece lands between ours, where Linux keeps one write or one writev contiguous.
     pub fn lockAppendCall() void {
@@ -1930,10 +1938,22 @@ pub const FdTable = struct {
 
     /// Write to a file descriptor at a specific offset without mutating the shared offset.
     /// Returns number of bytes written or negative errno.
-    /// Used by pwrite64/pwritev to avoid temporary offset mutation.
+    /// Used by pwrite64/pwritev to avoid temporary offset mutation. An O_APPEND descriptor appends instead (Linux ignores the offset).
     pub fn writeAtOffset(self: *FdTable, fd: u32, buf: [*]const u8, count: usize, offset: u64) i64 {
+        return self.writeAtOffsetMode(fd, buf, count, offset, .descriptor);
+    }
+
+    /// Whether an offset write appends: as the descriptor's O_APPEND says, or forced either way (pwritev2 RWF_APPEND / RWF_NOAPPEND).
+    pub const AppendMode = enum { descriptor, append, no_append };
+
+    pub fn writeAtOffsetMode(self: *FdTable, fd: u32, buf: [*]const u8, count: usize, offset: u64, mode: AppendMode) i64 {
         if (fd >= MAX_FDS) return -9; // EBADF
         const desc = &self.fds[fd];
+        const append_wanted = switch (mode) {
+            .descriptor => (desc.status_flags & 0x400) != 0,
+            .append => true,
+            .no_append => false,
+        };
 
         switch (desc.fd_type) {
             .none => return -9, // EBADF
@@ -1957,7 +1977,7 @@ pub const FdTable = struct {
             .fat32_file => {
                 if (!desc.writable) return -9; // EBADF
                 // O_APPEND: Linux ignores the offset of pwrite and appends at the end of the file.
-                const appending = (desc.status_flags & 0x400) != 0;
+                const appending = append_wanted;
                 if (appending) append_lock.lock();
                 defer if (appending) append_lock.unlock();
                 const at: u64 = if (appending) @import("fat32.zig").currentSize(desc.fat32_file_idx) else offset;
@@ -1972,7 +1992,7 @@ pub const FdTable = struct {
             .rofs_file => return -30, // EROFS
             .ext2_file => {
                 if (!desc.writable) return -9; // EBADF
-                const appending = (desc.status_flags & 0x400) != 0;
+                const appending = append_wanted;
                 if (appending) append_lock.lock();
                 defer if (appending) append_lock.unlock();
                 const at: u64 = if (appending) @import("ext2.zig").currentSize(desc.ext2_file_idx) else offset;
@@ -1985,7 +2005,7 @@ pub const FdTable = struct {
             .tmpfs_file => {
                 if (!desc.writable) return -9; // EBADF
                 const tmpfs = @import("tmpfs.zig");
-                if ((desc.status_flags & 0x400) != 0) {
+                if (append_wanted) {
                     const end = tmpfs.tmpfsGetSize(@intCast(desc.tmpfs_idx));
                     const agate = fsizeGate(end, count);
                     if (agate < 0) return agate;

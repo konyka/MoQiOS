@@ -11839,7 +11839,8 @@ test "O_APPEND: pwrite and pwritev append at the end, splice and copy_file_range
     try std.testing.expect(std.mem.indexOf(u8, vs, "tmpfs.tmpfsAppend(@intCast(desc.tmpfs_idx), buf, @intCast(agate), &began_at)") != null);
     // The syscall layer holds the per-call append lock across pwrite and pwritev like write and writev.
     try std.testing.expect(std.mem.indexOf(u8, kt.file_io_source, "const append_call = cur.fd_table.isAppendFile(fd);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.readv_source, "const append_call = cur.fd_table.isAppendFile(fd);\n    if (append_call) vfs_mod.FdTable.lockAppendCall();\n    defer if (append_call) vfs_mod.FdTable.unlockAppendCall();\n    var current_offset = pos_l;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.readv_source, ".descriptor => cur.fd_table.isAppendFile(fd),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.readv_source, "    if (append_call) vfs_mod.FdTable.lockAppendCall();\n    defer if (append_call) vfs_mod.FdTable.unlockAppendCall();\n    var current_offset = pos_l;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.splice_source, "if ((fd_table.fds[file_fd].status_flags & 0x400) != 0) return EINVAL;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.copy_file_range_source, "if ((cur.fd_table.fds[fd_out].status_flags & 0x400) != 0) return EBADF;") != null);
 }
@@ -11882,4 +11883,31 @@ test "tcp ephemeral ports: after one is handed out the next pick moves on, and a
     }
     // After the full range the first port comes round again.
     try std.testing.expectEqual(p.EPHEMERAL_FIRST, p.pickEphemeralPort(cur, &[_]u16{}).?);
+}
+
+test "preadv2/pwritev2 flags: RWF_APPEND / RWF_NOAPPEND choose the append mode, unknown bits are EOPNOTSUPP, offset -1 is the current position" {
+    const r = kt.rwf_policy;
+    try std.testing.expectEqual(r.Append.descriptor, r.writeMode(0).ok);
+    try std.testing.expectEqual(r.Append.append, r.writeMode(r.RWF_APPEND).ok);
+    try std.testing.expectEqual(r.Append.no_append, r.writeMode(r.RWF_NOAPPEND).ok);
+    try std.testing.expectEqual(r.Append.descriptor, r.writeMode(r.RWF_DSYNC | r.RWF_HIPRI).ok);
+    try std.testing.expectEqual(@as(i64, -22), r.writeMode(r.RWF_APPEND | r.RWF_NOAPPEND).err);
+    try std.testing.expectEqual(@as(i64, -95), r.writeMode(0x1000).err);
+    try std.testing.expectEqual(@as(?i64, null), r.readFlagsValid(r.RWF_APPEND));
+    try std.testing.expectEqual(@as(?i64, null), r.readFlagsValid(r.RWF_NOAPPEND | r.RWF_SYNC));
+    try std.testing.expectEqual(@as(?i64, -95), r.readFlagsValid(0x40));
+    try std.testing.expectEqual(.current, r.offsetKind(-1));
+    try std.testing.expectEqual(.invalid, r.offsetKind(-2));
+    try std.testing.expectEqual(.explicit, r.offsetKind(0));
+}
+
+test "preadv2/pwritev2 (498/499): dispatched with Linux's argument layout and the RWF_* mode reaches writeAtOffsetMode" {
+    const rs = kt.readv_source;
+    try std.testing.expect(std.mem.indexOf(u8, rs, "pub fn pwritev2(fd: u32, iov_ptr: u64, iovcnt: u32, offset: i64, flags: u32) i64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "const result = cur.fd_table.writeAtOffsetMode(fd, &kbuf, ucopy, current_offset, mode);") != null);
+    // plain pwritev keeps following the descriptor's own O_APPEND
+    try std.testing.expect(std.mem.indexOf(u8, rs, "return pwritevMode(fd, iov_ptr, iovcnt, pos_l, .descriptor);") != null);
+    const vs = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, vs, "return self.writeAtOffsetMode(fd, buf, count, offset, .descriptor);") != null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, vs[std.mem.indexOf(u8, vs, "pub fn writeAtOffsetMode(").?..std.mem.indexOf(u8, vs, "/// v53.47: Check if another fd in this table shares").?], "(desc.status_flags & 0x400) != 0;\n                if (appending)"));
 }

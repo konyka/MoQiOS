@@ -167,6 +167,7 @@ pub const unix_epoll_policy = @import("net/unix_epoll_policy.zig");
 pub const tcp_port_policy = @import("net/tcp_port_policy.zig");
 pub const udp_port_policy = @import("net/udp_port_policy.zig");
 pub const tcp_stats = @import("net/tcp_stats.zig");
+pub const rwf_policy = @import("fs/rwf_policy.zig");
 pub const icmp_echo_policy = @import("net/icmp_echo_policy.zig");
 pub const icmp_unreach_policy = @import("net/icmp_unreach_policy.zig");
 pub const udp_source = @embedFile("net/udp.zig");

@@ -80,6 +80,8 @@
 #define SYS_sigsuspend  220
 #define SYS_tkill       223
 #define SYS_gettid      497
+#define SYS_preadv2     498
+#define SYS_pwritev2    499
 
 /* Processes, identity and terminals */
 #define SYS_pause       34

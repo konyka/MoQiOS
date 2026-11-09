@@ -10,6 +10,10 @@
 
 #define SYS_PWRITEV_ 141
 #define SYS_SENDFILE_ 40
+#define SYS_PREADV2_ 498
+#define SYS_PWRITEV2_ 499
+#define RWF_APPEND_ 0x10
+#define RWF_NOAPPEND_ 0x20
 #define SYS_IO_SETUP_ 213
 #define SYS_IO_DESTROY_ 214
 #define SYS_IO_SUBMIT_ 215
@@ -150,6 +154,45 @@ static void one_fs(const char *label, const char *path) {
         close(afd);
         snprintf(what, sizeof what, "%s: sendfile into an O_APPEND file is EINVAL as on Linux (got %ld)", label, sf);
         check(sf == -22, what);
+    }
+    {
+        /* pwritev2/preadv2 (Linux semantics measured on the host): RWF_APPEND appends on a plain fd and leaves its offset alone; offset -1 means the
+         * current position (and moves it); RWF_NOAPPEND writes at the given offset even on an O_APPEND fd; an unknown flag is EOPNOTSUPP. */
+        unlink(path);
+        int c2 = (int)open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        write(c2, "AAAAAAAA", 8);
+        close(c2);
+        struct { void *base; unsigned long len; } v1[1] = { { (void *)"XY", 2 } };
+        int pf = (int)open(path, O_WRONLY, 0644);
+        long w1 = syscall6(SYS_PWRITEV2_, pf, (long)v1, 1, 0, 0, RWF_APPEND_);
+        long pos1 = lseek(pf, 0, SEEK_CUR);
+        long bad = syscall6(SYS_PWRITEV2_, pf, (long)v1, 1, 0, 0, 0x1000);
+        close(pf);
+        int af = (int)open(path, O_WRONLY | O_APPEND, 0644);
+        struct { void *base; unsigned long len; } v2[1] = { { (void *)"Q", 1 } };
+        long w2 = syscall6(SYS_PWRITEV2_, af, (long)v2, 1, -1, 0, 0);
+        struct { void *base; unsigned long len; } v3[1] = { { (void *)"Z", 1 } };
+        long w3 = syscall6(SYS_PWRITEV2_, af, (long)v3, 1, 0, 0, RWF_NOAPPEND_);
+        close(af);
+        char pb[32];
+        int rf = (int)open(path, O_RDONLY, 0);
+        struct { void *base; unsigned long len; } rv[1] = { { pb, sizeof pb } };
+        long r1 = syscall6(SYS_PREADV2_, rf, (long)rv, 1, 0, 0, 0);
+        long rpos = lseek(rf, 0, SEEK_CUR);
+        long r2 = syscall6(SYS_PREADV2_, rf, (long)rv, 1, -1, 0, 0);
+        close(rf);
+        snprintf(what, sizeof what, "%s: pwritev2(RWF_APPEND) on a plain fd appends and keeps the offset (w %ld, pos %ld)", label, w1, pos1);
+        check(w1 == 2 && pos1 == 0, what);
+        snprintf(what, sizeof what, "%s: an unknown pwritev2 flag is EOPNOTSUPP (got %ld)", label, bad);
+        check(bad == -95, what);
+        snprintf(what, sizeof what, "%s: pwritev2 offset -1 on an O_APPEND fd appends (got %ld)", label, w2);
+        check(w2 == 1, what);
+        snprintf(what, sizeof what, "%s: pwritev2(RWF_NOAPPEND) writes at the offset even on an O_APPEND fd (got %ld)", label, w3);
+        check(w3 == 1, what);
+        snprintf(what, sizeof what, "%s: preadv2 at offset 0 reads the whole file and leaves the offset at 0 (read %ld, pos %ld)", label, r1, rpos);
+        check(r1 == 11 && rpos == 0 && memcmp(pb, "ZAAAAAAAXYQ", 11) == 0, what);
+        snprintf(what, sizeof what, "%s: preadv2 offset -1 reads from the current position (got %ld)", label, r2);
+        check(r2 == 11, what);
     }
     int ok = 1;
     for (int round = 0; round < 6; round++) {

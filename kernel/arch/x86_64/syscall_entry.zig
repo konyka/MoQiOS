@@ -1930,6 +1930,12 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             frame.rax = @bitCast(signal_syscall_mod.pause());
             checkSignalsOnSyscallReturn(frame);
         },
+        498 => { // preadv2(fd, iov, iovcnt, pos_l, pos_h, flags) — Linux layout; pos_l is the whole 64-bit offset, -1 = current position
+            frame.rax = @bitCast(readv_mod.preadv2(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx), @bitCast(frame.r10), @truncate(frame.r9)));
+        },
+        499 => { // pwritev2(fd, iov, iovcnt, pos_l, pos_h, flags) — RWF_APPEND / RWF_NOAPPEND
+            frame.rax = @bitCast(readv_mod.pwritev2(@truncate(frame.rdi), frame.rsi, @truncate(frame.rdx), @bitCast(frame.r10), @truncate(frame.r9)));
+        },
         497 => { // gettid() — the calling thread's own id (getpid() is the thread group's)
             frame.rax = @bitCast(proc_mgmt_mod.gettid());
         },

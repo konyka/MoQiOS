@@ -7520,7 +7520,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello268 在改动之前的内核上，三个文件系统各有 3 项失败（`pwrite`/`pwritev` 把数据覆盖在偏移 0 上，文件仍是 8 字节；四个进程并发写，记录互相覆盖），共 9 项；`copy_file_range` 和 `splice` 的两项是后加的，在改动前也失败（返回成功的字节数）。
 - 实现：`vfs.zig` 的 `writeAtOffset` 对 `O_APPEND` 描述符把偏移换成文件当前末尾——ext2/FAT32 在 `append_lock` 之内取 `currentSize` 再暂存，tmpfs 走 `tmpfsAppend`（取末尾和写入在一次持锁里）；`file_io.pwrite` 和 `readv.pwritev` 像 `write`/`writev` 一样整次调用持有 `append_call_lock`；`splicePipeToFile` 对 `O_APPEND` 目的返回 `EINVAL`，`copyFileRange` 对 `O_APPEND` 目的返回 `EBADF`。
 - 绿灯：hello268 在三个文件系统上通过（含 6 轮四进程并发 `pwrite`/`pwritev`）；host 1124/1124，其中新增一条源码形状测试，并把 `O_APPEND` 的锁位置计数由 2 改为 4（`write` 与 `writeAtOffset` 各占 ext2/FAT32 两处）。
-- 局限（如实）：①~~`aio` 的 `PWRITE`~~、~~`sendfile` 到 `O_APPEND`~~ 已在下一节补了用例；②`pwritev2`/`preadv2` 这个内核根本没有实现（不在系统调用表里），所以 `RWF_APPEND`/`RWF_NOAPPEND` 也不存在；③全局 `append_call_lock` 的争用仍没有测量。
+- 局限（如实）：①~~`aio` 的 `PWRITE`~~、~~`sendfile` 到 `O_APPEND`~~ 已在下一节补了用例；②~~`pwritev2`/`preadv2` 没有实现~~（已在文末一节实现）；③全局 `append_call_lock` 的争用仍没有测量。
 
 ## TCB 表被已结束连接的 TIME_WAIT 占满：`socket()`/`connect` 失败（hello269，已修；这是 CI 上 hello183 G / hello184 D 偶发失败的根因）
 
@@ -7536,6 +7536,15 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - **hello269 修复前卡 78 秒的机制（已证实）**：临时关掉 TIME_WAIT 驱逐，在两处 SYN 处理（IPv4/IPv6）的 `allocTcb` 失败点打印诊断，再单独跑 hello269：100 轮共 238.5 秒，最慢一轮 78.7 秒，诊断恰好打印 12 次“SYN dropped: allocTcb failed”。所以确实是服务端收到 SYN 时没有空槽而丢弃、客户端靠 SYN 重传退避等到 TIME_WAIT 到期才连上。诊断与关闭驱逐的改动已撤回。
 - **能从用户态观察表的压力（新增 `/proc/tcpstats`）**：一行 `closed=N syn_sent=N … listen=N orphans=N active=N capacity=N syn_dropped=N time_wait_evicted=N`。各状态计数按 `TcpState` 的顺序，`orphans` 是没有描述符引用的槽，`syn_dropped` 是因没有空槽而丢弃的 SYN 总数，`time_wait_evicted` 是表满时让出的 TIME_WAIT 槽总数。格式化是纯模块 `net/tcp_stats.zig`（host 测试锁定输出），快照在 `tcp_lock` 下取。hello269 现在断言 100 轮期间 `syn_dropped` 增量为 0：实测两次都是 0，驱逐 137 次，结束时 TIME_WAIT 63 个（每轮两端各一个，共 200 个 = 137 + 63，账对得上）。
 - **2MSL 的风险（部分核实）**：被驱逐的 TIME_WAIT 槽的 4 元组会不会很快被新连接重用？hello269 记录每轮客户端 `getsockname` 得到的本地端口：100 轮里没有一个端口重复；host 测试证明临时端口在整个 16384 个端口的周期内不会重复。所以在这个负载下，被驱逐的 4 元组在新连接里不会马上再次出现，迟到的重复段落入新连接的风险需要端口用完一整圈才可能发生。**没有核实的**：服务端被驱逐的 TIME_WAIT（服务端端口固定，靠客户端端口区分 4 元组）同样依赖客户端端口不重复；外部对端主动选择端口的情形没有测。
-- **`O_APPEND` 的其余写路径（已补用例）**：本机 Linux 实测：`io_submit` 的 `PWRITE` 在 `O_APPEND` 描述符上忽略偏移、写在末尾；`sendfile` 输出到普通文件可以，输出到 `O_APPEND` 文件是 `EINVAL`。本内核：aio 的 `PWRITE` 经 `fd_table.write`，本来就走 `O_APPEND` 路径（hello268 新增用例三个文件系统都通过，**这不是先红后绿**，代码没改）；`sendfile` 只接受套接字和管道作输出，到 `O_APPEND` 文件同样是 `EINVAL`（用例通过，代码没改）。`pwritev2` 本内核没有实现，不做。
+- **`O_APPEND` 的其余写路径（已补用例）**：本机 Linux 实测：`io_submit` 的 `PWRITE` 在 `O_APPEND` 描述符上忽略偏移、写在末尾；`sendfile` 输出到普通文件可以，输出到 `O_APPEND` 文件是 `EINVAL`。本内核：aio 的 `PWRITE` 经 `fd_table.write`，本来就走 `O_APPEND` 路径（hello268 新增用例三个文件系统都通过，**这不是先红后绿**，代码没改）；`sendfile` 只接受套接字和管道作输出，到 `O_APPEND` 文件同样是 `EINVAL`（用例通过，代码没改）。`pwritev2` 当时没有实现，见下一节。
 - LAST_ACK、FIN_WAIT 等状态的孤儿 TCB 要不要也驱逐（测量后决定不做）：hello269 在开始前打印开机以来的 `/proc/tcpstats`。完整 smoke（整条 init 序列跑完前面所有网络测试）里：SMP=1 时 `syn_dropped=0`、`time_wait_evicted=0`，表里 TIME_WAIT 5 个、LISTEN 1 个，其它孤儿 0 个；SMP=2 时 `syn_dropped=0`、`time_wait_evicted=3`，TIME_WAIT 5 个、CLOSING 1 个。也就是说在有驱逐之后，整条序列里从没有 SYN 因表满被丢，非 TIME_WAIT 的孤儿最多 1 个，离 64 个槽很远；所以没有为 LAST_ACK/FIN_WAIT 加驱逐（它们有自己的超时：FIN_WAIT_2 60 秒，其余靠重传 5 次后放弃）。这是两次运行的结果，不代表更重的外部负载；`MAX_CONNECTIONS` 仍是 64。
+
+## `preadv2` / `pwritev2`（498 / 499，hello268 扩展，已补）
+
+- 来由：上面两节记录“`pwritev2` 没有实现，所以 `RWF_APPEND` 不存在”。
+- 本机 Linux（7.2.15，Python `os.pwritev`/`os.preadv`）实测：`RWF_APPEND`（0x10）在普通描述符上把数据写到末尾、不动描述符偏移；偏移 `-1` 表示“用并推进当前位置”（在 `O_APPEND` 描述符上即追加）；`RWF_NOAPPEND`（0x20）在 `O_APPEND` 描述符上照传入的偏移写；`RWF_APPEND|RWF_NOAPPEND` 是 `EINVAL`；未知标志位是 `EOPNOTSUPP`；偏移 `-2` 是 `EINVAL`；`preadv2` 接受并忽略两个追加标志（我原先以为读会拒绝它们，实测推翻了这个猜测）。
+- 红灯：hello268 每个文件系统新增 6 项，三个文件系统共 18 项，改动前全部是 `-38 ENOSYS`。
+- 实现：系统调用号按本内核自有编号取下一个空位：498 `preadv2`、499 `pwritev2`（参数布局同 Linux：`fd, iov, iovcnt, pos_l, pos_h, flags`，`pos_l` 是完整的 64 位偏移，`flags` 在第 6 个参数）。纯模块 `fs/rwf_policy.zig` 解码标志和偏移（host 测试）；`vfs.writeAtOffset` 拆出 `writeAtOffsetMode(…, .descriptor / .append / .no_append)`，原有的 `pwrite`/`pwritev`/`splice` 仍走 `.descriptor`（行为不变），`pwritev2` 按标志选模式；偏移 `-1` 转给 `readv`/`writev`。`RWF_APPEND` 在普通文件上也持有 `append_call_lock`。moqi_libc 的 `moqi_syscalls.h` 加了 `SYS_preadv2`/`SYS_pwritev2`。
+- 绿灯：hello268 三个文件系统的 18 项全部通过；host 1129/1129（含 `rwf_policy` 与接线测试；一条旧的源码形状测试随 `pwritev` 的追加锁写法更新）。
+- 局限（如实）：①`RWF_HIPRI`/`RWF_DSYNC`/`RWF_SYNC`/`RWF_NOWAIT` 只是被接受，没有语义（`DSYNC`/`SYNC` 不会在写后刷盘，`NOWAIT` 不会在要阻塞时返回 `EAGAIN`）；②没有 libc 包装函数，只有编号常量；③偏移 `-1` 走 `readv`/`writev`，所以管道、套接字也能用，与 Linux 一致，但没有为它们写用例。
 

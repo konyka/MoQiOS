@@ -107,9 +107,6 @@ pub fn preadv(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64) i64 {
     // Validate untrusted fd number before indexing the descriptor array.
     if (fd >= cur.fd_table.fds.len or cur.fd_table.fds[fd].fd_type == .none) return EBADF;
 
-    const append_call = cur.fd_table.isAppendFile(fd);
-    if (append_call) vfs_mod.FdTable.lockAppendCall();
-    defer if (append_call) vfs_mod.FdTable.unlockAppendCall();
     var current_offset = pos_l;
     var total: usize = 0;
     for (0..iovcnt) |i| {
@@ -153,6 +150,10 @@ pub fn preadv(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64) i64 {
 
 /// pwritev(fd, iov_ptr, iovcnt, pos_l) -> bytes written or -errno.
 pub fn pwritev(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64) i64 {
+    return pwritevMode(fd, iov_ptr, iovcnt, pos_l, .descriptor);
+}
+
+fn pwritevMode(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64, mode: vfs_mod.FdTable.AppendMode) i64 {
     if (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000 or iovcnt == 0 or iovcnt > 1024) return -22;
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
@@ -160,6 +161,13 @@ pub fn pwritev(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64) i64 {
     // Validate untrusted fd number before indexing the descriptor array.
     if (fd >= cur.fd_table.fds.len or cur.fd_table.fds[fd].fd_type == .none) return EBADF;
 
+    const append_call = switch (mode) {
+        .descriptor => cur.fd_table.isAppendFile(fd),
+        .append => cur.fd_table.isRegularWritableFile(fd),
+        .no_append => false,
+    };
+    if (append_call) vfs_mod.FdTable.lockAppendCall();
+    defer if (append_call) vfs_mod.FdTable.unlockAppendCall();
     var current_offset = pos_l;
     var total: usize = 0;
     for (0..iovcnt) |i| {
@@ -180,7 +188,7 @@ pub fn pwritev(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64) i64 {
             var kbuf: [4096]u8 = undefined;
             const ucopy = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(iov_base + pos), chunk);
             if (ucopy == 0) break;
-            const result = cur.fd_table.writeAtOffset(fd, &kbuf, ucopy, current_offset);
+            const result = cur.fd_table.writeAtOffsetMode(fd, &kbuf, ucopy, current_offset, mode);
             if (result < 0) return if (total == 0 and pos == 0) result else @intCast(total + pos);
             if (result == 0) break;
             pos += @intCast(result);
@@ -195,3 +203,34 @@ pub fn pwritev(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64) i64 {
 
     return @intCast(total);
 }
+
+/// preadv2(fd, iov_ptr, iovcnt, offset, flags): preadv with RWF_* flags. Offset -1 reads at the descriptor's position and advances it.
+pub fn preadv2(fd: u32, iov_ptr: u64, iovcnt: u32, offset: i64, flags: u32) i64 {
+    const rwf = @import("rwf_policy.zig");
+    if (rwf.readFlagsValid(flags)) |e| return e;
+    switch (rwf.offsetKind(offset)) {
+        .invalid => return -22,
+        .explicit => return preadv(fd, iov_ptr, iovcnt, @intCast(offset)),
+        .current => return readv(fd, iov_ptr, iovcnt),
+    }
+}
+
+/// pwritev2(fd, iov_ptr, iovcnt, offset, flags): pwritev with RWF_* flags. RWF_APPEND appends even on a plain descriptor, RWF_NOAPPEND writes
+/// at the offset even on an O_APPEND one; offset -1 writes at the descriptor's position (or appends on O_APPEND) and advances it.
+pub fn pwritev2(fd: u32, iov_ptr: u64, iovcnt: u32, offset: i64, flags: u32) i64 {
+    const rwf = @import("rwf_policy.zig");
+    const mode: vfs_mod.FdTable.AppendMode = switch (rwf.writeMode(flags)) {
+        .err => |e| return e,
+        .ok => |m| switch (m) {
+            .descriptor => .descriptor,
+            .append => .append,
+            .no_append => .no_append,
+        },
+    };
+    switch (rwf.offsetKind(offset)) {
+        .invalid => return -22,
+        .explicit => return pwritevMode(fd, iov_ptr, iovcnt, @intCast(offset), mode),
+        .current => return writev(fd, iov_ptr, iovcnt),
+    }
+}
+
