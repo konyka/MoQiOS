@@ -175,6 +175,11 @@ void _start(void) {
     int64_t drop0 = -1, drop1 = -1, ev0 = -1, ev1 = -1, tw1 = -1, orph1 = -1, act1 = -1, cap1 = -1;
     int have_stats = read_tcpstats(raw0, sizeof raw0) == 0 && stat_field(raw0, "syn_dropped=", &drop0) && stat_field(raw0, "time_wait_evicted=", &ev0);
     check(have_stats, "/proc/tcpstats exists and lists syn_dropped and time_wait_evicted");
+    if (have_stats) {
+        print_num("hello269: SYNs dropped for lack of a slot since boot (every earlier test): ", drop0);
+        print_num("hello269: TIME_WAIT slots evicted since boot: ", ev0);
+        print("hello269: table before the rounds: "); print(raw0);
+    }
     static uint16_t ports_seen[100];
     int rounds_ok = 0, total = 0, socket_fail = 0, connect_fail = 0;
     int64_t t_start = now_ms();
