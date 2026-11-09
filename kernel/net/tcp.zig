@@ -769,10 +769,34 @@ var next_ephemeral_port: u16 = 49152;
 
 // ─── Utilities ────────────────────────────────────────────────────────────
 
+/// Free the TIME_WAIT TCB that has waited longest (tcp_port_policy.pickTimeWaitVictim) when the table has no free slot. Caller holds
+/// tcp_lock. Returns false when no TIME_WAIT slot qualifies.
+fn evictOldestTimeWait() bool {
+    var waiting: [MAX_CONNECTIONS]bool = @splat(false);
+    var age: [MAX_CONNECTIONS]u32 = @splat(0);
+    var bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
+    while (bm != 0) {
+        const i = @ctz(bm);
+        bm &= bm - 1;
+        if (tcbs[i].state == .time_wait and tcbs[i].ref_count == 0) {
+            waiting[i] = true;
+            age[i] = tcbs[i].retransmit_timer;
+        }
+    }
+    const victim = tcp_port_policy.pickTimeWaitVictim(&waiting, &age) orelse return false;
+    deactivateTcb(&tcbs[victim]);
+    return true;
+}
+
 fn allocTcb() ?*TcpTcb {
     // Use inverted bitmap to find first free slot (0 bit = free)
     const all_mask: u64 = if (MAX_CONNECTIONS >= 64) 0xFFFFFFFFFFFFFFFF else (@as(u64, 1) << MAX_CONNECTIONS) - 1;
-    const free_bitmap = ~@atomicLoad(u64, &tcb_active_bitmap, .acquire) & all_mask;
+    var free_bitmap = ~@atomicLoad(u64, &tcb_active_bitmap, .acquire) & all_mask;
+    if (free_bitmap == 0) {
+        // Table full: a finished connection's TIME_WAIT leftover (no descriptor references it) gives up its slot to the new one
+        // instead of making the caller wait out the 15 s timer. Live connections and listeners are never taken.
+        if (evictOldestTimeWait()) free_bitmap = ~@atomicLoad(u64, &tcb_active_bitmap, .acquire) & all_mask;
+    }
     if (free_bitmap == 0) return null;
     const i: u6 = @intCast(@ctz(free_bitmap));
     _ = @atomicRmw(u64, &tcb_active_bitmap, .Or, @as(u64, 1) << i, .release);

@@ -11843,3 +11843,11 @@ test "O_APPEND: pwrite and pwritev append at the end, splice and copy_file_range
     try std.testing.expect(std.mem.indexOf(u8, kt.splice_source, "if ((fd_table.fds[file_fd].status_flags & 0x400) != 0) return EINVAL;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.copy_file_range_source, "if ((cur.fd_table.fds[fd_out].status_flags & 0x400) != 0) return EBADF;") != null);
 }
+
+test "tcp: a full TCB table gives a new connection the oldest unreferenced TIME_WAIT slot, never a live one" {
+    const p = kt.tcp_port_policy;
+    try std.testing.expectEqual(@as(?usize, null), p.pickTimeWaitVictim(&[_]bool{ false, false }, &[_]u32{ 99, 5 }));
+    try std.testing.expectEqual(@as(?usize, 1), p.pickTimeWaitVictim(&[_]bool{ true, true, false }, &[_]u32{ 3, 900, 99999 }));
+    try std.testing.expectEqual(@as(?usize, 2), p.pickTimeWaitVictim(&[_]bool{ false, false, true }, &[_]u32{ 99, 99, 0 }));
+    try std.testing.expectEqual(@as(?usize, null), p.pickTimeWaitVictim(&[_]bool{}, &[_]u32{}));
+}

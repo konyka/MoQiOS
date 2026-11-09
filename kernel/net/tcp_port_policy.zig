@@ -79,3 +79,17 @@ pub fn pickListener(count: u32, src_ip: [4]u8, src_port: u16) u32 {
 pub fn connectNeedsEphemeral(local_port: u16, bound_explicitly: bool) bool {
     return local_port == 0 or !bound_explicitly;
 }
+
+/// When the TCB table is full, the slot to give to a new connection: the TIME_WAIT leftover that has waited longest. A TIME_WAIT
+/// connection has no owner and holds nothing but its 4-tuple; every other state is a live connection, a listener or one an fd still
+/// references and is never taken. `waiting[i]` is true for a TIME_WAIT slot no descriptor references, `age_ms[i]` its time in that
+/// state (larger = older). Returns the index to evict, or null when no slot qualifies.
+pub fn pickTimeWaitVictim(waiting: []const bool, age_ms: []const u32) ?usize {
+    var best: ?usize = null;
+    for (waiting, 0..) |w, i| {
+        if (!w) continue;
+        if (best == null or age_ms[i] > age_ms[best.?]) best = i;
+    }
+    return best;
+}
+

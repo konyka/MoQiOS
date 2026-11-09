@@ -7521,3 +7521,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：`vfs.zig` 的 `writeAtOffset` 对 `O_APPEND` 描述符把偏移换成文件当前末尾——ext2/FAT32 在 `append_lock` 之内取 `currentSize` 再暂存，tmpfs 走 `tmpfsAppend`（取末尾和写入在一次持锁里）；`file_io.pwrite` 和 `readv.pwritev` 像 `write`/`writev` 一样整次调用持有 `append_call_lock`；`splicePipeToFile` 对 `O_APPEND` 目的返回 `EINVAL`，`copyFileRange` 对 `O_APPEND` 目的返回 `EBADF`。
 - 绿灯：hello268 在三个文件系统上通过（含 6 轮四进程并发 `pwrite`/`pwritev`）；host 1124/1124，其中新增一条源码形状测试，并把 `O_APPEND` 的锁位置计数由 2 改为 4（`write` 与 `writeAtOffset` 各占 ext2/FAT32 两处）。
 - 局限（如实）：①`aio` 的写（`io_submit` 的 `PWRITE`）没有检查，没有 `O_APPEND` 用例；②`pwritev2` 的 `RWF_APPEND` 标志没有实现；③全局 `append_call_lock` 的争用仍没有测量；④`sendfile` 到 `O_APPEND` 的普通文件：本内核本来就拒绝（`EINVAL`），与 Linux 一致，但没有为它写用例。
+
+## TCB 表被已结束连接的 TIME_WAIT 占满：`socket()`/`connect` 失败（hello269，已修；这是 CI 上 hello183 G / hello184 D 偶发失败的根因）
+
+- 现象：`06354df`、`ab2f8fc` 的 CI 在 SMP=2 冒烟里，hello183 G 段（12 个连接只 accept 到 11 个）和紧随其后的 hello184 D（`accept4` 拿不到连接）失败；SMP=1 与 host 测试都过。本地完整 SMP=2 约每 3 到 4 次失败 1 次。
+- 先排除了我自己的改动：改动前的 `3c2dbec` 在本地同样 4 次里失败 2 次，所以这是**既有**缺陷，不是 UDP 端口共享、TCP 迁移或 O_APPEND 改动造成的。
+- 查因过程（如实）：先猜是 SYN 丢了要等 2 秒重传，把等待放宽到 3 秒，本地照样失败，猜测错误，放宽已撤回。加临时诊断后得到证据：失败时第 12 个客户端的 `socket()` 返回 `-1`（所以第 12 个 `connect` 得 `-88 ENOTSOCK`，只 accept 到 11 个）；再在 `tcpSocket` 里打印表占用（失败那一次）：64 个槽里 CLOSED 1 个、ESTABLISHED 22 个、**TIME_WAIT 33 个、LAST_ACK 6 个**、LISTEN 2 个，其中 39 个槽 `ref_count == 0`（没有任何描述符引用）——恰好等于 TIME_WAIT 加 LAST_ACK。也就是说表被前面几十个测试留下的、已经结束的连接占满了，`allocTcb` 找不到空槽就返回失败。我只抓到这一次表占用，没有统计其它失败次数里的构成；表在 hello183 时刻是否恰好满取决于前面测试的快慢，这和“偶发”相符。
+- 复现：hello269（新增）：一个本机监听者，100 轮 `connect`/`accept`/双向 `close`，每轮留下一个 15 秒的 TIME_WAIT。修复前每满 31 轮就有一轮卡约 78 秒，100 轮共 237 秒；`socket()` 与 `connect` 本身仍然返回成功。我的推测（没有验证）是服务端收到 SYN 时 `allocTcb` 失败而丢弃，客户端的 SYN 重传退避到 TIME_WAIT 到期才成功，约 78 秒与这个解释相符。修复后 100 轮共 2.6 秒，最慢一轮 38 毫秒。
+- 修改：`tcp_port_policy.pickTimeWaitVictim`（纯函数，host 测试）；`tcp.zig` 的 `allocTcb` 在表满时调用 `evictOldestTimeWait`：在 TIME_WAIT 且 `ref_count == 0` 的槽里选等得最久的释放给新连接。活跃连接、监听者、仍被描述符引用的 TCB 从不被拿走。
+- 风险与局限（如实）：①驱逐 TIME_WAIT 提前放弃了 2MSL 保护（Linux 在表满时也会提前回收 TIME_WAIT，但会保留序号检查），本内核的 TIME_WAIT 本来就缩短到 15 秒，迟到的重复段可能被新连接误收的窗口比以前大；②只处理 TIME_WAIT；LAST_ACK、FIN_WAIT 等状态的孤儿 TCB 仍然占槽，直到它们自己的定时器到期；③CI 上是否从此不再失败要看之后的 CI 结果，本地只是 4 份并行运行没有再看到；④`MAX_CONNECTIONS` 仍是 64，没有改。

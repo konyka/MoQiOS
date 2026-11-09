@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello268`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello269`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -264,6 +264,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello266 | 同时追加写入同一文件（`O_APPEND`，每个文件系统 2 项，共 6 项：tmpfs、FAT32 根目录、ext2 `testdir/`）：四个子进程各向文件追加 50 行 2 字节，一次 `write` 一行，20 轮，文件恰好是 400 字节、每行完整（宿主机 Linux 0 轮出错）；同样但每行两次 `write`（`x` 再 `\n`），也不丢字节（宿主机 0 轮出错） |
 | hello267 | `SO_REUSEPORT` 监听者关闭时迁移积压连接：两个 TCP 监听者共享一个端口，4 个客户端连接，关闭其中一个，另一个必须 `accept` 到全部 4 个 |
 | hello268 | `O_APPEND` 描述符上的 `pwrite`/`pwritev`：数据落在文件末尾（忽略传入的偏移，与宿主机 Linux 一致），返回字节数；四个进程在偏移 0 上并发 `pwrite`/`pwritev` 同一个追加文件，每条记录完整落在末尾；`copy_file_range` 目的是 `O_APPEND` 返回 `EBADF`，`splice` 到 `O_APPEND` 文件返回 `EINVAL`（三个文件系统各一遍） |
+| hello269 | 已结束的连接不会耗尽 TCB 表：一个本机监听者，100 轮 `connect`/`accept`/双向 `close`（每轮留下一个 15 秒的 TIME_WAIT），`socket()` 与 `connect` 始终成功，且没有任何一轮卡住几秒（表满时等 TIME_WAIT 到期） |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。
