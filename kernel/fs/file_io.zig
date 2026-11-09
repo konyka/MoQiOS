@@ -53,8 +53,8 @@ pub fn write(fd: u64, buf: u64, count: u64) i64 {
                 return cur.fd_table.write(fdIndex(fd), &mbuf, n);
             }
             const append_call = cur.fd_table.isAppendFile(fdIndex(fd));
-            if (append_call) vfs_mod.FdTable.lockAppendCall();
-            defer if (append_call) vfs_mod.FdTable.unlockAppendCall();
+            if (append_call) cur.fd_table.lockAppendCall(fdIndex(fd));
+            defer if (append_call) cur.fd_table.unlockAppendCall(fdIndex(fd));
             var pos: usize = 0;
             while (pos < n) {
                 const chunk = @min(n - pos, 4096);
@@ -263,8 +263,8 @@ pub fn pwrite(fd: u32, buf_ptr: u64, count: u64, offset: u64) i64 {
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
     const append_call = cur.fd_table.isAppendFile(fd);
-    if (append_call) vfs_mod.FdTable.lockAppendCall();
-    defer if (append_call) vfs_mod.FdTable.unlockAppendCall();
+    if (append_call) cur.fd_table.lockAppendCall(fd);
+    defer if (append_call) cur.fd_table.unlockAppendCall(fd);
     var pos: usize = 0;
     var current_offset = offset;
     while (pos < n) {

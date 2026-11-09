@@ -37,3 +37,15 @@ pub fn offsetKind(offset: i64) enum { current, explicit, invalid } {
     if (offset < 0) return .invalid;
     return .explicit;
 }
+
+/// RWF_DSYNC / RWF_SYNC: the written data must be on disk before the call returns (Linux runs the equivalent of fdatasync / fsync).
+pub fn wantsSync(flags: u32) bool {
+    return flags & (RWF_DSYNC | RWF_SYNC) != 0;
+}
+
+/// RWF_NOWAIT: fail with EAGAIN instead of blocking. Only stream descriptors (pipes, sockets) can block here; on a regular file this kernel
+/// answers EOPNOTSUPP like Linux's tmpfs (which has no non-blocking file I/O).
+pub fn wantsNowait(flags: u32) bool {
+    return flags & RWF_NOWAIT != 0;
+}
+

@@ -181,6 +181,60 @@ void _start(void) {
         print("hello269: table before the rounds: "); print(raw0);
     }
     static uint16_t ports_seen[100];
+    {
+        /* The client picks its own port (bind with SO_REUSEADDR) and reuses it every round, while the SERVER closes first, so each round leaves a
+         * server-side TIME_WAIT on the very 4-tuple the next round asks for. Linux accepts the new SYN (its sequence number is higher) and the
+         * connection works; no byte from an earlier round may reach a later one. */
+        uint8_t ca[16];
+        int same_ok = 0, leaked = 0;
+        int64_t ev_before = -1;
+        { char tr[400]; if (read_tcpstats(tr, sizeof tr) == 0) stat_field(tr, "time_wait_evicted=", &ev_before); }
+        int64_t slowest_same = 0;
+        for (int r = 0; r < 8; r++) {
+            int64_t rt0 = now_ms();
+            int64_t c = sock4();
+            reuse(c);
+            mk_addr(ca, 18421);
+            int64_t b = syscall3(SYS_BIND, (uint64_t)c, (uint64_t)ca, 16);
+            int64_t rc = syscall3(SYS_CONNECT, (uint64_t)c, (uint64_t)ia, 16);
+            int64_t ac = -1;
+            for (int i = 0; i < 200 && ac < 0; i++) { syscall1(SYS_NETPOLL, 0); ac = syscall4(SYS_ACCEPT4, (uint64_t)srv, 0, 0, 0x800); if (ac < 0) sleep_ms(5); }
+            char msg[2] = { 'A' + r, 0 };
+            char got[8] = { 0 };
+            int64_t n = -1;
+            if (ac >= 0) {
+                syscall3(SYS_WRITE, (uint64_t)ac, (uint64_t)msg, 1);
+                for (int i = 0; i < 200 && n <= 0; i++) { syscall1(SYS_NETPOLL, 0); n = syscall6(SYS_RECVFROM, (uint64_t)c, (uint64_t)got, sizeof got, 0x40, 0, 0); if (n <= 0) sleep_ms(5); }
+                syscall1(SYS_CLOSE, (uint64_t)ac);
+            }
+            if (now_ms() - rt0 > slowest_same) slowest_same = now_ms() - rt0;
+            pump(30);
+            syscall1(SYS_CLOSE, (uint64_t)c);
+            pump(30);
+            if (b == 0 && (rc == 0 || rc == -115) && ac >= 0 && n == 1 && got[0] == msg[0]) same_ok++;
+            if (n > 1 || (n == 1 && got[0] != msg[0])) leaked++;
+        }
+        {
+            char tr[400];
+            int64_t evs = -1;
+            if (read_tcpstats(tr, sizeof tr) == 0 && stat_field(tr, "time_wait_evicted=", &evs)) {
+                print_num("hello269: TIME_WAIT slots evicted during the same-port rounds: ", evs - ev_before);
+                check(evs == ev_before, "the same-port rounds ran with room in the table, so the server's TIME_WAIT was reused, not evicted");
+            }
+        }
+        {
+            /* Which side held the TIME_WAIT: the accepted (server) end closed first, so the TIME_WAIT is on the listener's port, and the
+             * next SYN on the same 4-tuple must have been taken by the reuse path (no new slot was needed for it). */
+            char tr[400];
+            int64_t tw = -1;
+            if (read_tcpstats(tr, sizeof tr) == 0 && stat_field(tr, "time_wait=", &tw)) print_num("hello269: TIME_WAIT slots after the same-port rounds: ", tw);
+        }
+        print_num("hello269: rounds that reconnected on the same client port after a server-side TIME_WAIT: ", same_ok);
+        check(same_ok == 8, "a client that binds the same port every round reconnects each time after the server closed first");
+        print_num("hello269: slowest same-port reconnect ms: ", slowest_same);
+        check(slowest_same < 1500, "and the reconnect is accepted at once, not after the server's TIME_WAIT expires (Linux reuses a TIME_WAIT for a newer SYN)");
+        check(leaked == 0, "no byte of an earlier round reaches a later connection on the same 4-tuple");
+    }
     int rounds_ok = 0, total = 0, socket_fail = 0, connect_fail = 0;
     int64_t t_start = now_ms();
     int64_t worst_ms = 0;

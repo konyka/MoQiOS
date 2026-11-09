@@ -55,6 +55,24 @@ static void check(int ok, const char *what) {
 #define RECS 20
 #define REC 8
 
+/* Dirty: line of /proc/meminfo in kB (writeback buffers not yet on disk), -1 when absent. */
+static long dirty_kb(void) {
+    static char mb[512];
+    int fd = (int)open("/proc/meminfo", O_RDONLY, 0);
+    if (fd < 0) return -1;
+    long n = read(fd, mb, sizeof mb - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    mb[n] = 0;
+    char *p = strstr(mb, "Dirty:");
+    if (!p) return -1;
+    p += 6;
+    while (*p == ' ') p++;
+    long v = 0;
+    while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+    return v;
+}
+
 static int concurrent(const char *path, int use_vec) {
     unlink(path);
     int cfd = (int)open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -194,6 +212,31 @@ static void one_fs(const char *label, const char *path) {
         snprintf(what, sizeof what, "%s: preadv2 offset -1 reads from the current position (got %ld)", label, r2);
         check(r2 == 11, what);
     }
+    if (strcmp(label, "tmpfs") != 0) {
+        /* RWF_DSYNC / RWF_SYNC: the written data is on disk when the call returns, so nothing of it is left in the writeback buffers. A plain
+         * pwritev2 leaves it staged (Dirty: grows). init runs one test at a time, so the global count only moves with this program. */
+        int sf = (int)open(path, O_WRONLY, 0644);
+        fsync(sf);
+        static char page[4096];
+        memset(page, 'd', sizeof page);
+        struct { void *base; unsigned long len; } dv[1] = { { page, sizeof page } };
+        long d0 = dirty_kb();
+        long wp = syscall6(SYS_PWRITEV2_, sf, (long)dv, 1, 8192, 0, 0);
+        long d1 = dirty_kb();
+        fsync(sf);
+        long d2 = dirty_kb();
+        long ws = syscall6(SYS_PWRITEV2_, sf, (long)dv, 1, 16384, 0, 0x02 /* RWF_DSYNC */);
+        long d3 = dirty_kb();
+        long wy = syscall6(SYS_PWRITEV2_, sf, (long)dv, 1, 24576, 0, 0x04 /* RWF_SYNC */);
+        long d4 = dirty_kb();
+        close(sf);
+        snprintf(what, sizeof what, "%s: /proc/meminfo has a Dirty: line, and a plain pwritev2 leaves the page staged (Dirty %ld -> %ld kB)", label, d0, d1);
+        check(d0 >= 0 && wp == 4096 && d1 > d0, what);
+        snprintf(what, sizeof what, "%s: pwritev2(RWF_DSYNC) returns with nothing staged (Dirty %ld -> %ld kB)", label, d2, d3);
+        check(d2 >= 0 && ws == 4096 && d3 == d2, what);
+        snprintf(what, sizeof what, "%s: pwritev2(RWF_SYNC) too (Dirty -> %ld kB)", label, d4);
+        check(d2 >= 0 && wy == 4096 && d4 == d2, what);
+    }
     int ok = 1;
     for (int round = 0; round < 6; round++) {
         if (!concurrent(path, 0)) ok = 0;
@@ -204,12 +247,67 @@ static void one_fs(const char *label, const char *path) {
     unlink(path);
 }
 
+/* RWF_NOWAIT and offset -1 on a pipe and an AF_UNIX socket (Linux, measured): an empty one gives EAGAIN instead of blocking, one with data returns
+ * it; a full pipe write gives EAGAIN; an explicit offset on either is ESPIPE. On a regular file this kernel answers EOPNOTSUPP like Linux's tmpfs. */
+static void nowait_streams(void) {
+    char what[160];
+    int pp[2];
+    pipe2(pp, 0);
+    char rb[8];
+    struct { void *base; unsigned long len; } rv[1] = { { rb, sizeof rb } };
+    long e1 = syscall6(SYS_PREADV2_, pp[0], (long)rv, 1, -1, 0, 0x08);
+    snprintf(what, sizeof what, "pipe: preadv2(RWF_NOWAIT) on an empty pipe is EAGAIN, it does not block (got %ld)", e1);
+    check(e1 == -11, what);
+    write(pp[1], "abc", 3);
+    long g1 = syscall6(SYS_PREADV2_, pp[0], (long)rv, 1, -1, 0, 0x08);
+    snprintf(what, sizeof what, "pipe: with data it reads it (got %ld)", g1);
+    check(g1 == 3 && memcmp(rb, "abc", 3) == 0, what);
+    long sp = syscall6(SYS_PREADV2_, pp[0], (long)rv, 1, 0, 0, 0);
+    snprintf(what, sizeof what, "pipe: an explicit offset is ESPIPE (got %ld)", sp);
+    check(sp == -29, what);
+    int fl = (int)fcntl(pp[1], F_GETFL, 0);
+    fcntl(pp[1], F_SETFL, fl | O_NONBLOCK);
+    static char fill[4096];
+    memset(fill, 'f', sizeof fill);
+    for (int i = 0; i < 64; i++) if (write(pp[1], fill, sizeof fill) <= 0) break;
+    fcntl(pp[1], F_SETFL, fl);
+    struct { void *base; unsigned long len; } wv[1] = { { (void *)"y", 1 } };
+    long e2 = syscall6(SYS_PWRITEV2_, pp[1], (long)wv, 1, -1, 0, 0x08);
+    snprintf(what, sizeof what, "pipe: pwritev2(RWF_NOWAIT) to a full pipe is EAGAIN (got %ld)", e2);
+    check(e2 == -11, what);
+    int still = (int)fcntl(pp[1], F_GETFL, 0);
+    check((still & O_NONBLOCK) == 0, "pipe: RWF_NOWAIT does not leave O_NONBLOCK set on the descriptor");
+    close(pp[0]);
+    close(pp[1]);
+    int sv[2];
+    syscall4(53 /* socketpair */, 1, 1, 0, (long)sv);
+    long e3 = syscall6(SYS_PREADV2_, sv[0], (long)rv, 1, -1, 0, 0x08);
+    snprintf(what, sizeof what, "AF_UNIX: preadv2(RWF_NOWAIT) on an empty socket is EAGAIN (got %ld)", e3);
+    check(e3 == -11, what);
+    write(sv[1], "hi", 2);
+    long g3 = syscall6(SYS_PREADV2_, sv[0], (long)rv, 1, -1, 0, 0x08);
+    snprintf(what, sizeof what, "AF_UNIX: with data it reads it (got %ld)", g3);
+    check(g3 == 2 && memcmp(rb, "hi", 2) == 0, what);
+    long sp2 = syscall6(SYS_PREADV2_, sv[0], (long)rv, 1, 0, 0, 0);
+    snprintf(what, sizeof what, "AF_UNIX: an explicit offset is ESPIPE (got %ld)", sp2);
+    check(sp2 == -29, what);
+    close(sv[0]);
+    close(sv[1]);
+    int rf = (int)open("/tmp/h268nw", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    long e4 = syscall6(SYS_PWRITEV2_, rf, (long)wv, 1, 0, 0, 0x08);
+    snprintf(what, sizeof what, "tmpfs file: pwritev2(RWF_NOWAIT) is EOPNOTSUPP as on Linux's tmpfs (got %ld)", e4);
+    check(e4 == -95, what);
+    close(rf);
+    unlink("/tmp/h268nw");
+}
+
 int main(int argc, char **argv, char **envp) {
     (void)argc; (void)argv; (void)envp;
     print("hello268: pwrite/pwritev on O_APPEND files\n");
     one_fs("tmpfs", "/tmp/h268");
     one_fs("FAT32", "h268f");
     one_fs("ext2", "testdir/h268e");
+    nowait_streams();
     print(failures == 0 ? "hello268: PASS\n" : "hello268: FAIL\n");
     return failures;
 }

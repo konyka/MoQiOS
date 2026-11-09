@@ -63,8 +63,8 @@ pub fn writev(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
     const append_call = cur.fd_table.isAppendFile(fd);
-    if (append_call) vfs_mod.FdTable.lockAppendCall();
-    defer if (append_call) vfs_mod.FdTable.unlockAppendCall();
+    if (append_call) cur.fd_table.lockAppendCall(fd);
+    defer if (append_call) cur.fd_table.unlockAppendCall(fd);
     var total: usize = 0;
     for (0..iovcnt) |i| {
         var iov_buf: [16]u8 = undefined;
@@ -166,8 +166,8 @@ fn pwritevMode(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64, mode: vfs_mod.FdT
         .append => cur.fd_table.isRegularWritableFile(fd),
         .no_append => false,
     };
-    if (append_call) vfs_mod.FdTable.lockAppendCall();
-    defer if (append_call) vfs_mod.FdTable.unlockAppendCall();
+    if (append_call) cur.fd_table.lockAppendCall(fd);
+    defer if (append_call) cur.fd_table.unlockAppendCall(fd);
     var current_offset = pos_l;
     var total: usize = 0;
     for (0..iovcnt) |i| {
@@ -208,12 +208,51 @@ fn pwritevMode(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64, mode: vfs_mod.FdT
 pub fn preadv2(fd: u32, iov_ptr: u64, iovcnt: u32, offset: i64, flags: u32) i64 {
     const rwf = @import("rwf_policy.zig");
     if (rwf.readFlagsValid(flags)) |e| return e;
+    const nowait = NowaitGuard.begin(fd, rwf.wantsNowait(flags)) catch |e| return errnoOf(e);
+    defer nowait.end();
     switch (rwf.offsetKind(offset)) {
         .invalid => return -22,
         .explicit => return preadv(fd, iov_ptr, iovcnt, @intCast(offset)),
         .current => return readv(fd, iov_ptr, iovcnt),
     }
 }
+
+const NowaitError = error{ BadFd, NotSupported };
+
+fn errnoOf(e: NowaitError) i64 {
+    return switch (e) {
+        error.BadFd => EBADF,
+        error.NotSupported => -95, // EOPNOTSUPP
+    };
+}
+
+/// RWF_NOWAIT for one call: the descriptor behaves as O_NONBLOCK while the call runs and gets its own flags back afterwards. Only pipes and
+/// sockets can block; a regular file is EOPNOTSUPP (Linux's tmpfs answers the same, it has no non-blocking file I/O).
+const NowaitGuard = struct {
+    desc: ?*vfs_mod.FileDescriptor = null,
+    saved: u32 = 0,
+
+    fn begin(fd: u32, wanted: bool) NowaitError!NowaitGuard {
+        if (!wanted) return .{};
+        const cur_idx = sched_mod.currentTaskIndex() orelse return error.BadFd;
+        const cur = task_mod.getTask(cur_idx) orelse return error.BadFd;
+        if (fd >= cur.fd_table.fds.len or cur.fd_table.fds[fd].fd_type == .none) return error.BadFd;
+        const d = &cur.fd_table.fds[fd];
+        switch (d.fd_type) {
+            .pipe_read, .pipe_write, .unix_socket, .tcp_socket, .udp_socket => {},
+            else => return error.NotSupported,
+        }
+        const saved = d.status_flags;
+        if (saved & 0x800 != 0) return .{};
+        d.status_flags = saved | 0x800;
+        return .{ .desc = d, .saved = saved };
+    }
+
+    fn end(self: NowaitGuard) void {
+        const d = self.desc orelse return;
+        d.status_flags = (d.status_flags & ~@as(u32, 0x800)) | (self.saved & 0x800);
+    }
+};
 
 /// pwritev2(fd, iov_ptr, iovcnt, offset, flags): pwritev with RWF_* flags. RWF_APPEND appends even on a plain descriptor, RWF_NOAPPEND writes
 /// at the offset even on an O_APPEND one; offset -1 writes at the descriptor's position (or appends on O_APPEND) and advances it.
@@ -227,10 +266,35 @@ pub fn pwritev2(fd: u32, iov_ptr: u64, iovcnt: u32, offset: i64, flags: u32) i64
             .no_append => .no_append,
         },
     };
-    switch (rwf.offsetKind(offset)) {
+    const nowait = NowaitGuard.begin(fd, rwf.wantsNowait(flags)) catch |e| return errnoOf(e);
+    defer nowait.end();
+    const written = switch (rwf.offsetKind(offset)) {
         .invalid => return -22,
-        .explicit => return pwritevMode(fd, iov_ptr, iovcnt, @intCast(offset), mode),
-        .current => return writev(fd, iov_ptr, iovcnt),
+        .explicit => pwritevMode(fd, iov_ptr, iovcnt, @intCast(offset), mode),
+        .current => writev(fd, iov_ptr, iovcnt),
+    };
+    if (written > 0 and rwf.wantsSync(flags)) {
+        if (!syncDescriptor(fd)) return -5; // EIO: the data was written but could not be made durable
     }
+    return written;
+}
+
+/// Flush a file descriptor's staged data to disk (RWF_DSYNC / RWF_SYNC). Non-file descriptors and tmpfs have nothing to flush.
+fn syncDescriptor(fd: u32) bool {
+    const cur_idx = sched_mod.currentTaskIndex() orelse return false;
+    const cur = task_mod.getTask(cur_idx) orelse return false;
+    if (fd >= cur.fd_table.fds.len) return false;
+    const desc = &cur.fd_table.fds[fd];
+    const wb_type: @import("writeback.zig").FsType = switch (desc.fd_type) {
+        .ext2_file => .ext2,
+        .fat32_file => .fat32,
+        else => return true,
+    };
+    if (!vfs_mod.syncFile(desc.inode_id, wb_type)) return false;
+    // Like fsync: also drain the volatile write cache of the disk FAT32 and ext2 live on (virtio-blk 0).
+    const block_dev = @import("../drivers/block_dev.zig");
+    const dev = block_dev.findByDriver(.virtio_blk, 0) orelse return true;
+    if (!block_dev.supportsFlush(dev)) return true;
+    return block_dev.flush(dev) == 0;
 }
 

@@ -7520,7 +7520,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello268 在改动之前的内核上，三个文件系统各有 3 项失败（`pwrite`/`pwritev` 把数据覆盖在偏移 0 上，文件仍是 8 字节；四个进程并发写，记录互相覆盖），共 9 项；`copy_file_range` 和 `splice` 的两项是后加的，在改动前也失败（返回成功的字节数）。
 - 实现：`vfs.zig` 的 `writeAtOffset` 对 `O_APPEND` 描述符把偏移换成文件当前末尾——ext2/FAT32 在 `append_lock` 之内取 `currentSize` 再暂存，tmpfs 走 `tmpfsAppend`（取末尾和写入在一次持锁里）；`file_io.pwrite` 和 `readv.pwritev` 像 `write`/`writev` 一样整次调用持有 `append_call_lock`；`splicePipeToFile` 对 `O_APPEND` 目的返回 `EINVAL`，`copyFileRange` 对 `O_APPEND` 目的返回 `EBADF`。
 - 绿灯：hello268 在三个文件系统上通过（含 6 轮四进程并发 `pwrite`/`pwritev`）；host 1124/1124，其中新增一条源码形状测试，并把 `O_APPEND` 的锁位置计数由 2 改为 4（`write` 与 `writeAtOffset` 各占 ext2/FAT32 两处）。
-- 局限（如实）：①~~`aio` 的 `PWRITE`~~、~~`sendfile` 到 `O_APPEND`~~ 已在下一节补了用例；②~~`pwritev2`/`preadv2` 没有实现~~（已在文末一节实现）；③全局 `append_call_lock` 的争用仍没有测量。
+- 局限（如实）：①~~`aio` 的 `PWRITE`~~、~~`sendfile` 到 `O_APPEND`~~ 已在下一节补了用例；②~~`pwritev2`/`preadv2` 没有实现~~（已在文末一节实现）；③~~全局 `append_call_lock` 的争用~~（已测量并改为按文件分片，见下一节）。
 
 ## TCB 表被已结束连接的 TIME_WAIT 占满：`socket()`/`connect` 失败（hello269，已修；这是 CI 上 hello183 G / hello184 D 偶发失败的根因）
 
@@ -7546,5 +7546,16 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello268 每个文件系统新增 6 项，三个文件系统共 18 项，改动前全部是 `-38 ENOSYS`。
 - 实现：系统调用号按本内核自有编号取下一个空位：498 `preadv2`、499 `pwritev2`（参数布局同 Linux：`fd, iov, iovcnt, pos_l, pos_h, flags`，`pos_l` 是完整的 64 位偏移，`flags` 在第 6 个参数）。纯模块 `fs/rwf_policy.zig` 解码标志和偏移（host 测试）；`vfs.writeAtOffset` 拆出 `writeAtOffsetMode(…, .descriptor / .append / .no_append)`，原有的 `pwrite`/`pwritev`/`splice` 仍走 `.descriptor`（行为不变），`pwritev2` 按标志选模式；偏移 `-1` 转给 `readv`/`writev`。`RWF_APPEND` 在普通文件上也持有 `append_call_lock`。moqi_libc 的 `moqi_syscalls.h` 加了 `SYS_preadv2`/`SYS_pwritev2`。
 - 绿灯：hello268 三个文件系统的 18 项全部通过；host 1129/1129（含 `rwf_policy` 与接线测试；一条旧的源码形状测试随 `pwritev` 的追加锁写法更新）。
-- 局限（如实）：①`RWF_HIPRI`/`RWF_DSYNC`/`RWF_SYNC`/`RWF_NOWAIT` 只是被接受，没有语义（`DSYNC`/`SYNC` 不会在写后刷盘，`NOWAIT` 不会在要阻塞时返回 `EAGAIN`）；②没有 libc 包装函数，只有编号常量；③偏移 `-1` 走 `readv`/`writev`，所以管道、套接字也能用，与 Linux 一致，但没有为它们写用例。
+- 局限（如实）：①~~`RWF_DSYNC`/`RWF_SYNC`/`RWF_NOWAIT` 没有语义~~、~~没有 libc 包装函数~~、~~偏移 `-1` 在管道/套接字上没有用例~~（均见下一节）；②`RWF_HIPRI` 只是被接受（本内核没有轮询 I/O）。
+
+## 开放项收口：`RWF_DSYNC`/`RWF_SYNC`/`RWF_NOWAIT`、libc `preadv2`/`pwritev2`、`O_APPEND` 锁按文件分片、服务端 TIME_WAIT 上的重连
+
+- **`RWF_DSYNC` / `RWF_SYNC`（已实现）**：先给 `/proc/meminfo` 加了 Linux 的 `Dirty:` 行（回写缓冲里还没落盘的数据，按页计，kB），作为可观察量。hello268 在 FAT32/ext2 上：普通 `pwritev2` 之后 `Dirty` 由 0 变 4 kB；红灯时带 `RWF_DSYNC`/`RWF_SYNC` 的写仍留下 4/8 kB；修改后 `pwritev2` 在写成功后对该文件做与 `fsync` 相同的刷盘（`vfs.syncFile` + 刷 virtio-blk 0 的写缓存），`Dirty` 保持 0，三项通过。（这一项的测试第一版在 `Dirty:` 行不存在时读到 -1 而“通过”，我改成要求读数有效后才真正红。）
+- **`RWF_NOWAIT`（已实现）**：本机 Linux 实测：空管道读、满管道写、空 AF_UNIX 读都是 `EAGAIN`，有数据时照常返回；管道/套接字上给显式偏移是 `ESPIPE`；tmpfs 普通文件上 `RWF_NOWAIT` 是 `EOPNOTSUPP`（btrfs 上是另一种行为，本内核按 tmpfs 的做）。红灯：hello268 的流描述符一段在改动前**卡住不返回**（日志停在第 51 项）。实现：`readv.zig` 的 `NowaitGuard` 在这一次调用期间把描述符当作 `O_NONBLOCK`，调用结束恢复原来的标志（有用例检查调用后 `O_NONBLOCK` 没有残留）；普通文件返回 `EOPNOTSUPP`。9 项通过。
+- **偏移 `-1` 在管道和 AF_UNIX 上（已补用例）**：同上一段，读写与 `ESPIPE` 都有用例。
+- **libc `preadv2`/`pwritev2`（已实现）**：`unistd.h` 声明两个函数、`struct iovec` 和 `RWF_*` 常量，`fdops.c` 按 glibc 的 x86-64 布局（`pos_l` 为完整偏移、`pos_h` 为 0、标志在第 6 个参数）发系统调用。宿主机测试 `test_fdops_abi` 红灯是链接失败（没有这两个符号），之后通过。`user/hello66.c` 自己的 `struct iovec` 与头文件重复，删去（布局与字段名相同）。
+- **`O_APPEND` 锁的争用（已测量并修复）**：新增 hello270：四个进程各向**自己的**文件写 200 次 4 KiB，普通写与 `O_APPEND` 写各一遍。改动前 SMP=4 上 `O_APPEND` 慢得多：tmpfs 156 → 4636 ms、FAT32 2374 → 36263 ms、ext2 593 → 34632 ms（不同文件之间也互相等，因为两把锁都是全局的）。修改：`append_lock`/`append_call_lock` 改为 16 个分片（`fs/append_lock_policy.zig` 的 `stripeOf`，host 测试），按文件取键：ext2 用 inode 号，tmpfs 用条目号，FAT32 用打开文件槽（**不能用 `inode_id`**：新建的空文件首簇都是 0，四个新文件的 `inode_id` 相同，第一次改完 FAT32 仍慢 11 倍就是这个原因）。改后 tmpfs 164/160 ms、FAT32 2521/2549 ms、ext2 681/630 ms；hello266/hello268 的原子性用例仍通过。hello270 断言 `O_APPEND` 不超过普通写的 3 倍加 300 毫秒；变异（所有文件都映射到同一分片）后 FAT32、ext2 两行失败，**tmpfs 一行仍通过**——tmpfs 的写从不睡眠，外层锁几乎不被持有，所以 tmpfs 那一行只是测量，不是守卫（已在程序注释里写明）。
+- **服务端 TIME_WAIT 上的同端口重连（真缺陷，已修）**：本机 Linux 实测：客户端每轮 `bind` 同一个端口、服务端先关，下一轮的 `connect` 立即成功（Linux 的 TIME_WAIT 接受序号更新的 SYN）。hello269 新增这一段：8 轮都连上了，但**最慢一轮要 78.7 秒**——临时诊断显示：新 SYN 按 4 元组找到了服务端那个 TIME_WAIT 的 TCB，进入状态机的 `.time_wait` 分支被直接忽略（28 次），客户端靠 SYN 重传等到 TIME_WAIT 15 秒到期后才连上（8 次“找不到 TCB”）。`handleIncomingSyn` 里早就有一段 T17“TIME_WAIT 复用”代码，但它**从来到不了**（SYN 先被状态机截走）；而且即使到了，它也没有把复用的 TCB 放进监听队列，`accept` 永远拿不到。修改：`handlePacket` 对“命中 TIME_WAIT、只带 SYN、序号比旧连接新”的段跳过 TCB，交给监听者；T17 复用路径检查监听队列容量、把 TCB 的所有者改成监听者的、并把它排进监听队列。修复后最慢一轮 56 毫秒，8 轮没有一个字节串到下一轮。（hello269 前一版只看“8 轮都连上”，旧内核上也通过；加了“不超过 1.5 秒”之后才红。我起初还用“关掉 T17 代码”做变异来证明这一段有守卫，结果仍然通过——当时这段代码根本没被执行，变异无效。）
+- host 1133/1133；三个架构构建；完整 smoke（SMP=1 一次、SMP=2 三次）全部通过。
+- 仍开放（如实）：①UDP 共享端口上“已 `connect` 的套接字优先收它对端的数据报”还没做（下一节）；②`SO_REUSEPORT` 迁移进的是第一个有空位的兄弟而不是按哈希；③`MAX_CONNECTIONS` 仍是 64；④`SO_REUSEPORT` 的 BPF 选择器不做（本内核没有 BPF）；⑤`RWF_HIPRI` 只是被接受。
 

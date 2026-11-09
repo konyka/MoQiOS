@@ -11562,8 +11562,8 @@ test "O_APPEND writes to ext2 and FAT32 find the end and stage the data under on
     // hello266: with a tmpfs-only fix, four appenders on ext2 or FAT32 still lost lines (10 and 4 of 20 rounds); Linux loses none.
     const v = kt.vfs_source;
     // Four sites: write() and writeAtOffset() (pwrite/pwritev), for each of ext2 and FAT32.
-    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, v, "if (appending) append_lock.lock();\n                defer if (appending) append_lock.unlock();"));
-    try std.testing.expect(std.mem.indexOf(u8, v, "var append_lock: @import(\"../sync/task_sleep_lock.zig\").SleepLock = .{};") != null);
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, v, "if (appending) appendLockOf(desc).lock();\n                defer if (appending) appendLockOf(desc).unlock();"));
+    try std.testing.expect(std.mem.indexOf(u8, v, "var append_locks: [@import(\"append_lock_policy.zig\").STRIPES]@import(\"../sync/task_sleep_lock.zig\").SleepLock = @splat(.{});") != null);
     // ext2 takes the end from currentSize (disk size or the end still staged by another appender), not from this descriptor's cached size.
     try std.testing.expect(std.mem.indexOf(u8, v, "desc.file_size = @import(\"ext2.zig\").currentSize(desc.ext2_file_idx);\n                    desc.offset = desc.file_size;") != null);
 }
@@ -11669,15 +11669,15 @@ test "write() and writev() on an O_APPEND file hold one lock across all their pi
     try std.testing.expect(std.mem.indexOf(u8, v, "return d.fd_type == .tmpfs_file or d.fd_type == .fat32_file or d.fd_type == .ext2_file;") != null);
     // write(): the lock covers the 4 KiB piece loop; writev(): it covers every iovec.
     const w = kt.file_io_source;
-    const wl = std.mem.indexOf(u8, w, "if (append_call) vfs_mod.FdTable.lockAppendCall();") orelse return error.TestUnexpectedResult;
+    const wl = std.mem.indexOf(u8, w, "if (append_call) cur.fd_table.lockAppendCall(fdIndex(fd));") orelse return error.TestUnexpectedResult;
     const wp = std.mem.indexOf(u8, w, "const result = cur.fd_table.write(fdIndex(fd), &kbuf, copied);") orelse return error.TestUnexpectedResult;
     try std.testing.expect(wl < wp);
     const r = kt.readv_source;
     const rs = std.mem.indexOf(u8, r, "pub fn writev(") orelse return error.TestUnexpectedResult;
-    const rl = std.mem.indexOf(u8, r[rs..], "lockAppendCall()") orelse return error.TestUnexpectedResult;
+    const rl = std.mem.indexOf(u8, r[rs..], "cur.fd_table.lockAppendCall(fd)") orelse return error.TestUnexpectedResult;
     const rp = std.mem.indexOf(u8, r[rs..], "cur.fd_table.write(fd, &kbuf, from_user)") orelse return error.TestUnexpectedResult;
     try std.testing.expect(rl < rp);
-    // Order: the call lock is the outer one, taken before the per-piece append_lock.
+    // Order: the call lock is the outer one, taken before the same file's per-piece append lock stripe.
     try std.testing.expect(std.mem.indexOf(u8, v, "Outer lock of an O_APPEND write()/writev() as a whole") != null);
 }
 
@@ -11840,7 +11840,7 @@ test "O_APPEND: pwrite and pwritev append at the end, splice and copy_file_range
     // The syscall layer holds the per-call append lock across pwrite and pwritev like write and writev.
     try std.testing.expect(std.mem.indexOf(u8, kt.file_io_source, "const append_call = cur.fd_table.isAppendFile(fd);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.readv_source, ".descriptor => cur.fd_table.isAppendFile(fd),") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.readv_source, "    if (append_call) vfs_mod.FdTable.lockAppendCall();\n    defer if (append_call) vfs_mod.FdTable.unlockAppendCall();\n    var current_offset = pos_l;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.readv_source, "    if (append_call) cur.fd_table.lockAppendCall(fd);\n    defer if (append_call) cur.fd_table.unlockAppendCall(fd);\n    var current_offset = pos_l;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.splice_source, "if ((fd_table.fds[file_fd].status_flags & 0x400) != 0) return EINVAL;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.copy_file_range_source, "if ((cur.fd_table.fds[fd_out].status_flags & 0x400) != 0) return EBADF;") != null);
 }
@@ -11910,4 +11910,62 @@ test "preadv2/pwritev2 (498/499): dispatched with Linux's argument layout and th
     const vs = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, vs, "return self.writeAtOffsetMode(fd, buf, count, offset, .descriptor);") != null);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, vs[std.mem.indexOf(u8, vs, "pub fn writeAtOffsetMode(").?..std.mem.indexOf(u8, vs, "/// v53.47: Check if another fd in this table shares").?], "(desc.status_flags & 0x400) != 0;\n                if (appending)"));
+}
+
+test "pwritev2 RWF_DSYNC / RWF_SYNC flush the file and the disk cache before returning; /proc/meminfo reports Dirty" {
+    const r = kt.rwf_policy;
+    try std.testing.expect(r.wantsSync(r.RWF_DSYNC));
+    try std.testing.expect(r.wantsSync(r.RWF_SYNC | r.RWF_APPEND));
+    try std.testing.expect(!r.wantsSync(r.RWF_HIPRI | r.RWF_NOWAIT | r.RWF_APPEND));
+    const rs = kt.readv_source;
+    try std.testing.expect(std.mem.indexOf(u8, rs, "if (written > 0 and rwf.wantsSync(flags)) {\n        if (!syncDescriptor(fd)) return -5;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "if (!vfs_mod.syncFile(desc.inode_id, wb_type)) return false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "return block_dev.flush(dev) == 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, "\" kB\\nDirty:          \"") != null);
+}
+
+test "O_APPEND lock stripes: one file always maps to one stripe, different files spread over all of them" {
+    const p = kt.append_lock_policy;
+    try std.testing.expectEqual(p.stripeOf(0x3000_0000_0000_0000 + 12), p.stripeOf(0x3000_0000_0000_0000 + 12));
+    var hit = [_]u32{0} ** p.STRIPES;
+    // Consecutive ext2 inode numbers, consecutive FAT32 clusters and consecutive tmpfs slots each spread over every stripe.
+    for ([_]u64{ 0x3000_0000_0000_0000, 0x2000_0000_0000_0000, 0x1000_0000_0000_0000 }) |tag| {
+        @memset(&hit, 0);
+        var i: u64 = 0;
+        while (i < 256) : (i += 1) hit[p.stripeOf(tag + i)] += 1;
+        for (hit) |h| {
+            try std.testing.expect(h > 0);
+            try std.testing.expect(h < 40); // no stripe gets more than ~2.5x its share of 16
+        }
+    }
+    // Four files from the probes (four consecutive ext2 inodes) do not all fall on one stripe.
+    const a = p.stripeOf(0x3000_0000_0000_0000 + 20);
+    var same: u32 = 0;
+    for ([_]u64{ 21, 22, 23 }) |n| {
+        if (p.stripeOf(0x3000_0000_0000_0000 + n) == a) same += 1;
+    }
+    try std.testing.expect(same < 3);
+}
+
+test "O_APPEND locks are keyed per file: FAT32 by its open-file slot, tmpfs by its slot, ext2 by inode" {
+    const v = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, v, ".fat32_file => 0x2000_0000_0000_0000 + @as(u64, desc.fat32_file_idx),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, ".tmpfs_file => 0x1000_0000_0000_0000 + @as(u64, desc.tmpfs_idx),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "return &append_locks[@import(\"append_lock_policy.zig\").stripeOf(appendKey(desc))];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "append_call_locks[@import(\"append_lock_policy.zig\").stripeOf(appendKey(&self.fds[fd]))].lock();") != null);
+    // No global append lock is left.
+    try std.testing.expect(std.mem.indexOf(u8, v, "append_lock.lock()") == null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "append_call_lock.lock()") == null);
+}
+
+
+test "tcp: a newer SYN for a 4-tuple in TIME_WAIT goes to the listener, which reuses the slot and queues it for accept" {
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const tw_reopen = if (found) |t| t.state == .time_wait and flags & SYN != 0 and flags & ACK == 0 and tcp_util.seqGt(seq_num, t.irs) else false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const tcb = (if (tw_reopen) null else found) orelse {") != null);
+    // The reused slot joins the backlog (accept would never see it otherwise) and belongs to the listener's owner.
+    const tw = std.mem.indexOf(u8, ts, "tcpLog(\"[tcp] TIME_WAIT reuse → SYN-ACK\\n\");") orelse return error.TestUnexpectedResult;
+    const q = std.mem.indexOfPos(u8, ts, tw, "ls.pending_tpbs[ls.pending_tail % LISTEN_BACKLOG] = @intCast(i);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(q - tw < 300);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "reuse_tcb.owner_task = ls.owner_task;") != null);
 }

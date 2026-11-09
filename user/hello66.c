@@ -15,11 +15,6 @@ static volatile int xfsz_hits;
 #define SYS_PWRITEV 141
 #define SYS_FTRUNCATE 77
 
-struct iovec {
-    void *iov_base;
-    unsigned long iov_len;
-};
-
 static void on_xfsz(int signum) {
     if (signum == SIGXFSZ) xfsz_hits++;
 }

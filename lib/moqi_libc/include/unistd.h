@@ -93,6 +93,23 @@ unsigned int umask(unsigned int mask);
 int pipe2(int fds[2], int flags);
 int fchdir(int fd);
 
+/* preadv2 / pwritev2: vectored read/write at `offset` (-1 = the descriptor's current position, which then advances). `flags` are Linux's
+ * RWF_*: RWF_APPEND appends even without O_APPEND, RWF_NOAPPEND writes at the offset even with it, RWF_DSYNC / RWF_SYNC return only
+ * once the data is on disk, RWF_NOWAIT fails with EAGAIN instead of blocking on a pipe or socket (EOPNOTSUPP on a regular file); an
+ * unknown flag is EOPNOTSUPP. */
+#ifndef MOQI_STRUCT_IOVEC
+#define MOQI_STRUCT_IOVEC
+struct iovec { void *iov_base; size_t iov_len; };
+#endif
+#define RWF_HIPRI    0x01
+#define RWF_DSYNC    0x02
+#define RWF_SYNC     0x04
+#define RWF_NOWAIT   0x08
+#define RWF_APPEND   0x10
+#define RWF_NOAPPEND 0x20
+long preadv2(int fd, const struct iovec *iov, int iovcnt, long offset, int flags);
+long pwritev2(int fd, const struct iovec *iov, int iovcnt, long offset, int flags);
+
 long yield(void);
 
 void *brk(void *addr);

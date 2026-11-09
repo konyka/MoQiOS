@@ -1,4 +1,4 @@
-/* fdops.c -- descriptor and file operations: dup, dup3, fcntl, pread, pwrite, truncate, ftruncate, fsync, fdatasync, access,
+/* fdops.c -- descriptor and file operations: dup, dup3, fcntl, pread, pwrite, preadv2, pwritev2, truncate, ftruncate, fsync, fdatasync, access,
  * umask, pipe2 and fchdir (see include/unistd.h and include/fcntl.h).
  *
  * These follow the POSIX/glibc convention: the kernel's value on success, -1 with errno on failure (umask cannot fail and returns
@@ -41,6 +41,14 @@ int fcntl(int fd, int cmd, ...) {
 
 long pread(int fd, void *buf, size_t count, long offset) { return fd_lret(MSYS4(SYS_pread64, fd, buf, count, offset)); }
 long pwrite(int fd, const void *buf, size_t count, long offset) { return fd_lret(MSYS4(SYS_pwrite64, fd, buf, count, offset)); }
+
+/* glibc's x86-64 layout: the whole offset in pos_l, 0 in pos_h, the flags sixth. */
+long preadv2(int fd, const struct iovec *iov, int iovcnt, long offset, int flags) {
+    return fd_lret(MSYS6(SYS_preadv2, fd, iov, iovcnt, offset, 0, flags));
+}
+long pwritev2(int fd, const struct iovec *iov, int iovcnt, long offset, int flags) {
+    return fd_lret(MSYS6(SYS_pwritev2, fd, iov, iovcnt, offset, 0, flags));
+}
 
 int truncate(const char *path, long length) { return fd_ret(MSYS2(SYS_truncate, path, length)); }
 int ftruncate(int fd, long length) { return fd_ret(MSYS2(SYS_ftruncate, fd, length)); }

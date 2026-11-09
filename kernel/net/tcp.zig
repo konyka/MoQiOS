@@ -2074,6 +2074,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
             tcp_util.tupleMatchV4(dst_port, src_port, src_ip, tcbs[i].local_port, tcbs[i].remote_port, tcbs[i].remote_ip) and
             tcp_util.seqGt(seq_num, tcbs[i].irs))
         {
+            if (ls.pending_tail -% ls.pending_head >= LISTEN_BACKLOG) return;
             // Reuse this TIME_WAIT TCB — full state reset so no receive-ring
             // bytes, congestion state or negotiation flag of the dead
             // connection can reach the new one.
@@ -2105,8 +2106,12 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
             reuse_tcb.ecn_ok = peer_ecn;
             reuse_tcb.accecn_ok = peer_ecn;
 
+            reuse_tcb.owner_task = ls.owner_task;
             _ = sendSegment(reuse_tcb, probeEcnSynAckFlags(peer_ecn), undefined, 0);
             tcpLog("[tcp] TIME_WAIT reuse → SYN-ACK\n");
+            // Queue it like a fresh SYN_RECEIVED child, or accept() would never see the new connection.
+            ls.pending_tpbs[ls.pending_tail % LISTEN_BACKLOG] = @intCast(i);
+            ls.pending_tail += 1;
             return;
         }
     }
@@ -2872,8 +2877,11 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, e
     const payload_offset = data_offset;
     const payload_len: u32 = if (len > data_offset) len - data_offset else 0;
 
-    // Find matching TCB
-    const tcb = findTcbByTuple(dst_port, src_port, src_ip) orelse {
+    // Find matching TCB. A new SYN for a 4-tuple still in TIME_WAIT starts a new connection when its sequence number is newer (RFC 1122 4.2.2.13,
+    // Linux tcp_timewait_state_process): it goes to the listener like a fresh SYN, which takes over the TIME_WAIT slot.
+    const found = findTcbByTuple(dst_port, src_port, src_ip);
+    const tw_reopen = if (found) |t| t.state == .time_wait and flags & SYN != 0 and flags & ACK == 0 and tcp_util.seqGt(seq_num, t.irs) else false;
+    const tcb = (if (tw_reopen) null else found) orelse {
         // No matching connection — check if any socket is listening on this port
         if (flags & SYN != 0) {
             const before = pendingBacklogCount();

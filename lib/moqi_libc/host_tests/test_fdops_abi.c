@@ -23,6 +23,9 @@ int moqi_access(const char *, int);
 unsigned int moqi_umask(unsigned int);
 int moqi_pipe2(int[2], int);
 int moqi_fchdir(int);
+#include "../include/unistd.h"
+long moqi_preadv2(int, const struct iovec *, int, long, int);
+long moqi_pwritev2(int, const struct iovec *, int, long, int);
 
 static int bad;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); bad++; } } while (0)
@@ -31,17 +34,16 @@ static int errno_slot;
 int *__errno_location(void) { return &errno_slot; }
 
 static int ncalls;
-static long c_nr, c_a1, c_a2, c_a3, c_a4;
+static long c_nr, c_a1, c_a2, c_a3, c_a4, c_a5, c_a6;
 static long reply;
 
 long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
-    (void)a5; (void)a6;
     ncalls++;
-    c_nr = nr; c_a1 = a1; c_a2 = a2; c_a3 = a3; c_a4 = a4;
+    c_nr = nr; c_a1 = a1; c_a2 = a2; c_a3 = a3; c_a4 = a4; c_a5 = a5; c_a6 = a6;
     return reply;
 }
 
-static void arm(long r) { ncalls = 0; reply = r; errno_slot = 0; c_nr = c_a1 = c_a2 = c_a3 = c_a4 = -777; }
+static void arm(long r) { ncalls = 0; reply = r; errno_slot = 0; c_nr = c_a1 = c_a2 = c_a3 = c_a4 = c_a5 = c_a6 = -777; }
 
 int main(void) {
     CHECK(SYS_pread64 == 136 && SYS_pwrite64 == 137 && SYS_dup == 160 && SYS_dup3 == 161 && SYS_fcntl == 142);
@@ -120,6 +122,20 @@ int main(void) {
     CHECK(moqi_fchdir(5) == 0 && c_nr == SYS_fchdir && c_a1 == 5);
     arm(-20);
     CHECK(moqi_fchdir(5) == -1 && errno_slot == ENOTDIR);
+
+    /* preadv2 / pwritev2: glibc's x86-64 layout -- fd, iov, iovcnt, pos_l (the whole offset), pos_h (0), flags -- and -1 means the current
+     * position. The kernel's numbers are this system's own (498 / 499), not Linux's (327 / 328). */
+    CHECK(SYS_preadv2 == 498 && SYS_pwritev2 == 499);
+    struct iovec v[2] = { { (void *)0x1000, 4 }, { (void *)0x2000, 8 } };
+    arm(12);
+    CHECK(moqi_preadv2(3, v, 2, 4096, 0x08) == 12 && ncalls == 1 && c_nr == SYS_preadv2 && c_a1 == 3 && c_a2 == (long)v && c_a3 == 2 &&
+          c_a4 == 4096 && c_a5 == 0 && c_a6 == 0x08);
+    arm(-11);
+    CHECK(moqi_preadv2(3, v, 2, -1, 0x08) == -1 && errno_slot == EAGAIN && c_a4 == -1);
+    arm(2);
+    CHECK(moqi_pwritev2(4, v, 1, 0, 0x10) == 2 && c_nr == SYS_pwritev2 && c_a1 == 4 && c_a3 == 1 && c_a4 == 0 && c_a5 == 0 && c_a6 == 0x10);
+    arm(-95);
+    CHECK(moqi_pwritev2(4, v, 1, 0, 0x1000) == -1 && errno_slot == EOPNOTSUPP);
 
     if (bad) { fprintf(stderr, "%d check(s) failed\n", bad); return 1; }
     printf("test_fdops_abi: ok\n");

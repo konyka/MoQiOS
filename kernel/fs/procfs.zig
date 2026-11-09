@@ -184,6 +184,9 @@ fn generateMeminfo(buf: [*]u8, max_len: u32) u32 {
     pos = appendDec(buf, pos, max_len, free_kb);
     pos = appendStr(buf, pos, max_len, " kB\nMemAvailable:   ");
     pos = appendDec(buf, pos, max_len, avail_kb);
+    // Dirty: data written but still staged in the writeback buffers (one page per buffer), not yet on disk.
+    pos = appendStr(buf, pos, max_len, " kB\nDirty:          ");
+    pos = appendDec(buf, pos, max_len, @as(u64, @import("writeback.zig").getDirtyCount()) * 4);
     pos = appendStr(buf, pos, max_len, " kB\n");
     return pos;
 }

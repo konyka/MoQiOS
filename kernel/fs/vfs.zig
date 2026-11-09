@@ -1692,12 +1692,12 @@ pub const FdTable = struct {
 
     /// Held across a whole write()/writev() on an append file. The syscall layer cuts a large write into 4 KiB pieces (and writev into one piece
     /// per iovec); without this another appender's piece lands between ours, where Linux keeps one write or one writev contiguous.
-    pub fn lockAppendCall() void {
-        append_call_lock.lock();
+    pub fn lockAppendCall(self: *FdTable, fd: u32) void {
+        append_call_locks[@import("append_lock_policy.zig").stripeOf(appendKey(&self.fds[fd]))].lock();
     }
 
-    pub fn unlockAppendCall() void {
-        append_call_lock.unlock();
+    pub fn unlockAppendCall(self: *FdTable, fd: u32) void {
+        append_call_locks[@import("append_lock_policy.zig").stripeOf(appendKey(&self.fds[fd]))].unlock();
     }
 
     /// Write to a file descriptor from a kernel buffer.
@@ -1733,8 +1733,8 @@ pub const FdTable = struct {
             .fat32_file => {
                 // O_APPEND: every sequential write goes to the current end of the file, which another descriptor may have moved.
                 const appending = (desc.status_flags & 0x400) != 0;
-                if (appending) append_lock.lock();
-                defer if (appending) append_lock.unlock();
+                if (appending) appendLockOf(desc).lock();
+                defer if (appending) appendLockOf(desc).unlock();
                 desc.file_size = @import("fat32.zig").currentSize(desc.fat32_file_idx);
                 if (appending) desc.offset = desc.file_size;
                 const gate = fsizeGate(desc.offset, count);
@@ -1748,8 +1748,8 @@ pub const FdTable = struct {
             .rofs_file => return -30, // EROFS
             .ext2_file => {
                 const appending = (desc.status_flags & 0x400) != 0;
-                if (appending) append_lock.lock();
-                defer if (appending) append_lock.unlock();
+                if (appending) appendLockOf(desc).lock();
+                defer if (appending) appendLockOf(desc).unlock();
                 if (appending) {
                     // The end of the file as every descriptor sees it: the disk size or the end of data still staged by another appender.
                     desc.file_size = @import("ext2.zig").currentSize(desc.ext2_file_idx);
@@ -1978,8 +1978,8 @@ pub const FdTable = struct {
                 if (!desc.writable) return -9; // EBADF
                 // O_APPEND: Linux ignores the offset of pwrite and appends at the end of the file.
                 const appending = append_wanted;
-                if (appending) append_lock.lock();
-                defer if (appending) append_lock.unlock();
+                if (appending) appendLockOf(desc).lock();
+                defer if (appending) appendLockOf(desc).unlock();
                 const at: u64 = if (appending) @import("fat32.zig").currentSize(desc.fat32_file_idx) else offset;
                 const gate = fsizeGate(at, count);
                 if (gate < 0) return gate;
@@ -1993,8 +1993,8 @@ pub const FdTable = struct {
             .ext2_file => {
                 if (!desc.writable) return -9; // EBADF
                 const appending = append_wanted;
-                if (appending) append_lock.lock();
-                defer if (appending) append_lock.unlock();
+                if (appending) appendLockOf(desc).lock();
+                defer if (appending) appendLockOf(desc).unlock();
                 const at: u64 = if (appending) @import("ext2.zig").currentSize(desc.ext2_file_idx) else offset;
                 const gate = fsizeGate(at, count);
                 if (gate < 0) return gate;
@@ -2810,10 +2810,25 @@ var mount_op_lock: @import("../sync/task_sleep_lock.zig").SleepLock = .{};
 
 /// Serialises O_APPEND writes to ext2 and FAT32 files: finding the end of the file and staging the data behind it have to happen as one step, or two
 /// appenders pick the same end and one overwrites the other. A sleeping lock because staging can flush to disk. Only appenders take it.
-var append_lock: @import("../sync/task_sleep_lock.zig").SleepLock = .{};
+/// Striped by file (append_lock_policy.stripeOf): appenders to one file always share a stripe, appenders to different files usually do not.
+var append_locks: [@import("append_lock_policy.zig").STRIPES]@import("../sync/task_sleep_lock.zig").SleepLock = @splat(.{});
 
-/// Outer lock of an O_APPEND write()/writev() as a whole (see FdTable.lockAppendCall); always taken before `append_lock`.
-var append_call_lock: @import("../sync/task_sleep_lock.zig").SleepLock = .{};
+/// Outer lock of an O_APPEND write()/writev() as a whole (see FdTable.lockAppendCall); always taken before the same file's `append_locks` stripe.
+var append_call_locks: [@import("append_lock_policy.zig").STRIPES]@import("../sync/task_sleep_lock.zig").SleepLock = @splat(.{});
+
+/// The identity an O_APPEND lock is keyed by: the same for every descriptor of one file.
+fn appendKey(desc: *const FileDescriptor) u64 {
+    return switch (desc.fd_type) {
+        .tmpfs_file => 0x1000_0000_0000_0000 + @as(u64, desc.tmpfs_idx),
+        // The FAT32 open-file slot, not inode_id: every new empty file has first cluster 0, so their inode_ids are all the same.
+        .fat32_file => 0x2000_0000_0000_0000 + @as(u64, desc.fat32_file_idx),
+        else => desc.inode_id,
+    };
+}
+
+fn appendLockOf(desc: *const FileDescriptor) *@import("../sync/task_sleep_lock.zig").SleepLock {
+    return &append_locks[@import("append_lock_policy.zig").stripeOf(appendKey(desc))];
+}
 
 const mount_path = @import("mount_path_policy.zig");
 

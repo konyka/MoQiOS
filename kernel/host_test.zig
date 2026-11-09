@@ -168,6 +168,7 @@ pub const tcp_port_policy = @import("net/tcp_port_policy.zig");
 pub const udp_port_policy = @import("net/udp_port_policy.zig");
 pub const tcp_stats = @import("net/tcp_stats.zig");
 pub const rwf_policy = @import("fs/rwf_policy.zig");
+pub const append_lock_policy = @import("fs/append_lock_policy.zig");
 pub const icmp_echo_policy = @import("net/icmp_echo_policy.zig");
 pub const icmp_unreach_policy = @import("net/icmp_unreach_policy.zig");
 pub const udp_source = @embedFile("net/udp.zig");
