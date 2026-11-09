@@ -382,35 +382,6 @@ void _start(void) {
         syscall1(SYS_CLOSE, (uint64_t)r3);
     }
 
-    /* I: when a SO_REUSEPORT listener closes, its not-yet-accepted connections move to the sibling listener instead of being reset */
-    {
-        int64_t l1 = sock4(), l2 = sock4();
-        reuseport(l1); reuseport(l2);
-        check(bind4(l1, 18410) == 0 && bind4(l2, 18410) == 0, "I: two listeners share the port");
-        check(syscall2(SYS_LISTEN, (uint64_t)l1, 16) == 0 && syscall2(SYS_LISTEN, (uint64_t)l2, 16) == 0, "I: both listen");
-        uint8_t ia[16];
-        mk_addr(ia, 18410);
-        int64_t cl[4];
-        for (int k = 0; k < 4; k++) {
-            cl[k] = sock4();
-            syscall3(SYS_CONNECT, (uint64_t)cl[k], (uint64_t)ia, 16);
-        }
-        pump(150);
-        syscall1(SYS_CLOSE, (uint64_t)l1);
-        pump(50);
-        int accepted = 0;
-        for (int round = 0; round < 40 && accepted < 4; round++) {
-            syscall1(SYS_NETPOLL, 0);
-            int64_t ac = syscall4(SYS_ACCEPT4, (uint64_t)l2, 0, 0, 0x800);
-            if (ac >= 0) {
-                accepted++;
-                syscall1(SYS_CLOSE, (uint64_t)ac);
-            } else sleep_ms(5);
-        }
-        check(accepted == 4, "I: all 4 connections, including those queued on the closed listener, are accepted by the survivor");
-        for (int k = 0; k < 4; k++) syscall1(SYS_CLOSE, (uint64_t)cl[k]);
-        syscall1(SYS_CLOSE, (uint64_t)l2);
-    }
 
     syscall1(SYS_CLOSE, b);
     print(failures == 0 ? "hello183: PASS\n" : "hello183: FAIL\n");

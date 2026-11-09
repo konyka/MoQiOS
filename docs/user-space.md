@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello266`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello267`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -262,6 +262,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello264 | `/proc/<pid>/status` 的 `VmSize`/`VmRSS`/`VmData`（11 项）：两行存在且 `VmRSS` 不超过 `VmSize`；`mmap` 1 MiB 使 `VmSize` +1024 kB；逐页触碰后 `VmRSS` 比 `mmap` 前多 1024 kB 而 `VmSize` 不变；`munmap` 两者各 -1024 kB 且 `VmRSS` 回到起点附近；`sbrk` 1 MiB 使 `VmSize` +1024 kB；`/proc/<pid>/status` 与 `/proc/self/status` 一致；`VmData` 只计堆和可写私有映射（私有只读、共享映射不计，`sbrk` +1024 kB，`munmap` 可写私有映射 -1024 kB；`mprotect` 后 `VmData` 是否变化**没有**断言，本内核的数据账本不跟随 `mprotect`）。本内核在 `mmap` 时就填充匿名页，所以 `VmRSS` 在 `mmap` 瞬间就上升（Linux 是惰性的），用例打印这一差异而不断言它 |
 | hello265 | `mprotect` 与 RLIMIT_DATA 账本（20 项，经 `VmData` 观察）：可写→只读退还页数、改回可写再计入；把中间四分之一改只读退 256 kB；`PROT_NONE` 不是数据（退还可写的四分之三）；再全部可写计入整兆；`munmap` 按碎片**现在**的状态退款，净值为 0；只读→读+执行不变、加写计入；部分可写的区域只补另一半；共享映射永远不计；`RLIMIT_DATA` 下只读→可写若超限则 `ENOMEM`（`errno` 12）且账本不变，先在别处放弃可写后就有余量；`mprotect` 变成只读的区域上 `MAP_FIXED` 读写覆盖仍然成功并计入；一百次第一页 `mprotect` 往返不会耗尽区域表（相邻同保护位的区域会合并回去）；四十个同时存活的映射各做一次往返仍能放下；跨保护边界的 `mremap` 缩小成功，之后账本只剩留下的数据页（-8 kB）；横跨两个映射的放大是 `EFAULT`、缩到 4 页中的 3 页原地成功、同样大小的 `MREMAP_FIXED` 移动成功且数据带过去、各部分保留各自的保护位（搬走后账本 -12 kB）；四十个先拆分又合回的映射移走后全部存活仍放得进区域表。`MAP_FIXED` 只读覆盖读写区域被快路径拒绝是既有限制（hello65），不在此断言 |
 | hello266 | 同时追加写入同一文件（`O_APPEND`，每个文件系统 2 项，共 6 项：tmpfs、FAT32 根目录、ext2 `testdir/`）：四个子进程各向文件追加 50 行 2 字节，一次 `write` 一行，20 轮，文件恰好是 400 字节、每行完整（宿主机 Linux 0 轮出错）；同样但每行两次 `write`（`x` 再 `\n`），也不丢字节（宿主机 0 轮出错） |
+| hello267 | `SO_REUSEPORT` 监听者关闭时迁移积压连接：两个 TCP 监听者共享一个端口，4 个客户端连接，关闭其中一个，另一个必须 `accept` 到全部 4 个 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。

@@ -1,0 +1,160 @@
+/// hello267: a closing SO_REUSEPORT TCP listener hands its not-yet-accepted connections to the sibling listener.
+
+#include <stdint.h>
+
+static inline int64_t syscall1(uint64_t nr, uint64_t a1) {
+    int64_t ret;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1) : "rcx", "r11", "memory");
+    return ret;
+}
+static inline int64_t syscall2(uint64_t nr, uint64_t a1, uint64_t a2) {
+    int64_t ret;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2) : "rcx", "r11", "memory");
+    return ret;
+}
+static inline int64_t syscall3(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3) {
+    int64_t ret;
+    register uint64_t rdx __asm__("rdx") = a3;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx) : "rcx", "r11", "memory");
+    return ret;
+}
+static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
+    int64_t ret;
+    register uint64_t rdx __asm__("rdx") = a3;
+    register uint64_t r10 __asm__("r10") = a4;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10) : "rcx", "r11", "memory");
+    return ret;
+}
+static inline int64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+    int64_t ret;
+    register uint64_t rdx __asm__("rdx") = a3;
+    register uint64_t r10 __asm__("r10") = a4;
+    register uint64_t r8 __asm__("r8") = a5;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10), "r"(r8) : "rcx", "r11", "memory");
+    return ret;
+}
+static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
+    int64_t ret;
+    register uint64_t rdx __asm__("rdx") = a3;
+    register uint64_t r10 __asm__("r10") = a4;
+    register uint64_t r8 __asm__("r8") = a5;
+    register uint64_t r9 __asm__("r9") = a6;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10), "r"(r8), "r"(r9) : "rcx", "r11", "memory");
+    return ret;
+}
+
+#define SYS_WRITE     1
+#define SYS_EXIT      2
+#define SYS_CLOSE     11
+#define SYS_FORK      57
+#define SYS_WAITPID   6
+#define SYS_NANOSLEEP 35
+#define SYS_NETPOLL   104
+#define SYS_SOCKET    117
+#define SYS_BIND      118
+#define SYS_LISTEN    119
+#define SYS_SENDTO    121
+#define SYS_CONNECT   124
+#define SYS_ACCEPT4   131
+#define SYS_SETSOCKOPT 132
+#define SYS_GETSOCKOPT 133
+#define SYS_RECVFROM  122
+#define SO_RCVTIMEO 20
+#define MSG_DONTWAIT 0x40
+#define SYS_SETUID    174
+#define SYS_IOCTL     165
+#define SIOCGIFADDR   0x8915
+#define EADDRNOTAVAIL_ 99
+#define AF_INET 2
+#define AF_INET6 10
+#define SOCK_STREAM 1
+#define SOCK_DGRAM 2
+#define SOL_SOCKET 1
+#define SO_REUSEADDR 2
+#define SO_REUSEPORT 15
+#define EACCES_ 13
+#define EINVAL_ 22
+#define EADDRINUSE_ 98
+
+struct ts { int64_t s, n; };
+static void print(const char *s) {
+    uint64_t n = 0;
+    while (s[n]) n++;
+    syscall3(SYS_WRITE, 1, (uint64_t)s, n);
+}
+static int failures = 0;
+static void check(int ok, const char *what) {
+    print(ok ? "hello267:   ok   " : "hello267:   FAIL ");
+    print(what);
+    print("\n");
+    if (!ok) failures++;
+}
+static void sleep_ms(int ms) {
+    struct ts t = { 0, (int64_t)ms * 1000000 };
+    syscall2(SYS_NANOSLEEP, (uint64_t)&t, 0);
+}
+static void pump(int ms) {
+    for (int i = 0; i < ms; i += 10) { syscall1(SYS_NETPOLL, 0); sleep_ms(10); }
+}
+static void mk_addr(uint8_t *a, int port) {
+    for (int i = 0; i < 16; i++) a[i] = 0;
+    a[0] = 2; a[2] = (uint8_t)(port >> 8); a[3] = (uint8_t)port; a[4] = 127; a[7] = 1;
+}
+static void mk_addr6(uint8_t *a, int port) {
+    for (int i = 0; i < 28; i++) a[i] = 0;
+    a[0] = AF_INET6;
+    a[2] = (uint8_t)(port >> 8); a[3] = (uint8_t)port;
+    a[8 + 15] = 1;
+}
+static int64_t sock4(void) { return syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM, 0); }
+static int64_t bind4(int64_t s, int port) {
+    uint8_t sa[16];
+    mk_addr(sa, port);
+    return syscall3(SYS_BIND, (uint64_t)s, (uint64_t)sa, 16);
+}
+static void reuseport(int64_t s) {
+    int one = 1;
+    syscall5(SYS_SETSOCKOPT, (uint64_t)s, SOL_SOCKET, SO_REUSEPORT, (uint64_t)&one, 4);
+}
+static void reuse(int64_t s) {
+    int one = 1;
+    syscall5(SYS_SETSOCKOPT, (uint64_t)s, SOL_SOCKET, SO_REUSEADDR, (uint64_t)&one, 4);
+}
+
+void _start(void) {
+    print("hello267: SO_REUSEPORT listener close migrates its backlog\n");
+    /* when a SO_REUSEPORT listener closes, its not-yet-accepted connections move to the sibling listener instead of being reset */
+    {
+        int64_t l1 = sock4(), l2 = sock4();
+        reuseport(l1); reuseport(l2);
+        check(bind4(l1, 18410) == 0 && bind4(l2, 18410) == 0, "two listeners share the port");
+        check(syscall2(SYS_LISTEN, (uint64_t)l1, 16) == 0 && syscall2(SYS_LISTEN, (uint64_t)l2, 16) == 0, "both listen");
+        uint8_t ia[16];
+        mk_addr(ia, 18410);
+        int64_t cl[4];
+        for (int k = 0; k < 4; k++) {
+            cl[k] = sock4();
+            syscall3(SYS_CONNECT, (uint64_t)cl[k], (uint64_t)ia, 16);
+        }
+        pump(150);
+        syscall1(SYS_CLOSE, (uint64_t)l1);
+        pump(50);
+        int accepted = 0;
+        for (int round = 0; round < 40 && accepted < 4; round++) {
+            syscall1(SYS_NETPOLL, 0);
+            int64_t ac = syscall4(SYS_ACCEPT4, (uint64_t)l2, 0, 0, 0x800);
+            if (ac >= 0) {
+                accepted++;
+                syscall1(SYS_CLOSE, (uint64_t)ac);
+            } else sleep_ms(5);
+        }
+        check(accepted == 4, "all 4 connections, including those queued on the closed listener, are accepted by the survivor");
+        for (int k = 0; k < 4; k++) syscall1(SYS_CLOSE, (uint64_t)cl[k]);
+        syscall1(SYS_CLOSE, (uint64_t)l2);
+    }
+
+    print(failures == 0 ? "hello267: PASS\n" : "hello267: FAIL\n");
+    print("hello267 done\n");
+    syscall1(SYS_EXIT, failures == 0 ? 0 : 1);
+    for (;;) {}
+}
