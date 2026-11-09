@@ -11561,7 +11561,8 @@ test "an O_APPEND write to tmpfs finds the end and writes under one hold of the 
 test "O_APPEND writes to ext2 and FAT32 find the end and stage the data under one append lock" {
     // hello266: with a tmpfs-only fix, four appenders on ext2 or FAT32 still lost lines (10 and 4 of 20 rounds); Linux loses none.
     const v = kt.vfs_source;
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, v, "if (appending) append_lock.lock();\n                defer if (appending) append_lock.unlock();"));
+    // Four sites: write() and writeAtOffset() (pwrite/pwritev), for each of ext2 and FAT32.
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, v, "if (appending) append_lock.lock();\n                defer if (appending) append_lock.unlock();"));
     try std.testing.expect(std.mem.indexOf(u8, v, "var append_lock: @import(\"../sync/task_sleep_lock.zig\").SleepLock = .{};") != null);
     // ext2 takes the end from currentSize (disk size or the end still staged by another appender), not from this descriptor's cached size.
     try std.testing.expect(std.mem.indexOf(u8, v, "desc.file_size = @import(\"ext2.zig\").currentSize(desc.ext2_file_idx);\n                    desc.offset = desc.file_size;") != null);
@@ -11829,4 +11830,16 @@ test "tcp: a closing SO_REUSEPORT listener hands its backlog to a sibling before
     try std.testing.expect(dis < mig);
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (sib == from or sib.local_port != from.local_port or sib.is_v6 != from.is_v6) continue;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (sib.pending_tail -% sib.pending_head >= LISTEN_BACKLOG) continue;") != null);
+}
+
+test "O_APPEND: pwrite and pwritev append at the end, splice and copy_file_range refuse the descriptor" {
+    const vs = kt.vfs_source;
+    // Each file type's offset write takes the end of the file instead of the caller's offset when the descriptor is O_APPEND.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, vs, "const at: u64 = if (appending) @import("));
+    try std.testing.expect(std.mem.indexOf(u8, vs, "tmpfs.tmpfsAppend(@intCast(desc.tmpfs_idx), buf, @intCast(agate), &began_at)") != null);
+    // The syscall layer holds the per-call append lock across pwrite and pwritev like write and writev.
+    try std.testing.expect(std.mem.indexOf(u8, kt.file_io_source, "const append_call = cur.fd_table.isAppendFile(fd);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.readv_source, "const append_call = cur.fd_table.isAppendFile(fd);\n    if (append_call) vfs_mod.FdTable.lockAppendCall();\n    defer if (append_call) vfs_mod.FdTable.unlockAppendCall();\n    var current_offset = pos_l;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.splice_source, "if ((fd_table.fds[file_fd].status_flags & 0x400) != 0) return EINVAL;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.copy_file_range_source, "if ((cur.fd_table.fds[fd_out].status_flags & 0x400) != 0) return EBADF;") != null);
 }

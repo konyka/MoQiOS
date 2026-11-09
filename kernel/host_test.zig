@@ -321,6 +321,7 @@ pub const ramdisk_source = @embedFile("fs/ramdisk.zig");
 pub const unlink_source = @embedFile("fs/unlink.zig");
 pub const dir_ops_source = @embedFile("fs/dir_ops.zig");
 pub const readv_source = @embedFile("fs/readv.zig");
+pub const copy_file_range_source = @embedFile("fs/copy_file_range.zig");
 
 // Every kernel file with inline `test` blocks that compiles on the host. Zig runs a test block only in a file
 // that is reached from a `test {}` block of a test root: the `pub const x = @import(..)` re-exports above do not

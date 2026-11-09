@@ -262,6 +262,9 @@ pub fn pwrite(fd: u32, buf_ptr: u64, count: u64, offset: u64) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
+    const append_call = cur.fd_table.isAppendFile(fd);
+    if (append_call) vfs_mod.FdTable.lockAppendCall();
+    defer if (append_call) vfs_mod.FdTable.unlockAppendCall();
     var pos: usize = 0;
     var current_offset = offset;
     while (pos < n) {

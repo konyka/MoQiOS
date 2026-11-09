@@ -560,6 +560,7 @@ fn spliceFileToPipe(fd_table: *vfs.FdTable, file_fd: u32, off_in: u64, pipe_fd: 
 
 /// pipe → file: read from pipe, write to file.
 fn splicePipeToFile(fd_table: *vfs.FdTable, pipe_fd: u32, file_fd: u32, off_out: u64, len: u64, flags: u32) i64 {
+    if ((fd_table.fds[file_fd].status_flags & 0x400) != 0) return EINVAL; // Linux: splice into an O_APPEND file is refused
     var file_offset = vfs_mod.offsetOf(&fd_table.fds[file_fd]);
     var explicit_offset = false;
     if (off_out != 0) {

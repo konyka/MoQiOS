@@ -7514,6 +7514,10 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - **门禁里抓到的问题（CI 先抓到，如实记录）**：这个场景最初是 hello183 的 I 段。推送后 CI 的 SMP=2 冒烟失败：hello183 G 段（12 个连接）和紧随其后的 hello184 D（`accept4`）失败；本地 SMP=2 同样 3 次里 2 次失败。对照：改动前的内核 3/3 通过；HEAD 的 UDP 改动加旧 `tcp.zig` 4/4 失败（失败的仍是 I 段，其中一次还有 G 和 hello184 D），所以不是 TCP 迁移代码造成的；去掉 I 段后 4 次里 3 次通过，1 次失败的是 hello174 C（`SO_RCVBUF` 缓冲量），这是文档里早已记录的偶发项；把场景移到独立的 hello267（排在 init 序列末尾）后 4/4 通过。我的推测是这些连接留下的 TCB（表只有 64 个槽，TIME_WAIT 15 秒）挤占了紧随其后的 hello184；**但 G 段在 I 段之前运行，它为什么也失败，我没有查清**，也没有直接检查过 TCB 表的占用。样本很小，只能说明“移出后没有再看到”，不能证明原因。
 - 局限：①迁移的连接绕过哈希分发，进的是第一个有空位的兄弟；②兄弟队列满了的连接仍被复位；③已经建立但没有被 `accept` 的连接的 `owner_task` 改成兄弟的所有者，没有测多进程所有者不同的情形。
 
-## 未做：追加文件上的 `pwritev`、`sendfile`、`splice`、aio 写
+## `O_APPEND` 描述符上的 `pwrite`/`pwritev`/`copy_file_range`/`splice`（hello268，已修）
 
-- hello266 一节的局限③仍然有效：这些路径不经过 `append_call_lock`。我没有在本机 Linux 上验证它们对 `O_APPEND` 文件的原子性语义，也没有写红灯用例，所以没有改。这是一个明确保留的未验证项，不是“确认不需要”。
+- 来由：hello266 一节的局限③。先在本机 Linux（Python）上实测：`pwrite(fd, b"XY", 0)` 和 `pwritev` 在 `O_APPEND` 文件上把数据写在**文件末尾**（忽略传入的偏移），返回字节数，描述符自己的偏移不动；`copy_file_range` 的目的是 `O_APPEND` 返回 `EBADF`；`splice` 到 `O_APPEND` 文件返回 `EINVAL`；`sendfile` 的输出是普通文件时 Linux 也是 `EINVAL`（本内核本来就只接受套接字和管道，没有改）。
+- 红灯：hello268 在改动之前的内核上，三个文件系统各有 3 项失败（`pwrite`/`pwritev` 把数据覆盖在偏移 0 上，文件仍是 8 字节；四个进程并发写，记录互相覆盖），共 9 项；`copy_file_range` 和 `splice` 的两项是后加的，在改动前也失败（返回成功的字节数）。
+- 实现：`vfs.zig` 的 `writeAtOffset` 对 `O_APPEND` 描述符把偏移换成文件当前末尾——ext2/FAT32 在 `append_lock` 之内取 `currentSize` 再暂存，tmpfs 走 `tmpfsAppend`（取末尾和写入在一次持锁里）；`file_io.pwrite` 和 `readv.pwritev` 像 `write`/`writev` 一样整次调用持有 `append_call_lock`；`splicePipeToFile` 对 `O_APPEND` 目的返回 `EINVAL`，`copyFileRange` 对 `O_APPEND` 目的返回 `EBADF`。
+- 绿灯：hello268 在三个文件系统上通过（含 6 轮四进程并发 `pwrite`/`pwritev`）；host 1124/1124，其中新增一条源码形状测试，并把 `O_APPEND` 的锁位置计数由 2 改为 4（`write` 与 `writeAtOffset` 各占 ext2/FAT32 两处）。
+- 局限（如实）：①`aio` 的写（`io_submit` 的 `PWRITE`）没有检查，没有 `O_APPEND` 用例；②`pwritev2` 的 `RWF_APPEND` 标志没有实现；③全局 `append_call_lock` 的争用仍没有测量；④`sendfile` 到 `O_APPEND` 的普通文件：本内核本来就拒绝（`EINVAL`），与 Linux 一致，但没有为它写用例。

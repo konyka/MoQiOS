@@ -107,6 +107,9 @@ pub fn preadv(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64) i64 {
     // Validate untrusted fd number before indexing the descriptor array.
     if (fd >= cur.fd_table.fds.len or cur.fd_table.fds[fd].fd_type == .none) return EBADF;
 
+    const append_call = cur.fd_table.isAppendFile(fd);
+    if (append_call) vfs_mod.FdTable.lockAppendCall();
+    defer if (append_call) vfs_mod.FdTable.unlockAppendCall();
     var current_offset = pos_l;
     var total: usize = 0;
     for (0..iovcnt) |i| {

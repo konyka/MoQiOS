@@ -1954,28 +1954,44 @@ pub const FdTable = struct {
             .pidfd => return -1,
             .fat32_file => {
                 if (!desc.writable) return -9; // EBADF
-                const gate = fsizeGate(offset, count);
+                // O_APPEND: Linux ignores the offset of pwrite and appends at the end of the file.
+                const appending = (desc.status_flags & 0x400) != 0;
+                if (appending) append_lock.lock();
+                defer if (appending) append_lock.unlock();
+                const at: u64 = if (appending) @import("fat32.zig").currentSize(desc.fat32_file_idx) else offset;
+                const gate = fsizeGate(at, count);
                 if (gate < 0) return gate;
                 // Stage through the writeback cache like write() does so that
                 // write()-then-pwrite() ordering survives a later flush.
-                const n = bufferedWriteAt(desc, desc.fat32_file_idx, buf, @intCast(gate), offset, .fat32);
+                const n = bufferedWriteAt(desc, desc.fat32_file_idx, buf, @intCast(gate), at, .fat32);
                 if (n > 0) @import("fat32.zig").touchModified(desc.fat32_file_idx);
                 return n;
             },
             .rofs_file => return -30, // EROFS
             .ext2_file => {
                 if (!desc.writable) return -9; // EBADF
-                const gate = fsizeGate(offset, count);
+                const appending = (desc.status_flags & 0x400) != 0;
+                if (appending) append_lock.lock();
+                defer if (appending) append_lock.unlock();
+                const at: u64 = if (appending) @import("ext2.zig").currentSize(desc.ext2_file_idx) else offset;
+                const gate = fsizeGate(at, count);
                 if (gate < 0) return gate;
-                const n = bufferedWriteAt(desc, desc.ext2_file_idx, buf, @intCast(gate), offset, .ext2);
+                const n = bufferedWriteAt(desc, desc.ext2_file_idx, buf, @intCast(gate), at, .ext2);
                 if (n > 0) @import("ext2.zig").touchModified(desc.ext2_file_idx);
                 return n;
             },
             .tmpfs_file => {
                 if (!desc.writable) return -9; // EBADF
+                const tmpfs = @import("tmpfs.zig");
+                if ((desc.status_flags & 0x400) != 0) {
+                    const end = tmpfs.tmpfsGetSize(@intCast(desc.tmpfs_idx));
+                    const agate = fsizeGate(end, count);
+                    if (agate < 0) return agate;
+                    var began_at: u64 = end;
+                    return tmpfs.tmpfsAppend(@intCast(desc.tmpfs_idx), buf, @intCast(agate), &began_at);
+                }
                 const gate = fsizeGate(offset, count);
                 if (gate < 0) return gate;
-                const tmpfs = @import("tmpfs.zig");
                 return tmpfs.tmpfsWrite(@intCast(desc.tmpfs_idx), offset, buf, @intCast(gate));
             },
         }

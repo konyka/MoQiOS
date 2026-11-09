@@ -32,6 +32,7 @@ pub fn copyFileRange(fd_in: u32, off_in_ptr: u64, fd_out: u32, off_out_ptr: u64,
     if (fd_in >= cur.fd_table.fds.len or fd_out >= cur.fd_table.fds.len) return EBADF;
     if (cur.fd_table.fds[fd_in].fd_type == .none or cur.fd_table.fds[fd_out].fd_type == .none) return EBADF;
     if (!isCopySource(cur.fd_table.fds[fd_in].fd_type) or !isRegularFile(cur.fd_table.fds[fd_out].fd_type)) return EINVAL;
+    if ((cur.fd_table.fds[fd_out].status_flags & 0x400) != 0) return EBADF; // Linux: the destination of copy_file_range cannot be O_APPEND
 
     // Read optional offset pointers
     var off_in_val: u64 = 0;
