@@ -7483,7 +7483,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - `tcp_port_policy.zig` 新增 `reusePortMayShare`（两边都有标志位 8 且 uid 相同）和 `pickListener`（对对端 IP 和端口做 FNV 哈希，对监听者数取模，同一个对端总是到同一个监听者）。
   - `tcp.zig`：`ListenSlot` 新增 `tcb_idx`——此前监听槽按“端口加地址族”识别，两个监听者会撞在同一个槽里；现在每个监听 TCB 一个槽。`stopListening` 和 `tcpAccept` 改按 TCB 找槽；IPv4/IPv6 的 SYN 都通过新函数 `pickListenSlot` 选槽（只有一个监听者时行为与以前完全相同）。`tcpBind` 在 `SO_REUSEADDR`/`TIME_WAIT` 规则之外再问 `reusePortMayShare`；owner uid 取自拥有任务的 `euid`。
 - 绿灯：hello183 在 SMP=2 的两份运行里全部 PASS（12 个连接全部被两个监听者接走且两边都分到了；关闭一个监听者后另一个继续接收）；host 测试覆盖策略（单边不行、uid 不同不行、哈希稳定且在范围内、60 个对端会用到全部 3 个监听者）和接线；三个架构构建通过。
-- 局限（如实）：①分发只按对端地址和端口哈希，没有 Linux 的 `SO_ATTACH_REUSEPORT_*` BPF 选择器；②一个监听者关闭时，它队列里还没被 `accept` 的连接被复位（沿用 `stopListening` 的原有行为），Linux 会把它们迁移到同组的其它监听者（`net.ipv4.tcp_migrate_req` 打开时）——这里没有实现迁移；③连接分散的“均匀度”只测了“两边都分到”，没有测比例；④UDP 的 `SO_REUSEPORT`（多个套接字共享一个 UDP 端口并按哈希分发）没有做，UDP 的端口表仍是独占的；⑤owner uid 取自任务的 `euid`，任务退出后读到的是 0。
+- 局限（如实）：①分发只按对端地址和端口哈希，没有 Linux 的 `SO_ATTACH_REUSEPORT_*` BPF 选择器；②一个监听者关闭时它队列里还没被 `accept` 的连接的处理见文末“监听者关闭时迁移”一节；③连接分散的“均匀度”只测了“两边都分到”，没有测比例；④UDP 的 `SO_REUSEPORT` 见下一节；⑤owner uid 取自任务的 `euid`，任务退出后读到的是 0。
 
 ## epoll 嵌套深度上限 `EP_MAX_NESTS = 4`（hello236 G 段，已补）
 
@@ -7494,3 +7494,25 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 过程中一个测试写错（如实）：我最初把“往链底端加空 epoll”写成了往 `c[4]`（链的顶端）加，实际应是 `c[0]`（最底端）；Linux 实测顶端可以加（`top ok`）、底端 `ELOOP`。改对测试点后两份 SMP=2 都 PASS。
 - 局限：①`nestedDepthAbove` 对每个实例逐个 `acquireInstance` 并持锁扫描，最多 32 个实例，但在深度较大时是指数级的最坏情形（每个实例可能有多个父），被提前返回的上限截断；②深度只在 `EPOLL_CTL_ADD` 时检查，已经存在的链之后因 `EPOLL_CTL_MOD` 重新启用被禁用的条目不会重新检查；③非 epoll 成员（管道、套接字）不计入深度，与 Linux 一致。
 
+## UDP 端口共享：`SO_REUSEADDR` / `SO_REUSEPORT`，以及 `bind` 之前设置的选项不再丢失（hello183 H 段，已补）
+
+- 来由：上一节 TCP `SO_REUSEPORT` 的局限④。此前 UDP 端口表按端口号独占，第二个套接字 `bind` 同一端口一律 `EADDRINUSE`。
+- 本机 Linux（Python）实测的规则：两个套接字都设了 `SO_REUSEPORT`（同一有效 uid）可以共享，只有一方设置、或只设 `SO_REUSEADDR` 去加入一个 `SO_REUSEPORT` 持有者都是 `EADDRINUSE`；两个都设 `SO_REUSEADDR` 也可以共享，此时单播数据报只到其中一个（实测是后绑定的那个）；`SO_REUSEPORT` 共享时按发送方的地址和端口分发，同一发送方每次都到同一个套接字（实测 40 个不同发送方 20/20 分开，同一发送方 10 次全到同一个）。
+- 顺带发现并修复的真缺陷：`bind` 以前是“新注册端口 + 释放旧端口”，旧槽位里存的套接字选项（`SO_REUSEPORT`、`SO_RCVTIMEO`、`IP_*` 等）随旧槽位一起丢了。也就是说在 `bind` 之前设置的选项在 `bind` 之后读回都是默认值。
+- 红灯：hello183 H 段 17 项，在改动之前的内核上 7 项失败（第二个 `SO_REUSEPORT` 套接字绑定、选项经 `bind` 保留 ×2、两个套接字都分到数据、一个关闭后另一个继续收、两个 `SO_REUSEADDR` 共享、`SO_REUSEADDR` 时后绑定者收）。
+- 实现：`net/udp_port_policy.zig`（`mayShare`、`pickReceiver`，纯函数）；`udp.zig` 的槽位键由端口号改为 32 位（低 16 位端口，高 16 位区分同端口的多个套接字，`FileDescriptor.udp_disc` / `udpKey()`），每槽记录 uid、绑定顺序、地址族；新增 `udp.rebind`（原位移动并保留选项，按策略检查所有持有者）；`enqueue` 在同一临界区里选出接收者；`notifyUnreachable` 通知所有匹配的套接字；vfs 的引用计数、epoll、`FIONREAD`、`getsockopt`/`setsockopt`、`recvmsg` 全部改用 `udpKey()`。
+- 绿灯：hello183 在 SMP=2 的多份运行里 PASS；host 测试覆盖策略（单边不行、uid 不同不行、哈希稳定且 3 个套接字都会被选到、无 `SO_REUSEPORT` 时选最新绑定者）和接线；三个架构构建通过。
+- 过程说明（如实）：哈希第一版只用 FNV，12 个发送方全部落在同一个套接字，“两边都分到”那一项失败；加了一步混合，并把测试里的发送方改成 12 个不同的套接字（此前每轮新建关闭，可能复用同一个端口）。
+- 局限：①槽位表仍是 16 个，同端口共享也占槽位；②IPv4 与 IPv6 的套接字不互相共享端口（沿用原来的接口：判断只看端口号，地址族只用于投递时的过滤）；③只有 `SO_REUSEADDR` 的共享在 Linux 上对组播/广播有不同语义，这里没有区分；④`connect` 过的套接字（已固定对端）在共享端口上仍按选择规则接收，Linux 会优先交给匹配四元组的已连接套接字，没有实现；⑤`SO_REUSEPORT` 的 BPF 选择器没有。
+
+## TCP `SO_REUSEPORT`：监听者关闭时迁移尚未 `accept` 的连接（hello183 I 段，已补）
+
+- 来由：TCP `SO_REUSEPORT` 一节的局限②。此前一个监听者关闭，它队列里已经建立、还没被 `accept` 的连接全部被复位，同组的其它监听者本来可以接管。
+- 红灯：hello183 I 段（两个监听者，4 个客户端连接，关闭其中一个，另一个应接到全部 4 个）在改动之前失败。第一版用 10 个连接，完整 smoke 里 hello183 I 失败（SMP=1 和 SMP=2 都是）：我的推测（没有验证）是 TCB 表只有 64 个槽，这些连接关闭后停留在 TIME_WAIT，占满了后面测试要用的槽位；改成 4 个后完整 smoke（SMP=1、SMP=2）通过，但我没有单独确认是槽位耗尽。
+- 实现：`tcp.zig` 的 `stopListening` 先把监听槽标为不活动，再对队列里的每个连接调用 `migrateToSiblingListener`：找同端口、同地址族、还有空位的另一个监听槽，追加到它的队列并更新 `owner_task`；没有兄弟可接才按原来的方式复位。
+- 绿灯：hello183 SMP=2 两份 PASS；host 测试是源码顺序守卫（先停用本槽，再迁移，最后才丢弃）。
+- 局限：①迁移的连接绕过哈希分发，进的是第一个有空位的兄弟；②兄弟队列满了的连接仍被复位；③已经建立但没有被 `accept` 的连接的 `owner_task` 改成兄弟的所有者，没有测多进程所有者不同的情形。
+
+## 未做：追加文件上的 `pwritev`、`sendfile`、`splice`、aio 写
+
+- hello266 一节的局限③仍然有效：这些路径不经过 `append_call_lock`。我没有在本机 Linux 上验证它们对 `O_APPEND` 文件的原子性语义，也没有写红灯用例，所以没有改。这是一个明确保留的未验证项，不是“确认不需要”。

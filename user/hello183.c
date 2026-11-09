@@ -57,6 +57,10 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_CONNECT   124
 #define SYS_ACCEPT4   131
 #define SYS_SETSOCKOPT 132
+#define SYS_GETSOCKOPT 133
+#define SYS_RECVFROM  122
+#define SO_RCVTIMEO 20
+#define MSG_DONTWAIT 0x40
 #define SYS_SETUID    174
 #define SYS_IOCTL     165
 #define SIOCGIFADDR   0x8915
@@ -292,6 +296,120 @@ void _start(void) {
         check((cr == 0 || cr == -115 || cr == -106) && acc >= 0, "G: after one listener closes, the other still accepts new connections");
         if (acc >= 0) syscall1(SYS_CLOSE, (uint64_t)acc);
         syscall1(SYS_CLOSE, c2); syscall1(SYS_CLOSE, p2); syscall1(SYS_CLOSE, p3);
+    }
+
+
+    /* H: UDP SO_REUSEADDR / SO_REUSEPORT share a port; datagrams are spread by sender (REUSEPORT) or go to the newest socket (REUSEADDR) */
+    {
+        int64_t u1 = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0), u2 = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+        int64_t uplain = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+        reuseport(u1); reuseport(u2);
+        check(bind4(u1, 18400) == 0, "H: first SO_REUSEPORT UDP socket binds");
+        check(bind4(u2, 18400) == 0, "H: a second SO_REUSEPORT UDP socket binds the same port");
+        check(bind4(uplain, 18400) == -EADDRINUSE_, "H: a UDP socket without SO_REUSEPORT cannot join the port");
+        {
+            int v = 0; uint32_t l = 4;
+            check(syscall5(SYS_GETSOCKOPT, (uint64_t)u1, SOL_SOCKET, SO_REUSEPORT, (uint64_t)&v, (uint64_t)&l) == 0 && v == 1, "H: SO_REUSEPORT set before bind survives the bind");
+            int64_t tv[2] = { 3, 0 };
+            int64_t ut = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+            syscall5(SYS_SETSOCKOPT, (uint64_t)ut, SOL_SOCKET, SO_RCVTIMEO, (uint64_t)tv, 16);
+            check(bind4(ut, 18401) == 0, "H: bind a socket that has a receive timeout");
+            int64_t got[2] = { 0, 0 }; uint32_t gl = 16;
+            check(syscall5(SYS_GETSOCKOPT, (uint64_t)ut, SOL_SOCKET, SO_RCVTIMEO, (uint64_t)got, (uint64_t)&gl) == 0 && got[0] == 3, "H: SO_RCVTIMEO set before bind survives the bind");
+            syscall1(SYS_CLOSE, (uint64_t)ut);
+        }
+        uint8_t da[16];
+        mk_addr(da, 18400);
+        int cnt1 = 0, cnt2 = 0;
+        int64_t senders[12];
+        for (int i = 0; i < 12; i++) senders[i] = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+        for (int i = 0; i < 12; i++) {
+            char m = 'a' + i;
+            syscall6(SYS_SENDTO, (uint64_t)senders[i], (uint64_t)&m, 1, 0, (uint64_t)da, 16);
+            pump(10);
+            char rb[4];
+            if (syscall6(SYS_RECVFROM, (uint64_t)u1, (uint64_t)rb, 4, MSG_DONTWAIT, 0, 0) == 1) cnt1++;
+            if (syscall6(SYS_RECVFROM, (uint64_t)u2, (uint64_t)rb, 4, MSG_DONTWAIT, 0, 0) == 1) cnt2++;
+        }
+        for (int i = 0; i < 12; i++) syscall1(SYS_CLOSE, (uint64_t)senders[i]);
+        check(cnt1 + cnt2 == 12, "H: every datagram sent to the shared port is received by exactly one of the two sockets");
+        check(cnt1 > 0 && cnt2 > 0, "H: and both sockets get some (spread by sender)");
+        {
+            int64_t snd = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+            int a1 = 0, a2 = 0;
+            for (int i = 0; i < 6; i++) {
+                char m = 'x';
+                syscall6(SYS_SENDTO, (uint64_t)snd, (uint64_t)&m, 1, 0, (uint64_t)da, 16);
+            }
+            pump(20);
+            char rb[4];
+            while (syscall6(SYS_RECVFROM, (uint64_t)u1, (uint64_t)rb, 4, MSG_DONTWAIT, 0, 0) == 1) a1++;
+            while (syscall6(SYS_RECVFROM, (uint64_t)u2, (uint64_t)rb, 4, MSG_DONTWAIT, 0, 0) == 1) a2++;
+            check((a1 == 6 && a2 == 0) || (a1 == 0 && a2 == 6), "H: one sender always reaches the same socket");
+            syscall1(SYS_CLOSE, (uint64_t)snd);
+        }
+        syscall1(SYS_CLOSE, (uint64_t)u1);
+        {
+            int64_t snd = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+            char m = 'q', rb[4];
+            syscall6(SYS_SENDTO, (uint64_t)snd, (uint64_t)&m, 1, 0, (uint64_t)da, 16);
+            pump(20);
+            check(syscall6(SYS_RECVFROM, (uint64_t)u2, (uint64_t)rb, 4, MSG_DONTWAIT, 0, 0) == 1, "H: after one socket closes the other still receives");
+            syscall1(SYS_CLOSE, (uint64_t)snd);
+        }
+        syscall1(SYS_CLOSE, (uint64_t)u2);
+        syscall1(SYS_CLOSE, (uint64_t)uplain);
+        /* SO_REUSEADDR on both: the newest socket takes unicast datagrams */
+        int64_t r1 = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0), r2 = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0), r3 = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+        reuse(r1); reuse(r2);
+        check(bind4(r1, 18402) == 0 && bind4(r2, 18402) == 0, "H: two SO_REUSEADDR UDP sockets share a port");
+        check(bind4(r3, 18402) == -EADDRINUSE_, "H: a third without SO_REUSEADDR cannot");
+        {
+            uint8_t ra[16];
+            mk_addr(ra, 18402);
+            int64_t snd = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+            char m = 'r', rb[4];
+            syscall6(SYS_SENDTO, (uint64_t)snd, (uint64_t)&m, 1, 0, (uint64_t)ra, 16);
+            pump(20);
+            int g1 = (int)syscall6(SYS_RECVFROM, (uint64_t)r1, (uint64_t)rb, 4, MSG_DONTWAIT, 0, 0);
+            int g2 = (int)syscall6(SYS_RECVFROM, (uint64_t)r2, (uint64_t)rb, 4, MSG_DONTWAIT, 0, 0);
+            check(g2 == 1 && g1 != 1, "H: with SO_REUSEADDR the most recently bound socket receives the datagram");
+            syscall1(SYS_CLOSE, (uint64_t)snd);
+        }
+        /* a socket that closes frees its share; the port is released with the last one */
+        syscall1(SYS_CLOSE, (uint64_t)r1); syscall1(SYS_CLOSE, (uint64_t)r2);
+        check(bind4(r3, 18402) == 0, "H: once every sharer closed the port can be bound by anyone");
+        syscall1(SYS_CLOSE, (uint64_t)r3);
+    }
+
+    /* I: when a SO_REUSEPORT listener closes, its not-yet-accepted connections move to the sibling listener instead of being reset */
+    {
+        int64_t l1 = sock4(), l2 = sock4();
+        reuseport(l1); reuseport(l2);
+        check(bind4(l1, 18410) == 0 && bind4(l2, 18410) == 0, "I: two listeners share the port");
+        check(syscall2(SYS_LISTEN, (uint64_t)l1, 16) == 0 && syscall2(SYS_LISTEN, (uint64_t)l2, 16) == 0, "I: both listen");
+        uint8_t ia[16];
+        mk_addr(ia, 18410);
+        int64_t cl[4];
+        for (int k = 0; k < 4; k++) {
+            cl[k] = sock4();
+            syscall3(SYS_CONNECT, (uint64_t)cl[k], (uint64_t)ia, 16);
+        }
+        pump(150);
+        syscall1(SYS_CLOSE, (uint64_t)l1);
+        pump(50);
+        int accepted = 0;
+        for (int round = 0; round < 40 && accepted < 4; round++) {
+            syscall1(SYS_NETPOLL, 0);
+            int64_t ac = syscall4(SYS_ACCEPT4, (uint64_t)l2, 0, 0, 0x800);
+            if (ac >= 0) {
+                accepted++;
+                syscall1(SYS_CLOSE, (uint64_t)ac);
+            } else sleep_ms(5);
+        }
+        check(accepted == 4, "I: all 4 connections, including those queued on the closed listener, are accepted by the survivor");
+        for (int k = 0; k < 4; k++) syscall1(SYS_CLOSE, (uint64_t)cl[k]);
+        syscall1(SYS_CLOSE, (uint64_t)l2);
     }
 
     syscall1(SYS_CLOSE, b);

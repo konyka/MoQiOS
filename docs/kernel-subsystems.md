@@ -2988,3 +2988,4 @@ fork 与不带 `CLONE_VM` 的 clone 用 `inheritCharges` 继承，`CLONE_VM` 线
 
 **libc printf 浮点转换（hello218）**：`lib/moqi_libc/src/fpfmt.h` 把 double 精确展开为十进制数字串再做十进制舍入，`format.c` 的 `f F e E g G a A` 用它输出，
 与 glibc 逐位一致（9067 行表 + 500 万随机格式差分）。无 `long double`。
+- **UDP 端口共享与 TCP 监听者迁移（hello183 H/I）**：UDP 槽位键为 32 位（低 16 位端口，高 16 位区分同端口的套接字，`udp_disc`/`udpKey()`），`udp.rebind` 原位移动注册并保留 `bind` 之前设置的选项；`udp_port_policy` 规定两个都设 `SO_REUSEADDR`、或都设 `SO_REUSEPORT` 且 uid 相同才能共享，数据报在 `SO_REUSEPORT` 全员时按发送方哈希分发，否则交给最新绑定者。TCP 监听者关闭时，未 `accept` 的连接迁移到同端口还有空位的兄弟监听者，无处可去才复位。详见 current-code-review-and-fix-plan.md 文末两节。

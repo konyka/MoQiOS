@@ -625,7 +625,7 @@ fn resourceKeyFromDesc(desc: *const vfs.FileDescriptor) ?u64 {
         .ext2_file => desc.ext2_file_idx,
         .fat32_file => desc.fat32_file_idx,
         .tcp_socket => desc.tcb_idx,
-        .udp_socket => desc.udp_port,
+        .udp_socket => desc.udpKey(),
         .epoll => desc.epoll_idx,
         .unix_socket => desc.unix_sock_idx,
         .timerfd => desc.timerfd_idx,
@@ -844,7 +844,7 @@ fn copyEventFromUser(event_ptr: u64) ?EpollEvent {
 fn resourceIdxFromDesc(desc: *const vfs.FileDescriptor) u32 {
     return switch (desc.fd_type) {
         .tcp_socket => desc.tcb_idx,
-        .udp_socket => desc.udp_port,
+        .udp_socket => desc.udpKey(),
         .pipe_read => desc.pipe_idx,
         .pipe_write => desc.pipe_idx,
         .epoll => desc.epoll_idx,

@@ -101,7 +101,7 @@ const tip = @import("tcp_info_policy.zig");
 
 const SockRef = union(enum) {
     tcp: u32,
-    udp: u16,
+    udp: u32,
     unix: u32,
     raw,
 };
@@ -119,7 +119,7 @@ fn resolveSocket(fd: u64) union(enum) { ok: SockRef, err: i64, v6: SockRef } {
     return switch (d.fd_type) {
         .none => .{ .err = -9 },
         .tcp_socket => .{ .ok = .{ .tcp = d.tcb_idx } },
-        .udp_socket => if (d.udp_is_v6) .{ .v6 = .{ .udp = d.udp_port } } else .{ .ok = .{ .udp = d.udp_port } },
+        .udp_socket => if (d.udp_is_v6) .{ .v6 = .{ .udp = d.udpKey() } } else .{ .ok = .{ .udp = d.udpKey() } },
         .unix_socket => .{ .ok = .{ .unix = d.unix_sock_idx } },
         .raw_socket => .{ .ok = .raw },
         else => .{ .err = -88 },
@@ -599,7 +599,7 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
     var stored: sp.Stored = .{};
     var facts: sp.Facts = .{ .id = sp.identity(.raw, v6) };
     var tcp_idx: ?u32 = null;
-    var udp_clear: ?u16 = null;
+    var udp_clear: ?u32 = null;
     switch (ref) {
         .tcp => |idx| {
             const tcp_mod = @import("tcp.zig");

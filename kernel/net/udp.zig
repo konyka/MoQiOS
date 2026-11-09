@@ -29,7 +29,15 @@ const UdpEntry = struct {
     is_v6: bool,
 };
 
-var ports: [MAX_PORTS]u16 = @splat(0);
+/// Socket key per slot: the local port in the low 16 bits and a discriminator in the high 16 bits. The discriminator is 0 for the first
+/// socket on a port; sockets that share the port (SO_REUSEADDR / SO_REUSEPORT) get the smallest unused nonzero value.
+var ports: [MAX_PORTS]u32 = @splat(0);
+/// Effective uid that bound each slot (SO_REUSEPORT only shares between equal uids) and its bind order (later = larger).
+var port_uid: [MAX_PORTS]u32 = @splat(0);
+var port_seq: [MAX_PORTS]u32 = @splat(0);
+var next_seq: u32 = 1;
+/// Address family of the socket that owns each slot.
+var port_v6: [MAX_PORTS]bool = @splat(false);
 /// Cross-process references per registered port (fork/clone fd-table copy) —
 /// releasePort frees the slot only when the count reaches 0.
 var port_refs: [MAX_PORTS]u16 = @splat(0);
@@ -52,14 +60,14 @@ var port_err: [MAX_PORTS]i32 = @splat(0);
 var port_peer: [MAX_PORTS]u16 = @splat(0);
 
 /// Options of the socket bound to `port`, or null if it is not registered.
-pub fn getPortOpts(port: u16) ?@import("sockopt_policy.zig").Stored {
+pub fn getPortOpts(port: u32) ?@import("sockopt_policy.zig").Stored {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const i = findPortIdxLocked(port) orelse return null;
     return port_opts[i];
 }
 
-pub fn setPortOpts(port: u16, opts: @import("sockopt_policy.zig").Stored) bool {
+pub fn setPortOpts(port: u32, opts: @import("sockopt_policy.zig").Stored) bool {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const i = findPortIdxLocked(port) orelse return false;
@@ -68,7 +76,7 @@ pub fn setPortOpts(port: u16, opts: @import("sockopt_policy.zig").Stored) bool {
 }
 
 /// connect() fixed the peer port of the socket bound to `port`.
-pub fn setPeerPort(port: u16, peer_port: u16) void {
+pub fn setPeerPort(port: u32, peer_port: u16) void {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const i = findPortIdxLocked(port) orelse return;
@@ -77,7 +85,7 @@ pub fn setPeerPort(port: u16, peer_port: u16) void {
 }
 
 /// The pending error (positive errno) of the socket bound to `port`, 0 if none.
-pub fn peekPendingError(port: u16) i32 {
+pub fn peekPendingError(port: u32) i32 {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const i = findPortIdxLocked(port) orelse return 0;
@@ -85,7 +93,7 @@ pub fn peekPendingError(port: u16) i32 {
 }
 
 /// Take (return and clear) the pending error of the socket bound to `port`.
-pub fn takePendingError(port: u16) i32 {
+pub fn takePendingError(port: u32) i32 {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const i = findPortIdxLocked(port) orelse return 0;
@@ -95,7 +103,7 @@ pub fn takePendingError(port: u16) i32 {
 }
 
 /// Clear the pending error only if it still equals `expected` (SO_ERROR read).
-pub fn clearPendingErrorIfEqual(port: u16, expected: i32) void {
+pub fn clearPendingErrorIfEqual(port: u32, expected: i32) void {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const i = findPortIdxLocked(port) orelse return;
@@ -103,35 +111,69 @@ pub fn clearPendingErrorIfEqual(port: u16, expected: i32) void {
 }
 
 /// An ICMP port-unreachable quoted a datagram sent from `local_port` to
-/// `peer_port`: a socket connected to that peer fails with ECONNREFUSED.
+/// `peer_port`: every socket connected to that peer fails with ECONNREFUSED.
 pub fn notifyUnreachable(local_port: u16, peer_port: u16) void {
-    const hit = blk: {
+    var hits: [MAX_PORTS]u32 = undefined;
+    var n: usize = 0;
+    {
         const saved = udp_lock.acquire();
         defer udp_lock.release(saved);
-        const i = findPortIdxLocked(local_port) orelse break :blk false;
-        if (!@import("icmp_unreach_policy.zig").matchesConnected(.{ .src_port = local_port, .dst_port = peer_port }, local_port, port_peer[i] != 0, port_peer[i])) break :blk false;
-        port_err[i] = 111; // ECONNREFUSED
-        break :blk true;
-    };
-    if (hit) @import("epoll.zig").epollNotify(.udp_socket, local_port, @import("epoll.zig").EPOLLERR);
+        for (0..num_ports) |i| {
+            if (portNumber(ports[i]) != local_port) continue;
+            if (!@import("icmp_unreach_policy.zig").matchesConnected(.{ .src_port = local_port, .dst_port = peer_port }, local_port, port_peer[i] != 0, port_peer[i])) continue;
+            port_err[i] = 111; // ECONNREFUSED
+            hits[n] = ports[i];
+            n += 1;
+        }
+    }
+    for (hits[0..n]) |key| @import("epoll.zig").epollNotify(.udp_socket, key, @import("epoll.zig").EPOLLERR);
 }
 
 /// True when a socket is bound to `port`.
 pub fn portBound(port: u16) bool {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
-    return findPortIdxLocked(port) != null;
+    return countPortLocked(port) != 0;
 }
 
 /// Lookup with the lock already held. Callers that use the returned index to
 /// touch `queues` MUST stay in the same critical section: releasePort's
 /// swap-remove reshuffles slots, so an index computed under a previous lock
 /// hold can name a different port's queue by the time it is used (J1).
-fn findPortIdxLocked(port: u16) ?u16 {
+fn findPortIdxLocked(port: u32) ?u16 {
     for (0..num_ports) |i| {
         if (ports[i] == port) return @intCast(i);
     }
     return null;
+}
+
+fn portNumber(key: u32) u16 {
+    return @truncate(key);
+}
+
+/// Number of sockets holding local port `port` (every discriminator).
+fn countPortLocked(port: u16) u32 {
+    var n: u32 = 0;
+    for (0..num_ports) |i| {
+        if (portNumber(ports[i]) == port) n += 1;
+    }
+    return n;
+}
+
+fn newSlotLocked(key: u32, is_v6: bool, uid: u32) u16 {
+    const idx = num_ports;
+    ports[idx] = key;
+    port_refs[idx] = 1;
+    port_opts[idx] = .{};
+    port_err[idx] = 0;
+    port_peer[idx] = 0;
+    port_uid[idx] = uid;
+    port_seq[idx] = next_seq;
+    next_seq +%= 1;
+    port_v6[idx] = is_v6;
+    for (0..QUEUE_DEPTH) |j| queues[idx][j].valid = false;
+    num_ports += 1;
+    return @intCast(idx);
 }
 
 pub fn ensurePort(port: u16) u16 {
@@ -144,39 +186,50 @@ pub fn ensurePort(port: u16) u16 {
     }
 
     if (num_ports >= MAX_PORTS) return 0xFFFF;
-    const idx = num_ports;
-    ports[idx] = port;
-    port_refs[idx] = 1;
-    port_opts[idx] = .{};
-    port_err[idx] = 0;
-    port_peer[idx] = 0;
-    num_ports += 1;
-    return @intCast(idx);
+    return newSlotLocked(port, false, 0);
 }
 
 /// Register `port` only when no socket owns it yet. Returns the new slot
 /// index, 0xFFFE when the port is already registered, 0xFFFF when full.
-pub fn ensurePortExclusive(port: u16) u16 {
+pub fn ensurePortExclusive(port: u16, is_v6: bool, uid: u32) u16 {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
 
-    for (0..num_ports) |i| {
-        if (ports[i] == port) return 0xFFFE;
-    }
-
+    if (countPortLocked(port) != 0) return 0xFFFE;
     if (num_ports >= MAX_PORTS) return 0xFFFF;
-    const idx = num_ports;
-    ports[idx] = port;
-    port_refs[idx] = 1;
-    port_opts[idx] = .{};
-    port_err[idx] = 0;
-    port_peer[idx] = 0;
-    num_ports += 1;
-    return @intCast(idx);
+    return newSlotLocked(port, is_v6, uid);
+}
+
+/// bind() on a UDP socket already registered under `old_key`: move it to `new_port`, keeping its options (SO_REUSEADDR / SO_REUSEPORT are
+/// set before bind). A port another socket holds can be joined only when the sharing policy allows it with every holder. On success returns
+/// 0 and the socket's new discriminator in `out_disc`; -98 (EADDRINUSE) when the port is taken or the table is full, -9 when `old_key` is gone.
+pub fn rebind(old_key: u32, new_port: u16, uid: u32, out_disc: *u16) i64 {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+
+    const oi = findPortIdxLocked(old_key) orelse return -9;
+    if (portNumber(old_key) == new_port) {
+        out_disc.* = @truncate(old_key >> 16);
+        return 0;
+    }
+    const mine = port_opts[oi];
+    var used: u32 = 0;
+    for (0..num_ports) |j| {
+        if (portNumber(ports[j]) != new_port) continue;
+        if (!@import("udp_port_policy.zig").mayShare(mine.flags, port_opts[j].flags, uid, port_uid[j])) return -98;
+        used |= @as(u32, 1) << @intCast(ports[j] >> 16);
+    }
+    if (num_ports >= MAX_PORTS) return -98;
+    const disc: u16 = @intCast(@ctz(~used));
+    const ni = newSlotLocked(new_port | (@as(u32, disc) << 16), port_v6[oi], uid);
+    port_opts[ni] = mine;
+    releaseLocked(old_key);
+    out_disc.* = disc;
+    return 0;
 }
 
 /// Add a cross-process reference to a registered port (fork/clone).
-pub fn retainPort(port: u16) void {
+pub fn retainPort(port: u32) void {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     for (0..num_ports) |i| {
@@ -190,10 +243,13 @@ pub fn retainPort(port: u16) void {
 /// Deregister `port`, freeing its slot and dropping any queued datagrams.
 /// Swap-remove keeps slots dense; each queue travels with its port.
 /// A port shared across fork/clone survives until the last reference drops.
-pub fn releasePort(port: u16) void {
+pub fn releasePort(port: u32) void {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
+    releaseLocked(port);
+}
 
+fn releaseLocked(port: u32) void {
     for (0..num_ports) |i| {
         if (ports[i] == port) {
             if (port_refs[i] > 1) {
@@ -206,6 +262,9 @@ pub fn releasePort(port: u16) void {
             port_opts[i] = port_opts[num_ports];
             port_err[i] = port_err[num_ports];
             port_peer[i] = port_peer[num_ports];
+            port_uid[i] = port_uid[num_ports];
+            port_seq[i] = port_seq[num_ports];
+            port_v6[i] = port_v6[num_ports];
             port_err[num_ports] = 0;
             port_peer[num_ports] = 0;
             queues[i] = queues[num_ports];
@@ -220,7 +279,7 @@ pub fn releasePort(port: u16) void {
 }
 
 /// True when a datagram of the given address family is queued for `port`.
-pub fn hasQueuedDatagramFor(port: u16, is_v6: bool) bool {
+pub fn hasQueuedDatagramFor(port: u32, is_v6: bool) bool {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const port_idx = findPortIdxLocked(port) orelse return false;
@@ -231,7 +290,7 @@ pub fn hasQueuedDatagramFor(port: u16, is_v6: bool) bool {
 }
 
 /// True when a datagram is queued for `port` (epoll readiness).
-pub fn hasQueuedDatagram(port: u16) bool {
+pub fn hasQueuedDatagram(port: u32) bool {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const port_idx = findPortIdxLocked(port) orelse return false;
@@ -243,7 +302,7 @@ pub fn hasQueuedDatagram(port: u16) bool {
 
 /// Length of the datagram the next recvFromEx/recvFromV6Ex on `port` would
 /// return (FIONREAD); 0 when none is queued for that address family.
-pub fn nextDatagramLen(port: u16, is_v6: bool) u32 {
+pub fn nextDatagramLen(port: u32, is_v6: bool) u32 {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const port_idx = findPortIdxLocked(port) orelse return 0;
@@ -254,17 +313,43 @@ pub fn nextDatagramLen(port: u16, is_v6: bool) u32 {
     return 0;
 }
 
-/// J1: the port lookup and the queue insert share one critical section.
+/// J1: the socket choice and the queue insert share one critical section.
 /// Previously the caller looked the index up under its own lock hold and
 /// passed it here; a concurrent releasePort swap-remove in between could
 /// point the index at a different port's queue, delivering the datagram to
 /// the wrong socket (or effectively dropping it for the real owner).
+/// Sockets sharing the port (SO_REUSEADDR / SO_REUSEPORT) are told apart by udp_port_policy.pickReceiver.
 fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, payload: []const u8, is_v6: bool) void {
+    var notify_key: u32 = 0;
     const was_inserted = blk: {
         const saved = udp_lock.acquire();
         defer udp_lock.release(saved);
 
-        const port_idx = findPortIdxLocked(port) orelse break :blk false;
+        const policy = @import("udp_port_policy.zig");
+        var cand: [MAX_PORTS]u16 = undefined;
+        var flags: [MAX_PORTS]u16 = undefined;
+        var seqs: [MAX_PORTS]u32 = undefined;
+        var n: usize = 0;
+        for (0..num_ports) |i| {
+            if (portNumber(ports[i]) == port and port_v6[i] == is_v6) {
+                cand[n] = @intCast(i);
+                flags[n] = port_opts[i].flags;
+                seqs[n] = port_seq[i];
+                n += 1;
+            }
+        }
+        if (n == 0) {
+            for (0..num_ports) |i| {
+                if (portNumber(ports[i]) == port) {
+                    cand[n] = @intCast(i);
+                    flags[n] = port_opts[i].flags;
+                    seqs[n] = port_seq[i];
+                    n += 1;
+                }
+            }
+        }
+        if (n == 0) break :blk false;
+        const port_idx = cand[policy.pickReceiver(flags[0..n], seqs[0..n], src_ip, src_port)];
         const actual = @min(payload.len, MAX_UDP_PAYLOAD);
         for (0..QUEUE_DEPTH) |i| {
             if (!queues[port_idx][i].valid) {
@@ -275,6 +360,7 @@ fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, payload: []c
                 @memcpy(queues[port_idx][i].data[0..actual], payload[0..actual]);
                 queues[port_idx][i].is_v6 = is_v6;
                 queues[port_idx][i].valid = true;
+                notify_key = ports[port_idx];
                 break :blk true;
             }
         }
@@ -287,7 +373,7 @@ fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, payload: []c
     // list (readiness is only re-probed on epoll_ctl and ready-list drain),
     // so epoll_wait blocks forever even though a datagram is queued. Notified
     // with udp_lock released — epollNotify walks pool/instance locks.
-    @import("epoll.zig").epollNotify(.udp_socket, port, @import("epoll.zig").EPOLLIN);
+    @import("epoll.zig").epollNotify(.udp_socket, notify_key, @import("epoll.zig").EPOLLIN);
 }
 
 pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) void {
@@ -374,7 +460,7 @@ fn sendPortUnreachableV6(src_ip: [16]u8, dst_ip: [16]u8, udp: [*]const u8, udp_l
     _ = lo.sendPacket(&pkt, frame_len);
 }
 
-pub fn recvFrom(port: u16, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, out_src_port: *u16) i64 {
+pub fn recvFrom(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, out_src_port: *u16) i64 {
     var full_len: u16 = 0;
     return recvFromEx(port, out_buf, out_len, out_src_ip, out_src_port, &full_len, false);
 }
@@ -384,7 +470,7 @@ pub fn recvFrom(port: u16, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, out
 /// count (min of full length and out_len), 0 when no datagram is queued.
 /// `out_full_len` always receives the untruncated datagram length so the
 /// caller can implement MSG_TRUNC.
-pub fn recvFromEx(port: u16, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, out_src_port: *u16, out_full_len: *u16, peek: bool) i64 {
+pub fn recvFromEx(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, out_src_port: *u16, out_full_len: *u16, peek: bool) i64 {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
 
@@ -406,14 +492,14 @@ pub fn recvFromEx(port: u16, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, o
 }
 
 /// Drain one IPv6 datagram for `port` (SK-70).
-pub fn recvFromV6(port: u16, out_buf: [*]u8, out_src_ip: *[16]u8, out_src_port: *u16) i64 {
+pub fn recvFromV6(port: u32, out_buf: [*]u8, out_src_ip: *[16]u8, out_src_port: *u16) i64 {
     var full_len: u16 = 0;
     return recvFromV6Ex(port, out_buf, MAX_UDP_PAYLOAD_V6, out_src_ip, out_src_port, &full_len, false);
 }
 
 /// recvFromV6 variant with an explicit output cap, full-length reporting
 /// and optional peek — same contract as recvFromEx.
-pub fn recvFromV6Ex(port: u16, out_buf: [*]u8, out_len: u16, out_src_ip: *[16]u8, out_src_port: *u16, out_full_len: *u16, peek: bool) i64 {
+pub fn recvFromV6Ex(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[16]u8, out_src_port: *u16, out_full_len: *u16, peek: bool) i64 {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
 

@@ -72,6 +72,18 @@ pub fn socket(domain: u32, type_and_flags: u32, protocol: u32) i64 {
     return fd;
 }
 
+/// bind() of a UDP socket to `new_port`: the registration moves with its options, joining a port other sockets hold only when
+/// udp_port_policy allows it (both SO_REUSEADDR, or both SO_REUSEPORT with the same uid). The ephemeral port from socket() is dropped.
+fn udpRebind(t: *task_mod.Task, fd: u32, new_port: u16) i64 {
+    const d = &t.fd_table.fds[fd];
+    var disc: u16 = 0;
+    const rc = udp.rebind(d.udpKey(), new_port, t.euid, &disc);
+    if (rc != 0) return rc;
+    d.udp_port = new_port;
+    d.udp_disc = disc;
+    return 0;
+}
+
 fn socketCreate(domain: u32, sock_type: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
@@ -96,7 +108,7 @@ fn socketCreate(domain: u32, sock_type: u32) i64 {
             // ensurePortExclusive: an already-registered port (0xFFFE) must be
             // skipped — plain ensurePort would hand the new socket the EXISTING
             // slot, sharing the first socket's receive queue and refcount.
-            const idx = udp.ensurePortExclusive(port);
+            const idx = udp.ensurePortExclusive(port, false, t.euid);
             switch (udp_util.scanAction(idx)) {
                 .skip_in_use => continue,
                 .abort_full => return -1,
@@ -141,7 +153,7 @@ fn socketCreate(domain: u32, sock_type: u32) i64 {
             var port6: u16 = 49152;
             while (port6 < 65535) : (port6 += 1) {
                 // Same exclusivity rule as the IPv4 scan above.
-                const idx6 = udp.ensurePortExclusive(port6);
+                const idx6 = udp.ensurePortExclusive(port6, true, t.euid);
                 switch (udp_util.scanAction(idx6)) {
                     .skip_in_use => continue,
                     .abort_full => return -1,
@@ -254,15 +266,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
             const parsed = sa.parseInet6(&sa6) orelse return -97; // EAFNOSUPPORT
             if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;
             if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
-            const cur_port = t.fd_table.fds[fd].udp_port;
-            if (parsed.port != cur_port) {
-                // EADDRINUSE when another socket owns the port (0xFFFE) or the
-                // port table is full (0xFFFF).
-                if (udp.ensurePortExclusive(parsed.port) >= 0xFFFE) return -98;
-                udp.releasePort(cur_port); // drop the ephemeral port from socket()
-                t.fd_table.fds[fd].udp_port = parsed.port;
-            }
-            return 0;
+            return udpRebind(t, fd, parsed.port);
         }
         if (addr_len < SOCKADDR_IN_MIN_LEN) return -22;
         var sock_addr: [sa.SOCKADDR_IN_LEN]u8 = undefined;
@@ -272,15 +276,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         const new_port = bo.readU16BeAt(&sock_addr, 2);
         if (bindAddrNotAvail4(.{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] })) return bind_addr_policy.EADDRNOTAVAIL;
         if (net_mod.tcp_port_policy.bindNeedsPrivilege(new_port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
-        const cur_port = t.fd_table.fds[fd].udp_port;
-        if (new_port != cur_port) {
-            // EADDRINUSE when another socket owns the port (0xFFFE) or the
-            // port table is full (0xFFFF).
-            if (udp.ensurePortExclusive(new_port) >= 0xFFFE) return -98;
-            udp.releasePort(cur_port); // drop the ephemeral port from socket()
-            t.fd_table.fds[fd].udp_port = new_port;
-        }
-        return 0;
+        return udpRebind(t, fd, new_port);
     }
 
     if (t.fd_table.fds[fd].fd_type != .tcp_socket) return -88; // ENOTSOCK
@@ -437,7 +433,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         const is_v6 = t.fd_table.fds[fd].udp_is_v6;
         const src_port = t.fd_table.fds[fd].udp_port;
         // A pending ICMP error (port unreachable) fails this send, once.
-        const pending_send_err = udp.takePendingError(src_port);
+        const pending_send_err = udp.takePendingError(t.fd_table.fds[fd].udpKey());
         if (pending_send_err != 0) return -@as(i64, pending_send_err);
         if (is_v6) {
             var tmp6: [1232]u8 = undefined;
@@ -526,7 +522,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
 /// expired SO_RCVTIMEO, -EINTR when a signal ended the wait. The wait is a
 /// series of short sleeps that also pump the loopback device, so a datagram
 /// sent from another process on 127/8 arrives without an explicit net_poll.
-fn udpWaitForDatagram(port: u16, is_v6: bool, nonblock: bool) i64 {
+fn udpWaitForDatagram(port: u32, is_v6: bool, nonblock: bool) i64 {
     const urp = @import("udp_recv_policy.zig");
     const tsc = @import("../arch/arch.zig").tsc;
     const lo = @import("lo.zig");
@@ -646,12 +642,12 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
     } else if (t.fd_table.fds[fd].fd_type == .udp_socket) {
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         const is_v6 = t.fd_table.fds[fd].udp_is_v6;
-        const src_port = t.fd_table.fds[fd].udp_port;
+        const sock_key = t.fd_table.fds[fd].udpKey();
         // An ICMP port-unreachable for what this connected socket sent is
         // reported once, before any queued data (Linux: the next call fails).
-        const pending = udp.takePendingError(src_port);
+        const pending = udp.takePendingError(sock_key);
         if (pending != 0) return -@as(i64, pending);
-        const wait_rc = udpWaitForDatagram(src_port, is_v6, @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, flags));
+        const wait_rc = udpWaitForDatagram(sock_key, is_v6, @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, flags));
         if (wait_rc != 0) return wait_rc;
         var user_addr_len: u32 = 0;
         if (addr_ptr != 0) {
@@ -671,7 +667,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
             var src6: [16]u8 = @splat(0);
             var src_port_out6: u16 = 0;
             var full_len6: u16 = 0;
-            const result6 = udp.recvFromV6Ex(src_port, &tmp6, @intCast(tmp6.len), &src6, &src_port_out6, &full_len6, msg_peek);
+            const result6 = udp.recvFromV6Ex(sock_key, &tmp6, @intCast(tmp6.len), &src6, &src_port_out6, &full_len6, msg_peek);
             if (result6 > 0) {
                 const to_write6 = @min(@as(u32, @intCast(result6)), to_read6);
                 if (copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp6))[0..to_write6], to_write6) != to_write6) return -14;
@@ -702,7 +698,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         var src_ip: [4]u8 = .{ 0, 0, 0, 0 };
         var src_port_out: u16 = 0;
         var full_len: u16 = 0;
-        const result2 = udp.recvFromEx(src_port, &tmp_buf2, @intCast(tmp_buf2.len), &src_ip, &src_port_out, &full_len, msg_peek);
+        const result2 = udp.recvFromEx(sock_key, &tmp_buf2, @intCast(tmp_buf2.len), &src_ip, &src_port_out, &full_len, msg_peek);
         if (result2 > 0) {
             const to_write = @min(@as(u32, @intCast(result2)), to_read2);
             if (copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf2))[0..to_write], to_write) != to_write) return -14;
@@ -777,7 +773,7 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
             t.fd_table.fds[fd].udp_connected = true;
             t.fd_table.fds[fd].udp_dst_ip6 = parsed.addr;
             t.fd_table.fds[fd].udp_dst_port = parsed.port;
-            udp.setPeerPort(t.fd_table.fds[fd].udp_port, parsed.port);
+            udp.setPeerPort(t.fd_table.fds[fd].udpKey(), parsed.port);
             return 0;
         }
         if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, false)) return -22;
@@ -789,7 +785,7 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         t.fd_table.fds[fd].udp_connected = true;
         t.fd_table.fds[fd].udp_dst_ip = dst_ip;
         t.fd_table.fds[fd].udp_dst_port = dst_port;
-        udp.setPeerPort(t.fd_table.fds[fd].udp_port, dst_port);
+        udp.setPeerPort(t.fd_table.fds[fd].udpKey(), dst_port);
         return 0;
     }
 
@@ -1245,7 +1241,7 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
     if (iov_len != 0 and (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000)) return -14;
     const d = &cur.fd_table.fds[fd];
     const is_v6 = d.udp_is_v6;
-    const port = d.udp_port;
+    const port = d.udpKey();
     const wait_rc = udpWaitForDatagram(port, is_v6, @import("../fs/namespace_policy.zig").nonblockRequested(d.status_flags, flags));
     if (wait_rc != 0) return wait_rc;
 

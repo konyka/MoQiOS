@@ -9600,10 +9600,10 @@ test "icmp port unreachable: reply decision, quote length and matching" {
 }
 
 test "udp: the pending error is consulted by recv, SO_ERROR and readiness" {
-    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "udp.takePendingError(src_port)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "udp.takePendingError(sock_key)") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.epoll_source, "peekPendingError(@intCast(resource_idx))") != null);
     try std.testing.expect(std.mem.count(u8, kt.socket_syscall_source, "udp.setPeerPort(") >= 2);
-    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "pending_send_err = udp.takePendingError(src_port)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "pending_send_err = udp.takePendingError(t.fd_table.fds[fd].udpKey())") != null);
 }
 
 test "poll timeout write-back: remaining time arithmetic and unit split" {
@@ -10744,7 +10744,7 @@ test "TCP bind errors and SO_REUSEADDR sharing" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n        return net_mod.tcp.tcpBind(tcb_idx, parsed.port);"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n    return net_mod.tcp.tcpBind(tcb_idx, port);"));
     // UDP (IPv4 and IPv6) refuses a privileged port the same way; no bare -1 is left in any bind path.
-    try std.testing.expect(std.mem.indexOf(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n            const cur_port = t.fd_table.fds[fd].udp_port;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n            return udpRebind(t, fd, parsed.port);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(new_port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;") != null);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ss, "!cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return -1;"));
     // hello183 runs as uid 0 with only CAP_SETUID so the child's setuid leaves it unprivileged.
@@ -11771,4 +11771,62 @@ test "epoll nesting depth: EP_MAX_NESTS = 4 edges counted below the added epoll 
     const cyc = std.mem.indexOf(u8, es, "if (nestedChainReaches(target.instance, epfd_idx)) {") orelse return error.TestUnexpectedResult;
     const dep = std.mem.indexOf(u8, es, "epoll_policy.nestDepthExceeded(nestedDepthBelow(target.instance), nestedDepthAbove(epfd_idx))") orelse return error.TestUnexpectedResult;
     try std.testing.expect(cyc < dep);
+}
+
+test "udp port sharing: both SO_REUSEADDR, or both SO_REUSEPORT with one uid" {
+    const p = kt.udp_port_policy;
+    try std.testing.expect(p.mayShare(1, 1, 0, 1000));
+    try std.testing.expect(p.mayShare(8, 8, 5, 5));
+    try std.testing.expect(!p.mayShare(8, 8, 5, 6));
+    try std.testing.expect(!p.mayShare(8, 0, 5, 5));
+    try std.testing.expect(!p.mayShare(0, 8, 5, 5));
+    try std.testing.expect(!p.mayShare(1, 0, 0, 0));
+    try std.testing.expect(!p.mayShare(0, 0, 0, 0));
+    try std.testing.expect(!p.mayShare(1, 8, 0, 0));
+}
+
+test "udp port sharing: reuseport receiver is stable per peer and covers every socket" {
+    const p = kt.udp_port_policy;
+    const flags = [_]u16{ 8, 8, 8 };
+    const seqs = [_]u32{ 7, 3, 9 };
+    var ip: [16]u8 = @splat(0);
+    ip[0] = 127;
+    ip[3] = 1;
+    var hit = [_]bool{ false, false, false };
+    var port: u16 = 49152;
+    while (port < 49252) : (port += 1) {
+        const a = p.pickReceiver(&flags, &seqs, ip, port);
+        try std.testing.expectEqual(a, p.pickReceiver(&flags, &seqs, ip, port));
+        try std.testing.expect(a < 3);
+        hit[a] = true;
+    }
+    try std.testing.expect(hit[0] and hit[1] and hit[2]);
+    try std.testing.expectEqual(@as(usize, 0), p.pickReceiver(flags[0..1], seqs[0..1], ip, 1));
+}
+
+test "udp port sharing: without SO_REUSEPORT on every socket the newest bound one receives" {
+    const p = kt.udp_port_policy;
+    const ip: [16]u8 = @splat(0);
+    try std.testing.expectEqual(@as(usize, 2), p.pickReceiver(&[_]u16{ 1, 1, 1 }, &[_]u32{ 7, 3, 9 }, ip, 5));
+    try std.testing.expectEqual(@as(usize, 0), p.pickReceiver(&[_]u16{ 1, 1, 8 }, &[_]u32{ 10, 3, 9 }, ip, 5));
+}
+
+test "udp: bind moves the registration with its options and sharing goes through udp.rebind" {
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "pub fn rebind(old_key: u32, new_port: u16, uid: u32, out_disc: *u16) i64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "@import(\"udp_port_policy.zig\").mayShare(mine.flags, port_opts[j].flags, uid, port_uid[j])") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "port_opts[ni] = mine;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "policy.pickReceiver(flags[0..n], seqs[0..n], src_ip, src_port)") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "return udpRebind(t, fd,"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ss, "udp.ensurePortExclusive(parsed.port)"));
+}
+
+test "tcp: a closing SO_REUSEPORT listener hands its backlog to a sibling before dropping it" {
+    const ts = kt.tcp_source;
+    const dis = std.mem.indexOf(u8, ts, "ls.active = false;\n            while (ls.pending_head != ls.pending_tail) {") orelse return error.TestUnexpectedResult;
+    const mig = std.mem.indexOf(u8, ts, "if (migrateToSiblingListener(ls, pidx)) continue;\n                dropUnacceptedChild(&tcbs[pidx]);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(dis < mig);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (sib == from or sib.local_port != from.local_port or sib.is_v6 != from.is_v6) continue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (sib.pending_tail -% sib.pending_head >= LISTEN_BACKLOG) continue;") != null);
 }

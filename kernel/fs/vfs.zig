@@ -701,6 +701,8 @@ pub const FileDescriptor = struct {
     /// slots with -EIO.
     devfs_generation: u32 = 0,
     udp_port: u16 = 0,
+    /// Distinguishes sockets that share one local port (SO_REUSEADDR / SO_REUSEPORT); 0 for the first socket on a port.
+    udp_disc: u16 = 0,
     udp_connected: bool = false,
     udp_is_v6: bool = false,
     udp_dst_ip: [4]u8 = .{ 0, 0, 0, 0 },
@@ -718,6 +720,11 @@ pub const FileDescriptor = struct {
     /// Path of a .mount_dir descriptor (the directory above one or more mount points), normalised, with its length.
     mount_dir_path: [MOUNT_TARGET_MAX]u8 = @splat(0),
     mount_dir_len: u8 = 0,
+
+    /// Registry key of a UDP socket in net/udp.zig: local port in the low 16 bits, discriminator above.
+    pub fn udpKey(self: *const FileDescriptor) u32 {
+        return @as(u32, self.udp_port) | (@as(u32, self.udp_disc) << 16);
+    }
 };
 
 const TRANSFER_HOLD_MASK: u32 = 0x3FFF_FFFF;
@@ -2006,7 +2013,7 @@ pub const FdTable = struct {
                     self.slot_locks[i].release(flags);
                     return true;
                 },
-                .udp_socket => if (other.udp_port == desc.udp_port) {
+                .udp_socket => if (other.udpKey() == desc.udpKey()) {
                     self.slot_locks[i].release(flags);
                     return true;
                 },
@@ -2137,7 +2144,7 @@ pub const FdTable = struct {
         }
         if (desc.fd_type == .udp_socket) {
             const udp = @import("../net/udp.zig");
-            udp.releasePort(desc.udp_port);
+            udp.releasePort(desc.udpKey());
         }
         if (desc.fd_type == .epoll) {
             const epoll_mod = @import("../net/epoll.zig");
@@ -2427,7 +2434,7 @@ fn retainResource(desc: *const FileDescriptor) bool {
         .fat32_file => @import("fat32.zig").retainFile(desc.fat32_file_idx),
         .tmpfs_file => @import("tmpfs.zig").tmpfsRetain(@intCast(desc.tmpfs_idx)),
         .tcp_socket => @import("../net/tcp.zig").tcpRetain(desc.tcb_idx),
-        .udp_socket => @import("../net/udp.zig").retainPort(desc.udp_port),
+        .udp_socket => @import("../net/udp.zig").retainPort(desc.udpKey()),
         .epoll => @import("../net/epoll.zig").epollRetain(desc.epoll_idx),
         .unix_socket => @import("../net/unix_socket.zig").unixRetain(desc.unix_sock_idx),
         .timerfd => @import("../ipc/timerfd.zig").timerfdRetain(desc.timerfd_idx),
@@ -2446,7 +2453,7 @@ fn releaseResource(desc: *const FileDescriptor) void {
         .fat32_file => @import("fat32.zig").closeFile(desc.fat32_file_idx),
         .tmpfs_file => @import("tmpfs.zig").tmpfsClose(@intCast(desc.tmpfs_idx)),
         .tcp_socket => _ = @import("../net/tcp.zig").tcpClose(desc.tcb_idx),
-        .udp_socket => @import("../net/udp.zig").releasePort(desc.udp_port),
+        .udp_socket => @import("../net/udp.zig").releasePort(desc.udpKey()),
         .epoll => @import("../net/epoll.zig").epollDestroy(desc.epoll_idx),
         .unix_socket => @import("../net/unix_socket.zig").unixCloseAndReap(desc.unix_sock_idx),
         .timerfd => @import("../ipc/timerfd.zig").timerfdClose(desc.timerfd_idx),
@@ -2519,7 +2526,7 @@ pub fn retainSharedResources(table: *FdTable) void {
             switch (desc.fd_type) {
                 .ext2_file => seen = other.ext2_file_idx == desc.ext2_file_idx,
                 .tcp_socket => seen = other.tcb_idx == desc.tcb_idx,
-                .udp_socket => seen = other.udp_port == desc.udp_port,
+                .udp_socket => seen = other.udpKey() == desc.udpKey(),
                 .epoll => seen = other.epoll_idx == desc.epoll_idx,
                 .unix_socket => seen = other.unix_sock_idx == desc.unix_sock_idx,
                 .timerfd => seen = other.timerfd_idx == desc.timerfd_idx,
@@ -2535,7 +2542,7 @@ pub fn retainSharedResources(table: *FdTable) void {
                 const tcp = @import("../net/tcp.zig");
                 tcp.tcpRetain(desc.tcb_idx);
             },
-            .udp_socket => @import("../net/udp.zig").retainPort(desc.udp_port),
+            .udp_socket => @import("../net/udp.zig").retainPort(desc.udpKey()),
             .epoll => @import("../net/epoll.zig").epollRetain(desc.epoll_idx),
             .unix_socket => @import("../net/unix_socket.zig").unixRetain(desc.unix_sock_idx),
             .timerfd => @import("../ipc/timerfd.zig").timerfdRetain(desc.timerfd_idx),

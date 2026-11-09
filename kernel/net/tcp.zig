@@ -518,6 +518,24 @@ fn dropUnacceptedChild(child: *TcpTcb) void {
     deactivateTcb(child);
 }
 
+/// A backlog child of a closing SO_REUSEPORT listener moves to another listener on the same port that still has room (Linux migrates
+/// requests the same way); false when no sibling can take it, and the child is dropped as before.
+fn migrateToSiblingListener(from: *const ListenSlot, child_idx: u32) bool {
+    var lbm = listen_active_bitmap;
+    while (lbm != 0) {
+        const i = @ctz(lbm);
+        lbm &= lbm - 1;
+        const sib = &listen_slots[i];
+        if (sib == from or sib.local_port != from.local_port or sib.is_v6 != from.is_v6) continue;
+        if (sib.pending_tail -% sib.pending_head >= LISTEN_BACKLOG) continue;
+        sib.pending_tpbs[sib.pending_tail % LISTEN_BACKLOG] = child_idx;
+        sib.pending_tail += 1;
+        tcbs[child_idx].owner_task = sib.owner_task;
+        return true;
+    }
+    return false;
+}
+
 /// Stop a listener: clear its listen slot so the port stops answering SYNs, and reset or free the backlog children nobody can
 /// accept anymore. Caller holds tcp_lock and then marks the listener TCB closed.
 fn stopListening(tcb: *TcpTcb) void {
@@ -527,13 +545,15 @@ fn stopListening(tcb: *TcpTcb) void {
         lbm &= lbm - 1;
         const ls = &listen_slots[i];
         if (ls.tcb_idx == tcbIdx(tcb)) {
+            listen_active_bitmap &= ~(@as(u64, 1) << @intCast(i));
+            ls.active = false;
             while (ls.pending_head != ls.pending_tail) {
                 const pidx = ls.pending_tpbs[ls.pending_head % LISTEN_BACKLOG];
                 ls.pending_head += 1;
-                if (pidx < MAX_CONNECTIONS and tcbs[pidx].active) dropUnacceptedChild(&tcbs[pidx]);
+                if (pidx >= MAX_CONNECTIONS or !tcbs[pidx].active) continue;
+                if (migrateToSiblingListener(ls, pidx)) continue;
+                dropUnacceptedChild(&tcbs[pidx]);
             }
-            listen_active_bitmap &= ~(@as(u64, 1) << @intCast(i));
-            ls.active = false;
             break;
         }
     }

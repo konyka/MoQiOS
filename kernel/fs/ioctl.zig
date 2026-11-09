@@ -248,7 +248,7 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
                     .udp_socket => {
                         // Linux: size of the next pending datagram, not the queue total.
                         const udp_mod = @import("../net/udp.zig");
-                        nread = @intCast(udp_mod.nextDatagramLen(desc.udp_port, desc.udp_is_v6));
+                        nread = @intCast(udp_mod.nextDatagramLen(desc.udpKey(), desc.udp_is_v6));
                     },
                     .unix_socket => {
                         const unix_mod = @import("../net/unix_socket.zig");
