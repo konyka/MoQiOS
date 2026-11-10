@@ -456,6 +456,18 @@ void _start(void) {
         int pathok = g2 == 2 && fl >= el;
         for (uint64_t i = 0; i + 2 < el && pathok; i++) if (from.path[i] != exp.path[i]) pathok = 0;
         check(pathok, "I: recvfrom reports a path-bound sender's name as the source address");
+        /* 40 datagrams queued before any is read (more than a fixed table of remembered names): each one still reports its sender */
+        int named = 0;
+        for (int k = 0; k < 40; k++) syscall6(SYS_SENDTO, (uint64_t)bs, (uint64_t)"q", 1, 0, (uint64_t)&srv, sl);
+        for (int k = 0; k < 40; k++) {
+            fl = sizeof from;
+            for (unsigned i = 0; i < sizeof from; i++) ((char *)&from)[i] = 0;
+            int64_t gq = syscall6(SYS_RECVFROM, (uint64_t)rcv, (uint64_t)rb, 8, 0, (uint64_t)&from, (uint64_t)&fl);
+            int ok = gq == 1 && fl >= el;
+            for (uint64_t i = 0; i + 2 < el && ok; i++) if (from.path[i] != exp.path[i]) ok = 0;
+            if (ok) named++;
+        }
+        check(named == 40, "I: every one of 40 queued datagrams reports the sender's name");
         syscall1(SYS_CLOSE, (uint64_t)bs);
         syscall1(SYS_UNLINK, (uint64_t)"/tmp/h134i.sock");
         int64_t plain = syscall3(SYS_SOCKET, AF_UNIX, SOCK_DGRAM, 0);

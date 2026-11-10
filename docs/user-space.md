@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello272`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello273`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -267,7 +267,8 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello269 | 已结束的连接不会耗尽 TCB 表：一个本机监听者，100 轮 `connect`/`accept`/双向 `close`（每轮留下一个 15 秒的 TIME_WAIT），`socket()` 与 `connect` 始终成功，且没有任何一轮卡住几秒（表满时等 TIME_WAIT 到期） |
 | hello270 | `O_APPEND` 锁按文件分片：四个进程各向自己的文件写 200 次 4 KiB，普通写与 `O_APPEND` 写各一遍（tmpfs、FAT32、ext2），`O_APPEND` 的耗时不超过普通写的 3 倍加 300 毫秒（改成按文件分片之前慢 15 到 58 倍）；tmpfs 一行只是测量 |
 | hello271 | `fork` 之后子进程继承父进程在 `fork` 之前打开的描述符：管道和普通文件，子进程的写分别到达父进程和文件（回归保护；`pipe2` 写回两个 32 位整数） |
-| hello272 | 40 个同时打开的本机 TCP 连接（80 个 TCB，超过旧的 64 槽表）：全部被接受、同时保持打开、每条都能传一个字节；客户端在子进程里（每个进程 64 个描述符） |
+| hello272 | 40 个同时打开的本机 TCP 连接（80 个 TCB，超过旧的 64 槽表）：全部被接受、同时保持打开、每条都能传一个字节；客户端在子进程里，让每个进程都远低于描述符上限 |
+| hello273 | 一个进程超过 64 个描述符：`RLIMIT_NOFILE` 软上限不小于 100，同时打开 50 个管道共 100 个描述符（旧的管道池只有 16 个），每个管道都能传一个字节，`/proc/self/status` 的 `FDSize` 覆盖最高描述符，`dup2` 到 120 成功 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。

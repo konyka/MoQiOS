@@ -12022,8 +12022,11 @@ test "AF_UNIX datagrams remember their sender's bound name for recvfrom / recvms
     const us = kt.unix_socket_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "if (sock.sock_type == SOCK_DGRAM) pushSrcNameLocked(peer, sock);") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "const src = popSrcNameLocked(sock);") != null);
-    // A record is matched to its name by sequence number, so a dropped or unnamed record never shifts names onto other records.
-    try std.testing.expect(std.mem.indexOf(u8, us, "if (sock.src_count == 0 or sock.src_names[sock.src_head].seq != seq) return .{};") != null);
+    // Every queued record keeps a one-byte reference to a deduplicated, refcounted name entry: there is no fixed cap on remembered records,
+    // and a name entry is freed when its last record is read.
+    try std.testing.expect(std.mem.indexOf(u8, us, "pub const MAX_RECORDS: u32 = UNIX_SOCK_BUF_SIZE / 2;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "peer.rec_src[(peer.rec_head + peer.rec_count) % MAX_RECORDS] = slot;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "e.refs -= 1;") != null);
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "const rc = copySockaddrToUser(addr_ptr, addr_len_ptr, nb[0..nl], nl);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "const rname_ptr: u64 = bo.readU64At(msghdr, 0);") != null);
@@ -12099,4 +12102,19 @@ test "tcp accept: a connection still in its handshake stays queued and does not 
     try std.testing.expect(std.mem.indexOf(u8, ts, "tcp_port_policy.pickAcceptable(kinds[0..n])") != null);
     // Every live entry other than the chosen one stays queued (an established child behind the chosen one must not be lost).
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (pick != null and j == pick.?) continue;\n        if (k != .dead) {") != null);
+}
+
+test "NOFILE allocation over several bitmap words: descriptors past 64 are handed out in order and bounded by the limit" {
+    const P = rlimit.Policy;
+    var words = [_]u64{ 0, 0 };
+    words[1] = (@as(u64, 1) << 5) | (@as(u64, 1) << 40);
+    try std.testing.expectEqual(@as(?u32, 69), P.allocationCandidateWords(&words, 0, 128, 128));
+    try std.testing.expectEqual(@as(?u32, 104), P.allocationCandidateWords(&words, 70, 128, 128));
+    try std.testing.expectEqual(@as(?u32, null), P.allocationCandidateWords(&words, 0, 69, 128));
+    try std.testing.expectEqual(@as(?u32, 69), P.allocationCandidateWords(&words, 0, 70, 128));
+    try std.testing.expectEqual(@as(?u32, null), P.allocationCandidateWords(&words, 105, 128, 128));
+    words[0] = 1 << 63;
+    try std.testing.expectEqual(@as(?u32, 63), P.allocationCandidateWords(&words, 3, 128, 128));
+    // The one-word form is unchanged.
+    try std.testing.expectEqual(@as(?u32, 3), P.allocationCandidate(~@as(u64, 0b111), 0, 64, 64));
 }

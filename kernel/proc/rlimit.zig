@@ -35,20 +35,23 @@ pub const Policy = struct {
         return fd < soft_limit and fd < max_fds;
     }
 
-    pub fn allocationCandidate(free_bm: u64, min_fd: u64, soft_limit: u64, max_fds: u32) ?u32 {
-        const upper = @min(soft_limit, @as(u64, max_fds));
-        if (min_fd >= upper or min_fd >= 64) return null;
+    /// Lowest free descriptor in [min_fd, min(soft_limit, max_fds)), reading `free_words` (bit set = free, 64 descriptors per word).
+    pub fn allocationCandidateWords(free_words: []const u64, min_fd: u64, soft_limit: u64, max_fds: u32) ?u32 {
+        const upper = @min(@min(soft_limit, @as(u64, max_fds)), @as(u64, free_words.len) * 64);
+        if (min_fd >= upper) return null;
+        var w: usize = @intCast(min_fd / 64);
+        while (@as(u64, w) * 64 < upper) : (w += 1) {
+            var bits = free_words[w];
+            const base: u64 = @as(u64, w) * 64;
+            if (min_fd > base) bits &= ~((@as(u64, 1) << @intCast(min_fd - base)) - 1);
+            if (upper < base + 64) bits &= (@as(u64, 1) << @intCast(upper - base)) - 1;
+            if (bits != 0) return @intCast(base + @ctz(bits));
+        }
+        return null;
+    }
 
-        const upper_mask: u64 = if (upper >= 64)
-            ~@as(u64, 0)
-        else if (upper == 0)
-            0
-        else
-            (@as(u64, 1) << @intCast(upper)) - 1;
-        const lower_mask = (@as(u64, 1) << @intCast(min_fd)) - 1;
-        const available = free_bm & upper_mask & ~lower_mask;
-        if (available == 0) return null;
-        return @intCast(@ctz(available));
+    pub fn allocationCandidate(free_bm: u64, min_fd: u64, soft_limit: u64, max_fds: u32) ?u32 {
+        return allocationCandidateWords(&[_]u64{free_bm}, min_fd, soft_limit, max_fds);
     }
 
     pub fn dupMinimumValid(soft_limit: u64, min_fd: u64, max_fds: u32) bool {

@@ -430,7 +430,7 @@ MOQI_SERIAL=stdio ./tools/qemu_run_riscv64.sh
 - **动机**：SK-38 后非 x86 `Task` 仍 14.4KB，`fd_table`（64 × FileDescriptor
   ≈ 10KB）是最后的大项；非 x86 bring-up 不走任何 fd 系统调用。
   （sched_boot 已在 SK-19 收敛，无需重复。）
-- **方案**：`vfs.MAX_FDS` 按架构 comptime 裁剪（x86 不变：64；非 x86：8）。
+- **方案**：`vfs.MAX_FDS` 按架构 comptime 裁剪（x86 当时为 64，现为 128，见 current-code-review-and-fix-plan.md；非 x86：8）。
   `free_bm` 默认值改为 comptime `FREE_BM_ALL`，把 ≥ MAX_FDS 的位保持清零，
   确保 `allocFd` 在裁剪后不会发出越界槽位。`task.zig` 的 fd 清理循环
   本就以 `vfs.MAX_FDS` 为界，无需改动。

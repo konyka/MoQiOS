@@ -188,7 +188,7 @@ void _start(void) {
     /* When the only sibling's queue is already full, Linux still hands it the closing listener's children (the migration path,
      * inet_csk_reqsk_queue_add, does not check the backlog), so none is reset. This kernel's listen queue is a fixed 32-entry ring: the
      * sibling first takes 32 connections, then the closing listener takes 8 more, then it closes. 80 TCBs plus 2 listeners: the table
-     * needs more than 64 slots. The 40 client ends live in a child process (64 descriptors per process). */
+     * needs more than 64 slots. The 40 client ends live in a child process (this keeps each process well under its descriptor limit). */
     {
         int64_t f1 = sock4(), f2 = sock4();
         reuseport(f1); reuseport(f2);

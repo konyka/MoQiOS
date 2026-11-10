@@ -30,7 +30,9 @@ pub fn fdTypeSeekable(t: FdType) bool {
     return @import("fd_seek_policy.zig").seekable(@tagName(t));
 }
 
-pub const MAX_FDS: u32 = if (@import("builtin").cpu.arch == .x86_64) 64 else 8;
+pub const MAX_FDS: u32 = if (@import("builtin").cpu.arch == .x86_64) 128 else 8;
+/// Words of the free-descriptor bitmap (64 descriptors each).
+pub const FD_WORDS: u32 = (MAX_FDS + 63) / 64;
 pub const FD_STDIN: u32 = 0;
 pub const FD_STDOUT: u32 = 1;
 pub const FD_STDERR: u32 = 2;
@@ -71,6 +73,8 @@ pub const FdType = enum(u8) {
 };
 
 pub const PIPE_BUF_SIZE: u32 = 4096;
+/// Pipes open system-wide at once (4 KiB of buffer each).
+pub const MAX_PIPES: u32 = 64;
 
 pub const PipeBuffer = struct {
     buf: [PIPE_BUF_SIZE]u8,
@@ -96,7 +100,7 @@ pub const PipeReadToken = struct {
     generation: u32 = 0,
 };
 
-var pipes: [16]PipeBuffer = @splat(.{
+var pipes: [MAX_PIPES]PipeBuffer = @splat(.{
     .buf = @splat(0),
     .head = 0,
     .tail = 0,
@@ -104,9 +108,9 @@ var pipes: [16]PipeBuffer = @splat(.{
 });
 var pipe_count: u32 = 0;
 var pipe_lock: IrqSpinlock = .{};
-var pipe_read_waiters: [16]?*@import("../proc/task.zig").WaitNode = @splat(null);
+var pipe_read_waiters: [MAX_PIPES]?*@import("../proc/task.zig").WaitNode = @splat(null);
 /// Writers blocked on a full pipe; woken by every read that makes room and by the last reader closing.
-var pipe_write_waiters: [16]?*@import("../proc/task.zig").WaitNode = @splat(null);
+var pipe_write_waiters: [MAX_PIPES]?*@import("../proc/task.zig").WaitNode = @splat(null);
 
 /// Same as unlinkPipeReadWaiterLocked for the writers' queue. Caller holds pipe_lock.
 fn unlinkPipeWriteWaiterLocked(pipe_idx: u32, node: *@import("../proc/task.zig").WaitNode) void {
@@ -207,7 +211,7 @@ pub fn pipeMakeSingleEnded(pipe_idx: u32) bool {
 pub fn allocPipe() ?u32 {
     const flags = pipe_lock.acquire();
     defer pipe_lock.release(flags);
-    for (0..16) |i| {
+    for (0..MAX_PIPES) |i| {
         if (pipes[i].ref_count == 0) {
             const generation = pipes[i].generation +% 1;
             pipes[i] = .{ .buf = @splat(0), .head = 0, .tail = 0, .ref_count = 2, .read_refs = 1, .write_refs = 1, .generation = generation };
@@ -219,7 +223,7 @@ pub fn allocPipe() ?u32 {
 }
 
 pub fn pipeRead(pipe_idx: u32, buf: [*]u8, count: usize, status_flags: u32) i64 {
-    if (pipe_idx >= 16) return -1;
+    if (pipe_idx >= MAX_PIPES) return -1;
     if (count == 0) return 0;
     const sched = @import("../proc/sched.zig");
     const task_mod = @import("../proc/task.zig");
@@ -470,7 +474,7 @@ pub fn pipeTransfer(src_idx: u32, dst_idx: u32, count: usize) i64 {
 }
 
 pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u32) i64 {
-    if (pipe_idx >= 16) return -1;
+    if (pipe_idx >= MAX_PIPES) return -1;
     if (count == 0) return 0;
     const sched = @import("../proc/sched.zig");
     const task_mod = @import("../proc/task.zig");
@@ -557,7 +561,7 @@ pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u3
 /// Drop one reference to one end of a pipe; frees the slot when both ends
 /// are fully closed.
 pub fn pipeClose(pipe_idx: u32, write_end: bool) void {
-    if (pipe_idx >= 16) return;
+    if (pipe_idx >= MAX_PIPES) return;
     const flags = pipe_lock.acquire();
     const pipe = &pipes[pipe_idx];
     if (pipe.ref_count > 0) {
@@ -755,21 +759,40 @@ pub const FdTable = struct {
     slot_locks: [MAX_FDS]IrqSpinlock = @splat(.{}),
     /// Serializes resource cleanup decisions across dup-shared slots.
     lifecycle_lock: IrqSpinlock = .{},
-    /// v53.49: Bitmap tracking free fd slots — bit set = free, bit clear = occupied.
-    /// MAX_FDS<=64 fits in one u64. Eliminates O(N) linear scan in allocFd.
+    /// v53.49: Bitmap tracking free fd slots — bit set = free, bit clear = occupied; FD_WORDS words of 64, each changed with 64-bit
+    /// atomics. Eliminates O(N) linear scan in allocFd.
     /// SK-39: bits >= MAX_FDS stay clear so allocFd never returns an
     /// out-of-range slot when the table is arch-slimmed.
-    free_bm: u64 = FREE_BM_ALL, // bits 0-2 clear (stdin/stdout/stderr occupied)
+    free_bm: [FD_WORDS]u64 = FREE_BM_ALL, // bits 0-2 clear (stdin/stdout/stderr occupied)
     /// Mirrored from the owning Task so every allocator path shares the limit.
     alloc_limit: u64 = MAX_FDS,
     /// pthread v2 (CLONE_FILES): reference count of tasks sharing this table.
     /// Only touched via @atomicRmw; managed by allocFdTable/releaseFdTable.
     refs: u32 = 0,
 
-    const FREE_BM_ALL: u64 = blk: {
-        const in_range: u64 = if (MAX_FDS >= 64) ~@as(u64, 0) else (@as(u64, 1) << MAX_FDS) - 1;
-        break :blk in_range & ~@as(u64, 0b111);
+    const FREE_BM_ALL: [FD_WORDS]u64 = blk: {
+        var w: [FD_WORDS]u64 = undefined;
+        for (&w, 0..) |*word, k| {
+            const base = k * 64;
+            word.* = if (MAX_FDS >= base + 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(MAX_FDS - base)) - 1;
+        }
+        w[0] &= ~@as(u64, 0b111);
+        break :blk w;
     };
+
+    fn freeWord(self: *FdTable, fd: u32) *u64 {
+        return &self.free_bm[fd / 64];
+    }
+
+    fn freeBit(fd: u32) u64 {
+        return @as(u64, 1) << @intCast(fd % 64);
+    }
+
+    fn freeSnapshot(self: *const FdTable) [FD_WORDS]u64 {
+        var out: [FD_WORDS]u64 = undefined;
+        for (&out, 0..) |*w, k| w.* = @atomicLoad(u64, &self.free_bm[k], .acquire);
+        return out;
+    }
 
     /// Comptime-computed default table (stdin/stdout/stderr wired to the
     /// special console). Living in .rodata means init() is just a copy and
@@ -819,8 +842,8 @@ pub const FdTable = struct {
 
     pub fn allocFdAtLeast(self: *FdTable, min_fd: u32) ?u32 {
         while (true) {
-            const bm = @atomicLoad(u64, &self.free_bm, .acquire);
-            const slot = RlimitPolicy.allocationCandidate(bm, min_fd, self.alloc_limit, MAX_FDS) orelse return null;
+            const bm = self.freeSnapshot();
+            const slot = RlimitPolicy.allocationCandidateWords(&bm, min_fd, self.alloc_limit, MAX_FDS) orelse return null;
             if (self.claimFreeSlot(slot)) return slot;
         }
     }
@@ -836,17 +859,18 @@ pub const FdTable = struct {
     }
 
     fn claimFreeSlotLocked(self: *FdTable, fd: u32) bool {
-        const bit = @as(u64, 1) << @intCast(fd);
-        const bm = @atomicLoad(u64, &self.free_bm, .acquire);
+        const bit = freeBit(fd);
+        const word = self.freeWord(fd);
+        const bm = @atomicLoad(u64, word, .acquire);
         if (bm & bit == 0) return false;
         if (@cmpxchgStrong(u32, &self.transfer_state[fd], SLOT_FREE, SLOT_INITIALIZING, .acq_rel, .acquire) != null)
             return false;
 
-        const prev = @atomicRmw(u64, &self.free_bm, .And, ~bit, .acq_rel);
+        const prev = @atomicRmw(u64, word, .And, ~bit, .acq_rel);
         if (prev & bit == 0) {
             // Repair an inconsistent hint without publishing an unowned slot.
             @atomicStore(u32, &self.transfer_state[fd], SLOT_FREE, .release);
-            _ = @atomicRmw(u64, &self.free_bm, .Or, bit, .release);
+            _ = @atomicRmw(u64, word, .Or, bit, .release);
             return false;
         }
         self.fds[fd] = .{};
@@ -873,13 +897,13 @@ pub const FdTable = struct {
         @atomicStore(u32, &self.transfer_state[fd], SLOT_LIVE, .release);
     }
 
-    /// Snapshot a table for fork/clone. Holds are acquired for every occupied
+    /// Copy a table for fork/clone. Holds are acquired for every occupied
     /// slot before any descriptor is copied, so close/dup2 cannot tear down or
-    /// reuse a descriptor between the snapshot and its resource retains.
+    /// reuse a descriptor while it is copied and its resources retained. Each
+    /// descriptor is copied one at a time (no MAX_FDS-sized stack snapshot).
     pub fn inheritFdTable(self: *FdTable, child: *FdTable) void {
         while (true) {
             var held: [MAX_FDS]bool = @splat(false);
-            var snapshot: [MAX_FDS]FileDescriptor = @splat(.{});
             var complete = true;
 
             for (0..MAX_FDS) |i| {
@@ -890,7 +914,6 @@ pub const FdTable = struct {
                     break;
                 }
                 held[i] = true;
-                snapshot[i] = self.fds[i];
             }
 
             if (!complete) {
@@ -900,22 +923,23 @@ pub const FdTable = struct {
                 continue;
             }
 
-            var child_free_bm: u64 = FREE_BM_ALL;
+            var child_free_bm: [FD_WORDS]u64 = FREE_BM_ALL;
             for (0..MAX_FDS) |i| {
-                if (held[i]) child_free_bm &= ~(@as(u64, 1) << @intCast(i));
+                if (held[i]) child_free_bm[i / 64] &= ~freeBit(@intCast(i));
             }
             child.free_bm = child_free_bm;
             for (0..MAX_FDS) |i| {
                 if (!held[i]) continue;
                 // fork shares the open file description: promote the parent's offset
                 // (once) and give the child the same slot.
-                snapshot[i].offset_slot = shareOffsetFor(&self.fds[i]);
-                child.installInheritedFd(@intCast(i), snapshot[i], self.fd_generations[i]);
-                switch (snapshot[i].fd_type) {
+                var desc = self.fds[i];
+                desc.offset_slot = shareOffsetFor(&self.fds[i]);
+                child.installInheritedFd(@intCast(i), desc, self.fd_generations[i]);
+                switch (desc.fd_type) {
                     .pipe_read, .pipe_write => {
-                        const pidx = snapshot[i].pipe_idx;
-                        if (pidx < 16)
-                            _ = pipeRetain(pidx, snapshot[i].fd_type == .pipe_write);
+                        const pidx = desc.pipe_idx;
+                        if (pidx < MAX_PIPES)
+                            _ = pipeRetain(pidx, desc.fd_type == .pipe_write);
                     },
                     .fat32_file => {
                         const readahead_mod = @import("readahead.zig");
@@ -933,8 +957,14 @@ pub const FdTable = struct {
     }
 
     pub fn openFdCount(self: *const FdTable) u64 {
-        const free_bm = @atomicLoad(u64, &self.free_bm, .acquire);
-        return @popCount(~free_bm & if (MAX_FDS >= 64) ~@as(u64, 0) else (@as(u64, 1) << MAX_FDS) - 1);
+        const free_bm = self.freeSnapshot();
+        var used: u64 = 0;
+        for (free_bm, 0..) |w, k| {
+            const base: u32 = @intCast(k * 64);
+            const in_range: u64 = if (MAX_FDS >= base + 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(MAX_FDS - base)) - 1;
+            used += @popCount(~w & in_range);
+        }
+        return used;
     }
 
     /// Reserve a dup2-style explicit target below the owning task's NOFILE
@@ -986,7 +1016,7 @@ pub const FdTable = struct {
         self.fds[fd] = .{};
         self.fd_generations[fd] +%= 1;
         @atomicStore(u32, &self.transfer_state[fd], SLOT_FREE, .release);
-        _ = @atomicRmw(u64, &self.free_bm, .Or, @as(u64, 1) << @intCast(fd), .release);
+        _ = @atomicRmw(u64, self.freeWord(fd), .Or, freeBit(fd), .release);
     }
 
     /// Pin an fd slot for a multi-step transfer. This uses a CAS rather than
@@ -2308,7 +2338,7 @@ pub const FdTable = struct {
         const source = self.fds[oldfd];
         // Increment pipe ref count if it's a pipe
         if (source.fd_type == .pipe_read or source.fd_type == .pipe_write) {
-            if (source.pipe_idx < 16) {
+            if (source.pipe_idx < MAX_PIPES) {
                 _ = pipeRetain(source.pipe_idx, source.fd_type == .pipe_write);
             }
         }
@@ -2335,7 +2365,7 @@ pub const FdTable = struct {
         self.fds[slot].fd_flags = @import("namespace_policy.zig").dupFdFlags(self.fds[oldfd].fd_flags, new_flags != 0);
         self.fds[slot].offset_slot = shareOffsetFor(&self.fds[oldfd]);
         if (self.fds[slot].fd_type == .pipe_read or self.fds[slot].fd_type == .pipe_write) {
-            if (self.fds[slot].pipe_idx < 16)
+            if (self.fds[slot].pipe_idx < MAX_PIPES)
                 _ = pipeRetain(self.fds[slot].pipe_idx, self.fds[slot].fd_type == .pipe_write);
         }
         if (self.fds[slot].fd_type == .fat32_file) {

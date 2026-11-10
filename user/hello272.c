@@ -145,7 +145,7 @@ void _start(void) {
     int64_t srv = sock4();
     reuse(srv);
     check(bind4(srv, 18430) == 0 && syscall2(SYS_LISTEN, (uint64_t)srv, 64) == 0, "a listener with a backlog of 64");
-    /* Each process has 64 descriptors, so the 40 client ends live in a child and the 40 accepted ends in this process. */
+    /* The 40 client ends live in a child and the 40 accepted ends in this process, keeping each process well under its descriptor limit. */
     int64_t kid = syscall1(SYS_FORK, 0);
     if (kid == 0) {
         int64_t cl[40];

@@ -501,7 +501,7 @@ const Task = struct {
     regs: SavedRegs,            // r15..rax, rip, rsp, rflags, cr3
     kstack: []u8,               // 128KB 内核栈（KERNEL_STACK_PAGES=32 × 4KB，task.zig:23）
     mm: *AddressSpace,
-    fdtable: FdTable,           // 64 个 FD（MAX_FDS=64，vfs.zig:24）
+    fdtable: FdTable,           // x86_64 上 128 个 FD（vfs.MAX_FDS；占用位图 free_bm 为 FD_WORDS 个 u64）
     sigmask: u64, sigpending: u64,
     sigactions: [32]SigAction,
     cwd: [256]u8,

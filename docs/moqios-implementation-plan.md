@@ -20,7 +20,7 @@
 - **新增验收门禁**: `hello78` raw syscall #53 Unix `socketpair`（严格支持边界与双向 I/O）
 - **测试稳定性**: 29/29 通过 (KVM -smp 1)
 - **最大进程数**: 64
-- **每进程文件描述符**: 64
+- **每进程文件描述符**: 128（x86_64；`RLIMIT_NOFILE` 默认软/硬上限同为 128）
 - **文件系统**: FAT32 (virtio-blk) + ramdisk + ext2 (读写, 完整 symlink/hardlink/chown/chmod/xattr) + tmpfs + procfs (11种虚拟文件) + 统一页缓存
 - **网络**: e1000 (中断驱动) + virtio-net + TCP Reno/SACK/WS/TS/CORK/QUICKACK (64连接/64K缓冲) + Socket API + epoll (128项/32实例/位图优化) + eventfd + timerfd + UDP sendto/recvfrom/bind/connect
 - **多核**: SMP 支持 (BSP + AP, O(1)位图调度器, Per-CPU 队列, Work Stealing)

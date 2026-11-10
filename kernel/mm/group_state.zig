@@ -39,7 +39,7 @@ pub const SigActions = struct {
 };
 
 /// RLIMIT_NOFILE default: the descriptor table size (vfs.MAX_FDS; task.zig asserts they agree).
-pub const DEFAULT_NOFILE: u64 = if (@import("builtin").cpu.arch == .x86_64) 64 else 8;
+pub const DEFAULT_NOFILE: u64 = if (@import("builtin").cpu.arch == .x86_64) 128 else 8;
 pub const DEFAULT_STACK: u64 = 8 * 1024 * 1024;
 
 pub const Limits = struct {

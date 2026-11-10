@@ -7583,7 +7583,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - **TCB 表 64 → 128（已修）**：hello272：40 个同时打开的本机连接（80 个 TCB 加监听者），客户端放在子进程里（每个进程 64 个描述符）。旧表（64 个 TCB）下只接受到 31 个（红灯），`/proc/tcpstats` 显示 64 个槽全满。修改：所有 64 位的 TCB 位图（活跃位图、监听位图、唤醒待处理位图）换成纯模块 `net/tcb_bitset.zig` 的多字位集（逐字 64 位原子操作，x86_64 在这个构建里没有 128 位原子 RMW；快照逐字取，调用方本来都在 `tcp_lock` 下或只当提示用），host 测试覆盖跨字、首个空位、容量边界。`MAX_CONNECTIONS` = 128，TCB 数组约 16 MiB。改后 40 个全部接受并各传一个字节。
 - **`SO_REUSEPORT` 迁移进已满的兄弟队列（已修）**：读 Linux 源码（`inet_csk_listen_stop` → `reuseport_migrate_sock` → `inet_csk_reqsk_queue_add`，后者不检查 backlog）：迁移不受兄弟的 backlog 限制（本机 `tcp_migrate_req` 只能 root 打开，没法实测）。hello267 新增一段：兄弟先接 32 个连接（队列满），关闭的那个监听者再接 8 个，然后关闭：旧代码里兄弟队列满就复位，40 个只接受到 36 个（红灯；变异：只把迁移的上限改回 `LISTEN_BACKLOG`，同样 36/40）。修改：监听队列环的容量改为 `LISTEN_RING` = `MAX_CONNECTIONS`，新 SYN 仍受 `LISTEN_BACKLOG`（32）限制，只有迁移可以超过它。（这一段第一版的子进程仍持有两个监听套接字，父进程关闭监听者并没有真正停止它，测试无效；改为子进程先关闭它们。）
 - host 1143/1143；三个架构构建；完整 smoke 见提交记录。
-- 仍开放（如实）：`SO_REUSEPORT` 的 BPF 选择器不做（本内核没有 BPF）；AF_UNIX 源名字队列 32 项，超过时多出的数据报报告无地址；每进程描述符上限仍是 64。
+- 仍开放（如实）：`SO_REUSEPORT` 的 BPF 选择器不做（本内核没有 BPF）；~~AF_UNIX 源名字队列 32 项~~、~~每进程描述符上限 64~~（这两项见下文“描述符上限、管道池与 AF_UNIX 源名字”一节）。
 
 ## `accept` 把排在前面、还没完成握手的连接丢掉（hello272 偶发 39/40，已修）
 
@@ -7593,3 +7593,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修改：纯函数 `tcp_port_policy.pickAcceptable`（选最早的已建立项，host 测试）；`tcpAccept` 先分类整个队列（失效 / 握手中 / 已建立），交出选中的一项，其余活着的项按原顺序写回队列。
 - 验证：hello272 单独运行，修复前 6 次里 3 次 38–39/40（旧的 `accept` 代码同样失败，4 次里 2 次），修复后 6/6 都是 40/40；host 1144/1144。
 
+## 描述符上限、管道池与 AF_UNIX 源名字（hello134 I、hello273）
+
+- **AF_UNIX 源名字不再限 32 条（已修）**：hello134 I 新增一项：一个已绑定的发送者连发 40 个数据报，接收方逐个 `recvfrom`，每个都要报告发送者名字。旧代码的源名字队列只有 32 项，后 8 个数据报报告无地址（红灯）。修改（`kernel/net/unix_socket.zig`）：名字表按名字去重并带引用计数（`SrcName{len,name,refs}`，容量 `MAX_UNIX_SOCKETS`），每个排队的数据报只记一个字节的表下标（`rec_src[MAX_RECORDS]`，`MAX_RECORDS` = 缓冲区字节数 / 2，即缓冲区能装下的最多记录数；`NO_NAME` = 0xFF 表示无名）。同一发送者的 40 个数据报只占一个名字项。改后 40 个都报告名字。
+- **管道池 16 → 64（已修）**：`vfs.MAX_PIPES` = 64，原来散落的 16 都改用这个常量。红灯（hello273）：只开到 32 个描述符，第 17 个 `pipe()` 失败。
+- **每进程描述符 64 → 128（已修，x86_64）**：`vfs.MAX_FDS` = 128，`RLIMIT_NOFILE` 默认软/硬上限同为 128（`group_state.DEFAULT_NOFILE`）。空闲位图 `free_bm` 从一个 `u64` 改为 `[FD_WORDS]u64`，分配走纯函数 `rlimit.Policy.allocationCandidateWords`（逐字找第一个不小于 `min_fd`、低于软上限的空位，host 测试覆盖跨字、软上限截断、容量边界）。红灯（hello273）：`getrlimit(RLIMIT_NOFILE)` 软上限 64，`dup2(…, 120)` 返回 `EBADF`。
+  - `inheritFdTable`（fork/clone 复制描述符表）原来在栈上放一个 `[MAX_FDS]FileDescriptor` 快照，128 项约 140 KB，超过 128 KiB 的内核栈。改为先给所有占用的槽加 hold，再逐个复制（hold 期间槽不会被关闭或复用），不再需要快照。`fork.zig` 里先于 `inheritFdTable` 的一行位图直接赋值是多余的（`inheritFdTable` 自己根据 hold 的槽重建子进程位图），删掉。
+  - 代价（如实）：64 张描述符表的池（`fd_table_pool`）现在约 8.5 MiB。
+  - hello87（坏 `statx` 调用超过 `MAX_FDS` 次后不泄漏描述符）里写死的 `MAX_FDS 64` 改为 128；hello267/hello272 注释里的“每进程 64 个描述符”改为“远低于描述符上限”。
+- **hello273（新增）**：`RLIMIT_NOFILE` 软上限不小于 100；同时打开 50 个管道共 100 个描述符，每个都能传一个字节；`/proc/self/status` 的 `FDSize`（128）覆盖最高描述符；`dup2` 到 120 成功。改后全部通过；与 hello87、hello134、hello267、hello272 一起单独跑两份，全部 PASS。
+- 不做（如实）：`SO_REUSEPORT` 的 BPF 选择器（本内核没有 BPF 虚拟机）。非 x86 架构的 `MAX_FDS` 仍是 8（跨架构移植计划里的裁剪，`docs/cross-arch-port-plan.md`）。

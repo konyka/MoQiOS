@@ -12,6 +12,7 @@
 ///   - Each socket has its own 8KB ring buffer
 ///   - STREAM sockets: connect establishes a peer pair; send writes to peer's buffer
 ///   - DGRAM sockets: send writes to peer's buffer directly (no connect required if bound)
+const std = @import("std");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const vfs = @import("../fs/vfs.zig");
 const scm = @import("scm_policy.zig");
@@ -31,13 +32,18 @@ pub const UNIX_SOCK_BUF_SIZE: u32 = 8192;
 pub const MAX_UNIX_SOCKETS: u32 = 32;
 pub const UNIX_PATH_MAX: u8 = 108;
 /// Datagram records whose source name a socket remembers at once (records beyond this report no address).
-pub const SRC_NAMES: u8 = 32;
+/// Distinct sender names a datagram socket can have queued at once (a socket table entry each, so at most the number of sockets).
+pub const SRC_NAMES: u8 = MAX_UNIX_SOCKETS;
+/// The most datagram records the ring can hold (a zero-length datagram is its 2-byte length prefix).
+pub const MAX_RECORDS: u32 = UNIX_SOCK_BUF_SIZE / 2;
+/// Index stored for a record from an unbound sender.
+const NO_NAME: u8 = 0xFF;
 
 pub const SrcName = struct {
     len: u8 = 0,
     name: [UNIX_PATH_MAX]u8 = @splat(0),
-    /// Which datagram record (counted from 0 on this socket) the name belongs to.
-    seq: u32 = 0,
+    /// Queued records that point at this entry; 0 = free.
+    refs: u16 = 0,
 };
 pub const UNIX_BACKLOG_MAX: u8 = 4;
 pub const UNIX_PENDING_MAX: u16 = 1024;
@@ -114,11 +120,10 @@ pub const UnixSocket = struct {
     /// Source names of the datagrams in the ring, oldest first (DGRAM only): recvfrom/recvmsg report the sender's bound name. A datagram
     /// queued while the ring of names was full, or from an unbound sender, has length 0 here (reported as no address).
     src_names: [SRC_NAMES]SrcName = @splat(.{}),
-    src_head: u8 = 0,
-    src_count: u8 = 0,
-    /// Datagram records written into / read out of this socket's ring, to pair each record with its remembered name.
-    rec_written: u32 = 0,
-    rec_read: u32 = 0,
+    /// One byte per queued datagram record, in ring order: the src_names entry of its sender, or NO_NAME.
+    rec_src: [MAX_RECORDS]u8 = @splat(NO_NAME),
+    rec_head: u32 = 0,
+    rec_count: u32 = 0,
     /// Credentials of whoever sent the bytes now in this socket's ring (the
     /// latest sender); delivered by recvmsg when SO_PASSCRED is set.
     sender_cred: @import("sockopt_policy.zig").Cred = .{},
@@ -953,24 +958,43 @@ pub fn unixSendRightsTo(idx: u32, data: [*]const u8, len: usize, rights: ?*Right
 }
 
 fn pushSrcNameLocked(peer: *UnixSocket, sender: *const UnixSocket) void {
-    const seq = peer.rec_written;
-    peer.rec_written +%= 1;
-    // An unbound sender has no name to report; a full name queue leaves this record unnamed (never shifts names onto other records).
-    if (!sender.bound or sender.path_len == 0 or peer.src_count == SRC_NAMES) return;
-    var n: SrcName = .{ .len = sender.path_len, .seq = seq };
-    @memcpy(n.name[0..sender.path_len], sender.path[0..sender.path_len]);
-    peer.src_names[(peer.src_head + peer.src_count) % SRC_NAMES] = n;
-    peer.src_count += 1;
+    var slot: u8 = NO_NAME;
+    if (sender.bound and sender.path_len > 0) {
+        const name = sender.path[0..sender.path_len];
+        var free: ?u8 = null;
+        for (&peer.src_names, 0..) |*e, i| {
+            if (e.refs == 0) {
+                if (free == null) free = @intCast(i);
+                continue;
+            }
+            if (e.len == name.len and std.mem.eql(u8, e.name[0..e.len], name)) {
+                slot = @intCast(i);
+                break;
+            }
+        }
+        if (slot == NO_NAME) {
+            if (free) |f| {
+                peer.src_names[f] = .{ .len = sender.path_len };
+                @memcpy(peer.src_names[f].name[0..sender.path_len], name);
+                slot = f;
+            }
+        }
+        if (slot != NO_NAME) peer.src_names[slot].refs += 1;
+    }
+    peer.rec_src[(peer.rec_head + peer.rec_count) % MAX_RECORDS] = slot;
+    peer.rec_count += 1;
 }
 
 fn popSrcNameLocked(sock: *UnixSocket) SrcName {
-    const seq = sock.rec_read;
-    sock.rec_read +%= 1;
-    if (sock.src_count == 0 or sock.src_names[sock.src_head].seq != seq) return .{};
-    const n = sock.src_names[sock.src_head];
-    sock.src_head = (sock.src_head + 1) % SRC_NAMES;
-    sock.src_count -= 1;
-    return n;
+    if (sock.rec_count == 0) return .{};
+    const slot = sock.rec_src[sock.rec_head];
+    sock.rec_head = (sock.rec_head + 1) % MAX_RECORDS;
+    sock.rec_count -= 1;
+    if (slot == NO_NAME) return .{};
+    const e = &sock.src_names[slot];
+    const out = e.*;
+    e.refs -= 1;
+    return out;
 }
 
 /// Receive data from own ring buffer.

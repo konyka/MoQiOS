@@ -14,7 +14,7 @@ static inline int64_t syscall5(uint64_t n, uint64_t a, uint64_t b, uint64_t c, u
 #define AT_FDCWD ((uint64_t)-100L)
 #define STATX_BASIC_STATS 0x7ff
 #define EFAULT 14
-#define MAX_FDS 64
+#define MAX_FDS 128
 
 static void print(const char *s) { uint64_t n=0; while(s[n]) n++; syscall3(SYS_WRITE,1,(uint64_t)s,n); }
 static int check(int ok,const char *s){if(!ok){print("hello87: FAIL ");print(s);print("\n");return 1;}return 0;}

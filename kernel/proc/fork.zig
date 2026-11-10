@@ -76,10 +76,6 @@ pub fn fork(frame: *SyscallFrame) i64 {
     // same address.
     child.tls_base = parent.tls_base;
 
-    // v53.50: Copy free_bm bitmap — child inherits parent's fd occupancy state.
-    // Without this, child's free_bm stays at default (only bits 0-2 occupied),
-    // causing allocFd() to return already-occupied slots and corrupt fds.
-    child.fd_table.free_bm = parent.fd_table.free_bm;
     child.fd_table.alloc_limit = parent.lim().nofile.cur;
     // The child's address space mirrors the parent's (COW), so it starts with
     // the same charged usage.
