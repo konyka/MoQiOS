@@ -299,6 +299,31 @@ int main(int argc, char **argv, char **envp) {
         check(epoll_ctl(c[1], EPOLL_CTL_DEL, c[0], (struct epoll_event *)0) == 0, "G: deleting one edge works");
         int fresh = epoll_create1(0);
         check(epoll_ctl(fresh, EPOLL_CTL_ADD, c[4], &e2) == 0, "G: and the tree is now short enough to nest again");
+        /* A link disabled by EPOLLONESHOT still counts (Linux, measured): a four-deep chain whose bottom link fired once stays four deep, so
+         * adding it under another epoll is still ELOOP, and EPOLL_CTL_MOD re-enables that link without any new check. */
+        int d[6], dp[2];
+        for (int i = 0; i < 6; i++) d[i] = epoll_create1(0);
+        pipe2(dp, 0);
+        struct epoll_event pe; pe.events = EPOLLIN; pe.data.u64 = 0;
+        epoll_ctl(d[0], EPOLL_CTL_ADD, dp[0], &pe);
+        struct epoll_event one; one.events = EPOLLIN | EPOLLONESHOT; one.data.u64 = 0;
+        epoll_ctl(d[1], EPOLL_CTL_ADD, d[0], &one);
+        for (int i = 2; i < 5; i++) epoll_ctl(d[i], EPOLL_CTL_ADD, d[i - 1], &e2);
+        write(dp[1], "x", 1);
+        struct epoll_event got[2];
+        epoll_wait(d[1], got, 2, 100);   /* the one-shot link fires and is disabled */
+        errno = 0;
+        check(epoll_ctl(d[5], EPOLL_CTL_ADD, d[4], &e2) == -1 && errno == ELOOP, "G: a chain whose bottom link fired its EPOLLONESHOT still counts all four edges: ELOOP");
+        check(epoll_ctl(d[1], EPOLL_CTL_MOD, d[0], &e2) == 0, "G: and EPOLL_CTL_MOD re-enables that link");
+        /* a cycle through a one-shot link that fired is still a cycle: x contains y with EPOLLONESHOT, it fires, then adding x to y is ELOOP */
+        int x = epoll_create1(0), y = epoll_create1(0), cp[2];
+        pipe2(cp, 0);
+        epoll_ctl(y, EPOLL_CTL_ADD, cp[0], &pe);
+        epoll_ctl(x, EPOLL_CTL_ADD, y, &one);
+        write(cp[1], "c", 1);
+        epoll_wait(x, got, 2, 100);
+        errno = 0;
+        check(epoll_ctl(y, EPOLL_CTL_ADD, x, &e2) == -1 && errno == ELOOP, "G: a cycle closed through a fired EPOLLONESHOT link is still ELOOP");
     }
 
     close(p[0]);

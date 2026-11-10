@@ -30,6 +30,15 @@ fn connectionOriented(sock_type: u32) bool {
 pub const UNIX_SOCK_BUF_SIZE: u32 = 8192;
 pub const MAX_UNIX_SOCKETS: u32 = 32;
 pub const UNIX_PATH_MAX: u8 = 108;
+/// Datagram records whose source name a socket remembers at once (records beyond this report no address).
+pub const SRC_NAMES: u8 = 32;
+
+pub const SrcName = struct {
+    len: u8 = 0,
+    name: [UNIX_PATH_MAX]u8 = @splat(0),
+    /// Which datagram record (counted from 0 on this socket) the name belongs to.
+    seq: u32 = 0,
+};
 pub const UNIX_BACKLOG_MAX: u8 = 4;
 pub const UNIX_PENDING_MAX: u16 = 1024;
 const EPOLLERR: u32 = 0x008;
@@ -102,6 +111,14 @@ pub const UnixSocket = struct {
     /// A stream client that close()d while still waiting in a listener's queue: the slot is kept (descriptor gone) with its bytes in `pending`, so
     /// accept() still hands out the connection and the server reads the data, then EOF.
     closed_queued: bool = false,
+    /// Source names of the datagrams in the ring, oldest first (DGRAM only): recvfrom/recvmsg report the sender's bound name. A datagram
+    /// queued while the ring of names was full, or from an unbound sender, has length 0 here (reported as no address).
+    src_names: [SRC_NAMES]SrcName = @splat(.{}),
+    src_head: u8 = 0,
+    src_count: u8 = 0,
+    /// Datagram records written into / read out of this socket's ring, to pair each record with its remembered name.
+    rec_written: u32 = 0,
+    rec_read: u32 = 0,
     /// Credentials of whoever sent the bytes now in this socket's ring (the
     /// latest sender); delivered by recvmsg when SO_PASSCRED is set.
     sender_cred: @import("sockopt_policy.zig").Cred = .{},
@@ -216,6 +233,8 @@ pub const RightsOut = struct {
     cred: @import("sockopt_policy.zig").Cred = .{},
     /// Real length of the datagram just read (it may exceed what fitted).
     full_len: usize = 0,
+    /// Bound name of the datagram's sender (len 0: unbound, or not remembered).
+    src: SrcName = .{},
     count: usize = 0,
     descs: [MAX_RIGHTS_FDS]vfs.FileDescriptor = undefined,
 };
@@ -913,6 +932,7 @@ pub fn unixSendRightsTo(idx: u32, data: [*]const u8, len: usize, rights: ?*Right
         peer.buf_count += 2;
 
         peer.sender_cred = if (rights) |r| (r.cred_override orelse currentSenderCred()) else currentSenderCred();
+        if (sock.sock_type == SOCK_DGRAM) pushSrcNameLocked(peer, sock);
         // Write data
         ringWrite(&peer.buffer, peer.buf_write, data, len);
         peer.buf_write = (peer.buf_write + @as(u32, @intCast(len))) % UNIX_SOCK_BUF_SIZE;
@@ -930,6 +950,27 @@ pub fn unixSendRightsTo(idx: u32, data: [*]const u8, len: usize, rights: ?*Right
 
         return @intCast(len);
     }
+}
+
+fn pushSrcNameLocked(peer: *UnixSocket, sender: *const UnixSocket) void {
+    const seq = peer.rec_written;
+    peer.rec_written +%= 1;
+    // An unbound sender has no name to report; a full name queue leaves this record unnamed (never shifts names onto other records).
+    if (!sender.bound or sender.path_len == 0 or peer.src_count == SRC_NAMES) return;
+    var n: SrcName = .{ .len = sender.path_len, .seq = seq };
+    @memcpy(n.name[0..sender.path_len], sender.path[0..sender.path_len]);
+    peer.src_names[(peer.src_head + peer.src_count) % SRC_NAMES] = n;
+    peer.src_count += 1;
+}
+
+fn popSrcNameLocked(sock: *UnixSocket) SrcName {
+    const seq = sock.rec_read;
+    sock.rec_read +%= 1;
+    if (sock.src_count == 0 or sock.src_names[sock.src_head].seq != seq) return .{};
+    const n = sock.src_names[sock.src_head];
+    sock.src_head = (sock.src_head + 1) % SRC_NAMES;
+    sock.src_count -= 1;
+    return n;
 }
 
 /// Receive data from own ring buffer.
@@ -1109,6 +1150,10 @@ pub fn unixRecvRights(idx: u32, buf: [*]u8, len_in: usize, out: ?*RightsOut) i64
         // Discard remaining bytes of this datagram if buf was too small
         const discard: usize = dgram_len - to_read;
         if (out) |o| o.full_len = dgram_len;
+        if (sock.sock_type == SOCK_DGRAM) {
+            const src = popSrcNameLocked(sock);
+            if (out) |o| o.src = src;
+        }
         if (discard > 0) {
             const actual_discard = @min(discard, sock.buf_count);
             sock.buf_read = (sock.buf_read + @as(u32, @intCast(actual_discard))) % UNIX_SOCK_BUF_SIZE;
@@ -1454,6 +1499,11 @@ pub fn unixSendBlocking(idx: u32, data: [*]const u8, len: usize, nonblock: bool)
 /// SO_SNDTIMEO passes.
 pub fn unixSendToBlocking(idx: u32, data: [*]const u8, len: usize, dest: []const u8, nonblock: bool) i64 {
     if (idx >= MAX_UNIX_SOCKETS) return -9;
+    // An unbound sender with SO_PASSCRED gets an autobound abstract name at its first send, so the receiver has an address for it (Linux
+    // unix_dgram_sendmsg -> unix_autobind when SOCK_PASSCRED is set).
+    if (unixOptView(idx)) |v| {
+        if (v.opts.flags & 32 != 0) _ = unixAutobind(idx);
+    }
     const urp = @import("udp_recv_policy.zig");
     const tsc = @import("../arch/arch.zig").tsc;
     var deadline: ?u64 = null;

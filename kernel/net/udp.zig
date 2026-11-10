@@ -12,7 +12,8 @@ const ip_opt_policy = @import("ip_opt_policy.zig");
 const bo = @import("../lib/byte_order.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
-const MAX_PORTS = 16;
+/// Bound UDP sockets at once (Linux has no fixed limit; 64 sockets x 8 queued datagrams of 1.5 KiB is about 750 KiB).
+const MAX_PORTS = 64;
 const QUEUE_DEPTH = 8;
 /// IPv4 Ethernet MTU 1500 − 20 − 8.
 const MAX_UDP_PAYLOAD = 1472;
@@ -218,11 +219,11 @@ pub fn rebind(old_key: u32, new_port: u16, uid: u32, out_disc: *u16) i64 {
         return 0;
     }
     const mine = port_opts[oi];
-    var used: u32 = 0;
+    var used: u64 = 0;
     for (0..num_ports) |j| {
         if (portNumber(ports[j]) != new_port) continue;
         if (!@import("udp_port_policy.zig").mayShare(mine.flags, port_opts[j].flags, uid, port_uid[j])) return -98;
-        used |= @as(u32, 1) << @intCast(ports[j] >> 16);
+        used |= @as(u64, 1) << @intCast(ports[j] >> 16);
     }
     if (num_ports >= MAX_PORTS) return -98;
     const disc: u16 = @intCast(@ctz(~used));

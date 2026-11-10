@@ -7471,7 +7471,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello134 新增 H 段 13 项，旧内核上 9 项失败（自动绑定本身、名字格式、第二个套接字、不同名字、已绑定再绑定、显式绑定的 `EINVAL`、连接到自动名、数据报自动绑定、`sendto` 到自动名）。
 - 实现：`unix_socket.unixAutobind(idx)`：已绑定返回 0，已接受套接字（只有名字）`EINVAL`，否则取一个递增计数器的低 20 位生成 `\0xxxxx`，与已有绑定冲突就换下一个（最多试遍全部 2^20 个）。`socket_syscall.bind` 在“至少一个路径字节”的规则之前处理 `addr_len == 2`（地址族不是 `AF_UNIX` 返回 `EAFNOSUPPORT`）。长度小于 2 仍是 `EINVAL`。
 - 绿灯：hello134 两份（SMP=2）全部 PASS；host 测试是源码守卫（顺序和关键语句）；三个架构构建通过。
-- 局限（如实）：①计数器从 0 开始顺序分配，Linux 是随机起点，名字可预测——这里没有安全含义（抽象名本来就不是机密），但与 Linux 的“看起来随机”不同；②没有在 `connect`/`sendto` 时给未绑定的数据报发送者自动绑定（Linux 的 `SOCK_DGRAM` 在设置 `SO_PASSCRED` 后发送时会自动绑定）；③`unixAutobind` 持有 `unix_lock` 做线性扫描，最坏情形（2^20 次冲突）理论上很长，实际表只有 32 个槽位，最多 32 次冲突。
+- 局限（如实）：①计数器从 0 开始顺序分配，Linux 是随机起点，名字可预测——这里没有安全含义（抽象名本来就不是机密），但与 Linux 的“看起来随机”不同；②~~设置 `SO_PASSCRED` 的未绑定数据报发送者在发送时不自动绑定~~（已实现，见文末）；③`unixAutobind` 持有 `unix_lock` 做线性扫描，最坏情形（2^20 次冲突）理论上很长，实际表只有 32 个槽位，最多 32 次冲突。
 - **门禁里抓到的回归（已修）**：完整 smoke 一直不通过，不报错，只是不退出。原因是 hello39 的旧断言 “`bind` 地址长度 2 → `EINVAL`” 在自动绑定之后变成 `0`，hello39 打印 FAIL，而 smoke 脚本等的是它的 PASS 标记，所以只会超时。我先花了不少时间在查日志（我杀掉脚本时它会清掉工作目录，日志跟着没了；之后改用 `MOQI_SMOKE_WORK_DIR` 保留）。在本机 Linux 上用 `ctypes` 调 `bind` 确认：长度 1 → `EINVAL`，长度 2 → 自动绑定。所以 hello39 改成测长度 1（“比地址族还短”），这才是 Linux 的 `EINVAL` 条件；这不是放宽断言，而是把一个本来就错的测试点（长度 2）改对。
 
 ## TCP `SO_REUSEPORT`：多个套接字共享一个端口，连接分散到各自的监听者（hello183 G 段，已补）
@@ -7483,7 +7483,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - `tcp_port_policy.zig` 新增 `reusePortMayShare`（两边都有标志位 8 且 uid 相同）和 `pickListener`（对对端 IP 和端口做 FNV 哈希，对监听者数取模，同一个对端总是到同一个监听者）。
   - `tcp.zig`：`ListenSlot` 新增 `tcb_idx`——此前监听槽按“端口加地址族”识别，两个监听者会撞在同一个槽里；现在每个监听 TCB 一个槽。`stopListening` 和 `tcpAccept` 改按 TCB 找槽；IPv4/IPv6 的 SYN 都通过新函数 `pickListenSlot` 选槽（只有一个监听者时行为与以前完全相同）。`tcpBind` 在 `SO_REUSEADDR`/`TIME_WAIT` 规则之外再问 `reusePortMayShare`；owner uid 取自拥有任务的 `euid`。
 - 绿灯：hello183 在 SMP=2 的两份运行里全部 PASS（12 个连接全部被两个监听者接走且两边都分到了；关闭一个监听者后另一个继续接收）；host 测试覆盖策略（单边不行、uid 不同不行、哈希稳定且在范围内、60 个对端会用到全部 3 个监听者）和接线；三个架构构建通过。
-- 局限（如实）：①分发只按对端地址和端口哈希，没有 Linux 的 `SO_ATTACH_REUSEPORT_*` BPF 选择器；②一个监听者关闭时它队列里还没被 `accept` 的连接的处理见文末“监听者关闭时迁移”一节；③连接分散的“均匀度”只测了“两边都分到”，没有测比例；④UDP 的 `SO_REUSEPORT` 见下一节；⑤owner uid 取自任务的 `euid`，任务退出后读到的是 0。
+- 局限（如实）：①分发只按对端地址和端口哈希，没有 Linux 的 `SO_ATTACH_REUSEPORT_*` BPF 选择器；②一个监听者关闭时它队列里还没被 `accept` 的连接的处理见文末“监听者关闭时迁移”一节；③连接分散的“均匀度”只测了“两边都分到”，没有测比例；④UDP 的 `SO_REUSEPORT` 见下一节；⑤~~owner uid 取自任务的 `euid`，任务退出后读到的是 0~~（已改为在 `bind` 时记录，见文末）。
 
 ## epoll 嵌套深度上限 `EP_MAX_NESTS = 4`（hello236 G 段，已补）
 
@@ -7492,7 +7492,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello236 新增 G 段 9 项，旧内核上 3 项失败（四层树加到别的 epoll 下、往四层链最底下加、两层加两层）。
 - 实现：`epoll_policy.zig` 新增 `EP_MAX_NESTS` 与纯函数 `nestDepthExceeded(below, above)`；`epoll.zig` 新增 `nestedDepthBelow`（向下沿被加入 epoll 的 epoll 成员做深度优先，最长路径）与 `nestedDepthAbove`（扫描所有 epoll 实例，找登记了它的父实例，向上取最长路径），在环检测之后检查；两个遍历在深度越过上限后提前返回，所以不会因为大图而长时间持锁。
 - 过程中一个测试写错（如实）：我最初把“往链底端加空 epoll”写成了往 `c[4]`（链的顶端）加，实际应是 `c[0]`（最底端）；Linux 实测顶端可以加（`top ok`）、底端 `ELOOP`。改对测试点后两份 SMP=2 都 PASS。
-- 局限：①`nestedDepthAbove` 对每个实例逐个 `acquireInstance` 并持锁扫描，最多 32 个实例，但在深度较大时是指数级的最坏情形（每个实例可能有多个父），被提前返回的上限截断；②深度只在 `EPOLL_CTL_ADD` 时检查，已经存在的链之后因 `EPOLL_CTL_MOD` 重新启用被禁用的条目不会重新检查；③非 epoll 成员（管道、套接字）不计入深度，与 Linux 一致。
+- 局限：①`nestedDepthAbove` 对每个实例逐个 `acquireInstance` 并持锁扫描，最多 32 个实例，但在深度较大时是指数级的最坏情形（每个实例可能有多个父），被提前返回的上限截断；②~~`EPOLL_CTL_MOD` 重新启用被禁用的条目不重新检查~~（已修：被 `EPOLLONESHOT` 禁用的链接仍计入环与深度，见文末）；③非 epoll 成员（管道、套接字）不计入深度，与 Linux 一致。
 
 ## UDP 端口共享：`SO_REUSEADDR` / `SO_REUSEPORT`，以及 `bind` 之前设置的选项不再丢失（hello183 H 段，已补）
 
@@ -7503,7 +7503,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：`net/udp_port_policy.zig`（`mayShare`、`pickReceiver`，纯函数）；`udp.zig` 的槽位键由端口号改为 32 位（低 16 位端口，高 16 位区分同端口的多个套接字，`FileDescriptor.udp_disc` / `udpKey()`），每槽记录 uid、绑定顺序、地址族；新增 `udp.rebind`（原位移动并保留选项，按策略检查所有持有者）；`enqueue` 在同一临界区里选出接收者；`notifyUnreachable` 通知所有匹配的套接字；vfs 的引用计数、epoll、`FIONREAD`、`getsockopt`/`setsockopt`、`recvmsg` 全部改用 `udpKey()`。
 - 绿灯：hello183 在 SMP=2 的多份运行里 PASS；host 测试覆盖策略（单边不行、uid 不同不行、哈希稳定且 3 个套接字都会被选到、无 `SO_REUSEPORT` 时选最新绑定者）和接线；三个架构构建通过。
 - 过程说明（如实）：哈希第一版只用 FNV，12 个发送方全部落在同一个套接字，“两边都分到”那一项失败；加了一步混合，并把测试里的发送方改成 12 个不同的套接字（此前每轮新建关闭，可能复用同一个端口）。
-- 局限：①槽位表仍是 16 个，同端口共享也占槽位；②IPv4 与 IPv6 的套接字不互相共享端口（沿用原来的接口：判断只看端口号，地址族只用于投递时的过滤）；③只有 `SO_REUSEADDR` 的共享在 Linux 上对组播/广播有不同语义，这里没有区分；④~~`connect` 过的套接字优先~~（已实现，见文末）；⑤`SO_REUSEPORT` 的 BPF 选择器没有。
+- 局限：①~~槽位表仍是 16 个~~（已改为 64，见文末）；②IPv4 与 IPv6 的套接字不互相共享端口（沿用原来的接口：判断只看端口号，地址族只用于投递时的过滤）；③只有 `SO_REUSEADDR` 的共享在 Linux 上对组播/广播有不同语义，这里没有区分；④~~`connect` 过的套接字优先~~（已实现，见文末）；⑤`SO_REUSEPORT` 的 BPF 选择器没有。
 
 ## TCP `SO_REUSEPORT`：监听者关闭时迁移尚未 `accept` 的连接（hello267，已补）
 
@@ -7557,14 +7557,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - **`O_APPEND` 锁的争用（已测量并修复）**：新增 hello270：四个进程各向**自己的**文件写 200 次 4 KiB，普通写与 `O_APPEND` 写各一遍。改动前 SMP=4 上 `O_APPEND` 慢得多：tmpfs 156 → 4636 ms、FAT32 2374 → 36263 ms、ext2 593 → 34632 ms（不同文件之间也互相等，因为两把锁都是全局的）。修改：`append_lock`/`append_call_lock` 改为 16 个分片（`fs/append_lock_policy.zig` 的 `stripeOf`，host 测试），按文件取键：ext2 用 inode 号，tmpfs 用条目号，FAT32 用打开文件槽（**不能用 `inode_id`**：新建的空文件首簇都是 0，四个新文件的 `inode_id` 相同，第一次改完 FAT32 仍慢 11 倍就是这个原因）。改后 tmpfs 164/160 ms、FAT32 2521/2549 ms、ext2 681/630 ms；hello266/hello268 的原子性用例仍通过。hello270 断言 `O_APPEND` 不超过普通写的 3 倍加 300 毫秒；变异（所有文件都映射到同一分片）后 FAT32、ext2 两行失败，**tmpfs 一行仍通过**——tmpfs 的写从不睡眠，外层锁几乎不被持有，所以 tmpfs 那一行只是测量，不是守卫（已在程序注释里写明）。
 - **服务端 TIME_WAIT 上的同端口重连（真缺陷，已修）**：本机 Linux 实测：客户端每轮 `bind` 同一个端口、服务端先关，下一轮的 `connect` 立即成功（Linux 的 TIME_WAIT 接受序号更新的 SYN）。hello269 新增这一段：8 轮都连上了，但**最慢一轮要 78.7 秒**——临时诊断显示：新 SYN 按 4 元组找到了服务端那个 TIME_WAIT 的 TCB，进入状态机的 `.time_wait` 分支被直接忽略（28 次），客户端靠 SYN 重传等到 TIME_WAIT 15 秒到期后才连上（8 次“找不到 TCB”）。`handleIncomingSyn` 里早就有一段 T17“TIME_WAIT 复用”代码，但它**从来到不了**（SYN 先被状态机截走）；而且即使到了，它也没有把复用的 TCB 放进监听队列，`accept` 永远拿不到。修改：`handlePacket` 对“命中 TIME_WAIT、只带 SYN、序号比旧连接新”的段跳过 TCB，交给监听者；T17 复用路径检查监听队列容量、把 TCB 的所有者改成监听者的、并把它排进监听队列。修复后最慢一轮 56 毫秒，8 轮没有一个字节串到下一轮。（hello269 前一版只看“8 轮都连上”，旧内核上也通过；加了“不超过 1.5 秒”之后才红。我起初还用“关掉 T17 代码”做变异来证明这一段有守卫，结果仍然通过——当时这段代码根本没被执行，变异无效。）
 - host 1133/1133；三个架构构建；完整 smoke（SMP=1 一次、SMP=2 三次）全部通过。
-- 仍开放（如实）：①~~UDP 已连接套接字优先~~、②~~迁移按哈希~~（均见下一节）；③`MAX_CONNECTIONS` 仍是 64；④`SO_REUSEPORT` 的 BPF 选择器不做（本内核没有 BPF）；⑤`RWF_HIPRI` 只是被接受。
+- 仍开放（如实）：①~~UDP 已连接套接字优先~~、②~~迁移按哈希~~、③~~`MAX_CONNECTIONS` 64~~、⑤~~`RWF_HIPRI`~~（均见文末各节）；④`SO_REUSEPORT` 的 BPF 选择器不做（本内核没有 BPF）。
 
 ## UDP 已连接套接字优先收对端的数据报；`SO_REUSEPORT` 监听者关闭时按哈希迁移（hello183 H、hello267）
 
 - **UDP（已实现）**：本机 Linux 实测：两个 `SO_REUSEPORT` 套接字共享端口，其中一个 `connect` 到某个对端后，来自该对端的数据报 5/5 都到这个已连接的套接字，来自别人的 8/8 都到另一个；`SO_REUSEADDR` 共享时也一样（已连接的旧套接字收对端的，新绑定的收别人的）。红灯：hello183 H 新增 5 项，“对端来的全部到已连接的套接字”在改动前失败（按哈希分走了一部分）。实现：`connect` 在注册表里记下对端地址（`udp.setPeer`，此前只记端口）；`udp_port_policy.pickReceiverConnected`（纯函数，host 测试）先找连接到这个发送方（地址加端口）的套接字，没有就只在未连接的套接字里按原规则选，已连接到别人的套接字不收。
 - **TCP 迁移按哈希（已实现）**：本机 Linux 实测（`tcp_migrate_req=0`）：三个监听者里关闭一个，它队列里的连接会被复位，12 个里只接到 10 个；本内核打开迁移，所以没有拿 Linux 的数字作期望，期望的是“和新 SYN 一样按对端哈希分给存活的监听者”。红灯：hello267 新增一段，三个套接字共享端口、只有第一个先监听、12 个客户端都排在它的队列里，然后另外两个开始监听、第一个关闭：改动前 12 个全部进了第一个有空位的兄弟（12/0）。实现：`migrateToSiblingListener` 先收集有空位的兄弟，再用 `tcp_port_policy.pickListener` 按子连接的对端地址和端口选一个。改后 6/6。
 - host 1136/1136；完整 smoke 见提交记录。
-- 局限：①迁移时兄弟队列满了的连接仍被复位；②UDP 的已连接优先只看地址和端口，不看本地地址（本内核的 UDP 绑定本来就不区分本地地址）；③`MAX_CONNECTIONS` 64、`RWF_HIPRI`、BPF 选择器同上一节。
+- 局限：①~~迁移时兄弟队列满了的连接仍被复位~~（已修，见文末）；②UDP 的已连接优先只看地址和端口，不看本地地址（本内核的 UDP 绑定本来就不区分本地地址）；③BPF 选择器同上一节。
 
 ## CI：hello270 的 tmpfs 一行在 `994fb29` 的 SMP=2 上失败（`O_APPEND` 3001 ms 对普通写 198 ms），分片改为按低位
 
@@ -7572,4 +7572,24 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 推测（如实，没有在本地复现）：分片键是 tmpfs 条目号，分片号是它的哈希模 16；四个连续条目号有约 28% 的起点让其中两个落在同一分片上（宿主机上算的）。同一分片上的两个写者里，持锁的那个若在持锁期间被抢占（TCG 上更容易发生），另一个只能等它重新被调度。这能解释“偶发、只在慢机器上、只在 tmpfs 上”（tmpfs 的写本身最快，等待的比例最显眼），但我没有直接证据。
 - 修改：分片数 16 → 64，分片号直接取键的低位（`key % 64`）。键都是小的顺序编号（条目号、inode 号、打开文件槽），所以先后创建的文件在 64 个以内一定落在不同分片上。host 测试改为“任意起点的 4 个连续键各占一个分片”。
 - 验证：host 1136/1136；本地 6 份并行 SMP=2、每份跑两遍 hello270，tmpfs 一行 `O_APPEND` 120–227 ms，对应普通写 130–239 ms，没有一行超标；hello266 的原子性用例仍通过。由于原来的失败在本地就没出现过，这只能说明“改后在本地没有看到”，CI 是否不再失败要看之后的运行。
+
+## 剩余开放项收口（hello183 J/K、hello134 I、hello236 G、hello267、hello271、hello272）
+
+- **`RWF_HIPRI`（核实后保持）**：本机 Linux 上 `pwritev2(..., RWF_HIPRI)` 对缓冲文件、`O_DIRECT` 文件、管道、AF_UNIX 数据报都返回成功（只是没有轮询 I/O 时不起作用），所以本内核“接受、不做额外动作”与 Linux 一致，不是缺口。
+- **TCP `SO_REUSEPORT` 的属主 uid 在 `bind` 时记录（已修）**：hello183 J：一个 uid 1000 的子进程绑定 `SO_REUSEPORT` 端口，再 `fork` 一个孙进程持有套接字后自己退出；之后 uid 0 的父进程再绑同一端口。旧代码检查共享时按 `owner_task` 实时查任务的 `euid`，绑定的任务已退出就读到 0，于是 uid 0 被允许加入（红灯）。修改：`TcpTcb.bound_uid` 在 `tcpBind` 时记录，共享判断用 `tcbBoundUid`。（第一版测试用 `int64_t` 接 `pipe2` 写回的两个 32 位描述符，子进程拿到错误的描述符，我一度以为是 `fork` 不继承管道；hello271 验证了 `fork` 继承管道和文件都正常，问题在测试。）
+- **AF_UNIX 数据报的源地址与自动绑定（已实现）**：本机 Linux 实测：设了 `SO_PASSCRED` 的未绑定发送者在第一次发送时自动绑定一个抽象名，接收方 `recvfrom` 拿到这个名字；已绑定路径名的发送者，接收方拿到路径名；没设 `SO_PASSCRED` 的未绑定发送者保持无名。红灯：hello134 I 段，自动绑定两项和“`recvfrom` 报告发送者名字”两项失败——本内核的 AF_UNIX `recvfrom` 从来不填源地址。实现：`unixSendToBlocking` 在发送前对设了 `SO_PASSCRED` 的套接字调用 `unixAutobind`；每个数据报套接字有一个 32 项的源名字队列（`src_names`，按数据报序号配对，队列满或发送者未绑定时该数据报报告无地址，不会把名字错配到别的数据报），`recvfrom` 与 `recvmsg` 的 `msg_name` 用它填写。
+- **epoll：被 `EPOLLONESHOT` 禁用的链接仍计入环与深度（已修）**：本机 Linux 实测：四层链的底部链接是 `EPOLLONESHOT` 并已触发（禁用）后，把这条链加到另一个 epoll 下仍是 `ELOOP`；经过一个已触发的 one-shot 链接闭合的环也是 `ELOOP`；`EPOLL_CTL_MOD` 可以重新启用它。旧代码在环检测和深度计算里跳过 `is_disabled` 的条目，所以这两种情况都被放行（红灯，两项），之后 `MOD` 重新启用就得到一个超深的链或一个环。修改：三处遍历不再跳过禁用条目。
+- **UDP 套接字表 16 → 64（已修）**：hello183 K：40 个 UDP 套接字同时打开并各自绑定、各收一个数据报。旧表只有 16 项，第 16 个之后 `socket()` 失败（实测打开 15 个）。改为 64（接收队列约 750 KiB）；同端口共享的区分位图由 32 位改为 64 位。测试里每发 8 个数据报让本机回环队列（16 帧）排空一次。
+- **TCB 表 64 → 128（已修）**：hello272：40 个同时打开的本机连接（80 个 TCB 加监听者），客户端放在子进程里（每个进程 64 个描述符）。旧表（64 个 TCB）下只接受到 31 个（红灯），`/proc/tcpstats` 显示 64 个槽全满。修改：所有 64 位的 TCB 位图（活跃位图、监听位图、唤醒待处理位图）换成纯模块 `net/tcb_bitset.zig` 的多字位集（逐字 64 位原子操作，x86_64 在这个构建里没有 128 位原子 RMW；快照逐字取，调用方本来都在 `tcp_lock` 下或只当提示用），host 测试覆盖跨字、首个空位、容量边界。`MAX_CONNECTIONS` = 128，TCB 数组约 16 MiB。改后 40 个全部接受并各传一个字节。
+- **`SO_REUSEPORT` 迁移进已满的兄弟队列（已修）**：读 Linux 源码（`inet_csk_listen_stop` → `reuseport_migrate_sock` → `inet_csk_reqsk_queue_add`，后者不检查 backlog）：迁移不受兄弟的 backlog 限制（本机 `tcp_migrate_req` 只能 root 打开，没法实测）。hello267 新增一段：兄弟先接 32 个连接（队列满），关闭的那个监听者再接 8 个，然后关闭：旧代码里兄弟队列满就复位，40 个只接受到 36 个（红灯；变异：只把迁移的上限改回 `LISTEN_BACKLOG`，同样 36/40）。修改：监听队列环的容量改为 `LISTEN_RING` = `MAX_CONNECTIONS`，新 SYN 仍受 `LISTEN_BACKLOG`（32）限制，只有迁移可以超过它。（这一段第一版的子进程仍持有两个监听套接字，父进程关闭监听者并没有真正停止它，测试无效；改为子进程先关闭它们。）
+- host 1143/1143；三个架构构建；完整 smoke 见提交记录。
+- 仍开放（如实）：`SO_REUSEPORT` 的 BPF 选择器不做（本内核没有 BPF）；AF_UNIX 源名字队列 32 项，超过时多出的数据报报告无地址；每进程描述符上限仍是 64。
+
+## `accept` 把排在前面、还没完成握手的连接丢掉（hello272 偶发 39/40，已修）
+
+- 现象：hello272（40 个同时打开的连接）在完整 smoke 和单独运行里都偶发只接受到 38–39 个，`/proc/tcpstats` 显示 80 个 TCB 都已 ESTABLISHED、没有 SYN 被丢、`connect` 全部成功，`accept` 却一直 `EAGAIN`（单独运行 6 次里 3 次）。
+- 查因（如实，逐步排除）：①不是 TCB 表满（128 槽只用了 81）；②不是监听队列满、不是重复的 4 元组、不是 `allocTcpFd` 失败、不是孤儿回收（各加临时诊断，计数都是 0）；③在 `tcpAccept` 打印每次交出的 TCB 与对端端口：40 个都进了监听队列，但交出的只有 36–39 个，缺的那几个对端端口从未出现。
+- 根因：`tcpAccept` 从队头往后找第一个 ESTABLISHED 的子连接，**沿途经过的每一项都被出队丢弃**——包括还在 SYN_RECEIVED、最后一个 ACK 稍后才到的那些。它们之后完成握手，却已经不在任何队列里，`accept` 永远拿不到（连接也不会被复位，对端以为连上了）。连接一个接一个快速建立时，后面的子连接先完成握手的情况就会出现。我的第一版修复只保留 SYN_RECEIVED 的项，又把“排在被选中项之后、已经 ESTABLISHED 的项”丢掉了，仍然 6 次里 3 次失败；改为“除被选中的一项和已失效的项外，全部按原顺序留在队列里”后 6/6 通过。
+- 修改：纯函数 `tcp_port_policy.pickAcceptable`（选最早的已建立项，host 测试）；`tcpAccept` 先分类整个队列（失效 / 握手中 / 已建立），交出选中的一项，其余活着的项按原顺序写回队列。
+- 验证：hello272 单独运行，修复前 6 次里 3 次 38–39/40（旧的 `accept` 代码同样失败，4 次里 2 次），修复后 6/6 都是 40/40；host 1144/1144。
 

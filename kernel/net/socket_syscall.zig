@@ -570,6 +570,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         const rf = @import("recv_flags_policy.zig");
         const nonblock_u = @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, flags);
         var full_len_u: usize = 0;
+        var src_u: net_mod.unix_socket.SrcName = .{};
         var result: i64 = undefined;
         if (rf.peek(flags)) {
             result = net_mod.unix_socket.unixPeek(unix_idx, &tmp_buf, to_read, &full_len_u);
@@ -584,6 +585,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
             const is_stream_u = net_mod.unix_socket.unixIsStream(unix_idx);
             result = net_mod.unix_socket.unixRecvBlockingRights(unix_idx, &tmp_buf, to_read, nonblock_u, &rights_out);
             full_len_u = rights_out.full_len;
+            src_u = rights_out.src;
             for (rights_out.descs[0..rights_out.count]) |*d| vfs_mod.releaseDescriptor(d);
             // MSG_WAITALL: keep reading until the buffer is full (stream only).
             if (result > 0 and rf.waitAll(flags, is_stream_u, nonblock_u)) {
@@ -601,6 +603,13 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         if (result > 0) {
             const copied = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf))[0..@intCast(result)], @intCast(result));
             if (copied != @as(usize, @intCast(result))) return -14; // EFAULT
+            // The sender's bound name, as Linux reports it (a datagram from an unbound sender has no address: length 0).
+            if (addr_ptr != 0 and addr_len_ptr != 0) {
+                var nb: [2 + net_mod.unix_socket.UNIX_PATH_MAX + 1]u8 = undefined;
+                const nl: u32 = if (src_u.len == 0) 0 else @import("socket_address_policy.zig").unixNameEncode(src_u.name[0..src_u.len], &nb);
+                const rc = copySockaddrToUser(addr_ptr, addr_len_ptr, nb[0..nl], nl);
+                if (rc != 0) return rc;
+            }
             // MSG_TRUNC on a datagram socket reports the real message length.
             if (rf.truncReportsFullLength(flags) and full_len_u > @as(usize, @intCast(result))) return @intCast(full_len_u);
         }
@@ -1164,6 +1173,18 @@ fn unixRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8
     // in msg_flags whenever data was discarded).
     const cut_datagram = out.full_len > @as(usize, @intCast(n));
     if (cut_datagram) out_flags |= rf.MSG_TRUNC;
+    // msg_name / msg_namelen: the sender's bound name (an unbound sender: length 0).
+    const rname_ptr: u64 = bo.readU64At(msghdr, 0);
+    const rname_cap: u32 = bo.readU32Le(msghdr[8..12]);
+    if (rname_ptr != 0 and rname_ptr < 0x0000_8000_0000_0000) {
+        var nb: [2 + net_mod.unix_socket.UNIX_PATH_MAX + 1]u8 = undefined;
+        const nl: u32 = if (out.src.len == 0) 0 else @import("socket_address_policy.zig").unixNameEncode(out.src.name[0..out.src.len], &nb);
+        const to_copy = @min(nl, rname_cap);
+        if (to_copy != 0 and copy.copyToUser(@ptrFromInt(rname_ptr), nb[0..to_copy], to_copy) != to_copy) return -14;
+        var nlb: [4]u8 = undefined;
+        bo.writeU32Le(&nlb, nl);
+        _ = copy.copyToUser(@ptrFromInt(msg_ptr + 8), &nlb, 4);
+    }
     // msg_controllen and msg_flags
     var tail: [8]u8 = undefined;
     bo.writeU64Le(&tail, written);

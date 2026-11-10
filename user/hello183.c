@@ -45,7 +45,11 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 
 #define SYS_WRITE     1
 #define SYS_EXIT      2
+#define SYS_PIPE2     250
 #define SYS_CLOSE     11
+#define SYS_READ      10
+#define SYS_OPEN      9
+#define SYS_UNLINK    111
 #define SYS_FORK      57
 #define SYS_WAITPID   6
 #define SYS_NANOSLEEP 35
@@ -431,6 +435,77 @@ void _start(void) {
         syscall1(SYS_CLOSE, (uint64_t)r3);
     }
 
+
+    /* K: many UDP sockets at once. Linux opens hundreds; this kernel's port table was 16 entries, so the 17th socket() failed. 40 are opened
+     * here, each bound to its own port and each receiving one datagram. */
+    {
+        int64_t us[40];
+        int opened = 0, recvd = 0;
+        for (int i = 0; i < 40; i++) {
+            us[i] = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+            if (us[i] >= 0 && bind4(us[i], 18500 + i) == 0) opened++;
+        }
+        { char d[48] = "hello183: K opened NN UDP sockets\n"; d[19] = (char)('0' + opened / 10); d[20] = (char)('0' + opened % 10); print(d); }
+        check(opened == 40, "K: forty UDP sockets can be open and bound at once");
+        int64_t snd = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+        for (int i = 0; i < 40; i++) {
+            uint8_t da[16];
+            mk_addr(da, 18500 + i);
+            char m = (char)('A' + i % 26);
+            syscall6(SYS_SENDTO, (uint64_t)snd, (uint64_t)&m, 1, 0, (uint64_t)da, 16);
+            if (i % 8 == 7) pump(10);   /* the loopback queue holds 16 frames; let it drain */
+        }
+        pump(50);
+        for (int i = 0; i < 40; i++) {
+            char rb[4];
+            if (us[i] >= 0 && syscall6(SYS_RECVFROM, (uint64_t)us[i], (uint64_t)rb, 4, MSG_DONTWAIT, 0, 0) == 1 && rb[0] == (char)('A' + i % 26)) recvd++;
+        }
+        check(recvd == 40, "K: and each receives the datagram sent to its own port");
+        for (int i = 0; i < 40; i++) if (us[i] >= 0) syscall1(SYS_CLOSE, (uint64_t)us[i]);
+        syscall1(SYS_CLOSE, (uint64_t)snd);
+    }
+
+    /* J: the owner uid of a SO_REUSEPORT port group is the one recorded at bind(). An unprivileged child binds, forks a grandchild that keeps the
+     * socket open, and exits; the socket outlives the task that bound it. A live owner lookup then finds no task (uid 0) and would let the
+     * parent (uid 0) join; Linux keeps the binder's uid with the socket and refuses. The grandchild reports through a file and exits later. */
+    {
+        syscall1(SYS_UNLINK, (uint64_t)"/tmp/h183j");
+        int64_t jk = syscall1(SYS_FORK, 0);
+        if (jk == 0) {
+            failures = 0;
+            syscall1(SYS_SETUID, 1000);
+            int64_t s1 = sock4();
+            reuseport(s1);
+            int64_t r1 = bind4(s1, 18397);
+            int64_t gk = syscall1(SYS_FORK, 0);
+            if (gk == 0) {
+                pump(50);
+                int64_t wf = syscall3(SYS_OPEN, (uint64_t)"/tmp/h183j", 0x241, 0644);
+                if (wf >= 0) { char c = (char)(r1 == 0 ? 'y' : 'n'); syscall3(SYS_WRITE, (uint64_t)wf, (uint64_t)&c, 1); syscall1(SYS_CLOSE, (uint64_t)wf); }
+                pump(800);   /* keep the socket open after its binder exited */
+                syscall1(SYS_CLOSE, (uint64_t)s1);
+                syscall1(SYS_EXIT, 0);
+                for (;;) {}
+            }
+            syscall1(SYS_EXIT, 0);   /* the binding task goes away; the socket lives on in the grandchild */
+            for (;;) {}
+        }
+        int st2 = 0;
+        syscall3(SYS_WAITPID, (uint64_t)jk, (uint64_t)&st2, 0);
+        char got = 0;
+        for (int i = 0; i < 400 && got == 0; i++) {
+            int64_t rf = syscall3(SYS_OPEN, (uint64_t)"/tmp/h183j", 0, 0);
+            if (rf >= 0) { if (syscall3(SYS_READ, (uint64_t)rf, (uint64_t)&got, 1) != 1) got = 0; syscall1(SYS_CLOSE, (uint64_t)rf); }
+            if (got == 0) pump(10);
+        }
+        check(got == 'y', "J: the unprivileged child bound its SO_REUSEPORT port");
+        int64_t s2 = sock4();
+        reuseport(s2);
+        check(bind4(s2, 18397) == -EADDRINUSE_, "J: after the binding task exited, a socket from another user still cannot join the group");
+        syscall1(SYS_CLOSE, (uint64_t)s2);
+        pump(900);   /* let the grandchild close the socket before the next sections */
+        syscall1(SYS_UNLINK, (uint64_t)"/tmp/h183j");
+    }
 
     syscall1(SYS_CLOSE, b);
     print(failures == 0 ? "hello183: PASS\n" : "hello183: FAIL\n");

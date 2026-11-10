@@ -661,7 +661,8 @@ fn nestedChainReaches(start: *EpollInstance, epfd_idx: u32) bool {
                 bits &= bits - 1;
                 const i: u8 = @intCast(w * 64 + @as(u32, bit));
                 const item = &child.instance.items[i];
-                if (item.fd_type == .epoll and !item.is_disabled) {
+                // A link disabled by EPOLLONESHOT is still registered and can be re-armed with EPOLL_CTL_MOD, so it is part of the graph.
+                if (item.fd_type == .epoll) {
                     found |= @as(u32, 1) << @intCast(item.resource_idx);
                 }
             }
@@ -692,7 +693,7 @@ fn depthBelowFrom(slot: u32, depth_so_far: u32) u32 {
                 bits &= bits - 1;
                 const i: u8 = @intCast(w * 64 + @as(u32, bit));
                 const item = &child.instance.items[i];
-                if (item.fd_type == .epoll and !item.is_disabled) children |= @as(u32, 1) << @intCast(item.resource_idx);
+                if (item.fd_type == .epoll) children |= @as(u32, 1) << @intCast(item.resource_idx);
             }
         }
     }
@@ -731,7 +732,7 @@ fn depthAboveFrom(slot: u32, depth_so_far: u32) u32 {
                     bits &= bits - 1;
                     const i: u8 = @intCast(w * 64 + @as(u32, bit));
                     const item = &parent.instance.items[i];
-                    if (item.fd_type == .epoll and !item.is_disabled and item.resource_idx == slot) holds = true;
+                    if (item.fd_type == .epoll and item.resource_idx == slot) holds = true;
                 }
             }
         }

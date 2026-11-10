@@ -93,3 +93,16 @@ pub fn pickTimeWaitVictim(waiting: []const bool, age_ms: []const u32) ?usize {
     return best;
 }
 
+/// What accept() does with one queued entry of a listener's ring (oldest first).
+pub const QueueEntry = enum { dead, handshaking, ready };
+
+/// The entry accept() takes from `entries` (oldest first), or null when none is ready. A dead entry is dropped; a connection still in its
+/// handshake (SYN_RECEIVED) stays queued, and a ready one behind it may be taken first (Linux keeps half-open connections out of the
+/// accept queue, so they never block or lose a later established one).
+pub fn pickAcceptable(entries: []const QueueEntry) ?usize {
+    for (entries, 0..) |e, i| {
+        if (e == .ready) return i;
+    }
+    return null;
+}
+

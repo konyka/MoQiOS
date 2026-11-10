@@ -185,6 +185,64 @@ void _start(void) {
         syscall1(SYS_CLOSE, (uint64_t)m2); syscall1(SYS_CLOSE, (uint64_t)m3);
     }
 
+    /* When the only sibling's queue is already full, Linux still hands it the closing listener's children (the migration path,
+     * inet_csk_reqsk_queue_add, does not check the backlog), so none is reset. This kernel's listen queue is a fixed 32-entry ring: the
+     * sibling first takes 32 connections, then the closing listener takes 8 more, then it closes. 80 TCBs plus 2 listeners: the table
+     * needs more than 64 slots. The 40 client ends live in a child process (64 descriptors per process). */
+    {
+        int64_t f1 = sock4(), f2 = sock4();
+        reuseport(f1); reuseport(f2);
+        check(bind4(f1, 18412) == 0 && bind4(f2, 18412) == 0, "two sockets share a port (full-queue case)");
+        uint8_t fa[16];
+        mk_addr(fa, 18412);
+        check(syscall2(SYS_LISTEN, (uint64_t)f2, 32) == 0, "the sibling listens first");
+        int64_t fk = syscall1(SYS_FORK, 0);
+        if (fk == 0) {
+            syscall1(SYS_CLOSE, (uint64_t)f1);   /* the child must not hold the listeners: closing them in the parent has to stop them */
+            syscall1(SYS_CLOSE, (uint64_t)f2);
+            int64_t fc[40];
+            for (int k = 0; k < 32; k++) { fc[k] = sock4(); syscall3(SYS_CONNECT, (uint64_t)fc[k], (uint64_t)fa, 16); pump(10); }
+            /* the parent now starts the second listener; it can only take the next connections if the sibling's ring is full */
+            int64_t sig = syscall3(9 /* open */, (uint64_t)"/tmp/h267q", 0x241, 0644);
+            if (sig >= 0) syscall1(SYS_CLOSE, (uint64_t)sig);
+            pump(300);
+            /* non-blocking: a SYN the hash gives to the full sibling is dropped and retried later, and must not stall the others */
+            for (int k = 32; k < 40; k++) {
+                fc[k] = sock4();
+                int fl = (int)syscall3(142, (uint64_t)fc[k], 3, 0);
+                syscall3(142, (uint64_t)fc[k], 4, (uint64_t)(fl | 0x800));
+                syscall3(SYS_CONNECT, (uint64_t)fc[k], (uint64_t)fa, 16);
+                pump(10);
+            }
+            pump(6000);   /* keep every client open until the parent has accepted */
+            for (int k = 0; k < 40; k++) syscall1(SYS_CLOSE, (uint64_t)fc[k]);
+            syscall1(SYS_EXIT, 0);
+            for (;;) {}
+        }
+        for (int i = 0; i < 400; i++) {
+            int64_t t = syscall3(9, (uint64_t)"/tmp/h267q", 0, 0);
+            if (t >= 0) { syscall1(SYS_CLOSE, (uint64_t)t); break; }
+            pump(10);
+        }
+        check(syscall2(SYS_LISTEN, (uint64_t)f1, 32) == 0, "then the closing one");
+        pump(600);
+        syscall1(SYS_CLOSE, (uint64_t)f1);
+        pump(50);
+        int got = 0;
+        for (int round = 0; round < 1500 && got < 40; round++) {   /* up to ~7.5 s: dropped SYNs come back after their 2 s retransmit */
+            syscall1(SYS_NETPOLL, 0);
+            int64_t a = syscall4(SYS_ACCEPT4, (uint64_t)f2, 0, 0, 0x800);
+            if (a >= 0) { got++; syscall1(SYS_CLOSE, (uint64_t)a); } else sleep_ms(5);
+        }
+        { char d[48] = "hello267: full-queue case accepted NN of 40\n"; d[35] = (char)('0' + got / 10); d[36] = (char)('0' + got % 10); print(d); }
+        check(got == 40, "with the sibling's queue full, every connection of the closing listener is still accepted, none reset");
+        int fst = 0;
+        syscall3(SYS_WAITPID, (uint64_t)fk, (uint64_t)&fst, 0);
+        syscall1(SYS_CLOSE, (uint64_t)f2);
+        syscall1(111, (uint64_t)"/tmp/h267q");
+        pump(100);
+    }
+
     print(failures == 0 ? "hello267: PASS\n" : "hello267: FAIL\n");
     print("hello267 done\n");
     syscall1(SYS_EXIT, failures == 0 ? 0 : 1);

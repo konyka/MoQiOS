@@ -11750,7 +11750,7 @@ test "TCP SO_REUSEPORT: shared ports need both sides to opt in, same user; conne
     // Wiring: a listener owns its slot (by TCB), bind consults the rule, SYNs pick through pickListenSlot.
     const t = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, t, "listen_slots[i].tcb_idx = tcbIdx(tcb);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, t, "tcp_port_policy.reusePortMayShare(tcb.options.extra_flags, tcbs[i].options.extra_flags, tcbOwnerUid(tcb), tcbOwnerUid(&tcbs[i]))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t, "tcp_port_policy.reusePortMayShare(tcb.options.extra_flags, tcbs[i].options.extra_flags, tcbOwnerUid(tcb), tcbBoundUid(&tcbs[i]))") != null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, t, "pickListenSlot(dst_port, "));
     try std.testing.expect(std.mem.indexOf(u8, t, "if (listen_slots[i].tcb_idx == tcb_idx) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, t, "if (ls.tcb_idx == tcbIdx(tcb)) {") != null);
@@ -11829,7 +11829,7 @@ test "tcp: a closing SO_REUSEPORT listener hands its backlog to a sibling before
     const mig = std.mem.indexOf(u8, ts, "if (migrateToSiblingListener(ls, pidx)) continue;\n                dropUnacceptedChild(&tcbs[pidx]);") orelse return error.TestUnexpectedResult;
     try std.testing.expect(dis < mig);
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (sib == from or sib.local_port != from.local_port or sib.is_v6 != from.is_v6) continue;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ts, "if (sib.pending_tail -% sib.pending_head >= LISTEN_BACKLOG) continue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (sib.pending_tail -% sib.pending_head >= LISTEN_RING) continue;") != null);
 }
 
 test "O_APPEND: pwrite and pwritev append at the end, splice and copy_file_range refuse the descriptor" {
@@ -11961,7 +11961,7 @@ test "tcp: a newer SYN for a 4-tuple in TIME_WAIT goes to the listener, which re
     try std.testing.expect(std.mem.indexOf(u8, ts, "const tcb = (if (tw_reopen) null else found) orelse {") != null);
     // The reused slot joins the backlog (accept would never see it otherwise) and belongs to the listener's owner.
     const tw = std.mem.indexOf(u8, ts, "tcpLog(\"[tcp] TIME_WAIT reuse → SYN-ACK\\n\");") orelse return error.TestUnexpectedResult;
-    const q = std.mem.indexOfPos(u8, ts, tw, "ls.pending_tpbs[ls.pending_tail % LISTEN_BACKLOG] = @intCast(i);") orelse return error.TestUnexpectedResult;
+    const q = std.mem.indexOfPos(u8, ts, tw, "ls.pending_tpbs[ls.pending_tail % LISTEN_RING] = @intCast(i);") orelse return error.TestUnexpectedResult;
     try std.testing.expect(q - tw < 300);
     try std.testing.expect(std.mem.indexOf(u8, ts, "reuse_tcb.owner_task = ls.owner_task;") != null);
 }
@@ -12001,5 +12001,102 @@ test "udp: connect records the peer address and enqueue chooses the receiver wit
 test "tcp: a closing SO_REUSEPORT listener spreads its queued children over the siblings by the peer hash" {
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "const sib = sibs[tcp_port_policy.pickListener(n, child.remote_ip, child.remote_port)];") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ts, "if (sib.pending_tail -% sib.pending_head >= LISTEN_BACKLOG) continue;\n        sibs[n] = sib;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (sib.pending_tail -% sib.pending_head >= LISTEN_RING) continue;\n        sibs[n] = sib;") != null);
+}
+
+test "tcp SO_REUSEPORT: the owner uid is recorded at bind() and checked from the socket, not from the binding task" {
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "tcb.bound_uid = tcbOwnerUid(tcb);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "tcbOwnerUid(tcb), tcbBoundUid(&tcbs[i]))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "return if (tcb.bound_explicitly) tcb.bound_uid else tcbOwnerUid(tcb);") != null);
+}
+
+test "AF_UNIX: an unbound datagram sender with SO_PASSCRED autobinds at its first send" {
+    const us = kt.unix_socket_source;
+    const f = std.mem.indexOf(u8, us, "pub fn unixSendToBlocking(") orelse return error.TestUnexpectedResult;
+    const a = std.mem.indexOfPos(u8, us, f, "if (v.opts.flags & 32 != 0) _ = unixAutobind(idx);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(a - f < 600);
+}
+
+test "AF_UNIX datagrams remember their sender's bound name for recvfrom / recvmsg" {
+    const us = kt.unix_socket_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (sock.sock_type == SOCK_DGRAM) pushSrcNameLocked(peer, sock);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "const src = popSrcNameLocked(sock);") != null);
+    // A record is matched to its name by sequence number, so a dropped or unnamed record never shifts names onto other records.
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (sock.src_count == 0 or sock.src_names[sock.src_head].seq != seq) return .{};") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const rc = copySockaddrToUser(addr_ptr, addr_len_ptr, nb[0..nl], nl);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const rname_ptr: u64 = bo.readU64At(msghdr, 0);") != null);
+}
+
+test "epoll: a link disabled by EPOLLONESHOT still counts for the cycle and depth checks (it can be re-armed with EPOLL_CTL_MOD)" {
+    const es = kt.epoll_source;
+    try std.testing.expect(std.mem.indexOf(u8, es, "if (item.fd_type == .epoll and !item.is_disabled) children") == null);
+    try std.testing.expect(std.mem.indexOf(u8, es, "if (item.fd_type == .epoll and !item.is_disabled and item.resource_idx == slot) holds = true;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, es, "if (item.fd_type == .epoll and !item.is_disabled) {\n                    found") == null);
+}
+
+test "udp: the port table holds 64 sockets, and a port shared by up to 64 sockets gets a distinct discriminator each" {
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "const MAX_PORTS = 64;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "var used: u64 = 0;") != null);
+}
+
+test "tcb_bitset: more than 64 slots, lowest-first iteration, firstClear respects the capacity" {
+    const B = kt.tcb_bitset.Bitset(128);
+    var b: B = .{};
+    try std.testing.expect(b.isEmpty());
+    try std.testing.expectEqual(@as(?u32, 0), b.firstClear());
+    b.set(3);
+    b.set(64);
+    b.set(127);
+    try std.testing.expect(b.isSet(64) and b.isSet(127) and !b.isSet(65));
+    try std.testing.expectEqual(@as(u32, 3), b.count());
+    var it = b.snapshot();
+    try std.testing.expectEqual(@as(?u32, 3), it.next());
+    try std.testing.expectEqual(@as(?u32, 64), it.next());
+    try std.testing.expectEqual(@as(?u32, 127), it.next());
+    try std.testing.expectEqual(@as(?u32, null), it.next());
+    b.clear(64);
+    try std.testing.expect(!b.isSet(64));
+    var i: u32 = 0;
+    while (i < 128) : (i += 1) b.set(i);
+    try std.testing.expectEqual(@as(?u32, null), b.firstClear());
+    b.clear(100);
+    try std.testing.expectEqual(@as(?u32, 100), b.firstClear());
+    // A capacity that is not a multiple of 64 never hands out an index past it.
+    const C = kt.tcb_bitset.Bitset(70);
+    var c: C = .{};
+    i = 0;
+    while (i < 70) : (i += 1) c.set(i);
+    try std.testing.expectEqual(@as(?u32, null), c.firstClear());
+    var t = c.takeAll();
+    try std.testing.expect(c.isEmpty());
+    try std.testing.expectEqual(@as(u32, 70), t.count());
+    _ = t.next();
+}
+
+test "tcp: 128 TCB slots behind a multi-word bitset; a listener's ring holds every TCB so migration past the backlog never resets" {
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const MAX_CONNECTIONS: u32 = 128;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const TcbSet = @import(\"tcb_bitset.zig\").Bitset(MAX_CONNECTIONS);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "var tcb_active_bitmap: TcbSet = .{};") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "@atomicLoad(u64, &tcb_active_bitmap") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const LISTEN_RING: u32 = MAX_CONNECTIONS;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (sib.pending_tail -% sib.pending_head >= LISTEN_RING) continue;") != null);
+    // New SYNs are still limited by the backlog, only migration may go past it.
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, ts, "if (ls.pending_tail -% ls.pending_head >= LISTEN_BACKLOG) return;"));
+}
+
+test "tcp accept: a connection still in its handshake stays queued and does not hide an established one behind it" {
+    const p = kt.tcp_port_policy;
+    try std.testing.expectEqual(@as(?usize, null), p.pickAcceptable(&[_]p.QueueEntry{}));
+    try std.testing.expectEqual(@as(?usize, null), p.pickAcceptable(&[_]p.QueueEntry{ .handshaking, .dead }));
+    try std.testing.expectEqual(@as(?usize, 1), p.pickAcceptable(&[_]p.QueueEntry{ .handshaking, .ready, .ready }));
+    try std.testing.expectEqual(@as(?usize, 2), p.pickAcceptable(&[_]p.QueueEntry{ .dead, .handshaking, .ready }));
+    // The kernel removes the chosen entry and every dead one, and keeps the handshaking ones in order.
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "tcp_port_policy.pickAcceptable(kinds[0..n])") != null);
+    // Every live entry other than the chosen one stays queued (an established child behind the chosen one must not be lost).
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (pick != null and j == pick.?) continue;\n        if (k != .dead) {") != null);
 }

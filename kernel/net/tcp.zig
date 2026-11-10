@@ -31,11 +31,12 @@ const tcp_info_policy = @import("tcp_info_policy.zig");
 const ip_opt_policy = @import("ip_opt_policy.zig");
 const tcp_recv_policy = @import("tcp_recv_policy.zig");
 const tcp_stats = @import("tcp_stats.zig");
+const TcbSet = @import("tcb_bitset.zig").Bitset(MAX_CONNECTIONS);
 const tcp_port_policy = @import("tcp_port_policy.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 // v53.13: Global TCP lock — protects TCB array, tcb_active_bitmap, and all TCB fields.
-// v53.15: tcb_active_bitmap uses atomic RMW for all accesses (lock-free snapshot in timerTick).
+// v53.15: tcb_active_bitmap uses atomic RMW for all accesses (lock-free snapshot in timerTick); it is a TcbSet of u64 words (tcb_bitset.zig).
 // Lock order: tcp_lock → e1000.tx_lock (sendSegment acquires tx_lock internally).
 // Acquired at the entry of every public function; private helpers (sendSegment, flushSendBuffer,
 // processIncomingData, allocTcb, deactivateTcb) are called from within the lock and must NOT re-acquire.
@@ -54,7 +55,7 @@ const TcpLock = struct {
     }
 
     inline fn release(self: *TcpLock, saved: u64) void {
-        const chain = if (recv_wake_pending != 0 or send_wake_pending != 0) takeRecvWakesLocked() else null;
+        const chain = if (!recv_wake_pending.isEmpty() or !send_wake_pending.isEmpty()) takeRecvWakesLocked() else null;
         self.inner.release(saved);
         if (chain != null) wakeRecvChain(chain);
     }
@@ -70,7 +71,7 @@ inline fn tcpLog(comptime msg: []const u8) void {
 
 // ─── Constants ────────────────────────────────────────────────────────────
 
-const MAX_CONNECTIONS: u32 = 64;
+const MAX_CONNECTIONS: u32 = 128;
 const TCP_WINDOW: u32 = 32768;
 const TCP_MSS: u16 = 1460;
 /// IPv4 header + minimum TCP header (no options) for SMSS (SK-101).
@@ -329,6 +330,9 @@ const TcpTcb = struct {
     refused: bool = false,
     /// local_port was set by bind(); otherwise connect() treats it as stale.
     bound_explicitly: bool = false,
+    /// Effective uid of the task that bound the socket (SO_REUSEPORT groups only share between equal uids); kept with the socket so it
+    /// outlives the binding task.
+    bound_uid: u32 = 0,
     /// Zero-window persist probe timer (SK-110).
     persist_timer_ms: u32,
     /// Current persist probe interval (SK-110); doubles after each probe.
@@ -376,26 +380,26 @@ var recv_waiters: [MAX_CONNECTIONS]?*RecvWaitNode = @splat(null);
 /// Bitmap of TCB slots whose readers must be woken once tcp_lock is
 /// released. Set under tcp_lock wherever a blocked reader's wait condition
 /// can change (data, FIN, RST, teardown); drained by flushRecvWakes.
-var recv_wake_pending: u64 = 0;
+var recv_wake_pending: TcbSet = .{};
 
 /// Per-slot list of blocked writers (waiting for send-ring space) and the
 /// bitmap of slots whose writers must be woken once tcp_lock is released.
 var send_waiters: [MAX_CONNECTIONS]?*RecvWaitNode = @splat(null);
-var send_wake_pending: u64 = 0;
+var send_wake_pending: TcbSet = .{};
 
 /// Mark `tcb`'s blocked readers for wake-up (call with tcp_lock held). A
 /// blocked writer re-checks on every such event too: teardown, reset and
 /// state changes all end its wait.
 inline fn markRecvWake(tcb: *const TcpTcb) void {
-    const idx: u6 = @intCast(tcbIdx(tcb));
-    if (recv_waiters[idx] != null) recv_wake_pending |= @as(u64, 1) << idx;
-    if (send_waiters[idx] != null) send_wake_pending |= @as(u64, 1) << idx;
+    const idx = tcbIdx(tcb);
+    if (recv_waiters[idx] != null) recv_wake_pending.set(idx);
+    if (send_waiters[idx] != null) send_wake_pending.set(idx);
 }
 
 /// Mark `tcb`'s blocked writers for wake-up: an ACK freed send-ring space.
 inline fn markSendWake(tcb: *const TcpTcb) void {
-    const idx: u6 = @intCast(tcbIdx(tcb));
-    if (send_waiters[idx] != null) send_wake_pending |= @as(u64, 1) << idx;
+    const idx = tcbIdx(tcb);
+    if (send_waiters[idx] != null) send_wake_pending.set(idx);
 }
 
 /// Unlink every waiter of the slots marked by markRecvWake (tcp_lock held)
@@ -404,11 +408,8 @@ inline fn markSendWake(tcb: *const TcpTcb) void {
 /// inside tcp_lock).
 fn takeRecvWakesLocked() ?*RecvWaitNode {
     var chain: ?*RecvWaitNode = null;
-    var bm = recv_wake_pending;
-    recv_wake_pending = 0;
-    while (bm != 0) {
-        const i = @ctz(bm);
-        bm &= bm - 1;
+    var bm = recv_wake_pending.takeAll();
+    while (bm.next()) |i| {
         var cur = recv_waiters[i];
         recv_waiters[i] = null;
         while (cur) |node| {
@@ -417,11 +418,8 @@ fn takeRecvWakesLocked() ?*RecvWaitNode {
             chain = node;
         }
     }
-    bm = send_wake_pending;
-    send_wake_pending = 0;
-    while (bm != 0) {
-        const i = @ctz(bm);
-        bm &= bm - 1;
+    bm = send_wake_pending.takeAll();
+    while (bm.next()) |i| {
         var cur = send_waiters[i];
         send_waiters[i] = null;
         while (cur) |node| {
@@ -490,7 +488,7 @@ pub fn tcpRecvTimeoutMs(tcb_idx: u32) u32 {
 /// Bitmap tracking active TCB slots (1 = active, 0 = free).
 /// Enables O(1) skip of empty slots via @ctz instead of linear scan.
 // v53.15: All accesses use @atomicLoad/@atomicRmw for SMP-safe lock-free snapshot in timerTick.
-var tcb_active_bitmap: u64 = 0;
+var tcb_active_bitmap: TcbSet = .{};
 
 /// Compute the pool index of a TCB from its pointer.
 fn tcbIdx(tcb: *const TcpTcb) u32 {
@@ -501,8 +499,7 @@ fn tcbIdx(tcb: *const TcpTcb) u32 {
 
 /// Deactivate a TCB and clear its bitmap bit (single call site for consistency).
 inline fn deactivateTcb(tcb: *TcpTcb) void {
-    const idx: u6 = @intCast(tcbIdx(tcb));
-    _ = @atomicRmw(u64, &tcb_active_bitmap, .And, ~(@as(u64, 1) << idx), .release);
+    tcb_active_bitmap.clear(tcbIdx(tcb));
     tcb.active = false;
     markRecvWake(tcb);
 }
@@ -519,26 +516,24 @@ fn dropUnacceptedChild(child: *TcpTcb) void {
     deactivateTcb(child);
 }
 
-/// A backlog child of a closing SO_REUSEPORT listener moves to another listener on the same port that still has room (Linux migrates
+/// A backlog child of a closing SO_REUSEPORT listener moves to another listener on the same port, even one past its backlog (Linux migrates
 /// requests the same way); false when no sibling can take it, and the child is dropped as before.
 fn migrateToSiblingListener(from: *const ListenSlot, child_idx: u32) bool {
     // The siblings with room, in bitmap order; the child goes to the one the peer's hash picks among them (as a new SYN would be spread).
     var sibs: [MAX_CONNECTIONS]*ListenSlot = undefined;
     var n: u32 = 0;
-    var lbm = listen_active_bitmap;
-    while (lbm != 0) {
-        const i = @ctz(lbm);
-        lbm &= lbm - 1;
+    var lbm = listen_active_bitmap.snapshot();
+    while (lbm.next()) |i| {
         const sib = &listen_slots[i];
         if (sib == from or sib.local_port != from.local_port or sib.is_v6 != from.is_v6) continue;
-        if (sib.pending_tail -% sib.pending_head >= LISTEN_BACKLOG) continue;
+        if (sib.pending_tail -% sib.pending_head >= LISTEN_RING) continue;
         sibs[n] = sib;
         n += 1;
     }
     if (n == 0) return false;
     const child = &tcbs[child_idx];
     const sib = sibs[tcp_port_policy.pickListener(n, child.remote_ip, child.remote_port)];
-    sib.pending_tpbs[sib.pending_tail % LISTEN_BACKLOG] = child_idx;
+    sib.pending_tpbs[sib.pending_tail % LISTEN_RING] = child_idx;
     sib.pending_tail += 1;
     child.owner_task = sib.owner_task;
     return true;
@@ -547,16 +542,14 @@ fn migrateToSiblingListener(from: *const ListenSlot, child_idx: u32) bool {
 /// Stop a listener: clear its listen slot so the port stops answering SYNs, and reset or free the backlog children nobody can
 /// accept anymore. Caller holds tcp_lock and then marks the listener TCB closed.
 fn stopListening(tcb: *TcpTcb) void {
-    var lbm = listen_active_bitmap;
-    while (lbm != 0) {
-        const i = @ctz(lbm);
-        lbm &= lbm - 1;
+    var lbm = listen_active_bitmap.snapshot();
+    while (lbm.next()) |i| {
         const ls = &listen_slots[i];
         if (ls.tcb_idx == tcbIdx(tcb)) {
-            listen_active_bitmap &= ~(@as(u64, 1) << @intCast(i));
+            listen_active_bitmap.clear(i);
             ls.active = false;
             while (ls.pending_head != ls.pending_tail) {
-                const pidx = ls.pending_tpbs[ls.pending_head % LISTEN_BACKLOG];
+                const pidx = ls.pending_tpbs[ls.pending_head % LISTEN_RING];
                 ls.pending_head += 1;
                 if (pidx >= MAX_CONNECTIONS or !tcbs[pidx].active) continue;
                 if (migrateToSiblingListener(ls, pidx)) continue;
@@ -571,18 +564,14 @@ fn stopListening(tcb: *TcpTcb) void {
 /// a client always reaches the same listener; with one it is that one.
 fn pickListenSlot(port: u16, is_v6: bool, src_ip: [4]u8, src_port: u16) ?*ListenSlot {
     var count: u32 = 0;
-    var lbm = listen_active_bitmap;
-    while (lbm != 0) {
-        const i = @ctz(lbm);
-        lbm &= lbm - 1;
+    var lbm = listen_active_bitmap.snapshot();
+    while (lbm.next()) |i| {
         if (listen_slots[i].local_port == port and listen_slots[i].is_v6 == is_v6) count += 1;
     }
     if (count == 0) return null;
     var want = tcp_port_policy.pickListener(count, src_ip, src_port);
-    lbm = listen_active_bitmap;
-    while (lbm != 0) {
-        const i = @ctz(lbm);
-        lbm &= lbm - 1;
+    lbm = listen_active_bitmap.snapshot();
+    while (lbm.next()) |i| {
         if (listen_slots[i].local_port == port and listen_slots[i].is_v6 == is_v6) {
             if (want == 0) return &listen_slots[i];
             want -= 1;
@@ -592,19 +581,17 @@ fn pickListenSlot(port: u16, is_v6: bool, src_ip: [4]u8, src_port: u16) ?*Listen
 }
 
 /// Marker for a backlog ring entry whose handshake died (never a real TCB
-/// index — MAX_CONNECTIONS is 64).
+/// index — MAX_CONNECTIONS is 128).
 const INVALID_PENDING: u32 = 0xFFFF_FFFF;
 
 /// True when the TCB index still sits in some listen backlog ring.
 fn tcbInListenBacklog(tcb_idx: u32) bool {
-    var lbm = listen_active_bitmap;
-    while (lbm != 0) {
-        const i = @ctz(lbm);
-        lbm &= lbm - 1;
+    var lbm = listen_active_bitmap.snapshot();
+    while (lbm.next()) |i| {
         const ls = &listen_slots[i];
         var scan = ls.pending_head;
         while (scan != ls.pending_tail) : (scan += 1) {
-            if (ls.pending_tpbs[scan % LISTEN_BACKLOG] == tcb_idx) return true;
+            if (ls.pending_tpbs[scan % LISTEN_RING] == tcb_idx) return true;
         }
     }
     return false;
@@ -613,18 +600,16 @@ fn tcbInListenBacklog(tcb_idx: u32) bool {
 /// Release a backlog TCB whose handshake died. Such an entry has no fd
 /// reference (ref_count stays at the allocTcb baseline of 1), so the
 /// keep-slot-active rule of closeTcbRemote would otherwise pin the TCB slot
-/// — and, repeated, exhaust all 64 slots. Drop it from the ring and free the
+/// — and, repeated, exhaust every slot. Drop it from the ring and free the
 /// slot; tcpAccept skips the invalidated entry.
 fn releaseOrphanedBacklogTcb(tcb_idx: u32) void {
-    var lbm = listen_active_bitmap;
-    while (lbm != 0) {
-        const i = @ctz(lbm);
-        lbm &= lbm - 1;
+    var lbm = listen_active_bitmap.snapshot();
+    while (lbm.next()) |i| {
         const ls = &listen_slots[i];
         var scan = ls.pending_head;
         while (scan != ls.pending_tail) : (scan += 1) {
-            if (ls.pending_tpbs[scan % LISTEN_BACKLOG] == tcb_idx) {
-                ls.pending_tpbs[scan % LISTEN_BACKLOG] = INVALID_PENDING;
+            if (ls.pending_tpbs[scan % LISTEN_RING] == tcb_idx) {
+                ls.pending_tpbs[scan % LISTEN_RING] = INVALID_PENDING;
                 deactivateTcb(&tcbs[tcb_idx]);
                 return;
             }
@@ -650,8 +635,8 @@ inline fn closeTcbRemote(tcb: *TcpTcb) void {
 }
 
 pub fn initTcbs() void {
-    @atomicStore(u64, &tcb_active_bitmap, 0, .release);
-    listen_active_bitmap = 0;
+    tcb_active_bitmap.reset();
+    listen_active_bitmap.reset();
     for (0..MAX_CONNECTIONS) |i| {
         listen_slots[i] = .{
             .active = false,
@@ -786,10 +771,8 @@ pub fn tcpStatsSnapshot() tcp_stats.Stats {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
     var st: tcp_stats.Stats = .{ .capacity = MAX_CONNECTIONS, .syn_dropped = syn_dropped_no_slot, .time_wait_evicted = time_wait_evicted_count };
-    var bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
-    while (bm != 0) {
-        const i = @ctz(bm);
-        bm &= bm - 1;
+    var bm = tcb_active_bitmap.snapshot();
+    while (bm.next()) |i| {
         st.active += 1;
         st.per_state[@min(@as(usize, @intFromEnum(tcbs[i].state)), tcp_stats.STATE_COUNT - 1)] += 1;
         if (tcbs[i].ref_count == 0) st.orphans += 1;
@@ -802,10 +785,8 @@ pub fn tcpStatsSnapshot() tcp_stats.Stats {
 fn evictOldestTimeWait() bool {
     var waiting: [MAX_CONNECTIONS]bool = @splat(false);
     var age: [MAX_CONNECTIONS]u32 = @splat(0);
-    var bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
-    while (bm != 0) {
-        const i = @ctz(bm);
-        bm &= bm - 1;
+    var bm = tcb_active_bitmap.snapshot();
+    while (bm.next()) |i| {
         if (tcbs[i].state == .time_wait and tcbs[i].ref_count == 0) {
             waiting[i] = true;
             age[i] = tcbs[i].retransmit_timer;
@@ -819,16 +800,14 @@ fn evictOldestTimeWait() bool {
 
 fn allocTcb() ?*TcpTcb {
     // Use inverted bitmap to find first free slot (0 bit = free)
-    const all_mask: u64 = if (MAX_CONNECTIONS >= 64) 0xFFFFFFFFFFFFFFFF else (@as(u64, 1) << MAX_CONNECTIONS) - 1;
-    var free_bitmap = ~@atomicLoad(u64, &tcb_active_bitmap, .acquire) & all_mask;
-    if (free_bitmap == 0) {
+    var free = tcb_active_bitmap.snapshot().firstClear();
+    if (free == null) {
         // Table full: a finished connection's TIME_WAIT leftover (no descriptor references it) gives up its slot to the new one
         // instead of making the caller wait out the 15 s timer. Live connections and listeners are never taken.
-        if (evictOldestTimeWait()) free_bitmap = ~@atomicLoad(u64, &tcb_active_bitmap, .acquire) & all_mask;
+        if (evictOldestTimeWait()) free = tcb_active_bitmap.snapshot().firstClear();
     }
-    if (free_bitmap == 0) return null;
-    const i: u6 = @intCast(@ctz(free_bitmap));
-    _ = @atomicRmw(u64, &tcb_active_bitmap, .Or, @as(u64, 1) << i, .release);
+    const i = free orelse return null;
+    tcb_active_bitmap.set(i);
     tcbs[i].active = true;
     tcb_generations[i] +%= 1;
     initTcbState(&tcbs[i]);
@@ -933,6 +912,7 @@ fn initTcbState(t: *TcpTcb) void {
     t.shut_rd = false;
     t.refused = false;
     t.bound_explicitly = false;
+    t.bound_uid = 0;
     t.persist_timer_ms = 0;
     t.persist_rto_ms = RETRANSMIT_MS;
     t.delayed_ack_pending = false;
@@ -952,10 +932,8 @@ pub fn tcpRetain(tcb_idx: u32) void {
 }
 
 fn findTcbByTuple(local_port: u16, remote_port: u16, remote_ip: [4]u8) ?*TcpTcb {
-    var bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
-    while (bm != 0) {
-        const i = @ctz(bm);
-        bm &= bm - 1; // clear lowest set bit
+    var bm = tcb_active_bitmap.snapshot();
+    while (bm.next()) |i| {
         if (!tcbs[i].is_v6 and
             tcbs[i].local_port == local_port and
             tcbs[i].remote_port == remote_port and
@@ -968,10 +946,8 @@ fn findTcbByTuple(local_port: u16, remote_port: u16, remote_ip: [4]u8) ?*TcpTcb 
 }
 
 fn findTcbByTupleV6(local_port: u16, remote_port: u16, remote_ip6: [16]u8) ?*TcpTcb {
-    var bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
-    while (bm != 0) {
-        const i = @ctz(bm);
-        bm &= bm - 1;
+    var bm = tcb_active_bitmap.snapshot();
+    while (bm.next()) |i| {
         if (tcbs[i].is_v6 and
             tcbs[i].local_port == local_port and
             tcbs[i].remote_port == remote_port and
@@ -984,10 +960,8 @@ fn findTcbByTupleV6(local_port: u16, remote_port: u16, remote_ip6: [16]u8) ?*Tcp
 }
 
 fn findTcbByLocalPort(local_port: u16) ?*TcpTcb {
-    var bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
-    while (bm != 0) {
-        const i = @ctz(bm);
-        bm &= bm - 1;
+    var bm = tcb_active_bitmap.snapshot();
+    while (bm.next()) |i| {
         if (tcbs[i].local_port == local_port) {
             return &tcbs[i];
         }
@@ -1002,10 +976,8 @@ fn findTcbByLocalPort(local_port: u16) ?*TcpTcb {
 fn allocEphemeralPort(self: *const TcpTcb) u16 {
     var in_use: [MAX_CONNECTIONS]u16 = undefined;
     var n: usize = 0;
-    var bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
-    while (bm != 0) {
-        const i = @ctz(bm);
-        bm &= bm - 1;
+    var bm = tcb_active_bitmap.snapshot();
+    while (bm.next()) |i| {
         if (&tcbs[i] == self) continue;
         in_use[n] = tcbs[i].local_port;
         n += 1;
@@ -2072,10 +2044,8 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
     const ls = pickListenSlot(dst_port, false, src_ip, src_port) orelse return;
 
     // T17: Allow TCB reuse for TIME_WAIT connections (if ISN is larger)
-    var tw_bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
-    while (tw_bm != 0) {
-        const i = @ctz(tw_bm);
-        tw_bm &= tw_bm - 1;
+    var tw_bm = tcb_active_bitmap.snapshot();
+    while (tw_bm.next()) |i| {
         if (tcbs[i].state == .time_wait and
             !tcbs[i].is_v6 and
             tcp_util.tupleMatchV4(dst_port, src_port, src_ip, tcbs[i].local_port, tcbs[i].remote_port, tcbs[i].remote_ip) and
@@ -2117,7 +2087,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
             _ = sendSegment(reuse_tcb, probeEcnSynAckFlags(peer_ecn), undefined, 0);
             tcpLog("[tcp] TIME_WAIT reuse → SYN-ACK\n");
             // Queue it like a fresh SYN_RECEIVED child, or accept() would never see the new connection.
-            ls.pending_tpbs[ls.pending_tail % LISTEN_BACKLOG] = @intCast(i);
+            ls.pending_tpbs[ls.pending_tail % LISTEN_RING] = @intCast(i);
             ls.pending_tail += 1;
             return;
         }
@@ -2174,7 +2144,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
     const new_idx = tcbIdx(new_tcb);
 
     // Queue in listen backlog (will be moved to established when ACK arrives)
-    ls.pending_tpbs[ls.pending_tail % LISTEN_BACKLOG] = new_idx;
+    ls.pending_tpbs[ls.pending_tail % LISTEN_RING] = new_idx;
     ls.pending_tail += 1;
 }
 
@@ -2184,10 +2154,8 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
     const peer_ecn = probeEcnPeerSetup(flags);
     const ls = pickListenSlot(dst_port, true, .{ src_ip[12], src_ip[13], src_ip[14], src_ip[15] }, src_port) orelse return;
 
-    var tw_bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
-    while (tw_bm != 0) {
-        const i = @ctz(tw_bm);
-        tw_bm &= tw_bm - 1;
+    var tw_bm = tcb_active_bitmap.snapshot();
+    while (tw_bm.next()) |i| {
         if (tcbs[i].state == .time_wait and
             tcbs[i].is_v6 and
             tcbs[i].local_port == dst_port and
@@ -2262,7 +2230,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
     _ = sendSegment(new_tcb, probeEcnSynAckFlags(peer_ecn), undefined, 0);
 
     const new_idx = tcbIdx(new_tcb);
-    ls.pending_tpbs[ls.pending_tail % LISTEN_BACKLOG] = new_idx;
+    ls.pending_tpbs[ls.pending_tail % LISTEN_RING] = new_idx;
     ls.pending_tail += 1;
 }
 
@@ -2908,20 +2876,16 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, e
 /// Listen-backlog entries across all listeners (to tell whether a SYN was accepted).
 fn pendingBacklogCount() u32 {
     var n: u32 = 0;
-    var lbm = listen_active_bitmap;
-    while (lbm != 0) {
-        const i = @ctz(lbm);
-        lbm &= lbm - 1;
+    var lbm = listen_active_bitmap.snapshot();
+    while (lbm.next()) |i| {
         n +%= listen_slots[i].pending_tail -% listen_slots[i].pending_head;
     }
     return n;
 }
 
 fn hasListener(port: u16, is_v6: bool) bool {
-    var lbm = listen_active_bitmap;
-    while (lbm != 0) {
-        const i = @ctz(lbm);
-        lbm &= lbm - 1;
+    var lbm = listen_active_bitmap.snapshot();
+    while (lbm.next()) |i| {
         if (listen_slots[i].local_port == port and listen_slots[i].is_v6 == is_v6) return true;
     }
     return false;
@@ -3883,15 +3847,13 @@ pub fn isClosed(tcb_idx: u32) bool {
 /// v53.49: Single tcp_lock acquisition for the entire active-TCB sweep.
 /// Lock order tcp_lock -> e1000.tx_lock is maintained inside timerTickOne
 /// via sendSegment, so batch processing does not violate lock ordering.
-/// Worst-case hold time for 64 TCBs with retransmits: ~64-320us, well
+/// Worst-case hold time for 128 TCBs with retransmits: ~128-640us, well
 /// within the 10ms tick budget.
 pub fn timerTick(ms_elapsed: u32) void {
-    var bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
-    if (bm == 0) return;
+    var bm = tcb_active_bitmap.snapshot();
+    if (bm.isEmpty()) return;
     const lock_flags = tcp_lock.acquire();
-    while (bm != 0) {
-        const idx = @ctz(bm);
-        bm &= bm - 1;
+    while (bm.next()) |idx| {
         timerTickOne(idx, ms_elapsed);
     }
     tcp_lock.release(lock_flags);
@@ -4107,7 +4069,11 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
 
 // ─── Listening / Server Socket Support ──────────────────────────────────────
 
+/// Connections a listener admits from new SYNs before it drops them (the accept-queue limit).
 const LISTEN_BACKLOG: u32 = 32;
+/// Size of each listener's queue ring: room for every TCB, so children migrated from a closing SO_REUSEPORT sibling always fit even past
+/// LISTEN_BACKLOG (Linux's migration does not check the backlog either).
+const LISTEN_RING: u32 = MAX_CONNECTIONS;
 
 const ListenSlot = struct {
     active: bool = false,
@@ -4116,7 +4082,7 @@ const ListenSlot = struct {
     local_port: u16 = 0,
     owner_task: u32 = 0,
     is_v6: bool = false,
-    pending_tpbs: [LISTEN_BACKLOG]u32, // TCB indices of pending connections (SYN_RECEIVED)
+    pending_tpbs: [LISTEN_RING]u32, // TCB indices of pending connections (SYN_RECEIVED)
     // v53.50: Ring buffer indices — O(1) enqueue/dequeue instead of O(N) array shift
     pending_head: u32 = 0,
     pending_tail: u32 = 0,
@@ -4134,7 +4100,7 @@ var listen_slots: [MAX_CONNECTIONS]ListenSlot = @splat(.{
 });
 
 /// Bitmap tracking active listen slots (1 = active).
-var listen_active_bitmap: u64 = 0;
+var listen_active_bitmap: TcbSet = .{};
 
 /// Create a TCP socket (allocate a TCB in closed state).
 /// Returns TCB index (>= 0) on success, -1 on failure.
@@ -4166,6 +4132,11 @@ fn tcbOwnerUid(tcb: *const TcpTcb) u32 {
     return t.euid;
 }
 
+/// The uid a SO_REUSEPORT port share is checked against: the binder's, recorded at bind().
+fn tcbBoundUid(tcb: *const TcpTcb) u32 {
+    return if (tcb.bound_explicitly) tcb.bound_uid else tcbOwnerUid(tcb);
+}
+
 /// Bind a TCB to a local port.
 /// Returns 0 on success, -1 on failure.
 pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
@@ -4179,16 +4150,14 @@ pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
 
     // Check if port is already in use (bitmap-driven scan)
     // SO_REUSEADDR allows binding to a port in TIME_WAIT state
-    var bm = @atomicLoad(u64, &tcb_active_bitmap, .acquire);
-    while (bm != 0) {
-        const i = @ctz(bm);
-        bm &= bm - 1;
+    var bm = tcb_active_bitmap.snapshot();
+    while (bm.next()) |i| {
         if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict
         if (tcbs[i].local_port == port and port != 0) {
             if (tcp_port_policy.reuseMayShare(tcb.options.reuse_addr, @intFromEnum(tcbs[i].state) == @intFromEnum(TcpState.time_wait))) {
                 continue;
             }
-            if (tcp_port_policy.reusePortMayShare(tcb.options.extra_flags, tcbs[i].options.extra_flags, tcbOwnerUid(tcb), tcbOwnerUid(&tcbs[i]))) {
+            if (tcp_port_policy.reusePortMayShare(tcb.options.extra_flags, tcbs[i].options.extra_flags, tcbOwnerUid(tcb), tcbBoundUid(&tcbs[i]))) {
                 continue;
             }
             return tcp_port_policy.BIND_EADDRINUSE;
@@ -4197,6 +4166,7 @@ pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
 
     tcb.local_port = port;
     tcb.bound_explicitly = port != 0;
+    tcb.bound_uid = tcbOwnerUid(tcb);
     return 0;
 }
 
@@ -4217,11 +4187,8 @@ pub fn tcpListen(tcb_idx: u32) i64 {
     tcb.state = .listen;
 
     // Set up listen slot for incoming SYN tracking (bitmap-driven free slot search)
-    const all_listen_mask: u64 = if (MAX_CONNECTIONS >= 64) 0xFFFFFFFFFFFFFFFF else (@as(u64, 1) << MAX_CONNECTIONS) - 1;
-    const free_mask = ~listen_active_bitmap & all_listen_mask;
-    if (free_mask == 0) return -1;
-    const i: u6 = @intCast(@ctz(free_mask));
-    listen_active_bitmap |= @as(u64, 1) << i;
+    const i = listen_active_bitmap.firstClear() orelse return -1;
+    listen_active_bitmap.set(i);
     listen_slots[i].active = true;
     listen_slots[i].tcb_idx = tcbIdx(tcb);
     listen_slots[i].local_port = tcb.local_port;
@@ -4300,10 +4267,8 @@ pub fn tcpAccept(tcb_idx: u32, owner_task: u32) i64 {
 
     // Find the listen slot for this TCB (bitmap-driven)
     var slot: ?*ListenSlot = null;
-    var lbm = listen_active_bitmap;
-    while (lbm != 0) {
-        const i = @ctz(lbm);
-        lbm &= lbm - 1;
+    var lbm = listen_active_bitmap.snapshot();
+    while (lbm.next()) |i| {
         if (listen_slots[i].tcb_idx == tcb_idx) {
             slot = &listen_slots[i];
             break;
@@ -4313,19 +4278,35 @@ pub fn tcpAccept(tcb_idx: u32, owner_task: u32) i64 {
 
     if (ls.pending_head == ls.pending_tail) return -11; // EAGAIN: no pending connections
 
-    // v53.50: O(1) ring buffer dequeue — no array shift needed. Entries
-    // invalidated by a failed handshake (INVALID_PENDING) or otherwise no
-    // longer established are skipped instead of being handed to the acceptor.
-    var pending_idx: u32 = INVALID_PENDING;
-    while (ls.pending_head != ls.pending_tail) {
-        const cand = ls.pending_tpbs[ls.pending_head % LISTEN_BACKLOG];
-        ls.pending_head += 1;
-        if (cand < MAX_CONNECTIONS and tcbs[cand].active and tcbs[cand].state == .established) {
-            pending_idx = cand;
-            break;
+    // Classify every queued entry, take the oldest established one (tcp_port_policy.pickAcceptable), and rewrite the ring without it and
+    // without dead entries; everything else (still handshaking, or established behind the chosen one) stays queued in order. A child still in
+    // SYN_RECEIVED used to be dropped as it was passed over, which lost the connection when its final ACK arrived afterwards.
+    var kinds: [LISTEN_RING]tcp_port_policy.QueueEntry = undefined;
+    var idxs: [LISTEN_RING]u32 = undefined;
+    var n: usize = 0;
+    var scan = ls.pending_head;
+    while (scan != ls.pending_tail) : (scan += 1) {
+        const cand = ls.pending_tpbs[scan % LISTEN_RING];
+        idxs[n] = cand;
+        kinds[n] = if (cand >= MAX_CONNECTIONS or !tcbs[cand].active) .dead else switch (tcbs[cand].state) {
+            .established => .ready,
+            .syn_received => .handshaking,
+            else => .dead,
+        };
+        n += 1;
+    }
+    const pick = tcp_port_policy.pickAcceptable(kinds[0..n]);
+    var kept: u32 = 0;
+    for (kinds[0..n], 0..) |k, j| {
+        if (pick != null and j == pick.?) continue;
+        if (k != .dead) {
+            ls.pending_tpbs[(ls.pending_head + kept) % LISTEN_RING] = idxs[j];
+            kept += 1;
         }
     }
-    if (pending_idx == INVALID_PENDING) return -11; // EAGAIN: backlog drained to stale entries
+    ls.pending_tail = ls.pending_head + kept;
+    const chosen = pick orelse return -11; // EAGAIN: nothing has finished its handshake yet
+    const pending_idx: u32 = idxs[chosen];
 
     if (pending_idx >= MAX_CONNECTIONS) return -1;
     const new_tcb = &tcbs[pending_idx];

@@ -10,6 +10,7 @@
 #include "../lib/moqi_libc/include/stdlib.h"
 #include "../lib/moqi_libc/include/string.h"
 #include "../lib/moqi_libc/include/time.h"
+#include "../lib/moqi_libc/include/errno.h"
 
 static int failures;
 static void check(int ok, const char *what) {
@@ -45,9 +46,15 @@ static long run(const char *prefix, int append) {
             static char rec[REC];
             memset(rec, 'a' + k, sizeof rec);
             int fd = (int)open(path[k], O_WRONLY | (append ? O_APPEND : 0), 0644);
-            for (int i = 0; i < RECS; i++) write(fd, rec, REC);
+            int bad = fd < 0 ? -1 : 0;
+            long last = 0;
+            for (int i = 0; i < RECS && fd >= 0; i++) {
+                long w = write(fd, rec, REC);
+                if (w != REC) { bad = i + 1; last = w; break; }
+            }
+            if (bad != 0) printf("hello270: writer %d (%s): open fd %d, write %d returned %ld errno %d\n", k, append ? "O_APPEND" : "plain", fd, bad, last, errno);
             close(fd);
-            _exit(0);
+            _exit(bad == 0 ? 0 : 1);
         }
         pids[k] = p;
     }
@@ -61,7 +68,10 @@ static long run(const char *prefix, int append) {
         int fd = (int)open(path[k], O_RDONLY, 0);
         long sz = lseek(fd, 0, SEEK_END);
         close(fd);
-        if (sz != (long)RECS * REC) ok = 0;
+        if (sz != (long)RECS * REC) {
+            ok = 0;
+            printf("hello270: %s: file %d is %ld bytes, expected %ld (open fd %d)\n", append ? "O_APPEND" : "plain", k, sz, (long)RECS * REC, fd);
+        }
         unlink(path[k]);
     }
     return ok ? dt : -1;

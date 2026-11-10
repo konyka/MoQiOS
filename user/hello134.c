@@ -63,6 +63,9 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_WAITPID   6
 #define SYS_NANOSLEEP 35
 #define SYS_RT_SIGACTION 13
+#define SYS_SETSOCKOPT 54
+#define SOL_SOCKET 1
+#define SO_PASSCRED 16
 
 #define AF_UNIX 1
 #define AF_INET 2
@@ -410,6 +413,58 @@ void _start(void) {
         check(recvfrom0(db, rb, 8) == 2 && rb[0] == 'd' && rb[1] == 'g', "H: and the datagram arrives");
         syscall1(SYS_CLOSE, (uint64_t)a1); syscall1(SYS_CLOSE, (uint64_t)a2);
         syscall1(SYS_CLOSE, (uint64_t)da); syscall1(SYS_CLOSE, (uint64_t)db);
+    }
+
+    /* I: an unbound datagram sender with SO_PASSCRED autobinds at its first send, and the receiver sees that abstract name as the source; one
+     * without SO_PASSCRED stays unnamed (Linux, measured). */
+    {
+        struct sockaddr_un fam, srv, nm, from;
+        fam.family = AF_UNIX;
+        int64_t rcv = syscall3(SYS_SOCKET, AF_UNIX, SOCK_DGRAM, 0);
+        check(syscall3(SYS_BIND, (uint64_t)rcv, (uint64_t)&fam, 2) == 0, "I: the receiver autobinds");
+        uint32_t sl = sizeof srv;
+        syscall3(SYS_GETSOCKNAME, (uint64_t)rcv, (uint64_t)&srv, (uint64_t)&sl);
+        int64_t snd = syscall3(SYS_SOCKET, AF_UNIX, SOCK_DGRAM, 0);
+        int one = 1;
+        check(syscall5(SYS_SETSOCKOPT, (uint64_t)snd, SOL_SOCKET, SO_PASSCRED, (uint64_t)&one, 4) == 0, "I: the sender sets SO_PASSCRED");
+        uint32_t nl = sizeof nm;
+        for (unsigned i = 0; i < sizeof nm; i++) ((char *)&nm)[i] = 0x7f;
+        syscall3(SYS_GETSOCKNAME, (uint64_t)snd, (uint64_t)&nm, (uint64_t)&nl);
+        check(nl == 2, "I: before sending it has no name");
+        check(syscall6(SYS_SENDTO, (uint64_t)snd, (uint64_t)"pc", 2, 0, (uint64_t)&srv, sl) == 2, "I: it sends a datagram");
+        nl = sizeof nm;
+        syscall3(SYS_GETSOCKNAME, (uint64_t)snd, (uint64_t)&nm, (uint64_t)&nl);
+        check(nl == 8 && nm.path[0] == 0, "I: after the send it has an autobound name (length 8)");
+        char rb[8];
+        uint32_t fl = sizeof from;
+        for (unsigned i = 0; i < sizeof from; i++) ((char *)&from)[i] = 0;
+        int64_t got = syscall6(SYS_RECVFROM, (uint64_t)rcv, (uint64_t)rb, 8, 0, (uint64_t)&from, (uint64_t)&fl);
+        check(got == 2, "I: the receiver gets the datagram");
+        int same = fl == 8;
+        for (int i = 0; i < 6 && same; i++) if (from.path[i] != nm.path[i]) same = 0;
+        check(same, "I: recvfrom reports the sender's autobound name as the source address");
+        /* an explicitly bound sender is reported by its name too */
+        struct sockaddr_un exp;
+        uint64_t el = mkaddr(&exp, "/tmp/h134i.sock");
+        syscall1(SYS_UNLINK, (uint64_t)"/tmp/h134i.sock");
+        int64_t bs = syscall3(SYS_SOCKET, AF_UNIX, SOCK_DGRAM, 0);
+        check(syscall3(SYS_BIND, (uint64_t)bs, (uint64_t)&exp, el) == 0, "I: a sender binds a path name");
+        syscall6(SYS_SENDTO, (uint64_t)bs, (uint64_t)"bn", 2, 0, (uint64_t)&srv, sl);
+        fl = sizeof from;
+        for (unsigned i = 0; i < sizeof from; i++) ((char *)&from)[i] = 0;
+        int64_t g2 = syscall6(SYS_RECVFROM, (uint64_t)rcv, (uint64_t)rb, 8, 0, (uint64_t)&from, (uint64_t)&fl);
+        int pathok = g2 == 2 && fl >= el;
+        for (uint64_t i = 0; i + 2 < el && pathok; i++) if (from.path[i] != exp.path[i]) pathok = 0;
+        check(pathok, "I: recvfrom reports a path-bound sender's name as the source address");
+        syscall1(SYS_CLOSE, (uint64_t)bs);
+        syscall1(SYS_UNLINK, (uint64_t)"/tmp/h134i.sock");
+        int64_t plain = syscall3(SYS_SOCKET, AF_UNIX, SOCK_DGRAM, 0);
+        check(syscall6(SYS_SENDTO, (uint64_t)plain, (uint64_t)"np", 2, 0, (uint64_t)&srv, sl) == 2, "I: a sender without SO_PASSCRED sends");
+        nl = sizeof nm;
+        syscall3(SYS_GETSOCKNAME, (uint64_t)plain, (uint64_t)&nm, (uint64_t)&nl);
+        check(nl == 2, "I: and stays unnamed");
+        recvfrom0(rcv, rb, 8);
+        syscall1(SYS_CLOSE, (uint64_t)rcv); syscall1(SYS_CLOSE, (uint64_t)snd); syscall1(SYS_CLOSE, (uint64_t)plain);
     }
 
     print(failures == 0 ? "hello134: PASS\n" : "hello134: FAIL\n");
