@@ -538,6 +538,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         15 => {
             syscallSigreturn(frame);
+            // Like Linux, the next pending signal (another queued real-time instance, or one the restored mask unblocks) is
+            // delivered on top of the restored context before it resumes.
+            checkSignalsAfterSigreturn(frame);
         },
         22 => {
             syscallPipe(frame);
@@ -3305,7 +3308,21 @@ pub fn checkSignalsOnSyscallReturn(frame: *SyscallFrame) void {
     }
 }
 
+/// After a successful sigreturn the context to resume is in the exec redirect (pending = 2): deliver a pending signal on
+/// top of it rather than on top of the sigreturn call itself.
+fn checkSignalsAfterSigreturn(frame: *SyscallFrame) void {
+    const sched = @import("../../proc/sched.zig");
+    const current = sched.currentTask() orelse return;
+    const pc = getPerCpu();
+    if (pc.exec_pending != 2) return;
+    deliverSignalAt(frame, current, pc.exec_new_stack, pc.exec_new_entry, pc.exec_new_flags);
+}
+
 fn deliverSignalOnSyscallReturn(frame: *SyscallFrame, current: anytype) void {
+    deliverSignalAt(frame, current, getPerCpu().saved_user_rsp, frame.rcx, frame.r11);
+}
+
+fn deliverSignalAt(frame: *SyscallFrame, current: anytype, user_rsp: u64, resume_rip: u64, user_rflags: u64) void {
     const sig_mod = @import("../../proc/signal.zig");
 
     if (!current.is_user) return;
@@ -3337,9 +3354,7 @@ fn deliverSignalOnSyscallReturn(frame: *SyscallFrame, current: anytype) void {
 
     if (handler_addr == 1) return;
 
-    const user_rsp = getPerCpu().saved_user_rsp;
-    var user_rip = frame.rcx;
-    const user_rflags = frame.r11;
+    var user_rip = resume_rip;
 
     // SA_RESTART: a restartable call that the handler interrupted is run again after sigreturn -- the saved context gets the
     // syscall number back in rax and rip back on the `syscall` instruction; the argument registers still hold the arguments.

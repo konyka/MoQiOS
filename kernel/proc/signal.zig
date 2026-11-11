@@ -11,6 +11,48 @@
 /// user's signal handler. The sigreturn syscall restores the original context.
 const task = @import("task.zig");
 const siginfo = @import("siginfo_policy.zig");
+const sigqueue = @import("sigqueue_policy.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+
+/// Guards every task's rt_queue.
+var rt_queue_lock: IrqSpinlock = .{};
+
+/// Record the siginfo of one send. A real-time signal queues one instance per
+/// send; false means the queue is full and this kind of send must fail with
+/// EAGAIN (sigqueue_policy.pendingWithoutInfoWhenFull). A standard signal
+/// overwrites the per-number slot (sends coalesce).
+fn recordSendInfo(t: *task.Task, signum: u32, info: siginfo.Info) bool {
+    if (!sigqueue.isRealtime(signum)) {
+        t.sig_info[signum - 1] = info;
+        return true;
+    }
+    const flags = rt_queue_lock.acquire();
+    defer rt_queue_lock.release(flags);
+    if (t.rt_queue.push(signum, info)) return true;
+    return sigqueue.pendingWithoutInfoWhenFull(info.code);
+}
+
+/// Called after the pending bit of `signum` was cleared to take one instance:
+/// stage the oldest queued instance's siginfo in sig_info (where delivery reads
+/// it) and set the bit again while more instances remain. No-op for standard
+/// signals.
+pub fn claimInstance(t: *task.Task, signum: u32) void {
+    if (!sigqueue.isRealtime(signum)) return;
+    const flags = rt_queue_lock.acquire();
+    defer rt_queue_lock.release(flags);
+    t.sig_info[signum - 1] = t.rt_queue.take(signum) orelse .{};
+    if (t.rt_queue.has(signum))
+        _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
+}
+
+/// Drop a pending signal and every queued instance of it (SIG_IGN installed,
+/// or SIG_DFL for a default-ignored signal; Linux flushes them in sigaction).
+pub fn discardPending(t: *task.Task, signum: u32) void {
+    const flags = rt_queue_lock.acquire();
+    defer rt_queue_lock.release(flags);
+    _ = @atomicRmw(u64, &t.pending_signals, .And, ~(@as(u64, 1) << @intCast(signum - 1)), .seq_cst);
+    t.rt_queue.discard(signum);
+}
 
 /// Highest signal number (SIGRTMAX); the first real-time signal is 32.
 pub const MAX_SIGNAL: u32 = 64;
@@ -121,7 +163,13 @@ pub fn senderInfo() siginfo.Info {
 /// faults). The info is recorded before the pending bit is set so the
 /// delivery that consumes the bit sees it.
 pub fn sendSignalInfo(target_tid: u32, signum: u32, info: siginfo.Info) bool {
-    if (signum == 0 or signum > MAX_SIGNAL) return false;
+    return sendSignalInfoResult(target_tid, signum, info) != -3;
+}
+
+/// sendSignalInfo with the errno: 0, -3 (ESRCH: no such live task) or -11
+/// (EAGAIN: the real-time queue is full and this send may not drop its info).
+pub fn sendSignalInfoResult(target_tid: u32, signum: u32, info: siginfo.Info) i64 {
+    if (signum == 0 or signum > MAX_SIGNAL) return -3;
 
     for (0..task.MAX_TASKS) |i| {
         const t = task.getTask(@intCast(i)) orelse continue;
@@ -131,21 +179,21 @@ pub fn sendSignalInfo(target_tid: u32, signum: u32, info: siginfo.Info) bool {
             // until SIGCONT (Linux, measured: SIGTERM leaves a stopped process in T, then it dies or runs its handler after the continue).
             if (signum == SIGCONT) continueTask(t);
             if (signum == SIGKILL and t.stopped) t.stopped = false;
-            t.sig_info[signum - 1] = info;
+            if (!recordSendInfo(t, signum, info)) return -11;
             // A default stop reaches a task that is asleep right away: a blocked task would otherwise stay in its wait (a stop signal is
             // not "actionable" for kickIfBlocked) and only stop once something woke it. The bit is not left pending, or the SIGCONT wake
             // would deliver it and stop the task a second time. A running task (including the caller itself) takes the pending path.
             if (stopsBlockedTarget(t, signum, @intCast(i))) {
                 stopTask(t);
-                return true;
+                return 0;
             }
             _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
             kickIfBlocked(@intCast(i));
             if ((t.state == .running or t.state == .ready) and (pendingActionable(t) or defaultAction(signum) == .stop)) kickRunningCpu(t);
-            return true;
+            return 0;
         }
     }
-    return false;
+    return -3;
 }
 
 /// Wake a blocked task so it can observe an actionable pending signal on
@@ -229,7 +277,7 @@ pub fn sendSignalToPgrpFiltered(pgid: u16, signum: u32, sender: ?*task.Task) u32
             if (!@import("signal_syscall.zig").maySignal(snd, t)) continue;
         }
         sent += 1;
-        t.sig_info[signum - 1] = info;
+        _ = recordSendInfo(t, signum, info);
         switch (action) {
             .stop => {
                 const h = t.sigact().handlers[signum - 1];
@@ -326,6 +374,7 @@ pub fn dequeueSignal(t: *task.Task) ?u32 {
 
     const bit: u6 = @intCast(@ctz(pending));
     _ = @atomicRmw(u64, &t.pending_signals, .And, ~(@as(u64, 1) << bit), .seq_cst);
+    claimInstance(t, @as(u32, bit) + 1);
     return @as(u32, bit) + 1;
 }
 

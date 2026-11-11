@@ -11418,7 +11418,7 @@ test "a default stop signal stops a sleeping target at once, without leaving the
     // never showed T. Leaving the bit pending as well would stop the task a second time when SIGCONT woke it.
     const sg = kt.signal_source;
     try std.testing.expect(std.mem.indexOf(u8, sg, "fn stopsBlockedTarget(t: *task.Task, signum: u32, idx: u32) bool {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sg, "if (stopsBlockedTarget(t, signum, @intCast(i))) {\n                stopTask(t);\n                return true;\n            }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sg, "if (stopsBlockedTarget(t, signum, @intCast(i))) {\n                stopTask(t);\n                return 0;\n            }") != null);
     try std.testing.expect(std.mem.indexOf(u8, sg, "if (cur == idx) return false;") != null);
     try std.testing.expect(std.mem.indexOf(u8, sg, "return t.sigact().handlers[signum - 1] == 0 and (t.signal_mask & bit) == 0;") != null);
 }

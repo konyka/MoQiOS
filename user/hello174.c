@@ -239,7 +239,9 @@ void _start(void) {
         int c, s;
         make_pair(18175 + port_off, &c, &s);
         big_total = fill(c);
+        /* Loopback delivery is paced by the timer tick, so give the receiver up to 5 s to take what the sender queued. */
         big_avail = ioctl_int(s, FIONREAD);
+        for (int64_t t0 = now_ms(); big_avail <= 20000 && now_ms() - t0 < 5000; big_avail = ioctl_int(s, FIONREAD)) pump(50);
         syscall1(SYS_CLOSE, c);
         syscall1(SYS_CLOSE, s);
     }
@@ -280,6 +282,7 @@ void _start(void) {
             note("sender_outq", ioctl_int(c, TIOCOUTQ));
         }
         check(big_avail > 20000, "C: while a receiver that never set SO_RCVBUF buffers more than that (> 20000)");
+        if (big_avail <= 20000) { note("big_avail", big_avail); note("big_total", big_total); }
         char drain[4096];
         long got = 0;
         syscall3(SYS_FCNTL, (uint64_t)s, F_SETFL, O_NONBLOCK);

@@ -5396,7 +5396,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 问题：内核只支持信号 1–31，`pending_signals` 为 `u32`，处理函数数组 31 项；`sigaction(32..64)` 返回 EINVAL，`kill/tkill(34)` 无法投递，pthread 取消、`SIGRTMIN` 家族都不可用。hello135 阶段已把它记为已知缺口。
 - 修复：`signal.MAX_SIGNAL = 64`；`Task.pending_signals: u64`，`signal_handlers/signal_sa_masks/signal_sa_flags: [64]`；`sendSignal`/`sendSignalToPgrp`/`raiseSelf`/`dequeueSignal`/`pendingFatal`/`pendingActionable` 全部改为 64 位；`rtSigpending`、`rtSigtimedwait`、`killPosix`、`sigaction`、`pidfd_send_signal`、POSIX 定时器与消息队列通知改为 1–64；fork/clone 复制 64 项；`jobctl`、`sched`、`syscall_entry` 的 32 位截断掩码改为 64 位。
-- 已知差异：实时信号不排队计数，重复发送合并为一次（Linux 会排队）；`siginfo`/`SA_SIGINFO` 的信息结构未实现。
+- 已知差异：~~实时信号不排队计数，重复发送合并为一次（Linux 会排队）~~（已实现，见文末“实时信号排队”一节）；`siginfo`/`SA_SIGINFO` 的信息结构未实现。
 - 排查过程（如实）：E 段第一版探测在同一次 `sigprocmask(UNBLOCK)` 后只立即收到一个信号，其余在下一个 tick 边界投递——这是既有的投递时机（每次返回投递一个），不是缺陷，探测改为循环等待而非固定睡眠；红灯运行在旧内核上 10 项 FAIL 后挂起超时，说明旧内核也无法完成后续项。
 - TDD：hello136（A–G 共 26 项）在 HEAD 上 10 项以上 FAIL；`pidfd_signal_policy` 的 host 测试先改为期望 64 后随实现通过。
 
@@ -7603,3 +7603,19 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - hello87（坏 `statx` 调用超过 `MAX_FDS` 次后不泄漏描述符）里写死的 `MAX_FDS 64` 改为 128；hello267/hello272 注释里的“每进程 64 个描述符”改为“远低于描述符上限”。
 - **hello273（新增）**：`RLIMIT_NOFILE` 软上限不小于 100；同时打开 50 个管道共 100 个描述符，每个都能传一个字节；`/proc/self/status` 的 `FDSize`（128）覆盖最高描述符；`dup2` 到 120 成功。改后全部通过；与 hello87、hello134、hello267、hello272 一起单独跑两份，全部 PASS。
 - 不做（如实）：`SO_REUSEPORT` 的 BPF 选择器（本内核没有 BPF 虚拟机）。非 x86 架构的 `MAX_FDS` 仍是 8（跨架构移植计划里的裁剪，`docs/cross-arch-port-plan.md`）。
+
+## 实时信号排队（hello274）
+
+- 缺口：实时信号（32–64）和标准信号一样只有一个待处理位、一份 siginfo，同一个信号发几次都只投递一次，带的值只剩最后一个（上文 hello136 一节记为已知差异）。
+- 本机 Linux（7.2）实测：同一个实时信号 `sigqueue` 三次，`sigtimedwait` 取到三次，值依次是 1、2、3；`SIGUSR1` 发三次只取到一次；`kill`、`tkill`、`tgkill` 发的实时信号同样排队；多个待处理时编号小的先出，同一个信号内先进先出；解除屏蔽时处理函数在 `sigprocmask` 返回前把排队的四个实例都跑完；`SIG_IGN` 会丢弃所有排队的实例。（同一台机器上 `tkill` 报告的 `si_code` 是 0 而不是 `SI_TKILL`，与 hello137 B 的预期不同；本节不涉及，没有改。）
+- 红灯：hello274 共 13 项，旧内核失败 8 项（`sigtimedwait` 只取到一次、值是 3；处理函数只跑一次；`SIG_IGN` 之后仍取到一个）。
+- 实现：
+  - 纯模块 `kernel/proc/sigqueue_policy.zig`：每个任务一个 32 项的实例队列（按到达顺序，`take` 取某个信号最早的实例，`discard` 丢弃某个信号的全部实例），以及队列满时的规则 `pendingWithoutInfoWhenFull`：Linux 对 `SI_QUEUE` 这类发送返回 `EAGAIN`，`kill` 和内核发送仍置待处理位、只丢 siginfo。host 测试 3 个。
+  - `signal.zig`：发送时实时信号把 siginfo 压进 `Task.rt_queue`（`rt_queue_lock` 保护），标准信号照旧覆盖 `sig_info`；`dequeueSignal` 和 `rt_sigtimedwait` 清掉待处理位后调用 `claimInstance`，把最早的实例放到 `sig_info`（投递从这里读），队列里还有同一信号的实例就再置位。`rt_sigqueueinfo`、`tkill` 返回 `sendSignalInfoResult` 的错误码（队列满时 `EAGAIN`）。
+  - `sigaction` 装 `SIG_IGN`（或对默认忽略的信号装 `SIG_DFL`）时丢弃待处理位与所有排队实例（`discardPending`）。
+  - `sigreturn` 之后检查待处理信号（`checkSignalsAfterSigreturn`），把下一个处理函数的帧压在**恢复后的**上下文上。原来 sigreturn 返回时不检查，处理函数要等下一次系统调用或时钟中断才再跑，hello274 E 里 `sigprocmask` 返回时只跑了 2 次（Linux 是 4 次）。
+- 改后 hello274 全部通过，与 hello136、hello137 一起单独跑两份，全部 PASS；host 1148/1148。
+- 如实的局限：①队列容量 32，不读 `RLIMIT_SIGPENDING`；②POSIX 定时器和 `mq_notify` 的信号仍直接置位，不排队、不带 siginfo（与改之前一样）；③线程组共享的待处理集合仍不存在（这个内核的待处理信号按任务记），与本节无关。
+- 门禁记录（如实）：本节改动后的第一轮本地完整 smoke（SMP=1 一份、SMP=2 两份，宿主机负载约 5，CPU 调速策略 powersave）三份都失败：都是 hello108（“RT task lost the CPU to reaping”），其中一份还有 hello107；SMP=2 的一份另在 hello210 的 `pthread_exit` → `dead_push`（`pthread.c:122`）处出现上文记录过的用户态崩溃（`r8 == 0`，地址 0x13f），之后超时。对照：上一次推送的 `1e19238` 上单独跑 hello108 三次，三次也都失败，回收窗口里最长的单次定时器中断 3.0–4.9 ms（阈值 4 ms），与新内核同一形状，所以 hello108 的失败与本节无关；新内核上 hello210 连跑三次都通过，崩溃没有复现，原因仍未查清（libc 本节没有改）。第二轮 SMP=1 通过；SMP=2 的一份 hello108/hello107/hello274 都通过，失败的是 hello174 C 的“没设 `SO_RCVBUF` 的接收方缓冲超过 20000 字节”。
+- hello174 C 的这一项是在 `fill()` 返回后立即读一次 `FIONREAD`，而本机回环的投递由时钟节拍推动，SMP=2 下接收方可能还没收完。改为最多等 5 秒、每 50 ms 推一次回环再读，并在失败时打印 `big_avail`、`big_total`（测试的写法问题，不是内核改动）。单独跑两份、每份两次，都通过。
+- 第三轮本地完整 smoke（hello174 改后）：SMP=1 一份、SMP=2 两份，全部 PASS。

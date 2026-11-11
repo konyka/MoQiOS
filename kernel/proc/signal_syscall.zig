@@ -172,6 +172,9 @@ pub fn sigaction(signum: u32, act_ptr: u64, oldact_ptr: u64) i64 {
         current.sigact().handlers[signum - 1] = new_handler;
         current.sigact().masks[signum - 1] = new_sa_mask;
         current.sigact().flags[signum - 1] = new_flags;
+        // Linux: an action that ignores the signal discards it if pending, with every queued real-time instance.
+        if (new_handler == 1 or (new_handler == 0 and sig_mod.defaultAction(signum) == .ignore))
+            sig_mod.discardPending(current, signum);
     }
 
     return 0;
@@ -471,6 +474,7 @@ pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_s
             if (info_ptr != 0 and !copy.validateUserBufferWritable(info_ptr, si.SIGINFO_SIZE)) return -14;
             const bit: u6 = @intCast(@ctz(pending));
             _ = @atomicRmw(u64, &cur.pending_signals, .And, ~(@as(u64, 1) << bit), .seq_cst);
+            sig_mod.claimInstance(cur, @as(u32, bit) + 1);
             const taken = cur.sig_info[bit];
             cur.sig_info[bit] = .{};
             if (info_ptr != 0) {
@@ -509,8 +513,7 @@ pub fn rtSigqueueinfo(tgid: u32, sig: u32, uinfo_ptr: u64) i64 {
     _ = task_mod.findTaskByTid(tgid) orelse return -3; // ESRCH
     if (!currentMaySignalTask(tgid)) return -1; // EPERM
     if (sig == 0) return 0;
-    if (sig_mod.sendSignalInfo(tgid, sig, info)) return 0;
-    return -3; // ESRCH
+    return sig_mod.sendSignalInfoResult(tgid, sig, info); // 0, ESRCH, or EAGAIN when the real-time queue is full
 }
 
 /// tkill(tid, sig) → 0 or -errno
@@ -525,8 +528,7 @@ pub fn tkill(tid_arg: i64, sig: u32) i64 {
     if (sig == 0) return 0; // existence and permission probe
     var info = sig_mod.senderInfo();
     if (info.code == @import("siginfo_policy.zig").SI_USER) info.code = @import("siginfo_policy.zig").SI_TKILL;
-    if (sig_mod.sendSignalInfo(tid, sig, info)) return 0;
-    return -3; // ESRCH
+    return sig_mod.sendSignalInfoResult(tid, sig, info);
 }
 
 /// pidfd_send_signal(pidfd, sig, info_ptr, flags) → 0 or -errno

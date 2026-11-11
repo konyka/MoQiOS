@@ -173,9 +173,14 @@ pub const Task = struct {
     /// Signals 1-64 supported. Bit 0 = SIGHUP (1), bit 63 = SIGRTMAX (64).
     pending_signals: u64,
 
-    /// siginfo of the most recent send of each signal (siginfo_policy.Info),
-    /// recorded before the pending bit is set; same-number sends coalesce.
+    /// siginfo of the most recent send of each standard signal (siginfo_policy.Info),
+    /// recorded before the pending bit is set; same-number sends coalesce. For a
+    /// real-time signal this slot is only the staging area for the instance being
+    /// delivered (signal.dequeueSignal fills it from rt_queue).
     sig_info: [64]@import("siginfo_policy.zig").Info = @splat(.{}),
+    /// Pending real-time signal instances in arrival order (sigqueue_policy);
+    /// guarded by signal.zig's rt_queue_lock.
+    rt_queue: @import("sigqueue_policy.zig").Queue = .{},
 
     /// Signal mask — blocked signals (bit N = signal N+1 is blocked).
     /// SIGKILL (9) and SIGSTOP (19) cannot be blocked.
