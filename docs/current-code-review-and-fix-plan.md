@@ -7634,3 +7634,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - 与本节 CPU 亲和性的改动无关：失败的写入发生在 hello249/hello270 的单进程或 `fork` 子进程里，不涉及 `sched_setaffinity`；完整 smoke 的 SMP=1/2 通过，SMP=4 里同一形态在亲和性改动之前的提交上也出现过（见上文 hello270 偶发短文件的记录）。
 - 门禁（SMP=4 完整 smoke）里第一次跑 H 段时，“迁移后只在 CPU 1、2 上运行”一项失败（200 of 200 次采样在 CPU 0）。原因在测试本身：`sched_setaffinity` 之后的迁移是异步的（`sched_setaffinity` 之后迁移延迟是既有问题，hello245 一节记录过），第一版在 300 次 `sched_yield` 之后就计数，此时任务可能还没搬走。改为最多等 2 秒等第一次落在子集内的采样，再数后面 200 次；没有迁移过去也算失败（不是放宽，是把“什么时候开始数”写清楚）。同一提交的另一项失败（hello270 FAT32 短文件）与本改动无关，见上文。
 - 门禁结果（如实）：`smoke 1`（SMP=1）与 `smoke 2`（SMP=2，CI 的两个门禁）全部 PASS；本地额外跑的 SMP=4 完整 smoke 里 hello243（H 段，本节改动）通过，失败的是 hello259（“T 之后进程已离开 CPU”，7/8 轮迟到，上文已记录的高负载残留）和 hello270（FAT32/ext2 重复失败时 `-1 ms`，即上一段记录的写回缓存被卡住的问题）。两者在改动前都会出现，且都不在 CI 覆盖的 CPU 数里。
+
+## FAT32 的两种写入毒化了写回池（hello275，已修；就是 hello270 短文件的根因）
+
+- 现象与定位（上一轮已记录失败形态，本节补齐根因）：hello270 在 SMP=4 稳定失败、CI 的 SMP=2 也失败过（那次是 ext2）。写回缓存要淘汰缓冲时，最老的那块脏缓冲属于某个“填不满”的文件，刷盘回调失败，缓存遂拒绝分配；那块缓冲永远留在池里当最老的，此后每次淘汰都先撞上它，于是**任意文件系统**的写入都会拿到 `ENOSPC`。临时诊断（`[FSDIAG]`，已撤回）给出两个罪魁，都发生在 hello249 的 FAT32 段落：
+  - **写入 `unlink` 后仍打开的文件**：`writeFile` 在增长文件时用 `updateDirEntry` 发布新大小，但目录项已经写成 `0xE5`（删除标记），永远找不到，于是每次刷盘都返回 `-1`，只剩下“刷不掉”的脏缓冲。
+  - **`ftruncate` 加长之后再写入**：`writeFile` 用 `fi.size` 推断“这条簇链有多长”，已加长的 `size` 让内核以为链已经够长，于是一个簇都没分配，写循环走到链尾就停，返回 0 字节（`-1`），又是刷不掉的脏缓冲。
+- 红灯（新程序 hello275，三项，都在旧内核上失败）：A 对已 `unlink` 的打开文件继续写、`fsync` 后按 `unlink` 前的内容读回；B `ftruncate` 加长后在旧末尾之外 `pwrite`、空洞读到 0；C 随后各向新建的 FAT32 和 ext2 文件写 4 MiB（超过 512 个 4 KiB 缓冲）——旧内核在 B/C 上失败，C 连 ext2 也写不满，正是 CI 那次失败的形状。
+- 修复：`writeFile` 不再用 `size` 推断链长，改为**实际走一遍簇链**（上限为本次写入需要的簇数），`truncateFile` 的“加长”路径也直接返回（不经过 `updateDirEntry`）；对 `unlink_pending` 的槽位，增长时不再尝试发布目录项（名字已经没了，只有打开的描述符还能读到数据，槽位与簇链在最后一次 `close` 时由 `deleteFileInternal` 回收），而不是当成失败。新增纯函数 `fat32_util.neededClusters`（host 测试一条）。
+- 绿灯：hello275 三项全过（两份并行各一次）；host 1149/1149（新增 `neededClusters` 与 `fat32_util` 的 inline 测试接线）；三个架构构建通过；完整 smoke 见提交记录。
+- 如实的局限：①`truncateFile` 加长时不预分配簇（Linux 的 FAT 也不预分配，写入时再分配；差别是 Linux 的 `ftruncate` 之后立即读返回 0，本节已按此断言）；②本节只覆盖 FAT32 侧，ext2 的 `writeFile` 仍是“size 就是链长”的模型，但它的块分配在 `ensureBlock` 里按逻辑块号进行，不依赖 size 推断，所以同类问题不成立（C 项同时验证 ext2 能写满 4 MiB）。

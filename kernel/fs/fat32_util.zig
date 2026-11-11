@@ -181,6 +181,17 @@ pub fn allocLimitCluster(data_start: u32, sectors_per_cluster: u8, total_data_cl
     return @min(own, fits + 2);
 }
 
+/// Clusters a write at [offset, offset+count) needs, i.e. how many the chain must hold afterwards. A write of zero bytes at
+/// offset 0 still needs the single cluster every file owns.
+pub fn neededClusters(offset: u64, count: u64, cluster_size: u32) u32 {
+    if (cluster_size == 0) return 0;
+    const end = offset + count;
+    const n = (end + cluster_size - 1) / cluster_size;
+    if (n == 0) return 1;
+    if (n > 0xFFFF_FFFF) return 0xFFFF_FFFF;
+    return @intCast(n);
+}
+
 /// Clusters a file's chain holds for `size` bytes. A file created empty
 /// already owns one cluster (createFile preallocates it), so an empty file
 /// with a first cluster counts as one — the first write must reuse it rather
@@ -869,4 +880,16 @@ pub fn dirEntryMtime(entry: [*]const u8) u64 {
     const time: u16 = @bitCast([2]u8{ entry[22], entry[23] });
     const date: u16 = @bitCast([2]u8{ entry[24], entry[25] });
     return dosToUnix(date, time);
+}
+
+test "neededClusters counts the clusters a write must reach" {
+    const std = @import("std");
+    try std.testing.expectEqual(@as(u32, 1), neededClusters(0, 0, 512));
+    try std.testing.expectEqual(@as(u32, 1), neededClusters(0, 512, 512));
+    try std.testing.expectEqual(@as(u32, 2), neededClusters(0, 513, 512));
+    try std.testing.expectEqual(@as(u32, 2), neededClusters(512, 512, 512));
+    try std.testing.expectEqual(@as(u32, 16), neededClusters(0, 8192, 512));
+    // a write past the current end still only needs the clusters it reaches
+    try std.testing.expectEqual(@as(u32, 12), neededClusters(6000, 4, 512));
+    try std.testing.expectEqual(@as(u32, 0), neededClusters(0, 512, 0));
 }

@@ -1095,10 +1095,23 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
 
     const cluster_size = @as(u32, fat32_sectors_per_cluster) * SECTOR_SIZE;
 
-    // Allocate additional clusters if needed
-    var needed_clusters: u32 = (offset + count + cluster_size - 1) / cluster_size;
+    // Allocate additional clusters if needed.
+    var needed_clusters: u32 = fat_util.neededClusters(offset, count, cluster_size);
     if (needed_clusters == 0) needed_clusters = 1;
     var current_clusters: u32 = fat_util.ownedClusters(fi.size, cluster_size, fi.first_cluster >= 2 and fi.first_cluster < 0x0FFFFFF8);
+    // The size can overstate the chain: a truncate publishes a longer size without extending the chain (clusters are allocated
+    // on write, and a hole is a cluster the chain never held). Trusting the size there allocated nothing and the loop below
+    // stopped at the chain end, reporting a short write. Count what the chain really holds.
+    if (fi.first_cluster >= 2 and fi.first_cluster < 0x0FFFFFF8) {
+        var walked: u32 = 0;
+        var c: u32 = fi.first_cluster;
+        while (c >= 2 and c < 0x0FFFFFF8 and walked < needed_clusters) : (walked += 1) {
+            c = getFATEntry(c) orelse break;
+        }
+        current_clusters = walked;
+    } else {
+        current_clusters = 0;
+    }
 
     while (current_clusters < needed_clusters) : (current_clusters += 1) {
         var c: u32 = fi.first_cluster;
@@ -1233,7 +1246,11 @@ pub fn writeFile(file_idx: u32, offset: u32, buf: [*]const u8, count: u32) i64 {
         // v53.52: the data is on disk but the on-disk size is stale — report
         // failure so writeback keeps the buffer and retries (the retry
         // rewrites the same range and republishes the size).
-        if (!updateDirEntry(file_idx)) return -1;
+        // An unlinked file has no directory entry left to publish the size to: the name is already gone, only the open
+        // descriptors reach the data, and the slot with its chain is reclaimed at the last close (deleteFileInternal). The
+        // size still lives in the slot. Refusing the write here left a dirty writeback buffer that could never flush, and
+        // such a buffer becomes the oldest in the shared pool, so every later eviction failed with ENOSPC.
+        if (!fi.unlink_pending and !updateDirEntry(file_idx)) return -1;
     }
 
     // v53.51: Invalidate page_cache for this inode after the write loop. The
@@ -1406,10 +1423,12 @@ pub fn truncateFile(file_idx: u32, new_size: u32) bool {
     const effective_size: u64 = @max(@as(u64, fi.size), staged_end);
 
     if (new_size >= effective_size) {
-        // Growing: just update the size (clusters are allocated on write).
+        // Growing: update the size. The chain is not extended here, so the extension has no data behind it yet; the next write
+        // into that range allocates what it needs (writeFile owns the chain depth from what the chain really holds, not from
+        // the size — a file can be longer than its chain).
         if (new_size > fi.size) {
             files[file_idx].size = new_size;
-            if (!updateDirEntry(file_idx)) {
+            if (!files[file_idx].unlink_pending and !updateDirEntry(file_idx)) {
                 fs_lock.release(flags);
                 return false;
             }
