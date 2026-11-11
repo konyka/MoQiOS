@@ -60,7 +60,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
     // Inherit parent's CPU pin — fork must not migrate (M8-5b-2).
     // Task #2: also inherit last_cpu so the child first runs on the same
     // CPU as the parent (warm cache), then participates in work-stealing.
-    child.cpu_affinity = parent.cpu_affinity;
+    child.cpu_mask = parent.cpu_mask;
     child.last_cpu = parent.last_cpu;
     @import("../arch/x86_64/context_switch.zig").inheritFpuState(parent, child);
 

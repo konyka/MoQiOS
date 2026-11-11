@@ -1065,7 +1065,7 @@ test "sched_setaffinity pins target lifetime before mutation and migration" {
     const body = source[start..end];
     try std.testing.expect(std.mem.indexOf(u8, body, "pinTaskByTid(pid") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "pinTaskByIndex(cur_idx") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "target.cpu_affinity = affinity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "target.cpu_mask = new_mask") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "const was_ready = target.state == .ready") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "const lock_flags = task_mod2.lockTask()") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "defer target_pin.release()") != null);
@@ -11113,12 +11113,14 @@ test "no caller squeezes a tmpfs slot number into a byte" {
 
 test "a running task pinned to another CPU must leave this CPU; unpinned, pinned here, or not running must not" {
     const sp = kt.sched_policy;
-    try std.testing.expect(sp.mustLeaveCpu(true, 3, 0));
-    try std.testing.expect(sp.mustLeaveCpu(true, 0, 5));
-    try std.testing.expect(!sp.mustLeaveCpu(true, -1, 2));
-    try std.testing.expect(!sp.mustLeaveCpu(true, 2, 2));
-    try std.testing.expect(!sp.mustLeaveCpu(false, 3, 0));
-    try std.testing.expect(!sp.mustLeaveCpu(false, -1, 0));
+    try std.testing.expect(sp.mustLeaveCpu(true, 1 << 3, 0));
+    try std.testing.expect(sp.mustLeaveCpu(true, 1 << 0, 5));
+    try std.testing.expect(!sp.mustLeaveCpu(true, 0, 2));
+    try std.testing.expect(!sp.mustLeaveCpu(true, 1 << 2, 2));
+    try std.testing.expect(!sp.mustLeaveCpu(true, 0b110, 1));
+    try std.testing.expect(sp.mustLeaveCpu(true, 0b110, 0));
+    try std.testing.expect(!sp.mustLeaveCpu(false, 1 << 3, 0));
+    try std.testing.expect(!sp.mustLeaveCpu(false, 0, 0));
 }
 
 test "the scheduler pass vacates a running task that was pinned to another CPU, even when nothing else is runnable" {
@@ -11137,10 +11139,12 @@ test "the lone-task early return does not keep a running task that is pinned to 
 
 test "publishing a task that is pinned to another CPU kicks that CPU" {
     const sp = kt.sched_policy;
-    try std.testing.expectEqual(@as(?u8, 3), sp.kickAfterPublish(3, 0));
-    try std.testing.expectEqual(@as(?u8, 0), sp.kickAfterPublish(0, 5));
-    try std.testing.expectEqual(@as(?u8, null), sp.kickAfterPublish(-1, 2));
-    try std.testing.expectEqual(@as(?u8, null), sp.kickAfterPublish(2, 2));
+    try std.testing.expectEqual(@as(?u8, 3), sp.kickAfterPublish(1 << 3, 0));
+    try std.testing.expectEqual(@as(?u8, 0), sp.kickAfterPublish(1 << 0, 5));
+    try std.testing.expectEqual(@as(?u8, null), sp.kickAfterPublish(0, 2));
+    try std.testing.expectEqual(@as(?u8, null), sp.kickAfterPublish(1 << 2, 2));
+    try std.testing.expectEqual(@as(?u8, null), sp.kickAfterPublish(0b110, 2));
+    try std.testing.expectEqual(@as(?u8, 1), sp.kickAfterPublish(0b110, 3));
 }
 
 test "publishOldTask kicks the pin CPU after the task is back on its queue" {

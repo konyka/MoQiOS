@@ -4634,14 +4634,14 @@ fn syscallSchedSetaffinity(pid: u32, cpusetsize: u32, mask_ptr: u64) i64 {
     if (cpusetsize == 0) return -22;
 
     // Linux reads the first 128 bytes of the mask at most and treats a short buffer as zero-extended; a mask that names no existing
-    // CPU is EINVAL (see affinityFromMask for how a mask maps to this scheduler's single pin).
+    // CPU is EINVAL (affinityFromMask: the named configured CPUs, 0 when that is all of them).
     const copy = @import("../../mm/copy_from_user.zig");
     var mask_buf: [128]u8 = @splat(0);
     const to_copy: u32 = @min(cpusetsize, mask_buf.len);
     const copied = copy.copyFromUser(mask_buf[0..to_copy], @ptrFromInt(mask_ptr), to_copy);
     if (copied < to_copy) return -14;
-    const affinity: i16 = switch (aff_policy.affinityFromMask(mask_buf[0..to_copy], @import("../../smp.zig").configured_cpu_count)) {
-        .pin => |p| p,
+    const new_mask: u64 = switch (aff_policy.affinityFromMask(mask_buf[0..to_copy], @import("../../smp.zig").configured_cpu_count)) {
+        .mask => |m| m,
         .err => |e| return e,
     };
 
@@ -4658,7 +4658,7 @@ fn syscallSchedSetaffinity(pid: u32, cpusetsize: u32, mask_ptr: u64) i64 {
     if (!maySchedule(target, false)) return -1; // EPERM
     const target_idx = target_pin.slot;
     const lock_flags = task_mod2.lockTask();
-    target.cpu_affinity = affinity;
+    target.cpu_mask = new_mask;
     const was_running = target.state == .running;
     const was_ready = target.state == .ready;
     const old_cpu = target.last_cpu;
@@ -4672,9 +4672,10 @@ fn syscallSchedSetaffinity(pid: u32, cpusetsize: u32, mask_ptr: u64) i64 {
     // current CPU switch away (to idle if nothing else is runnable) — a bare
     // reschedule is not enough: with no other runnable work the scheduler
     // just keeps the task on the wrong CPU (flaky migration).
-    // Removing the pin (affinity < 0) needs no migration: the task simply becomes eligible everywhere.
-    if (affinity >= 0 and (was_running or was_ready) and old_cpu != @as(u32, @intCast(affinity))) {
-        const pin_cpu: u8 = @intCast(affinity);
+    // A task whose current CPU is still allowed needs no migration (including an unrestricted mask).
+    const sp = @import("../../proc/sched_policy.zig");
+    if ((was_running or was_ready) and !sp.cpuAllowed(new_mask, old_cpu)) {
+        const pin_cpu: u8 = @intCast(sp.homeCpu(new_mask));
         _ = @import("../../proc/per_cpu.zig").enqueueTask(target);
         sched.kickCpu(pin_cpu);
         if (target_idx == cur_idx) {

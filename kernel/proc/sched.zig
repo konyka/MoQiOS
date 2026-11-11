@@ -491,15 +491,15 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
     // DIAG: pinned task scheduled on a foreign CPU (catches both first
     // schedule and switches).
     if (task.getTask(next_idx)) |nt| {
-        if (nt.cpu_affinity >= 0 and nt.cpu_affinity != @as(i16, @intCast(currentCpuId()))) {
+        if (!sched_policy.cpuAllowed(nt.cpu_mask, @intCast(currentCpuId()))) {
             var b1: [24]u8 = undefined;
             var b2: [24]u8 = undefined;
             var b3: [24]u8 = undefined;
             const serial = @import("../arch/arch.zig").serial;
             serial.writeString("[AFFDIAG] tid=");
             serial.writeString(fmt.fmtDec(&b1, nt.tid));
-            serial.writeString(" pin=");
-            serial.writeString(fmt.fmtDec(&b2, @as(u64, @intCast(nt.cpu_affinity))));
+            serial.writeString(" mask=");
+            serial.writeString(fmt.fmtDec(&b2, nt.cpu_mask));
             serial.writeString(" cpu=");
             serial.writeString(fmt.fmtDec(&b3, currentCpuId()));
             serial.writeString("\n");
@@ -760,7 +760,7 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
             const ct_state = sched_claim.load(&ct.state);
             // A lone running task normally skips the pass, but not one that sched_setaffinity pinned to another CPU: it is no longer
             // counted here and must be switched out so its pin CPU can take it (otherwise the pin waits for an unrelated wake-up).
-            const pinned_away = sched_policy.mustLeaveCpu(ct_state == .running, ct.cpu_affinity, @intCast(cpu));
+            const pinned_away = sched_policy.mustLeaveCpu(ct_state == .running, ct.cpu_mask, cpu);
             if (!force_pick and !pinned_away and countActiveOnThisCpu() == 1 and ct_state != .zombie and ct_state != .blocked) {
                 return;
             }
@@ -836,8 +836,8 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
             const s0 = sched_claim.load(&ct0.state);
             // A running task that sched_setaffinity pinned to another CPU must leave as well: otherwise, when the pick finds nothing
             // else to run, it stays here and the pin never takes effect (its entry on the pin CPU's queue is dropped as "not ready").
-            const here0: i16 = @intCast(currentCpuId());
-            break :blk2 s0 == .zombie or s0 == .blocked or sched_policy.mustLeaveCpu(s0 == .running, ct0.cpu_affinity, here0);
+            const here0: u32 = @intCast(currentCpuId());
+            break :blk2 s0 == .zombie or s0 == .blocked or sched_policy.mustLeaveCpu(s0 == .running, ct0.cpu_mask, here0);
         } else false;
         if (!cur_unrunnable) return;
         const k = pickBootstrapKernel() orelse return;
@@ -852,8 +852,7 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
         if (ci != next_idx) {
             if (task.getTask(ci)) |ct| {
                 if (task.getTask(next_idx)) |nt| {
-                    const here: i16 = @intCast(currentCpuId());
-                    const allowed_here = ct.cpu_affinity < 0 or ct.cpu_affinity == here;
+                    const allowed_here = sched_policy.cpuAllowed(ct.cpu_mask, @intCast(currentCpuId()));
                     if (sched_claim.load(&ct.state) == .running and sched_policy.keepsCpuOverIdle(
                         sched_policy.rankKey(ct.sched_policy, ct.priority),
                         sched_policy.rankKey(nt.sched_policy, nt.priority),
@@ -870,15 +869,15 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
     // DIAG: pinned task scheduled on a foreign CPU (catches both first
     // schedule and switches).
     if (task.getTask(next_idx)) |nt| {
-        if (nt.cpu_affinity >= 0 and nt.cpu_affinity != @as(i16, @intCast(currentCpuId()))) {
+        if (!sched_policy.cpuAllowed(nt.cpu_mask, @intCast(currentCpuId()))) {
             var b1: [24]u8 = undefined;
             var b2: [24]u8 = undefined;
             var b3: [24]u8 = undefined;
             const serial = @import("../arch/arch.zig").serial;
             serial.writeString("[AFFDIAG] tid=");
             serial.writeString(fmt.fmtDec(&b1, nt.tid));
-            serial.writeString(" pin=");
-            serial.writeString(fmt.fmtDec(&b2, @as(u64, @intCast(nt.cpu_affinity))));
+            serial.writeString(" mask=");
+            serial.writeString(fmt.fmtDec(&b2, nt.cpu_mask));
             serial.writeString(" cpu=");
             serial.writeString(fmt.fmtDec(&b3, currentCpuId()));
             serial.writeString("\n");
@@ -1032,7 +1031,7 @@ fn publishOldTask(old_task: *task.Task) void {
         // a full queue just falls back to the bitmap scan.
         if (per_cpu.isAnyReady()) _ = per_cpu.enqueueTask(old_task);
         // A task that sched_setaffinity pinned to another CPU is only now ready to run there: wake that CPU, which may be idle.
-        if (sched_policy.kickAfterPublish(old_task.cpu_affinity, @intCast(currentCpuId()))) |target_cpu| kickCpu(target_cpu);
+        if (sched_policy.kickAfterPublish(old_task.cpu_mask, @intCast(currentCpuId()))) |target_cpu| kickCpu(target_cpu);
     }
 }
 
@@ -1113,7 +1112,7 @@ fn popRunnableClaim(q: *per_cpu.PerCpuRunQueue, deferred_local: *bool) ?u32 {
         const i = taskIndexOf(t) orelse continue;
         if (sched_claim.load(&t.state) != .ready) continue;
         // J1: never run a task pinned to another CPU (see popRunnable).
-        if (t.cpu_affinity >= 0 and t.cpu_affinity != @as(i16, @intCast(my_cpu))) continue;
+        if (!sched_policy.cpuAllowed(t.cpu_mask, @intCast(my_cpu))) continue;
         if (task.isCurrentOnOtherCpu(i, my_cpu)) {
             deferred_local.* = true;
             continue;
@@ -1265,7 +1264,7 @@ fn popRunnable(q: *per_cpu.PerCpuRunQueue, deferred_local: *bool) ?u32 {
         // pin (the task was queued while still unpinned, e.g. right after
         // fork before sched_setaffinity); the bitmap fallback on the pinned
         // CPU rediscovers the task via pickReadyForCpu's matchesCpu check.
-        if (t.cpu_affinity >= 0 and t.cpu_affinity != @as(i16, @intCast(my_cpu))) continue;
+        if (!sched_policy.cpuAllowed(t.cpu_mask, @intCast(my_cpu))) continue;
         if (task.isCurrentOnOtherCpu(i, my_cpu)) {
             deferred_local.* = true;
             continue;

@@ -10,7 +10,7 @@
 //!     moving tasks. This makes concurrent steals and remote wakeups safe
 //!     without a global scheduler lock or an ABBA deadlock.
 //!
-//! Tasks pinned via `cpu_affinity >= 0` are still placed in the affinity
+//! Tasks restricted by `cpu_mask` are still placed in the affinity
 //! CPU's queue and never stolen — see `enqueueTask` / `steal_half`.
 
 const task_mod = @import("task.zig");
@@ -174,7 +174,7 @@ pub const PerCpuRunQueue = struct {
     }
 
     /// Steal up to half of `target`'s tasks into self. Returns count stolen.
-    /// Tasks pinned via `cpu_affinity >= 0` to a different CPU are skipped.
+    /// Tasks restricted by `cpu_mask` to a different CPU are skipped.
     pub fn steal_half(self: *PerCpuRunQueue, target: *PerCpuRunQueue) u32 {
         if (self.cpu_id == target.cpu_id) return 0;
 
@@ -204,7 +204,7 @@ pub const PerCpuRunQueue = struct {
             if (!queue_policy.tokenMatches(.{ .task = @intFromPtr(tt_entry.task), .incarnation = tt_entry.incarnation }, tt_entry.task.incarnation)) continue;
             const tt = tt_entry.task;
             // Skip tasks pinned away from us.
-            if (tt.cpu_affinity >= 0 and tt.cpu_affinity != @as(i16, self.cpu_id)) {
+            if (!@import("sched_policy.zig").cpuAllowed(tt.cpu_mask, self.cpu_id)) {
                 // Re-insert at target's local end (head) so it stays runnable
                 // on its pinned CPU. This walks the loop's tail forward but
                 // never loses the task.
@@ -301,11 +301,12 @@ pub fn getQueue(cpu_id: u8) ?*PerCpuRunQueue {
 }
 
 /// Decide which CPU a ready task should be enqueued onto:
-///   * Pinned (cpu_affinity >= 0): the affinity CPU.
-///   * Otherwise: the task's `last_cpu` (or 0 if uninitialised).
+///   * `last_cpu` when the task's allowed-CPU mask includes it (or 0 if uninitialised);
+///   * otherwise the lowest allowed CPU.
 pub fn targetCpuFor(t: *task_mod.Task) u8 {
-    if (t.cpu_affinity >= 0) return @intCast(t.cpu_affinity);
-    return t.last_cpu;
+    const sp = @import("sched_policy.zig");
+    if (sp.cpuAllowed(t.cpu_mask, t.last_cpu)) return t.last_cpu;
+    return @intCast(sp.homeCpu(t.cpu_mask));
 }
 
 /// Push a task onto its target CPU's queue. Returns false if the destination

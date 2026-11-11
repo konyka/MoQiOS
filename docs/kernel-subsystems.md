@@ -546,8 +546,9 @@ wakeup 前释放 pin；slot 只有在 zombie、无 operation refs 且满足调�
 - **Work-Stealing**：仅当本地队列为空（idle）时触发，`tryStealForCurrent` 以
   TSC 派生的随机 CPU 为起点扫描其他 CPU 的队列，调用 `steal_half` 从对端 `tail`
   端窃取约一半任务（>1 才偷，留 1 给被偷者避免乒乓）。
-- **CPU 亲和性尊重**：`Task.cpu_affinity: i8`（`-1` = 不绑定，可被偷；`>=0` = 绑定到
-  指定 CPU），`steal_half` 跳过被绑定到其他 CPU 的任务并将其放回原队列。
+- **CPU 亲和性尊重**：`Task.cpu_mask: u64`（位 N = 允许 CPU N；`0` = 任意 CPU，可被偷），
+  `steal_half` 跳过掩码不含本 CPU 的任务并将其放回原队列；不在掩码内的 `last_cpu` 不作归位提示，
+  改用掩码里最低的 CPU（`sched_policy.cpuAllowed` / `homeCpu`）。
 - **`Task.last_cpu: u8`**：记录任务最近一次运行的 CPU，作为 enqueue 时的归位提示
   （warm cache hint）。
 - **调度入口 `pickNext` 三段式回退**：① 本地 `pop` → ② `tryStealForCurrent` 跨核

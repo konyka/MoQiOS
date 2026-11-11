@@ -6971,7 +6971,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 缺口：上一节修了 `sched_getaffinity` 之后，`sched_setaffinity` 和它不对称。宿主机 Linux 实测（4 个 CPU 可用，原生系统调用）：任意非零大小都可用（3、129、200 字节），超出 128 字节的部分不读；不存在的 CPU 的位在同时点名了真实 CPU 时被忽略（`{1,60}` 实际固定到 CPU 1）；没有点名任何真实 CPU（空掩码、只有 CPU 60、只有 CPU 64）是 `EINVAL`；点名所有 CPU 就是"不限制"，`getaffinity` 随后报告全部。这个内核原来：大小超过 128 是 `EINVAL`（Linux 可以）、点名全部 CPU 仍然固定到最低那个（`getaffinity` 随后只报告 CPU 0，`rc 0, mask 0x1, want 0xf`）、只有一个 `u8` 缓冲上限 32 字节。
 - 实现：纯函数 `sched_getaffinity_policy.affinityFromMask`（点名全部 → 不固定；其它非空集合 → 固定到最低的那个；没有真实 CPU 或空 → `EINVAL`；缺的高字节当 0），内核的 `syscallSchedSetaffinity` 按它取 128 字节缓冲、放宽大小限制、去掉"一定有目标 CPU"的假设（不固定时不需要迁移）。host 测试一个，5 个变异（去掉"全部 → 不固定"、去掉"空 → EINVAL"、"最低"改成"最高"、不检查掩码长度、不要求大小是 8 的倍数）都被抓住。
 - 红灯：hello243 在旧内核上 D（点名全部 CPU 后仍是 `0x1`）和 G（200 字节掩码得 `-22`）失败；新内核 SMP=4 共 17 项通过（"任务真的在 CPU 1 上运行"那一项后来降为说明性输出，见下）。
-- **已知限制（如实）**：调度器每个任务只有一个固定位（`cpu_affinity: i16`），所以点名一个真子集（如 `{2,3}`）会被**窄化到最低的 CPU**（这里是 2），`getaffinity` 随后只报告 CPU 2，而 Linux 报告 `{2,3}`。这在 hello243 的 F 项里被如实断言为"报告的 CPU 是被点名的之一"，而不是假装支持整个子集。要完整支持需要在任务里存一个位图并让每个调度决策都查它，我没有做。
+- ~~**已知限制（如实）**：调度器每个任务只有一个固定位（`cpu_affinity: i16`）~~（已解决，见文末“CPU 亲和性保留整个子集”一节），所以点名一个真子集（如 `{2,3}`）会被**窄化到最低的 CPU**（这里是 2），`getaffinity` 随后只报告 CPU 2，而 Linux 报告 `{2,3}`。这在 hello243 的 F 项里被如实断言为"报告的 CPU 是被点名的之一"，而不是假装支持整个子集。要完整支持需要在任务里存一个位图并让每个调度决策都查它，我没有做。
 - **既有的迁移延迟（未解决）**：hello243 第一版断言"固定到 CPU 1 之后 `getcpu` 马上就在 CPU 1 上"，SMP=8 冒烟里失败了一次。我在**修改之前**的内核上重复同样的用例 10 次，也有 2 次失败（`getcpu` 一直是 0，连续 200 次 `sched_yield` 之后仍是 0），所以这是 `sched_setaffinity` 之后的迁移偶尔不立刻完成的**既有**问题（代码里 `sched_setaffinity` 的注释也写着 "flaky migration"），不是这次改动引入的。我没有去修它（需要调度器内部的工作），也不能让一条会随机失败的断言守着冒烟，所以这一项改为**只打印**（`hello243: note: ...`）、不判通过失败；掩码本身（`getaffinity` 报告的值）仍然是断言。
 - 如实说明：①SMP=1 的运行没有单独跑 hello243 的 `ncpu > 1` 分支（该分支被跳过）；②`sched_setaffinity` 对别的 pid（不是自己）没有新用例，沿用原来的 `pinTaskByTid` 路径；③hello243 结束时把掩码恢复成全部 CPU，避免影响之后的测试。
 
@@ -7619,3 +7619,18 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 门禁记录（如实）：本节改动后的第一轮本地完整 smoke（SMP=1 一份、SMP=2 两份，宿主机负载约 5，CPU 调速策略 powersave）三份都失败：都是 hello108（“RT task lost the CPU to reaping”），其中一份还有 hello107；SMP=2 的一份另在 hello210 的 `pthread_exit` → `dead_push`（`pthread.c:122`）处出现上文记录过的用户态崩溃（`r8 == 0`，地址 0x13f），之后超时。对照：上一次推送的 `1e19238` 上单独跑 hello108 三次，三次也都失败，回收窗口里最长的单次定时器中断 3.0–4.9 ms（阈值 4 ms），与新内核同一形状，所以 hello108 的失败与本节无关；新内核上 hello210 连跑三次都通过，崩溃没有复现，原因仍未查清（libc 本节没有改）。第二轮 SMP=1 通过；SMP=2 的一份 hello108/hello107/hello274 都通过，失败的是 hello174 C 的“没设 `SO_RCVBUF` 的接收方缓冲超过 20000 字节”。
 - hello174 C 的这一项是在 `fill()` 返回后立即读一次 `FIONREAD`，而本机回环的投递由时钟节拍推动，SMP=2 下接收方可能还没收完。改为最多等 5 秒、每 50 ms 推一次回环再读，并在失败时打印 `big_avail`、`big_total`（测试的写法问题，不是内核改动）。单独跑两份、每份两次，都通过。
 - 第三轮本地完整 smoke（hello174 改后）：SMP=1 一份、SMP=2 两份，全部 PASS。
+
+## CPU 亲和性保留整个子集（hello243 H）
+
+- 缺口：每个任务只有一个固定位（`cpu_affinity: i16`），`sched_setaffinity` 点名的真子集（如 `{1,2}`）被窄化到最低的 CPU，`sched_getaffinity` 随后只报告那一个 CPU（Linux 报告整个子集），任务也只能在那一个 CPU 上运行；`fork` 的子进程继承的也是窄化后的结果。
+- 红灯：hello243 新增 H 段（需要 3 个以上 CPU，SMP=4 运行）：`{1,2}` 报告回来是 `0x2`，`fork` 的子进程也是 `0x2`，两项失败；“迁移后只在 CPU 1、2 上运行”一项在旧内核上也成立（固定到 1 当然在子集内），所以它只是回归保护。
+- 修改：`Task.cpu_affinity: i16` 换成 `Task.cpu_mask: u64`（位 N = 允许 CPU N，0 = 任意 CPU）。`sched_policy` 新增纯函数 `cpuAllowed`、`homeCpu`（掩码里最低的 CPU，用作排队和唤醒的目标），`mustLeaveCpu`、`kickAfterPublish` 改为接收掩码；`sched_getaffinity_policy.affinityFromMask` 返回点名的已配置 CPU 集合（全部点名时为 0），`buildMask` 按掩码报告。调度器各处（本地出队、`steal_half`、位图回退、"保留当前任务"判断、`fork`、`spawn` 的唤醒、`targetCpuFor`）都改用掩码；`last_cpu` 在掩码内时仍作归位提示，否则用 `homeCpu`。`sched_setaffinity` 只在当前 CPU 不在新掩码内时才迁移。
+- 掩码只覆盖 CPU 0–63：这个内核配置的 CPU 数不超过任务槽数（64，`smp.zig` 里 `task_limit`），所以每个已配置的 CPU 都有一位。
+- 验证：host 1148/1148（两个策略测试改写为掩码语义，新增子集、第二字节、64 个 CPU 的用例）；三个架构构建；hello243、hello245、hello44、hello50 在 SMP=4 两份、SMP=2 一份全部通过，`[AFFDIAG]`（任务在不允许的 CPU 上运行时的诊断输出）没有出现。
+- 门禁中再次出现 hello270 的 FAT32 短文件（SMP=4 完整 smoke 稳定复现，单独运行从不出现），本节**没有修**，只记下诊断结果（临时诊断已全部撤回）：
+  - 失败形态：写回缓存要淘汰缓冲时，最老的那块脏缓冲属于 FAT32，刷盘回调 `fat32WriteFlush` 失败，于是拒绝分配，`write` 返回 `ENOSPC`。写之前 FAT32 还有约 15.5 MiB 空闲（`fstatfs`：31704/31728 个 512 字节块），不是空间满。
+  - 刷盘失败的那几块缓冲来自 hello249（“截短后的写不碰别的文件”那一段）：`writeFile(file_idx=7, offset=2000/3000/6000, 2 或 4 字节)` 一个字节也没写进去，此时这个槽位的 `first_cluster=518`、`size=8192`。这些缓冲刷不掉，就一直是最老的，此后每次淘汰都先撞上它们。另一处观察：hello246 在 F/G 段出现过 `updateDirEntry` 找不到目录项（first_cluster 287、345）。
+  - 尚未查清：为什么这个槽位的 `writeFile` 写不进去（候选：截短后 `last_walk_cluster`/簇链与目录项不一致、或槽位已被另一次 `createFile` 复用）。下一步应先写一个只含 hello249 FAT32 段加大量后续写入的复现测试（红灯），再修。
+  - 与本节 CPU 亲和性的改动无关：失败的写入发生在 hello249/hello270 的单进程或 `fork` 子进程里，不涉及 `sched_setaffinity`；完整 smoke 的 SMP=1/2 通过，SMP=4 里同一形态在亲和性改动之前的提交上也出现过（见上文 hello270 偶发短文件的记录）。
+- 门禁（SMP=4 完整 smoke）里第一次跑 H 段时，“迁移后只在 CPU 1、2 上运行”一项失败（200 of 200 次采样在 CPU 0）。原因在测试本身：`sched_setaffinity` 之后的迁移是异步的（`sched_setaffinity` 之后迁移延迟是既有问题，hello245 一节记录过），第一版在 300 次 `sched_yield` 之后就计数，此时任务可能还没搬走。改为最多等 2 秒等第一次落在子集内的采样，再数后面 200 次；没有迁移过去也算失败（不是放宽，是把“什么时候开始数”写清楚）。同一提交的另一项失败（hello270 FAT32 短文件）与本改动无关，见上文。
+- 门禁结果（如实）：`smoke 1`（SMP=1）与 `smoke 2`（SMP=2，CI 的两个门禁）全部 PASS；本地额外跑的 SMP=4 完整 smoke 里 hello243（H 段，本节改动）通过，失败的是 hello259（“T 之后进程已离开 CPU”，7/8 轮迟到，上文已记录的高负载残留）和 hello270（FAT32/ext2 重复失败时 `-1 ms`，即上一段记录的写回缓存被卡住的问题）。两者在改动前都会出现，且都不在 CI 覆盖的 CPU 数里。

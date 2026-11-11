@@ -1,14 +1,14 @@
 /* hello243: sched_setaffinity masks, through the raw system call, against what sched_getaffinity then reports. Expected values were
  * measured on Linux (4 CPUs allowed): any non-zero size works (extra bytes are ignored, a short buffer is zero-extended); bits of CPUs that
  * do not exist are ignored next to a real one; a mask naming no existing CPU is EINVAL; naming every CPU leaves the task free to run
- * anywhere, and getaffinity then reports all of them. This kernel keeps one pin per task, so a subset is narrowed to its lowest CPU
- * (Linux would report the whole subset): the test checks that the CPU the task is told it may use is one of the CPUs it asked for. */
+ * anywhere, and getaffinity then reports all of them; a subset is kept whole and reported back exactly (section H, needs 3+ CPUs). */
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
 #include "../lib/moqi_libc/include/stdio.h"
 #include "../lib/moqi_libc/include/unistd.h"
 #include "../lib/moqi_libc/include/string.h"
 #include "../lib/moqi_libc/include/errno.h"
 #include "../lib/moqi_libc/include/sysinfo.h"
+#include "../lib/moqi_libc/include/time.h"
 
 static int failures;
 static void check(int ok, const char *what) {
@@ -16,6 +16,12 @@ static void check(int ok, const char *what) {
     print(what);
     print("\n");
     if (!ok) failures++;
+}
+
+static long now_ms(void) {
+    struct timespec t;
+    clock_gettime(1, &t);
+    return t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
 static unsigned long get0(void) {
@@ -88,7 +94,7 @@ int main(int argc, char **argv, char **envp) {
         snprintf(what, sizeof what, "hello243: note: after pinning to CPU 1, getcpu said %lu at once and %lu after %d yields%s\n", first_cpu, cpu, tries, cpu == 1 ? "" : " (known migration delay)");
         print(what);
 
-        /* a subset: this kernel narrows to the lowest CPU; the reported CPU must be one that was asked for */
+        /* a subset of two CPUs on a two-CPU machine is every CPU; on more CPUs section H checks the exact subset */
         memset(v, 0, sizeof v);
         v[0] = (1UL << 1) | (1UL << 0);
         r = set(8, v);
@@ -103,6 +109,50 @@ int main(int argc, char **argv, char **envp) {
         m = get0();
         snprintf(what, sizeof what, "F: {1, 60} pins to CPU 1 and ignores the absent CPU (rc %ld, mask 0x%lx)", r, m);
         check(r == 0 && m == 2, what);
+    }
+
+    /* H: a subset is kept whole (Linux reports exactly the CPUs named), the task only runs inside it, and fork inherits it */
+    if (ncpu > 2) {
+        memset(v, 0, sizeof v);
+        v[0] = (1UL << 1) | (1UL << 2);
+        r = set(8, v);
+        m = get0();
+        snprintf(what, sizeof what, "H: a {1,2} mask is reported back as exactly {1,2} (rc %ld, mask 0x%lx)", r, m);
+        check(r == 0 && m == 6, what);
+        /* Migration is asynchronous (sched_setaffinity can return before the task has moved), so wait up to 2 s for the first
+         * sample inside the subset before counting the ones after it. */
+        unsigned long cpu = 99, node = 99, outside = 0;
+        long t0 = now_ms();
+        int migrated = 0;
+        while (now_ms() - t0 < 2000) {
+            syscall1(SYS_yield, 0);
+            syscall3(249, (long)&cpu, (long)&node, 0);
+            if (cpu == 1 || cpu == 2) { migrated = 1; break; }
+        }
+        for (int i = 0; migrated && i < 200; i++) {
+            syscall1(SYS_yield, 0);
+            syscall3(249, (long)&cpu, (long)&node, 0);
+            if (cpu != 1 && cpu != 2) outside++;
+        }
+        snprintf(what, sizeof what, "H: after migration (within 2 s), the task runs only on CPU 1 or 2 (%d migrated after %ld ms, %lu of 200 samples outside, last on %lu)", migrated, (long)(now_ms() - t0), outside, cpu);
+        check(migrated && outside == 0, what);
+        int pfd[2];
+        pipe(pfd);
+        long pid = syscall1(57, 0); /* fork */
+        if (pid == 0) {
+            unsigned long cm = get0();
+            write(pfd[1], &cm, sizeof cm);
+            _exit(0);
+        }
+        unsigned long child_mask = 0;
+        read(pfd[0], &child_mask, sizeof child_mask);
+        int st = 0;
+        waitpid((int)pid, &st, 0);
+        close(pfd[0]); close(pfd[1]);
+        snprintf(what, sizeof what, "H: a forked child inherits the {1,2} mask (child mask 0x%lx)", child_mask);
+        check(child_mask == 6, what);
+        v[0] = all;
+        set(8, v);
     }
 
     /* G: a short buffer is zero-extended and a long one is read only as far as needed */

@@ -89,10 +89,9 @@ pub const Task = struct {
     self_idx: u32 = 0,
     state: TaskState,
     priority: u8,
-    /// CPU affinity. -1 = no pin (eligible for any CPU / work-stealing);
-    /// >=0 = hard-pinned to that logical CPU (Task #2: pinned tasks are
-    /// never stolen by another CPU's run queue).
-    cpu_affinity: i16 = -1,
+    /// Allowed CPUs (bit N = CPU N). 0 = every CPU (eligible for work-stealing); otherwise the task only
+    /// runs on the named CPUs and is queued on the lowest of them (sched_policy.homeCpu).
+    cpu_mask: u64 = 0,
     /// Last CPU this task ran on. Used by Task #2 for run-queue placement
     /// preference (warm cache) and as the fallback target when not pinned.
     last_cpu: u8 = 0,
@@ -696,9 +695,9 @@ pub fn freeSlotCount() u32 {
     return MAX_TASKS - @popCount(slot_bitmap);
 }
 
-/// True if `t`'s affinity allows it to run on `cpu` (-1 = no pin).
+/// True if `t`'s allowed-CPU mask lets it run on `cpu`.
 fn matchesCpu(t: *Task, cpu: u8) bool {
-    return t.cpu_affinity < 0 or t.cpu_affinity == @as(i16, cpu);
+    return @import("sched_policy.zig").cpuAllowed(t.cpu_mask, cpu);
 }
 
 fn considerReady(idx: u32, cpu: u8, best_idx: *?u32, best_key: *u16) void {
@@ -936,7 +935,7 @@ pub fn createKernelThreadAffinity(entry: TaskFunc, priority: u8, affinity: u8) ?
     tasks[slot].personality = .native;
     tasks[slot].fd_table = fd_table;
     tasks[slot].fd_table.alloc_limit = tasks[slot].lim().nofile.cur;
-    tasks[slot].cpu_affinity = affinity;
+    tasks[slot].cpu_mask = @as(u64, 1) << @intCast(affinity);
     tasks[slot].last_cpu = affinity;
 
     task_count += 1;
@@ -961,7 +960,7 @@ pub fn cancelUnstartedKernelThread(slot: u32) void {
     uidTaskCountRemoveLocked(t.uid);
 }
 
-/// Create an unpinned kernel thread (cpu_affinity = -1, eligible for stealing).
+/// Create an unrestricted kernel thread (cpu_mask = 0, eligible for stealing).
 /// Returns the task index or null on failure. Starts in .ready state.
 pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     const flags = task_lock.acquire();
@@ -997,7 +996,7 @@ pub fn createKernelThread(entry: TaskFunc, priority: u8) ?u32 {
     tasks[slot].personality = .native;
     tasks[slot].fd_table = fd_table;
     tasks[slot].fd_table.alloc_limit = tasks[slot].lim().nofile.cur;
-    tasks[slot].cpu_affinity = -1;
+    tasks[slot].cpu_mask = 0;
     tasks[slot].last_cpu = 0;
     task_count += 1;
     uidTaskCountAddLocked(tasks[slot].uid);
@@ -1724,7 +1723,7 @@ pub fn createUserProcess(
         // other limits start at the defaults.
         tasks[slot].lim().fsize = .{ .cur = fsize_cur, .max = fsize_max };
         // User processes are not pinned by default; last_cpu seeds placement.
-        tasks[slot].cpu_affinity = -1;
+        tasks[slot].cpu_mask = 0;
         tasks[slot].last_cpu = assignCpuAffinity(elf);
 
         tasks[slot].effective_caps = profile.caps;
@@ -1762,9 +1761,9 @@ pub fn kickChildCpus(parent_tid: u32, parent_cpu: u8) void {
             const t = &tasks[i];
             if (t.parent_tid != parent_tid) continue;
             if (t.state != .ready and t.state != .running) continue;
-            // Task #2: prefer last_cpu (where the child actually runs) over
-            // affinity, which may be -1 (unpinned) and tell us nothing.
-            const cpu = if (t.cpu_affinity >= 0) @as(u8, @intCast(t.cpu_affinity)) else t.last_cpu;
+            // Task #2: prefer last_cpu (where the child actually runs) unless the mask excludes it.
+            const sp = @import("sched_policy.zig");
+            const cpu: u8 = if (sp.cpuAllowed(t.cpu_mask, t.last_cpu)) t.last_cpu else @intCast(sp.homeCpu(t.cpu_mask));
             if (cpu == parent_cpu) continue;
             var seen = false;
             for (cpus[0..cpu_count]) |c| {

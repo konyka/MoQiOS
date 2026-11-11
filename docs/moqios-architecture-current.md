@@ -445,8 +445,8 @@ M8 路线图的最后三项重要 SMP 性能优化同时落地，**考虑到三�
   `IrqSpinlock` 串行化 head/tail 更新。
 - **`push` / `pop`**：本地 LIFO、O(1)，利于缓存局部性（刚入队的任务仍在本 CPU 缓存）。
 - **`steal_half(target)`**：在控 `target.lock` 后从 `tail` 端窃取约一半任务；
-  尊重 `cpu_affinity`，被绑定到别的 CPU 的任务会被重新放回原队列。
-- **Task 扩展**：`cpu_affinity: i8`（-1 = 不绑定）与 `last_cpu: u8`（warm cache hint）。
+  尊重 `cpu_mask`，掩码不含本 CPU 的任务会被重新放回原队列。
+- **Task 扩展**：`cpu_mask: u64`（允许的 CPU 位图，0 = 任意 CPU）与 `last_cpu: u8`（warm cache hint）。
 - **调度器 `pickNext` 三段式**：本地 `pop` → `tryStealForCurrent` 跨核窃取 → 全局
   位图回退（`task.pickReadyForCpu`）。
 - **窃取策略**：仅当本地队列为空（idle）时触发；TSC 派生随机起点扫描避免热点；
@@ -722,8 +722,8 @@ envp-NULL 与 auxv 之间，确保 RSP 在 argc 之前为 16 字节对齐。
 - **Per-CPU 队列**: 每 CPU 一份 `PerCpuRunQueue`，256 槽环形缓冲区，`IrqSpinlock` 保护
 - **本地 LIFO**: `push` / `pop` 在 `head` 端操作，最大化缓存局部性
 - **Work-Stealing**: idle 时 `tryStealForCurrent` 从别的 CPU `tail` 端 `steal_half`
-  窃取约一半任务；尊重 `cpu_affinity`，TSC 派生随机起点扫描
-- **亲和性**: `Task.cpu_affinity: i8`（-1 = 不绑定） + `Task.last_cpu: u8`（warm cache hint）
+  窃取约一半任务；尊重 `cpu_mask`，TSC 派生随机起点扫描
+- **亲和性**: `Task.cpu_mask: u64`（允许的 CPU 位图，0 = 任意 CPU） + `Task.last_cpu: u8`（warm cache hint）
 - **`pickNext` 三段式**: 本地 `pop` → `tryStealForCurrent` → 全局位图回退扫描
 - **时间片**: 10 个 tick (100ms)，抢占式
 - **上下文切换**: 通过 `switchContext` 汇编实现；切换前 `context_switch.onContextSwitch` 处理 FPU 保存
