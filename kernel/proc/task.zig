@@ -95,6 +95,11 @@ pub const Task = struct {
     /// Last CPU this task ran on. Used by Task #2 for run-queue placement
     /// preference (warm cache) and as the fallback target when not pinned.
     last_cpu: u8 = 0,
+    /// CPU this task is executing on, published by the task itself at every timer tick and syscall entry. A stop signal uses it
+    /// to aim a reschedule IPI at the right CPU: `state == .running` alone does not say where, and `current_task_idx` only names a
+    /// task while that CPU is switching. Kept apart from `last_cpu`: that one is a placement hint the scheduler maintains at
+    /// enqueue time, and churning it on every tick would make the hint point at wherever the task happens to be.
+    running_cpu: u8 = 0,
     /// CPU the task exited on, and the sched_entries value observed there at
     /// that moment. waitpid must not free this task's kernel stack until
     /// sched_entries[exit_cpu] advances past exit_epoch — proof that the
@@ -741,8 +746,18 @@ pub fn pickReadyForCpu(cpu: u8, after_idx: ?u32) ?u32 {
 
 /// Prefer a ready kernel thread on `cpu` when this CPU has no current task.
 pub fn pickKernelBootstrapForCpu(cpu: u8) ?u32 {
+    return pickKernelBootstrapForCpuPrefer(cpu, false);
+}
+
+/// Same, but `prefer_idle` picks this CPU's idle thread (priority 255) before any other kernel thread. A CPU that has to leave a task
+/// pinned elsewhere because nothing else is runnable must not take another CPU's work ahead of its idle loop: otherwise two CPUs take
+/// each other's work back and forth while each keeps the newly pinned task waiting.
+pub fn pickKernelBootstrapForCpuPrefer(cpu: u8, prefer_idle: bool) ?u32 {
     const flags = task_lock.acquire();
     defer task_lock.release(flags);
+    if (prefer_idle) {
+        if (idleThreadLocked(cpu)) |i| return i;
+    }
     var bits = slot_bitmap;
     while (bits != 0) {
         const i: u32 = @intCast(@ctz(bits));
@@ -755,6 +770,21 @@ pub fn pickKernelBootstrapForCpu(cpu: u8) ?u32 {
             if (isCurrentOnOtherCpu(i, cpu)) continue;
             return i;
         }
+    }
+    return null;
+}
+
+/// This CPU's idle kernel thread (priority 255, pinned to `cpu`), ready to be claimed (task_lock held).
+fn idleThreadLocked(cpu: u8) ?u32 {
+    var bits = slot_bitmap;
+    while (bits != 0) {
+        const i: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const t = getTask(i) orelse continue;
+        if (t.is_user or t.priority != 255) continue;
+        if (!matchesCpu(t, cpu)) continue;
+        if (sched_claim.load(&t.state) != .ready or isCurrentOnOtherCpu(i, cpu)) continue;
+        return i;
     }
     return null;
 }
@@ -1253,8 +1283,17 @@ fn isCurrentOnAnyCpu(idx: u32) bool {
     return false;
 }
 
+/// Record that `idx` is executing on `cpu` (or queued there). The task itself calls this at every timer tick and syscall
+/// entry, so a cross-CPU reader learns where a running task is without inspecting scheduler switches.
+pub fn publishRunningCpu(idx: u32, cpu: u8) void {
+    const t = getTask(idx) orelse return;
+    if (@atomicLoad(u8, &t.running_cpu, .monotonic) == cpu) return;
+    @atomicStore(u8, &t.running_cpu, cpu, .release);
+}
+
 /// True while a CPU other than `my_cpu` has `idx` as its current task.
 /// A woken (.ready) task can still be another CPU's current (e.g. a blocked
+
 /// waitpid parent keeps cur_idx until its CPU switches away). Picking it from
 /// here would run one task on two CPUs — two live contexts on one kernel
 /// stack. Pickers must skip such tasks; the owning CPU resumes them itself.

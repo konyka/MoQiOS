@@ -189,7 +189,12 @@ pub fn sendSignalInfoResult(target_tid: u32, signum: u32, info: siginfo.Info) i6
             }
             _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
             kickIfBlocked(@intCast(i));
-            if ((t.state == .running or t.state == .ready) and (pendingActionable(t) or defaultAction(signum) == .stop)) kickRunningCpu(t);
+            if (t.state == .running and defaultAction(signum) == .stop) {
+                // A running target notices the pending bit only at its next entry; keep kicking until it is off the CPU.
+                kickUntilStopped(t);
+            } else if (t.state == .running or t.state == .ready) {
+                if (pendingActionable(t) or defaultAction(signum) == .stop) kickRunningCpu(t);
+            }
             return 0;
         }
     }
@@ -230,8 +235,23 @@ pub fn stopTask(t: *task.Task) void {
     const sc = @import("sched_claim.zig");
     const s = sc.load(&t.state);
     if (s == .running or s == .ready) sc.store(&t.state, .blocked);
-    if (s == .running or s == .ready) kickRunningCpu(t);
+    if (s == .running) kickUntilStopped(t) else if (s == .ready) kickRunningCpu(t);
 }
+
+/// Wake the CPUs a stopped task could still be running on until it has actually left them. One kick can be coalesced away: the target
+/// may be in the middle of a scheduler pass when the IPI arrives, and that pass finishes by resuming the task, so the stop is only
+/// noticed at the next entry. Linux waits for the target to deactivate and re-sends; polling its published CPU has the same effect.
+fn kickUntilStopped(t: *task.Task) void {
+    var tries: u32 = 0;
+    while (tries < STOP_KICK_TRIES) : (tries += 1) {
+        if (@import("sched_claim.zig").load(&t.state) != .running) return;
+        kickRunningCpu(t);
+        var spin: u32 = 0;
+        while (spin < STOP_KICK_SPIN) : (spin += 1) asm volatile ("pause");
+    }
+}
+const STOP_KICK_TRIES: u32 = 200;
+const STOP_KICK_SPIN: u32 = 2000;
 
 /// A task that is executing on another CPU only notices a pending signal (or a stop) at that CPU's next timer tick; send it a reschedule IPI so
 /// the signal is acted on right away, as Linux does. A task that is executing there can still read `.ready`: the scheduler marks the outgoing
@@ -240,9 +260,15 @@ fn kickRunningCpu(t: *task.Task) void {
     const sched = @import("sched.zig");
     const se = @import("../arch/arch.zig").syscall;
     const here: ?u32 = if (se.getPerCpuOrNull()) |pc| pc.cpu_id else null;
+    const published = @atomicLoad(u8, &t.running_cpu, .acquire);
+    if (here != null and here.? == published) return; // it is us: the caller switches out itself
+    if (published < se.MAX_CPUS) sched.kickCpu(published);
+    // Also look for a CPU that still has it as current (a task switched away from but not yet published): the kick above is
+    // harmless if this finds nothing else.
     var cpu: u32 = 0;
     while (cpu < se.MAX_CPUS) : (cpu += 1) {
         if (here != null and here.? == cpu) continue;
+        if (cpu == published) continue;
         if (@atomicLoad(u32, &se.percpu_array[cpu].current_task_idx, .acquire) == t.self_idx) sched.kickCpu(@intCast(cpu));
     }
 }

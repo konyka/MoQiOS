@@ -7644,3 +7644,17 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修复：`writeFile` 不再用 `size` 推断链长，改为**实际走一遍簇链**（上限为本次写入需要的簇数），`truncateFile` 的“加长”路径也直接返回（不经过 `updateDirEntry`）；对 `unlink_pending` 的槽位，增长时不再尝试发布目录项（名字已经没了，只有打开的描述符还能读到数据，槽位与簇链在最后一次 `close` 时由 `deleteFileInternal` 回收），而不是当成失败。新增纯函数 `fat32_util.neededClusters`（host 测试一条）。
 - 绿灯：hello275 三项全过（两份并行各一次）；host 1149/1149（新增 `neededClusters` 与 `fat32_util` 的 inline 测试接线）；三个架构构建通过；完整 smoke 见提交记录。
 - 如实的局限：①`truncateFile` 加长时不预分配簇（Linux 的 FAT 也不预分配，写入时再分配；差别是 Linux 的 `ftruncate` 之后立即读返回 0，本节已按此断言）；②本节只覆盖 FAT32 侧，ext2 的 `writeFile` 仍是“size 就是链长”的模型，但它的块分配在 `ensureBlock` 里按逻辑块号进行，不依赖 size 推断，所以同类问题不成立（C 项同时验证 ext2 能写满 4 MiB）。
+
+## SIGSTOP 的 IPI 被调度器吞掉（hello259 高负载残留，已修）
+
+- 现象：上节修完后，四份并行跑 hello259（SMP=4）仍有一份出现 4/8 轮“状态已是 T 但目标又写了一次管道”；单独运行时几乎总是 0/8。
+- 查因（如实）：手边没有足够证据证明是宿主机把 vCPU 调走。读代码后发现两处可改进的地方，两处都改了：①`kickRunningCpu` 只能靠各 CPU 的 `current_task_idx` 找目标，而这个字段在调度过程中段时间里不指向正在运行的任务（换出时先标 `.ready`、发布队列之后才清）；②`kickCpu` 有合并逻辑（`resched_pending` 已置位就不再发 IPI），如果目标 CPU 恰好正在做一次调度，这只 IPI 会被那一次调度“吃掉”，而那次调度结束又会恢复目标，停止信号要等下一个入口。
+- 修改：①`Task.last_cpu` 改为由任务自己在每个时钟节拍和每次系统调用返回时发布（`task.publishRunningCpu`，值相同时不写），`kickRunningCpu` 优先按它踢，再补充查 `current_task_idx`；②`stopTask` 和 `kill` 的待处理停止路径改为 `kickUntilStopped`：目标是 `.running` 就反复踢、每次间隔少量 `pause`，直到它离开 `.running`（最多 200 次），这等价于 Linux 等目标 deactivate 再重发，但不需要握手。
+- 验证（如实）：第一轮四份并行 SMP=4、每份跑两次 hello259：8 次里 7 次通过（0–1 轮迟到），1 次失败在**另一项**（“停止期间没有任何进展”，`kill` 返回后立刻排空管道之前目标又写了一次，属同一条 IPI 延迟路径）。第二轮同样的四份并行 8 次全部通过（最多 1 轮迟到）；单份 SMP=4 仍是 0/8。host 1149/1149（源码形状测试改了两条以匹配新的调用点）。**没有**证明高负载下的残留已完全消除；本次只把“IPI 被吃掉”这条路径堵上，宿主机把 vCPU 调走时 IPI 仍要等它回来。
+
+### 追加：这次修复第一版引起了一个回归（hello245，SMP=2 上 30–53/200 不再立刻迁移，已修）
+
+- 回归：把“任务在哪颗 CPU 上”记进 `Task.last_cpu` 时，每次时钟节拍和系统调用返回都写它；而 `last_cpu` 同时被调度器当作**归位提示**（`per_cpu.targetCpuFor`、`spawn` 的唤醒），于是这个提示在任务运行期间不断变化，双核上 `sched_setaffinity` 之后任务被在两颗 CPU 之间来回排，30–53 次（每 200 次）不能立刻迁移。对照：改动**之前**的提交上 hello245 在 SMP=2 是 200/200 立刻迁移、0 迟到。
+- 修复：拆成两个字段。`last_cpu` 仍只作归位提示（只在入队/创建时写），新增 `Task.running_cpu` 由任务自己在每个节拍和系统调用返回时发布，停止信号的 IPI 按它瞄准。
+- 另外把“必须让出本 CPU（被钉到别处）时找谁运行”改成**优先本核 idle 线程**（`pickKernelBootstrapForCpuPrefer(cpu, true)`）：否则两颗 CPU 可能互相把对方的工作接过来、来回搬，而各自新钉住的任务在等自己。这一条在双核上的效果没有单独量化（拆分 `running_cpu` 之后已经是 200/200），只为避免同类乒乓。
+- 验证：hello245 SMP=2、两份并行各两次，全部 200/200（0 迟到）；hello259 SMP=2 0/8；host 1149/1149。完整 smoke 见提交记录。

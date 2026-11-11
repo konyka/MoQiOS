@@ -11643,12 +11643,18 @@ test "SIGSTOP on a task running on another CPU kicks that CPU instead of waiting
     const start = std.mem.indexOf(u8, sig, "pub fn stopTask(t: *task.Task) void {") orelse return error.TestUnexpectedResult;
     const body = sig[start..][0..std.mem.indexOf(u8, sig[start..], "\n}\n").?];
     // A task marked ready can still be executing on its CPU (the scheduler marks the outgoing task ready before publishing it); the kick comes after the state change.
-    try std.testing.expect(std.mem.indexOf(u8, body, "if (s == .running or s == .ready) sc.store(&t.state, .blocked);\n    if (s == .running or s == .ready) kickRunningCpu(t);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (s == .running or s == .ready) sc.store(&t.state, .blocked);\n    if (s == .running) kickUntilStopped(t) else if (s == .ready) kickRunningCpu(t);") != null);
+    // One kick can be coalesced away by a scheduler pass that already started, so a running target is kicked until it leaves.
+    try std.testing.expect(std.mem.indexOf(u8, sig, "while (tries < STOP_KICK_TRIES) : (tries += 1) {\n        if (@import(\"sched_claim.zig\").load(&t.state) != .running) return;\n        kickRunningCpu(t);") != null);
+    // The kick aims at the CPU the target itself publishes at every tick and syscall entry.
+    try std.testing.expect(std.mem.indexOf(u8, sig, "if (published < se.MAX_CPUS) sched.kickCpu(published);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.sched_source, "if (getCurrentIdx()) |ci| task.publishRunningCpu(ci, @intCast(currentCpuId()));") != null);
     // The helper finds the CPU by the per-CPU current task index, skips the caller's own CPU, and sends the reschedule IPI.
     try std.testing.expect(std.mem.indexOf(u8, sig, "se.percpu_array[cpu].current_task_idx, .acquire) == t.self_idx) sched.kickCpu(@intCast(cpu));") != null);
     try std.testing.expect(std.mem.indexOf(u8, sig, "if (here != null and here.? == cpu) continue;") != null);
-    // A signal queued for a running target (the kill() path, where SIGSTOP is only pending) kicks it too.
-    try std.testing.expect(std.mem.indexOf(u8, sig, "kickIfBlocked(@intCast(i));\n            if ((t.state == .running or t.state == .ready) and (pendingActionable(t) or defaultAction(signum) == .stop)) kickRunningCpu(t);") != null);
+    // A signal queued for a running target (the kill() path, where SIGSTOP is only pending) keeps kicking until it is off the CPU.
+    try std.testing.expect(std.mem.indexOf(u8, sig, "if (t.state == .running and defaultAction(signum) == .stop) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sig, "kickUntilStopped(t);") != null);
 }
 
 test "currentSize reads the staged end before the recorded size so a concurrent flush cannot make both reads short" {

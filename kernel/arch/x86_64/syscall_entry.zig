@@ -3299,6 +3299,10 @@ fn syscallNetPoll(frame: *SyscallFrame) void {
 pub fn checkSignalsOnSyscallReturn(frame: *SyscallFrame) void {
     const sched = @import("../../proc/sched.zig");
     const current = sched.currentTask() orelse return;
+    // A stop signal may arrive between timer ticks; publish the CPU too so kickRunningCpu can aim at it from another CPU.
+    if (sched.currentTaskIndex()) |ci| {
+        if (getPerCpuOrNull()) |pc| @import("../../proc/task.zig").publishRunningCpu(ci, @intCast(pc.cpu_id));
+    }
     deliverSignalOnSyscallReturn(frame, current);
     // A deferred temporary-mask restore not consumed by a handler frame
     // (no deliverable signal, ignored, default action) happens now.

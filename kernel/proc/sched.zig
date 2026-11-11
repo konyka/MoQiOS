@@ -711,6 +711,9 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
         }
     }
 
+    // Publish where the currently running task is (see Task.running_cpu): a stop signal aims its IPI by this field.
+    if (getCurrentIdx()) |ci| task.publishRunningCpu(ci, @intCast(currentCpuId()));
+
     // nanosleep wakeups — every tick, every CPU (bitmap-gated, ~free when idle).
     sleepTimerTick(@import("../arch/arch.zig").tsc.nanos());
 
@@ -840,7 +843,7 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
             break :blk2 s0 == .zombie or s0 == .blocked or sched_policy.mustLeaveCpu(s0 == .running, ct0.cpu_mask, here0);
         } else false;
         if (!cur_unrunnable) return;
-        const k = pickBootstrapKernel() orelse return;
+        const k = pickBootstrapKernelPreferIdle() orelse return;
         const kt = task.getTask(k) orelse return;
         if (!sched_claim.tryClaim(&kt.state)) return;
         break :blk k;
@@ -1167,6 +1170,12 @@ pub fn prepareTaskFrame(idx: u32) bool {
 /// Avoids first-ever scheduling straight into user mode (unstable on AP bring-up).
 fn pickBootstrapKernel() ?u32 {
     return task.pickKernelBootstrapForCpu(@intCast(currentCpuId()));
+}
+
+/// The fallback for a current task that must leave this CPU (pinned elsewhere): prefer the local idle thread, so this CPU does not take
+/// another CPU's runnable work while its own freshly pinned task waits for it.
+fn pickBootstrapKernelPreferIdle() ?u32 {
+    return task.pickKernelBootstrapForCpuPrefer(@intCast(currentCpuId()), true);
 }
 
 /// Pick the next ready task — priority-aware round-robin with bitmap fast-path.
