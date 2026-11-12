@@ -1428,6 +1428,13 @@ pub fn deliverSignalToRunningTask(t: *task.Task, iframe: *idt.InterruptFrame) bo
                 // 默认停：标记 stopped 并转入 .blocked——下一调度点自然切出，
                 // 只有 SIGCONT 能复活（见 signal.continueTask / Task.stopped）。
                 // Falls through to the scheduling pass (false): resuming the frame would keep the stopped task on the CPU until the next tick.
+                // A task asleep in pause()/sigsuspend() is still the current task of its CPU, so a tick can dequeue the stop before the
+                // syscall return path does. Stopping it here would put it back to sleep and let the tick resume it; the wait itself stops
+                // the task and keeps it off the CPU, so put the bit back and let that path take it (hello286 I).
+                if (t.state == .blocked) {
+                    _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
+                    return false;
+                }
                 sig_mod.stopTask(t, signum);
                 return false;
             },

@@ -7785,7 +7785,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 第四版的实现：`sched_boot.createIdleThread()` 改为 `createKernelThreadAffinity(sched.kernelIdleLoop, 255, 0)`，BSP idle 绑在 CPU 0；`task.idleThreadLocked` 优先返回恰好绑在本 CPU 上的 idle，没有才退回不绑定的（非 x86 的探针仍可能建不绑定的 idle）。`sched.zig` 兜底分支里“the BSP idle is unpinned”的注释同步改掉。`tests/main.zig` 的形状测试断言这两处源码。`or ct.stopped` 保留，作为防御性改动。
 - 绿灯（第四版）：`zig build test` 通过，三个架构构建通过。完整 smoke 第一批（仍带临时诊断，开机早期另跑一次 hello286）：SMP=1、SMP=4、SMP=2 三份通过，诊断行为 0；另一份 SMP=4 卡在早期那次 hello286（见下面卡住一条）。删除诊断后的最终一批（SMP 1/4/4/2 并行）：四份里 hello286 全部通过，其中三份 `EXIT=0`；SMP=2 那份失败在 hello228 B（`corrupted canaries=1`），这是本节之外的一个真实 libc 缺陷，见上文 hello228 一节。
 - smoke 脚本竞态（已修）：`tools/qemu_smoke.sh` 的 FAIL 检查要求日志里已经有 `MoQiOS shell` 横幅，而 PASS 判断是几百条 grep 串起来的，要跑一段时间；横幅如果恰好在这段时间里出现，脚本就直接报 PASS，测试的 FAIL 行被忽略。第三版完整 smoke 里一份 hello286 失败的 SMP=4 就是这样被报成 `EXIT=0` 的。修复：报告 PASS 之前再调用一次 `check_fatal_output`。`tools/tests/test_qemu_smoke_keeps_failure_log.sh` 新增一条断言（PASS 那行 `echo` 的前一行是 `check_fatal_output`），改动前红、改动后绿，这个脚本在 `zig build test` 里运行。
-- 如实的局限：①整组里最后一个还没停的成员如果是退出而不是停止，这次停止不会被报告（没有成员再调用 `markStopped`）；②`tkill(thread, SIGCONT)` 在 Linux 上会恢复整组，这里只恢复那个线程（`continueTask` 按任务）；③继续仍由组长的 `continueTask` 报告，线程自己的 `SIGCONT` 不产生报告；④仍没有 ptrace 停止。
+- 如实的局限：①整组里最后一个还没停的成员如果是退出而不是停止，这次停止不会被报告（没有成员再调用 `markStopped`）；②~~`tkill(thread, SIGCONT)` 在 Linux 上会恢复整组，这里只恢复那个线程（`continueTask` 按任务）~~（已实现，见文末 hello286 H 一节）；③继续仍由组长的 `continueTask` 报告，线程自己的 `SIGCONT` 不产生报告；④仍没有 ptrace 停止。
 - 压测里的一次卡住（如实）：第二版在 SMP=4 并行三份中有一份停在 hello286 的 `[clone] ... VM THREAD` 之后，没有任何测试输出，日志不再增长。随后挂上 gdb 探针（卡住 60 秒即导出各 CPU 与任务表）又并行跑了三份 SMP=4，三份都通过，没有复现，所以没有现场数据，原因未知。第三版改动前的红灯批次里又出现一次同样的卡住（SMP=4，日志停在 `spawned hello286` 之后，约 15 KB）；第三版的十一份定向运行没有再出现。第四版第一批完整 smoke（仍带临时诊断，开机早期另加一次 hello286）中又有一份 SMP=4 停在早期那次 hello286 的 G2 段，日志约 17 KB，最后几行是 `[kill] tid=17 code=137`、`[fork]`、`[clone] ... VM THREAD`；那份没有挂 gdb 桩。随后挂 gdb 探针跑了一份 SMP=4，跑完早期和 smoke 里的两次 hello286 都通过，没有卡住。三次卡住都在新线程创建之后、本段第一次打印之前。推测（未证实）：新线程一直没有被调度，或者绑到 CPU 0 后 CPU 0 一直不选它，组停止凑不齐，父进程的 `waitpid(WUNTRACED)` 永远阻塞。原因仍未查明，作为开放项保留。
 - 本轮期间记下的另外两个偶发观察（与本节无关，原因未查）：①`ff8e28e` 的 CI（run 43198919292）失败在 hello174 A 段 `loopback connection`，紧接着 `c041c75` 的 CI 通过。hello173 写死了端口 18173/18174，hello174 用 `18174 + (pid*7)%5000`，理论上可能撞上前一个测试的端口，但概率低；CI 只打印失败日志的最后 40 行，现场不全。②第一版的完整 smoke 里，一份 SMP=4 还失败了 hello228 B（`no worker found its stack changed under it`）；hello228 不用 kill 或 SIGSTOP，是否与本改动有关没有做对照。
 
@@ -7798,3 +7798,21 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：新增原生系统调用 501 `exit_group(status)`（`lifecycle.exitGroup`）。`task.beginGroupExit` 在 `task_lock` 下给线程组里每个活着的成员（包括调用者）记下 `group_exit_code`，再给其他成员发 `SIGKILL`；成员经各自的致命路径进入 `exitTask`，`exitTask` 开头用 `exit_group_policy.finalStatus` 把 `128+SIGKILL` 换成组的状态并按正常退出报告。所以不管哪个线程调用，组长的 `waitpid` 状态都是 `exit_group` 的参数；两个线程同时调用时，成员上先记下的那个状态保留（`claim`）。纯函数模块 `kernel/proc/exit_group_policy.zig` 有 3 条宿主机测试。libc：`_exit` 改走 `SYS_exit_group`（与 glibc 一致），`pthread_exit` 改为直接 `SYS_exit`，只结束自己的线程。hello190–hello193 的跳过表加了 501。
 - 绿灯：hello287 九项在宿主机 Linux 上全过；目标机定向 SMP=2、SMP=4 各一份全过。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello286、hello287 都通过，hello228 的 `corrupted canaries` 都是 0。
 - 如实的局限：①`waitpid` 在组长成为僵尸时就可能报告，那时其他成员可能还在走致命路径（Linux 要等整组都退出）；hello287 A/D 段在报告后 200 ms 内没有看到写入，但没有测更短的窗口；②只在 x86_64 的系统调用表里加了 501，riscv64/aarch64 没有对应的 libc 线程实现；③Linux personality 下 231 号仍不是 `exit_group`（231 在原生表里是 `move_pages`，别名表目前只服务 rlimit）。④主线程已经退出（组长已是僵尸）之后，另一个线程再调 `exit_group`，`beginGroupExit` 跳过僵尸组长，组长报告的是它自己的状态，Linux 报告的是 `exit_group` 的参数；没有用例。
+
+## tkill 的停止、继续和 SIGKILL 作用于整个进程（hello286 H，已实现）
+
+- 起因：hello286 一节局限②。`tkill`/`tgkill` 只把信号发给被点名的那个线程。
+- Linux 依据（宿主机实测，`/tmp/tk.c` 与 `user/hello286.c -DHOST`）：`tgkill(thread, SIGSTOP)` 停下整组，父进程看到一次 `0x137f`，旋转的线程不再写管道；`tgkill(thread, SIGCONT)` 恢复整组，报告一次 `0xffff`；进程被 `kill(pid, SIGSTOP)` 停下后，`tgkill(leader, SIGCONT)` 同样恢复另一个线程；`tgkill(thread, SIGKILL)` 结束整个进程，报告信号 9。
+- 红灯：hello286 新增 H 段八项。改动前的内核（SMP=2）上，H 段第一项就卡住：`tkill(thread, SIGSTOP)` 只停了那个线程，组长还在跑，父进程的 `waitpid(WUNTRACED)` 一直等不到整组停下，测试不再有输出。
+- 实现：`signal_syscall.tkill` 在权限检查之后，若 `group_stop_policy.actsOnEveryThread(sig, 目标的处理动作)` 为真（`SIGKILL`、`SIGCONT`、`SIGSTOP`，以及取默认动作的 `SIGTSTP`/`SIGTTIN`/`SIGTTOU`），改走 `kill(pid)` 用的 `sendToProcess`；其余信号仍只发给那个线程。继续的报告仍由组长的 `continueTask` 产生，因为 `sendToProcess` 总是最后给组长发信号。
+- 绿灯：宿主机 Linux 上 H 段八项全过；目标机定向 SMP=4 一份、SMP=2 两份全过（hello286 整体 PASS）。随后的完整 smoke 里有两份卡住，原因见下一节（`sigsuspend`/`pause` 里的停止），修好后完整 smoke 四份通过。
+- 如实的局限：①整组路径走 `sendSignal`，每个成员的 `siginfo` 都是 `SI_USER`；Linux 上被点名的那个线程是 `SI_TKILL`。停止和 `SIGKILL` 读不到这个差别，装了 handler 的 `SIGCONT` 可以，没有用例；②`rt_tgsigqueueinfo` 没有同样改动。
+
+## 在 sigsuspend 里解除阻塞的默认停止信号会停下任务（hello286 I，已实现）
+
+- 起因：hello286 H 段加入后，完整 smoke 里有两份卡住：一份 SMP=2 和一份 SMP=4 停在 H 段第二次 `SIGSTOP` 之后（日志最后是那个线程的 `[stop] ... partial`，组长一直没停下）；另一份 SMP=4 停在 hello190 的 `fz 34/7`（对 `pause` 的调用）。两处的共同点是组长或子进程正睡在 `pause`/`sigsuspend` 里时收到默认停止信号。
+- Linux 依据（宿主机实测，`/tmp/ss2.c` 与 `user/hello286.c -DHOST`）：任务先阻塞 `SIGTSTP` 再 `raise`，然后 `sigsuspend(空集)`。解除阻塞后，那个待处理的默认停止信号会停下任务，父进程看到 `0x147f`；`SIGCONT` 之后任务继续停在 `sigsuspend` 里，不会返回。
+- 红灯：hello286 新增 I 段三项。改动前的内核（SMP=4）上第一项失败：`waitpid(WUNTRACED|WNOHANG)` 在 3 s 内一直返回 0，子进程没有停下。
+- 原因：`waitForSignal`（`pause`/`sigsuspend` 共用）只在有 handler 或会结束进程的信号到来时返回，默认停止信号不算，任务继续睡。时钟中断看到睡着的任务仍是本 CPU 的当前任务，会把停止位取走并调用 `stopTask`；但任务随后又从 `waitForSignal` 的循环里被切回，停止就丢了。
+- 实现：新增 `signal.takePendingStop`，取出一个未阻塞、取默认动作的停止信号。`waitForSignal` 每轮循环先调用它：取到就 `stopTask`，再 `while (stopped) forceReschedule()` 离开 CPU；`SIGCONT` 或 `SIGKILL` 清掉 `stopped` 后接着等。阻塞前的复查也把待处理的停止算进去。时钟中断路径（`sched.deliverSignalToRunningTask`）对 `.blocked` 的任务不再自己 `stopTask`，而是把位放回，交给 `waitForSignal`。
+- 绿灯：宿主机 Linux 上 I 段三项全过；目标机定向 SMP=4 两份、SMP=2 两份全过（hello286 整体 PASS，H 段八项也全过）。`zig build test` 通过，三个架构构建通过；完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello286、hello287 都通过，hello190 不再卡在 `pause`。

@@ -430,14 +430,38 @@ pub fn rtSigsuspend(mask_ptr: u64, sigsetsize: u64) i64 {
 /// lost (the check is repeated after the task is marked blocked, and sendSignal wakes a blocked task).
 pub fn waitForSignal(cur_idx: u32, cur: *task_mod.Task) void {
     while (!sig_mod.pendingActionable(cur) and sig_mod.pendingFatal(cur) == null) {
+        if (stopWhileWaiting(cur)) continue;
         task_mod.blockTask(cur_idx);
-        if (sig_mod.pendingActionable(cur) or sig_mod.pendingFatal(cur) != null) {
+        if (sig_mod.pendingActionable(cur) or sig_mod.pendingFatal(cur) != null or pendingStop(cur)) {
             task_mod.unblockTask(cur_idx);
-            break;
+            continue;
         }
         sched.forceReschedule();
         sched.repairCurrentAfterBlock();
     }
+}
+
+fn pendingStop(cur: *task_mod.Task) bool {
+    const pending = @atomicLoad(u64, &cur.pending_signals, .seq_cst) & ~cur.signal_mask;
+    var bits = pending;
+    while (bits != 0) {
+        const bit: u6 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const signum = @as(u32, bit) + 1;
+        if (sig_mod.defaultAction(signum) != .stop) continue;
+        if (signum == sig_mod.SIGSTOP or cur.sigact().handlers[bit] == 0) return true;
+    }
+    return false;
+}
+
+/// A default stop that is pending while the task waits for a signal stops it here (it is not a signal pause() returns for); the task
+/// stays off the CPU until SIGCONT or SIGKILL, then the wait goes on. Returns whether it stopped.
+fn stopWhileWaiting(cur: *task_mod.Task) bool {
+    const signum = sig_mod.takePendingStop(cur) orelse return false;
+    sig_mod.stopTask(cur, signum);
+    while (@atomicLoad(bool, &cur.stopped, .acquire)) sched.forceReschedule();
+    sched.repairCurrentAfterBlock();
+    return true;
 }
 
 /// pause() → -EINTR once a signal has been caught (the dispatcher runs the handler before returning to user mode). A signal
@@ -539,10 +563,15 @@ pub fn tkill(tid_arg: i64, sig: u32) i64 {
     // Linux: a tid that is not positive is EINVAL first; then the thread must exist (ESRCH); only then is
     // the signal number checked (EINVAL).
     const tid = id_policy.tkillTargetTid(tid_arg) orelse return -22;
-    _ = task_mod.findTaskByTid(tid) orelse return -3; // ESRCH
+    const target_idx = task_mod.findTaskByTid(tid) orelse return -3; // ESRCH
     if (sig > 64) return -22;
     if (!currentMaySignalTask(tid)) return -1; // EPERM
     if (sig == 0) return 0; // existence and permission probe
+    // Linux: a stop, SIGCONT or SIGKILL aimed at one thread acts on its whole process, as kill(pid) does.
+    if (task_mod.getTask(target_idx)) |target| {
+        if (@import("group_stop_policy.zig").actsOnEveryThread(sig, target.sigact().handlers[sig - 1]))
+            return sendToProcess(target, tid, sig);
+    }
     var info = sig_mod.senderInfo();
     if (info.code == @import("siginfo_policy.zig").SI_USER) info.code = @import("siginfo_policy.zig").SI_TKILL;
     return sig_mod.sendSignalInfoResult(tid, sig, info);

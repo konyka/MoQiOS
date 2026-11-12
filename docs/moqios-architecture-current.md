@@ -1056,7 +1056,7 @@ LAPIC Timer 中断
 - **write**: 支持三种 fd — stdout/stderr (VGA+串口), stdin (键盘), 文件 fd
 - **fork**: COW 克隆地址空间，设置所有页为 Read-Only，缺页时才复制
 - **execve**: 完全替换地址空间，释放旧页表，加载 ELF，构建新栈
-- **waitpid**: 阻塞式等待，使用 WaitNode 睡眠唤醒机制；`WUNTRACED`/`WCONTINUED` 报告停止与继续（hello284）；`kill(pid, SIGSTOP/SIGCONT/SIGKILL)` 作用于整个线程组，父进程在整组都停下后才看到那一次报告；停止的任务在系统调用返回和时钟节拍里都会离开 CPU，不再回到用户态（hello286）；BSP 的 idle 线程绑在 CPU 0 上，否则空闲的 AP 会拿走它，CPU 0 上被停的任务就没有线程可切走而继续跑用户代码（hello286 G）
+- **waitpid**: 阻塞式等待，使用 WaitNode 睡眠唤醒机制；`WUNTRACED`/`WCONTINUED` 报告停止与继续（hello284）；`kill(pid, SIGSTOP/SIGCONT/SIGKILL)` 和对单个线程的 `tkill` 都作用于整个线程组，父进程在整组都停下后才看到那一次报告；停止的任务在系统调用返回和时钟节拍里都会离开 CPU，不再回到用户态（hello286）；BSP 的 idle 线程绑在 CPU 0 上，否则空闲的 AP 会拿走它，CPU 0 上被停的任务就没有线程可切走而继续跑用户代码（hello286 G）
 - **waitid**（#500）: 与 waitpid 同一套等待，但成功返回 0，子进程身份和状态写进调用方的 128 字节 siginfo；`WNOWAIT` 报告而不回收，`WNOHANG` 无变化时清零 siginfo；第五个参数 rusage 非空时先验证可写，只在报告了子进程时写回 utime/stime（子进程线程组加上它已等待过的子孙），无变化时不写（hello285）
 - **mmap**: 支持匿名映射 (MAP_ANONYMOUS) 和文件映射 (MAP_PRIVATE / MAP_SHARED)；G2 起文件映射为
   按需分页——mmap 只记录区域元数据，#PF 时经 page_cache/tmpfs 零拷贝映射共享帧

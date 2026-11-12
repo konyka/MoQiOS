@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -37,6 +38,9 @@ static void print(const char *s) { fputs(s, stdout); fflush(stdout); }
 #endif
 #ifndef SIGSTOP
 #define SIGSTOP 19
+#endif
+#ifndef SIGTSTP
+#define SIGTSTP 20
 #endif
 #ifndef SIGCONT
 #define SIGCONT 18
@@ -84,6 +88,29 @@ static void *spin_cpu0(void *a) {
         if ((s & 0xFFFFF) == 0) write(bp[1], "g", 1);
     }
     return (void *)0;
+}
+static int tp[2];
+static void *spin_tid(void *a) {
+    (void)a;
+#ifdef HOST
+    long me = syscall(SYS_gettid);
+#else
+    long me = syscall0(SYS_gettid);
+#endif
+    write(tp[1], &me, sizeof me);
+    volatile unsigned long s = 0;
+    for (;;) {
+        s++;
+        if ((s & 0xFFFFF) == 0) write(bp[1], "h", 1);
+    }
+    return (void *)0;
+}
+static long tkill_call(long tid, int sig) {
+#ifdef HOST
+    return syscall(SYS_tkill, tid, sig);
+#else
+    return syscall2(SYS_tkill, tid, sig);
+#endif
 }
 static int drain(void) {
     char b[256];
@@ -232,6 +259,98 @@ int main(void) {
         kill(c, 9);
         waitpid(c, &st, 0);
     }
+
+    /* H: tkill on one thread with SIGSTOP, SIGCONT or SIGKILL acts on the whole process, as kill(pid) does. */
+    drain();
+    pipe(tp);
+    c = fork();
+    if (c == 0) {
+        pthread_t th;
+        pthread_create(&th, (void *)0, spin_tid, (void *)0);
+        for (;;) pause();
+    }
+    long ttid = 0;
+    read(tp[0], &ttid, sizeof ttid);
+    started = 0;
+    for (int i = 0; i < 300 && !started; i++) {
+        started = drain();
+        if (!started) nap(10);
+    }
+    tkill_call(ttid, SIGSTOP);
+    st = 0;
+    r = waitpid(c, &st, WUNTRACED);
+    snprintf(msg, sizeof msg, "H: tkill(thread, SIGSTOP) stops the group and is reported as 0x137f (%ld, 0x%x)", r, st);
+    check(started && r == c && st == 0x137f, msg);
+    drain();
+    nap(200);
+    check(!drain(), "H: and the thread writes nothing while stopped");
+    tkill_call(ttid, SIGCONT);
+    st = 0;
+    r = waitpid(c, &st, WCONTINUED);
+    snprintf(msg, sizeof msg, "H: tkill(thread, SIGCONT) is reported once as 0xffff (%ld, 0x%x)", r, st);
+    check(r == c && st == 0xffff, msg);
+    resumed = 0;
+    for (int i = 0; i < 300 && !resumed; i++) {
+        resumed = drain();
+        if (!resumed) nap(10);
+    }
+    check(resumed, "H: and the thread runs again");
+    r = waitpid(c, &st, WCONTINUED | WNOHANG);
+    snprintf(msg, sizeof msg, "H: the continue is reported only once (%ld)", r);
+    check(r == 0, msg);
+    kill(c, SIGSTOP);
+    waitpid(c, &st, WUNTRACED);
+    drain();
+    tkill_call(c, SIGCONT);
+    st = 0;
+    r = waitpid(c, &st, WCONTINUED);
+    snprintf(msg, sizeof msg, "H: tkill(leader, SIGCONT) after kill(pid, SIGSTOP) is reported as 0xffff (%ld, 0x%x)", r, st);
+    check(r == c && st == 0xffff, msg);
+    resumed = 0;
+    for (int i = 0; i < 300 && !resumed; i++) {
+        resumed = drain();
+        if (!resumed) nap(10);
+    }
+    check(resumed, "H: and the other thread runs again too");
+    tkill_call(ttid, 9);
+    st = 0;
+    r = waitpid(c, &st, 0);
+    snprintf(msg, sizeof msg, "H: tkill(thread, SIGKILL) ends the process, reported as signal 9 (%ld, 0x%x)", r, st);
+    check(r == c && st == 9, msg);
+
+    /* I: a default stop that is already pending when the task goes to sleep in sigsuspend (it was blocked, sigsuspend unblocks it)
+     * stops the task; after SIGCONT it keeps waiting in sigsuspend. */
+    c = fork();
+    if (c == 0) {
+        setpgid(0, 0);
+        sigset_t b, e;
+        sigemptyset(&b);
+        sigaddset(&b, SIGTSTP);
+        sigprocmask(SIG_BLOCK, &b, (sigset_t *)0);
+        raise(SIGTSTP);
+        sigemptyset(&e);
+        sigsuspend(&e);
+        _exit(3);
+    }
+    setpgid(c, c);
+    st = 0;
+    r = 0;
+    for (int i = 0; i < 300 && r == 0; i++) {
+        r = waitpid(c, &st, WUNTRACED | WNOHANG);
+        if (r == 0) nap(10);
+    }
+    snprintf(msg, sizeof msg, "I: sigsuspend unblocking a pending SIGTSTP stops the task, reported as 0x147f (%ld, 0x%x)", r, st);
+    check(r == c && st == 0x147f, msg);
+    kill(c, SIGCONT);
+    nap(200);
+    r = waitpid(c, &st, WNOHANG);
+    snprintf(msg, sizeof msg, "I: after SIGCONT it keeps waiting in sigsuspend (%ld)", r);
+    check(r == 0, msg);
+    kill(c, 9);
+    st = 0;
+    r = waitpid(c, &st, 0);
+    snprintf(msg, sizeof msg, "I: and SIGKILL ends it (%ld, 0x%x)", r, st);
+    check(r == c && st == 9, msg);
 
     print(failures == 0 ? "hello286: PASS\n" : "hello286: FAIL\n");
     return failures;

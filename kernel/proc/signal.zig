@@ -408,6 +408,24 @@ pub fn pendingActionable(t: *task.Task) bool {
     return false;
 }
 
+/// A pending, unblocked signal whose default action stops `t` (SIGSTOP always; SIGTSTP/SIGTTIN/SIGTTOU without a handler), taken off the
+/// pending set, or null. A task asleep in pause()/sigsuspend() stops for it there and then keeps waiting (Linux, measured).
+pub fn takePendingStop(t: *task.Task) ?u32 {
+    const pending = @atomicLoad(u64, &t.pending_signals, .seq_cst) & ~t.signal_mask;
+    var bits = pending;
+    while (bits != 0) {
+        const bit: u6 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const signum = @as(u32, bit) + 1;
+        if (defaultAction(signum) != .stop) continue;
+        if (signum != SIGSTOP and t.sigact().handlers[bit] != 0) continue;
+        _ = @atomicRmw(u64, &t.pending_signals, .And, ~(@as(u64, 1) << bit), .seq_cst);
+        claimInstance(t, signum);
+        return signum;
+    }
+    return null;
+}
+
 /// Check if a task has any pending, non-blocked signals.
 /// Returns the lowest signal number, or null if none.
 /// v53.44: O(1) with @ctz instead of O(31) linear scan.
