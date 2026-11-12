@@ -74,3 +74,29 @@ pub fn permits(operation: Operation, local: Mapping, remote: Mapping) bool {
         .writev => mappingAllowed(local, false) and mappingAllowed(remote, true),
     };
 }
+
+/// The credential triples Linux's ptrace access check compares.
+pub const Ids = struct {
+    uid: u32,
+    euid: u32,
+    suid: u32,
+    gid: u32,
+    egid: u32,
+    sgid: u32,
+};
+
+/// Linux __ptrace_may_access (PTRACE_MODE_ATTACH_REALCREDS): the caller's real
+/// uid must equal all three of the target's uids and its real gid all three of
+/// the target's gids, unless it holds CAP_SYS_PTRACE. A setuid target (or one
+/// that kept a saved root id) is therefore out of reach.
+pub fn mayAccess(caller: Ids, target: Ids, cap_sys_ptrace: bool) bool {
+    if (cap_sys_ptrace) return true;
+    return caller.uid == target.uid and caller.uid == target.euid and caller.uid == target.suid and
+        caller.gid == target.gid and caller.gid == target.egid and caller.gid == target.sgid;
+}
+
+/// Linux returns 0 before looking the target up when either iovec count is 0.
+pub fn movesNothing(liovcnt: u64, riovcnt: u64) bool {
+    return liovcnt == 0 or riovcnt == 0;
+}
+

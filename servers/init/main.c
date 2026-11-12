@@ -220,7 +220,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello89");  /* epoll_pwait/epoll_pwait2 masks and boundaries */
     run_test("hello90");  /* raw sendfile/splice offsets, FIFO, and boundaries */
     run_test("hello91");  /* raw pipe fd lifecycle, duplication, fork, and waitpid */
-    run_test("hello92");  /* self-only process_vm readv/writev safety and boundaries */
+    run_test("hello92");  /* process_vm readv/writev on the caller: safety and boundaries */
     run_test("hello93");  /* eventfd2 drain/semaphore, EAGAIN/EINVAL, fork, blocking wake */
     run_test("hello94");  /* timerfd real fd, settime/gettime, EAGAIN, expiry read */
     run_test("hello95");  /* mount/umount2/vmsplice/setitimer user-copy EFAULT */
@@ -398,6 +398,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello279"); /* ext2 names removed under an open descriptor (rmdir, rename victims) */
     run_test("hello280"); /* FAT32 files unlinked while open through /proc/self/fd/N */
     run_test("hello281"); /* sticky directories: EPERM for another user's entries on ext2 and tmpfs */
+    run_test("hello282"); /* process_vm_readv/writev across processes: COW-private writes, ESRCH, EPERM */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

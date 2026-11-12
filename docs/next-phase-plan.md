@@ -135,8 +135,8 @@
   pin、由 guard 持有的 Mm retain，并为当前任务的 mmap/munmap/mremap/mprotect/brk
   入口接入 VM 锁；同时沿现有 API 能提供的精确生命周期边界，接通 task 创建、共享
   VM clone、exec 和 reap/exit 的 Mm 所有权。该阶段仍只是生命周期与锁基础设施，
-  `process_vm_readv/writev` 继续保持 x86_64 self-only，不提供目标 task 查找、跨进程
-  访问或 CR3 切换。page fault/COW 的三条缺页路径（COW/demand/文件映射）与
+  `process_vm_readv/writev` 当时保持 self-only（后来已实现跨进程访问，见
+  `docs/current-code-review-and-fix-plan.md` 的 hello282 一节；不切换 CR3）。page fault/COW 的三条缺页路径（COW/demand/文件映射）与
   fork/clone COW 页表克隆已纳入 `Mm.vm_lock` 串行化（§6.43，含 vm_lock 等待方
   服务化 TLB shootdown 的前置停机隐患修复）；swap-reclaim 两趟扫描的 PTE
   写入（Accessed 清除 + swapOut swap-entry 安装）已接入非阻塞

@@ -1581,7 +1581,7 @@ slice is x86_64-only; riscv64/aarch64 cross-arch skeletons do not provide this c
 
 #### Deferred items (explicit, with reasons)
 
-- **`process_vm_readv`/`process_vm_writev` true cross-process path**: the current x86_64 implementation intentionally accepts only the caller's own PID and does not switch CR3. The self-only safety slice is smoke-gated by `hello92` and uses at most a 4096-byte kernel staging buffer through `copyFromUser`/`copyToUser`, preserving partial-copy and zero-byte `-EFAULT` behavior. True cross-process access remains deferred until the address-space manager has a reference-counted `mm` lifetime design, including concurrent exit/execve/munmap safety and COW semantics. riscv64/aarch64 remain cross-arch skeletons without this coverage.
+- **`process_vm_readv`/`process_vm_writev` true cross-process path** (done later, see the hello282 section at the end): the x86_64 implementation at that time accepted only the caller's own PID and did not switch CR3. The self-only safety slice is smoke-gated by `hello92` and uses at most a 4096-byte kernel staging buffer through `copyFromUser`/`copyToUser`, preserving partial-copy and zero-byte `-EFAULT` behavior. True cross-process access remains deferred until the address-space manager has a reference-counted `mm` lifetime design, including concurrent exit/execve/munmap safety and COW semantics. riscv64/aarch64 remain cross-arch skeletons without this coverage.
 - **`RwLock` IRQ-mode API defect**: `kernel/sync/rwlock.zig` exposes `readLockIrq`/`writeUnlockIrq` variants but the unlock paths do not restore the saved IRQ flags, so any call site that acquired with IRQs enabled and releases with the intent to re-enable them silently leaves interrupts disabled. No current call site in the merged tree uses these variants in a context where the bug is reachable, so it is deferred rather than fixed speculatively. It must be resolved before any IRQ-mode read-writer lock usage is introduced.
 - ~~**`~80 discarded copyToUser results`**~~ ✅ RESOLVED (2026-08): `grep -rn "_ = .*copyToUser" kernel/`
   now returns 0 hits. A later fix round required the full byte count at every previously discarded
@@ -7717,4 +7717,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：hello281 五项全过，hello119 照常通过；host 测试、三个架构构建与完整 smoke 见提交记录。
 - 如实的局限：FAT32 没有权限位，所以没有 DAC，也没有粘滞位。
 - 门禁中的观察（未解决）：第一次 SMP=4 smoke 在 hello58 第 5 段（会话长退出、孤儿进程组 SIGHUP）之后串口静默，900 秒超时；SMP=1、SMP=2 和 SMP=4 重跑都通过。这段路径（`jobctl.onSessionLeaderExit`）本次没有改动，与 §6.25/§6.26 记录的历史停滞在同一位置，留作待查项。
+
+## 跨进程 process_vm_readv/writev（hello282，已实现）
+
+- 起因：`docs/build-and-toolchain.md` 记录 process_vm 只允许访问调用者自身，跨进程未实现；原因是当时目标地址空间没有独立的引用计数。现在 `Mm` 已有引用计数，`task.pinTaskMmByTid` 能在 task_lock 下同时钉住目标任务和它的 Mm。
+- 宿主机 Linux 实测（`/tmp/lm/pvm.c`）：父进程能读写子进程内存；写进 COW 页只改子进程的副本；不存在的 pid 和已回收的子进程是 `ESRCH`；flags 非零是 `EINVAL`；只读目标页是 `EFAULT`；本地 iovec 总长为 0 时即使 pid 不存在也返回 0。源码 `mm/process_vm_access.c`：先查 flags，再导入 iovec（总长 0 直接返回），再查找任务（`ESRCH`），再 `mm_access(PTRACE_MODE_ATTACH_REALCREDS)`，`EACCES` 改报 `EPERM`。
+- 红灯（改动前的内核，真编译）：hello282 中跨进程读、三种写、零长度、`ESRCH` 全部失败（一律 `EPERM`），只有 flags 一项通过；host 测试中 `process_vm_policy.Ids`、`movesNothing` 不存在（编译失败）。
+- 实现：`process_vm_policy.zig` 新增 `mayAccess`（调用者的实际 uid 必须等于目标的三个 uid，实际 gid 等于目标的三个 gid，否则需要 `CAP_SYS_PTRACE`）和 `movesNothing`。`process_vm.zig`：自身仍走普通用户拷贝；别的进程经 `pinTaskMmByTid` 持有其 Mm，`pinRemotePage` 在目标的 `vm_lock` 下逐页翻译、对物理页加引用（拷贝期间不会被释放），写入时若是 COW 页则先给目标一份私有副本（与目标自己的写缺页相同：唯一持有者直接改为可写，否则复制并做 TLB shootdown），解锁后经内核直接映射拷贝，最后 `pmm.freePage` 放掉引用。检查顺序与 Linux 相同：flags、计数、iovec 数组、本地总长、目标查找、权限。
+- hello92 里“非自身目标被拒绝（`EPERM`）”一项改为“不存在的目标是 `ESRCH`”。
+- 绿灯：hello282 十项全过（含降为 uid 1000 的子进程读 root 进程得 `EPERM`），hello92 照常通过；host 测试、三个架构构建与完整 smoke 见提交记录。
+- 如实的局限：①syscall 只在 x86_64 上接入；②被换出的远端页会在目标的 vm_lock 下换入（`swap.swapIn`，与目标自己的换入缺页相同），但**没有运行时用例**：构造换出需要 swapon（`CAP_SYS_ADMIN`）和回收下限钩子，会改变系统级状态，没有放进 hello282。尚未缺页的文件映射页不会替目标填充，返回已拷贝的字节数或 `EFAULT`；Linux 的 `get_user_pages` 会替目标缺页（宿主机实测：目标从未访问过的匿名页，读得 0、写成功）。本内核的匿名映射在 `mmap` 时立即分配，所以只有文件映射页受影响；③2 MiB 巨页不支持（`getPageEntryRaw` 拒绝下降进巨页）。
 

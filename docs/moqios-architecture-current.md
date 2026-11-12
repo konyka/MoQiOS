@@ -92,7 +92,7 @@ MoQiOS 是一个运行在 x86_64 架构上的**单体内核** (Monolithic Kernel
 （被中断代码 RAX/RCX 遭污染，详见 **1.8 节**）。三者全部修复后，系统首次**完整启动至交互式
 `MoQiOS shell`**，依次跑通 `init` 自动序列及后续用户态测试（含用户态被定时器抢占、
 ext2 多级目录读写删，QEMU 串口验证，零异常、零三重故障）。当前 init（`servers/init/main.c`，
-基于 moqi_libc；汇编版 `user/init.S` 保留为回退，不再构建）自动 spawn 当前 hello2–hello281
+基于 moqi_libc；汇编版 `user/init.S` 保留为回退，不再构建）自动 spawn 当前 hello2–hello282
 全序列（hello11、hello28 不在自动序列中，hello6 因阻塞键盘输入被跳过；hello116 是 hello115 的 exec 目标、hello149 是手工复现程序、hello230–hello233 是 hello227 用的探针，也都不在序列里，权威序列见 `servers/init/main.c`），smoke 门禁以
 `hello44 done` + shell 提示符为准（见 `tools/qemu_smoke.sh`）。
 
@@ -568,7 +568,7 @@ QEMU / 真机
   └─ init 任务 (内核线程)
        ├─ 延迟初始化网络模块 (net/mod.zig) — 不能在 boot 阶段初始化
        └─ 加载并执行 /init (servers/init/main.c，基于 moqi_libc；汇编回退 user/init.S 保留不构建)
-├─ 自动 spawn hello2–hello281 序列 (hello6 因阻塞键盘跳过，
+├─ 自动 spawn hello2–hello282 序列 (hello6 因阻塞键盘跳过，
             │    hello11/hello28 不在自动序列中)
             └─ 序列结束后进入 shell (sh.c)
 ```
@@ -577,7 +577,7 @@ QEMU / 真机
 
 - **HHDM**: Limine 在启动时将全部物理内存映射到高地址区域，内核通过 HHDM 偏移访问物理页
 - **网络延迟初始化**: `net_mod.init()` 不能在 boot 阶段调用（会导致未解释的死锁），而是在第一个 init 内核线程中执行
-- **init**: 用户空间第一个进程（`servers/init/main.c`，基于 moqi_libc；`user/init.S` 保留为汇编回退），通过 `spawn` 系统调用启动当前 hello2–hello281 测试程序和 shell
+- **init**: 用户空间第一个进程（`servers/init/main.c`，基于 moqi_libc；`user/init.S` 保留为汇编回退），通过 `spawn` 系统调用启动当前 hello2–hello282 测试程序和 shell
 
 ---
 
@@ -1014,8 +1014,8 @@ LAPIC Timer 中断
 | 233 | epoll_ctl | 控制epoll监视集 |
 | 271 | poll | I/O多路复用 |
 | 275 | splice | 管道数据拼接 |
-| 283 | process_vm_readv | 读取进程虚拟内存（当前仅支持自身地址空间） |
-| 284 | process_vm_writev | 写入进程虚拟内存（当前仅支持自身地址空间） |
+| 283 | process_vm_readv | 读取进程虚拟内存（自身或调用者完全拥有的进程；跨进程见 hello282） |
+| 284 | process_vm_writev | 写入进程虚拟内存（写入 COW 页时先给目标私有副本） |
 | 286 | timerfd_settime | 设置定时器 |
 | 287 | timerfd_gettime | 获取定时器 |
 | 288 | accept4 | 接受连接 (带标志) |
@@ -1268,7 +1268,7 @@ C 版与汇编版字节级行为一致：相同的 spawn 顺序、相同的打�
 （`spawned helloN` / `helloN done` / hello2 的 `child exited`）、相同的
 waitpid 语义，smoke 门禁标记不受影响。
 
-启动时第一个用户进程，自动 spawn hello2–hello281 序列（按 `servers/init/main.c` 中的顺序）:
+启动时第一个用户进程，自动 spawn hello2–hello282 序列（按 `servers/init/main.c` 中的顺序）:
 - hello2 (串口输出), hello3 (ramdisk 读写), hello4 (多进程), hello5 (ELF 加载)
 - hello7 (FAT32 写入), hello8 (网络 ARP), hello12-hello20 (信号/UDP/环境变量/execve/argv/网络/ext2)
 - hello22-hello27 (TCP socket/echo/connect), hello23-hello25 (mkdir/ext2 unlink/多级路径)

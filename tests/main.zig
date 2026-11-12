@@ -1680,6 +1680,32 @@ test "process_vm policy enforces the iovec count and array boundary" {
     try std.testing.expect(!process_vm_policy.validIovArray(0x1000, seventeen_entries));
 }
 
+test "process_vm policy: only a process the caller fully owns, or CAP_SYS_PTRACE" {
+    const pv = process_vm_policy;
+    const same: pv.Ids = .{ .uid = 1000, .euid = 1000, .suid = 1000, .gid = 1000, .egid = 1000, .sgid = 1000 };
+    try std.testing.expect(pv.mayAccess(same, same, false));
+    var setuid_target = same;
+    setuid_target.euid = 0;
+    try std.testing.expect(!pv.mayAccess(same, setuid_target, false));
+    var saved_root = same;
+    saved_root.suid = 0;
+    try std.testing.expect(!pv.mayAccess(same, saved_root, false));
+    var other_group = same;
+    other_group.sgid = 50;
+    try std.testing.expect(!pv.mayAccess(same, other_group, false));
+    const root: pv.Ids = .{ .uid = 0, .euid = 0, .suid = 0, .gid = 0, .egid = 0, .sgid = 0 };
+    try std.testing.expect(!pv.mayAccess(same, root, false));
+    try std.testing.expect(pv.mayAccess(same, root, true));
+    try std.testing.expect(!pv.mayAccess(root, same, false));
+}
+
+test "process_vm policy: a request that moves no bytes succeeds before the target lookup" {
+    const pv = process_vm_policy;
+    try std.testing.expect(pv.movesNothing(0, 1));
+    try std.testing.expect(pv.movesNothing(1, 0));
+    try std.testing.expect(!pv.movesNothing(1, 1));
+}
+
 test "process_vm policy rejects aggregate iovec length overflow" {
     const valid: []const process_vm_policy.Iovec = &[_]process_vm_policy.Iovec{
         .{ .base = 0x1000, .len = 3 },

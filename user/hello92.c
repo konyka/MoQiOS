@@ -1,4 +1,4 @@
-// hello92 - self-only process_vm_readv/writev safety and page-boundary checks.
+// hello92 - process_vm_readv/writev on the caller itself: safety and page-boundary checks (cross-process: hello282).
 #include <stdint.h>
 
 typedef struct {
@@ -63,6 +63,7 @@ static inline int64_t syscall6(uint64_t n, uint64_t a, uint64_t b, uint64_t c,
 #define EFAULT 14
 #define EINVAL 22
 #define EPERM 1
+#define ESRCH 3
 
 static void print(const char *s) {
     uint64_t n = 0;
@@ -143,9 +144,9 @@ void _start(void) {
     failures += check(source[PAGE - 8] == 0xa0 && source[PAGE + 23] == 0xbf,
                       "writev copied both pages");
 
-    failures += check(syscall6(SYS_PROCESS_VM_READV, (uint64_t)(pid + 1),
-                               (uint64_t)&local, 1, (uint64_t)&remote, 1, 0) == -EPERM,
-                      "non-self target is rejected");
+    failures += check(syscall6(SYS_PROCESS_VM_READV, 999999,
+                               (uint64_t)&local, 1, (uint64_t)&remote, 1, 0) == -ESRCH,
+                      "a missing target pid is ESRCH");
     failures += check(syscall6(SYS_PROCESS_VM_READV, (uint64_t)pid,
                                0, 1, (uint64_t)&remote, 1, 0) == -EFAULT,
                       "invalid local iovec pointer is rejected");

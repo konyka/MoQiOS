@@ -333,8 +333,8 @@
 | 233 | epoll_ctl | 控制epoll监视集 | Phase1 |
 | 271 | poll | I/O多路复用 | Phase1 |
 | 275 | splice | 管道数据拼接 | Phase1 |
-| 283 | process_vm_readv | 读取进程虚拟内存（当前仅支持自身地址空间） | Phase1 |
-| 284 | process_vm_writev | 写入进程虚拟内存（当前仅支持自身地址空间） | Phase1 |
+| 283 | process_vm_readv | 读取进程虚拟内存（自身或调用者完全拥有的进程；跨进程见 hello282） | Phase1 |
+| 284 | process_vm_writev | 写入进程虚拟内存（写入 COW 页时先给目标私有副本） | Phase1 |
 | 286 | timerfd_settime | 设置定时器 | Phase1 |
 | 287 | timerfd_gettime | 获取定时器 | Phase1 |
 | 288 | accept4 | 接受连接 (带标志) | Phase2 |
