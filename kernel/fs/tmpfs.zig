@@ -587,9 +587,10 @@ pub const Remover = struct {
     effective_caps: capability.SysCap,
 };
 
-/// Unlink with the caller's credentials: write+search on the parent, and in
-/// a sticky directory only the entry's owner, the directory's owner, uid 0 or
-/// CAP_FOWNER (dac.mayRemoveEntry). -13 (EACCES) when refused.
+/// Unlink with the caller's credentials. Linux order (may_delete): the
+/// parent's write+search permission is EACCES; a sticky directory then
+/// refuses with EPERM unless the caller owns the entry or the directory,
+/// is uid 0, or holds CAP_FOWNER.
 pub fn tmpfsUnlinkAuthorized(path: []const u8, who: ?Remover) i64 {
     return tmpfsRemove(path, who, .any);
 }
@@ -621,7 +622,8 @@ pub fn tmpfsRemove(path: []const u8, who: ?Remover, want: RemoveKind) i64 {
 
     if (who) |w| {
         const creds: dac.Credentials = .{ .euid = w.euid, .egid = w.egid, .cap_dac_override = w.effective_caps.cap_dac_override, .groups = @import("../proc/current_groups.zig").forCaller(w.euid, w.egid) };
-        if (!dac.mayRemoveEntry(dirMeta(parent), entry.uid, creds, w.effective_caps.cap_fowner)) return -13;
+        if (!dac.allows(dirMeta(parent), creds, dac.Access.write_search)) return -13;
+        if (!dac.mayRemoveEntry(dirMeta(parent), entry.uid, creds, w.effective_caps.cap_fowner)) return -1;
     }
 
     if (entry.is_dir) {

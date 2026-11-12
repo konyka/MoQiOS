@@ -888,7 +888,7 @@ void _start(void) {
             /* this kernel's statx layout: mode (u16) at byte 28, i.e. w[3] high half */
             check(vr && ((uint32_t)(vx[3] >> 32) & 07777) == 01777, "V: /tmp is mode 1777 (world-writable, sticky)");
         }
-        check(syscall1(SYS_UNLINK, (uint64_t)"/tmp/h114-rootfile") == -EACCES, "V: unlink of root's file in the sticky /tmp is EACCES");
+        check(syscall1(SYS_UNLINK, (uint64_t)"/tmp/h114-rootfile") == -EPERM, "V: unlink of root's file in the sticky /tmp is EPERM");
         int64_t still = syscall2(SYS_OPEN, (uint64_t)"/tmp/h114-rootfile", O_RDONLY);
         check(still >= 0, "V: root's file in /tmp is still there");
         if (still >= 0) syscall1(SYS_CLOSE, (uint64_t)still);

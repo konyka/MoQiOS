@@ -7708,3 +7708,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：FAT32 的 `unlink` 本来就把打开中的文件槽位标为 `unlink_pending`，到最后一次关闭才删除目录项和簇链，只是 `getFileName` 对这类槽位返回 null。新增 `fat32.pendingName`（给出这类槽位的名字）和 `fat32.retainPending`（对这类槽位加一个引用）。`fd_target.describe` 在槽位已删除时追加 ` (deleted)`，`resolveMagicLink` 不再给出路径；`file_io.openAt` 对这类描述符调用新的 `FdTable.reopenFat32Pending`，它处理 `O_CREAT|O_EXCL`（`EEXIST`）、`O_DIRECTORY`（`ENOTDIR`）和 `O_TRUNC`，建立偏移为 0 的新描述符。新描述符关闭时走原有的 `closeFile`，引用计数归零才真正删除。
 - 绿灯：hello280 七项全过，hello270（FAT32 上的 `O_APPEND`）照常通过；host 测试、三个架构构建与完整 smoke 见提交记录。
 - 如实的局限：①FAT32 只有根目录，没有 rename 后的路径跟随问题之外的父目录情形；②FAT32 没有权限位，重开不核对模式位（与按名打开一致）；③没有在 Linux vfat 上直接实测（见上）。
+
+## 目录的粘滞位（hello281，已修）
+
+- 起因：`docs/user-space.md` 写着 ext2 没有粘滞位语义；tmpfs 虽有，但拒绝时返回 `EACCES`。宿主机 Linux 实测：在 `/tmp`（`1777`）中对别的用户的文件或目录做 `unlink`、`rmdir`、`rename` 都得 `EPERM`。内核源码 `may_delete_dentry`（`3rd/linux-7.0.6/fs/namei.c`）的顺序是：先查父目录的 write+exec 权限（`EACCES`），再做 `check_sticky`（`EPERM`），然后才是 `ENOTDIR`/`EISDIR` 检查。条目属主、目录属主和持有 `CAP_FOWNER` 的进程不受限制。
+- 红灯（改动前的内核，真编译）：hello281 中 ext2 粘滞目录一段的五个子步骤全错（child bits 31），root 的文件被移走；tmpfs 一段的 `unlink`、`rmdir` 返回 `-13` 而不是 `-1`；`0777` 目录一段通过。
+- 实现：`ext2.zig` 新增 `stickyRefuses`，接入 `unlinkFile`、`rmdirFile`、`renameFileMode`（检查源条目，也检查将被覆盖的目标）和 `renameExchange`（两边都检查）。`tmpfs.tmpfsRemove` 先查父目录 write+search（`EACCES`），再查粘滞位（`EPERM`）。`unlink.zig` 的 `caller()` 之前漏传 `cap_fowner`，已补上。hello114 V 段的期望相应地从 `EACCES` 改为 `EPERM`。
+- 绿灯：hello281 五项全过，hello119 照常通过；host 测试、三个架构构建与完整 smoke 见提交记录。
+- 如实的局限：FAT32 没有权限位，所以没有 DAC，也没有粘滞位。
+- 门禁中的观察（未解决）：第一次 SMP=4 smoke 在 hello58 第 5 段（会话长退出、孤儿进程组 SIGHUP）之后串口静默，900 秒超时；SMP=1、SMP=2 和 SMP=4 重跑都通过。这段路径（`jobctl.onSessionLeaderExit`）本次没有改动，与 §6.25/§6.26 记录的历史停滞在同一位置，留作待查项。
+

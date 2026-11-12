@@ -3038,6 +3038,7 @@ pub fn unlinkFile(path: []const u8, who: ?Who) i64 {
     // Read file inode
     var file_inode: Ext2Inode = undefined;
     if (!readInode(file_inode_num, &file_inode)) return -5;
+    if (stickyRefuses(&parent_inode, &file_inode, who)) return -1; // EPERM
 
     // POSIX: unlink() must refuse directories (EISDIR). Unlinking one here
     // freed its blocks while every child entry became an orphan and the
@@ -3189,6 +3190,18 @@ pub fn renameFileMode(old_path: []const u8, new_path: []const u8, who: ?Who, nor
     // Read file inode to get file_type
     var file_inode: Ext2Inode = undefined;
     if (!readInode(file_inode_num, &file_inode)) return -5;
+    if (stickyRefuses(&old_parent_ino_data, &file_inode, who)) return -1; // EPERM
+    {
+        var np: Ext2Inode = undefined;
+        if (!readInode(new_parent_inode, &np)) return -5;
+        if (findDirEntryCached(new_parent_inode, &np, new_filename)) |victim_num| {
+            if (victim_num != file_inode_num) {
+                var victim_ino: Ext2Inode = undefined;
+                if (!readInode(victim_num, &victim_ino)) return -5;
+                if (stickyRefuses(&np, &victim_ino, who)) return -1; // EPERM
+            }
+        }
+    }
     if (eu.isDirectory(file_inode.mode)) {
         const dr = renameDirUnlocked(old_parent_inode, old_filename, new_parent_inode, new_filename, file_inode_num, noreplace);
         if (dr == 0) followRenameUnlocked(old_path, new_path, false);
@@ -3405,6 +3418,7 @@ pub fn renameExchange(old_path: []const u8, new_path: []const u8, who: ?Who) i64
     var ad: Ext2Inode = undefined;
     var bd: Ext2Inode = undefined;
     if (!readInode(ia, &ad) or !readInode(ib, &bd)) return -5;
+    if (stickyRefuses(&pa_d, &ad, who) or stickyRefuses(&pb_d, &bd, who)) return -1; // EPERM
     const a_dir = eu.isDirectory(ad.mode);
     const b_dir = eu.isDirectory(bd.mode);
     if (pa != pb) {
@@ -3464,6 +3478,7 @@ pub fn rmdirFile(path: []const u8, who: ?Who) i64 {
 
     var dir_inode: Ext2Inode = undefined;
     if (!readInode(dir_inode_num, &dir_inode)) return -5;
+    if (stickyRefuses(&parent_inode, &dir_inode, who)) return -1; // EPERM
     if (!eu.isDirectory(dir_inode.mode)) return -20; // ENOTDIR
 
     if (!dirIsEmpty(&dir_inode)) return -39; // ENOTEMPTY (or unreadable)
@@ -3717,6 +3732,15 @@ pub const Who = struct {
         return .{ .euid = self.euid, .egid = self.egid, .cap_dac_override = self.cap_dac_override, .groups = self.groups };
     }
 };
+
+/// A sticky parent (S_ISVTX) refuses removing or renaming away `victim`
+/// unless the caller owns it or the directory, or holds CAP_FOWNER (Linux
+/// check_sticky, EPERM). The parent's write+search was already checked by
+/// resolveParentChecked, so a refusal here is only the sticky rule.
+fn stickyRefuses(parent: *const Ext2Inode, victim: *const Ext2Inode, who: ?Who) bool {
+    const w = who orelse return false;
+    return !@import("dac.zig").mayRemoveEntry(inodeMeta(parent), inodeUid(victim), w.creds(), w.cap_fowner);
+}
 
 fn inodeUid(inode: *const Ext2Inode) u32 {
     return @as(u32, inode.uid) | (@as(u32, inode.osd2[4]) << 16) | (@as(u32, inode.osd2[5]) << 24);

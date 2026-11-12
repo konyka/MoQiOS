@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello280`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello281`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -276,6 +276,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello278 | ext2 文件的 `/proc/self/fd/N` 跟随改名和删除：文件或父目录被 `rename` 后链接给出新路径（在非根工作目录下按相对名打开、改名、删除也一样）；打开时用的名字被 `unlink` 后给出 `"<路径> (deleted)"`（即使还有别的硬链接），经链接仍能重开并读到数据，重开得到的描述符同样是 deleted；未改动的文件和幸存的硬链接给出普通路径 |
 | hello279 | 打开期间被删掉名字的 ext2 对象：被 `rmdir` 的目录经 `/proc/self/fd/N` 读出 `"<路径> (deleted)"`，`fstat` 的 nlink 为 0，`getdents64` 和 `openat(O_CREAT)` 得 `ENOENT`（同名新目录出现后也一样，不会建到新目录里），仍能经链接重开；被 `rename` 覆盖的文件和空目录同样是 ` (deleted)`，被覆盖的文件仍能读到数据 |
 | hello280 | 打开期间被 `unlink` 的 FAT32 文件：`/proc/self/fd/N` 读出 `"/<名字> (deleted)"`，经链接 `O_CREAT\|O_EXCL` 得 `EEXIST`，重开从偏移 0 读到数据，新描述符同样是 deleted，并在原描述符关闭后仍能读；最后一次关闭后名字仍不存在 |
+| hello281 | 目录的粘滞位（ext2 与 tmpfs）：uid 1000 对 root 在 `1777` 目录里的文件和目录做 `rename` 移走、`unlink`、`rmdir`、`rename` 覆盖都得 `EPERM`，root 的文件仍在；自己的文件可删；`0777` 无粘滞位的目录里同样操作都成功 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。
@@ -559,8 +560,9 @@ its parent directory; unlink/rmdir need the same and, in a sticky directory,
 additionally that the caller owns the entry or the directory, is uid 0, or holds
 `CAP_FOWNER` (`dac.mayRemoveEntry`). chmod and chown on `/tmp` paths use the
 same owner rules as ext2, both by path and through an open descriptor
-(`fchmod`/`fchown`). A denial is `-13` (`EACCES`) for namespace changes and
-`-1` (`EPERM`) for chmod/chown.
+(`fchmod`/`fchown`). As in Linux `may_delete`, missing write+search on the
+parent is `-13` (`EACCES`); a sticky-directory refusal is `-1` (`EPERM`), as is
+a chmod/chown refusal.
 
 chmod/fchmod/fchmodat/fchmodat2 and chown/fchown/lchown on the ext2 root disk
 are authorized against the inode's current owner (`fs/dac.zig` `mayChmod` /
@@ -587,8 +589,11 @@ checks search permission on intermediate directories and write+search on the
 final parent while holding the ext2 lock. A denial is `-13` (`EACCES`), not a
 fallback to FAT32. Opening a path (and statx, access and truncate by path)
 checks search permission on every directory walked; a denial is `-13`
-(`EACCES`). Sticky-bit semantics are not implemented; tmpfs and FAT32
-namespace mutation still has no parent-directory DAC.
+(`EACCES`). Sticky directories are enforced on ext2 as on tmpfs: unlink, rmdir,
+rename of the source and of a replaced or exchanged target are refused with
+`-1` (`EPERM`) unless the caller owns the entry or the directory, or holds
+`CAP_FOWNER`. FAT32 has no permission bits, so neither DAC nor the sticky rule
+applies there.
 
 Independent of DAC, descriptor access modes are enforced at read time
 regardless of filesystem: reading a descriptor opened `O_WRONLY` fails with

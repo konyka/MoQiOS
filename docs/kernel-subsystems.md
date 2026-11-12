@@ -985,7 +985,7 @@ const SchedStats = struct {
   - **阻塞 connect**：`tcpWaitConnected` 等到握手结束，成功返回 0，失败返回记录的 errno 并清除 `SO_ERROR`；等待期间每个切片泵一次回环队列，信号可以打断（`EINTR`，握手继续）。
   - **非阻塞 connect**：返回 `EINPROGRESS`；完成时 `POLLOUT`，失败时 `POLLERR|POLLHUP`（`tcp_ready_policy` 的 `so_error` 报 `ERR`），原因在 `SO_ERROR`，读取后清零。
   - 在已连接或正在握手的套接字上 `connect`：`EISCONN`/`EALREADY`（此前是裸 `-1`）。
-  hello27（连 SLIRP 网关 10.0.2.2:80，那里没有 TCP 服务）改为非阻塞 connect，否则阻塞 connect 会等完整的 SYN 重传（约两分钟）。已知差异：对非回环目标不发 RST；`connect` 的超时没有 `SO_SNDTIMEO` 控制；IPv6 的 RST 未实现。
+  hello27（连 SLIRP 网关 10.0.2.2:80，那里没有 TCP 服务）改为非阻塞 connect，否则阻塞 connect 会等完整的 SYN 重传（约两分钟）。已知差异：对非回环目标不发 RST（IPv4 与 IPv6 一样：回环 `127/8` 和 `::1` 上无连接匹配的段由 `sendLoopbackReset`/`sendLoopbackResetV6` 回 RST）；`connect` 的超时没有 `SO_SNDTIMEO` 控制。
 - **AF_UNIX 的 `EPOLLRDHUP` / `POLLRDHUP`（hello159）**：`unix_epoll_policy.events` 新增 `peer_shut_wr`：对端 `shutdown(SHUT_WR)` 或对端已断开（关闭）时流套接字报 `EPOLLRDHUP`（断开时与 `IN|OUT|HUP` 一起）；本端自己的 `SHUT_RD`/`SHUT_WR`、数据报套接字和监听套接字都不报；`EpollWake`（`shutdown`/`close` 的通知）带上 `EPOLLRDHUP`，所以阻塞在 `epoll_wait` 的任务会被唤醒。poll 与 epoll 共用 `unixEpollEvents`，同样只在调用者请求时返回。
 - **`EPOLLRDHUP` / `POLLRDHUP`（hello158）**：事件循环靠它检测“对端关闭了写方向”（半关闭）而不必先 `read` 到 0。`tcp_ready_policy.events` 在对端已发 FIN（`CLOSE_WAIT`、`LAST_ACK`、`CLOSING`、`TIME_WAIT`）或连接已关闭时置 `RDHUP`（0x2000），**只在调用者请求时**才返回（epoll 的兴趣掩码、poll 的 `events` 过滤）；本端自己的 `SHUT_RD`/`SHUT_WR` 不触发它；收到对端 FIN 时 `driveTcbStateMachine` 用 `EPOLLIN | EPOLLHUP | EPOLLRDHUP` 唤醒 epoll 等待者。AF_UNIX 的 `RDHUP` 见上一条（hello159）。
 - **TCP 套接字的 poll/epoll 就绪状态（hello157）**：此前 epoll 对**每一个** TCP 套接字都无条件加 `EPOLLERR`（空闲、健康的连接也一样），`CLOSE_WAIT`（对端已 `SHUT_WR`，本端仍可回复）既不可写，本端 `SHUT_RD` 之后也不报可读（此时 `read` 立即返回 EOF），而 poll 与 epoll 各用一套互相不一致的判断。现在 `net/tcp_ready_policy.events` 是同一个纯函数（`tcp.tcpReadiness` 取快照），poll 与 epoll 共用，规则取 Linux `tcp_poll`：可读 = 有数据，或读会返回 EOF（对端 FIN、本端 `SHUT_RD`、连接已关闭）；可写 = 发送环有空位，或本端已关闭写方向（写会立即失败，不应让轮询者阻塞）；`HUP` = 两个方向都结束（或连接已关闭）；`ERR` 只在对端 RST 时出现；握手中的连接什么也不报，监听套接字有待接受连接时可读。`file_io.read` 判断后续数据块是否可读（hello152）用的也是这套 poll 就绪，所以 `read` 在 EOF 连接上的行为也随之正确。
@@ -1423,7 +1423,7 @@ const FdTable = struct {
   文件/目录权限为 `(requested & 0777) & ~umask`。命名空间修改（create/mkdir/symlink/unlink/rmdir/rename/hardlink）
   在 fs_lock 内检查中间目录 search 与父目录 write+search，拒绝返回 EACCES，不再回落到 FAT32 的同名文件。
   `user.*` xattr 的 set/remove 需要文件写权限、get/list 需要读权限，拒绝返回 EACCES 且先于属性是否存在的判断。
-  打开（含 statx/access/truncate(path)）的路径遍历对每级目录检查 search，拒绝为 EACCES。粘滞位、补充组未实现。
+  打开（含 statx/access/truncate(path)）的路径遍历对每级目录检查 search，拒绝为 EACCES。粘滞位目录（S_ISVTX）中删除、rmdir、rename 移走或覆盖别人的条目返回 EPERM（`stickyRefuses`，条目属主、目录属主、CAP_FOWNER 例外）；补充组参与组类判定（见 `proc/group_policy.zig`）。
 - 操作: `readFile` / `writeFile` / `createFile` / `createDir` / `unlinkFile` / `listDirInode` / `truncate`
 - TRIM (G5)：`freeBlock` 把释放的数据块记入 discard 积攒缓冲（非批量时立即
   下发；`batch_free_depth` 批量释放时在 defer 收尾统一经 `trim_ranges.coalesce`
