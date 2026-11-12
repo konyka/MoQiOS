@@ -146,6 +146,8 @@ pub const Task = struct {
     /// Stopped tasks are held in .blocked and resume only via SIGCONT —
     /// plain wait-queue wakes must not revive them.
     stopped: bool = false,
+    /// Stop / continue not yet reported to the parent's waitpid (WUNTRACED / WCONTINUED). Guarded by task_lock.
+    wait_report: @import("wait_report_policy.zig").Pending = .{},
     /// User-space entry point (RIP).
     user_entry: u64,
     /// User-space stack top (RSP for ring3).
@@ -840,6 +842,7 @@ fn reserveSlotLocked() ?u32 {
     _ = @atomicRmw(u64, &@import("sched.zig").sleep_bm, .And, ~(@as(u64, 1) << @intCast(slot)), .seq_cst);
     tasks[slot].sleep_deadline_ns = 0;
     tasks[slot].stopped = false;
+    tasks[slot].wait_report = .{};
     tasks[slot].mq_waiter = .{};
     slot_bitmap |= @as(u64, 1) << @intCast(slot);
     tasks[slot].incarnation +%= 1;
@@ -1845,6 +1848,56 @@ pub fn publishRunnable(slot: u32) void {
     const sched = @import("sched.zig");
     sched.enqueue(t);
     sched.notifyWake(t);
+}
+
+/// A child stopped or continued: record what its parent's waitpid will report and wake the parent if it is blocked in waitpid.
+/// Returns the parent and whether it wants SIGCHLD for the change; null when the task reports to nobody (threads, kernel tasks, orphans).
+pub fn noteChildStateChange(t: *Task, change: @import("wait_report_policy.zig").Change) ?struct { tid: u32, sigchld: bool } {
+    if (!t.is_user or t.is_thread or t.parent_tid == 0) return null;
+    const wrp = @import("wait_report_policy.zig");
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    t.wait_report = wrp.record(change);
+    const pi = findTaskByTidLocked(t.parent_tid) orelse return null;
+    const parent = &tasks[pi];
+    if (parent.waiting_for_child) {
+        parent.waiting_for_child = false;
+        // Same wake as exitTask's: only a blocked parent is made ready; a running one sees the cleared flag in its wait loop.
+        if (parent.state == .blocked) {
+            sched_claim.store(&parent.state, .ready);
+            _ = @import("per_cpu.zig").enqueueTask(parent);
+            asm volatile ("" ::: .{ .memory = true });
+            @import("sched.zig").kickCpu(parent.wait_cpu);
+        }
+    }
+    return .{ .tid = parent.tid, .sigchld = wrp.notifiesParent(parent.sigact().flags[17 - 1]) };
+}
+
+/// waitpid(WUNTRACED / WCONTINUED): take a matching live child's pending stop or continue report. Caller MUST hold task_lock.
+pub fn takeWaitReportLocked(parent_idx: u32, pid: i32, options: u32, status: *i32) ?u32 {
+    const wrp = @import("wait_report_policy.zig");
+    if (options & (wrp.WUNTRACED | wrp.WCONTINUED) == 0) return null;
+    const parent = getTask(parent_idx) orelse return null;
+    var bits = slot_bitmap;
+    while (bits != 0) {
+        const i: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const t = &tasks[i];
+        if (t.parent_tid != parent.tid or t.is_thread or t.state == .zombie) continue;
+        if (!@import("proc_id_policy.zig").waitMatches(pid, t.tid, t.pgid, parent.pgid)) continue;
+        const st = wrp.report(options, t.wait_report) orelse continue;
+        t.wait_report = wrp.consume(t.wait_report, st);
+        status.* = st;
+        return t.tid;
+    }
+    return null;
+}
+
+/// takeWaitReportLocked under task_lock.
+pub fn takeWaitReport(parent_idx: u32, pid: i32, options: u32, status: *i32) ?u32 {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    return takeWaitReportLocked(parent_idx, pid, options, status);
 }
 
 /// Result of a single waitpid zombie scan (task_lock held by caller).

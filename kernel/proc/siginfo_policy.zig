@@ -16,6 +16,8 @@ pub const SI_QUEUE: i32 = -1;
 pub const SI_TKILL: i32 = -6;
 pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
+pub const CLD_STOPPED: i32 = 5;
+pub const CLD_CONTINUED: i32 = 6;
 pub const SEGV_MAPERR: i32 = 1;
 pub const SEGV_ACCERR: i32 = 2;
 pub const BUS_ADRERR: i32 = 2;
@@ -66,6 +68,14 @@ pub fn childInfo(pid: u32, uid: u32, internal_code: i32, via_exit_syscall: bool)
         .code = if (e.signaled) CLD_KILLED else CLD_EXITED,
         .a = pidUid(pid, uid),
         .b = e.value,
+    };
+}
+
+/// SIGCHLD siginfo for a child that stopped (si_status = the stop signal) or continued (si_status = SIGCONT).
+pub fn childStateInfo(pid: u32, uid: u32, change: @import("wait_report_policy.zig").Change) Info {
+    return switch (change) {
+        .stopped => |sig| .{ .code = CLD_STOPPED, .a = pidUid(pid, uid), .b = sig },
+        .continued => .{ .code = CLD_CONTINUED, .a = pidUid(pid, uid), .b = 18 },
     };
 }
 
@@ -174,4 +184,15 @@ test "child and fault siginfo" {
     try std.testing.expectEqual(SEGV_ACCERR, faultInfo(false, true, 0x10).code);
     try std.testing.expectEqual(BUS_ADRERR, faultInfo(true, false, 0x10).code);
     try std.testing.expectEqual(@as(u64, 0x10), faultInfo(false, false, 0x10).a);
+}
+
+test "SIGCHLD for a stop carries CLD_STOPPED and the stop signal, for a continue CLD_CONTINUED and SIGCONT" {
+    const std = @import("std");
+    const st = childStateInfo(42, 1000, .{ .stopped = 19 });
+    try std.testing.expectEqual(CLD_STOPPED, st.code);
+    try std.testing.expectEqual(@as(u64, 19), st.b);
+    try std.testing.expectEqual(pidUid(42, 1000), st.a);
+    const ct = childStateInfo(42, 1000, .continued);
+    try std.testing.expectEqual(CLD_CONTINUED, ct.code);
+    try std.testing.expectEqual(@as(u64, 18), ct.b);
 }

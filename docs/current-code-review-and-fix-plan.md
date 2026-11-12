@@ -7738,3 +7738,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 测试不再靠固定 sleep：hello283 和 hello58 第 5 段在退出前有界轮询 `/proc/<子进程>/stat`，直到第三个字段是 `T`（`procfs.generatePidStat` 用 `pid_status.stateOf` 生成）。不用 `waitpid` 的 `WUNTRACED`：内核只校验了这个选项，没有确认会报告停止的子进程（未验证，记为后续开放项）。
 - 绿灯：hello283 六项、hello58 全段在 SMP=1 与 SMP=4 下通过；host 测试、三个架构构建与完整 smoke 见提交记录。
 - 如实的局限：①本内核的 handler 运行顺序与 Linux 不同（见上），测试不比较顺序；②`WUNTRACED`/`WCONTINUED` 是否报告子进程的停止和继续尚未验证。
+
+## waitpid 报告停止和继续的子进程（hello284，已实现）
+
+- 起因：hello283 一节局限 ②。`proc_id_policy.waitOptionsErrno` 接受 `WUNTRACED` 和 `WCONTINUED`，但 `waitpidScanLocked` 只找僵尸子进程，停止和继续都不会报告；子进程停止或继续时父进程也收不到 SIGCHLD。宿主机 Linux 实测（`user/hello284.c` 加 `-DHOST` 在宿主机编译运行，13 项全过）：SIGSTOP 停止报告为 `0x137f`，只报告一次，不带 `WUNTRACED` 不报告；SIGCONT 后 `WCONTINUED` 报告 `0xffff`，同样只报告一次；阻塞的 `WUNTRACED` 等待在子进程停止时返回；父进程在停止和继续时各收一次 SIGCHLD；SIGCHLD 动作带 `SA_NOCLDSTOP` 时停止不发 SIGCHLD，但仍报告给 `WUNTRACED`。
+- 红灯（改动前的内核，真编译）：hello284 十三项中五项失败：停止时没有 SIGCHLD，`WUNTRACED` 返回 0，阻塞的 `WCONTINUED` 一直等到子进程退出并把它回收（返回状态 `0x700`），之后两项得 `ECHILD`。
+- 实现：新的 `kernel/proc/wait_report_policy.zig`（带内联测试）给出状态编码、只报告一次、新变化取代旧变化和 `SA_NOCLDSTOP` 的规则。`Task.wait_report` 记录待报告的变化，`task.noteChildStateChange` 在 task_lock 下记录变化并按 exitTask 的方式唤醒阻塞在 waitpid 里的父进程。`signal.stopTask` 多了 `signum` 参数（四个调用点都传入实际的停止信号），它和 `continueTask` 只在状态真正改变时经 `notifyParentOfChange` 通知父进程，并按需发送 SIGCHLD（`siginfo_policy.childStateInfo`：`CLD_STOPPED` 带停止信号，`CLD_CONTINUED` 带 SIGCONT）。`waitpid` 在回收僵尸之后、`WNOHANG` 判断之前、阻塞前的加锁检查里、以及每次被唤醒后，都会经 `takeWaitReport(Locked)` 取走报告。
+- 绿灯：hello284 十三项在 SMP=1 下全过；host 测试、三个架构构建与完整 smoke 见提交记录。
+- 如实的局限：①`waitid` 没有实现（`WSTOPPED`/`WEXITED`/`WNOWAIT` 无从谈起）；②ptrace 停止（`__WALL` 的跟踪停止）没有实现；③停止的线程组：本内核按任务停止，只有线程组组长的停止和继续会报告（线程不报告），Linux 要等整组都停下才报告。

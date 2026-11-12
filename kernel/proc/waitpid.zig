@@ -41,6 +41,12 @@ pub fn waitpidUsage(pid_raw: u64, status_ptr: u64, options: u32, usage_out: ?*cp
         return child_tid;
     }
 
+    // WUNTRACED / WCONTINUED: a live child's unreported stop or continue.
+    if (task_mod.takeWaitReport(cur_idx, pid, options, &exit_code)) |child_tid| {
+        if (!writeStatus(status_ptr, exit_code)) return -14;
+        return child_tid;
+    }
+
     // WNOHANG: return 0 immediately if no zombie child
     if (options & 1 != 0) return 0;
 
@@ -66,6 +72,13 @@ pub fn waitpidUsage(pid_raw: u64, status_ptr: u64, options: u32, usage_out: ?*cp
         const tflags = task_mod.lockTask();
         parent.waiting_for_child = true;
         parent.wait_cpu = @intCast(se.getPerCpu().cpu_id);
+        // Under the same lock as noteChildStateChange's record + wake, so a stop or continue cannot slip past this check.
+        if (task_mod.takeWaitReportLocked(cur_idx, pid, options, &exit_code)) |child_tid| {
+            parent.waiting_for_child = false;
+            task_mod.unlockTask(tflags);
+            if (!writeStatus(status_ptr, exit_code)) return -14;
+            return child_tid;
+        }
 
         switch (task_mod.waitpidScanLocked(cur_idx, pid, &exit_code)) {
             .reaped => |reaped| {
@@ -128,6 +141,10 @@ pub fn waitpidUsage(pid_raw: u64, status_ptr: u64, options: u32, usage_out: ?*cp
         // only aborts the wait when no child status is available, so an
         // EINTR'd (or killed) waitpid never consumes the child's exit status.
         if (task_mod.waitpid(cur_idx, pid, &exit_code, usage_out)) |child_tid| {
+            if (!writeStatus(status_ptr, exit_code)) return -14;
+            return child_tid;
+        }
+        if (task_mod.takeWaitReport(cur_idx, pid, options, &exit_code)) |child_tid| {
             if (!writeStatus(status_ptr, exit_code)) return -14;
             return child_tid;
         }

@@ -1427,7 +1427,7 @@ pub fn deliverSignalToRunningTask(t: *task.Task, iframe: *idt.InterruptFrame) bo
                 // 默认停：标记 stopped 并转入 .blocked——下一调度点自然切出，
                 // 只有 SIGCONT 能复活（见 signal.continueTask / Task.stopped）。
                 // Falls through to the scheduling pass (false): resuming the frame would keep the stopped task on the CPU until the next tick.
-                sig_mod.stopTask(t);
+                sig_mod.stopTask(t, signum);
                 return false;
             },
             .cont => {

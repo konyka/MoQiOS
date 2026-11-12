@@ -11451,7 +11451,7 @@ test "a default stop signal stops a sleeping target at once, without leaving the
     // never showed T. Leaving the bit pending as well would stop the task a second time when SIGCONT woke it.
     const sg = kt.signal_source;
     try std.testing.expect(std.mem.indexOf(u8, sg, "fn stopsBlockedTarget(t: *task.Task, signum: u32, idx: u32) bool {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sg, "if (stopsBlockedTarget(t, signum, @intCast(i))) {\n                stopTask(t);\n                return 0;\n            }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sg, "if (stopsBlockedTarget(t, signum, @intCast(i))) {\n                stopTask(t, signum);\n                return 0;\n            }") != null);
     try std.testing.expect(std.mem.indexOf(u8, sg, "if (cur == idx) return false;") != null);
     try std.testing.expect(std.mem.indexOf(u8, sg, "return t.sigact().handlers[signum - 1] == 0 and (t.signal_mask & bit) == 0;") != null);
 }
@@ -11669,10 +11669,10 @@ test "bind(): an address the host does not have is EADDRNOTAVAIL, checked before
 
 test "SIGSTOP on a task running on another CPU kicks that CPU instead of waiting for its next tick" {
     const sig = kt.signal_source;
-    const start = std.mem.indexOf(u8, sig, "pub fn stopTask(t: *task.Task) void {") orelse return error.TestUnexpectedResult;
+    const start = std.mem.indexOf(u8, sig, "pub fn stopTask(t: *task.Task, signum: u32) void {") orelse return error.TestUnexpectedResult;
     const body = sig[start..][0..std.mem.indexOf(u8, sig[start..], "\n}\n").?];
     // A task marked ready can still be executing on its CPU (the scheduler marks the outgoing task ready before publishing it); the kick comes after the state change.
-    try std.testing.expect(std.mem.indexOf(u8, body, "if (s == .running or s == .ready) sc.store(&t.state, .blocked);\n    if (s == .running) kickUntilStopped(t) else if (s == .ready) kickRunningCpu(t);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (s == .running or s == .ready) sc.store(&t.state, .blocked);\n    notifyParentOfChange(t, .{ .stopped = @intCast(signum) });\n    if (s == .running) kickUntilStopped(t) else if (s == .ready) kickRunningCpu(t);") != null);
     // One kick can be coalesced away by a scheduler pass that already started, so a running target is kicked until it leaves.
     try std.testing.expect(std.mem.indexOf(u8, sig, "while (tries < STOP_KICK_TRIES) : (tries += 1) {\n        if (@import(\"sched_claim.zig\").load(&t.state) != .running) return;\n        kickRunningCpu(t);") != null);
     // The kick aims at the CPU the target itself publishes at every tick and syscall entry.

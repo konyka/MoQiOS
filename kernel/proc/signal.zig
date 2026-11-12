@@ -184,7 +184,7 @@ pub fn sendSignalInfoResult(target_tid: u32, signum: u32, info: siginfo.Info) i6
             // not "actionable" for kickIfBlocked) and only stop once something woke it. The bit is not left pending, or the SIGCONT wake
             // would deliver it and stop the task a second time. A running task (including the caller itself) takes the pending path.
             if (stopsBlockedTarget(t, signum, @intCast(i))) {
-                stopTask(t);
+                stopTask(t, signum);
                 return 0;
             }
             _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
@@ -235,13 +235,22 @@ fn isCallerTask(idx: u32) bool {
 /// Job control: stop a task (SIGSTOP/SIGTTIN/SIGTTOU default). Running/ready
 /// tasks transition to .blocked and stay there until SIGCONT — wait-queue
 /// wakes are suppressed while `stopped` holds (see continueTask).
-pub fn stopTask(t: *task.Task) void {
+pub fn stopTask(t: *task.Task, signum: u32) void {
     if (t.stopped) return;
     t.stopped = true;
     const sc = @import("sched_claim.zig");
     const s = sc.load(&t.state);
     if (s == .running or s == .ready) sc.store(&t.state, .blocked);
+    notifyParentOfChange(t, .{ .stopped = @intCast(signum) });
     if (s == .running) kickUntilStopped(t) else if (s == .ready) kickRunningCpu(t);
+}
+
+/// A stop or continue is reported to the parent: waitpid(WUNTRACED / WCONTINUED) sees it, a parent blocked in waitpid wakes, and the
+/// parent gets SIGCHLD (CLD_STOPPED / CLD_CONTINUED) unless its SIGCHLD action has SA_NOCLDSTOP. Called outside task_lock.
+fn notifyParentOfChange(t: *task.Task, change: @import("wait_report_policy.zig").Change) void {
+    const parent = task.noteChildStateChange(t, change) orelse return;
+    if (!parent.sigchld) return;
+    _ = sendSignalInfo(parent.tid, SIGCHLD, siginfo.childStateInfo(t.tid, t.uid, change));
 }
 
 /// Wake the CPUs a stopped task could still be running on until it has actually left them. One kick can be coalesced away: the target
@@ -285,6 +294,7 @@ pub fn continueTask(t: *task.Task) void {
     if (!t.stopped) return;
     t.stopped = false;
     task.unblockTask(t.self_idx);
+    notifyParentOfChange(t, .continued);
 }
 
 /// Broadcast a signal to every task in a process group (kill(-pgid) and the
@@ -320,7 +330,7 @@ pub fn sendSignalToPgrpFiltered(pgid: u16, signum: u32, sender: ?*task.Task) u32
                     _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
                     kickIfBlocked(@intCast(i));
                 } else {
-                    stopTask(t);
+                    stopTask(t, signum);
                 }
             },
             .cont => {

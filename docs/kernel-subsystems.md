@@ -833,6 +833,13 @@ const SchedStats = struct {
   任意任务的 pgid）。严格语义：只能改自己或子进程、目标组必须已存在于同会话、会话长不
   可改 pgid、新建组时禁止会话长建组。`syscallWaitpid` 现在透传 options（WNOHANG 此前被
   静默丢弃，是 waitpid(-1,…,WNOHANG) 永久阻塞的根因）。
+- **停止/继续报告（hello284）**：`stopTask(t, signum)` 和 `continueTask` 在状态真正改变时调用
+  `task.noteChildStateChange`：在 task_lock 下给子进程记下待报告的变化（`Task.wait_report`，
+  规则在 `proc/wait_report_policy.zig`：停止报告为 `(sig << 8) | 0x7f`，继续报告为 `0xffff`，
+  每次变化只报告一次，新的变化取代未报告的旧变化），并唤醒阻塞在 waitpid 里的父进程；父进程
+  的 SIGCHLD 动作没有 `SA_NOCLDSTOP` 时再发 SIGCHLD（`CLD_STOPPED`/`CLD_CONTINUED`）。
+  `waitpid` 带 `WUNTRACED`/`WCONTINUED` 时经 `takeWaitReportLocked` 取走报告；阻塞前在同一把
+  锁下再检查一次，所以变化不会从检查和阻塞之间漏掉。
 - **kill(-pgid) 广播**：`lifecycle.kill(pid<0)` → `signal.sendSignalToPgrp`——stop/cont 类
   按默认处置立即生效，其余走 pending + 唤醒；返回发送计数（0 → ESRCH）。
 - **孤儿组 SIGHUP（Linux `kill_orphaned_pgrp`）**：任何用户进程退出（线程退出不算）时

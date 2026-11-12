@@ -3350,7 +3350,7 @@ fn deliverSignalAt(frame: *SyscallFrame, current: anytype, user_rsp: u64, resume
                 @import("../../proc/task.zig").exitTask(128 + @as(i32, @intCast(signum)));
             },
             .ignore => return,
-            .stop => sig_mod.stopTask(current),
+            .stop => sig_mod.stopTask(current, signum),
             .cont => sig_mod.continueTask(current),
         }
         return;
