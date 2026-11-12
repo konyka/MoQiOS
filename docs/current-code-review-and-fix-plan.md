@@ -7754,4 +7754,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：改动前的内核没有 500 号分支（分发表 `else =>` 返回 `ENOSYS`），没有在目标机上单独运行。第一版实现在目标机（SMP=1）上 hello285 二十项中一项失败：`WCONTINUED` 报告成了 `CLD_STOPPED`/255。原因是继续的状态字 `0xffff` 低 7 位也是 `0x7f`，判断停止要看低 8 位等于 `0x7f`。
 - 实现：`kernel/proc/waitid_policy.zig` 给出 idtype/options 校验（`P_ALL`→-1、`P_PID`→id、`P_PGID`→-id，id 为 0 或超过 0x7fffffff、没有 `WEXITED`/`WSTOPPED`/`WCONTINUED` 之一、未知位都是 `EINVAL`）和报告选择（退出优先，`WNOWAIT` 时不回收）。`kernel/proc/waitpid.zig` 的 `waitid` 复用 waitpid 的锁内阻塞协议；回收走 `waitpidScanLocked`，`WNOWAIT` 走新增的只读 `task.peekZombieLocked`（按 `reap_policy.verdict` 跳过已交给回收线程的僵尸），停止和继续复用 `takeWaitReportLocked` 并加了不消费的参数。siginfo 用 `siginfo_policy.encode` 写 128 字节；`WNOHANG` 没有可报告的变化时写全 0。系统调用号用原生 500（247 已被 `clock_nanosleep` 占用，Linux 别名表只覆盖 rlimit 的两个号），并加入 `syscall_restart_policy.restartable`。libc 只加 `SYS_waitid`，hello285 直接用 `syscall5`。
 - 绿灯：hello285 二十项在宿主机（`-DHOST`）和目标机（SMP=1）上全过；host 测试、三个架构构建与完整 smoke 见提交记录。
-- 如实的局限：①第五个参数 rusage 不填写；②`WNOHANG` 无变化时把整份 128 字节 siginfo 写 0，Linux 只清其中的几个字段（读到的值相同）；③没有 Linux 247 到原生 500 的 personality 别名（别名表目前只服务 rlimit）；④继承 hello284 的局限：没有 ptrace 停止，线程组只有组长的停止和继续会报告。
+- 如实的局限：①~~第五个参数 rusage 不填写~~（已实现，见下一节）；②`WNOHANG` 无变化时把整份 128 字节 siginfo 写 0，Linux 只清其中的几个字段（读到的值相同）；③没有 Linux 247 到原生 500 的 personality 别名（别名表目前只服务 rlimit）；④继承 hello284 的局限：没有 ptrace 停止，线程组只有组长的停止和继续会报告。
+
+## waitid 的 rusage 参数（hello285 E 段，已实现）
+
+- 起因：上一节局限 ①。分发分支丢掉了第五个参数（`frame.r8`），调用方的 rusage 缓冲区保持原样，读到的是垃圾。
+- Linux 依据：`kernel/exit.c` 的 `waitid` 系统调用只在 `err > 0`（确实报告了一个子进程）时 `copy_to_user` rusage，写失败返回 `EFAULT`；没有找到或 `WNOHANG` 无变化返回 0 时不写。每个 `wait_task_*`（包括 `WNOWAIT`、停止、继续）都调用 `getrusage(p, RUSAGE_BOTH, ru)`，即子进程自身加上它已等待过的子孙。宿主机实测（hello285 `-DHOST`）：子进程自旋 250ms 后，`WNOWAIT` 和回收都报告约 247ms；`WNOHANG` 无变化时 144 字节保持 0x5a；rusage 指向地址 8 时是 `EFAULT`。
+- 红灯：改动前的内核在目标机（SMP=1）上 E 段四项中三项失败：两次 CPU 时间读出 -2157183954031447096 ms（缓冲区未写），不可写的 rusage 没有返回 `EFAULT`。
+- 实现：`waitpid.waitid` 增加 `ru` 参数，入口处验证 144 字节可写（否则 `-EFAULT`）。`WaitidGot` 新增 `usage`：回收取 `Reaped.usage`（与 wait4 同一个值），`WNOWAIT`、尚未可回收的僵尸、停止和继续取新增的 `task.childUsageLocked(tid)`（`cpu_time_policy.reapedUsage(groupTimesLocked(...))`，锁内计算）。`publishWaitid` 只在 got 非空时经 `writeRusage` 写 utime/stime 两个 timeval，其余字段为 0。分发分支传入 `frame.r8`。
+- 绿灯：hello285 二十四项在宿主机和目标机（SMP=1）上全过，目标机报告 251ms。
+- 如实的局限：rusage 只有 utime/stime，其余计数（maxrss、缺页、上下文切换等）写 0，与 wait4 的现有实现一致。

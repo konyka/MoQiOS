@@ -1,6 +1,7 @@
 /// hello285: waitid(idtype, id, infop, options). Measured on the host with the raw syscall (build with -DHOST): success returns 0 and
 /// fills a SIGCHLD siginfo (si_code CLD_EXITED/KILLED/STOPPED/CONTINUED, si_pid, si_status); WNOWAIT leaves the child waitable;
 /// WNOHANG with nothing to report returns 0 with si_signo cleared; bad idtype/options/id are EINVAL, no such child is ECHILD.
+/// The fifth argument (struct rusage) is filled with the child's CPU time only when a child was reported, and is EFAULT when unwritable.
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -17,6 +18,10 @@ static long wid(long type, long id, void *info, long opt) {
     long r = syscall(SYS_waitid, type, id, info, opt, 0);
     return r < 0 ? -errno : r;
 }
+static long widr(long type, long id, void *info, long opt, void *ru) {
+    long r = syscall(SYS_waitid, type, id, info, opt, ru);
+    return r < 0 ? -errno : r;
+}
 #else
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
 #include "../lib/moqi_libc/include/stdio.h"
@@ -27,6 +32,7 @@ static long wid(long type, long id, void *info, long opt) {
 #include "../lib/moqi_libc/include/time.h"
 #include "../lib/moqi_libc/include/errno.h"
 static long wid(long type, long id, void *info, long opt) { return syscall5(SYS_waitid, type, id, (long)info, opt, 0); }
+static long widr(long type, long id, void *info, long opt, void *ru) { return syscall5(SYS_waitid, type, id, (long)info, opt, (long)ru); }
 #endif
 
 #ifndef P_ALL
@@ -76,6 +82,23 @@ static int info_signo(const unsigned char *b) { return b[0] | (b[1] << 8) | (b[2
 static int info_code(const unsigned char *b) { return b[8] | (b[9] << 8) | (b[10] << 16) | (b[11] << 24); }
 static int info_pid(const unsigned char *b) { return b[16] | (b[17] << 8) | (b[18] << 16) | (b[19] << 24); }
 static int info_status(const unsigned char *b) { return b[24] | (b[25] << 8) | (b[26] << 16) | (b[27] << 24); }
+
+/* struct rusage: ru_utime {sec@0, usec@8}, ru_stime {sec@16, usec@24}. */
+static long ru_cpu_ms(const unsigned char *b) {
+    long v[4];
+    memcpy(v, b, sizeof v);
+    return v[0] * 1000 + v[1] / 1000 + v[2] * 1000 + v[3] / 1000;
+}
+static int all_byte(const unsigned char *b, int n, unsigned char x) {
+    for (int i = 0; i < n; i++) if (b[i] != x) return 0;
+    return 1;
+}
+static void spin_ms(long ms) {
+    struct timespec a, b;
+    clock_gettime(1, &a);
+    do clock_gettime(1, &b);
+    while ((b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000 < ms);
+}
 
 static void nap(int ms) { struct timespec t = { ms / 1000, (ms % 1000) * 1000000L }; nanosleep(&t, 0); }
 
@@ -169,6 +192,26 @@ int main(void) {
     r = wid(P_PGID, c, info, WEXITED);
     snprintf(msg, sizeof msg, "D: P_PGID reports the kill (%ld, code %d, pid %d)", r, info_code(info), info_pid(info));
     check(r == 0 && info_code(info) == CLD_KILLED && info_pid(info) == (int)c, msg);
+
+    unsigned char ru[144];
+    c = fork();
+    if (c == 0) { spin_ms(250); _exit(3); }
+    memset(ru, 0x5a, sizeof ru);
+    r = widr(P_PID, c, info, WEXITED | WNOHANG, ru);
+    check(r == 0 && all_byte(ru, sizeof ru, 0x5a), "E: WNOHANG with nothing to report leaves the rusage untouched");
+    memset(ru, 0x5a, sizeof ru);
+    r = widr(P_PID, c, info, WEXITED | WNOWAIT, ru);
+    snprintf(msg, sizeof msg, "E: WNOWAIT fills the rusage with the child's CPU time (%ld, %ld ms)", r, ru_cpu_ms(ru));
+    check(r == 0 && ru_cpu_ms(ru) >= 100 && ru[140] == 0, msg);
+    memset(ru, 0x5a, sizeof ru);
+    r = widr(P_PID, c, info, WEXITED, ru);
+    snprintf(msg, sizeof msg, "E: the reap fills the rusage too (%ld, status %d, %ld ms)", r, info_status(info), ru_cpu_ms(ru));
+    check(r == 0 && info_status(info) == 3 && ru_cpu_ms(ru) >= 100 && ru_cpu_ms(ru) < 5000 && ru[140] == 0, msg);
+    c = fork();
+    if (c == 0) _exit(0);
+    r = widr(P_PID, c, info, WEXITED, (void *)8);
+    check(r == -14, "E: an unwritable rusage is EFAULT");
+    wid(P_PID, c, info, WEXITED);
 
     print(failures == 0 ? "hello285: PASS\n" : "hello285: FAIL\n");
     return failures;

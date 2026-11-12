@@ -1415,6 +1415,13 @@ pub fn processCpuTimes(cur_idx: u32, now_tsc: u64, tsc_mhz: u64) cpu_time_policy
     return groupTimesLocked(gid, now_tsc, tsc_mhz);
 }
 
+/// CPU time waitid reports for a child it did not reap (WNOWAIT, a stop, a continue): the child's own group plus the
+/// children that child had itself waited for, the same figure a reap would hand back. Caller MUST hold task_lock.
+pub fn childUsageLocked(child_tid: u32) cpu_time_policy.Usage {
+    const tsc_mod = @import("../arch/arch.zig").tsc;
+    return cpu_time_policy.reapedUsage(groupTimesLocked(child_tid, tsc_mod.read(), tsc_mod.tsc_freq_mhz));
+}
+
 /// A thread is being reclaimed: its CPU time moves to the group leader, and
 /// the slot's own counters are cleared so a second call adds nothing.
 fn foldThreadTimeLocked(i: u32, t: *Task) void {
