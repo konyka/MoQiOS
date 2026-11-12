@@ -7856,7 +7856,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello288 新增 F 段两项、G/H 段各两项。改动前的内核（SMP=2）上 F、G 四项失败：线程发给 `getpid()` 返回 0、发给自己的 tid 返回 `EPERM`；不存在的 pid 配信号 65 返回 `EINVAL`；G 段 `SIGSTOP` 只停下那一个线程，3 秒内等不到停止报告，`SIGCONT` 也没有报告。H 段（`rt_tgsigqueueinfo`，上一节已实现）通过。
 - 实现：`proc_id_policy.sigqueueinfoVerdict`（宿主机测试 1 条，6 个断言）：伪造的 code 是 `EPERM`（判断"发给自己"用调用者的 tid）、目标不存在是 `ESRCH`、信号号超过 64 是 `EINVAL`、权限、sig 0 探测。`signal_syscall.rtSigqueueinfo` 拷贝 siginfo 后交给它判断；停止信号、`SIGCONT`、`SIGKILL` 经 `sendToProcessWith` 作用于整个进程，其余信号仍排给 pid 指名的任务。`tests/main.zig` 里"先读 siginfo、后查信号号"的源码断言改为定位 `sigqueueinfoVerdict(`。
 - 绿灯：目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS）。完整 smoke 第一轮四份并行（SMP 1/4/4/2）里两份 `EXIT=0`，两份失败且都与本节改动无关：SMP=1 的 hello267（`SO_REUSEPORT` 监听关闭后迁移的 12 个连接）失败，SMP=4 的 hello286 J 段 60 轮里只报告了 30 次停止和继续。随后把 hello286、hello267 提前到开机后单独跑四次（SMP 1/4/4/1），全部 PASS。第二轮完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello267、hello286、hello287、hello288 都通过，hello228 的 `corrupted canaries` 都是 0。
-- 如实的局限：传入非组长线程 tid 的普通信号（比如 `SIGUSR1`）在 Linux 上是进程级的待处理信号，可由任何未阻塞它的线程处理；这里仍排给那一个线程。hello288 F 段只测了发给自己 tid 的情形，进程级与线程级排队的区别没有测。
+- 如实的局限：~~进程级的普通信号仍排给那一个线程~~（主线程阻塞时改投另一个线程已实现，见文末 hello288 I 一节）。
 
 ## Linux personality 下 231 是 exit_group、247 是 waitid（hello289，已实现）
 
@@ -7875,3 +7875,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：`siginfo_policy.waitidInfo`（宿主机测试 1 条）在调用者原来的 128 字节上只覆盖六个字段。`waitpid.publishWaitid` 先把调用者的缓冲区读回来，再写回 `waitidInfo` 的结果；读不回来是 `EFAULT`。
 - 绿灯：宿主机 Linux 上 hello285 全过（含 F 段两项）；目标机定向 SMP=2 一份、SMP=4 两份全过（hello285 PASS）。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello285、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
 - 如实的局限：读回再写回不是原子的，同一进程的另一个线程在这段时间里写同一缓冲区的其他字节，写入可能被覆盖；Linux 逐字段写，没有这个窗口。
+
+## 进程级信号投给不阻塞它的线程（hello288 I，已实现）
+
+- 起因：hello288 F/G/H 一节的局限。`kill(pid)` 和 `rt_sigqueueinfo(pid)` 的普通信号总是排给 pid 指名的那个线程（通常是组长）；组长阻塞这个信号时，信号一直挂在组长上，同一进程里不阻塞它的线程也不会处理。
+- Linux 依据（`3rd/linux-7.0.6/kernel/signal.c` 的 `complete_signal`/`wants_signal`：进程级信号放进共享队列，挑一个不阻塞它的线程唤醒；宿主机实测 `/tmp/pd.c` 与 `user/hello288.c -DHOST`）：主线程和另一个线程都阻塞 `SIGUSR1` 时，`kill(getpid())` 留在进程的待处理集合里；另一个线程解除阻塞后由它处理；主线程阻塞、另一个线程不阻塞时，`kill(getpid())` 和 `rt_sigqueueinfo(getpid())` 都在另一个线程里运行 handler，值也传过去。
+- 红灯：hello288 新增 I 段三项。改动前的内核（SMP=2）上三项全失败：handler 没有在任何线程里运行，`rt_sigqueueinfo` 的值没送到，主线程解除阻塞后才处理了一次。
+- 实现：`group_stop_policy.processRecipient`（宿主机测试 1 条）：被点名的线程不阻塞时就是它，否则取第一个不阻塞它的其他线程，都阻塞时仍是被点名的线程。`signal_syscall.processRecipient` 扫描同一线程组，`sendToProcessWith` 的单次投递分支和 `rtSigqueueinfo` 的普通信号分支都经它选线程。
+- 绿灯：宿主机 Linux 上 hello288 全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS）。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
+- 如实的局限：这里不是真正的共享待处理队列。都阻塞时信号挂在被点名的线程上，之后只有那个线程解除阻塞才会处理；另一个线程先解除阻塞不会接手（Linux 会）。`sigpending` 也只看到本线程的集合。

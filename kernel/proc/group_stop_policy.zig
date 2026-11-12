@@ -2,7 +2,8 @@
 //!
 //! kill(pid, sig) names a process. SIGKILL ends every thread, SIGCONT resumes every thread, and a stop that takes its default action
 //! (SIGSTOP always; SIGTSTP/SIGTTIN/SIGTTOU when no handler is installed) stops every thread, so the spinning thread of a stopped
-//! process makes no progress. Any other signal, or a stop signal with a handler, is delivered once, to the process's leader.
+//! process makes no progress. Any other signal, or a stop signal with a handler, is delivered once: to the named thread, or to
+//! another thread of the process when the named one blocks it (processRecipient).
 
 pub const SIGKILL: u32 = 9;
 pub const SIGCONT: u32 = 18;
@@ -46,7 +47,21 @@ pub fn deliversContinue(member: u32, named: u32) bool {
     return member == named;
 }
 
+/// The thread that takes a process-directed signal that is delivered once (Linux complete_signal / wants_signal): the thread the
+/// caller named when it does not block the signal, otherwise the first other live thread that does not block it, otherwise the
+/// named thread (the signal stays pending there). `unblocked_other` is that first other thread, null when every other one blocks it.
+pub fn processRecipient(named: u32, named_blocks: bool, unblocked_other: ?u32) u32 {
+    if (!named_blocks) return named;
+    return unblocked_other orelse named;
+}
+
 const std = @import("std");
+
+test "a process-directed signal goes to a thread that does not block it" {
+    try std.testing.expectEqual(@as(u32, 5), processRecipient(5, false, 7));
+    try std.testing.expectEqual(@as(u32, 7), processRecipient(5, true, 7));
+    try std.testing.expectEqual(@as(u32, 5), processRecipient(5, true, null));
+}
 
 test "SIGKILL, SIGCONT and SIGSTOP reach every thread whatever the action" {
     try std.testing.expect(actsOnEveryThread(SIGKILL, 0));

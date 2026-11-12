@@ -88,7 +88,8 @@ pub fn killPosix(pid: i64, signum: u32) i64 {
 
 /// kill(pid > 0, sig) once the target exists and may be signalled. SIGKILL, SIGCONT and a default-action stop act on every thread
 /// of the process (group_stop_policy.zig): the other threads first, the leader last. The parent's WUNTRACED report does not come
-/// from this order — it waits until the whole group has stopped (signal.stopTask). Anything else goes to the named task only.
+/// from this order — it waits until the whole group has stopped (signal.stopTask). Anything else is delivered once, to the named task
+/// or to another thread of the process when the named one blocks it (processRecipient).
 fn sendToProcess(target: *task_mod.Task, tid: u32, signum: u32) i64 {
     return sendToProcessWith(target, tid, signum, sig_mod.senderInfo());
 }
@@ -98,7 +99,7 @@ fn sendToProcess(target: *task_mod.Task, tid: u32, signum: u32) i64 {
 fn sendToProcessWith(target: *task_mod.Task, tid: u32, signum: u32, info: @import("siginfo_policy.zig").Info) i64 {
     const gsp = @import("group_stop_policy.zig");
     if (!gsp.actsOnEveryThread(signum, target.sigact().handlers[signum - 1]))
-        return if (sig_mod.sendSignalInfo(tid, signum, info)) 0 else -3;
+        return if (sig_mod.sendSignalInfo(processRecipient(target, tid, signum), signum, info)) 0 else -3;
     const group = threadGroupId(target);
     var reached = false;
     for (0..task_mod.MAX_TASKS) |i| {
@@ -118,6 +119,27 @@ fn sendToProcessWith(target: *task_mod.Task, tid: u32, signum: u32, info: @impor
         reached = true;
     }
     return if (reached) 0 else -3;
+}
+
+/// The thread of `target`'s process that takes a process-directed signal delivered once: `tid` unless it blocks the signal, then
+/// the first other live thread that does not (group_stop_policy.processRecipient). Thread-directed calls (tkill, rt_tgsigqueueinfo)
+/// do not come here.
+fn processRecipient(target: *task_mod.Task, tid: u32, signum: u32) u32 {
+    const bit = @as(u64, 1) << @intCast(signum - 1);
+    const named_blocks = (target.signal_mask & bit) != 0;
+    var other: ?u32 = null;
+    if (named_blocks) {
+        const group = threadGroupId(target);
+        for (0..task_mod.MAX_TASKS) |i| {
+            const t = task_mod.getTask(@intCast(i)) orelse continue;
+            if (t.tid == tid or t.state == .zombie or threadGroupId(t) != group) continue;
+            if ((t.signal_mask & bit) == 0) {
+                other = t.tid;
+                break;
+            }
+        }
+    }
+    return @import("group_stop_policy.zig").processRecipient(tid, named_blocks, other);
 }
 
 /// kill(-1, sig): every process but init and the caller's own (see
@@ -584,7 +606,8 @@ pub fn rtSigqueueinfo(tgid: u32, sig: u32, uinfo_ptr: u64) i64 {
     const t = target.?;
     if (@import("group_stop_policy.zig").actsOnEveryThread(sig, t.sigact().handlers[sig - 1]))
         return sendToProcessWith(t, tgid, sig, info);
-    return sig_mod.sendSignalInfoResult(tgid, sig, info); // 0, ESRCH, or EAGAIN when the real-time queue is full
+    // Process-directed: a thread that does not block the signal takes it.
+    return sig_mod.sendSignalInfoResult(processRecipient(t, tgid, sig), sig, info); // 0, ESRCH, or EAGAIN when the real-time queue is full
 }
 
 /// tkill(tid, sig) → 0 or -errno

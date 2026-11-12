@@ -4,7 +4,8 @@
  * signal 0 only probes; an unreadable info pointer is EFAULT.
  * rt_sigqueueinfo(pid, sig, info) (F): a forged code (SI_USER) is allowed only towards the caller's own tid, so a non-main thread gets
  * EPERM for getpid(); a missing pid is ESRCH ahead of signal 65 (EINVAL). G/H: SIGSTOP and SIGCONT queued with either call for the
- * second thread of a child stop and continue the whole child (waitpid reports 0x137f and 0xffff). */
+ * second thread of a child stop and continue the whole child (waitpid reports 0x137f and 0xffff). I: while the main thread blocks
+ * SIGUSR1, kill(getpid()) and rt_sigqueueinfo(getpid()) run the handler in the other thread. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -262,6 +263,31 @@ int main(void) {
     r3 = sq(pid, 65, &q);
     snprintf(msg, sizeof msg, "F: SI_USER to another thread is EPERM, a missing pid beats signal 65 (ESRCH), signal 65 is EINVAL (%ld, %ld, %ld)", r, r2, r3);
     check(r == -1 && r2 == -3 && r3 == -22, msg);
+
+    /* I: a process-directed signal goes to a thread that does not block it: with the main thread blocking SIGUSR1, kill(getpid()) and
+     * rt_sigqueueinfo(getpid()) run the handler in the other thread. */
+    sigset_t bs;
+    sigemptyset(&bs);
+    sigaddset(&bs, SIGUSR1_N);
+    sigprocmask(SIG_BLOCK, &bs, (sigset_t *)0);
+    long n0 = runs;
+    ran_tid = 0;
+    kill(pid, SIGUSR1_N);
+    ok = wait_runs(n0 + 1);
+    snprintf(msg, sizeof msg, "I: kill(getpid()) while the main thread blocks the signal runs it in the other thread (%d, %s)", ok,
+             ran_tid == other_tid ? "other" : ran_tid == me ? "main" : "none");
+    check(ok && ran_tid == other_tid, msg);
+    ran_tid = 0;
+    fill(&q, SI_QUEUE_N, 5);
+    r = sq(pid, SIGUSR1_N, &q);
+    ok = wait_runs(n0 + 2);
+    snprintf(msg, sizeof msg, "I: rt_sigqueueinfo(getpid()) does the same, with value 5 (%ld, %d, %s, %ld)", r, ok,
+             ran_tid == other_tid ? "other" : ran_tid == me ? "main" : "none", ran_value);
+    check(r == 0 && ok && ran_tid == other_tid && ran_value == 5, msg);
+    sigprocmask(SIG_UNBLOCK, &bs, (sigset_t *)0);
+    nap(50);
+    snprintf(msg, sizeof msg, "I: nothing is left pending for the main thread (%ld runs)", runs - n0);
+    check(runs - n0 == 2, msg);
 
     /* G/H: a stop and a continue queued for one thread of another process act on the whole process. */
     group_stop_via(0, "G: rt_sigqueueinfo");
