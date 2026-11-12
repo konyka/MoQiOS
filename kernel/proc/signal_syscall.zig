@@ -311,12 +311,25 @@ pub fn sigaction(signum: u32, act_ptr: u64, oldact_ptr: u64) i64 {
         current.sigact().handlers[signum - 1] = new_handler;
         current.sigact().masks[signum - 1] = new_sa_mask;
         current.sigact().flags[signum - 1] = new_flags;
-        // Linux: an action that ignores the signal discards it if pending, with every queued real-time instance.
+        // Linux: an action that ignores the signal discards it if pending, with every queued real-time instance, for the whole
+        // process: the held bit and every thread's copy (do_sigaction flushes shared_pending and each thread's pending).
         if (new_handler == 1 or (new_handler == 0 and sig_mod.defaultAction(signum) == .ignore))
-            sig_mod.discardPending(current, signum);
+            discardForProcess(current, signum);
     }
 
     return 0;
+}
+
+/// Drop `signum` from the held set and from every live thread of `cur`'s process (its private pending bit and real-time queue).
+fn discardForProcess(cur: *task_mod.Task, signum: u32) void {
+    const bit = @as(u64, 1) << @intCast(signum - 1);
+    _ = @atomicRmw(u64, &cur.grp().held_signals, .And, ~bit, .seq_cst);
+    const group = threadGroupId(cur);
+    for (0..task_mod.MAX_TASKS) |i| {
+        const t = task_mod.getTask(@intCast(i)) orelse continue;
+        if (t.state == .zombie or threadGroupId(t) != group) continue;
+        sig_mod.discardPending(t, signum);
+    }
 }
 
 /// sigprocmask(how, set_ptr, oldset_ptr, sigsetsize) → 0 or -errno

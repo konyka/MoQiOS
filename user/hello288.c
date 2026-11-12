@@ -8,7 +8,8 @@
  * SIGUSR1, kill(getpid()) and rt_sigqueueinfo(getpid()) run the handler in the other thread. J: when every thread blocks it, the
  * signal waits for the process and the first thread to unblock it runs the handler. K: such a signal shows in every thread's
  * sigpending and any thread's sigtimedwait takes it; a tkill one stays with its thread. L: when the thread it was queued for exits,
- * the signal stays pending for the process and the thread that unblocks it later runs it with its value. */
+ * the signal stays pending for the process and the thread that unblocks it later runs it with its value. M: sigaction(SIG_IGN) discards that signal for the whole process, including a sibling's copy and the held bit;
+ * a different signal tkill'd to a sibling stays. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -56,6 +57,7 @@ static long tk(long tid, long sig) { return syscall2(SYS_tkill, tid, sig); }
 #endif
 
 #define SIGUSR1_N 10
+#define SIGUSR2_N 12
 #define SIGSTOP_N 19
 #define SIGCONT_N 18
 #define SI_QUEUE_N (-1)
@@ -160,6 +162,23 @@ static void *l_thread(void *a) {
     sigprocmask(SIG_BLOCK, &j_set, (sigset_t *)0);
     l_tid = my_tid();
     while (l_tid > 0) nap(1);
+    return (void *)0;
+}
+
+/* M: the second thread carries a tkill signal; it reports what it still has after the main thread ignores SIGUSR1. */
+static volatile long m_stage, m_tid, m_usr1, m_usr2;
+static void *m_thread(void *a) {
+    (void)a;
+    sigprocmask(SIG_BLOCK, &j_set, (sigset_t *)0);
+    m_tid = my_tid();
+    m_stage = 1;
+    while (m_stage < 2) nap(1);
+    sigset_t p;
+    sigemptyset(&p);
+    sigpending(&p);
+    m_usr1 = sigismember(&p, SIGUSR1_N);
+    m_usr2 = sigismember(&p, SIGUSR2_N);
+    m_stage = 3;
     return (void *)0;
 }
 
@@ -452,6 +471,46 @@ int main(void) {
     if (lw != lc) {
         kill(lc, 9);
         waitpid(lc, &lst, 0);
+    }
+
+    /* M: in a child whose two threads block every signal, rt_sigqueueinfo(getpid(), SIGUSR1) is held for the process and a tkill
+     * puts SIGUSR2 on the second thread. sigaction(SIG_IGN) for SIGUSR1 discards the process-directed one everywhere: the main
+     * thread and the second thread both stop seeing it, and the held bit is gone. SIGUSR2, a different signal, stays with the second thread. */
+    long mc = fork();
+    if (mc == 0) {
+        sigset_t all;
+        sigfillset(&all);
+        sigprocmask(SIG_SETMASK, &all, (sigset_t *)0);
+        pthread_t mt;
+        pthread_create(&mt, (void *)0, m_thread, (void *)0);
+        while (m_stage < 1) nap(1);
+        struct qinfo mq;
+        fill(&mq, SI_QUEUE_N, 1);
+        if (sq(getpid(), SIGUSR1_N, &mq) != 0) _exit(1);
+        tk(m_tid, SIGUSR2_N);
+#ifdef HOST
+        signal(SIGUSR1_N, SIG_IGN);
+#else
+        struct ksigaction ign = { (void (*)(int))1, 0, (void *)0, 0 };
+        sigaction(SIGUSR1_N, &ign, (struct ksigaction *)0);
+#endif
+        sigset_t mp;
+        sigemptyset(&mp);
+        sigpending(&mp);
+        if (sigismember(&mp, SIGUSR1_N)) _exit(2);
+        m_stage = 2;
+        while (m_stage < 3) nap(1);
+        if (m_usr1) _exit(3);
+        _exit(m_usr2 ? 0 : 4);
+    }
+    int mst = 0;
+    long mw = wait_for(mc, &mst, 0);
+    snprintf(msg, sizeof msg, "M: SIG_IGN discards a held signal for the whole process, a different tkill signal stays (%ld, exit %d)",
+             mw == mc ? 1L : mw, (mst >> 8) & 0xff);
+    check(mw == mc && mst == 0, msg);
+    if (mw != mc) {
+        kill(mc, 9);
+        waitpid(mc, &mst, 0);
     }
 
     /* G/H: a stop and a continue queued for one thread of another process act on the whole process. */
