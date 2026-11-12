@@ -10,7 +10,8 @@
  * sigpending and any thread's sigtimedwait takes it; a tkill one stays with its thread. L: when the thread it was queued for exits,
  * the signal stays pending for the process and the thread that unblocks it later runs it with its value. M: sigaction(SIG_IGN) discards that signal for the whole process, including a sibling's copy and the held bit;
  * a different signal tkill'd to a sibling stays. N: a real-time signal sent twice while every thread blocks it is taken, both
- * instances in send order, by the thread that unblocks it first. */
+ * instances in send order, by the thread that unblocks it first. O: a signal that is ignored and not blocked is dropped when it is
+ * sent, so sigtimedwait for it times out (EAGAIN); the same signal blocked is queued and sigtimedwait takes it. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -206,6 +207,15 @@ static void *n_thread(void *a) {
     while (!n_go) nap(1);
     sigprocmask(SIG_UNBLOCK, &s, (sigset_t *)0);
     for (;;) nap(10);
+    return (void *)0;
+}
+
+/* O: a second thread sends SIGUSR1 to the main thread 100 ms after it starts. */
+static volatile long o_target;
+static void *o_thread(void *a) {
+    (void)a;
+    nap(100);
+    tk(o_target, SIGUSR1_N);
     return (void *)0;
 }
 
@@ -588,6 +598,39 @@ int main(void) {
     if (nw != nc) {
         kill(nc, 9);
         waitpid(nc, &nst, 0);
+    }
+
+    /* O: in a child that ignores SIGUSR1, the main thread waits for it with sigtimedwait (400 ms) while a second thread tkills it. Not
+     * blocked, the signal is dropped when it is sent and the wait times out; blocked, it is queued and the wait returns it. */
+    long oc = fork();
+    if (oc == 0) {
+#ifdef HOST
+        signal(SIGUSR1_N, SIG_IGN);
+#else
+        struct ksigaction oign = { (void (*)(int))1, 0, (void *)0, 0 };
+        sigaction(SIGUSR1_N, &oign, (struct ksigaction *)0);
+#endif
+        o_target = my_tid();
+        struct timespec ots = { 0, 400000000L };
+        pthread_t ot;
+        pthread_create(&ot, (void *)0, o_thread, (void *)0);
+        long r1 = stw(&j_set, (void *)0, &ots);
+        pthread_join(ot, (void **)0);
+        if (r1 != -11) _exit(1);
+        sigprocmask(SIG_BLOCK, &j_set, (sigset_t *)0);
+        pthread_create(&ot, (void *)0, o_thread, (void *)0);
+        long r2 = stw(&j_set, (void *)0, &ots);
+        pthread_join(ot, (void **)0);
+        _exit(r2 == SIGUSR1_N ? 0 : 2);
+    }
+    int ost = 0;
+    long ow = wait_for(oc, &ost, 0);
+    snprintf(msg, sizeof msg, "O: an ignored, unblocked signal is dropped at send; blocked, sigtimedwait takes it (%ld, exit %d)",
+             ow == oc ? 1L : ow, (ost >> 8) & 0xff);
+    check(ow == oc && ost == 0, msg);
+    if (ow != oc) {
+        kill(oc, 9);
+        waitpid(oc, &ost, 0);
     }
 
     /* G/H: a stop and a continue queued for one thread of another process act on the whole process. */

@@ -208,6 +208,8 @@ pub fn sendSignalInfoResult(target_tid: u32, signum: u32, info: siginfo.Info) i6
             // until SIGCONT (Linux, measured: SIGTERM leaves a stopped process in T, then it dies or runs its handler after the continue).
             if (signum == SIGCONT) continueTask(t);
             if (signum == SIGKILL and t.stopped) t.stopped = false;
+            // Linux sig_ignored: an ignored signal the target does not block is dropped here, after SIGCONT has continued it.
+            if (ignoredAtSend(t, signum)) return 0;
             if (!recordSendInfo(t, signum, info)) return -11;
             // A default stop reaches a task that is asleep right away: a blocked task would otherwise stay in its wait (a stop signal is
             // not "actionable" for kickIfBlocked) and only stop once something woke it. The bit is not left pending, or the SIGCONT wake
@@ -240,6 +242,17 @@ pub fn kickIfBlocked(idx: u32) void {
     if (t.state == .blocked and pendingActionable(t)) {
         task.unblockTask(idx);
     }
+}
+
+/// Whether a send of `signum` to `t` is dropped because `t` ignores it and does not block it (signal_action_policy.droppedAtSend).
+fn ignoredAtSend(t: *task.Task, signum: u32) bool {
+    const bit = @as(u64, 1) << @intCast(signum - 1);
+    return @import("signal_action_policy.zig").droppedAtSend(
+        signum,
+        t.sigact().handlers[signum - 1],
+        defaultAction(signum) == .ignore,
+        (t.signal_mask & bit) != 0,
+    );
 }
 
 /// Whether `signum` sent to `t` stops it on the spot: the signal's default action is to stop, `t` has no handler for it (SIGSTOP never has
@@ -376,6 +389,7 @@ pub fn sendSignalToPgrpFiltered(pgid: u16, signum: u32, sender: ?*task.Task) u32
                 kickIfBlocked(@intCast(i));
             },
             else => {
+                if (ignoredAtSend(t, signum)) continue;
                 _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
                 // Only SIGKILL ends a stopped task at once; the rest wait for SIGCONT (see sendSignalInfo).
                 if (signum == SIGKILL and t.stopped) t.stopped = false;
@@ -392,6 +406,7 @@ pub fn raiseSelf(signum: u32) void {
     if (signum == 0 or signum > MAX_SIGNAL) return;
     const sched = @import("sched.zig");
     const t = sched.currentTask() orelse return;
+    if (ignoredAtSend(t, signum)) return;
     _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
 }
 

@@ -7919,7 +7919,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello288 新增 M 段一项，子进程用退出码说明哪一步出错（1 发送失败，2 主线程忽略后仍看到，3 另一个线程仍看到，4 另一个线程的 `SIGUSR2` 丢了）。改动前的内核（SMP=2 一份、SMP=4 一份）上子进程以 2 退出：held 位还在，主线程的 `sigpending` 仍报告 `SIGUSR1`。
 - 实现：新的 `signal_syscall.discardForProcess` 先用原子与清掉 `held_signals` 里的这一位，再对同一线程组里每个非 zombie 的线程调 `signal.discardPending`（待处理位和实时队列一起清）。`sigaction` 在新处理方式是 `SIG_IGN`、或是默认动作为忽略的 `SIG_DFL` 时改调它。只清被忽略的那个信号，别的信号（包括 `tkill` 发给兄弟线程的）不动。
 - 绿灯：宿主机 Linux 上 hello288 全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS，K、L、M 段子进程都以 0 退出，日志开头是 `spawned hello2`、`spawned hello288`，确认跑的是带 TEMP 的构建）。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）里三份 `EXIT=0`、0 FAIL；SMP=1 那份以 `EXIT=1` 结束，唯一的失败是 hello267（`SO_REUSEPORT` 监听关闭后迁移的 12 个连接只迁走 6 个），与之前记录的同一偶发项相同，这一项不涉及信号。随后把 hello267 提前到开机后单独跑四份（SMP 1/4/4/1），全部 PASS（迁移 6/6）。四份完整 smoke 里 hello57、hello210、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
-- 如实的局限：①~~实时信号仍不进 held 集合，所有线程都阻塞时不会被先解除阻塞的线程接手~~（已实现，见文末 hello288 N 一节）；②丢弃时逐个线程扫描，和并发的发送之间没有锁；发送路径（`signal.sendSignalInfoResult`）也不在发送时丢弃已被忽略的信号，照常置待处理位。所以在忽略之后（或扫描期间）送到、且被阻塞的同一信号仍会留在待处理集合里，直到解除阻塞时按忽略处理掉（Linux 对被阻塞的已忽略信号同样会排队，但对未阻塞的会在发送时直接丢弃）。
+- 如实的局限：①~~实时信号仍不进 held 集合，所有线程都阻塞时不会被先解除阻塞的线程接手~~（已实现，见文末 hello288 N 一节）；②丢弃时逐个线程扫描，和并发的发送之间没有锁；发送路径（`signal.sendSignalInfoResult`）也不在发送时丢弃已被忽略的信号，照常置待处理位。所以在忽略之后（或扫描期间）送到、且被阻塞的同一信号仍会留在待处理集合里，直到解除阻塞时按忽略处理掉（Linux 对被阻塞的已忽略信号同样会排队，但对未阻塞的会在发送时直接丢弃；后一半已实现，见文末 hello288 O 一节）。
 
 ## 所有线程都阻塞时，实时信号也由先解除阻塞的线程接手（hello288 N，已实现）
 
@@ -7928,4 +7928,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello288 新增 N 段一项（信号 40），子进程用退出码说明哪一步出错。改动前的内核（SMP=2 一份、SMP=4 一份）上子进程以 3 退出：第二个线程解除阻塞后实例没有运行。
 - 实现：`processRecipient` 不再把实时信号排除在 held 之外。新的 `signal.moveRealtime` 在 `rt_queue_lock` 下把一个实时信号的所有排队实例按顺序移到目标线程队列的末尾（目标队列满时剩下的留在原线程，原线程保留待处理位），并移动待处理位（因队列满而丢了 siginfo、只剩待处理位的也一起移）。`takeHeldSignal` 对实时信号从所有兄弟线程收集实例；`handOffHeld` 在线程退出时对实时信号也用它转交。`sigtimedwait` 和 `sigpending` 走同一条路径，不用改。
 - 绿灯：宿主机 Linux 上 hello288 全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS，K、L、M、N 段子进程都以 0 退出，日志开头是 `spawned hello2`、`spawned hello288`，确认跑的是带 TEMP 的构建）。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
-- 如实的局限：①目标队列（每线程 32 个实例）满时，多出的实例留在原线程上，要等原线程解除阻塞或下一次接手；Linux 的共享队列受 `RLIMIT_SIGPENDING` 限制，不按线程分；②发送路径不在发送时丢弃未阻塞的已忽略信号。
+- 如实的局限：①目标队列（每线程 32 个实例）满时，多出的实例留在原线程上，要等原线程解除阻塞或下一次接手；Linux 的共享队列受 `RLIMIT_SIGPENDING` 限制，不按线程分；②~~发送路径不在发送时丢弃未阻塞的已忽略信号~~（已实现，见文末 hello288 O 一节）。
+
+## 未阻塞的已忽略信号在发送时丢弃（hello288 O，已实现）
+
+- 起因：hello288 M、N 两节的局限。发送路径（`signal.sendSignalInfoResult`）不看目标的处理方式，已忽略的信号也照常置待处理位、记 siginfo。目标没有阻塞它时，这个信号要等到投递时才被丢掉；在那之前 `sigtimedwait` 会把它取走，`sigpending` 也会报告它。
+- Linux 依据（`3rd/linux-7.0.6/kernel/signal.c`：`prepare_signal`（871 行）最后 `return !sig_ignored(p, sig, force)`（935 行）；`sig_ignored`（106 行）对被阻塞的信号返回 false，因为解除阻塞前处理方式可能改变；宿主机实测 `/tmp/pv9.c`、`/tmp/pv10.c` 与 `user/hello288.c -DHOST`）：忽略 `SIGUSR1` 且不阻塞时，另一个线程 `tkill` 过来，`sigtimedwait` 400 ms 后超时（`EAGAIN`）；之后再阻塞也看不到它。阻塞时同样发送，`sigtimedwait` 返回 10。
+- 红灯：hello288 新增 O 段一项，子进程用退出码说明哪一步出错（1 未阻塞时 `sigtimedwait` 没有超时，2 阻塞时没有取到）。把两处内核改动暂存后构建的旧内核（SMP=2 一份、SMP=4 一份）上子进程以 1 退出：未阻塞的已忽略信号被排队，`sigtimedwait` 取走了它。
+- 实现：新的纯函数 `signal_action_policy.droppedAtSend`（宿主机测试 1 条，并登记进 `kernel/host_test.zig` 的测试块）：目标不阻塞、处理方式是 `SIG_IGN` 或默认动作为忽略的 `SIG_DFL` 时丢弃；被阻塞的保留；`SIGKILL`、`SIGSTOP` 从不丢弃。`signal.ignoredAtSend` 用目标线程的处理方式和掩码调用它，接在三处发送路径上：`sendSignalInfoResult`（在 `SIGCONT` 已经继续目标之后、记 siginfo 之前）、`sendSignalToPgrpFiltered` 的普通分支、`raiseSelf`。缺页产生的 `SIGSEGV`/`SIGBUS` 在发送前已被重置为 `SIG_DFL` 并解除阻塞，不受影响。
+- 绿灯：宿主机 Linux 上 hello288 全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS，K 到 O 段子进程都以 0 退出，日志开头是 `spawned hello2`、`spawned hello288`，确认跑的是带 TEMP 的构建）。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
+- 如实的局限：①判断用的线程和 Linux 不同：进程级信号先经 `processRecipient` 选好线程再判断，选中的线程不阻塞就丢弃；Linux 的 `prepare_signal` 用的是调用里点名的那个任务的掩码，点名的线程阻塞而别的线程不阻塞时，Linux 会先把信号放进共享集合，等那个不阻塞的线程取出时再按忽略丢掉，这里则直接丢弃，区别只在丢弃之前那一小段时间里点名线程的 `sigpending` 能否看到它；另外 POSIX 定时器和消息队列通知（`posix_timer.zig`、`posix_mq.zig`）直接置位，不走这条路径，仍会排队已忽略的信号；②`sendSignalToPgrpFiltered` 的停止类分支保留原来的 `SIG_IGN` 处理，没有改用新函数。

@@ -384,6 +384,7 @@ test {
     _ = @import("proc/siginfo_policy.zig");
     _ = @import("proc/sigqueue_policy.zig");
     _ = @import("proc/shared_pending_policy.zig");
+    _ = @import("proc/signal_action_policy.zig");
     _ = @import("proc/uts.zig");
     _ = @import("ipc/sysv_policy.zig");
     _ = @import("ipc/posix_timer_policy.zig");
