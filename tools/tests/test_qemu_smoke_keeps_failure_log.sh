@@ -60,5 +60,14 @@ else
     fi
 fi
 
+# 4. The PASS markers take a while to check and the FAIL check needs the shell banner, so a test that failed before a banner that
+# appeared during the marker scan used to be reported as PASS. The PASS branch must re-run the fatal checks before it exits 0.
+pass_line="$(grep -n 'echo "PASS: MoQiOS x86_64 smoke' "$SMOKE" | head -1 | cut -d: -f1)"
+if [ -n "$pass_line" ] && sed -n "$((pass_line - 1))p" "$SMOKE" | grep -q '^ *check_fatal_output$'; then
+    ok "the PASS branch re-runs check_fatal_output right before reporting PASS"
+else
+    bad "the PASS branch reports PASS without re-running check_fatal_output"
+fi
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

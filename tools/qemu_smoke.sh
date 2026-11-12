@@ -811,7 +811,9 @@ while [ "$SECONDS" -lt "$deadline" ]; do
         { [ "$STRICT_SMP" = "1" ] || { [ -n "${detected_count:-}" ] && [ -n "${selected_count:-}" ] && [ -n "${online_count:-}" ]; }; }; then
         # A healthy run faults nothing and panics nowhere. Checking the markers
         # alone is not enough: a kernel bug can kill an unrelated task while
-        # every test still prints its PASS line.
+        # every test still prints its PASS line. The FAIL check needs the shell banner, and that banner can appear while the
+        # markers above are being scanned, so run the fatal checks once more before reporting PASS.
+        check_fatal_output
         echo "PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=$SMP_COUNT)."
         echo "Serial log: $LOG_FILE"
         exit 0

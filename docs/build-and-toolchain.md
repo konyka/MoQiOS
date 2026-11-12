@@ -100,7 +100,9 @@ ext2 inodes 12-14; the file set the tests rely on is unchanged.
 `qemu_smoke.sh` truncates its serial and run logs before every boot (also when the caller names
 them via `MOQI_SMOKE_LOG`/`MOQI_SMOKE_RUN_LOG`), so markers from an earlier run cannot satisfy the
 PASS checks. Once a test prints `helloN: FAIL` and init has reached the shell, it fails at once
-instead of waiting for the timeout. It removes its automatically created temporary work directory and
+instead of waiting for the timeout. The PASS decision re-runs that check right before it reports
+PASS: the marker scan takes a while, and a `helloN: FAIL` whose shell banner appears during it would
+otherwise be reported as a pass. It removes its automatically created temporary work directory and
 generated logs on exit. `qemu_run.sh` serialises Limine preparation and `bios-install` with `flock`
 (`MOQI_LIMINE_LOCK`, default `/tmp/moqios-limine.lock`) so parallel runs do not delete the shared
 `limine/limine` utility under each other. The smoke gate also requires `[virtio-blk] first cache flush completed` (hello29's fsync must reach the boot disk's
