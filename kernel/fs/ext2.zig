@@ -160,7 +160,26 @@ fn followUnlinkUnlocked(path: []const u8) void {
     }
 }
 
-/// True when the name slot `file_idx` was opened by has been unlinked.
+/// A directory lost its only name (rmdir, or replaced by rename). Freed now when nothing has it open; otherwise links_count 0 is
+/// persisted, its slots read " (deleted)" and the last close frees it, so the inode cannot be reused under an open descriptor (a new
+/// directory of the same name would otherwise be reached through the old one). Caller holds fs_lock.
+fn retireDirUnlocked(dir_ino: u32, dir_inode: *Ext2Inode) void {
+    if (openSlotsForInode(dir_ino, null) == 0) {
+        freeDirBlocks(dir_inode);
+        freeInodeAs(dir_ino, true);
+        return;
+    }
+    dir_inode.links_count = 0;
+    _ = writeInode(dir_ino, dir_inode);
+    for (0..open_count) |i| {
+        if (open_files[i].inode_num != dir_ino) continue;
+        open_files[i].inode.links_count = 0;
+        open_files[i].unlink_pending = true;
+        open_path_deleted[i] = true;
+    }
+}
+
+/// True when the name slot `file_idx` was opened by has been unlinked (for a directory: it was removed).
 pub fn openPathDeleted(file_idx: u32) bool {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);
@@ -1274,6 +1293,22 @@ fn reclaimUnlinkedInode(inode_num: u32, flags: *@TypeOf(fs_lock.acquire())) void
     var inode: Ext2Inode = undefined;
     if (!readInode(inode_num, &inode)) return;
     if (inode.links_count != 0) return;
+    if (eu.isDirectory(inode.mode)) {
+        batch_free_depth += 1;
+        defer {
+            batch_free_depth -= 1;
+            if (batch_free_depth == 0) {
+                cacheFlushUnlocked();
+                writeGroupDescs();
+                writeSuperblock();
+                flushDiscard();
+            }
+        }
+        @import("page_cache.zig").invalidateInode(0x3000_0000_0000_0000 + @as(u64, inode_num));
+        freeDirBlocks(&inode);
+        freeInodeAs(inode_num, true);
+        return;
+    }
     _ = freeInodeData(inode_num, &inode, flags);
 }
 
@@ -3212,6 +3247,7 @@ pub fn renameFileMode(old_path: []const u8, new_path: []const u8, who: ?Who, nor
         }
     }
 
+    if (replaced_inode_num != null) followUnlinkUnlocked(new_path);
     followRenameUnlocked(old_path, new_path, false);
     serial.writeString("[ext2] renamed to: ");
     serial.writeString(new_filename);
@@ -3335,8 +3371,7 @@ fn renameDirUnlocked(old_parent: u32, old_name: []const u8, new_parent: u32, new
         if (readInode(v, &vd)) {
             @import("page_cache.zig").invalidateInode(0x3000_0000_0000_0000 + @as(u64, v));
             dcache.invalidateParent(.ext2, v);
-            freeDirBlocks(&vd);
-            freeInodeAs(v, true);
+            retireDirUnlocked(v, &vd);
             writeGroupDescs();
             writeSuperblock();
         }
@@ -3455,8 +3490,7 @@ pub fn rmdirFile(path: []const u8, who: ?Who) i64 {
         parent_inode.links_count -= 1;
         _ = writeInode(parent_inode_num, &parent_inode);
     }
-    freeDirBlocks(&dir_inode);
-    freeInodeAs(dir_inode_num, true);
+    retireDirUnlocked(dir_inode_num, &dir_inode);
 
     serial.writeString("[ext2] rmdir: ");
     serial.writeString(filename);

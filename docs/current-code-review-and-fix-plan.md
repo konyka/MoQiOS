@@ -7691,4 +7691,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：ext2 的打开槽位一直保存着打开时的路径。新的 `kernel/fs/ext2_open_path_policy.zig` 给出两条纯函数规则（带内联测试）：`afterRename` 把以旧名字为全名或目录前缀的路径改写成新名字，`unlinkHits` 判断被删的名字是否就是保存的路径（比较时去掉首尾的 `/`）。`ext2.zig` 在 `unlinkFile`、`renameFileMode`（文件与目录两个分支）和 `renameExchange` 成功后对所有打开槽位应用这两条规则；被删中的槽位记在 `open_path_deleted`。`fd_target.describe` 对这类槽位追加 ` (deleted)`，`resolveMagicLink` 不再给出路径，`file_io.openAt` 改为调用 `FdTable.reopenExt2Slot`：它复制 inode 和 unlink_pending 到新槽位（新槽位同样是 deleted），处理 `O_CREAT|O_EXCL`（`EEXIST`）和 `O_TRUNC`。
 - 红灯（如实）：实现先于测试写好。为证明测试有效，做了变异：让 `followRenameUnlocked` 和 `followUnlinkUnlocked` 直接返回（真编译），hello278 的改名、删除、经链接重开、父目录改名四项失败（链接仍是 `"/testdir/h278a"`，重开 `-2`），两项“普通路径”通过；还原后七项全过。
 - 绿灯：hello278 七项全过，hello257、hello277 照常通过；host 测试、三个架构构建与完整 smoke 见提交记录。
-- 如实的局限：①目录被 `rmdir` 后，目录描述符的链接在 Linux 上是 ` (deleted)`，这里没有处理；②保存的路径如果是在非根工作目录下按相对名字打开的，而 `rename` 的参数已被解析成绝对路径，两者匹配不上，链接会留在旧名字（测试都从根目录出发）；③FAT32 不做（它没有硬链接，打开槽位也不保留父链）；④硬链接 `link` 不改变任何槽位的路径，这与 Linux 一致。
+- 如实的局限：①~~目录被 `rmdir` 后，目录描述符的链接在 Linux 上是 ` (deleted)`，这里没有处理~~（hello279 处理，见下一节）；②保存的路径如果是在非根工作目录下按相对名字打开的，而 `rename` 的参数已被解析成绝对路径，两者匹配不上，链接会留在旧名字（测试都从根目录出发）；③FAT32 不做（它没有硬链接，打开槽位也不保留父链）；④硬链接 `link` 不改变任何槽位的路径，这与 Linux 一致。
+
+## 打开期间被删掉名字的 ext2 目录和被 rename 覆盖的对象（hello279，已修）
+
+- 起因：hello278 一节局限 ①。宿主机 Linux 实测（`/tmp/lm/rd*.c`）：目录打开后被 `rmdir`，`readlink` 返回 `"<路径> (deleted)"`，经链接仍能重开，`fstat` 的 nlink 为 0；`getdents64` 和 `openat(fd, "x", O_CREAT)` 都得 `ENOENT`，同名新目录建好之后仍是 `ENOENT`。被 `rename` 覆盖的文件和空目录的描述符也读出 ` (deleted)`，移过去的那个读出目标名。
+- 发现的真实缺陷：旧代码 `rmdir` 时立即释放目录 inode 和数据块，打开着的目录描述符留在一个已释放（可被复用）的 inode 上；`at_path` 对 ext2 目录描述符在按 inode 重建路径失败后退回到打开时的路径，于是同名新目录建好后，`openat(旧描述符, "y", O_CREAT)` 会把文件**建进新目录**（变异运行中实测：`openat 4`，新目录里 `open` 到了 `y`）。
+- 实现（`kernel/fs/ext2.zig`）：新增 `retireDirUnlocked`，`rmdirFile` 和 `renameDirUnlocked` 的被覆盖目录都走它。没有打开槽位时照旧立即释放；有打开槽位时把 links_count 0 写回磁盘，槽位标为 `unlink_pending` 和 deleted，由最后一次关闭回收（`reclaimUnlinkedInode` 新增目录分支：`freeDirBlocks` 加 `freeInodeAs(.., true)`，组描述符的目录计数随之减少）。`renameFileMode` 覆盖了文件时，对目标名调用 `followUnlinkUnlocked`。`getdents.zig` 对 deleted 的 ext2 目录返回 `ENOENT`，`at_path.zig` 对 deleted 的目录描述符返回 `ENOENT`，不再退回旧路径。
+- 红灯（如实，实现先于测试）：变异为“目录总是立即释放、覆盖不标记”（真编译），hello279 九项中六项失败（链接无后缀、`getdents64` 返回 48、`openat` 建进新目录、重开 `-2`、两项覆盖无后缀）；还原后九项全过，hello278 照常通过。
+- 如实的局限：①变异下 fstat 和“`openat` 在已删目录中得 ENOENT”两项仍通过（旧代码碰巧给出相同结果），这两项是回归保护；②被删目录经链接重开得到的新描述符同样是 deleted；③FAT32 仍不做。

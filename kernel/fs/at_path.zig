@@ -74,6 +74,9 @@ pub fn dirFdBase(cur: *task_mod.Task, fd: u32, out: *[256]u8) union(enum) { ok: 
             const ext2 = @import("ext2.zig");
             const is_dir = ext2.openFileIsDir(d.ext2_file_idx) orelse return .{ .err = -9 };
             if (!is_dir) return .{ .err = -20 };
+            // A removed directory: nothing can be found or created in it (ENOENT, Linux measured), and the path it was opened by may
+            // name a new directory now.
+            if (ext2.openPathDeleted(d.ext2_file_idx)) return .{ .err = -2 };
             // Follow the inode, not the path it was opened by: the directory
             // may have been renamed or moved since. Fall back to the opening
             // path only when the inode chain cannot be walked.

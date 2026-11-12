@@ -400,6 +400,8 @@ fn getdents64Ext2(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i6
     var next_offs: [64]u32 = undefined;
     // The root of the tree lists the directories that hang off it besides its own entries (tmp, dev, proc), after the ext2 entries. They
     // use their own cursor range, far above any ext2 byte offset.
+    // A removed directory lists nothing and is ENOENT (Linux, measured), even though its own "." and ".." records are still on disk.
+    if (ext2.openPathDeleted(desc.ext2_file_idx)) return -2;
     const is_root = ext2.getInodeNum(desc.ext2_file_idx) == 2;
     if (is_root and desc.offset >= ROOT_VIRTUAL_BASE) return getdents64RootVirtual(desc, buf_ptr, buf_size);
     const off32: u32 = @intCast(@min(desc.offset, 0xFFFFFFFF));
