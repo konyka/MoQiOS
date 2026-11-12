@@ -950,11 +950,11 @@ LAPIC Timer 中断
 | 219 | rt_sigpending | 查询挂起信号 |
 | 220 | rt_sigsuspend | 挂起等待信号 |
 | 221 | rt_sigtimedwait | 等待信号 (带超时) |
-| 222 | rt_sigqueueinfo | 排队信号到进程 |
+| 222 | rt_sigqueueinfo | 排队信号到进程；伪造的 si_code 只允许发给调用者自己的 tid，停止/继续/SIGKILL 作用于整个进程（hello288 F/G） |
 | 223 | tkill | 发送信号到线程 |
 | 224 | pidfd_send_signal | 通过pidfd发信号 |
 | 225 | signalfd4 | 创建signalfd |
-| 226 | rt_tgsigqueueinfo | 排队信号到线程 |
+| 226 | rt_tgsigqueueinfo | 排队信号到指定进程的指定线程；tid/tgid 非正是 EINVAL，线程不属于该进程是 ESRCH，停止/继续/SIGKILL 作用于整个进程（hello288） |
 | 227 | sched_getaffinity | 获取CPU亲和性 |
 | 229 | getcomm | 获取进程名 |
 | 230 | closefrom | 批量关闭fd |

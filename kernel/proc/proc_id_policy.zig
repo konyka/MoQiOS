@@ -96,6 +96,31 @@ pub fn tgsigqueueinfoVerdict(tgid: i32, tid: i32, sig: u32, code_allowed: bool, 
     return .deliver;
 }
 
+/// rt_sigqueueinfo after the siginfo copy (do_rt_sigqueueinfo, then kill_proc_info and check_kill_permission): a forged
+/// si_code is EPERM unless the pid is the caller's own tid; a pid that names no task is ESRCH ahead of a bad signal number;
+/// the signal number is checked before permission, and permission is checked even for sig 0.
+pub fn sigqueueinfoVerdict(sig: u32, code_allowed: bool, target_exists: bool, may_signal: bool) TgsigqueueVerdict {
+    if (!code_allowed) return .eperm;
+    if (!target_exists) return .esrch;
+    if (sig > 64) return .einval;
+    if (!may_signal) return .eperm;
+    if (sig == 0) return .probe;
+    return .deliver;
+}
+
+test "rt_sigqueueinfo checks run in Linux order" {
+    const V = TgsigqueueVerdict;
+    const t = @import("std").testing;
+    // A forged code towards a pid that is not the caller's tid is EPERM, even for a missing pid or a bad signal.
+    try t.expectEqual(V.eperm, sigqueueinfoVerdict(65, false, false, false));
+    // A missing process beats a bad signal number.
+    try t.expectEqual(V.esrch, sigqueueinfoVerdict(65, true, false, false));
+    try t.expectEqual(V.einval, sigqueueinfoVerdict(65, true, true, true));
+    try t.expectEqual(V.eperm, sigqueueinfoVerdict(0, true, true, false));
+    try t.expectEqual(V.probe, sigqueueinfoVerdict(0, true, true, true));
+    try t.expectEqual(V.deliver, sigqueueinfoVerdict(10, true, true, true));
+}
+
 test "rt_tgsigqueueinfo checks run in Linux order" {
     const V = TgsigqueueVerdict;
     try @import("std").testing.expectEqual(V.einval, tgsigqueueinfoVerdict(1, 0, 10, true, null, false));

@@ -562,14 +562,28 @@ pub fn rtSigqueueinfo(tgid: u32, sig: u32, uinfo_ptr: u64) i64 {
     var raw: [si.SIGINFO_SIZE]u8 = undefined;
     if (uinfo_ptr == 0 or !copy.validateUserBuffer(uinfo_ptr, raw.len)) return -14;
     if (copy.copyFromUser(&raw, @ptrFromInt(uinfo_ptr), raw.len) != raw.len) return -14;
-    if (sig > 64) return -22;
     const info = si.decode(&raw);
     const cur = sched.currentTask();
-    const to_self = if (cur) |c| threadGroupId(c) == tgid else true;
-    if (!si.queueinfoAllowed(info.code, to_self)) return -1; // EPERM
-    _ = task_mod.findTaskByTid(tgid) orelse return -3; // ESRCH
-    if (!currentMaySignalTask(tgid)) return -1; // EPERM
-    if (sig == 0) return 0;
+    // Linux compares the caller's tid (not its process) with the pid, so a non-main thread may forge a code only towards its own
+    // tid; a missing pid is ESRCH ahead of a bad signal number (proc_id_policy.sigqueueinfoVerdict).
+    const target_idx = task_mod.findTaskByTid(tgid);
+    const target = if (target_idx) |i| task_mod.getTask(i) else null;
+    switch (@import("proc_id_policy.zig").sigqueueinfoVerdict(
+        sig,
+        si.queueinfoAllowed(info.code, if (cur) |c| c.tid == tgid else true),
+        target != null,
+        target != null and currentMaySignalTask(tgid),
+    )) {
+        .einval => return -22,
+        .eperm => return -1,
+        .esrch => return -3,
+        .probe => return 0,
+        .deliver => {},
+    }
+    // A stop, SIGCONT or SIGKILL acts on the whole process, as kill(pid) does.
+    const t = target.?;
+    if (@import("group_stop_policy.zig").actsOnEveryThread(sig, t.sigact().handlers[sig - 1]))
+        return sendToProcessWith(t, tgid, sig, info);
     return sig_mod.sendSignalInfoResult(tgid, sig, info); // 0, ESRCH, or EAGAIN when the real-time queue is full
 }
 

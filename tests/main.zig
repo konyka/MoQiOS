@@ -2004,12 +2004,12 @@ test "signal errnos follow Linux's order of checks, and a NULL siginfo no longer
     try std.testing.expect(taking < consume);
 
     // rt_sigqueueinfo: a NULL siginfo used to reach @ptrFromInt(0) and panic the kernel; it is EFAULT, and the
-    // read comes before the signal-number check.
+    // read comes before the signal-number check (sigqueueinfoVerdict, after the copy).
     const qi = idx(u8, src, "pub fn rtSigqueueinfo(").?;
     const qb = src[qi..];
     const null_check = idx(u8, qb, "if (uinfo_ptr == 0 or !copy.validateUserBuffer(uinfo_ptr, raw.len)) return -14;").?;
     const copy_in = idx(u8, qb, "if (copy.copyFromUser(&raw, @ptrFromInt(uinfo_ptr), raw.len) != raw.len) return -14;").?;
-    const qsig = idx(u8, qb, "if (sig > 64) return -22;").?;
+    const qsig = idx(u8, qb, "sigqueueinfoVerdict(").?;
     try std.testing.expect(null_check < copy_in and copy_in < qsig);
 }
 

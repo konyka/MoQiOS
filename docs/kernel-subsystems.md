@@ -866,6 +866,8 @@ const SchedStats = struct {
   与 `rt_sigqueueinfo` 按 tgid 判断不同），再查目标线程存在且属于给定的 tgid（否则 `ESRCH`，排在信号号检查前面），
   信号号超过 64 是 `EINVAL`，权限检查对 sig 0 也生效，sig 0 只探测。投递只发给被点名的线程；
   `SIGSTOP`/`SIGCONT`/`SIGKILL` 和取默认动作的 `SIGTSTP`/`SIGTTIN`/`SIGTTOU` 经 `sendToProcessWith` 作用于整个进程。
+  `rt_sigqueueinfo`（222）同样按调用者的 tid 判断"发给自己"（非主线程用 `SI_USER` 发给 `getpid()` 是 `EPERM`），检查顺序在
+  `proc_id_policy.sigqueueinfoVerdict`（不存在的 pid 是 `ESRCH`，排在信号号前面），停止、继续和 `SIGKILL` 也作用于整个进程（hello288 F/G）。
 - **waitid（hello285，系统调用 500）**：`proc/waitpid.zig` 的 `waitid`。`idtype` 是 `P_ALL`/`P_PID`/`P_PGID`
   （`proc/waitid_policy.zig` 把它换成 waitpid 的 pid 选择：-1、正 pid、负进程组），`options` 必须含
   `WEXITED`/`WSTOPPED`/`WCONTINUED` 之一，其余位除 `WNOHANG`/`WNOWAIT` 外都是 `EINVAL`。成功返回 0，
