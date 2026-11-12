@@ -125,6 +125,8 @@ pub const Task = struct {
     /// True when the task left through the exit()/_exit() syscall, which
     /// lets waitpid tell exit(137) from a SIGKILL (wait_status_policy).
     exited_via_syscall: bool = false,
+    /// exit_group status recorded on this member before it is killed (exit_group_policy). Guarded by task_lock.
+    group_exit_code: ?u8 = null,
 
     // --- User-space fields (M5) ---
     /// Physical address of the process's PML4 page table (0 for kernel threads).
@@ -845,6 +847,7 @@ fn reserveSlotLocked() ?u32 {
     _ = @atomicRmw(u64, &@import("sched.zig").sleep_bm, .And, ~(@as(u64, 1) << @intCast(slot)), .seq_cst);
     tasks[slot].sleep_deadline_ns = 0;
     tasks[slot].stopped = false;
+    tasks[slot].group_exit_code = null;
     tasks[slot].wait_report = .{};
     tasks[slot].mq_waiter = .{};
     slot_bitmap |= @as(u64, 1) << @intCast(slot);
@@ -1077,13 +1080,17 @@ pub fn getTask(idx: u32) ?*Task {
 /// Mark the current task as exiting (zombie). Called from the task itself.
 /// The scheduler will skip zombie tasks. Use reapZombies() to free resources.
 /// If the parent is waiting (waitpid), unblock it so it can collect the exit code.
-pub fn exitTask(exit_code: i32) void {
+pub fn exitTask(requested_code: i32) void {
     const sched = @import("sched.zig");
     const idx = sched.currentTaskIndex() orelse return;
     const t = getTask(idx) orelse return;
     const exit_flags = task_lock.acquire();
     @atomicStore(u32, &t.exiting, 1, .release);
+    // A member killed by exit_group reports the group's status as a normal exit.
+    const final = @import("exit_group_policy.zig").finalStatus(t.group_exit_code, requested_code, t.exited_via_syscall);
+    t.exited_via_syscall = final.via_exit_syscall;
     task_lock.release(exit_flags);
+    const exit_code = final.code;
 
     if (t.clear_tid_ptr != 0 and t.page_table_phys != 0) {
         const copy = @import("../mm/copy_from_user.zig");
@@ -1271,6 +1278,37 @@ pub fn exitTask(exit_code: i32) void {
     while (true) {
         arch_cpu.waitForInterrupt();
     }
+}
+
+/// exit_group, first half: record `code` on every live member of the caller's thread group (the caller included) and send
+/// SIGKILL to the others, which then die through their fatal path with the group's status (exit_group_policy). The caller
+/// then leaves through exitTask.
+pub fn beginGroupExit(code: u8) void {
+    const sched = @import("sched.zig");
+    const egp = @import("exit_group_policy.zig");
+    const idx = sched.currentTaskIndex() orelse return;
+    var tids: [MAX_TASKS]u32 = undefined;
+    var n: u32 = 0;
+    {
+        const flags = task_lock.acquire();
+        defer task_lock.release(flags);
+        const cur = getTask(idx) orelse return;
+        cur.group_exit_code = egp.claim(cur.group_exit_code, code);
+        const gid = if (cur.is_thread and cur.parent_tid != 0) cur.parent_tid else cur.tid;
+        var bits = slot_bitmap;
+        while (bits != 0) {
+            const j: u32 = @intCast(@ctz(bits));
+            bits &= bits - 1;
+            const m = &tasks[j];
+            if (j == idx or !m.is_user or m.state == .zombie) continue;
+            const in_group = if (m.is_thread) m.parent_tid == gid else m.tid == gid;
+            if (!in_group) continue;
+            m.group_exit_code = egp.claim(m.group_exit_code, code);
+            tids[n] = m.tid;
+            n += 1;
+        }
+    }
+    for (tids[0..n]) |tid| _ = @import("signal.zig").sendSignal(tid, @import("signal.zig").SIGKILL);
 }
 
 /// True while some CPU's per-CPU `current_task_idx` still points at `idx`.

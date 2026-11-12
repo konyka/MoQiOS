@@ -255,8 +255,9 @@ void pthread_exit(void *retval) {
             : "rcx", "r11", "memory");
         __builtin_unreachable();
     }
-    _exit(0);
-    __builtin_unreachable();
+    /* SYS_exit ends only this thread; _exit would end the whole process (exit_group). */
+    syscall1(SYS_exit, 0);
+    for (;;) {}
 }
 
 int pthread_detach(pthread_t thread) {

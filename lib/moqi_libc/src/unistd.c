@@ -68,8 +68,9 @@ long getsid(long pid) {
     return syscall1(209, pid);
 }
 
+/* Like glibc, _exit ends the whole process (exit_group); pthread_exit ends one thread through SYS_exit. */
 void _exit(int code) {
-    syscall1(SYS_exit, code);
+    syscall1(SYS_exit_group, code);
     for (;;) {}
 }
 

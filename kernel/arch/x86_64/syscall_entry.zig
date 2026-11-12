@@ -2570,6 +2570,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         496 => { // mlock2(addr, len, flags) — mlock with MLOCK_ONFAULT accepted
             frame.rax = @bitCast(@import("../../mm/mlock.zig").mlock2(frame.rdi, frame.rsi, frame.rdx));
         },
+        501 => { // exit_group(status) — every thread of the process ends with status
+            lifecycle_mod.exitGroup(frame.rdi);
+        },
         500 => { // waitid(idtype, id, infop, options, rusage)
             frame.rax = @bitCast(waitpid_mod.waitid(@truncate(frame.rdi), frame.rsi, frame.rdx, @truncate(frame.r10), frame.r8));
             checkSignalsOnSyscallReturn(frame);

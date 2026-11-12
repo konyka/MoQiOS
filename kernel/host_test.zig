@@ -207,6 +207,7 @@ pub const orphan_pgrp_policy = @import("proc/orphan_pgrp_policy.zig");
 pub const wait_report_policy = @import("proc/wait_report_policy.zig");
 pub const waitid_policy = @import("proc/waitid_policy.zig");
 pub const group_stop_policy = @import("proc/group_stop_policy.zig");
+pub const exit_group_policy = @import("proc/exit_group_policy.zig");
 pub const segment_copy_policy = @import("proc/segment_copy_policy.zig");
 pub const fs_reader = @import("fs/fs_reader.zig");
 pub const fr_alias = @import("fs/fs_reader.zig");
@@ -345,6 +346,7 @@ test {
     _ = @import("proc/wait_report_policy.zig");
     _ = @import("proc/waitid_policy.zig");
     _ = @import("proc/group_stop_policy.zig");
+    _ = @import("proc/exit_group_policy.zig");
     _ = @import("proc/exec_policy.zig");
     _ = @import("proc/comm_policy.zig");
     _ = @import("proc/user_stack.zig");

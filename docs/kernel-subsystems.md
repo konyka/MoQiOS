@@ -854,6 +854,11 @@ const SchedStats = struct {
   上（`createKernelThreadAffinity(..., 0)`），`task.idleThreadLocked` 优先取恰好绑在本 CPU 上的 idle。
   此前 BSP idle 不绑定，空闲的 AP 会把它拿走，CPU 0 上被停的任务在 `pickBootstrapKernelPreferIdle`
   返回空时继续跑自己的用户帧（hello286 G）。
+- **exit_group（hello287，系统调用 501）**：`lifecycle.exitGroup` → `task.beginGroupExit`：在 `task_lock` 下给线程组每个
+  活着的成员记下 `group_exit_code`（`proc/exit_group_policy.zig` 的 `claim`：先记下的保留），再给调用者以外的成员发
+  `SIGKILL`；调用者随后走 `exitTask`。`exitTask` 开头用 `finalStatus` 把成员自己的 `128+sig` 换成组的状态并标成正常退出，
+  所以组长的 wait 状态就是 `exit_group` 的参数。libc 的 `_exit` 走 501，`pthread_exit` 走 `SYS_exit`（只结束一个线程）。
+  局限：组长成为僵尸时 `waitpid` 就可能报告，不等其他成员都退出。
 - **waitid（hello285，系统调用 500）**：`proc/waitpid.zig` 的 `waitid`。`idtype` 是 `P_ALL`/`P_PID`/`P_PGID`
   （`proc/waitid_policy.zig` 把它换成 waitpid 的 pid 选择：-1、正 pid、负进程组），`options` 必须含
   `WEXITED`/`WSTOPPED`/`WCONTINUED` 之一，其余位除 `WNOHANG`/`WNOWAIT` 外都是 `EINVAL`。成功返回 0，

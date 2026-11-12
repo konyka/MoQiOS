@@ -83,6 +83,7 @@
 #define SYS_preadv2     498
 #define SYS_pwritev2    499
 #define SYS_waitid      500
+#define SYS_exit_group  501
 
 /* Processes, identity and terminals */
 #define SYS_pause       34

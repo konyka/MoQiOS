@@ -13,6 +13,18 @@ pub fn exit(status: u64) void {
     t.exitTask(code);
 }
 
+/// exit_group(status): end every thread of the calling process with `status` (only its low 8 bits are reported).
+pub fn exitGroup(status: u64) void {
+    const t = @import("task.zig");
+    const code: u8 = @intCast(@import("proc_id_policy.zig").exitCode(status));
+    serial.writeString("[exit] thread group exited with code ");
+    fmt.writeDecimal64(code);
+    serial.writeString("\n");
+    if (@import("sched.zig").currentTask()) |cur| cur.exited_via_syscall = true;
+    t.beginGroupExit(code);
+    t.exitTask(code);
+}
+
 /// Syscall #5: spawn(name_ptr) — load and start a program from ramdisk.
 pub fn spawn(name_ptr: u64) i64 {
     if (name_ptr >= 0x0000_8000_0000_0000) return -1;
