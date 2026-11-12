@@ -1,12 +1,15 @@
 // hello58 — 作业控制（job control）验收测试（TDD 目标）。
 // 覆盖：setsid/getpgid/getsid、后台读 SIGTTIN（handler→EINTR 与默认→停）、
 // TIOCSPGRP 前台切换 + SIGCONT 继续、kill(-pgid) 广播、孤儿进程组 SIGHUP。
+// 第 5 段按 Linux 语义（kill_orphaned_pgrp，宿主机实测见 hello283）：停止的 C 在会话长 D 的会话里
+// 自成一组，D 退出使该组成为孤儿 → SIGHUP+SIGCONT。C 若留在 D 自己的组里，Linux 什么也不发（hello283 覆盖）。
 #include "../lib/moqi_libc/include/stdio.h"
 #include "../lib/moqi_libc/include/stdlib.h"
 #include "../lib/moqi_libc/include/string.h"
 #include "../lib/moqi_libc/include/unistd.h"
 #include "../lib/moqi_libc/include/signal.h"
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
+#include "../lib/moqi_libc/include/fcntl.h"
 
 #define SYS_ioctl_v 165
 #define TIOCSPGRP 0x5410
@@ -118,7 +121,8 @@ int main(int argc, char **argv, char **envp) {
     CHECK(w1 == e1 && w2 == e2, "kill(-pgid) both reaped");
     CHECK(sx1 == SIGKILLv && sx2 == SIGKILLv, "kill(-pgid) both dead");
 
-    /* 5. 孤儿进程组：子会话长退出 → 成员收 SIGHUP（经继承的 pipe 回报） */
+    /* 5. 孤儿进程组：C 在子会话长 D 的会话里自成一组并停止；D 退出 → 该组成为孤儿且含停止成员
+     *    → SIGHUP+SIGCONT（经继承的 pipe 回报） */
     int pfd[2];
     if (pipe(pfd) != 0) { print("hello58: FAIL pipe\n"); return 1; }
     int rfd[2]; /* C -> D: "about to stop myself" */
@@ -134,7 +138,10 @@ int main(int argc, char **argv, char **envp) {
             sigaction(SIGHUP, &sa, 0);
             /* POSIX: only a newly orphaned group WITH STOPPED MEMBERS gets
              * SIGHUP+SIGCONT (running background groups are left alone).
-             * Stop ourselves; the orphaning must wake and hang us up. */
+             * Our own group in D's session: D (another group, same session)
+             * is its only link, so D's exit orphans it. Stop ourselves; the
+             * orphaning must wake and hang us up. */
+            setpgid(0, 0);
             char r = 'R';
             syscall3(SYS_write, rfd[1], (long)&r, 1);
             kill(getpid(), SIGSTOP);
@@ -154,17 +161,33 @@ int main(int argc, char **argv, char **envp) {
             struct timespec rp = { 0, 5 * 1000 * 1000 };
             for (int i = 0; i < 2000 && read(rfd[0], &rb, 1) != 1; i++) nanosleep(&rp, 0);
         }
-        /* Let C reach its SIGSTOP before the leader exits. */
-        struct timespec w = { 0, 50 * 1000 * 1000 };
-        nanosleep(&w, 0);
-        _exit(0); // 会话长退出 → C 所在组成孤儿且含停止成员 → SIGHUP+SIGCONT
+        /* Wait (bounded) until /proc/<c>/stat reports C stopped ("pid (comm) T ...") before the leader exits. */
+        {
+            char path[32], sb[128];
+            snprintf(path, sizeof path, "/proc/%ld/stat", c);
+            struct timespec sp = { 0, 5 * 1000 * 1000 };
+            for (int i = 0; i < 400; i++) {
+                int fd = (int)open(path, O_RDONLY, 0);
+                long n = fd >= 0 ? read(fd, sb, sizeof sb - 1) : -1;
+                if (fd >= 0) close(fd);
+                if (n > 0) {
+                    sb[n] = 0;
+                    char *p = strrchr(sb, ')');
+                    if (p && p[1] == ' ' && p[2] == 'T') break;
+                }
+                nanosleep(&sp, 0);
+            }
+        }
+        _exit(0); // 会话长退出 → C 自成的组成孤儿且含停止成员 → SIGHUP+SIGCONT
     }
     close(pfd[1]);
     close(rfd[0]);
     close(rfd[1]);
-    /* 等 C 的 SIGHUP 报告（pipe 读在本内核是非阻塞的：空管道返回 0，轮询到有界） */
+    /* 等 C 的 SIGHUP 报告。停止的 C 仍持有写端，阻塞读会在内核漏发时永远等下去：
+     * 置 O_NONBLOCK（空管道返回 -EAGAIN），轮询到有界。 */
     char buf[4] = { 0 };
     long rn = 0;
+    fcntl(pfd[0], F_SETFL, O_NONBLOCK);
     {
         struct timespec ps = { 0, 5 * 1000 * 1000 };
         for (int i = 0; i < 600 && rn != 1; i++) {

@@ -1245,15 +1245,15 @@ pub fn exitTask(exit_code: i32) void {
         _ = @import("signal.zig").sendSignalInfo(sigchld_parent, 17, sp.childInfo(t.tid, t.uid, exit_code, t.exited_via_syscall));
     }
 
-    // 作业控制：会话长退出 → 同会话成员收 SIGHUP（孤儿进程组，近似规则）。
+    // 作业控制：控制台会话长挂断前台组；因本次退出成为孤儿且含停止成员的
+    // 进程组收 SIGHUP + SIGCONT（jobctl.onExit）。
     // 必须在 task_lock 之外调用：广播路径的 kickIfBlocked/continueTask 会经
     // unblockTask 重取 task_lock（非递归 IrqSpinlock），锁内调用且目标成员
     // 处于 .blocked 时构成同 CPU 自死锁（SMP=4 hello58 测试 5 全系统冻结的
-    // 根因：SMP=1 下 D 总在 C 首次阻塞前退完所以不触发）。此刻本任务已标
-    // .zombie 且仍是某 CPU 的当前任务，reap 静默门保证槽位不会被提前回收，
-    // 指针 t 在广播期间保持有效。
-    if (t.is_user and @import("proc_id_policy.zig").groupIdIsTid(t.sid, t.tid)) {
-        @import("jobctl.zig").onSessionLeaderExit(t);
+    // 根因）。此刻本任务已标 .zombie 且仍是某 CPU 的当前任务，reap 静默门
+    // 保证槽位不会被提前回收，指针 t 在广播期间保持有效。
+    if (t.is_user and !t.is_thread) {
+        @import("jobctl.zig").onExit(t);
     }
 
     // Prompt the next timer interrupt to switch away from this zombie. Avoid

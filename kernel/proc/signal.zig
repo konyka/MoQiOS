@@ -190,8 +190,9 @@ pub fn sendSignalInfoResult(target_tid: u32, signum: u32, info: siginfo.Info) i6
             _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
             kickIfBlocked(@intCast(i));
             if (t.state == .running and defaultAction(signum) == .stop) {
-                // A running target notices the pending bit only at its next entry; keep kicking until it is off the CPU.
-                kickUntilStopped(t);
+                // A running target notices the pending bit only at its next entry; keep kicking until it is off the CPU. The caller
+                // itself stops on its way out of this syscall, and kicking its own CPU is a no-op, so it is not waited for.
+                if (!isCallerTask(@intCast(i))) kickUntilStopped(t);
             } else if (t.state == .running or t.state == .ready) {
                 if (pendingActionable(t) or defaultAction(signum) == .stop) kickRunningCpu(t);
             }
@@ -224,6 +225,11 @@ fn stopsBlockedTarget(t: *task.Task, signum: u32, idx: u32) bool {
     if (signum == SIGSTOP) return true;
     const bit = @as(u64, 1) << @intCast(signum - 1);
     return t.sigact().handlers[signum - 1] == 0 and (t.signal_mask & bit) == 0;
+}
+
+fn isCallerTask(idx: u32) bool {
+    const cur = @import("sched.zig").currentTaskIndex() orelse return false;
+    return cur == idx;
 }
 
 /// Job control: stop a task (SIGSTOP/SIGTTIN/SIGTTOU default). Running/ready

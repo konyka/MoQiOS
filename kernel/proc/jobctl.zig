@@ -5,7 +5,8 @@
 /// - 后台进程读 fd 0：投递 SIGTTIN 到其进程组；已装 handler → read 返回
 ///   EINTR；默认动作 → 组内全部停止（stopped），SIGCONT 后继续。
 /// - SIGTTIN 被阻塞/忽略：read 返回 EIO。
-/// - 会话长退出：同会话成员收 SIGHUP 并被 SIGCONT 唤醒（孤儿进程组近似）。
+/// - 退出：控制台的会话长退出时前台组收 SIGHUP 并释放控制台；因退出成为孤儿且含
+///   停止成员的进程组收 SIGHUP + SIGCONT（onExit，规则见 orphan_pgrp_policy.zig）。
 const sched = @import("sched.zig");
 const task_mod = @import("task.zig");
 const sig_mod = @import("signal.zig");
@@ -85,32 +86,66 @@ pub fn tcSetForegroundPgrp(new_pgid: u16) i64 {
     return 0;
 }
 
-/// 会话长（控制进程）退出，POSIX 规则：
-///  1. 若它是控制终端的会话长，终端前台进程组收 SIGHUP；
-///  2. 会话中因此成为孤儿且含停止成员的进程组收 SIGHUP + SIGCONT
-///     （停止的孤儿组否则永远无人唤醒）。
-/// 旧实现向整个会话（含后台运行中的组）广播 SIGHUP，会杀掉 nohup 式后台作业
-/// 之外所有运行中的后台进程。
-pub fn onSessionLeaderExit(leader: *task_mod.Task) void {
-    const fg: u16 = if (ctty_owner_sid == leader.sid) foreground_pgid else 0;
+/// A process exits (Linux exit_notify + disassociate_ctty):
+///  1. a session leader that owns the console hangs it up: the foreground
+///     process group gets SIGHUP, and the console is released;
+///  2. every process group the exit leaves orphaned (no member keeps a parent
+///     in another group of the same session) that has a stopped member gets
+///     SIGHUP and SIGCONT — nobody could continue it otherwise. Checked for
+///     the exiting process's own group and for each of its children's groups
+///     (orphan_pgrp_policy).
+/// Called outside task_lock (the signal paths re-take it).
+pub fn onExit(exiting: *task_mod.Task) void {
+    const policy = @import("orphan_pgrp_policy.zig");
+    var members: [task_mod.MAX_TASKS]policy.Member = undefined;
+    var n: usize = 0;
+    var me: ?policy.Member = null;
+    const init_tid = @atomicLoad(u32, &task_mod.init_tid, .acquire);
     for (0..task_mod.MAX_TASKS) |i| {
         const t = task_mod.getTask(@intCast(i)) orelse continue;
-        if (t.tid == leader.tid or t.state == .zombie) continue;
-        if (t.sid != leader.sid) continue;
-        const in_fg = fg != 0 and t.pgid == fg;
-        const stopped_orphan = groupHasStopped(t.pgid, leader.sid);
-        if (!in_fg and !stopped_orphan) continue;
-        _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(sig_mod.SIGHUP - 1), .seq_cst);
-        if (stopped_orphan) sig_mod.continueTask(t);
-        sig_mod.kickIfBlocked(@intCast(i));
+        if (!t.is_user or t.is_thread) continue;
+        const zombie = t != exiting and sched_claim.load(&t.state) == .zombie;
+        var parent_pgid: u32 = 0;
+        var parent_sid: u32 = 0;
+        var parent_alive = false;
+        if (t.parent_tid != 0) {
+            if (task_mod.findTaskByTid(t.parent_tid)) |pi| {
+                if (task_mod.getTask(pi)) |par| {
+                    parent_pgid = par.pgid;
+                    parent_sid = par.sid;
+                    parent_alive = true;
+                }
+            }
+        }
+        const m: policy.Member = .{
+            .pid = t.tid,
+            .parent_pid = t.parent_tid,
+            .pgid = t.pgid,
+            .sid = t.sid,
+            .parent_pgid = parent_pgid,
+            .parent_sid = parent_sid,
+            .parent_is_init = !parent_alive or t.parent_tid == init_tid,
+            .stopped = t.stopped,
+            .zombie = zombie,
+        };
+        members[n] = m;
+        n += 1;
+        if (t == exiting) me = m;
     }
-}
+    const self = me orelse return;
 
-fn groupHasStopped(pgid: u16, sid: u16) bool {
-    for (0..task_mod.MAX_TASKS) |i| {
-        const t = task_mod.getTask(@intCast(i)) orelse continue;
-        if (t.state == .zombie or t.sid != sid or t.pgid != pgid) continue;
-        if (t.stopped) return true;
+    if (@import("proc_id_policy.zig").groupIdIsTid(exiting.sid, exiting.tid) and ctty_owner_sid == exiting.sid) {
+        const fg = foreground_pgid;
+        ctty_owner_sid = 0;
+        foreground_pgid = 0;
+        if (fg != 0) _ = sig_mod.sendSignalToPgrp(fg, sig_mod.SIGHUP);
     }
-    return false;
+
+    var groups: [task_mod.MAX_TASKS]u32 = undefined;
+    const count = policy.groupsToHangUp(members[0..n], self, &groups);
+    for (groups[0..count]) |g| {
+        const pgid: u16 = @intCast(g);
+        _ = sig_mod.sendSignalToPgrp(pgid, sig_mod.SIGHUP);
+        _ = sig_mod.sendSignalToPgrp(pgid, sig_mod.SIGCONT);
+    }
 }

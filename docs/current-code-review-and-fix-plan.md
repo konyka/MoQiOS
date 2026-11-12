@@ -7716,7 +7716,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：`ext2.zig` 新增 `stickyRefuses`，接入 `unlinkFile`、`rmdirFile`、`renameFileMode`（检查源条目，也检查将被覆盖的目标）和 `renameExchange`（两边都检查）。`tmpfs.tmpfsRemove` 先查父目录 write+search（`EACCES`），再查粘滞位（`EPERM`）。`unlink.zig` 的 `caller()` 之前漏传 `cap_fowner`，已补上。hello114 V 段的期望相应地从 `EACCES` 改为 `EPERM`。
 - 绿灯：hello281 五项全过，hello119 照常通过；host 测试、三个架构构建与完整 smoke 见提交记录。
 - 如实的局限：FAT32 没有权限位，所以没有 DAC，也没有粘滞位。
-- 门禁中的观察（未解决）：第一次 SMP=4 smoke 在 hello58 第 5 段（会话长退出、孤儿进程组 SIGHUP）之后串口静默，900 秒超时；SMP=1、SMP=2 和 SMP=4 重跑都通过。这段路径（`jobctl.onSessionLeaderExit`）本次没有改动，与 §6.25/§6.26 记录的历史停滞在同一位置，留作待查项。
+- 门禁中的观察（已关闭，见“孤儿进程组按 Linux kill_orphaned_pgrp”一节：根因是测试时序，会话长退出时 C 尚未停止）：第一次 SMP=4 smoke 在 hello58 第 5 段（会话长退出、孤儿进程组 SIGHUP）之后串口静默，900 秒超时；SMP=1、SMP=2 和 SMP=4 重跑都通过。这段路径（`jobctl.onSessionLeaderExit`）本次没有改动，与 §6.25/§6.26 记录的历史停滞在同一位置，留作待查项。
 
 ## 跨进程 process_vm_readv/writev（hello282，已实现）
 
@@ -7728,3 +7728,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：hello282 十项全过（含降为 uid 1000 的子进程读 root 进程得 `EPERM`），hello92 照常通过；host 测试、三个架构构建与完整 smoke 见提交记录。
 - 如实的局限：①syscall 只在 x86_64 上接入；②被换出的远端页会在目标的 vm_lock 下换入（`swap.swapIn`，与目标自己的换入缺页相同），但**没有运行时用例**：构造换出需要 swapon（`CAP_SYS_ADMIN`）和回收下限钩子，会改变系统级状态，没有放进 hello282。尚未缺页的文件映射页不会替目标填充，返回已拷贝的字节数或 `EFAULT`；Linux 的 `get_user_pages` 会替目标缺页（宿主机实测：目标从未访问过的匿名页，读得 0、写成功）。本内核的匿名映射在 `mmap` 时立即分配，所以只有文件映射页受影响；③2 MiB 巨页不支持（`getPageEntryRaw` 拒绝下降进巨页）。
 
+
+## 孤儿进程组按 Linux kill_orphaned_pgrp（hello283，已修）
+
+- 起因：hello281 一节末尾的待查项（SMP=4 在 hello58 第 5 段之后串口静默），以及 `docs/kernel-subsystems.md` 写明的近似规则。宿主机 Linux 实测（`/tmp/lm/orph.c`、`orph2.c`）：退出使一个组新成为孤儿且组内有停止成员时，成员先收 SIGHUP 再收 SIGCONT；没有停止成员、组仍被同会话他组的父进程链接、或停止的子进程留在退出会话长自己的组里，什么都不发。Linux 一次为所有挂起的 handler 建帧，所以 handler 按 "CH" 运行；本内核每次返回用户态建一帧，运行顺序是 "HC"。测试只比较收到了哪些信号。
+- 发现的两处缺陷：①旧规则只在会话长退出时给同会话成员发 SIGHUP（`onSessionLeaderExit`），普通进程退出不处理，而且不区分组是否真的成为孤儿、是否有停止成员；②hello58 第 5 段让 C 留在会话长 D 自己的组里并期望收到 SIGHUP，按 Linux 语义这个组从未被会话内的链接连着，什么都不该发（宿主机 mode 7 实测收到空串）。
+- 实现：`kernel/proc/orphan_pgrp_policy.zig` 给出纯函数规则（带内联测试）：`willBeOrphaned`、`hasStopped`、`hangsUp`、`groupsToHangUp`。`jobctl.onExit` 先对任务做快照，持有控制台的会话长退出时向前台组发 SIGHUP 并释放控制台，再对选出的每个组先发 SIGHUP 再发 SIGCONT。`exitTask` 对每个退出的用户进程（线程除外）调用它。hello58 第 5 段改为 C 先 `setpgid(0,0)` 自成一组再停止。
+- 顺带修掉的延迟：`kill(getpid(), SIGSTOP)` 停止自己时，`sendSignalInfoResult` 对调用者自己也走 `kickUntilStopped`，而 `kickRunningCpu` 对调用者所在的 CPU 直接返回，于是空转满 200×2000 次 pause（实测约 190ms）。现在目标就是当前任务时跳过这段等待，调用者在 syscall 返回时自己停下。
+- 测试不再靠固定 sleep：hello283 和 hello58 第 5 段在退出前有界轮询 `/proc/<子进程>/stat`，直到第三个字段是 `T`（`procfs.generatePidStat` 用 `pid_status.stateOf` 生成）。不用 `waitpid` 的 `WUNTRACED`：内核只校验了这个选项，没有确认会报告停止的子进程（未验证，记为后续开放项）。
+- 绿灯：hello283 六项、hello58 全段在 SMP=1 与 SMP=4 下通过；host 测试、三个架构构建与完整 smoke 见提交记录。
+- 如实的局限：①本内核的 handler 运行顺序与 Linux 不同（见上），测试不比较顺序；②`WUNTRACED`/`WCONTINUED` 是否报告子进程的停止和继续尚未验证。

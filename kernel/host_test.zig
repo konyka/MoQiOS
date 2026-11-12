@@ -203,6 +203,7 @@ pub const ext2_dirpath = @import("fs/ext2_dirpath.zig");
 pub const fd_stat_policy = @import("fs/fd_stat_policy.zig");
 pub const sigaltstack_policy = @import("proc/sigaltstack_policy.zig");
 pub const kill_broadcast_policy = @import("proc/kill_broadcast_policy.zig");
+pub const orphan_pgrp_policy = @import("proc/orphan_pgrp_policy.zig");
 pub const segment_copy_policy = @import("proc/segment_copy_policy.zig");
 pub const fs_reader = @import("fs/fs_reader.zig");
 pub const fr_alias = @import("fs/fs_reader.zig");
@@ -336,6 +337,7 @@ pub const copy_file_range_source = @embedFile("fs/copy_file_range.zig");
 // arch/x86_64/clone.zig and mm/process_vm.zig.
 test {
     _ = @import("proc/syscall_restart_policy.zig");
+    _ = @import("proc/orphan_pgrp_policy.zig");
     _ = @import("proc/exec_policy.zig");
     _ = @import("proc/comm_policy.zig");
     _ = @import("proc/user_stack.zig");

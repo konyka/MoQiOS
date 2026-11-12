@@ -399,6 +399,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello280"); /* FAT32 files unlinked while open through /proc/self/fd/N */
     run_test("hello281"); /* sticky directories: EPERM for another user's entries on ext2 and tmpfs */
     run_test("hello282"); /* process_vm_readv/writev across processes: COW-private writes, ESRCH, EPERM */
+    run_test("hello283"); /* orphaned process groups: SIGHUP+SIGCONT only for a newly orphaned group with a stopped member */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

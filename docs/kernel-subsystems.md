@@ -835,11 +835,15 @@ const SchedStats = struct {
   静默丢弃，是 waitpid(-1,…,WNOHANG) 永久阻塞的根因）。
 - **kill(-pgid) 广播**：`lifecycle.kill(pid<0)` → `signal.sendSignalToPgrp`——stop/cont 类
   按默认处置立即生效，其余走 pending + 唤醒；返回发送计数（0 → ESRCH）。
-- **孤儿组 SIGHUP（近似规则）**：会话长退出时 `exitTask → jobctl.onSessionLeaderExit`，
-  同会话成员收 SIGHUP，停止中的成员同时被 SIGCONT 唤醒（v1 简化：未实现完整的"孤儿组
-  停止成员才收 SIGHUP+SIGCONT"区分）。
+- **孤儿组 SIGHUP（Linux `kill_orphaned_pgrp`）**：任何用户进程退出（线程退出不算）时
+  `exitTask → jobctl.onExit`，由 `proc/orphan_pgrp_policy.zig` 决定哪些组新成为孤儿：
+  一个组被同会话里、属于另一个组的父进程链接着；init 的子进程不算链接。检查退出进程
+  自己的组和每个子进程所在的组。组里有停止成员时，全组成员先收 SIGHUP 再收 SIGCONT；
+  没有停止成员、仍被链接、或停止的子进程留在退出会话长自己的组里（该组从未被会话内的
+  链接连着），什么都不发。持有控制台的会话长退出时，另外向前台组发 SIGHUP 并释放控制台。
 - **验收**：`user/hello58.c`——setsid/getpgid/getsid、后台读两类处置（handler→EINTR、
-  默认→停→前台化→SIGCONT 恢复）、kill(-pgid) 全组终止、孤儿组 SIGHUP，SMP=1/4 全绿。
+  默认→停→前台化→SIGCONT 恢复）、kill(-pgid) 全组终止、孤儿组 SIGHUP；`user/hello283.c`
+  覆盖上面的六种情形（宿主机 Linux 实测同结果），SMP=1/4 全绿。
 
 ### 2.4b nanosleep 阻塞化（2026-08-15）✅
 

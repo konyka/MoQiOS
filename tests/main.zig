@@ -11684,6 +11684,8 @@ test "SIGSTOP on a task running on another CPU kicks that CPU instead of waiting
     // A signal queued for a running target (the kill() path, where SIGSTOP is only pending) keeps kicking until it is off the CPU.
     try std.testing.expect(std.mem.indexOf(u8, sig, "if (t.state == .running and defaultAction(signum) == .stop) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, sig, "kickUntilStopped(t);") != null);
+    // A task stopping itself (kill(getpid(), SIGSTOP)) is not kicked: kickRunningCpu skips the caller's CPU, so the loop would spin all its tries.
+    try std.testing.expect(std.mem.indexOf(u8, sig, "if (!isCallerTask(@intCast(i))) kickUntilStopped(t);") != null);
 }
 
 test "currentSize reads the staged end before the recorded size so a concurrent flush cannot make both reads short" {
