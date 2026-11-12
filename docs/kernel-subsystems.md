@@ -846,7 +846,7 @@ const SchedStats = struct {
   handler 或 `SIG_IGN` 的只发给组长）。其余信号只发给被点名的那个任务。父进程 `waitpid` 看到的
   停止报告不取决于发送顺序：`signal.stopTask` 经 `task.markStopped` 在 `task_lock` 内置 `stopped`
   并扫描同组，只有让整组最后一个活着的成员停下的那一次才经 `groupLeaderOf` 找到组长、由它报告
-  （`group_stop_policy.completesStop`）。`tkill` 对这些信号同样改走 `sendToProcess`，作用于整个进程（hello286 H）；其余信号只发给被点名的线程。睡在 `pause`/`sigsuspend` 里的任务遇到未阻塞的默认停止信号时，由 `waitForSignal` 经 `signal.takePendingStop` 停下，`SIGCONT` 后接着等；时钟中断对 `.blocked` 的任务不再自己停止，把位放回（hello286 I）。停止的任务在离开 CPU 之前
+  （`group_stop_policy.completesStop`）。`tkill` 对这些信号同样改走 `sendToProcess`，作用于整个进程（hello286 H）；其余信号只发给被点名的线程。睡在 `pause`/`sigsuspend` 里的任务遇到未阻塞的默认停止信号时，由 `waitForSignal` 经 `signal.takePendingStop` 停下，`SIGCONT` 后接着等；时钟中断对 `.blocked` 的任务不再自己停止，把位放回（hello286 I）。成员走 `exit()` 而不是停止、且组里其余成员都已停下时，`exitTask` 补上这次整组停止的报告（`group_stop_policy.exitCompletesStop`，hello286 J）。停止的任务在离开 CPU 之前
   不会回到用户态：系统调用返回路径（`syscall_entry.deliverSignalAt` 的 `.stop` 分支）循环
   `forceReschedule` 直到 `stopped` 被清除，期间来的 `SIGKILL` 在返回用户态前就结束任务；
   `timerTickFg` 对已停止的当前任务即使本 CPU 没有其他就绪任务也切走，不恢复原帧。

@@ -148,6 +148,8 @@ pub const Task = struct {
     /// Stopped tasks are held in .blocked and resume only via SIGCONT —
     /// plain wait-queue wakes must not revive them.
     stopped: bool = false,
+    /// The signal of this task's latest stop (reported when a member's exit completes the group stop). Guarded by task_lock.
+    stop_signum: u8 = 0,
     /// Stop / continue not yet reported to the parent's waitpid (WUNTRACED / WCONTINUED). Guarded by task_lock.
     wait_report: @import("wait_report_policy.zig").Pending = .{},
     /// User-space entry point (RIP).
@@ -847,6 +849,7 @@ fn reserveSlotLocked() ?u32 {
     _ = @atomicRmw(u64, &@import("sched.zig").sleep_bm, .And, ~(@as(u64, 1) << @intCast(slot)), .seq_cst);
     tasks[slot].sleep_deadline_ns = 0;
     tasks[slot].stopped = false;
+    tasks[slot].stop_signum = 0;
     tasks[slot].group_exit_code = null;
     tasks[slot].wait_report = .{};
     tasks[slot].mq_waiter = .{};
@@ -1191,6 +1194,35 @@ pub fn exitTask(requested_code: i32) void {
     // last thread to exit after it hands the leader its own status and reports the process on the leader's behalf.
     const group_running = t.is_user and !t.is_thread and groupHasLiveMemberLocked(t.tid, idx);
     var finishes_group: ?*Task = null;
+    // A member that leaves through exit() while the rest of its group is stopped completes that group stop (it will never stop
+    // itself); the leader's parent is told after task_lock is released.
+    var completes_stop: ?*Task = null;
+    var completes_sig: u8 = 0;
+    if (t.is_user and t.exited_via_syscall and t.group_exit_code == null) {
+        const gid = if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid;
+        var live: u32 = 0;
+        var stopped_n: u32 = 0;
+        var bits = slot_bitmap;
+        while (bits != 0) {
+            const j: u32 = @intCast(@ctz(bits));
+            bits &= bits - 1;
+            if (j == idx) continue;
+            const m = &tasks[j];
+            if (m.state == .zombie) continue;
+            const in_group = if (m.is_thread) m.parent_tid == gid else m.tid == gid;
+            if (!in_group) continue;
+            live += 1;
+            if (m.stopped) {
+                stopped_n += 1;
+                completes_sig = m.stop_signum;
+            }
+        }
+        if (@import("group_stop_policy.zig").exitCompletesStop(t.stopped, live, stopped_n) and t.is_thread) {
+            if (groupLeaderLocked(gid, idx)) |li| {
+                if (tasks[li].state != .zombie) completes_stop = &tasks[li];
+            }
+        }
+    }
     if (t.is_user and t.is_thread and t.parent_tid != 0) {
         if (groupLeaderLocked(t.parent_tid, idx)) |li| {
             const leader = &tasks[li];
@@ -1265,6 +1297,7 @@ pub fn exitTask(requested_code: i32) void {
     }
     task_lock.release(flags);
     for (0..death_n) |k| _ = @import("signal.zig").sendSignal(death_tids[k], death_sigs[k]);
+    if (completes_stop) |leader| @import("signal.zig").reportGroupStop(leader, if (completes_sig != 0) completes_sig else 19);
 
     // POSIX: the parent of an exiting child receives SIGCHLD (default
     // action: ignore). Sent outside task_lock — sendSignal/kickIfBlocked
@@ -1952,12 +1985,13 @@ pub fn publishRunnable(slot: u32) void {
 
 /// A member of a thread group stops. The flag is set and the rest of the group checked under one task_lock hold, so exactly one stopping
 /// member sees `.group_complete`: the one whose stop leaves no live member of the group running (group_stop_policy.completesStop).
-pub fn markStopped(t: *Task) @import("group_stop_policy.zig").StopProgress {
+pub fn markStopped(t: *Task, signum: u32) @import("group_stop_policy.zig").StopProgress {
     const gsp = @import("group_stop_policy.zig");
     const flags = task_lock.acquire();
     defer task_lock.release(flags);
     const was = t.stopped;
     t.stopped = true;
+    if (!was) t.stop_signum = @intCast(signum);
     const gid = if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid;
     var others_running = false;
     var bits = slot_bitmap;

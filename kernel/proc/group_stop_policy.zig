@@ -30,6 +30,15 @@ pub fn completesStop(was_stopped: bool, others_running: bool) StopProgress {
     return if (others_running) .partial else .group_complete;
 }
 
+/// A member exits through exit() while a group stop is in progress: it will never stop, so if every other live member is already
+/// stopped its exit completes the stop and the parent is told now (Linux: the exiting task drops group_stop_count). `exiting_stopped`
+/// is the member's own flag (true: the group stop already completed and was reported). `live_others` / `stopped_others` count the
+/// other members that have not exited, and those of them that are stopped.
+pub fn exitCompletesStop(exiting_stopped: bool, live_others: u32, stopped_others: u32) bool {
+    if (exiting_stopped or live_others == 0) return false;
+    return stopped_others == live_others;
+}
+
 const std = @import("std");
 
 test "SIGKILL, SIGCONT and SIGSTOP reach every thread whatever the action" {
@@ -50,6 +59,13 @@ test "the parent's stop report waits for the last live member" {
     try std.testing.expect(completesStop(false, false) == .group_complete);
     try std.testing.expect(completesStop(true, false) == .already);
     try std.testing.expect(completesStop(true, true) == .already);
+}
+
+test "a member that exits instead of stopping completes a group stop in progress" {
+    try std.testing.expect(exitCompletesStop(false, 2, 2));
+    try std.testing.expect(!exitCompletesStop(false, 2, 1)); // another member still runs: its own stop reports
+    try std.testing.expect(!exitCompletesStop(true, 2, 2)); // already reported
+    try std.testing.expect(!exitCompletesStop(false, 0, 0)); // nobody left: the process exits instead
 }
 
 test "other signals are delivered once" {

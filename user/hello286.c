@@ -112,6 +112,24 @@ static long tkill_call(long tid, int sig) {
     return syscall2(SYS_tkill, tid, sig);
 #endif
 }
+static void *short_lived(void *a) { return a; }
+static void *churn(void *a) {
+    (void)a;
+    for (;;) {
+        pthread_t t;
+        if (pthread_create(&t, (void *)0, short_lived, (void *)0) == 0) pthread_join(t, (void **)0);
+        write(bp[1], "c", 1);
+    }
+    return (void *)0;
+}
+static long wait_report(long c, int *st, int opt) {
+    long r = 0;
+    for (int i = 0; i < 300 && r == 0; i++) {
+        r = waitpid(c, st, opt | WNOHANG);
+        if (r == 0) nap(10);
+    }
+    return r;
+}
 static int drain(void) {
     char b[256];
     int any = 0;
@@ -351,6 +369,44 @@ int main(void) {
     r = waitpid(c, &st, 0);
     snprintf(msg, sizeof msg, "I: and SIGKILL ends it (%ld, 0x%x)", r, st);
     check(r == c && st == 9, msg);
+
+    /* J: threads keep being created and exiting while the process is stopped and continued. A member that exits instead of stopping
+     * still completes the group stop, and a thread created while the stop is in progress stops too. */
+    drain();
+    c = fork();
+    if (c == 0) {
+        pthread_t th;
+        pthread_create(&th, (void *)0, churn, (void *)0);
+        for (;;) pause();
+    }
+    started = 0;
+    for (int i = 0; i < 300 && !started; i++) {
+        started = drain();
+        if (!started) nap(10);
+    }
+    int stops = 0, quiet = 0, conts = 0;
+    for (int round = 0; round < 60; round++) {
+        kill(c, SIGSTOP);
+        st = 0;
+        if (wait_report(c, &st, WUNTRACED) == c && st == 0x137f) stops++;
+        else break;
+        drain();
+        nap(30);
+        if (!drain()) quiet++;
+        kill(c, SIGCONT);
+        st = 0;
+        if (wait_report(c, &st, WCONTINUED) == c && st == 0xffff) conts++;
+        else break;
+        nap(5);
+    }
+    snprintf(msg, sizeof msg, "J: 60 group stops while threads come and go are all reported (%d/60)", stops);
+    check(started && stops == 60, msg);
+    snprintf(msg, sizeof msg, "J: and nothing runs while the group is stopped (%d/%d)", quiet, stops);
+    check(quiet == stops && stops > 0, msg);
+    snprintf(msg, sizeof msg, "J: and every continue is reported (%d/60)", conts);
+    check(conts == 60, msg);
+    kill(c, 9);
+    waitpid(c, &st, 0);
 
     print(failures == 0 ? "hello286: PASS\n" : "hello286: FAIL\n");
     return failures;

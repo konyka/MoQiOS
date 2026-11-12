@@ -236,7 +236,7 @@ fn isCallerTask(idx: u32) bool {
 /// tasks transition to .blocked and stay there until SIGCONT — wait-queue
 /// wakes are suppressed while `stopped` holds (see continueTask).
 pub fn stopTask(t: *task.Task, signum: u32) void {
-    const progress = task.markStopped(t);
+    const progress = task.markStopped(t, signum);
     if (progress == .already) return;
     const sc = @import("sched_claim.zig");
     const s = sc.load(&t.state);
@@ -244,6 +244,11 @@ pub fn stopTask(t: *task.Task, signum: u32) void {
     // The parent hears of the stop once the whole thread group has stopped, from whichever member stopped last, on the leader's behalf.
     if (progress == .group_complete) if (task.groupLeaderOf(t)) |leader| notifyParentOfChange(leader, .{ .stopped = @intCast(signum) });
     if (s == .running) kickUntilStopped(t) else if (s == .ready) kickRunningCpu(t);
+}
+
+/// A member's exit completed the group stop of `leader`'s process (task.exitTask): report the stop as stopTask would have.
+pub fn reportGroupStop(leader: *task.Task, signum: u8) void {
+    notifyParentOfChange(leader, .{ .stopped = signum });
 }
 
 /// A stop or continue is reported to the parent: waitpid(WUNTRACED / WCONTINUED) sees it, a parent blocked in waitpid wakes, and the
