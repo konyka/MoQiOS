@@ -352,6 +352,7 @@ test {
     _ = @import("fs/pid_status.zig");
     _ = @import("fs/fat32_util.zig");
     _ = @import("fs/deleted_name_policy.zig");
+    _ = @import("fs/magic_link_policy.zig");
     _ = @import("mm/mprotect_ledger.zig");
     _ = @import("proc/cap_abi.zig");
     _ = @import("fs/readlink_policy.zig");

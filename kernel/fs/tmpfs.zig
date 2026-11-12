@@ -903,6 +903,32 @@ pub fn tmpfsDirPath(idx: u32, out: *[256]u8) PathResult {
 /// unlinked while a descriptor is still open keeps its name and its parent link, so its path is rebuilt the same way with
 /// " (deleted)" appended — the descriptor keeps working, and Linux reports exactly that (measured). An anonymous entry (a memfd, which
 /// never had a name) is ENOENT, like Linux's "/memfd:name (deleted)" is not reachable here. ENOENT also when an ancestor is gone.
+/// Open tmpfs entry `idx` again by its index: open("/proc/self/fd/N") of an entry that was unlinked while open, which has no name to
+/// look up. The same checks as opening an existing name (Linux, measured): O_CREAT|O_EXCL is EEXIST, the directory rules (O_DIRECTORY
+/// on a file is ENOTDIR, writing a directory EISDIR), the mode bits against the new access mode (EACCES), then O_TRUNC; one more open
+/// reference on success.
+pub fn tmpfsReopenIdx(idx: u32, euid: u32, egid: u32, effective_caps: capability.SysCap, flags: u32) i64 {
+    if (idx >= MAX_FILES) return -2;
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    const entry = &entries[idx];
+    if (!entry.active) return -2;
+    if (creation_metadata.exclusiveCreateRejectsExisting((flags & 0x40) != 0, flags)) return -17;
+    const rule = @import("namespace_policy.zig").openExisting(if (entry.is_dir) .directory else .file, flags);
+    if (rule != 0) return rule;
+    if (!entry.is_dir) {
+        const decision = dac.decideExistingOpen(
+            .{ .mode = entry.mode, .uid = entry.uid, .gid = entry.gid },
+            .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override, .groups = @import("../proc/current_groups.zig").forCaller(euid, egid) },
+            flags,
+        );
+        if (!decision.allowed) return -13;
+        if (decision.truncate) truncateLocked(entry, 0);
+    }
+    entry.open_count +|= 1;
+    return @intCast(idx);
+}
+
 /// True when tmpfs entry `idx` is unlinked while a descriptor still holds it. The /proc/self/fd/N resolver uses this rather than the
 /// path text, because a live file can itself be named "... (deleted)".
 pub fn tmpfsIsDeleted(idx: u32) bool {

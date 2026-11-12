@@ -83,6 +83,7 @@ pub fn statx(dirfd: i64, pathname_ptr: u64, flags: u32, mask: u32, statxbuf_ptr:
             stat_on_fd = f.fd;
             if (f.path) |p| stat_name = p;
         },
+        .object => |o| stat_on_fd = o.fd,
         .err => |e| return e,
     };
     const fd_result = if (stat_on_fd) |src| @as(i64, src) else cur.fd_table.openWithCredentials(stat_name, open_flags, cur.euid, cur.egid, cur.effective_caps);

@@ -2356,27 +2356,38 @@ pub const FdTable = struct {
         return newfd;
     }
 
-    /// Copy descriptor `oldfd` into a fresh slot WITHOUT sharing its offset: the copy is a new open file description starting at
-    /// offset 0, like any fresh open (Linux's reopen through /proc/self/fd/N of a file that was unlinked while open). Other state is
-    /// copied as a dup, including the access mode of `oldfd`; descriptor flags start clear (the caller applies O_CLOEXEC).
-    pub fn dupFdOwnOffset(self: *FdTable, oldfd: u32) i64 {
-        if (oldfd >= MAX_FDS or !self.acquireTransferFd(oldfd)) return -9; // EBADF
-        defer self.releaseTransferFd(oldfd);
+    /// open("/proc/self/fd/N") of a tmpfs entry that was unlinked while open: a new open file description of entry `idx` (offset 0,
+    /// its own), opened with the flags given now and checked like an open by name (tmpfs.tmpfsReopenIdx).
+    pub fn reopenTmpfsIdx(self: *FdTable, idx: u32, flags: u32, euid: u32, egid: u32, effective_caps: SysCap) i64 {
+        const tmpfs = @import("tmpfs.zig");
         const slot = self.allocFd() orelse return -24;
-        self.fds[slot] = self.fds[oldfd];
-        self.fds[slot].offset_slot = 0;
-        self.fds[slot].offset = 0;
-        self.fds[slot].fd_flags = 0;
-        if (self.fds[slot].fd_type == .pipe_read or self.fds[slot].fd_type == .pipe_write) {
-            if (self.fds[slot].pipe_idx < MAX_PIPES)
-                _ = pipeRetain(self.fds[slot].pipe_idx, self.fds[slot].fd_type == .pipe_write);
+        const r = tmpfs.tmpfsReopenIdx(idx, euid, egid, effective_caps, flags);
+        if (r < 0) {
+            self.freeFd(slot);
+            return r;
         }
-        if (self.fds[slot].fd_type == .fat32_file) {
-            @import("fat32.zig").retainFile(self.fds[slot].fat32_file_idx);
+        self.fds[slot] = .{
+            .fd_type = .tmpfs_file,
+            .offset = 0,
+            .file_size = tmpfs.tmpfsGetSize(@intCast(idx)),
+            .tmpfs_idx = idx,
+            .writable = (flags & 0x03) != 0,
+            .status_flags = flags & @import("fcntl_policy.zig").OPEN_STATUS_MASK,
+        };
+        self.publishFd(slot);
+        return @intCast(slot);
+    }
+
+    /// open("/proc/self/fd/N") of a pipe end: a new descriptor on the same pipe, as the end the new access mode asks for
+    /// (magic_link_policy.reopenObject), with the new status flags.
+    pub fn reopenPipe(self: *FdTable, pipe_idx: u32, write_end: bool, flags: u32) i64 {
+        const slot = self.allocFd() orelse return -24;
+        if (!pipeRetain(pipe_idx, write_end)) {
+            self.freeFd(slot);
+            return -2;
         }
-        if (self.fds[slot].fd_type == .tmpfs_file) {
-            @import("tmpfs.zig").tmpfsRetain(@intCast(self.fds[slot].tmpfs_idx));
-        }
+        const status = (flags & @import("fcntl_policy.zig").OPEN_STATUS_MASK & ~@import("fcntl_policy.zig").O_ACCMODE) | @import("namespace_policy.zig").pipeStatusFlags(write_end);
+        self.fds[slot] = .{ .fd_type = if (write_end) .pipe_write else .pipe_read, .pipe_idx = pipe_idx, .writable = write_end, .status_flags = status };
         self.publishFd(slot);
         return @intCast(slot);
     }

@@ -76,12 +76,15 @@ pub const Resolved = union(enum) {
     /// Descriptor N opened a file: reopening through this name gives a NEW open file description of the same file (its own offset,
     /// Linux measured) — `path` is that file's path when it still has one, null when it was unlinked (the descriptor still works).
     file: struct { fd: u32, path: ?[]const u8 },
+    /// Descriptor N is on an object with no path (a pipe, a socket, an anonymous inode): stat describes the descriptor itself, open
+    /// follows magic_link_policy.reopenObject.
+    object: struct { fd: u32, kind: @import("magic_link_policy.zig").Kind },
     err: i64,
 };
 
 /// If `name` is "/proc/self/fd/N" and N is an open descriptor of `t` on something with a path, open and stat act on that descriptor (Linux's
-/// magic link); otherwise `.same`. A name that is not a number, or a number that is not open, is ENOENT; a descriptor with no path (a pipe,
-/// a socket, an event object) is ENXIO.
+/// magic link); otherwise `.same`. A name that is not a number, or a number that is not open, is ENOENT; a pipe, a socket or an
+/// anonymous inode is `.object`; any other descriptor with no path is ENXIO.
 pub fn resolveMagicLink(t: *task_mod.Task, name: []const u8, buf: *[256]u8) Resolved {
     const prefix = "/proc/self/fd/";
     if (name.len <= prefix.len or !std.mem.startsWith(u8, name, prefix)) return .same;
@@ -93,7 +96,6 @@ pub fn resolveMagicLink(t: *task_mod.Task, name: []const u8, buf: *[256]u8) Reso
     }
     if (digits == 0 or digits != rest.len) return .{ .err = -2 };
     if (fdn >= vfs_mod.MAX_FDS or t.fd_table.fds[fdn].fd_type == .none) return .{ .err = -2 };
-    // Linux: a name with no path (a pipe, a socket, an event object) is ENXIO through this route.
     switch (t.fd_table.fds[fdn].fd_type) {
         .tmpfs_file => {
             // A deleted entry's path text ends in " (deleted)", but a live file can be named that too, so the flag decides, not the text.
@@ -109,6 +111,9 @@ pub fn resolveMagicLink(t: *task_mod.Task, name: []const u8, buf: *[256]u8) Reso
             const p = filePath(t, fdn, buf) orelse return .{ .err = -2 };
             return .{ .file = .{ .fd = fdn, .path = p } };
         },
+        .pipe_read, .pipe_write => return .{ .object = .{ .fd = fdn, .kind = .pipe } },
+        .tcp_socket, .udp_socket, .unix_socket, .raw_socket => return .{ .object = .{ .fd = fdn, .kind = .socket } },
+        .eventfd, .epoll, .timerfd, .inotify, .pidfd => return .{ .object = .{ .fd = fdn, .kind = .anon } },
         else => return .{ .err = -6 },
     }
 }

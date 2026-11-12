@@ -121,25 +121,22 @@ pub fn openAt(dirfd: i64, name_ptr: u64, flags: u32, requested_mode: ?u32) i64 {
     // All of that happens here, before openWithCreationCredentials: its procfs branch would take a descriptor slot for the magic link
     // itself (and, for a live entry, the caller's own path would have to go through the full open again).
     var fd_link: [256]u8 = undefined;
-    var reopen_path: ?[]const u8 = null;
-    var unlinked_src: ?u32 = null;
-    switch (@import("fd_target.zig").resolveMagicLink(cur, use_name, &fd_link)) {
-        .same => {},
-        .file => |f| if (f.path) |p| {
-            // Still has a path: a real reopen of that path, so the new descriptor has its own offset (Linux measured).
-            reopen_path = p;
-        } else {
-            // Unlinked while open: the descriptor is the only way in; the copy keeps its own offset.
-            unlinked_src = f.fd;
+    const result = switch (@import("fd_target.zig").resolveMagicLink(cur, use_name, &fd_link)) {
+        .same => cur.fd_table.openWithCreationCredentials(use_name, flags, requested_mode, cur.fsctx().umask, cur.euid, cur.egid, cur.effective_caps),
+        // Still has a path: a real reopen of that path with the new flags, so the new descriptor has its own offset (Linux measured).
+        .file => |f| if (f.path) |p|
+            cur.fd_table.openWithCreationCredentials(p, flags, requested_mode, cur.fsctx().umask, cur.euid, cur.egid, cur.effective_caps)
+        else if (cur.fd_table.fds[f.fd].fd_type == .tmpfs_file)
+            // Unlinked while open: reopen the entry itself, with the same checks as an open by name.
+            cur.fd_table.reopenTmpfsIdx(cur.fd_table.fds[f.fd].tmpfs_idx, flags, cur.euid, cur.egid, cur.effective_caps)
+        else
+            -2,
+        .object => |o| switch (@import("magic_link_policy.zig").reopenObject(o.kind, flags)) {
+            .pipe_end => |w| cur.fd_table.reopenPipe(cur.fd_table.fds[o.fd].pipe_idx, w, flags),
+            .err => |e| e,
         },
-        .err => |e| return e,
-    }
-    const open_name: []const u8 = reopen_path orelse use_name;
-
-    const result = if (unlinked_src) |src|
-        cur.fd_table.dupFdOwnOffset(src)
-    else
-        cur.fd_table.openWithCreationCredentials(open_name, flags, requested_mode, cur.fsctx().umask, cur.euid, cur.egid, cur.effective_caps);
+        .err => |e| e,
+    };
     if (result >= 0 and (flags & @import("fcntl_policy.zig").O_CLOEXEC) != 0 and result < vfs_mod.MAX_FDS) {
         cur.fd_table.fds[@intCast(result)].fd_flags = @import("fcntl_policy.zig").FD_CLOEXEC;
     }
