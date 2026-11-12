@@ -7230,7 +7230,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：hello257 共 10 项（实际运行计数）通过（含后加的"两个管道编号不同、同一管道两端相同"，它第一次就绿，是对编号取自对象索引的回归保护）；host 1076/1076（中途两处失败：`readlink_policy.zig` 里的新内联测试没登记进 `host_test.zig`，被仓库自己的守卫抓到；以及我前一个 `maps` 形状测试里的那行因为加了 `.fd_dir` 要同步）。
 - **一个已有探针被我改坏了（如实）**：完整冒烟 SMP=2 报 `hello86: FAIL readlink invalid fd returns EINVAL`。hello86 一直断言"不是打开描述符的数字 → `EINVAL`"，而宿主机 Linux 的答案是 `ENOENT`；我按 Linux 改了内核，所以把 hello86 的期望改成 `ENOENT`（探针头部加了一行说明）。顺带测了 Linux 对其它名字的答案：`/proc/self/fd/abc`、`/proc/self/fd/-1`、`/proc/self/fd/99999999999` 都是 `ENOENT`，只有空名字是 `EINVAL`；内核照此改了（非数字开头和超出范围的数字都返回 `ENOENT`），hello257 加了一项断言这三种名字。这是**改变了既有行为并改了既有测试**，不是内核回归：被改的断言本来就与 Linux 不一致。
 - 变异：把 TCP 套接字的文本改成 `pipe:[...]`（真编译）→ "套接字读回 socket:[inode]" 失败（`"pipe:[0]"`），其余通过；还原后通过。
-- 未验证：①管道和套接字的编号是**内核里的数组下标**，不是 Linux 那样的 inode 号，数字本身没有意义，只保证"同一对象相同、不同对象不同"，管道槽位复用后编号会重复；②`open("/proc/self/fd/N")`（重新打开同一个文件）没有做，`stat` 这些路径也没有；~~③被 `unlink` 的 tmpfs 文件读回 `ENOENT`，Linux 是路径加 ` (deleted)`~~（tmpfs 已处理，见文末 hello276 一节）；④ext2 的路径取的是**打开时的名字**，文件被 `rename` 之后仍是旧名字（目录描述符那边是按 inode 重建的，文件这边没有）；⑤只测了自己的进程，别的用户进程的 `fd` 目录的 `EACCES` 没有单独用例（共用 `maps` 的策略，策略有单元测试）。
+- 未验证：①管道和套接字的编号是**内核里的数组下标**，不是 Linux 那样的 inode 号，数字本身没有意义，只保证"同一对象相同、不同对象不同"，管道槽位复用后编号会重复；②`open("/proc/self/fd/N")`（重新打开同一个文件）没有做，`stat` 这些路径也没有；~~③被 `unlink` 的 tmpfs 文件读回 `ENOENT`，Linux 是路径加 ` (deleted)`~~（tmpfs 已处理，见文末 hello276 一节）；~~④ext2 的路径取的是**打开时的名字**，文件被 `rename` 之后仍是旧名字（目录描述符那边是按 inode 重建的，文件这边没有）~~（hello278 处理，见文末）；⑤只测了自己的进程，别的用户进程的 `fd` 目录的 `EACCES` 没有单独用例（共用 `maps` 的策略，策略有单元测试）。
 
 ### `/proc/self/fd/N` 作为路径：`open` 与 `stat`（hello257 续，已修）
 
@@ -7239,7 +7239,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修改：把上一段 `readlink.zig` 里按描述符类型拼目标文本的那一大段**抽成独立模块 `fd_target.zig`**（`describe`），`readlink`、`open`、`stat` 共用同一份；新增 `resolveMagicLink`：名字是 `/proc/self/fd/N` 时换成描述符读回的路径，没有路径的（管道、套接字、event 对象）返回 `ENXIO`。FAT32 文件原来在 `readlink` 里落到 "file"，现在读回 `/<名字>`。`file_io.openAt` 和 `statx` 各加一处调用（`statx` 只在跟随链接时换名）。
 - 绿灯：hello257 现在 13 项（实际运行计数）通过；host 1077/1077。变异：让 `resolveMagicLink` 永远返回 `.same`（真编译）→ `open` 和 `stat` 两项失败（`open -2`、`rc -1`），其余通过；还原后通过。
 - 过程说明（如实）：①中间我在 `file_io.zig` 里加了 `const std`，抽出之后用不到，已删，`git diff` 里不再出现；②`host_test.zig` 里 `file_io_source`/`statx_source` 已存在，我重复添加被编译器拒绝，去掉了重复；③两条 host 形状测试因代码移动需要同步：`statx` 的 `openWithCredentials` 调用变量名变了（`stat_name`），readlink 形状测试改为检查 `fd_target.zig`——断言的是同样的意图。
-- `lstat` 一项见下一段（已处理）。未验证：①（已处理，见下）；~~②`O_CREAT|O_EXCL` 等标志经过这个名字的行为；③`open` 到 `ENXIO` 的情形（管道）没有运行时用例~~（hello277 处理；另外，管道在 Linux 上其实能重开，不是 `ENXIO`，见文末）；④描述符指向的文件被 `rename` 后 ext2 仍用旧名字。
+- `lstat` 一项见下一段（已处理）。未验证：①（已处理，见下）；~~②`O_CREAT|O_EXCL` 等标志经过这个名字的行为；③`open` 到 `ENXIO` 的情形（管道）没有运行时用例~~（hello277 处理；另外，管道在 Linux 上其实能重开，不是 `ENXIO`，见文末）；~~④描述符指向的文件被 `rename` 后 ext2 仍用旧名字~~（hello278 处理）。
 
 ### hello174 排空完全停滞：第一次拿到收发两端的 TCP_INFO（本地 SMP=2 门禁里复现）
 
@@ -7668,7 +7668,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - `fd_target.resolveMagicLink` 改为返回描述符和可选路径。对 tmpfs，是否已删除由新增的 `tmpfs.tmpfsIsDeleted` 判断，而不是看文本是否以后缀结尾，因为活着的文件本身也可能叫 `x (deleted)`。
   - `openAt`：仍有路径时按路径重新打开（与以前一样）；已删除时复制描述符，偏移独立并从 0 开始（这一步在 hello277 一节改为按索引重新打开，见下）。`statx` 直接对该描述符取属性，不再按名字重开。
 - 绿灯：hello276 五项全过，hello257、hello86 照常通过；host 测试见提交记录；三个架构构建通过；完整 smoke 见提交记录。
-- 如实的局限：①只覆盖 tmpfs。ext2/FAT32 的文件被 `unlink` 后，链接仍返回 `ENOENT` 或旧名字（这两个文件系统在这里不保留已删除条目的父链）。~~②复制描述符时沿用原访问模式~~、~~③`O_CREAT|O_EXCL`、`O_TRUNC` 没有运行时用例~~：两项都在 hello277 一节处理。
+- 如实的局限：①只覆盖 tmpfs。ext2/FAT32 的文件被 `unlink` 后，链接仍返回 `ENOENT` 或旧名字（这两个文件系统在这里不保留已删除条目的父链）。（ext2 部分已在 hello278 处理，FAT32 仍是旧行为。）~~②复制描述符时沿用原访问模式~~、~~③`O_CREAT|O_EXCL`、`O_TRUNC` 没有运行时用例~~：两项都在 hello277 一节处理。
 
 ## 经 /proc/self/fd/N 打开时的标志与对象类型（hello277，已修）
 
@@ -7683,4 +7683,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - `openAt`：仍有名字时按路径以新标志打开（`O_EXCL`、`O_DIRECTORY` 原来就由按名打开处理，这次只是因为链接名不再被当成普通名字而生效）；已删除的 tmpfs 条目改用新的 `tmpfs.tmpfsReopenIdx`，与按名打开现有条目做同样的检查（`EEXIST`、目录规则、权限、`O_TRUNC`）；管道用 `FdTable.reopenPipe`。删除了 `dupFdOwnOffset`。
   - `statx`：`.object` 直接对该描述符取属性。
 - 绿灯：hello277 16 项全过，hello276、hello257 照常通过；host 测试见提交记录；三个架构构建与完整 smoke 见提交记录。
-- 如实的局限：①ext2/FAT32 文件被 `unlink` 后仍不能经链接重开（同 hello276 ①）；②权限只核对文件自身的模式位，不核对路径上各级目录（这与按名打开 tmpfs 的现状一致）；③timerfd、inotify、pidfd 的 `EACCES` 由同一条规则覆盖，没有逐一的运行时用例。
+- 如实的局限：①~~ext2~~/FAT32 文件被 `unlink` 后仍不能经链接重开（同 hello276 ①；ext2 已在 hello278 处理）；②权限只核对文件自身的模式位，不核对路径上各级目录（这与按名打开 tmpfs 的现状一致）；③timerfd、inotify、pidfd 的 `EACCES` 由同一条规则覆盖，没有逐一的运行时用例。
+
+## ext2 文件的 /proc/self/fd/N 跟随改名和删除（hello278，已修）
+
+- 起因：hello257 一节“未验证”的第 ④ 项，以及 hello276 一节局限 ① 的 ext2 部分。宿主机 Linux 实测：文件被 `rename` 后，`readlink` 返回新路径；父目录被 `rename` 后，返回新的父路径加文件名；打开时用的名字被 `unlink` 后返回 `"<路径> (deleted)"`，**即使还有别的硬链接也一样**；此时经链接仍能重开并读到数据。
+- 实现：ext2 的打开槽位一直保存着打开时的路径。新的 `kernel/fs/ext2_open_path_policy.zig` 给出两条纯函数规则（带内联测试）：`afterRename` 把以旧名字为全名或目录前缀的路径改写成新名字，`unlinkHits` 判断被删的名字是否就是保存的路径（比较时去掉首尾的 `/`）。`ext2.zig` 在 `unlinkFile`、`renameFileMode`（文件与目录两个分支）和 `renameExchange` 成功后对所有打开槽位应用这两条规则；被删中的槽位记在 `open_path_deleted`。`fd_target.describe` 对这类槽位追加 ` (deleted)`，`resolveMagicLink` 不再给出路径，`file_io.openAt` 改为调用 `FdTable.reopenExt2Slot`：它复制 inode 和 unlink_pending 到新槽位（新槽位同样是 deleted），处理 `O_CREAT|O_EXCL`（`EEXIST`）和 `O_TRUNC`。
+- 红灯（如实）：实现先于测试写好。为证明测试有效，做了变异：让 `followRenameUnlocked` 和 `followUnlinkUnlocked` 直接返回（真编译），hello278 的改名、删除、经链接重开、父目录改名四项失败（链接仍是 `"/testdir/h278a"`，重开 `-2`），两项“普通路径”通过；还原后七项全过。
+- 绿灯：hello278 七项全过，hello257、hello277 照常通过；host 测试、三个架构构建与完整 smoke 见提交记录。
+- 如实的局限：①目录被 `rmdir` 后，目录描述符的链接在 Linux 上是 ` (deleted)`，这里没有处理；②保存的路径如果是在非根工作目录下按相对名字打开的，而 `rename` 的参数已被解析成绝对路径，两者匹配不上，链接会留在旧名字（测试都从根目录出发）；③FAT32 不做（它没有硬链接，打开槽位也不保留父链）；④硬链接 `link` 不改变任何槽位的路径，这与 Linux 一致。

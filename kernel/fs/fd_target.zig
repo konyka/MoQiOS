@@ -28,6 +28,11 @@ pub fn describe(t: *task_mod.Task, fd_val: u32, text: *[256]u8) Result {
             }
             if (w + stored.len > text.len) return .{ .err = -36 };
             @memcpy(text[w..][0..stored.len], stored);
+            // The name it was opened by was unlinked: Linux reports that path plus " (deleted)" (measured, also with another link left).
+            if (ext2_mod.openPathDeleted(d.ext2_file_idx)) {
+                const total = @import("deleted_name_policy.zig").appendInPlace(text, w + stored.len) orelse return .{ .err = -36 };
+                return .{ .ok = total };
+            }
             return .{ .ok = w + stored.len };
         },
         .fat32_file => {
@@ -103,7 +108,12 @@ pub fn resolveMagicLink(t: *task_mod.Task, name: []const u8, buf: *[256]u8) Reso
             const gone = @import("tmpfs.zig").tmpfsIsDeleted(t.fd_table.fds[fdn].tmpfs_idx);
             return .{ .file = .{ .fd = fdn, .path = if (gone) null else p } };
         },
-        .ext2_file, .fat32_file => {
+        .ext2_file => {
+            const p = filePath(t, fdn, buf);
+            const gone = ext2_mod.openPathDeleted(t.fd_table.fds[fdn].ext2_file_idx);
+            return .{ .file = .{ .fd = fdn, .path = if (gone) null else p } };
+        },
+        .fat32_file => {
             const p = filePath(t, fdn, buf);
             return .{ .file = .{ .fd = fdn, .path = p } };
         },

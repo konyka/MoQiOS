@@ -2378,6 +2378,34 @@ pub const FdTable = struct {
         return @intCast(slot);
     }
 
+    /// open("/proc/self/fd/N") of an ext2 file whose name was unlinked: a new slot on the same inode (ext2.reopenSlot), its own offset,
+    /// opened with the flags given now. O_CREAT|O_EXCL is EEXIST (the file exists), O_TRUNC truncates.
+    pub fn reopenExt2Slot(self: *FdTable, src_idx: u32, flags: u32, euid: u32, egid: u32, effective_caps: SysCap) i64 {
+        const ext2 = @import("ext2.zig");
+        if ((flags & 0x40) != 0 and (flags & 0x80) != 0) return -17;
+        const slot = self.allocFd() orelse return -24;
+        const r = ext2.reopenSlot(src_idx, .{ .euid = euid, .egid = egid, .cap_dac_override = effective_caps.cap_dac_override, .groups = @import("../proc/current_groups.zig").forCaller(euid, egid) }, flags);
+        if (r < 0) {
+            self.freeFd(slot);
+            return r;
+        }
+        const idx: u32 = @intCast(r);
+        const is_writable = (flags & 0x03) != 0;
+        if ((flags & 0x200) != 0 and is_writable) _ = ext2.truncateFile(idx, 0);
+        self.fds[slot] = .{
+            .fd_type = .ext2_file,
+            .offset = 0,
+            .file_size = ext2.getFileSize(idx),
+            .ext2_file_idx = idx,
+            .writable = is_writable,
+            .inode_id = 0x3000_0000_0000_0000 + @as(u64, ext2.getInodeNum(idx)),
+            .status_flags = flags & @import("fcntl_policy.zig").OPEN_STATUS_MASK,
+        };
+        readahead.initState(&self.fds[slot].readahead_state);
+        self.publishFd(slot);
+        return @intCast(slot);
+    }
+
     /// open("/proc/self/fd/N") of a pipe end: a new descriptor on the same pipe, as the end the new access mode asks for
     /// (magic_link_policy.reopenObject), with the new status flags.
     pub fn reopenPipe(self: *FdTable, pipe_idx: u32, write_end: bool, flags: u32) i64 {

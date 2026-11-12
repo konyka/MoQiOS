@@ -130,6 +130,67 @@ var fs_lock: IrqSpinlock = .{};
 
 // ─── Open file path table (paths of open slots, for *at() directory fds) ───
 var open_file_paths: [MAX_OPEN_FILES][256]u8 = @splat(@splat(0));
+/// The name a slot was opened by has been unlinked (ext2_open_path_policy): /proc/self/fd/N reads its path plus " (deleted)".
+var open_path_deleted: [MAX_OPEN_FILES]bool = @splat(false);
+
+/// Keep every open slot's path where the namespace moved it after `old` was renamed to `new` (or swapped with it). Caller holds fs_lock.
+fn followRenameUnlocked(old: []const u8, new: []const u8, exchange: bool) void {
+    const pol = @import("ext2_open_path_policy.zig");
+    for (0..open_count) |i| {
+        if (open_files[i].inode_num == 0 or open_path_deleted[i]) continue;
+        var len: usize = 0;
+        while (len < 256 and open_file_paths[i][len] != 0) : (len += 1) {}
+        var cur: [256]u8 = undefined;
+        @memcpy(cur[0..len], open_file_paths[i][0..len]);
+        var out: [255]u8 = undefined;
+        const n = pol.afterRename(cur[0..len], old, new, &out) orelse (if (exchange) pol.afterRename(cur[0..len], new, old, &out) else null) orelse continue;
+        @memcpy(open_file_paths[i][0..n], out[0..n]);
+        open_file_paths[i][n] = 0;
+    }
+}
+
+/// Mark the open slots reached by `path` as deleted after it was unlinked. Caller holds fs_lock.
+fn followUnlinkUnlocked(path: []const u8) void {
+    const pol = @import("ext2_open_path_policy.zig");
+    for (0..open_count) |i| {
+        if (open_files[i].inode_num == 0) continue;
+        var len: usize = 0;
+        while (len < 256 and open_file_paths[i][len] != 0) : (len += 1) {}
+        if (pol.unlinkHits(open_file_paths[i][0..len], path)) open_path_deleted[i] = true;
+    }
+}
+
+/// True when the name slot `file_idx` was opened by has been unlinked.
+pub fn openPathDeleted(file_idx: u32) bool {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    return file_idx < open_count and open_files[file_idx].inode_num != 0 and open_path_deleted[file_idx];
+}
+
+/// open("/proc/self/fd/N") of an ext2 slot whose name was unlinked: a new slot on the same inode, checked like an open by name
+/// (directory rules, the mode bits against the new access mode), with O_TRUNC applied by the caller. -2 when the slot is gone.
+pub fn reopenSlot(file_idx: u32, who: ?Who, flags_in: u32) i64 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (!active or file_idx >= open_count or open_files[file_idx].inode_num == 0) return -2;
+    const src = open_files[file_idx];
+    const np = @import("namespace_policy.zig");
+    const rule = np.openExisting(if (eu.isDirectory(src.inode.mode)) .directory else .file, flags_in);
+    if (rule != 0) return rule;
+    if (who) |w| {
+        if (!@import("dac.zig").decideExistingOpen(inodeMeta(&src.inode), w.creds(), flags_in).allowed) return -13;
+    }
+    for (0..MAX_OPEN_FILES) |i| {
+        if (i >= open_count or open_files[i].inode_num == 0) {
+            open_files[i] = .{ .inode_num = src.inode_num, .inode = src.inode, .offset = 0, .unlink_pending = src.unlink_pending };
+            open_file_paths[i] = open_file_paths[file_idx];
+            open_path_deleted[i] = true;
+            if (i >= open_count) open_count = @intCast(i + 1);
+            return @intCast(i);
+        }
+    }
+    return -23;
+}
 
 // ─── Initialization ───────────────────────────────────────────────────────
 
@@ -559,6 +620,7 @@ pub fn openFileFollow(name: []const u8, who: ?Who, follow_final: bool) i64 {
         const copy_len = @min(name.len, 255);
         @memcpy(open_file_paths[idx][0..copy_len], name[0..copy_len]);
         open_file_paths[idx][copy_len] = 0;
+        open_path_deleted[idx] = false;
     }
     return result;
 }
@@ -1201,6 +1263,7 @@ fn closeFileUnlocked(file_idx: u32) u32 {
     f.unlink_pending = false;
     // v52.3: clear full path to prevent stale data leak
     @memset(open_file_paths[file_idx][0..256], 0);
+    open_path_deleted[file_idx] = false;
     return if (reclaim) inode_num else 0;
 }
 
@@ -2460,6 +2523,7 @@ pub fn createFile(name: []const u8, creator: Creator, who: ?Who) i64 {
             const copy_len = @min(name.len, 255);
             @memcpy(open_file_paths[i][0..copy_len], name[0..copy_len]);
             open_file_paths[i][copy_len] = 0;
+            open_path_deleted[i] = false;
             if (i >= open_count) open_count = @intCast(i + 1);
             return @intCast(i);
         }
@@ -2659,6 +2723,7 @@ pub fn createDir(name: []const u8, creator: Creator, who: ?Who) i64 {
             const copy_len = @min(name.len, 255);
             @memcpy(open_file_paths[i][0..copy_len], name[0..copy_len]);
             open_file_paths[i][copy_len] = 0;
+            open_path_deleted[i] = false;
             if (i >= open_count) open_count = @intCast(i + 1);
             return @intCast(i);
         }
@@ -2951,6 +3016,7 @@ pub fn unlinkFile(path: []const u8, who: ?Who) i64 {
 
     // Remove directory entry from parent
     if (!removeDirEntry(parent_inode_num, filename)) return -1;
+    followUnlinkUnlocked(path);
 
     serial.writeString("[ext2] unlinked: ");
     serial.writeString(filename);
@@ -3089,7 +3155,9 @@ pub fn renameFileMode(old_path: []const u8, new_path: []const u8, who: ?Who, nor
     var file_inode: Ext2Inode = undefined;
     if (!readInode(file_inode_num, &file_inode)) return -5;
     if (eu.isDirectory(file_inode.mode)) {
-        return renameDirUnlocked(old_parent_inode, old_filename, new_parent_inode, new_filename, file_inode_num, noreplace);
+        const dr = renameDirUnlocked(old_parent_inode, old_filename, new_parent_inode, new_filename, file_inode_num, noreplace);
+        if (dr == 0) followRenameUnlocked(old_path, new_path, false);
+        return dr;
     }
     const file_type: u8 = 1;
 
@@ -3144,6 +3212,7 @@ pub fn renameFileMode(old_path: []const u8, new_path: []const u8, who: ?Who, nor
         }
     }
 
+    followRenameUnlocked(old_path, new_path, false);
     serial.writeString("[ext2] renamed to: ");
     serial.writeString(new_filename);
     serial.writeString("\n");
@@ -3320,6 +3389,7 @@ pub fn renameExchange(old_path: []const u8, new_path: []const u8, who: ?Who) i64
         adjustLinks(pa, d.old_parent);
         adjustLinks(pb, d.new_parent);
     }
+    followRenameUnlocked(old_path, new_path, true);
     return 0;
 }
 

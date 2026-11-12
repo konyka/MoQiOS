@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello277`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello278`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -273,6 +273,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello275 | 曾经让写回池失效的两种 FAT32 写入：`unlink` 之后仍打开的文件的写入（并在 `fsync` 后按 `unlink` 前的内容读回）、`ftruncate` 加长后在旧末尾之外写入（空洞读回 0）；随后各向一个新建的 FAT32 和 ext2 文件写 4 MiB（超过整个 512 块的写回池），两者都必须完整 |
 | hello276 | 打开期间被 `unlink` 的 tmpfs 条目的 `/proc/self/fd/N`：`readlink` 返回原路径加 `" (deleted)"`（文件和目录都是），经该链接 `open` 仍能读到数据且从偏移 0 开始、不影响原描述符的偏移，`stat` 成功；仍有名字的条目不带后缀 |
 | hello277 | 经 `/proc/self/fd/N` 打开时按本次传入的标志和对象类型处理（文件和已 `unlink` 的 tmpfs 条目都一样）：`O_CREAT\|O_EXCL` 得 `EEXIST`，`O_TRUNC` 截断，文件上的 `O_DIRECTORY` 得 `ENOTDIR`，目录的 `O_RDWR` 得 `EISDIR`；访问模式按新标志并重新核对权限（非 root 对 0444 文件请求写得 `EACCES`，`unlink` 后仍然）；管道任一端按访问模式重开为对应的一端，eventfd/epoll 得 `EACCES`、套接字得 `ENXIO`；经链接对管道、套接字 `stat` 成功 |
+| hello278 | ext2 文件的 `/proc/self/fd/N` 跟随改名和删除：文件或父目录被 `rename` 后链接给出新路径；打开时用的名字被 `unlink` 后给出 `"<路径> (deleted)"`（即使还有别的硬链接），经链接仍能重开并读到数据，重开得到的描述符同样是 deleted；未改动的文件和幸存的硬链接给出普通路径 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。
