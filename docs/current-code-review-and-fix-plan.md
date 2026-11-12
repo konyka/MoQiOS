@@ -7806,7 +7806,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello286 新增 H 段八项。改动前的内核（SMP=2）上，H 段第一项就卡住：`tkill(thread, SIGSTOP)` 只停了那个线程，组长还在跑，父进程的 `waitpid(WUNTRACED)` 一直等不到整组停下，测试不再有输出。
 - 实现：`signal_syscall.tkill` 在权限检查之后，若 `group_stop_policy.actsOnEveryThread(sig, 目标的处理动作)` 为真（`SIGKILL`、`SIGCONT`、`SIGSTOP`，以及取默认动作的 `SIGTSTP`/`SIGTTIN`/`SIGTTOU`），改走 `kill(pid)` 用的 `sendToProcess`；其余信号仍只发给那个线程。继续的报告仍由组长的 `continueTask` 产生，因为 `sendToProcess` 总是最后给组长发信号。
 - 绿灯：宿主机 Linux 上 H 段八项全过；目标机定向 SMP=4 一份、SMP=2 两份全过（hello286 整体 PASS）。随后的完整 smoke 里有两份卡住，原因见下一节（`sigsuspend`/`pause` 里的停止），修好后完整 smoke 四份通过。
-- 如实的局限：①~~整组路径走 `sendSignal`，每个成员的 `siginfo` 都是 `SI_USER`~~（已实现，见文末 hello286 K 一节）；②`rt_tgsigqueueinfo` 没有同样改动。
+- 如实的局限：①~~整组路径走 `sendSignal`，每个成员的 `siginfo` 都是 `SI_USER`~~（已实现，见文末 hello286 K 一节）；②~~`rt_tgsigqueueinfo` 没有同样改动~~（已实现，见文末 hello288 一节）。
 
 ## 在 sigsuspend 里解除阻塞的默认停止信号会停下任务（hello286 I，已实现）
 
@@ -7839,3 +7839,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello286 新增 K 段三项。改动前的内核（SMP=2）上三项全失败：handler 运行了 3 次（`UUU`），`tkill` 那一项也是 `SI_USER`。
 - 实现：`group_stop_policy.deliversContinue`（宿主机测试 1 条）：整组 `SIGCONT` 只排给被点名的那个任务（`kill(pid)` 是组长）。`signal_syscall.sendToProcessWith` 对其余成员只调用新的 `signal.continueOnly`，恢复它们但不置待处理位。`tkill` 先构造 `SI_TKILL` 的 `siginfo` 再走整组路径，所以停止、继续和 `SIGKILL` 也都带调用者的 `siginfo`。
 - 绿灯：宿主机 Linux 上 K 段三项全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello286 整体 PASS）。`zig build test` 通过，三个架构构建通过；完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，hello57、hello210、hello286、hello287 都通过，hello228 的 `corrupted canaries` 都是 0。
+
+## rt_tgsigqueueinfo 按线程投递（hello288，已实现）
+
+- 起因：hello286 H 一节局限②，以及 hello189 一节"未对照"里的同一条：`rtTgsigqueueinfo` 丢掉 tid 参数，直接转给 `rtSigqueueinfo(tgid, ...)`，信号总是排给组长，tid 是 0、负数或别的进程的线程时也照样成功。
+- Linux 依据（宿主机实测，`/tmp/tq2.c` 与 `user/hello288.c -DHOST`，8 项全过；检查顺序取自 `do_rt_tgsigqueueinfo`、`do_send_specific`、`check_kill_permission`）：先拷贝 siginfo（`EFAULT`），tid 或 tgid 不是正数是 `EINVAL`，si_code 是 `SI_USER`/`SI_TKILL` 之类且调用者的 tid 不等于目标 tid 时是 `EPERM`，目标线程不存在或不属于 tgid 是 `ESRCH`（排在信号号前面），信号号非法是 `EINVAL`，然后查权限，sig 0 只探测；handler 在被点名的线程里运行，带调用者的 value 和 code。
+- 红灯：改动前的内核（SMP=2）上 hello288 八项里三项失败：A 段 handler 在组长里运行而不是被点名的线程；C 段 tid 1（init）配本进程的 tgid 返回 0；D 段 tid 0 返回 0、tgid 0 返回 `ESRCH`、tid -1 返回 0。
+- 实现：`proc_id_policy.tgsigqueueinfoVerdict`（宿主机测试 1 条，11 个断言）按上面的顺序给出 `einval`/`eperm`/`esrch`/`probe`/`deliver`。`signal_syscall.rtTgsigqueueinfo` 拷贝 siginfo、按 tid 查目标，把结果交给它判断；投递时 `SIGSTOP`/`SIGCONT`/`SIGKILL` 和取默认动作的 `SIGTSTP`/`SIGTTIN`/`SIGTTOU` 走 `sendToProcessWith`（与 `tkill` 一致，作用于整个进程），其余信号经 `sendSignalInfoResult` 只排给那个线程。
+- 绿灯：宿主机 Linux 上八项全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS）。`zig build test` 通过，三个架构构建通过；完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello286、hello287、hello288 都通过，hello228 的 `corrupted canaries` 都是 0。
+- 如实的局限：①hello288 没有测停止、继续经 `rt_tgsigqueueinfo` 作用于整组，这条路径与 `tkill` 共用 `sendToProcessWith`，由 hello286 H/K 覆盖；②`rt_sigqueueinfo` 判断"发给自己"用的是 tgid，Linux 用调用者的 tid 和目标 pid 比较，非主线程用 `SI_USER` 发给自己所在的进程在 Linux 上是 `EPERM`，这里允许，待实测后再改。

@@ -77,3 +77,36 @@ pub fn waitMatches(pid: i32, child_tid: u32, child_pgid: u16, caller_pgid: u16) 
     if (pid == @import("std").math.minInt(i32)) return false;
     return child_pgid == @as(u32, @intCast(-pid)) and -pid <= MAX_GROUP_ID;
 }
+
+/// Outcome of the checks rt_tgsigqueueinfo does after the siginfo copy.
+/// Linux (do_rt_tgsigqueueinfo / do_send_specific / check_kill_permission):
+/// a non-positive id is EINVAL; a forged si_code is EPERM before the target
+/// is looked up; a missing thread or a thread of another process is ESRCH,
+/// ahead of the signal-number check; permission is checked even for sig 0.
+pub const TgsigqueueVerdict = enum { einval, eperm, esrch, probe, deliver };
+
+pub fn tgsigqueueinfoVerdict(tgid: i32, tid: i32, sig: u32, code_allowed: bool, target_tgid: ?u32, may_signal: bool) TgsigqueueVerdict {
+    if (tid <= 0 or tgid <= 0) return .einval;
+    if (!code_allowed) return .eperm;
+    const tg = target_tgid orelse return .esrch;
+    if (tg != @as(u32, @intCast(tgid))) return .esrch;
+    if (sig > 64) return .einval;
+    if (!may_signal) return .eperm;
+    if (sig == 0) return .probe;
+    return .deliver;
+}
+
+test "rt_tgsigqueueinfo checks run in Linux order" {
+    const V = TgsigqueueVerdict;
+    try @import("std").testing.expectEqual(V.einval, tgsigqueueinfoVerdict(1, 0, 10, true, null, false));
+    try @import("std").testing.expectEqual(V.einval, tgsigqueueinfoVerdict(-1, 5, 10, true, 1, true));
+    try @import("std").testing.expectEqual(V.eperm, tgsigqueueinfoVerdict(1, 5, 10, false, null, false));
+    try @import("std").testing.expectEqual(V.esrch, tgsigqueueinfoVerdict(1, 5, 10, true, null, false));
+    try @import("std").testing.expectEqual(V.esrch, tgsigqueueinfoVerdict(1, 5, 10, true, 2, true));
+    try @import("std").testing.expectEqual(V.esrch, tgsigqueueinfoVerdict(1, 5, 65, true, null, false));
+    try @import("std").testing.expectEqual(V.einval, tgsigqueueinfoVerdict(1, 5, 65, true, 1, true));
+    try @import("std").testing.expectEqual(V.eperm, tgsigqueueinfoVerdict(1, 5, 10, true, 1, false));
+    try @import("std").testing.expectEqual(V.eperm, tgsigqueueinfoVerdict(1, 5, 0, true, 1, false));
+    try @import("std").testing.expectEqual(V.probe, tgsigqueueinfoVerdict(1, 5, 0, true, 1, true));
+    try @import("std").testing.expectEqual(V.deliver, tgsigqueueinfoVerdict(1, 5, 10, true, 1, true));
+}

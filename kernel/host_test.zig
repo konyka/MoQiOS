@@ -379,6 +379,7 @@ test {
     _ = @import("proc/task_lifetime_policy.zig");
     _ = @import("proc/task_slot_lifetime.zig");
     _ = @import("proc/reap_policy.zig");
+    _ = @import("proc/proc_id_policy.zig");
     _ = @import("proc/sched_queue_policy.zig");
     _ = @import("proc/siginfo_policy.zig");
     _ = @import("proc/sigqueue_policy.zig");

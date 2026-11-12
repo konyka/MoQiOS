@@ -647,6 +647,35 @@ pub fn signalfd4(old_fd: u64, mask: u64, sizemask: u64, flags: u64) i64 {
 
 /// rt_tgsigqueueinfo(tgid, tid, sig, uinfo) → 0 or -errno
 pub fn rtTgsigqueueinfo(tgid: u32, tid: u32, sig: u32, uinfo: u64) i64 {
-    _ = tid;
-    return rtSigqueueinfo(tgid, sig, uinfo);
+    const si = @import("siginfo_policy.zig");
+    const id_policy = @import("proc_id_policy.zig");
+    // Linux copies the siginfo before anything else: an unreadable pointer is
+    // EFAULT even for a nonsense id or signal number.
+    var raw: [si.SIGINFO_SIZE]u8 = undefined;
+    if (uinfo == 0 or !copy.validateUserBuffer(uinfo, raw.len)) return -14;
+    if (copy.copyFromUser(&raw, @ptrFromInt(uinfo), raw.len) != raw.len) return -14;
+    const info = si.decode(&raw);
+    const cur = sched.currentTask();
+    const target_idx = task_mod.findTaskByTid(tid);
+    const target = if (target_idx) |i| task_mod.getTask(i) else null;
+    const verdict = id_policy.tgsigqueueinfoVerdict(
+        @bitCast(tgid),
+        @bitCast(tid),
+        sig,
+        si.queueinfoAllowed(info.code, if (cur) |c| c.tid == tid else true),
+        if (target) |t| threadGroupId(t) else null,
+        target != null and currentMaySignalTask(tid),
+    );
+    switch (verdict) {
+        .einval => return -22,
+        .eperm => return -1,
+        .esrch => return -3,
+        .probe => return 0,
+        .deliver => {},
+    }
+    // Linux: a stop, SIGCONT or SIGKILL aimed at one thread acts on its whole process.
+    const t = target.?;
+    if (@import("group_stop_policy.zig").actsOnEveryThread(sig, t.sigact().handlers[sig - 1]))
+        return sendToProcessWith(t, tid, sig, info);
+    return sig_mod.sendSignalInfoResult(tid, sig, info);
 }
