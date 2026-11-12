@@ -2406,6 +2406,33 @@ pub const FdTable = struct {
         return @intCast(slot);
     }
 
+    /// open("/proc/self/fd/N") of a FAT32 file unlinked while open: a new descriptor (offset 0) holding one more reference on the same
+    /// slot. FAT32 has no permission bits here (like an open by name); O_CREAT|O_EXCL is EEXIST, O_DIRECTORY ENOTDIR, O_TRUNC truncates.
+    pub fn reopenFat32Pending(self: *FdTable, idx: u32, flags: u32) i64 {
+        const fat32 = @import("fat32.zig");
+        if ((flags & 0x40) != 0 and (flags & 0x80) != 0) return -17;
+        if ((flags & 0x10000) != 0) return -20;
+        const slot = self.allocFd() orelse return -24;
+        if (!fat32.retainPending(idx)) {
+            self.freeFd(slot);
+            return -2;
+        }
+        const is_writable = (flags & 0x03) != 0;
+        if ((flags & 0x200) != 0 and is_writable) _ = fat32.truncateFile(idx, 0);
+        self.fds[slot] = .{
+            .fd_type = .fat32_file,
+            .offset = 0,
+            .file_size = fat32.getFileSize(idx),
+            .fat32_file_idx = idx,
+            .writable = is_writable,
+            .inode_id = 0x2000_0000_0000_0000 + @as(u64, fat32.getFirstCluster(idx)),
+            .status_flags = flags & @import("fcntl_policy.zig").OPEN_STATUS_MASK,
+        };
+        readahead.initState(&self.fds[slot].readahead_state);
+        self.publishFd(slot);
+        return @intCast(slot);
+    }
+
     /// open("/proc/self/fd/N") of a pipe end: a new descriptor on the same pipe, as the end the new access mode asks for
     /// (magic_link_policy.reopenObject), with the new status flags.
     pub fn reopenPipe(self: *FdTable, pipe_idx: u32, write_end: bool, flags: u32) i64 {

@@ -131,6 +131,8 @@ pub fn openAt(dirfd: i64, name_ptr: u64, flags: u32, requested_mode: ?u32) i64 {
             cur.fd_table.reopenTmpfsIdx(cur.fd_table.fds[f.fd].tmpfs_idx, flags, cur.euid, cur.egid, cur.effective_caps)
         else if (cur.fd_table.fds[f.fd].fd_type == .ext2_file)
             cur.fd_table.reopenExt2Slot(cur.fd_table.fds[f.fd].ext2_file_idx, flags, cur.euid, cur.egid, cur.effective_caps)
+        else if (cur.fd_table.fds[f.fd].fd_type == .fat32_file)
+            cur.fd_table.reopenFat32Pending(cur.fd_table.fds[f.fd].fat32_file_idx, flags)
         else
             -2,
         .object => |o| switch (@import("magic_link_policy.zig").reopenObject(o.kind, flags)) {

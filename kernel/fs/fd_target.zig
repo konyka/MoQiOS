@@ -37,10 +37,17 @@ pub fn describe(t: *task_mod.Task, fd_val: u32, text: *[256]u8) Result {
         },
         .fat32_file => {
             // A FAT32 file is an entry of the root directory.
-            const nm = @import("fat32.zig").getFileName(d.fat32_file_idx) orelse return .{ .err = -2 };
+            const fat32 = @import("fat32.zig");
+            const live = fat32.getFileName(d.fat32_file_idx);
+            const nm = live orelse fat32.pendingName(d.fat32_file_idx) orelse return .{ .err = -2 };
             if (1 + nm.len > text.len) return .{ .err = -36 };
             text[0] = '/';
             @memcpy(text[1..][0..nm.len], nm);
+            if (live == null) {
+                // Unlinked while open: the name plus " (deleted)", as on every Linux filesystem.
+                const total = @import("deleted_name_policy.zig").appendInPlace(text, 1 + nm.len) orelse return .{ .err = -36 };
+                return .{ .ok = total };
+            }
             return .{ .ok = 1 + nm.len };
         },
         .pipe_read, .pipe_write => return wrap(readlink_policy.numberedLink("pipe", d.pipe_idx, text)),
@@ -115,7 +122,8 @@ pub fn resolveMagicLink(t: *task_mod.Task, name: []const u8, buf: *[256]u8) Reso
         },
         .fat32_file => {
             const p = filePath(t, fdn, buf);
-            return .{ .file = .{ .fd = fdn, .path = p } };
+            const gone = @import("fat32.zig").pendingName(t.fd_table.fds[fdn].fat32_file_idx) != null;
+            return .{ .file = .{ .fd = fdn, .path = if (gone) null else p } };
         },
         .devfs => {
             const p = filePath(t, fdn, buf) orelse return .{ .err = -2 };

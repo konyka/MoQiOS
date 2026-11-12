@@ -7668,7 +7668,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - `fd_target.resolveMagicLink` 改为返回描述符和可选路径。对 tmpfs，是否已删除由新增的 `tmpfs.tmpfsIsDeleted` 判断，而不是看文本是否以后缀结尾，因为活着的文件本身也可能叫 `x (deleted)`。
   - `openAt`：仍有路径时按路径重新打开（与以前一样）；已删除时复制描述符，偏移独立并从 0 开始（这一步在 hello277 一节改为按索引重新打开，见下）。`statx` 直接对该描述符取属性，不再按名字重开。
 - 绿灯：hello276 五项全过，hello257、hello86 照常通过；host 测试见提交记录；三个架构构建通过；完整 smoke 见提交记录。
-- 如实的局限：①只覆盖 tmpfs。ext2/FAT32 的文件被 `unlink` 后，链接仍返回 `ENOENT` 或旧名字（这两个文件系统在这里不保留已删除条目的父链）。（ext2 部分已在 hello278 处理，FAT32 仍是旧行为。）~~②复制描述符时沿用原访问模式~~、~~③`O_CREAT|O_EXCL`、`O_TRUNC` 没有运行时用例~~：两项都在 hello277 一节处理。
+- 如实的局限：①只覆盖 tmpfs。ext2/FAT32 的文件被 `unlink` 后，链接仍返回 `ENOENT` 或旧名字（这两个文件系统在这里不保留已删除条目的父链）。（ext2 部分已在 hello278 处理，FAT32 在 hello280 处理。）~~②复制描述符时沿用原访问模式~~、~~③`O_CREAT|O_EXCL`、`O_TRUNC` 没有运行时用例~~：两项都在 hello277 一节处理。
 
 ## 经 /proc/self/fd/N 打开时的标志与对象类型（hello277，已修）
 
@@ -7683,7 +7683,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - `openAt`：仍有名字时按路径以新标志打开（`O_EXCL`、`O_DIRECTORY` 原来就由按名打开处理，这次只是因为链接名不再被当成普通名字而生效）；已删除的 tmpfs 条目改用新的 `tmpfs.tmpfsReopenIdx`，与按名打开现有条目做同样的检查（`EEXIST`、目录规则、权限、`O_TRUNC`）；管道用 `FdTable.reopenPipe`。删除了 `dupFdOwnOffset`。
   - `statx`：`.object` 直接对该描述符取属性。
 - 绿灯：hello277 16 项全过，hello276、hello257 照常通过；host 测试见提交记录；三个架构构建与完整 smoke 见提交记录。
-- 如实的局限：①~~ext2~~/FAT32 文件被 `unlink` 后仍不能经链接重开（同 hello276 ①；ext2 已在 hello278 处理）；②权限只核对文件自身的模式位，不核对路径上各级目录（这与按名打开 tmpfs 的现状一致）；③timerfd、inotify、pidfd 的 `EACCES` 由同一条规则覆盖，没有逐一的运行时用例。
+- 如实的局限：①~~ext2/FAT32 文件被 `unlink` 后仍不能经链接重开~~（同 hello276 ①；ext2 在 hello278、FAT32 在 hello280 处理）；②权限只核对文件自身的模式位，不核对路径上各级目录（这与按名打开 tmpfs 的现状一致）；③timerfd、inotify、pidfd 的 `EACCES` 由同一条规则覆盖，没有逐一的运行时用例。
 
 ## ext2 文件的 /proc/self/fd/N 跟随改名和删除（hello278，已修）
 
@@ -7699,4 +7699,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 发现的真实缺陷：旧代码 `rmdir` 时立即释放目录 inode 和数据块，打开着的目录描述符留在一个已释放（可被复用）的 inode 上；`at_path` 对 ext2 目录描述符在按 inode 重建路径失败后退回到打开时的路径，于是同名新目录建好后，`openat(旧描述符, "y", O_CREAT)` 会把文件**建进新目录**（变异运行中实测：`openat 4`，新目录里 `open` 到了 `y`）。
 - 实现（`kernel/fs/ext2.zig`）：新增 `retireDirUnlocked`，`rmdirFile` 和 `renameDirUnlocked` 的被覆盖目录都走它。没有打开槽位时照旧立即释放；有打开槽位时把 links_count 0 写回磁盘，槽位标为 `unlink_pending` 和 deleted，由最后一次关闭回收（`reclaimUnlinkedInode` 新增目录分支：`freeDirBlocks` 加 `freeInodeAs(.., true)`，组描述符的目录计数随之减少）。`renameFileMode` 覆盖了文件时，对目标名调用 `followUnlinkUnlocked`。`getdents.zig` 对 deleted 的 ext2 目录返回 `ENOENT`，`at_path.zig` 对 deleted 的目录描述符返回 `ENOENT`，不再退回旧路径。
 - 红灯（如实，实现先于测试）：变异为“目录总是立即释放、覆盖不标记”（真编译），hello279 九项中六项失败（链接无后缀、`getdents64` 返回 48、`openat` 建进新目录、重开 `-2`、两项覆盖无后缀）；还原后九项全过，hello278 照常通过。
-- 如实的局限：①变异下 fstat 和“`openat` 在已删目录中得 ENOENT”两项仍通过（旧代码碰巧给出相同结果），这两项是回归保护；②被删目录经链接重开得到的新描述符同样是 deleted；③FAT32 仍不做。
+- 如实的局限：①变异下 fstat 和“`openat` 在已删目录中得 ENOENT”两项仍通过（旧代码碰巧给出相同结果），这两项是回归保护；②被删目录经链接重开得到的新描述符同样是 deleted；③~~FAT32 仍不做~~（hello280 处理，见下一节）。
+
+## 打开期间被 unlink 的 FAT32 文件的 /proc/self/fd/N（hello280，已修）
+
+- 起因：hello276 一节局限 ①、hello277 一节局限 ① 和 hello279 一节局限 ③ 里剩下的 FAT32 部分。Linux 的链接文字由通用 VFS（`d_path`）生成，与文件系统无关，所以按 ext4 和 tmpfs 上实测的行为来做：链接读出 `"<路径> (deleted)"`，经链接仍能重开并读到数据，`O_CREAT|O_EXCL` 得 `EEXIST`。本机没有 root，无法挂载 vfat 直接实测，这一点如实说明。
+- 红灯（改动前的内核，真编译）：hello280 七项中四项失败：链接读回空串（readlink 失败），`O_EXCL` 得 `-2`，重开得 `-2`，原描述符关闭后读不到数据；“有名字时是普通路径”和“最后关闭后名字不存在”两项通过。
+- 实现：FAT32 的 `unlink` 本来就把打开中的文件槽位标为 `unlink_pending`，到最后一次关闭才删除目录项和簇链，只是 `getFileName` 对这类槽位返回 null。新增 `fat32.pendingName`（给出这类槽位的名字）和 `fat32.retainPending`（对这类槽位加一个引用）。`fd_target.describe` 在槽位已删除时追加 ` (deleted)`，`resolveMagicLink` 不再给出路径；`file_io.openAt` 对这类描述符调用新的 `FdTable.reopenFat32Pending`，它处理 `O_CREAT|O_EXCL`（`EEXIST`）、`O_DIRECTORY`（`ENOTDIR`）和 `O_TRUNC`，建立偏移为 0 的新描述符。新描述符关闭时走原有的 `closeFile`，引用计数归零才真正删除。
+- 绿灯：hello280 七项全过，hello270（FAT32 上的 `O_APPEND`）照常通过；host 测试、三个架构构建与完整 smoke 见提交记录。
+- 如实的局限：①FAT32 只有根目录，没有 rename 后的路径跟随问题之外的父目录情形；②FAT32 没有权限位，重开不核对模式位（与按名打开一致）；③没有在 Linux vfat 上直接实测（见上）。

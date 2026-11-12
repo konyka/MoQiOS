@@ -663,6 +663,27 @@ pub fn getFileName(idx: u32) ?[]const u8 {
     return files[idx].name[0..len];
 }
 
+/// The name of a file unlinked while still open (its slot stays active until the last close), or null when `idx` is not such a slot.
+/// /proc/self/fd/N reads it plus " (deleted)" (Linux builds that text in the generic VFS, so FAT32 behaves like the other filesystems).
+pub fn pendingName(idx: u32) ?[]const u8 {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (idx >= file_count) return null;
+    const len = files[idx].name_len;
+    if (!files[idx].active or !files[idx].unlink_pending or len == 0) return null;
+    return files[idx].name[0..len];
+}
+
+/// open("/proc/self/fd/N") of an unlinked-but-open file: one more reference on the same slot, so the data outlives the first
+/// descriptor. False when the slot is gone or not pending.
+pub fn retainPending(idx: u32) bool {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    if (idx >= file_count or !files[idx].active or !files[idx].unlink_pending or files[idx].is_dir) return false;
+    files[idx].ref_count +%= 1;
+    return true;
+}
+
 pub fn setFileSize(idx: u32, size: u32) void {
     const flags = fs_lock.acquire();
     defer fs_lock.release(flags);

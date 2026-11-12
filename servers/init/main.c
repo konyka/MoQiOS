@@ -396,6 +396,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello277"); /* open flags and object kinds through /proc/self/fd/N */
     run_test("hello278"); /* ext2 fd paths follow rename and unlink */
     run_test("hello279"); /* ext2 names removed under an open descriptor (rmdir, rename victims) */
+    run_test("hello280"); /* FAT32 files unlinked while open through /proc/self/fd/N */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */
