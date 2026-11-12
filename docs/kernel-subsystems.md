@@ -869,7 +869,7 @@ const SchedStats = struct {
   `rt_sigqueueinfo`（222）同样按调用者的 tid 判断"发给自己"（非主线程用 `SI_USER` 发给 `getpid()` 是 `EPERM`），检查顺序在
   `proc_id_policy.sigqueueinfoVerdict`（不存在的 pid 是 `ESRCH`，排在信号号前面），停止、继续和 `SIGKILL` 也作用于整个进程（hello288 F/G）。
   进程级的普通信号（`kill(pid)`、`rt_sigqueueinfo`）只投递一次：被点名的线程阻塞它时，改投同一进程里第一个不阻塞它的线程
-  （`group_stop_policy.processRecipient`），都阻塞时留在被点名的线程上待处理（hello288 I），同时记进线程组共享的 `GroupState.held_signals`；之后任何线程解除阻塞（`sigprocmask`、`rt_sigsuspend`、`sigreturn`、`ppoll`/`pselect6`/`epoll_pwait` 的临时掩码及其恢复）都经 `signal_syscall.claimHeld` 把它从兄弟线程上接过来，由先解除阻塞的线程处理（`shared_pending_policy`，hello288 J）。实时信号不进这个集合。`tkill`、`rt_tgsigqueueinfo` 仍只投给被点名的线程。
+  （`group_stop_policy.processRecipient`），都阻塞时留在被点名的线程上待处理（hello288 I），同时记进线程组共享的 `GroupState.held_signals`；之后任何线程解除阻塞（`sigprocmask`、`rt_sigsuspend`、`sigreturn`、`ppoll`/`pselect6`/`epoll_pwait` 的临时掩码及其恢复）都经 `signal_syscall.claimHeld` 把它从兄弟线程上接过来，由先解除阻塞的线程处理（`shared_pending_policy`，hello288 J）。实时信号不进这个集合。`rt_sigpending` 把 held 集合并进报告，所以任何线程都看得到这些进程级信号；`rt_sigtimedwait` 等待其中一位时经 `takeHeldSignal` 从兄弟线程上把它和 siginfo 一起取走（hello288 K）。`tkill` 的线程级信号不进 held，另一个线程的 `sigpending` 看不到。`tkill`、`rt_tgsigqueueinfo` 仍只投给被点名的线程。
 - **Linux personality 的调用号别名（hello289）**：`personality(1)` 的进程在进入原生分发表之前先经 `syscall_entry.dispatchLinuxAlias`，
   `rlimit.Policy.linuxAlias` 把 Linux 的号换成原生实现：160→setrlimit、302→prlimit64、231→`exit_group`（原生 501）、247→`waitid`（原生 500）。
   原生 personality 下 231 仍是 `move_pages`、247 仍是 `clock_nanosleep`。其余号仍按原生表解释。

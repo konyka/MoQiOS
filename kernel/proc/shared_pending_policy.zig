@@ -25,6 +25,12 @@ pub fn taken(held: u64, signum: u32) u64 {
     return held & ~(@as(u64, 1) << @intCast(signum - 1));
 }
 
+/// What sigpending reports: this thread's own pending set plus the process-directed signals every thread still blocks.
+/// A thread-directed signal is only in `private`, so a sibling does not see it.
+pub fn visible(private: u64, held: u64) u64 {
+    return private | held;
+}
+
 test "a process-directed signal stays pending only while every thread blocks it" {
     var held: u64 = 0;
     held = hold(held, 10, false);
@@ -34,4 +40,7 @@ test "a process-directed signal stays pending only while every thread blocks it"
     held = taken(held, 10);
     try std.testing.expectEqual(@as(u64, 0), held);
     try std.testing.expectEqual(@as(u64, 0), hold(0, 10, true)); // a thread could take it: nothing is held
+    // The sibling has nothing of its own, but the held process-directed signal shows; a private bit stays private.
+    try std.testing.expectEqual(@as(u64, 1) << 9, visible(0, 1 << 9));
+    try std.testing.expectEqual(@as(u64, (1 << 9) | (1 << 11)), visible(1 << 11, 1 << 9));
 }

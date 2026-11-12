@@ -6,7 +6,8 @@
  * EPERM for getpid(); a missing pid is ESRCH ahead of signal 65 (EINVAL). G/H: SIGSTOP and SIGCONT queued with either call for the
  * second thread of a child stop and continue the whole child (waitpid reports 0x137f and 0xffff). I: while the main thread blocks
  * SIGUSR1, kill(getpid()) and rt_sigqueueinfo(getpid()) run the handler in the other thread. J: when every thread blocks it, the
- * signal waits for the process and the first thread to unblock it runs the handler. */
+ * signal waits for the process and the first thread to unblock it runs the handler. K: such a signal shows in every thread's
+ * sigpending and any thread's sigtimedwait takes it; a tkill one stays with its thread. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -29,6 +30,14 @@ static long sq(long pid, long sig, void *info) {
     return r < 0 ? -errno : r;
 }
 static long my_tid(void) { return syscall(SYS_gettid); }
+static long stw(void *set, void *info, void *ts) {
+    long r = syscall(SYS_rt_sigtimedwait, set, info, ts, 8);
+    return r < 0 ? -errno : r;
+}
+static long tk(long tid, long sig) {
+    long r = syscall(SYS_tkill, tid, sig);
+    return r < 0 ? -errno : r;
+}
 #else
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
 #include "../lib/moqi_libc/include/stdio.h"
@@ -41,6 +50,8 @@ static long my_tid(void) { return syscall(SYS_gettid); }
 static long tgsq(long tgid, long tid, long sig, void *info) { return syscall4(226, tgid, tid, sig, (long)info); }
 static long sq(long pid, long sig, void *info) { return syscall3(222, pid, sig, (long)info); }
 static long my_tid(void) { return syscall0(SYS_gettid); }
+static long stw(void *set, void *info, void *ts) { return syscall4(221, (long)set, (long)info, (long)ts, 8); }
+static long tk(long tid, long sig) { return syscall2(SYS_tkill, tid, sig); }
 #endif
 
 #define SIGUSR1_N 10
@@ -112,6 +123,32 @@ static void *j_thread(void *a) {
     while (!j_go) nap(1);
     sigprocmask(SIG_UNBLOCK, &j_set, (sigset_t *)0);
     for (;;) nap(10);
+    return (void *)0;
+}
+
+/* K: the second thread looks at a process-directed signal queued while both threads block it. */
+static volatile long k_stage, k_seen, k_taken, k_code, k_value, k_seen_tkill;
+static void *k_thread(void *a) {
+    (void)a;
+    sigprocmask(SIG_BLOCK, &j_set, (sigset_t *)0);
+    k_stage = 1;
+    while (k_stage < 2) nap(1);
+    sigset_t p;
+    sigemptyset(&p);
+    sigpending(&p);
+    k_seen = sigismember(&p, SIGUSR1_N);
+    struct qinfo got;
+    memset(&got, 0, sizeof got);
+    struct timespec zero = { 0, 0 };
+    k_taken = stw(&j_set, &got, &zero);
+    k_code = got.code;
+    k_value = (int)got.value;
+    k_stage = 3;
+    while (k_stage < 4) nap(1);
+    sigemptyset(&p);
+    sigpending(&p);
+    k_seen_tkill = sigismember(&p, SIGUSR1_N);
+    k_stage = 5;
     return (void *)0;
 }
 
@@ -330,6 +367,44 @@ int main(void) {
     if (jw != jc) {
         kill(jc, 9);
         waitpid(jc, &jst, 0);
+    }
+
+    /* K: in a child whose two threads block SIGUSR1, rt_sigqueueinfo(getpid()) is pending for the process: the second thread's
+     * sigpending shows it and its sigtimedwait takes it with the queued value, after which the main thread no longer has it. A
+     * tkill to the main thread stays the main thread's: the second thread does not see it. The exit code names the failing step. */
+    long kc = fork();
+    if (kc == 0) {
+        sigprocmask(SIG_BLOCK, &j_set, (sigset_t *)0);
+        pthread_t kt;
+        pthread_create(&kt, (void *)0, k_thread, (void *)0);
+        while (k_stage < 1) nap(1);
+        struct qinfo kq;
+        fill(&kq, SI_QUEUE_N, 7);
+        if (sq(getpid(), SIGUSR1_N, &kq) != 0) _exit(1);
+        k_stage = 2;
+        while (k_stage < 3) nap(1);
+        if (!k_seen) _exit(2);
+        if (k_taken != SIGUSR1_N || k_code != SI_QUEUE_N || k_value != 7) _exit(3);
+        sigset_t mp;
+        sigemptyset(&mp);
+        sigpending(&mp);
+        if (sigismember(&mp, SIGUSR1_N)) _exit(4);
+        tk(my_tid(), SIGUSR1_N);
+        k_stage = 4;
+        while (k_stage < 5) nap(1);
+        if (k_seen_tkill) _exit(5);
+        sigemptyset(&mp);
+        sigpending(&mp);
+        _exit(sigismember(&mp, SIGUSR1_N) ? 0 : 6);
+    }
+    int kst = 0;
+    long kw = wait_for(kc, &kst, 0);
+    snprintf(msg, sizeof msg, "K: another thread's sigpending and sigtimedwait see a process-directed signal, not a tkill one (%ld, exit %d)",
+             kw == kc ? 1L : kw, (kst >> 8) & 0xff);
+    check(kw == kc && kst == 0, msg);
+    if (kw != kc) {
+        kill(kc, 9);
+        waitpid(kc, &kst, 0);
     }
 
     /* G/H: a stop and a continue queued for one thread of another process act on the whole process. */

@@ -154,26 +154,34 @@ fn processRecipient(target: *task_mod.Task, tid: u32, signum: u32) u32 {
 pub fn claimHeld(cur: *task_mod.Task) void {
     const sp = @import("shared_pending_policy.zig");
     const g = cur.grp();
-    const group = threadGroupId(cur);
     var tried: u64 = 0;
     while (true) {
         const held = @atomicLoad(u64, &g.held_signals, .seq_cst) & ~tried;
         const signum = sp.claimable(held, cur.signal_mask) orelse return;
-        const bit = @as(u64, 1) << @intCast(signum - 1);
-        tried |= bit;
-        _ = @atomicRmw(u64, &g.held_signals, .And, ~bit, .seq_cst);
-        if (@atomicLoad(u64, &cur.pending_signals, .seq_cst) & bit != 0) continue; // already queued for this thread
-        for (0..task_mod.MAX_TASKS) |i| {
-            const t = task_mod.getTask(@intCast(i)) orelse continue;
-            if (t.tid == cur.tid or t.state == .zombie or threadGroupId(t) != group) continue;
-            const prev = @atomicRmw(u64, &t.pending_signals, .And, ~bit, .seq_cst);
-            if (prev & bit == 0) continue;
-            cur.sig_info[signum - 1] = t.sig_info[signum - 1];
-            t.sig_info[signum - 1] = .{};
-            _ = @atomicRmw(u64, &cur.pending_signals, .Or, bit, .seq_cst);
-            break;
-        }
+        tried |= @as(u64, 1) << @intCast(signum - 1);
+        _ = takeHeldSignal(cur, signum);
     }
+}
+
+/// Take the process-directed `signum` out of the held set. If it is already queued for `cur`, that is the whole job. Otherwise move it
+/// off the sibling that holds it, with its siginfo, onto `cur`. Returns whether `cur` now has it: a held bit whose holder already
+/// consumed it (or exited with it) is dropped.
+fn takeHeldSignal(cur: *task_mod.Task, signum: u32) bool {
+    const bit = @as(u64, 1) << @intCast(signum - 1);
+    _ = @atomicRmw(u64, &cur.grp().held_signals, .And, ~bit, .seq_cst);
+    if (@atomicLoad(u64, &cur.pending_signals, .seq_cst) & bit != 0) return true;
+    const group = threadGroupId(cur);
+    for (0..task_mod.MAX_TASKS) |i| {
+        const t = task_mod.getTask(@intCast(i)) orelse continue;
+        if (t.tid == cur.tid or t.state == .zombie or threadGroupId(t) != group) continue;
+        const prev = @atomicRmw(u64, &t.pending_signals, .And, ~bit, .seq_cst);
+        if (prev & bit == 0) continue;
+        cur.sig_info[signum - 1] = t.sig_info[signum - 1];
+        t.sig_info[signum - 1] = .{};
+        _ = @atomicRmw(u64, &cur.pending_signals, .Or, bit, .seq_cst);
+        return true;
+    }
+    return false;
 }
 
 /// kill(-1, sig): every process but init and the caller's own (see
@@ -456,13 +464,20 @@ pub fn sigaltstack(ss_ptr: u64, old_ss_ptr: u64) i64 {
 }
 
 /// rt_sigpending(set_ptr, sigsetsize) → 0 or -errno
+///
+/// Reports this thread's own pending set plus the process-directed signals every thread blocks (held for the process), so any
+/// thread sees those; a thread-directed signal (tkill/tgkill) shows only on its own thread (Linux do_sigpending merges the
+/// shared set the same way).
 pub fn rtSigpending(set_ptr: u64, sigsetsize: u64) i64 {
     _ = sigsetsize;
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
     if (set_ptr != 0) {
-        const pending: u64 = @atomicLoad(u64, &cur.pending_signals, .seq_cst);
+        const pending: u64 = @import("shared_pending_policy.zig").visible(
+            @atomicLoad(u64, &cur.pending_signals, .seq_cst),
+            @atomicLoad(u64, &cur.grp().held_signals, .seq_cst),
+        );
         const bytes: [*]const u8 = @ptrCast(&pending);
         if (copy.copyToUser(@ptrFromInt(set_ptr), bytes[0..8], 8) != 8) return -14;
     } else {
@@ -581,6 +596,10 @@ pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_s
     }
 
     while (true) {
+        // A process-directed signal every thread blocks is held for the process: any thread waiting for it takes it (with its
+        // siginfo) from the sibling it was queued on, as Linux dequeue_signal takes from the shared set.
+        const held_wanted = @atomicLoad(u64, &cur.grp().held_signals, .seq_cst) & mask;
+        if (held_wanted != 0) _ = takeHeldSignal(cur, @as(u32, @ctz(held_wanted)) + 1);
         // Atomic load + Rmw like dequeueSignal: a plain read-modify-write
         // races with sendSignal's atomic Rmw on another CPU.
         const pending = @atomicLoad(u64, &cur.pending_signals, .seq_cst) & mask;
