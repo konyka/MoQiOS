@@ -249,10 +249,14 @@ const rusage_policy = @import("rusage_policy.zig");
 fn publishWaitid(infop: u64, ru: u64, got: ?WaitidGot) i64 {
     if (got) |g| if (ru != 0 and !writeRusage(ru, g.usage)) return -14;
     if (infop == 0) return 0;
+    // Linux writes six fields and leaves the rest of the caller's buffer alone (siginfo_policy.waitidInfo), so the previous
+    // contents are read back first. A buffer that became unreadable since the entry check is EFAULT.
+    var prev: [siginfo.SIGINFO_SIZE]u8 = undefined;
+    if (copy.copyFromUser(&prev, @ptrFromInt(infop), siginfo.SIGINFO_SIZE) != siginfo.SIGINFO_SIZE) return -14;
     const bytes: [siginfo.SIGINFO_SIZE]u8 = if (got) |g|
-        siginfo.encode(17, .{ .code = g.rep.code, .a = siginfo.pidUid(g.child_tid, g.uid), .b = g.rep.status })
+        siginfo.waitidInfo(17, g.rep.code, g.child_tid, g.uid, g.rep.status, prev)
     else
-        @splat(0);
+        siginfo.waitidInfo(0, 0, 0, 0, 0, prev);
     return if (copy.copyToUser(@ptrFromInt(infop), &bytes, siginfo.SIGINFO_SIZE) == siginfo.SIGINFO_SIZE) 0 else -14;
 }
 

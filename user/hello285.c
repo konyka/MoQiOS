@@ -2,6 +2,7 @@
 /// fills a SIGCHLD siginfo (si_code CLD_EXITED/KILLED/STOPPED/CONTINUED, si_pid, si_status); WNOWAIT leaves the child waitable;
 /// WNOHANG with nothing to report returns 0 with si_signo cleared; bad idtype/options/id are EINVAL, no such child is ECHILD.
 /// The fifth argument (struct rusage) is filled with the child's CPU time only when a child was reported, and is EFAULT when unwritable.
+/// Only six siginfo fields are written (si_signo, si_errno, si_code, si_pid, si_uid, si_status); the rest of the buffer stays as the caller left it.
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -212,6 +213,25 @@ int main(void) {
     r = widr(P_PID, c, info, WEXITED, (void *)8);
     check(r == -14, "E: an unwritable rusage is EFAULT");
     wid(P_PID, c, info, WEXITED);
+
+    /* F: waitid writes six fields and leaves the rest of the caller's buffer, both when it reports a child and when WNOHANG finds nothing. */
+    c = fork();
+    if (c == 0) { nap(30000); _exit(0); }
+    memset(info, 0xAA, sizeof info);
+    r = wid(P_PID, c, info, WEXITED | WNOHANG);
+    int kept = 1;
+    for (int i = 12; i < 16; i++) if (info[i] != 0xAA) kept = 0;
+    for (int i = 28; i < 128; i++) if (info[i] != 0xAA) kept = 0;
+    snprintf(msg, sizeof msg, "F: WNOHANG with nothing to report clears the six fields and leaves the rest (%ld, signo %d, kept %d)", r, info_signo(info), kept);
+    check(r == 0 && info_signo(info) == 0 && info_code(info) == 0 && info_pid(info) == 0 && info_status(info) == 0 && kept, msg);
+    kill(c, 9);
+    memset(info, 0xAA, sizeof info);
+    r = wid(P_PID, c, info, WEXITED);
+    kept = 1;
+    for (int i = 12; i < 16; i++) if (info[i] != 0xAA) kept = 0;
+    for (int i = 28; i < 128; i++) if (info[i] != 0xAA) kept = 0;
+    snprintf(msg, sizeof msg, "F: a reported child fills the six fields and leaves the rest (%ld, code %d, status %d, kept %d)", r, info_code(info), info_status(info), kept);
+    check(r == 0 && info_signo(info) == 17 && info_code(info) == CLD_KILLED && info_pid(info) == (int)c && info_status(info) == 9 && kept, msg);
 
     print(failures == 0 ? "hello285: PASS\n" : "hello285: FAIL\n");
     return failures;

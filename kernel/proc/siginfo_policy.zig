@@ -44,6 +44,39 @@ pub fn encode(signo: u32, info: Info) [SIGINFO_SIZE]u8 {
     return out;
 }
 
+/// The bytes waitid writes into the caller's siginfo. Linux (kernel/exit.c, SYSCALL_DEFINE5(waitid)) puts exactly six fields:
+/// si_signo, si_errno (always 0), si_code, si_pid, si_uid and si_status. Every other byte of the 128-byte buffer is left as the
+/// caller wrote it, both when a child is reported and when WNOHANG finds nothing (signo 0, the other five fields 0).
+pub fn waitidInfo(signo: u32, code: i32, pid: u32, uid: u32, status: u32, prev: [SIGINFO_SIZE]u8) [SIGINFO_SIZE]u8 {
+    var out = prev;
+    writeLe(out[0..4], signo);
+    writeLe(out[4..8], 0);
+    writeLe(out[8..12], @bitCast(code));
+    writeLe(out[16..20], pid);
+    writeLe(out[20..24], uid);
+    writeLe(out[24..28], status);
+    return out;
+}
+
+test "waitid writes six siginfo fields and leaves the rest of the buffer" {
+    const t = @import("std").testing;
+    var prev: [SIGINFO_SIZE]u8 = @splat(0xAA);
+    const none = waitidInfo(0, 0, 0, 0, 0, prev);
+    try t.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, none[0..12]);
+    try t.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, none[16..28]);
+    try t.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xAA, 0xAA, 0xAA }, none[12..16]);
+    try t.expectEqualSlices(u8, prev[28..], none[28..]);
+    const got = waitidInfo(17, CLD_KILLED, 0x31a5d1, 0x3e8, 9, prev);
+    try t.expectEqual(@as(u32, 17), readLe(got[0..4]));
+    try t.expectEqual(@as(u32, 0), readLe(got[4..8]));
+    try t.expectEqual(CLD_KILLED, @as(i32, @bitCast(readLe(got[8..12]))));
+    try t.expectEqual(@as(u32, 0x31a5d1), readLe(got[16..20]));
+    try t.expectEqual(@as(u32, 0x3e8), readLe(got[20..24]));
+    try t.expectEqual(@as(u32, 9), readLe(got[24..28]));
+    try t.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xAA, 0xAA, 0xAA }, got[12..16]);
+    try t.expectEqualSlices(u8, prev[28..], got[28..]);
+}
+
 /// An Info rebuilt from the user-supplied siginfo_t of rt_sigqueueinfo.
 pub fn decode(raw: *const [SIGINFO_SIZE]u8) Info {
     return .{

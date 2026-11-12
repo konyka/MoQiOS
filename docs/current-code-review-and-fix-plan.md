@@ -7757,7 +7757,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：改动前的内核没有 500 号分支（分发表 `else =>` 返回 `ENOSYS`），没有在目标机上单独运行。第一版实现在目标机（SMP=1）上 hello285 二十项中一项失败：`WCONTINUED` 报告成了 `CLD_STOPPED`/255。原因是继续的状态字 `0xffff` 低 7 位也是 `0x7f`，判断停止要看低 8 位等于 `0x7f`。
 - 实现：`kernel/proc/waitid_policy.zig` 给出 idtype/options 校验（`P_ALL`→-1、`P_PID`→id、`P_PGID`→-id，id 为 0 或超过 0x7fffffff、没有 `WEXITED`/`WSTOPPED`/`WCONTINUED` 之一、未知位都是 `EINVAL`）和报告选择（退出优先，`WNOWAIT` 时不回收）。`kernel/proc/waitpid.zig` 的 `waitid` 复用 waitpid 的锁内阻塞协议；回收走 `waitpidScanLocked`，`WNOWAIT` 走新增的只读 `task.peekZombieLocked`（按 `reap_policy.verdict` 跳过已交给回收线程的僵尸），停止和继续复用 `takeWaitReportLocked` 并加了不消费的参数。siginfo 用 `siginfo_policy.encode` 写 128 字节；`WNOHANG` 没有可报告的变化时写全 0。系统调用号用原生 500（247 已被 `clock_nanosleep` 占用，Linux 别名表只覆盖 rlimit 的两个号），并加入 `syscall_restart_policy.restartable`。libc 只加 `SYS_waitid`，hello285 直接用 `syscall5`。
 - 绿灯：hello285 二十项在宿主机（`-DHOST`）和目标机（SMP=1）上全过；host 测试、三个架构构建与完整 smoke 见提交记录。
-- 如实的局限：①~~第五个参数 rusage 不填写~~（已实现，见下一节）；②`WNOHANG` 无变化时把整份 128 字节 siginfo 写 0，Linux 只清其中的几个字段（读到的值相同）；③~~没有 Linux 247 到原生 500 的 personality 别名~~（已实现，见文末 hello289 一节）；④继承 hello284 的局限：没有 ptrace 停止，~~线程组只有组长的停止和继续会报告~~（hello286 已实现，见文末）。
+- 如实的局限：①~~第五个参数 rusage 不填写~~（已实现，见下一节）；②~~`WNOHANG` 无变化时把整份 128 字节 siginfo 写 0~~（已实现，见文末 hello285 F 一节）；③~~没有 Linux 247 到原生 500 的 personality 别名~~（已实现，见文末 hello289 一节）；④继承 hello284 的局限：没有 ptrace 停止，~~线程组只有组长的停止和继续会报告~~（hello286 已实现，见文末）。
 
 ## waitid 的 rusage 参数（hello285 E 段，已实现）
 
@@ -7866,3 +7866,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：`LinuxAlias` 增加 `exit_group`、`waitid`，`linuxAlias` 在 Linux personality 下把 231、247 映射过去；`syscall_entry.dispatchLinuxRlimitAlias` 改名为 `dispatchLinuxAlias`，分别调用 `lifecycle.exitGroup` 和 `waitpid.waitid`。`tests/main.zig` 新增一条宿主机测试，覆盖两个新映射和原生 personality 不映射，原有的源码断言随函数改名更新。
 - 绿灯：hello289 C、D 在宿主机 Linux 上通过；目标机上 hello289 回到序列末尾后，SMP=2 定向测试四段全过。之前把它放到序列最前面跑过 SMP=2 一份、SMP=4 两份，也全过，但那三份用的是还没删掉 TEMP 行的旧 init，已经作废，所以不算在绿灯里。SMP=4 定向测试排到末尾后，300 秒内跑不到它，由完整 smoke 覆盖。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
 - 如实的局限：别名只在 x86_64 的分发入口生效；Linux personality 下其余与原生不同的号仍按原生表解释，这里只补了 231 和 247。
+
+## waitid 只写 siginfo 的六个字段（hello285 F，已实现）
+
+- 起因：hello285 一节局限②。`publishWaitid` 把整份 128 字节 siginfo 写回：报告子进程时其余字节写 0，`WNOHANG` 无变化时整份写 0。
+- Linux 依据（`3rd/linux-7.0.6/kernel/exit.c` 的 `SYSCALL_DEFINE5(waitid)` 只用 `unsafe_put_user` 写 `si_signo`、`si_errno`、`si_code`、`si_pid`、`si_uid`、`si_status`；宿主机实测 `/tmp/wid.c`：缓冲区先填 `0xAA`，`WNOHANG` 无变化和报告被杀的子进程两种情形下，只有字节 0–11 和 16–27 被改写，12–15 和 28 以后保持 `0xAA`）。
+- 红灯：hello285 新增 F 段两项。改动前的内核（SMP=2）上两项都失败：其余字节被清零（`kept 0`），六个字段本身的值正确。
+- 实现：`siginfo_policy.waitidInfo`（宿主机测试 1 条）在调用者原来的 128 字节上只覆盖六个字段。`waitpid.publishWaitid` 先把调用者的缓冲区读回来，再写回 `waitidInfo` 的结果；读不回来是 `EFAULT`。
+- 绿灯：宿主机 Linux 上 hello285 全过（含 F 段两项）；目标机定向 SMP=2 一份、SMP=4 两份全过（hello285 PASS）。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello285、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
+- 如实的局限：读回再写回不是原子的，同一进程的另一个线程在这段时间里写同一缓冲区的其他字节，写入可能被覆盖；Linux 逐字段写，没有这个窗口。

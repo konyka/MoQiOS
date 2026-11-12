@@ -877,7 +877,9 @@ const SchedStats = struct {
   子进程的身份和状态写进 128 字节的 SIGCHLD siginfo（`si_code` 为 `CLD_EXITED`/`CLD_KILLED`/`CLD_STOPPED`/
   `CLD_CONTINUED`，`si_status` 是退出码、致死信号、停止信号或 SIGCONT，`si_pid`/`si_uid` 是子进程的）。
   退出优先于同一子进程未报告的停止或继续；`WNOWAIT` 报告但不回收（`peekZombieLocked`，停止/继续报告也不消费），
-  所以同一个僵尸或停止可以再报告一次。`WNOHANG` 没有可报告的变化时返回 0 并把 siginfo 清零（`si_signo` 为 0）；
+  所以同一个僵尸或停止可以再报告一次。`WNOHANG` 没有可报告的变化时返回 0，六个字段写 0（`si_signo` 为 0）；
+  写回 siginfo 时只覆盖六个字段（`si_signo`、`si_errno`、`si_code`、`si_pid`、`si_uid`、`si_status`，`siginfo_policy.waitidInfo`），
+  其余字节保留调用者原来的内容，报告子进程和 `WNOHANG` 无变化时都一样（hello285 F）。
   infop 为空也允许，照样回收。没有匹配的子进程是 `ECHILD`。阻塞沿用 waitpid 的锁内协议，被信号打断返回 `-EINTR`
   并可按 `SA_RESTART` 重启。第五个参数 rusage 非空时先验证可写（144 字节，否则 `EFAULT`），只在确实报告了
   子进程时写回：utime/stime 是子进程整个线程组加上它已等待过的子孙的 CPU 时间（回收取 `Reaped.usage`，
