@@ -858,7 +858,8 @@ const SchedStats = struct {
   活着的成员记下 `group_exit_code`（`proc/exit_group_policy.zig` 的 `claim`：先记下的保留），再给调用者以外的成员发
   `SIGKILL`；调用者随后走 `exitTask`。`exitTask` 开头用 `finalStatus` 把成员自己的 `128+sig` 换成组的状态并标成正常退出，
   所以组长的 wait 状态就是 `exit_group` 的参数。libc 的 `_exit` 走 501，`pthread_exit` 走 `SYS_exit`（只结束一个线程）。
-  局限：组长成为僵尸时 `waitpid` 就可能报告，不等其他成员都退出。
+  进程随最后一个线程退出（hello287 G/H）：组长已是僵尸而组里还有活着的成员时，`reap_policy.verdict` 返回 `.skip`，
+  `waitpid`/`waitid` 不报告它；最后一个退出的线程把状态写到组长上并代它发 `SIGCHLD`。
 - **waitid（hello285，系统调用 500）**：`proc/waitpid.zig` 的 `waitid`。`idtype` 是 `P_ALL`/`P_PID`/`P_PGID`
   （`proc/waitid_policy.zig` 把它换成 waitpid 的 pid 选择：-1、正 pid、负进程组），`options` 必须含
   `WEXITED`/`WSTOPPED`/`WCONTINUED` 之一，其余位除 `WNOHANG`/`WNOWAIT` 外都是 `EINVAL`。成功返回 0，

@@ -1187,6 +1187,21 @@ pub fn exitTask(requested_code: i32) void {
     t.exit_code = exit_code;
     sched_claim.store(&t.state, .zombie);
     asm volatile ("" ::: .{ .memory = true });
+    // The process exits with its last thread (Linux). A leader that leaves while other threads run is not reported yet; the
+    // last thread to exit after it hands the leader its own status and reports the process on the leader's behalf.
+    const group_running = t.is_user and !t.is_thread and groupHasLiveMemberLocked(t.tid, idx);
+    var finishes_group: ?*Task = null;
+    if (t.is_user and t.is_thread and t.parent_tid != 0) {
+        if (groupLeaderLocked(t.parent_tid, idx)) |li| {
+            const leader = &tasks[li];
+            if (leader.state == .zombie and !groupHasLiveMemberLocked(leader.tid, li)) {
+                leader.exit_code = exit_code;
+                leader.exited_via_syscall = t.exited_via_syscall;
+                finishes_group = leader;
+                if (leader.parent_tid != 0) wakeWaitingParentLocked(leader.parent_tid);
+            }
+        }
+    }
 
     // Wake parent if sleeping on our exit_waiters queue
     if (t.exit_waiters != null) {
@@ -1226,8 +1241,9 @@ pub fn exitTask(requested_code: i32) void {
             }
         }
     }
-    const sigchld_parent = t.parent_tid;
-    const notify_parent = t.is_user and !t.is_thread and sigchld_parent != 0;
+    const reporter: *Task = finishes_group orelse t;
+    const sigchld_parent = reporter.parent_tid;
+    const notify_parent = (finishes_group != null or (t.is_user and !t.is_thread and !group_running)) and sigchld_parent != 0;
     // prctl(PR_SET_PDEATHSIG): children that asked to be told about this
     // task's death. Collected under task_lock, signalled after it.
     var death_tids: [MAX_TASKS]u32 = undefined;
@@ -1255,7 +1271,7 @@ pub fn exitTask(requested_code: i32) void {
     // re-take it. Threads report through clear_tid, not SIGCHLD.
     if (notify_parent) {
         const sp = @import("siginfo_policy.zig");
-        _ = @import("signal.zig").sendSignalInfo(sigchld_parent, 17, sp.childInfo(t.tid, t.uid, exit_code, t.exited_via_syscall));
+        _ = @import("signal.zig").sendSignalInfo(sigchld_parent, 17, sp.childInfo(reporter.tid, reporter.uid, exit_code, reporter.exited_via_syscall));
     }
 
     // 作业控制：控制台会话长挂断前台组；因本次退出成为孤儿且含停止成员的
@@ -1278,6 +1294,26 @@ pub fn exitTask(requested_code: i32) void {
     while (true) {
         arch_cpu.waitForInterrupt();
     }
+}
+
+/// Wake the parent `parent_tid` if it is blocked in waitpid (task_lock held). Same wake as exitTask's own: only a blocked parent
+/// is made ready; a running one sees the cleared flag in its wait loop.
+fn wakeWaitingParentLocked(parent_tid: u32) void {
+    const pi = findTaskByTidLocked(parent_tid) orelse return;
+    const parent = &tasks[pi];
+    if (!parent.waiting_for_child) return;
+    parent.waiting_for_child = false;
+    if (parent.state == .blocked) {
+        sched_claim.store(&parent.state, .ready);
+        _ = @import("per_cpu.zig").enqueueTask(parent);
+        asm volatile ("" ::: .{ .memory = true });
+        @import("sched.zig").kickCpu(parent.wait_cpu);
+    }
+}
+
+/// A zombie thread-group leader whose other threads are still alive (task_lock held by the caller).
+pub fn groupStillRunning(t: *const Task) bool {
+    return !t.is_thread and t.state == .zombie and groupHasLiveMemberLocked(t.tid, t.self_idx);
 }
 
 /// exit_group, first half: record `code` on every live member of the caller's thread group (the caller included) and send
@@ -1358,9 +1394,25 @@ pub fn isCurrentOnOtherCpu(idx: u32, my_cpu: u32) bool {
 }
 
 /// Quiesce-gate inputs for a zombie (task_lock held). See reap_policy.zig.
+/// Whether thread group `gid` has a member other than slot `skip` that has not exited yet (task_lock held).
+fn groupHasLiveMemberLocked(gid: u32, skip: u32) bool {
+    var bits = slot_bitmap;
+    while (bits != 0) {
+        const j: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        if (j == skip) continue;
+        const m = &tasks[j];
+        if (m.state == .zombie) continue;
+        const in_group = if (m.is_thread) m.parent_tid == gid else m.tid == gid;
+        if (in_group) return true;
+    }
+    return false;
+}
+
 fn zombieViewLocked(i: u32, t: *const Task) reap_policy.ZombieView {
     const pc = @import("per_cpu.zig");
     return .{
+        .group_running = !t.is_thread and t.state == .zombie and groupHasLiveMemberLocked(t.tid, i),
         .is_zombie = t.state == .zombie,
         .reap_pending = t.reap_pending,
         .operation_refs = t.operation_refs,

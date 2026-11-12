@@ -7797,7 +7797,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：改动前的内核（SMP=2）上 hello287 九项里七项失败：501 号不存在，子进程落到 `_exit(99)`（`0x6300`），主线程 `exit(5)` 之后旋转的线程继续写管道。通过的两项是 `exit(5)` 的状态本身和 `pthread_exit`。
 - 实现：新增原生系统调用 501 `exit_group(status)`（`lifecycle.exitGroup`）。`task.beginGroupExit` 在 `task_lock` 下给线程组里每个活着的成员（包括调用者）记下 `group_exit_code`，再给其他成员发 `SIGKILL`；成员经各自的致命路径进入 `exitTask`，`exitTask` 开头用 `exit_group_policy.finalStatus` 把 `128+SIGKILL` 换成组的状态并按正常退出报告。所以不管哪个线程调用，组长的 `waitpid` 状态都是 `exit_group` 的参数；两个线程同时调用时，成员上先记下的那个状态保留（`claim`）。纯函数模块 `kernel/proc/exit_group_policy.zig` 有 3 条宿主机测试。libc：`_exit` 改走 `SYS_exit_group`（与 glibc 一致），`pthread_exit` 改为直接 `SYS_exit`，只结束自己的线程。hello190–hello193 的跳过表加了 501。
 - 绿灯：hello287 九项在宿主机 Linux 上全过；目标机定向 SMP=2、SMP=4 各一份全过。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello286、hello287 都通过，hello228 的 `corrupted canaries` 都是 0。
-- 如实的局限：①`waitpid` 在组长成为僵尸时就可能报告，那时其他成员可能还在走致命路径（Linux 要等整组都退出）；hello287 A/D 段在报告后 200 ms 内没有看到写入，但没有测更短的窗口；②只在 x86_64 的系统调用表里加了 501，riscv64/aarch64 没有对应的 libc 线程实现；③Linux personality 下 231 号仍不是 `exit_group`（231 在原生表里是 `move_pages`，别名表目前只服务 rlimit）。④主线程已经退出（组长已是僵尸）之后，另一个线程再调 `exit_group`，`beginGroupExit` 跳过僵尸组长，组长报告的是它自己的状态，Linux 报告的是 `exit_group` 的参数；没有用例。
+- 如实的局限：①`waitpid` 在组长成为僵尸时就可能报告，那时其他成员可能还在走致命路径（Linux 要等整组都退出）；hello287 A/D 段在报告后 200 ms 内没有看到写入，但没有测更短的窗口；②只在 x86_64 的系统调用表里加了 501，riscv64/aarch64 没有对应的 libc 线程实现；③Linux personality 下 231 号仍不是 `exit_group`（231 在原生表里是 `move_pages`，别名表目前只服务 rlimit）。④~~主线程已经退出之后另一个线程再调 `exit_group`，组长报告的是它自己的状态~~（已实现，见文末 hello287 G/H 一节）。
 
 ## tkill 的停止、继续和 SIGKILL 作用于整个进程（hello286 H，已实现）
 
@@ -7816,3 +7816,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 原因：`waitForSignal`（`pause`/`sigsuspend` 共用）只在有 handler 或会结束进程的信号到来时返回，默认停止信号不算，任务继续睡。时钟中断看到睡着的任务仍是本 CPU 的当前任务，会把停止位取走并调用 `stopTask`；但任务随后又从 `waitForSignal` 的循环里被切回，停止就丢了。
 - 实现：新增 `signal.takePendingStop`，取出一个未阻塞、取默认动作的停止信号。`waitForSignal` 每轮循环先调用它：取到就 `stopTask`，再 `while (stopped) forceReschedule()` 离开 CPU；`SIGCONT` 或 `SIGKILL` 清掉 `stopped` 后接着等。阻塞前的复查也把待处理的停止算进去。时钟中断路径（`sched.deliverSignalToRunningTask`）对 `.blocked` 的任务不再自己 `stopTask`，而是把位放回，交给 `waitForSignal`。
 - 绿灯：宿主机 Linux 上 I 段三项全过；目标机定向 SMP=4 两份、SMP=2 两份全过（hello286 整体 PASS，H 段八项也全过）。`zig build test` 通过，三个架构构建通过；完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello286、hello287 都通过，hello190 不再卡在 `pause`。
+
+## 进程随最后一个线程退出（hello287 G/H，已实现）
+
+- 起因：hello287 一节局限④，以及同一处没写明的更基本的缺口：组长线程 `SYS_exit` 之后，只要组里还有线程活着，进程就不该被报告。
+- Linux 依据（宿主机实测，`/tmp/lz.c` 与 `user/hello287.c -DHOST`）：主线程 `SYS_exit(4)`、另一个线程 400 ms 后 `SYS_exit(9)`，100 ms 时 `waitpid(WNOHANG)` 返回 0，最终报告 `0x900`，那个线程在主线程退出后确实写了管道；主线程 `SYS_exit(4)`、另一个线程之后 `exit_group(21)`，报告的是 `0x1500`。
+- 红灯：hello287 新增 G/H 段五项。改动前的内核（SMP=2）上五项全失败：100 ms 时 `waitpid(WNOHANG)` 已经返回子进程 pid（`98`、`100`），子进程随即被回收，后面的 `waitpid` 返回 `-10`（`ECHILD`），管道里也读不到那个线程的写入。
+- 实现：`reap_policy.ZombieView` 新增 `group_running`，`verdict` 对它返回 `.skip`：组长已是僵尸但组里还有活着的成员时，`waitpid`/`waitid` 都不报告它，自动回收也不收它。`task.exitTask` 里，最后一个退出的线程发现组长已是僵尸且没有其他活着的成员，就把自己的状态写到组长上（`exit_code` 和 `exited_via_syscall`），唤醒组长的父进程，并以组长的身份发 `SIGCHLD`。所以报告的状态是最后一个线程的，无论它走 `SYS_exit` 还是 `exit_group`。纯函数测试加了 1 条。
+- 绿灯：宿主机 Linux 上五项全过；目标机定向 SMP=2、SMP=4 各一份全过（hello287 整体 PASS）。`zig build test` 通过，三个架构构建通过；完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello286、hello287 都通过，hello228 的 `corrupted canaries` 都是 0。

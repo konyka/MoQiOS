@@ -343,6 +343,7 @@ fn waitidBusyZombie(cur_idx: u32, req: wid.Request) ?WaitidGot {
         const t = task_mod.getTask(i) orelse continue;
         if (t.parent_tid != parent.tid or t.is_thread or t.state != .zombie) continue;
         if (!@import("proc_id_policy.zig").waitMatches(req.pid, t.tid, t.pgid, parent.pgid)) continue;
+        if (task_mod.groupStillRunning(t)) continue; // the process exits with its last thread
         const e = wsp.fromInternal(t.exit_code, t.exited_via_syscall);
         return .{ .child_tid = t.tid, .uid = t.uid, .usage = task_mod.childUsageLocked(t.tid), .rep = wid.report(req.options, .{ .zombie = true, .exit_value = e.value, .signaled = e.signaled }).? };
     }

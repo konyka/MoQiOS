@@ -26,6 +26,9 @@ pub const ZombieView = struct {
     exit_epoch: u64,
     /// sched_entries[exit_cpu] now.
     exit_cpu_entries: u64,
+    /// A thread-group leader whose other threads are still alive: the process has not exited yet (Linux reports and reaps it
+    /// only once its last thread is gone).
+    group_running: bool = false,
 };
 
 pub const Verdict = enum {
@@ -37,7 +40,7 @@ pub const Verdict = enum {
 };
 
 pub fn verdict(v: ZombieView) Verdict {
-    if (!v.is_zombie or v.reap_pending) return .skip;
+    if (!v.is_zombie or v.reap_pending or v.group_running) return .skip;
     if (v.operation_refs != 0 or v.current_somewhere) return .busy;
     if (v.exit_cpu != 255) {
         const gate = @addWithOverflow(v.exit_epoch, QUIESCE_PASSES);
@@ -154,4 +157,13 @@ test "waiter tokens reject a reused slot" {
     try std.testing.expect(old.valid());
     try std.testing.expect(fresh.valid());
     try std.testing.expect(old.tid != fresh.tid and old.incarnation != fresh.incarnation);
+}
+
+test "a leader whose other threads still run is neither reported nor reaped" {
+    const v: ZombieView = .{ .is_zombie = true, .reap_pending = false, .operation_refs = 0, .current_somewhere = false, .exit_cpu = 255, .exit_epoch = 0, .exit_cpu_entries = 0, .group_running = true };
+    try @import("std").testing.expectEqual(Verdict.skip, verdict(v));
+    try @import("std").testing.expectEqual(Verdict.skip, autoReap(v, .{ .is_thread = false, .parent_alive = false, .maps_objects = false }));
+    var gone = v;
+    gone.group_running = false;
+    try @import("std").testing.expectEqual(Verdict.detach, verdict(gone));
 }

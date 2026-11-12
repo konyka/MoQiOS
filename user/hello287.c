@@ -2,7 +2,9 @@
  * Measured on the host (build with -DHOST): exit_group(42) from the main thread while another thread spins is reported as 0x2a00
  * and the spinning thread writes nothing afterwards; only the low 8 bits of the status survive (300 -> 44); exit_group from a
  * thread other than the main one ends the main thread too and its status is the one reported; exit(5) from main stops the other
- * threads; a thread that leaves through pthread_exit does not end the process. */
+ * threads; a thread that leaves through pthread_exit does not end the process. When the main thread leaves with SYS_exit while
+ * another thread runs, the process is reported only after its last thread has exited, with that thread's status (or the status
+ * of an exit_group it calls). */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -16,6 +18,7 @@
 #include <unistd.h>
 static void print(const char *s) { fputs(s, stdout); fflush(stdout); }
 static void exit_group_call(int code) { syscall(SYS_exit_group, code); }
+static void exit_thread_call(int code) { syscall(SYS_exit, code); }
 #else
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
 #include "../lib/moqi_libc/include/stdio.h"
@@ -26,6 +29,11 @@ static void exit_group_call(int code) { syscall(SYS_exit_group, code); }
 #include "../lib/moqi_libc/include/time.h"
 #include "../lib/moqi_libc/include/pthread.h"
 static void exit_group_call(int code) { syscall1(SYS_exit_group, code); }
+static void exit_thread_call(int code) { syscall1(SYS_exit, code); }
+#endif
+
+#ifndef WNOHANG
+#define WNOHANG 1
 #endif
 
 static int failures;
@@ -59,6 +67,19 @@ static void *group_exit_33(void *a) {
 static void *leave(void *a) {
     (void)a;
     pthread_exit((void *)7);
+    return (void *)0;
+}
+static void *late_exit_9(void *a) {
+    (void)a;
+    nap(400);
+    write(bp[1], "L", 1);
+    exit_thread_call(9);
+    return (void *)0;
+}
+static void *late_group_21(void *a) {
+    (void)a;
+    nap(400);
+    exit_group_call(21);
     return (void *)0;
 }
 static int drain(void) {
@@ -154,6 +175,40 @@ int main(void) {
     drain();
     snprintf(msg, sizeof msg, "F: 40 processes in a row whose threads end through exit_group (%d/40)", ok);
     check(ok == 40, msg);
+
+    /* G: the main thread leaves with SYS_exit while another thread runs on. The process is not reported until its last thread
+     * has gone, and the status is that thread's. */
+    drain();
+    c = fork();
+    if (c == 0) {
+        pthread_t th;
+        pthread_create(&th, (void *)0, late_exit_9, (void *)0);
+        exit_thread_call(4);
+    }
+    nap(100);
+    r = waitpid(c, &st, WNOHANG);
+    snprintf(msg, sizeof msg, "G: the main thread exited but another runs: waitpid(WNOHANG) is 0 (%ld)", r);
+    check(r == 0, msg);
+    st = 0;
+    r = waitpid(c, &st, 0);
+    snprintf(msg, sizeof msg, "G: reported once the last thread exits, with its status 9 (%ld, 0x%x)", r, st);
+    check(r == c && st == 0x900, msg);
+    check(drain(), "G: and that thread ran after the main thread had exited");
+
+    c = fork();
+    if (c == 0) {
+        pthread_t th;
+        pthread_create(&th, (void *)0, late_group_21, (void *)0);
+        exit_thread_call(4);
+    }
+    nap(100);
+    r = waitpid(c, &st, WNOHANG);
+    snprintf(msg, sizeof msg, "H: the main thread exited first, waitpid(WNOHANG) is 0 (%ld)", r);
+    check(r == 0, msg);
+    st = 0;
+    r = waitpid(c, &st, 0);
+    snprintf(msg, sizeof msg, "H: a later exit_group(21) from the other thread is the reported status (%ld, 0x%x)", r, st);
+    check(r == c && st == 0x1500, msg);
 
     print(failures == 0 ? "hello287: PASS\n" : "hello287: FAIL\n");
     return failures;
