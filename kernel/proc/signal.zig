@@ -45,6 +45,27 @@ pub fn claimInstance(t: *task.Task, signum: u32) void {
         _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
 }
 
+/// Move the pending real-time `signum` from `from` to `to`: every queued instance, in send order, to the end of `to`'s queue (while
+/// it has room), and the pending bit, which `from` keeps only if some instances did not fit. A bit pending without a queued instance
+/// (its siginfo was lost to a full queue) moves too. Returns whether anything moved.
+pub fn moveRealtime(from: *task.Task, to: *task.Task, signum: u32) bool {
+    const bit = @as(u64, 1) << @intCast(signum - 1);
+    const flags = rt_queue_lock.acquire();
+    defer rt_queue_lock.release(flags);
+    var moved = false;
+    while (to.rt_queue.count < sigqueue.CAPACITY) {
+        const info = from.rt_queue.take(signum) orelse break;
+        _ = to.rt_queue.push(signum, info);
+        moved = true;
+    }
+    if (!from.rt_queue.has(signum)) {
+        const prev = @atomicRmw(u64, &from.pending_signals, .And, ~bit, .seq_cst);
+        if (prev & bit != 0) moved = true;
+    }
+    if (moved) _ = @atomicRmw(u64, &to.pending_signals, .Or, bit, .seq_cst);
+    return moved;
+}
+
 /// Drop a pending signal and every queued instance of it (SIG_IGN installed,
 /// or SIG_DFL for a default-ignored signal; Linux flushes them in sigaction).
 pub fn discardPending(t: *task.Task, signum: u32) void {

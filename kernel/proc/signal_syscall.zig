@@ -138,9 +138,9 @@ fn processRecipient(target: *task_mod.Task, tid: u32, signum: u32) u32 {
                 break;
             }
         }
-        // Every thread blocks it: it waits for the process, and whichever thread unblocks it first takes it (claimHeld). Real-time
-        // signals keep their queued instances on the named thread and are not held.
-        if (other == null and !@import("sigqueue_policy.zig").isRealtime(signum)) {
+        // Every thread blocks it: it waits for the process, and whichever thread unblocks it first takes it (claimHeld). A real-time
+        // signal's queued instances stay on the named thread until then and move together, in send order.
+        if (other == null) {
             // Or, not load-then-store: two CPUs can hold different signals at once.
             _ = @atomicRmw(u64, &target.grp().held_signals, .Or, bit, .seq_cst);
         }
@@ -169,8 +169,17 @@ pub fn claimHeld(cur: *task_mod.Task) void {
 fn takeHeldSignal(cur: *task_mod.Task, signum: u32) bool {
     const bit = @as(u64, 1) << @intCast(signum - 1);
     _ = @atomicRmw(u64, &cur.grp().held_signals, .And, ~bit, .seq_cst);
-    if (@atomicLoad(u64, &cur.pending_signals, .seq_cst) & bit != 0) return true;
     const group = threadGroupId(cur);
+    if (@import("sigqueue_policy.zig").isRealtime(signum)) {
+        // Every queued instance comes along, from whichever siblings hold them.
+        for (0..task_mod.MAX_TASKS) |i| {
+            const t = task_mod.getTask(@intCast(i)) orelse continue;
+            if (t.tid == cur.tid or t.state == .zombie or threadGroupId(t) != group) continue;
+            _ = sig_mod.moveRealtime(t, cur, signum);
+        }
+        return @atomicLoad(u64, &cur.pending_signals, .seq_cst) & bit != 0;
+    }
+    if (@atomicLoad(u64, &cur.pending_signals, .seq_cst) & bit != 0) return true;
     for (0..task_mod.MAX_TASKS) |i| {
         const t = task_mod.getTask(@intCast(i)) orelse continue;
         if (t.tid == cur.tid or t.state == .zombie or threadGroupId(t) != group) continue;
@@ -213,12 +222,16 @@ pub fn handOffHeld(t: *task_mod.Task) void {
             }
         }
         const dest_idx = free orelse any orelse continue;
-        const prev = @atomicRmw(u64, &t.pending_signals, .And, ~bit, .seq_cst);
-        if (prev & bit == 0) continue;
         const dest = task_mod.getTask(dest_idx) orelse continue;
-        dest.sig_info[b] = t.sig_info[b];
-        t.sig_info[b] = .{};
-        _ = @atomicRmw(u64, &dest.pending_signals, .Or, bit, .seq_cst);
+        if (@import("sigqueue_policy.zig").isRealtime(@as(u32, b) + 1)) {
+            if (!sig_mod.moveRealtime(t, dest, @as(u32, b) + 1)) continue;
+        } else {
+            const prev = @atomicRmw(u64, &t.pending_signals, .And, ~bit, .seq_cst);
+            if (prev & bit == 0) continue;
+            dest.sig_info[b] = t.sig_info[b];
+            t.sig_info[b] = .{};
+            _ = @atomicRmw(u64, &dest.pending_signals, .Or, bit, .seq_cst);
+        }
         if (free != null) {
             _ = @atomicRmw(u64, &g.held_signals, .And, ~bit, .seq_cst);
             sig_mod.kickIfBlocked(dest_idx);

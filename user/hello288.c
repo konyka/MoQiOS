@@ -9,7 +9,8 @@
  * signal waits for the process and the first thread to unblock it runs the handler. K: such a signal shows in every thread's
  * sigpending and any thread's sigtimedwait takes it; a tkill one stays with its thread. L: when the thread it was queued for exits,
  * the signal stays pending for the process and the thread that unblocks it later runs it with its value. M: sigaction(SIG_IGN) discards that signal for the whole process, including a sibling's copy and the held bit;
- * a different signal tkill'd to a sibling stays. */
+ * a different signal tkill'd to a sibling stays. N: a real-time signal sent twice while every thread blocks it is taken, both
+ * instances in send order, by the thread that unblocks it first. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -179,6 +180,32 @@ static void *m_thread(void *a) {
     m_usr1 = sigismember(&p, SIGUSR1_N);
     m_usr2 = sigismember(&p, SIGUSR2_N);
     m_stage = 3;
+    return (void *)0;
+}
+
+/* N: the second thread unblocks a real-time signal that both threads block; it records the values in the order they run. */
+#define RT_N 40
+static volatile long n_tid, n_go, n_vals[4], n_tids[4], n_runs;
+static void on_rt(int sig, void *info, void *uc) {
+    (void)sig;
+    (void)uc;
+    struct qinfo *i = (struct qinfo *)info;
+    if (n_runs < 4) {
+        n_vals[n_runs] = (int)i->value;
+        n_tids[n_runs] = my_tid();
+    }
+    n_runs++;
+}
+static void *n_thread(void *a) {
+    (void)a;
+    sigset_t s;
+    sigemptyset(&s);
+    sigaddset(&s, RT_N);
+    sigprocmask(SIG_BLOCK, &s, (sigset_t *)0);
+    n_tid = my_tid();
+    while (!n_go) nap(1);
+    sigprocmask(SIG_UNBLOCK, &s, (sigset_t *)0);
+    for (;;) nap(10);
     return (void *)0;
 }
 
@@ -511,6 +538,56 @@ int main(void) {
     if (mw != mc) {
         kill(mc, 9);
         waitpid(mc, &mst, 0);
+    }
+
+    /* N: in a child whose two threads block real-time signal 40, rt_sigqueueinfo(getpid()) sends it twice (values 1, 2). Nothing
+     * runs while both block it; when the second thread unblocks it, both instances run there in send order and the main thread has
+     * nothing left pending. The exit code names the failing step. */
+    long nc = fork();
+    if (nc == 0) {
+        sigset_t ns;
+        sigemptyset(&ns);
+        sigaddset(&ns, RT_N);
+        sigprocmask(SIG_BLOCK, &ns, (sigset_t *)0);
+#ifdef HOST
+        struct sigaction nsa;
+        memset(&nsa, 0, sizeof nsa);
+        nsa.sa_sigaction = (void (*)(int, siginfo_t *, void *))on_rt;
+        nsa.sa_flags = SA_SIGINFO;
+        sigaction(RT_N, &nsa, (struct sigaction *)0);
+#else
+        struct ksigaction nsa = { (void (*)(int))on_rt, 0x4, (void *)0, 0 };
+        sigaction(RT_N, &nsa, (struct ksigaction *)0);
+#endif
+        pthread_t nt;
+        pthread_create(&nt, (void *)0, n_thread, (void *)0);
+        while (!n_tid) nap(1);
+        struct qinfo nq;
+        fill(&nq, SI_QUEUE_N, 1);
+        nq.signo = RT_N;
+        if (sq(getpid(), RT_N, &nq) != 0) _exit(1);
+        nq.value = 2;
+        if (sq(getpid(), RT_N, &nq) != 0) _exit(1);
+        nap(100);
+        if (n_runs != 0) _exit(2);
+        n_go = 1;
+        for (int i = 0; i < 100 && n_runs < 2; i++) nap(10);
+        nap(50);
+        if (n_runs != 2) _exit(3);
+        if (n_tids[0] != n_tid || n_tids[1] != n_tid || n_vals[0] != 1 || n_vals[1] != 2) _exit(4);
+        sigset_t np;
+        sigemptyset(&np);
+        sigpending(&np);
+        _exit(sigismember(&np, RT_N) ? 5 : 0);
+    }
+    int nst = 0;
+    long nw = wait_for(nc, &nst, 0);
+    snprintf(msg, sizeof msg, "N: both instances of a real-time signal every thread blocks run, in order, in the thread that unblocks it (%ld, exit %d)",
+             nw == nc ? 1L : nw, (nst >> 8) & 0xff);
+    check(nw == nc && nst == 0, msg);
+    if (nw != nc) {
+        kill(nc, 9);
+        waitpid(nc, &nst, 0);
     }
 
     /* G/H: a stop and a continue queued for one thread of another process act on the whole process. */

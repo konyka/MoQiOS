@@ -105,8 +105,8 @@ pub const GroupState = struct {
     sig: SigActions,
     lim: Limits,
     fs: FsContext,
-    /// Process-directed standard signals that every thread blocked when they were sent (proc/shared_pending_policy.zig): the
-    /// first thread to unblock one takes it from the thread it was queued on. A fork child starts with none.
+    /// Process-directed signals that every thread blocked when they were sent (proc/shared_pending_policy.zig): the first thread to
+    /// unblock one takes it from the thread it was queued on, with every queued instance of a real-time one. A fork child starts with none.
     held_signals: u64 = 0,
 
     pub fn initial(max_fds: u64) GroupState {

@@ -7892,7 +7892,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello288 新增 J 段一项，子进程用退出码说明哪一步出错。改动前的内核（SMP=2）上子进程以 2 退出：第二个线程解除阻塞后 1 秒内 handler 没有运行。
 - 实现：新文件 `proc/shared_pending_policy.zig`（`hold`/`claimable`/`taken`，宿主机测试 1 条）。`GroupState` 新增 `held_signals`，由线程组共享，fork 的子进程从 0 开始。`processRecipient` 在找不到不阻塞的线程时用原子或把标准信号记进去（两个 CPU 可能同时记不同的信号；实时信号的多个实例仍留在被点名的线程上，不记）。新的 `signal_syscall.claimHeld` 在掩码改变后取出本线程不再阻塞的 held 信号：从兄弟线程上清掉待处理位，把 siginfo 和待处理位移到本线程。调用点：`sigprocmask`、`rt_sigsuspend`、`sigreturn`、`ppoll`/`pselect6` 的 `beginTempMask`、`epoll_pwait` 的临时掩码，以及系统调用返回时的延迟掩码恢复。
 - 绿灯：宿主机 Linux 上 hello288 全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS，J 段子进程以 0 退出）。定向测试之后把记入 `held_signals` 的写法从先读后写改成原子或，没有重跑定向测试，由完整 smoke 覆盖。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）里三份 `EXIT=0`、0 FAIL；一份 SMP=4 以 `EXIT=1` 结束，唯一的失败是 hello286 J 段（60 轮里报告了 40 次停止和继续），与之前记录的同一偶发项相同，这一段不发进程级普通信号，见下一行的单独重跑。四份里 hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。hello286 单独定向重跑四份（SMP 4/4/4/2，hello286 放在第一位）全部 PASS，J 段都是 60/60，所以那一次是偶发的，不是这次改动引入的。
-- 如实的局限：①不是真正的共享队列：信号的待处理位仍在被点名的线程上，`claimHeld` 是在解除阻塞时把它搬过来，所以被点名的线程退出时 held 信号随它丢失；②~~`sigpending` 只看到本线程的集合，看不到 held 的进程级信号（Linux 会合并共享集合）~~（已实现，见文末 hello288 K 一节）；③实时信号没有接手。
+- 如实的局限：①不是真正的共享队列：信号的待处理位仍在被点名的线程上，`claimHeld` 是在解除阻塞时把它搬过来，所以被点名的线程退出时 held 信号随它丢失；②~~`sigpending` 只看到本线程的集合，看不到 held 的进程级信号（Linux 会合并共享集合）~~（已实现，见文末 hello288 K 一节）；③~~实时信号没有接手~~（已实现，见文末 hello288 N 一节）。
 
 ## 另一个线程的 sigpending 和 sigtimedwait 看得到进程级信号（hello288 K，已实现）
 
@@ -7901,7 +7901,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello288 新增 K 段一项，子进程用退出码说明哪一步出错。改动前的内核（SMP=2）上子进程以 2 退出：另一个线程的 `sigpending` 没有看到这个信号。
 - 实现：`shared_pending_policy.visible` 把本线程的集合和 held 集合合并（宿主机测试补了两条断言）。`rtSigpending` 报告这个合并结果。`rtSigtimedwait` 每轮先看 held 里被等待的最低位，经抽出的 `takeHeldSignal` 从兄弟线程上把待处理位和 siginfo 搬到本线程再取走；`claimHeld` 改用同一个函数。持有者自己用 `sigtimedwait` 取走时，过期的 held 位同样被清掉。`tkill` 的信号不进 held，另一个线程仍然看不到。
 - 绿灯：宿主机 Linux 上 hello288 全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS，K 段子进程以 0 退出，日志开头是 `spawned hello2`、`spawned hello288`，确认跑的是带 TEMP 的构建）。`zig build test` 通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
-- 如实的局限：①~~held 的信号仍挂在被点名的线程上，那个线程退出时信号随它丢失~~（已实现，见文末 hello288 L 一节）；②实时信号没有接手；③~~`sigaction(SIG_IGN)` 只丢弃本线程的信号，不清兄弟线程上的信号，也不清 held 位~~（已实现，见文末 hello288 M 一节）。
+- 如实的局限：①~~held 的信号仍挂在被点名的线程上，那个线程退出时信号随它丢失~~（已实现，见文末 hello288 L 一节）；②~~实时信号没有接手~~（已实现，见文末 hello288 N 一节）；③~~`sigaction(SIG_IGN)` 只丢弃本线程的信号，不清兄弟线程上的信号，也不清 held 位~~（已实现，见文末 hello288 M 一节）。
 
 ## 被点名的线程退出后，held 的进程级信号仍在（hello288 L，已实现）
 
@@ -7910,7 +7910,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello288 新增 L 段一项，子进程用退出码说明哪一步出错。改动前的内核（SMP=2 一份、SMP=4 一份）上子进程以 3 退出：被点名的线程退出后主线程解除阻塞，handler 没有运行。
 - 实现：`shared_pending_policy.handOff` 只挑出既挂在本线程、又属于 held 集合的信号（线程级的 `tkill` 信号不转交，宿主机测试 1 条）。新的 `signal_syscall.handOffHeld` 在 `exitTask` 的开头调用：把这些信号连同 siginfo 交给还活着、且没有在退出的兄弟线程；兄弟线程不阻塞它时清掉 held 位并 `kickIfBlocked`，否则 held 位保留，等先解除阻塞的线程经 `claimHeld` 接手。没有活着的兄弟时进程正在退出，信号丢弃。
 - 绿灯：宿主机 Linux 上 hello288 全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS，L 段子进程以 0 退出，日志开头是 `spawned hello2`、`spawned hello288`，确认跑的是带 TEMP 的构建）。`zig build test` 通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
-- 如实的局限：①实时信号没有接手；②~~`sigaction(SIG_IGN)` 只丢弃本线程的信号，不清兄弟线程上的信号，也不清 held 位~~（已实现，见文末 hello288 M 一节）。
+- 如实的局限：①~~实时信号没有接手~~（已实现，见文末 hello288 N 一节）；②~~`sigaction(SIG_IGN)` 只丢弃本线程的信号，不清兄弟线程上的信号，也不清 held 位~~（已实现，见文末 hello288 M 一节）。
 
 ## sigaction(SIG_IGN) 对整个进程丢弃待处理的信号（hello288 M，已实现）
 
@@ -7919,4 +7919,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello288 新增 M 段一项，子进程用退出码说明哪一步出错（1 发送失败，2 主线程忽略后仍看到，3 另一个线程仍看到，4 另一个线程的 `SIGUSR2` 丢了）。改动前的内核（SMP=2 一份、SMP=4 一份）上子进程以 2 退出：held 位还在，主线程的 `sigpending` 仍报告 `SIGUSR1`。
 - 实现：新的 `signal_syscall.discardForProcess` 先用原子与清掉 `held_signals` 里的这一位，再对同一线程组里每个非 zombie 的线程调 `signal.discardPending`（待处理位和实时队列一起清）。`sigaction` 在新处理方式是 `SIG_IGN`、或是默认动作为忽略的 `SIG_DFL` 时改调它。只清被忽略的那个信号，别的信号（包括 `tkill` 发给兄弟线程的）不动。
 - 绿灯：宿主机 Linux 上 hello288 全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS，K、L、M 段子进程都以 0 退出，日志开头是 `spawned hello2`、`spawned hello288`，确认跑的是带 TEMP 的构建）。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）里三份 `EXIT=0`、0 FAIL；SMP=1 那份以 `EXIT=1` 结束，唯一的失败是 hello267（`SO_REUSEPORT` 监听关闭后迁移的 12 个连接只迁走 6 个），与之前记录的同一偶发项相同，这一项不涉及信号。随后把 hello267 提前到开机后单独跑四份（SMP 1/4/4/1），全部 PASS（迁移 6/6）。四份完整 smoke 里 hello57、hello210、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
-- 如实的局限：①实时信号仍不进 held 集合，所有线程都阻塞时不会被先解除阻塞的线程接手；②丢弃时逐个线程扫描，和并发的发送之间没有锁；发送路径（`signal.sendSignalInfoResult`）也不在发送时丢弃已被忽略的信号，照常置待处理位。所以在忽略之后（或扫描期间）送到、且被阻塞的同一信号仍会留在待处理集合里，直到解除阻塞时按忽略处理掉（Linux 对被阻塞的已忽略信号同样会排队，但对未阻塞的会在发送时直接丢弃）。
+- 如实的局限：①~~实时信号仍不进 held 集合，所有线程都阻塞时不会被先解除阻塞的线程接手~~（已实现，见文末 hello288 N 一节）；②丢弃时逐个线程扫描，和并发的发送之间没有锁；发送路径（`signal.sendSignalInfoResult`）也不在发送时丢弃已被忽略的信号，照常置待处理位。所以在忽略之后（或扫描期间）送到、且被阻塞的同一信号仍会留在待处理集合里，直到解除阻塞时按忽略处理掉（Linux 对被阻塞的已忽略信号同样会排队，但对未阻塞的会在发送时直接丢弃）。
+
+## 所有线程都阻塞时，实时信号也由先解除阻塞的线程接手（hello288 N，已实现）
+
+- 起因：hello288 J 到 M 各节的局限。`processRecipient` 只把标准信号记进 `held_signals`，实时信号的各个实例留在被点名的线程上；另一个线程先解除阻塞时既不接手，被点名的线程也一直不解除阻塞，信号就永远不会运行。
+- Linux 依据（`3rd/linux-7.0.6/kernel/signal.c`：进程级信号不论标准还是实时都进 `signal->shared_pending`，实时信号在那里按发送顺序排队，`dequeue_signal`（618 行）从共享队列取；宿主机实测 `/tmp/pv8.c` 与 `user/hello288.c -DHOST`）：两个线程都阻塞信号 36，`sigqueue(getpid())` 发两次（值 1、2），解除阻塞前不运行；另一个线程解除阻塞后两个实例都在它里面运行，顺序是 1、2，之后主线程没有待处理的。
+- 红灯：hello288 新增 N 段一项（信号 40），子进程用退出码说明哪一步出错。改动前的内核（SMP=2 一份、SMP=4 一份）上子进程以 3 退出：第二个线程解除阻塞后实例没有运行。
+- 实现：`processRecipient` 不再把实时信号排除在 held 之外。新的 `signal.moveRealtime` 在 `rt_queue_lock` 下把一个实时信号的所有排队实例按顺序移到目标线程队列的末尾（目标队列满时剩下的留在原线程，原线程保留待处理位），并移动待处理位（因队列满而丢了 siginfo、只剩待处理位的也一起移）。`takeHeldSignal` 对实时信号从所有兄弟线程收集实例；`handOffHeld` 在线程退出时对实时信号也用它转交。`sigtimedwait` 和 `sigpending` 走同一条路径，不用改。
+- 绿灯：宿主机 Linux 上 hello288 全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS，K、L、M、N 段子进程都以 0 退出，日志开头是 `spawned hello2`、`spawned hello288`，确认跑的是带 TEMP 的构建）。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
+- 如实的局限：①目标队列（每线程 32 个实例）满时，多出的实例留在原线程上，要等原线程解除阻塞或下一次接手；Linux 的共享队列受 `RLIMIT_SIGPENDING` 限制，不按线程分；②发送路径不在发送时丢弃未阻塞的已忽略信号。
