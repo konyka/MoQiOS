@@ -23,6 +23,7 @@
 #define CLONE_FILES     0x400
 #define CLONE_THREAD    0x10000
 #define CLONE_SETTLS    0x80000
+#define CLONE_CHILD_CLEARTID 0x200000
 
 #define FUTEX_WAIT      0
 #define FUTEX_WAKE      1
@@ -105,14 +106,14 @@ typedef struct TCB {
     volatile int dead_claimed;      /* 死栈链压入所有权认领（见 dead_reap.h） */
     volatile int join_claimed;      /* join 块所有权认领（见 dead_reap.h） */
     struct TCB *dead_next;          /* 死栈链链接（仅退出后使用） */
+    volatile int tid_word;          /* CLONE_CHILD_CLEARTID 字：内核在线程不再运行用户代码后清零（见 dead_reap.h） */
 } TCB;
 
 /* ── detached 栈惰性回收（v2） ────────────────────────────────────────
  * 退出的 detached 线程无法安全 free 自己仍在运行的栈，因此把 TCB 块压入
- * 无锁死栈链，由下一次 pthread_create 排空并 free。压链是退出线程的
- * 最后内存写：其后以纯寄存器 asm 直接 syscall exit，不再触碰本栈；
- * 残余窗口是压链与 exit 之间的信号投递（帧会写到可能已回收的栈顶），
- * 指令级宽度，按既有惯例记录为已接受残余。 */
+ * 无锁死栈链，由下一次 pthread_create 排空。压链之后线程仍在本栈上，直到
+ * 进入内核退出；排空只 free 内核已清零 tid_word（CLONE_CHILD_CLEARTID）
+ * 的块，其余重新压回，留到下一次排空。 */
 static TCB *volatile dead_head;
 
 static void dead_push(TCB *t) {
@@ -127,7 +128,8 @@ static void dead_drain(void) {
     TCB *list = __sync_lock_test_and_set(&dead_head, (TCB *)0);
     while (list != 0) {
         TCB *next = list->dead_next;
-        free(list->alloc_base);
+        if (dead_block_released(&list->tid_word)) free(list->alloc_base);
+        else dead_push(list);       /* 线程尚未进入内核退出：留到下一次排空 */
         list = next;
     }
 }
@@ -217,12 +219,13 @@ int pthread_create(pthread_t *thread, const void *attr,
     t->dead_claimed = 0;
     t->join_claimed = 0;
     t->dead_next = 0;
+    t->tid_word = 1;
     for (int i = 0; i < PTHREAD_KEYS_MAX; i++) t->specific[i] = 0;
 
     long sp = (long)t + sizeof(TCB) + THREAD_STACK_SIZE;
     sp &= ~15L;
-    long ret = clone_call(CLONE_VM | CLONE_FILES | CLONE_THREAD | CLONE_SETTLS,
-                          sp, 0, 0, (long)t);
+    long ret = clone_call(CLONE_VM | CLONE_FILES | CLONE_THREAD | CLONE_SETTLS | CLONE_CHILD_CLEARTID,
+                          sp, 0, (long)&t->tid_word, (long)t);
     if (ret == 0) {
         /* 子线程：不经 pthread_create 帧（父可能已返回），经 FS 自取 TCB。 */
         TCB *me = tcb_self();
@@ -277,6 +280,12 @@ int pthread_join(pthread_t thread, void **retval) {
         futex_call((volatile int *)&t->state, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0, 0);
     }
     if (retval) *retval = t->retval;
+    /* state=1 之后线程仍在本栈上调用 futex/_exit；等内核清零 tid 字再 free，
+       否则复用该块的下一个线程的栈会被改写（hello228 B）。 */
+    int w;
+    while ((w = __atomic_load_n(&t->tid_word, __ATOMIC_ACQUIRE)) != 0) {
+        futex_call(&t->tid_word, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, w, 0);
+    }
     free(t->alloc_base);
     return 0;
 }

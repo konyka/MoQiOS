@@ -65,4 +65,13 @@ static int dead_reap_on_detach(volatile int *state, volatile int *claimed) {
            __sync_bool_compare_and_swap(claimed, 0, 1);
 }
 
+/* 线程块可回收的判据：内核在线程退出、不再执行任何用户代码之后才把
+ * CLONE_CHILD_CLEARTID 字清零并唤醒其 futex。state=1 只说明线程函数已
+ * 返回——此后 pthread_exit 仍在本栈上调用 futex/_exit（压返回地址），
+ * 以 state 为准回收块会让下一个复用该块的线程的栈被改写（hello228 B）。
+ * join 等待该字归零后才 free；dead_drain 只 free 该字已归零的块。 */
+static inline int dead_block_released(volatile int *tid_word) {
+    return __atomic_load_n(tid_word, __ATOMIC_ACQUIRE) == 0;
+}
+
 #endif

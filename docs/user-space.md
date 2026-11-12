@@ -228,7 +228,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello225 | `pause`/`alarm`/`gettid` |
 | hello226 | `atexit/exit/abort/raise/assert/signal()/sigprocmask/perror/remove/rename/isatty` 与 id 调用，每个会终止进程的用例在 fork 的子进程里跑 |
 | hello227 | `system()` 与 shell：`sh -c` 的状态、命令列表 `; && \|\|`、引号与反斜杠、`$?`/`$!`/延迟变量展开、后台 `&` 与 `wait`、`<` `>>`、`export`/`env`、`ls`、`cd` 与重定向失败的状态（见第 3 节） |
-| hello228 | 线程 `join` 之后立刻复用其内存：4000 个线程，每个带栈上金丝雀 |
+| hello228 | 线程 `join` 之后立刻复用其内存：4000 个线程，每个带栈上金丝雀；join 等到内核清零 `CLONE_CHILD_CLEARTID` 字才回收线程块 |
 | hello229 | `SA_RESTART`（`read`/`write`/`waitpid`/`wait4`/`readv`/`writev`/`accept`/`recvfrom`）、管道写阻塞、`EINTR`/`EPIPE`、`PIPE_BUF` 原子性 |
 | hello234 | `poll`/`ppoll`/`select` 的 libc 封装在真内核上：管道的 `POLLIN`/`POLLOUT`/`POLLHUP`、`POLLNVAL`、负描述符被忽略、超时、被写者唤醒、信号处理函数打断得 `EINTR`、`ppoll` 掩码挡住信号 |
 | hello235 | 被信号打断的阻塞调用在返回 `-EINTR` **之前**已经运行了处理函数：`epoll_wait`、`futex(FUTEX_WAIT)`、SysV `semop`、`rt_sigtimedwait`、`mq_timedreceive`、`recvmmsg`、`connect` |

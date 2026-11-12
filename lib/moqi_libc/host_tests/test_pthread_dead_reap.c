@@ -115,6 +115,15 @@ int main(void) {
         CHECK(t.dead_claimed == 0);
     }
 
+    /* A block on the dead-stack list may still be the stack of a thread that has not yet entered the kernel to exit: the
+     * drain frees it only once the kernel has cleared the block's CLONE_CHILD_CLEARTID word. */
+    {
+        volatile int tid_word = 1;
+        CHECK(dead_block_released(&tid_word) == 0);
+        tid_word = 0;
+        CHECK(dead_block_released(&tid_word) != 0);
+    }
+
     printf("test_pthread_dead_reap: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
