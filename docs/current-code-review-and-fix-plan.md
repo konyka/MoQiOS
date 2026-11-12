@@ -7691,7 +7691,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：ext2 的打开槽位一直保存着打开时的路径。新的 `kernel/fs/ext2_open_path_policy.zig` 给出两条纯函数规则（带内联测试）：`afterRename` 把以旧名字为全名或目录前缀的路径改写成新名字，`unlinkHits` 判断被删的名字是否就是保存的路径（比较时去掉首尾的 `/`）。`ext2.zig` 在 `unlinkFile`、`renameFileMode`（文件与目录两个分支）和 `renameExchange` 成功后对所有打开槽位应用这两条规则；被删中的槽位记在 `open_path_deleted`。`fd_target.describe` 对这类槽位追加 ` (deleted)`，`resolveMagicLink` 不再给出路径，`file_io.openAt` 改为调用 `FdTable.reopenExt2Slot`：它复制 inode 和 unlink_pending 到新槽位（新槽位同样是 deleted），处理 `O_CREAT|O_EXCL`（`EEXIST`）和 `O_TRUNC`。
 - 红灯（如实）：实现先于测试写好。为证明测试有效，做了变异：让 `followRenameUnlocked` 和 `followUnlinkUnlocked` 直接返回（真编译），hello278 的改名、删除、经链接重开、父目录改名四项失败（链接仍是 `"/testdir/h278a"`，重开 `-2`），两项“普通路径”通过；还原后七项全过。
 - 绿灯：hello278 七项全过，hello257、hello277 照常通过；host 测试、三个架构构建与完整 smoke 见提交记录。
-- 如实的局限：①~~目录被 `rmdir` 后，目录描述符的链接在 Linux 上是 ` (deleted)`，这里没有处理~~（hello279 处理，见下一节）；②保存的路径如果是在非根工作目录下按相对名字打开的，而 `rename` 的参数已被解析成绝对路径，两者匹配不上，链接会留在旧名字（测试都从根目录出发）；③FAT32 不做（它没有硬链接，打开槽位也不保留父链）；④硬链接 `link` 不改变任何槽位的路径，这与 Linux 一致。
+- 如实的局限：①~~目录被 `rmdir` 后，目录描述符的链接在 Linux 上是 ` (deleted)`，这里没有处理~~（hello279 处理，见下一节）；②~~保存的路径如果是在非根工作目录下按相对名字打开的，而 `rename` 的参数已被解析成绝对路径，两者匹配不上，链接会留在旧名字~~（这条推测不成立：`file_io.openAt` 先经 `at_path.resolve` 按 cwd 拼成绝对路径再交给 ext2，存下的就是绝对路径。hello278 新增两项：`chdir("/testdir")` 后按相对名打开、`rename`、`unlink`，链接分别为 `/testdir/h278g` 和 `/testdir/h278g (deleted)`，在当前内核上直接通过，是回归保护，没有红灯）；③FAT32 不做（它没有硬链接，打开槽位也不保留父链）；④硬链接 `link` 不改变任何槽位的路径，这与 Linux 一致。
 
 ## 打开期间被删掉名字的 ext2 目录和被 rename 覆盖的对象（hello279，已修）
 

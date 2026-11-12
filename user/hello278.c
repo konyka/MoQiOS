@@ -81,6 +81,21 @@ int main(void) {
     snprintf(what, sizeof what, "after the parent is renamed the link names the new parent (mkdir %ld rename %ld, \"%s\")", mk, rr, got);
     check(mk == 0 && s >= 0 && rr == 0 && strcmp(got, "/testdir/h278sub2/f") == 0, what);
 
+    long cd = chdir("/testdir");
+    unlink("h278f");
+    unlink("h278g");
+    int rf = (int)open("h278f", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    long rr2 = rename("h278f", "h278g");
+    linkText(rf, got, sizeof got);
+    snprintf(what, sizeof what, "a file opened by a relative name in a non-root cwd follows its rename (chdir %ld rename %ld, \"%s\")", cd, rr2, got);
+    check(cd == 0 && rf >= 0 && rr2 == 0 && strcmp(got, "/testdir/h278g") == 0, what);
+    long ru = unlink("h278g");
+    linkText(rf, got, sizeof got);
+    snprintf(what, sizeof what, "and after a relative unlink it reads \" (deleted)\" (unlink %ld, \"%s\")", ru, got);
+    check(ru == 0 && strcmp(got, "/testdir/h278g (deleted)") == 0, what);
+    if (rf >= 0) close(rf);
+    chdir("/");
+
     close(a);
     close(e);
     if (s >= 0) close(s);

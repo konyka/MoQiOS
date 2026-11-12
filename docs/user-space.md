@@ -273,7 +273,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello275 | 曾经让写回池失效的两种 FAT32 写入：`unlink` 之后仍打开的文件的写入（并在 `fsync` 后按 `unlink` 前的内容读回）、`ftruncate` 加长后在旧末尾之外写入（空洞读回 0）；随后各向一个新建的 FAT32 和 ext2 文件写 4 MiB（超过整个 512 块的写回池），两者都必须完整 |
 | hello276 | 打开期间被 `unlink` 的 tmpfs 条目的 `/proc/self/fd/N`：`readlink` 返回原路径加 `" (deleted)"`（文件和目录都是），经该链接 `open` 仍能读到数据且从偏移 0 开始、不影响原描述符的偏移，`stat` 成功；仍有名字的条目不带后缀 |
 | hello277 | 经 `/proc/self/fd/N` 打开时按本次传入的标志和对象类型处理（文件和已 `unlink` 的 tmpfs 条目都一样）：`O_CREAT\|O_EXCL` 得 `EEXIST`，`O_TRUNC` 截断，文件上的 `O_DIRECTORY` 得 `ENOTDIR`，目录的 `O_RDWR` 得 `EISDIR`；访问模式按新标志并重新核对权限（非 root 对 0444 文件请求写得 `EACCES`，`unlink` 后仍然）；管道任一端按访问模式重开为对应的一端，eventfd/epoll 得 `EACCES`、套接字得 `ENXIO`；经链接对管道、套接字 `stat` 成功 |
-| hello278 | ext2 文件的 `/proc/self/fd/N` 跟随改名和删除：文件或父目录被 `rename` 后链接给出新路径；打开时用的名字被 `unlink` 后给出 `"<路径> (deleted)"`（即使还有别的硬链接），经链接仍能重开并读到数据，重开得到的描述符同样是 deleted；未改动的文件和幸存的硬链接给出普通路径 |
+| hello278 | ext2 文件的 `/proc/self/fd/N` 跟随改名和删除：文件或父目录被 `rename` 后链接给出新路径（在非根工作目录下按相对名打开、改名、删除也一样）；打开时用的名字被 `unlink` 后给出 `"<路径> (deleted)"`（即使还有别的硬链接），经链接仍能重开并读到数据，重开得到的描述符同样是 deleted；未改动的文件和幸存的硬链接给出普通路径 |
 | hello279 | 打开期间被删掉名字的 ext2 对象：被 `rmdir` 的目录经 `/proc/self/fd/N` 读出 `"<路径> (deleted)"`，`fstat` 的 nlink 为 0，`getdents64` 和 `openat(O_CREAT)` 得 `ENOENT`（同名新目录出现后也一样，不会建到新目录里），仍能经链接重开；被 `rename` 覆盖的文件和空目录同样是 ` (deleted)`，被覆盖的文件仍能读到数据 |
 | hello280 | 打开期间被 `unlink` 的 FAT32 文件：`/proc/self/fd/N` 读出 `"/<名字> (deleted)"`，经链接 `O_CREAT\|O_EXCL` 得 `EEXIST`，重开从偏移 0 读到数据，新描述符同样是 deleted，并在原描述符关闭后仍能读；最后一次关闭后名字仍不存在 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
