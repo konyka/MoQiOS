@@ -11,12 +11,12 @@ pub const EINTR_RESULT: i64 = -4;
 pub const SYSCALL_INSN_LEN: u64 = 2;
 
 /// Native syscall numbers that restart (each has both its native number and its Linux number): read 10, write 1, waitpid 6,
-/// wait4 263/61, readv 138/19, writev 139/20, accept 120/43, accept4 131, sendto 121/44, recvfrom 122/45, sendmsg 129/46 and
-/// recvmsg 130/47. All of them deliver the handler on the way out (checkSignalsOnSyscallReturn), which is where the restart is
-/// arranged. connect, flock, futex, sleeps and the poll/epoll/select waits are not restartable.
+/// wait4 263/61, waitid 500, readv 138/19, writev 139/20, accept 120/43, accept4 131, sendto 121/44, recvfrom 122/45,
+/// sendmsg 129/46 and recvmsg 130/47. All of them deliver the handler on the way out (checkSignalsOnSyscallReturn), which is
+/// where the restart is arranged. connect, flock, futex, sleeps and the poll/epoll/select waits are not restartable.
 pub fn restartable(nr: u64) bool {
     return switch (nr) {
-        1, 6, 10, 61, 263, 138, 19, 139, 20, 120, 43, 131, 121, 44, 122, 45, 129, 46, 130, 47 => true,
+        1, 6, 10, 61, 263, 500, 138, 19, 139, 20, 120, 43, 131, 121, 44, 122, 45, 129, 46, 130, 47 => true,
         else => false,
     };
 }
@@ -46,7 +46,7 @@ test "other flag bits do not matter" {
 }
 
 test "the blocking read, write, wait and socket calls restart" {
-    for ([_]u64{ 1, 6, 10, 61, 263, 138, 19, 139, 20, 120, 43, 131, 121, 44, 122, 45, 129, 46, 130, 47 }) |nr| try testing.expect(restartable(nr));
+    for ([_]u64{ 1, 6, 10, 61, 263, 500, 138, 19, 139, 20, 120, 43, 131, 121, 44, 122, 45, 129, 46, 130, 47 }) |nr| try testing.expect(restartable(nr));
 }
 
 test "sleeps and waits that name a timeout never restart" {

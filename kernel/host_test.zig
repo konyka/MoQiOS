@@ -205,6 +205,7 @@ pub const sigaltstack_policy = @import("proc/sigaltstack_policy.zig");
 pub const kill_broadcast_policy = @import("proc/kill_broadcast_policy.zig");
 pub const orphan_pgrp_policy = @import("proc/orphan_pgrp_policy.zig");
 pub const wait_report_policy = @import("proc/wait_report_policy.zig");
+pub const waitid_policy = @import("proc/waitid_policy.zig");
 pub const segment_copy_policy = @import("proc/segment_copy_policy.zig");
 pub const fs_reader = @import("fs/fs_reader.zig");
 pub const fr_alias = @import("fs/fs_reader.zig");
@@ -340,6 +341,7 @@ test {
     _ = @import("proc/syscall_restart_policy.zig");
     _ = @import("proc/orphan_pgrp_policy.zig");
     _ = @import("proc/wait_report_policy.zig");
+    _ = @import("proc/waitid_policy.zig");
     _ = @import("proc/exec_policy.zig");
     _ = @import("proc/comm_policy.zig");
     _ = @import("proc/user_stack.zig");

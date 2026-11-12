@@ -2570,6 +2570,10 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         496 => { // mlock2(addr, len, flags) — mlock with MLOCK_ONFAULT accepted
             frame.rax = @bitCast(@import("../../mm/mlock.zig").mlock2(frame.rdi, frame.rsi, frame.rdx));
         },
+        500 => { // waitid(idtype, id, infop, options, rusage) — rusage is ignored
+            frame.rax = @bitCast(waitpid_mod.waitid(@truncate(frame.rdi), frame.rsi, frame.rdx, @truncate(frame.r10)));
+            checkSignalsOnSyscallReturn(frame);
+        },
         495 => { // dns_resolve(name, out4) — hostname to IPv4 through the kernel resolver
             frame.rax = @bitCast(syscallDnsResolve(frame.rdi, frame.rsi));
         },

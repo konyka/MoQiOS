@@ -840,6 +840,15 @@ const SchedStats = struct {
   的 SIGCHLD 动作没有 `SA_NOCLDSTOP` 时再发 SIGCHLD（`CLD_STOPPED`/`CLD_CONTINUED`）。
   `waitpid` 带 `WUNTRACED`/`WCONTINUED` 时经 `takeWaitReportLocked` 取走报告；阻塞前在同一把
   锁下再检查一次，所以变化不会从检查和阻塞之间漏掉。
+- **waitid（hello285，系统调用 500）**：`proc/waitpid.zig` 的 `waitid`。`idtype` 是 `P_ALL`/`P_PID`/`P_PGID`
+  （`proc/waitid_policy.zig` 把它换成 waitpid 的 pid 选择：-1、正 pid、负进程组），`options` 必须含
+  `WEXITED`/`WSTOPPED`/`WCONTINUED` 之一，其余位除 `WNOHANG`/`WNOWAIT` 外都是 `EINVAL`。成功返回 0，
+  子进程的身份和状态写进 128 字节的 SIGCHLD siginfo（`si_code` 为 `CLD_EXITED`/`CLD_KILLED`/`CLD_STOPPED`/
+  `CLD_CONTINUED`，`si_status` 是退出码、致死信号、停止信号或 SIGCONT，`si_pid`/`si_uid` 是子进程的）。
+  退出优先于同一子进程未报告的停止或继续；`WNOWAIT` 报告但不回收（`peekZombieLocked`，停止/继续报告也不消费），
+  所以同一个僵尸或停止可以再报告一次。`WNOHANG` 没有可报告的变化时返回 0 并把 siginfo 清零（`si_signo` 为 0）；
+  infop 为空也允许，照样回收。没有匹配的子进程是 `ECHILD`。阻塞沿用 waitpid 的锁内协议，被信号打断返回 `-EINTR`
+  并可按 `SA_RESTART` 重启。第五个参数 rusage 暂不填写。
 - **kill(-pgid) 广播**：`lifecycle.kill(pid<0)` → `signal.sendSignalToPgrp`——stop/cont 类
   按默认处置立即生效，其余走 pending + 唤醒；返回发送计数（0 → ESRCH）。
 - **孤儿组 SIGHUP（Linux `kill_orphaned_pgrp`）**：任何用户进程退出（线程退出不算）时

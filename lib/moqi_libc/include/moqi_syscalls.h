@@ -82,6 +82,7 @@
 #define SYS_gettid      497
 #define SYS_preadv2     498
 #define SYS_pwritev2    499
+#define SYS_waitid      500
 
 /* Processes, identity and terminals */
 #define SYS_pause       34

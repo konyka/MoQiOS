@@ -1874,7 +1874,8 @@ pub fn noteChildStateChange(t: *Task, change: @import("wait_report_policy.zig").
 }
 
 /// waitpid(WUNTRACED / WCONTINUED): take a matching live child's pending stop or continue report. Caller MUST hold task_lock.
-pub fn takeWaitReportLocked(parent_idx: u32, pid: i32, options: u32, status: *i32) ?u32 {
+/// `consume` is false for waitid(WNOWAIT): the report stays pending and the next wait sees it again.
+pub fn takeWaitReportLocked(parent_idx: u32, pid: i32, options: u32, status: *i32, consume: bool) ?u32 {
     const wrp = @import("wait_report_policy.zig");
     if (options & (wrp.WUNTRACED | wrp.WCONTINUED) == 0) return null;
     const parent = getTask(parent_idx) orelse return null;
@@ -1886,7 +1887,7 @@ pub fn takeWaitReportLocked(parent_idx: u32, pid: i32, options: u32, status: *i3
         if (t.parent_tid != parent.tid or t.is_thread or t.state == .zombie) continue;
         if (!@import("proc_id_policy.zig").waitMatches(pid, t.tid, t.pgid, parent.pgid)) continue;
         const st = wrp.report(options, t.wait_report) orelse continue;
-        t.wait_report = wrp.consume(t.wait_report, st);
+        if (consume) t.wait_report = wrp.consume(t.wait_report, st);
         status.* = st;
         return t.tid;
     }
@@ -1897,7 +1898,32 @@ pub fn takeWaitReportLocked(parent_idx: u32, pid: i32, options: u32, status: *i3
 pub fn takeWaitReport(parent_idx: u32, pid: i32, options: u32, status: *i32) ?u32 {
     const flags = task_lock.acquire();
     defer task_lock.release(flags);
-    return takeWaitReportLocked(parent_idx, pid, options, status);
+    return takeWaitReportLocked(parent_idx, pid, options, status, true);
+}
+
+/// waitid(WNOWAIT): a matching zombie whose exit can be reported, without reaping it. Caller MUST hold task_lock.
+/// Returns the child's slot, or null. A zombie that is not yet reportable (still the current task, or not past the
+/// epilogue gate) comes back as `.busy` so the caller waits instead of saying there is no status.
+pub fn peekZombieLocked(parent_idx: u32, pid: i32) union(enum) { none, busy, child: u32 } {
+    const parent = getTask(parent_idx) orelse return .none;
+    var busy_child = false;
+    var bits = slot_bitmap;
+    while (bits != 0) {
+        const i: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const t = &tasks[i];
+        if (t.parent_tid != parent.tid or t.is_thread) continue;
+        if (!@import("proc_id_policy.zig").waitMatches(pid, t.tid, t.pgid, parent.pgid)) continue;
+        switch (reap_policy.verdict(zombieViewLocked(i, t))) {
+            .skip => continue,
+            .busy => {
+                busy_child = true;
+                continue;
+            },
+            .detach => return .{ .child = i },
+        }
+    }
+    return if (busy_child) .busy else .none;
 }
 
 /// Result of a single waitpid zombie scan (task_lock held by caller).

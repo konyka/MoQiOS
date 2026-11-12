@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello284`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello285`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -280,6 +280,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello282 | 跨进程 `process_vm_readv/writev`：父进程读到子进程的数据；写进子进程的 COW 页（栈、`mmap` 匿名页、数据段）只改子进程的副本；不存在的 pid 与已回收的子进程是 `ESRCH`；flags 非零是 `EINVAL`；零长度读取对不存在的 pid 也返回 0；降为 uid 1000 的子进程读 root 进程是 `EPERM` |
 | hello283 | 孤儿进程组（Linux `kill_orphaned_pgrp`）：退出使一个含停止成员的组新成为孤儿时，组内成员先收 SIGHUP 再收 SIGCONT；检查退出者自己的组和每个子进程所在的组；组内无停止成员、组仍被同会话他组的父进程链接、或停止的子进程留在退出会话长自己的组里时，什么都不发（宿主机 Linux 实测同结果） |
 | hello284 | `waitpid` 报告停止与继续的子进程：`WUNTRACED` 把 SIGSTOP 停止报告为 `0x137f`（每次停止只报告一次，不带该选项不报告），`WCONTINUED` 把 SIGCONT 继续报告为 `0xffff`；阻塞的 `WUNTRACED` 等待在子进程停止时返回；父进程在停止和继续时各收一次 SIGCHLD，SIGCHLD 动作带 `SA_NOCLDSTOP` 时不收，但停止照样报告（宿主机 Linux 实测同结果） |
+| hello285 | `waitid`（系统调用 500）：成功返回 0，子进程身份和状态写进调用方的 siginfo（`CLD_EXITED`/`CLD_KILLED`/`CLD_STOPPED`/`CLD_CONTINUED`，`si_status` 是退出码、致死信号、停止信号或 SIGCONT）；`WNOWAIT` 报告但不回收，同一僵尸或停止可再报告；`WNOHANG` 没有可报告的变化时返回 0 并清掉 siginfo；`idtype`/`options`/`id` 非法是 `EINVAL`，没有这样的子进程是 `ECHILD`；空的 infop 也照样回收（宿主机原始 syscall 实测同结果） |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。

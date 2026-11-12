@@ -7735,9 +7735,9 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 发现的两处缺陷：①旧规则只在会话长退出时给同会话成员发 SIGHUP（`onSessionLeaderExit`），普通进程退出不处理，而且不区分组是否真的成为孤儿、是否有停止成员；②hello58 第 5 段让 C 留在会话长 D 自己的组里并期望收到 SIGHUP，按 Linux 语义这个组从未被会话内的链接连着，什么都不该发（宿主机 mode 7 实测收到空串）。
 - 实现：`kernel/proc/orphan_pgrp_policy.zig` 给出纯函数规则（带内联测试）：`willBeOrphaned`、`hasStopped`、`hangsUp`、`groupsToHangUp`。`jobctl.onExit` 先对任务做快照，持有控制台的会话长退出时向前台组发 SIGHUP 并释放控制台，再对选出的每个组先发 SIGHUP 再发 SIGCONT。`exitTask` 对每个退出的用户进程（线程除外）调用它。hello58 第 5 段改为 C 先 `setpgid(0,0)` 自成一组再停止。
 - 顺带修掉的延迟：`kill(getpid(), SIGSTOP)` 停止自己时，`sendSignalInfoResult` 对调用者自己也走 `kickUntilStopped`，而 `kickRunningCpu` 对调用者所在的 CPU 直接返回，于是空转满 200×2000 次 pause（实测约 190ms）。现在目标就是当前任务时跳过这段等待，调用者在 syscall 返回时自己停下。
-- 测试不再靠固定 sleep：hello283 和 hello58 第 5 段在退出前有界轮询 `/proc/<子进程>/stat`，直到第三个字段是 `T`（`procfs.generatePidStat` 用 `pid_status.stateOf` 生成）。不用 `waitpid` 的 `WUNTRACED`：内核只校验了这个选项，没有确认会报告停止的子进程（未验证，记为后续开放项）。
+- 测试不再靠固定 sleep：hello283 和 hello58 第 5 段在退出前有界轮询 `/proc/<子进程>/stat`，直到第三个字段是 `T`（`procfs.generatePidStat` 用 `pid_status.stateOf` 生成）。当时没有用 `waitpid` 的 `WUNTRACED`（那时它还不报告停止的子进程）；hello284 已实现该报告，见下一节。
 - 绿灯：hello283 六项、hello58 全段在 SMP=1 与 SMP=4 下通过；host 测试、三个架构构建与完整 smoke 见提交记录。
-- 如实的局限：①本内核的 handler 运行顺序与 Linux 不同（见上），测试不比较顺序；②`WUNTRACED`/`WCONTINUED` 是否报告子进程的停止和继续尚未验证。
+- 如实的局限：①本内核的 handler 运行顺序与 Linux 不同（见上），测试不比较顺序；②~~`WUNTRACED`/`WCONTINUED` 是否报告子进程的停止和继续尚未验证~~（hello284 已实现并实测，见下一节）。
 
 ## waitpid 报告停止和继续的子进程（hello284，已实现）
 
@@ -7745,4 +7745,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯（改动前的内核，真编译）：hello284 十三项中五项失败：停止时没有 SIGCHLD，`WUNTRACED` 返回 0，阻塞的 `WCONTINUED` 一直等到子进程退出并把它回收（返回状态 `0x700`），之后两项得 `ECHILD`。
 - 实现：新的 `kernel/proc/wait_report_policy.zig`（带内联测试）给出状态编码、只报告一次、新变化取代旧变化和 `SA_NOCLDSTOP` 的规则。`Task.wait_report` 记录待报告的变化，`task.noteChildStateChange` 在 task_lock 下记录变化并按 exitTask 的方式唤醒阻塞在 waitpid 里的父进程。`signal.stopTask` 多了 `signum` 参数（四个调用点都传入实际的停止信号），它和 `continueTask` 只在状态真正改变时经 `notifyParentOfChange` 通知父进程，并按需发送 SIGCHLD（`siginfo_policy.childStateInfo`：`CLD_STOPPED` 带停止信号，`CLD_CONTINUED` 带 SIGCONT）。`waitpid` 在回收僵尸之后、`WNOHANG` 判断之前、阻塞前的加锁检查里、以及每次被唤醒后，都会经 `takeWaitReport(Locked)` 取走报告。
 - 绿灯：hello284 十三项在 SMP=1 下全过；host 测试、三个架构构建与完整 smoke 见提交记录。
-- 如实的局限：①`waitid` 没有实现（`WSTOPPED`/`WEXITED`/`WNOWAIT` 无从谈起）；②ptrace 停止（`__WALL` 的跟踪停止）没有实现；③停止的线程组：本内核按任务停止，只有线程组组长的停止和继续会报告（线程不报告），Linux 要等整组都停下才报告。
+- 如实的局限：①~~`waitid` 没有实现（`WSTOPPED`/`WEXITED`/`WNOWAIT` 无从谈起）~~（hello285 已实现，见下一节）；②ptrace 停止（`__WALL` 的跟踪停止）没有实现；③停止的线程组：本内核按任务停止，只有线程组组长的停止和继续会报告（线程不报告），Linux 要等整组都停下才报告。
+
+## waitid（hello285，已实现）
+
+- 起因：hello284 局限 ①。`waitpid` 只写一个状态字并返回子进程 tid；Linux 的 `waitid` 成功时返回 0，把身份和状态写进调用方的 siginfo，并且 `WNOWAIT` 能报告而不回收。
+- 宿主机实测（`/tmp/lm/waitid_probe.c`、`waitid_probe2.c`、`waitid_raw.c`，原始 syscall）：成功返回 0，siginfo 为 signo@0=17、code@8、pid@16、uid@20、status@24；`exit(7)` 是 `CLD_EXITED`/`7`，被 SIGKILL 杀死是 `CLD_KILLED`/`9`，停止是 `CLD_STOPPED`/`19`，SIGCONT 之后是 `CLD_CONTINUED`/`18`；`WNOWAIT` 不消费，同一僵尸或停止可再报告，之后 `waitpid` 仍能拿到；回收后再 `waitid` 或 `waitpid` 都是 `ECHILD`；子进程还活着或处于停止态时用 `WEXITED|WNOHANG` 查询返回 0 且 siginfo 被清零；`P_PGID` 能匹配；`P_PID` 的 id 为 0、options 只有 `WNOHANG`、未知位、非法 idtype 都是 `EINVAL`；infop 为 NULL 也成功并照样回收。
+- 红灯：改动前的内核没有 500 号分支（分发表 `else =>` 返回 `ENOSYS`），没有在目标机上单独运行。第一版实现在目标机（SMP=1）上 hello285 二十项中一项失败：`WCONTINUED` 报告成了 `CLD_STOPPED`/255。原因是继续的状态字 `0xffff` 低 7 位也是 `0x7f`，判断停止要看低 8 位等于 `0x7f`。
+- 实现：`kernel/proc/waitid_policy.zig` 给出 idtype/options 校验（`P_ALL`→-1、`P_PID`→id、`P_PGID`→-id，id 为 0 或超过 0x7fffffff、没有 `WEXITED`/`WSTOPPED`/`WCONTINUED` 之一、未知位都是 `EINVAL`）和报告选择（退出优先，`WNOWAIT` 时不回收）。`kernel/proc/waitpid.zig` 的 `waitid` 复用 waitpid 的锁内阻塞协议；回收走 `waitpidScanLocked`，`WNOWAIT` 走新增的只读 `task.peekZombieLocked`（按 `reap_policy.verdict` 跳过已交给回收线程的僵尸），停止和继续复用 `takeWaitReportLocked` 并加了不消费的参数。siginfo 用 `siginfo_policy.encode` 写 128 字节；`WNOHANG` 没有可报告的变化时写全 0。系统调用号用原生 500（247 已被 `clock_nanosleep` 占用，Linux 别名表只覆盖 rlimit 的两个号），并加入 `syscall_restart_policy.restartable`。libc 只加 `SYS_waitid`，hello285 直接用 `syscall5`。
+- 绿灯：hello285 二十项在宿主机（`-DHOST`）和目标机（SMP=1）上全过；host 测试、三个架构构建与完整 smoke 见提交记录。
+- 如实的局限：①第五个参数 rusage 不填写；②`WNOHANG` 无变化时把整份 128 字节 siginfo 写 0，Linux 只清其中的几个字段（读到的值相同）；③没有 Linux 247 到原生 500 的 personality 别名（别名表目前只服务 rlimit）；④继承 hello284 的局限：没有 ptrace 停止，线程组只有组长的停止和继续会报告。

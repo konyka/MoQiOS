@@ -73,7 +73,7 @@ pub fn waitpidUsage(pid_raw: u64, status_ptr: u64, options: u32, usage_out: ?*cp
         parent.waiting_for_child = true;
         parent.wait_cpu = @intCast(se.getPerCpu().cpu_id);
         // Under the same lock as noteChildStateChange's record + wake, so a stop or continue cannot slip past this check.
-        if (task_mod.takeWaitReportLocked(cur_idx, pid, options, &exit_code)) |child_tid| {
+        if (task_mod.takeWaitReportLocked(cur_idx, pid, options, &exit_code, true)) |child_tid| {
             parent.waiting_for_child = false;
             task_mod.unlockTask(tflags);
             if (!writeStatus(status_ptr, exit_code)) return -14;
@@ -162,4 +162,167 @@ fn writeStatus(status_ptr: u64, exit_code: i32) bool {
     if (status_ptr >= 0x0000_8000_0000_0000) return false;
     const src: [*]const u8 = @ptrCast(&exit_code);
     return copy.copyToUser(@ptrFromInt(status_ptr), src[0..4], 4) == 4;
+}
+
+const wid = @import("waitid_policy.zig");
+const siginfo = @import("siginfo_policy.zig");
+const wsp = @import("wait_status_policy.zig");
+
+/// waitid(idtype, id, infop, options) -> 0 or -errno. Unlike waitpid the success value is always 0; the child's identity and
+/// status go into the caller's siginfo. A null infop is allowed and still reaps. WNOHANG with nothing to report returns 0 and
+/// clears the siginfo (si_signo 0).
+pub fn waitid(idtype: u32, id: u64, infop: u64, options: u32) i64 {
+    const req = wid.request(idtype, id, options) orelse return wid.EINVAL;
+    const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
+    if (infop != 0 and !copy.validateUserBufferWritable(infop, siginfo.SIGINFO_SIZE)) return -14;
+    if (!task_mod.hasMatchingChild(cur_idx, req.pid)) return -10; // -ECHILD
+
+    if (collectWaitid(cur_idx, req)) |got| {
+        return publishWaitid(infop, got);
+    }
+    if (options & wid.WNOHANG != 0) return publishWaitid(infop, null);
+
+    const parent = task_mod.getTask(cur_idx) orelse return -1;
+    const sig_mod = @import("signal.zig");
+    while (true) {
+        const tflags = task_mod.lockTask();
+        parent.waiting_for_child = true;
+        parent.wait_cpu = @intCast(se.getPerCpu().cpu_id);
+        switch (collectWaitidLocked(cur_idx, req)) {
+            .got => |got| {
+                parent.waiting_for_child = false;
+                task_mod.unlockTask(tflags);
+                if (got.finish) |r| task_mod.finishReap(r);
+                return publishWaitid(infop, got);
+            },
+            .busy => {
+                parent.waiting_for_child = false;
+                task_mod.unlockTask(tflags);
+                asm volatile ("sti");
+                @import("../arch/arch.zig").cpu.pause();
+                continue;
+            },
+            .none => {},
+        }
+        if (!task_mod.hasChildrenLocked(cur_idx)) {
+            parent.waiting_for_child = false;
+            task_mod.unlockTask(tflags);
+            return -10;
+        }
+        se.syncUserRspToTask(parent);
+        @import("sched_claim.zig").store(&parent.state, .blocked);
+        task_mod.unlockTask(tflags);
+        task_mod.kickChildCpus(parent.tid, parent.wait_cpu);
+        sched_mod.requestReschedule();
+
+        while (@as(*volatile bool, @ptrCast(&parent.waiting_for_child)).* and !sig_mod.pendingActionable(parent)) {
+            asm volatile ("sti");
+            asm volatile ("hlt" ::: .{ .memory = true });
+        }
+        parent.waiting_for_child = false;
+        if (parent.state != .running) @import("sched_claim.zig").store(&parent.state, .running);
+        se.syncUserRspFromTask(parent);
+        se.getPerCpu().kernel_rsp = parent.kernel_stack_top;
+        @import("../arch/arch.zig").gdt.setRsp0(se.getPerCpu().cpu_id, parent.kernel_stack_top);
+        @import("ioperm.zig").loadForTask(se.getPerCpu().cpu_id, parent);
+
+        if (collectWaitid(cur_idx, req)) |got| return publishWaitid(infop, got);
+        if (sig_mod.pendingFatal(parent)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+        if (sig_mod.pendingActionable(parent)) return -4;
+    }
+}
+
+const WaitidGot = struct {
+    child_tid: u32,
+    uid: u32,
+    rep: wid.Report,
+    /// Non-null when the child was reaped and its teardown is still owed.
+    finish: ?task_mod.Reaped = null,
+};
+
+fn publishWaitid(infop: u64, got: ?WaitidGot) i64 {
+    if (infop == 0) return 0;
+    const bytes: [siginfo.SIGINFO_SIZE]u8 = if (got) |g|
+        siginfo.encode(17, .{ .code = g.rep.code, .a = siginfo.pidUid(g.child_tid, g.uid), .b = g.rep.status })
+    else
+        @splat(0);
+    return if (copy.copyToUser(@ptrFromInt(infop), &bytes, siginfo.SIGINFO_SIZE) == siginfo.SIGINFO_SIZE) 0 else -14;
+}
+
+/// One non-blocking pass over the caller's children. `.busy` means a matching zombie exists but is not yet reapable, so the
+/// caller retries instead of reporting that nothing happened.
+const WaitidPass = union(enum) { none, busy, got: WaitidGot };
+
+fn collectWaitid(cur_idx: u32, req: wid.Request) ?WaitidGot {
+    while (true) {
+        const flags = task_mod.lockTask();
+        const pass = collectWaitidLocked(cur_idx, req);
+        task_mod.unlockTask(flags);
+        switch (pass) {
+            .got => |g| {
+                if (g.finish) |r| task_mod.finishReap(r);
+                return g;
+            },
+            .none => return null,
+            .busy => {
+                asm volatile ("sti");
+                @import("../arch/arch.zig").cpu.pause();
+            },
+        }
+    }
+}
+
+/// Caller MUST hold task_lock, and MUST call finishReap on a non-null `finish` after releasing it.
+fn collectWaitidLocked(cur_idx: u32, req: wid.Request) WaitidPass {
+    if (req.options & wid.WEXITED != 0) {
+        const nowait = req.options & wid.WNOWAIT != 0;
+        switch (task_mod.peekZombieLocked(cur_idx, req.pid)) {
+            .busy => if (!nowait) return .busy,
+            .child => |slot| if (task_mod.getTask(slot)) |t| {
+                const tid = t.tid;
+                const uid = t.uid;
+                const e = wsp.fromInternal(t.exit_code, t.exited_via_syscall);
+                if (nowait) return .{ .got = .{ .child_tid = tid, .uid = uid, .rep = wid.report(req.options, .{ .zombie = true, .exit_value = e.value, .signaled = e.signaled }).? } };
+                var scratch: i32 = 0;
+                switch (task_mod.waitpidScanLocked(cur_idx, req.pid, &scratch)) {
+                    .reaped => |r| return .{ .got = .{
+                        .child_tid = r.tid,
+                        .uid = uid,
+                        .rep = .{ .code = if (e.signaled) wid.CLD_KILLED else wid.CLD_EXITED, .status = e.value, .reap = true },
+                        .finish = r,
+                    } },
+                    .busy => return .busy,
+                    .none => {},
+                }
+            },
+            .none => {},
+        }
+        // WNOWAIT may report a zombie that is not reapable yet: its exit code is already final, and nothing is freed.
+        if (nowait) if (waitidBusyZombie(cur_idx, req)) |g| return .{ .got = g };
+    }
+    var scratch: i32 = 0;
+    if (task_mod.takeWaitReportLocked(cur_idx, req.pid, req.options, &scratch, req.options & wid.WNOWAIT == 0)) |child_tid| {
+        const stopped = (scratch & 0xff) == 0x7f;
+        const uid: u32 = if (task_mod.findTaskByTidLocked(child_tid)) |slot| (task_mod.getTask(slot) orelse return .none).uid else 0;
+        return .{ .got = .{
+            .child_tid = child_tid,
+            .uid = uid,
+            .rep = .{ .code = if (stopped) wid.CLD_STOPPED else wid.CLD_CONTINUED, .status = if (stopped) @as(u32, @intCast((scratch >> 8) & 0xff)) else wid.SIGCONT, .reap = false },
+        } };
+    }
+    return .none;
+}
+
+/// A matching zombie that peekZombieLocked called busy, reported for WNOWAIT only. Caller holds task_lock.
+fn waitidBusyZombie(cur_idx: u32, req: wid.Request) ?WaitidGot {
+    const parent = task_mod.getTask(cur_idx) orelse return null;
+    var i: u32 = 0;
+    while (i < task_mod.MAX_TASKS) : (i += 1) {
+        const t = task_mod.getTask(i) orelse continue;
+        if (t.parent_tid != parent.tid or t.is_thread or t.state != .zombie) continue;
+        if (!@import("proc_id_policy.zig").waitMatches(req.pid, t.tid, t.pgid, parent.pgid)) continue;
+        const e = wsp.fromInternal(t.exit_code, t.exited_via_syscall);
+        return .{ .child_tid = t.tid, .uid = t.uid, .rep = wid.report(req.options, .{ .zombie = true, .exit_value = e.value, .signaled = e.signaled }).? };
+    }
+    return null;
 }
