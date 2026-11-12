@@ -130,6 +130,27 @@ static long wait_report(long c, int *st, int opt) {
     }
     return r;
 }
+static int kp[2];
+static void on_cont(int sig, void *info, void *uc) {
+    (void)sig;
+    (void)uc;
+    char c = ((int *)info)[2] == -6 ? 'T' : (((int *)info)[2] == 0 ? 'U' : '?');
+    write(kp[1], &c, 1);
+}
+static void *idle_thread(void *a) {
+    (void)a;
+    for (;;) pause();
+    return (void *)0;
+}
+static int cont_runs(char *codes) {
+    nap(200);
+    char b[64];
+    long n = read(kp[0], b, sizeof b - 1);
+    if (n < 0) n = 0;
+    b[n] = 0;
+    for (long i = 0; i <= n; i++) codes[i] = b[i];
+    return (int)n;
+}
 static int drain(void) {
     char b[256];
     int any = 0;
@@ -405,6 +426,55 @@ int main(void) {
     check(quiet == stops && stops > 0, msg);
     snprintf(msg, sizeof msg, "J: and every continue is reported (%d/60)", conts);
     check(conts == 60, msg);
+    kill(c, 9);
+    waitpid(c, &st, 0);
+
+    /* K: a SIGCONT handler runs once per continue, not once per thread, and tkill reports SI_TKILL to the named thread. */
+    pipe2(kp, O_NONBLOCK);
+    pipe(tp);
+    c = fork();
+    if (c == 0) {
+#ifdef HOST
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = (void (*)(int, siginfo_t *, void *))on_cont;
+        sa.sa_flags = SA_SIGINFO;
+        sigaction(SIGCONT, &sa, (struct sigaction *)0);
+        long me = syscall(SYS_gettid);
+#else
+        struct ksigaction sa = { (void (*)(int))on_cont, 0x4, (void *)0, 0 };
+        sigaction(SIGCONT, &sa, (struct ksigaction *)0);
+        long me = syscall0(SYS_gettid);
+#endif
+        pthread_t th;
+        pthread_create(&th, (void *)0, idle_thread, (void *)0);
+        pthread_create(&th, (void *)0, idle_thread, (void *)0);
+        write(tp[1], &me, sizeof me);
+        for (;;) pause();
+    }
+    long ltid = 0;
+    read(tp[0], &ltid, sizeof ltid);
+    nap(100);
+    char codes[64];
+    kill(c, SIGCONT);
+    int n = cont_runs(codes);
+    snprintf(msg, sizeof msg, "K: kill(pid, SIGCONT) to a running 3-thread process runs the handler once (%d, %s)", n, codes);
+    check(n == 1 && codes[0] == 'U', msg);
+    kill(c, SIGSTOP);
+    waitpid(c, &st, WUNTRACED);
+    kill(c, SIGCONT);
+    waitpid(c, &st, WCONTINUED);
+    n = cont_runs(codes);
+    snprintf(msg, sizeof msg, "K: kill(pid, SIGCONT) after a group stop runs it once, as SI_USER (%d, %s)", n, codes);
+    check(n == 1 && codes[0] == 'U', msg);
+    kill(c, SIGSTOP);
+    waitpid(c, &st, WUNTRACED);
+    tkill_call(ltid, SIGCONT);
+    st = 0;
+    r = waitpid(c, &st, WCONTINUED);
+    n = cont_runs(codes);
+    snprintf(msg, sizeof msg, "K: tkill(leader, SIGCONT) continues the group and runs it once, as SI_TKILL (%d, %s, 0x%x)", n, codes, st);
+    check(n == 1 && codes[0] == 'T' && r == c && st == 0xffff, msg);
     kill(c, 9);
     waitpid(c, &st, 0);
 

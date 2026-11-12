@@ -39,6 +39,13 @@ pub fn exitCompletesStop(exiting_stopped: bool, live_others: u32, stopped_others
     return stopped_others == live_others;
 }
 
+/// A process-directed SIGCONT reaches every thread for the continue itself, but its handler runs once (Linux, measured): in the
+/// thread the caller named, or in the leader when the caller named the process. `member` is the thread being considered,
+/// `named` the tid the caller passed (the leader's tid for kill(pid)).
+pub fn deliversContinue(member: u32, named: u32) bool {
+    return member == named;
+}
+
 const std = @import("std");
 
 test "SIGKILL, SIGCONT and SIGSTOP reach every thread whatever the action" {
@@ -66,6 +73,11 @@ test "a member that exits instead of stopping completes a group stop in progress
     try std.testing.expect(!exitCompletesStop(false, 2, 1)); // another member still runs: its own stop reports
     try std.testing.expect(!exitCompletesStop(true, 2, 2)); // already reported
     try std.testing.expect(!exitCompletesStop(false, 0, 0)); // nobody left: the process exits instead
+}
+
+test "a process-directed SIGCONT runs its handler in exactly one thread" {
+    try std.testing.expect(deliversContinue(7, 7));
+    try std.testing.expect(!deliversContinue(8, 7)); // a sibling is continued, but not delivered the signal
 }
 
 test "other signals are delivered once" {

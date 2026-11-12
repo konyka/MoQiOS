@@ -168,6 +168,14 @@ pub fn sendSignalInfo(target_tid: u32, signum: u32, info: siginfo.Info) bool {
 
 /// sendSignalInfo with the errno: 0, -3 (ESRCH: no such live task) or -11
 /// (EAGAIN: the real-time queue is full and this send may not drop its info).
+/// SIGCONT that only continues: the thread is resumed, but the signal is not queued for it (a sibling gets the one delivery).
+pub fn continueOnly(target_tid: u32) void {
+    for (0..task.MAX_TASKS) |i| {
+        const t = task.getTask(@intCast(i)) orelse continue;
+        if (t.tid == target_tid and t.state != .zombie) continueTask(t);
+    }
+}
+
 pub fn sendSignalInfoResult(target_tid: u32, signum: u32, info: siginfo.Info) i64 {
     if (signum == 0 or signum > MAX_SIGNAL) return -3;
 

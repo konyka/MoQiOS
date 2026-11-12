@@ -7806,7 +7806,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello286 新增 H 段八项。改动前的内核（SMP=2）上，H 段第一项就卡住：`tkill(thread, SIGSTOP)` 只停了那个线程，组长还在跑，父进程的 `waitpid(WUNTRACED)` 一直等不到整组停下，测试不再有输出。
 - 实现：`signal_syscall.tkill` 在权限检查之后，若 `group_stop_policy.actsOnEveryThread(sig, 目标的处理动作)` 为真（`SIGKILL`、`SIGCONT`、`SIGSTOP`，以及取默认动作的 `SIGTSTP`/`SIGTTIN`/`SIGTTOU`），改走 `kill(pid)` 用的 `sendToProcess`；其余信号仍只发给那个线程。继续的报告仍由组长的 `continueTask` 产生，因为 `sendToProcess` 总是最后给组长发信号。
 - 绿灯：宿主机 Linux 上 H 段八项全过；目标机定向 SMP=4 一份、SMP=2 两份全过（hello286 整体 PASS）。随后的完整 smoke 里有两份卡住，原因见下一节（`sigsuspend`/`pause` 里的停止），修好后完整 smoke 四份通过。
-- 如实的局限：①整组路径走 `sendSignal`，每个成员的 `siginfo` 都是 `SI_USER`；Linux 上被点名的那个线程是 `SI_TKILL`。停止和 `SIGKILL` 读不到这个差别，装了 handler 的 `SIGCONT` 可以，没有用例；②`rt_tgsigqueueinfo` 没有同样改动。
+- 如实的局限：①~~整组路径走 `sendSignal`，每个成员的 `siginfo` 都是 `SI_USER`~~（已实现，见文末 hello286 K 一节）；②`rt_tgsigqueueinfo` 没有同样改动。
 
 ## 在 sigsuspend 里解除阻塞的默认停止信号会停下任务（hello286 I，已实现）
 
@@ -7831,3 +7831,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - Linux 依据（宿主机实测，`user/hello286.c -DHOST`）：进程一边不断创建并 `pthread_join` 短命线程，一边被 `kill(SIGSTOP)`/`kill(SIGCONT)` 60 轮。60 次停止都报告为 `0x137f`，停止期间管道里没有任何写入，60 次继续都报告为 `0xffff`。
 - 实现：`task.exitTask` 在 `task_lock` 下数同组里还活着的成员和其中已停止的成员。`group_stop_policy.exitCompletesStop`（宿主机测试 4 条）：退出的成员自己没停过、还有其他成员、且其他成员全部已停，这次退出就补上那次整组停止。锁外以组长的身份调用 `signal.reportGroupStop`，信号号取已停止成员记下的 `stop_signum`（`markStopped` 在第一次停止时记录）。`exit_group` 和 `SIGKILL` 不走这里（`group_exit_code` 非空），它们报告的是进程退出。
 - 绿灯：宿主机 Linux 上 J 段三项全过；目标机定向 SMP=4 两份、SMP=2 一份全过（hello286 整体 PASS）。`zig build test` 通过（`tests/main.zig` 里 stopTask 的源码断言随 `markStopped(t, signum)` 新签名更新），三个架构构建通过；完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，hello57、hello210、hello286、hello287 都通过。改动前的内核上同样的三项也通过，所以没有先红后绿的目标机记录：短命线程在 `pthread_join` 返回前就已经退出，窗口里通常没有活着的成员，这个缺口要有成员在停止进行中退出才出现。
+
+## 整组 SIGCONT 的 handler 只运行一次，tkill 报告 SI_TKILL（hello286 K，已实现）
+
+- 起因：hello286 H 一节局限①。`sendToProcess` 给组里每个线程各发一次信号；对装了 handler 的 `SIGCONT`，handler 会在每个线程里各跑一次，而且 `tkill` 走这条路径时 `siginfo` 是 `SI_USER`。
+- Linux 依据（宿主机实测，`/tmp/ch.c`、`/tmp/ch2.c` 与 `user/hello286.c -DHOST`）：三线程进程装了 `SA_SIGINFO` 的 `SIGCONT` handler。`kill(pid, SIGCONT)` 无论进程在跑还是已整组停止，handler 都只运行一次，`si_code` 是 `SI_USER`；`tgkill(组长, SIGCONT)` 恢复整组，handler 只在组长里运行一次，`si_code` 是 `SI_TKILL`。
+- 红灯：hello286 新增 K 段三项。改动前的内核（SMP=2）上三项全失败：handler 运行了 3 次（`UUU`），`tkill` 那一项也是 `SI_USER`。
+- 实现：`group_stop_policy.deliversContinue`（宿主机测试 1 条）：整组 `SIGCONT` 只排给被点名的那个任务（`kill(pid)` 是组长）。`signal_syscall.sendToProcessWith` 对其余成员只调用新的 `signal.continueOnly`，恢复它们但不置待处理位。`tkill` 先构造 `SI_TKILL` 的 `siginfo` 再走整组路径，所以停止、继续和 `SIGKILL` 也都带调用者的 `siginfo`。
+- 绿灯：宿主机 Linux 上 K 段三项全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello286 整体 PASS）。`zig build test` 通过，三个架构构建通过；完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，hello57、hello210、hello286、hello287 都通过，hello228 的 `corrupted canaries` 都是 0。

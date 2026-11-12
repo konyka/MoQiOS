@@ -90,17 +90,33 @@ pub fn killPosix(pid: i64, signum: u32) i64 {
 /// of the process (group_stop_policy.zig): the other threads first, the leader last. The parent's WUNTRACED report does not come
 /// from this order — it waits until the whole group has stopped (signal.stopTask). Anything else goes to the named task only.
 fn sendToProcess(target: *task_mod.Task, tid: u32, signum: u32) i64 {
+    return sendToProcessWith(target, tid, signum, sig_mod.senderInfo());
+}
+
+/// The same as sendToProcess with the caller's siginfo. SIGCONT continues every thread but is queued for exactly one
+/// (group_stop_policy.deliversContinue): the handler runs once, and a tkill aimed at one thread reports SI_TKILL.
+fn sendToProcessWith(target: *task_mod.Task, tid: u32, signum: u32, info: @import("siginfo_policy.zig").Info) i64 {
     const gsp = @import("group_stop_policy.zig");
     if (!gsp.actsOnEveryThread(signum, target.sigact().handlers[signum - 1]))
-        return if (sig_mod.sendSignal(tid, signum)) 0 else -3;
+        return if (sig_mod.sendSignalInfo(tid, signum, info)) 0 else -3;
     const group = threadGroupId(target);
     var reached = false;
     for (0..task_mod.MAX_TASKS) |i| {
         const t = task_mod.getTask(@intCast(i)) orelse continue;
         if (!t.is_thread or t.state == .zombie or threadGroupId(t) != group) continue;
-        if (sig_mod.sendSignal(t.tid, signum)) reached = true;
+        if (signum == sig_mod.SIGCONT and !gsp.deliversContinue(t.tid, tid)) {
+            sig_mod.continueOnly(t.tid);
+            reached = true;
+            continue;
+        }
+        if (sig_mod.sendSignalInfo(t.tid, signum, info)) reached = true;
     }
-    if (sig_mod.sendSignal(group, signum)) reached = true;
+    if (signum == sig_mod.SIGCONT and !gsp.deliversContinue(group, tid)) {
+        sig_mod.continueOnly(group);
+        reached = true;
+    } else if (sig_mod.sendSignalInfo(group, signum, info)) {
+        reached = true;
+    }
     return if (reached) 0 else -3;
 }
 
@@ -568,12 +584,12 @@ pub fn tkill(tid_arg: i64, sig: u32) i64 {
     if (!currentMaySignalTask(tid)) return -1; // EPERM
     if (sig == 0) return 0; // existence and permission probe
     // Linux: a stop, SIGCONT or SIGKILL aimed at one thread acts on its whole process, as kill(pid) does.
-    if (task_mod.getTask(target_idx)) |target| {
-        if (@import("group_stop_policy.zig").actsOnEveryThread(sig, target.sigact().handlers[sig - 1]))
-            return sendToProcess(target, tid, sig);
-    }
     var info = sig_mod.senderInfo();
     if (info.code == @import("siginfo_policy.zig").SI_USER) info.code = @import("siginfo_policy.zig").SI_TKILL;
+    if (task_mod.getTask(target_idx)) |target| {
+        if (@import("group_stop_policy.zig").actsOnEveryThread(sig, target.sigact().handlers[sig - 1]))
+            return sendToProcessWith(target, tid, sig, info);
+    }
     return sig_mod.sendSignalInfoResult(tid, sig, info);
 }
 
