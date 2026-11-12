@@ -3457,7 +3457,16 @@ test "Linux RLIMIT aliases preserve native syscall numbers" {
     try std.testing.expectEqual(rlimit.Policy.LinuxAlias.prlimit64, rlimit.Policy.linuxAlias(true, 302).?);
     try std.testing.expectEqual(@as(?rlimit.Policy.LinuxAlias, null), rlimit.Policy.linuxAlias(false, 160));
     try std.testing.expectEqual(@as(?rlimit.Policy.LinuxAlias, null), rlimit.Policy.linuxAlias(false, 302));
-    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "dispatchLinuxRlimitAlias(frame, syscall_nr)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "dispatchLinuxAlias(frame, syscall_nr)") != null);
+}
+
+test "Linux personality maps exit_group (231) and waitid (247) to the native calls" {
+    // Native 231 is move_pages and native 247 is clock_nanosleep; a Linux-personality process means Linux's numbers.
+    try std.testing.expectEqual(rlimit.Policy.LinuxAlias.exit_group, rlimit.Policy.linuxAlias(true, 231).?);
+    try std.testing.expectEqual(rlimit.Policy.LinuxAlias.waitid, rlimit.Policy.linuxAlias(true, 247).?);
+    try std.testing.expectEqual(@as(?rlimit.Policy.LinuxAlias, null), rlimit.Policy.linuxAlias(false, 231));
+    try std.testing.expectEqual(@as(?rlimit.Policy.LinuxAlias, null), rlimit.Policy.linuxAlias(false, 247));
+    try std.testing.expectEqual(@as(?rlimit.Policy.LinuxAlias, null), rlimit.Policy.linuxAlias(true, 1));
 }
 
 test "signalfd closes backing eventfd on later failures" {

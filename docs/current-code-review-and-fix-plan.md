@@ -7757,7 +7757,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：改动前的内核没有 500 号分支（分发表 `else =>` 返回 `ENOSYS`），没有在目标机上单独运行。第一版实现在目标机（SMP=1）上 hello285 二十项中一项失败：`WCONTINUED` 报告成了 `CLD_STOPPED`/255。原因是继续的状态字 `0xffff` 低 7 位也是 `0x7f`，判断停止要看低 8 位等于 `0x7f`。
 - 实现：`kernel/proc/waitid_policy.zig` 给出 idtype/options 校验（`P_ALL`→-1、`P_PID`→id、`P_PGID`→-id，id 为 0 或超过 0x7fffffff、没有 `WEXITED`/`WSTOPPED`/`WCONTINUED` 之一、未知位都是 `EINVAL`）和报告选择（退出优先，`WNOWAIT` 时不回收）。`kernel/proc/waitpid.zig` 的 `waitid` 复用 waitpid 的锁内阻塞协议；回收走 `waitpidScanLocked`，`WNOWAIT` 走新增的只读 `task.peekZombieLocked`（按 `reap_policy.verdict` 跳过已交给回收线程的僵尸），停止和继续复用 `takeWaitReportLocked` 并加了不消费的参数。siginfo 用 `siginfo_policy.encode` 写 128 字节；`WNOHANG` 没有可报告的变化时写全 0。系统调用号用原生 500（247 已被 `clock_nanosleep` 占用，Linux 别名表只覆盖 rlimit 的两个号），并加入 `syscall_restart_policy.restartable`。libc 只加 `SYS_waitid`，hello285 直接用 `syscall5`。
 - 绿灯：hello285 二十项在宿主机（`-DHOST`）和目标机（SMP=1）上全过；host 测试、三个架构构建与完整 smoke 见提交记录。
-- 如实的局限：①~~第五个参数 rusage 不填写~~（已实现，见下一节）；②`WNOHANG` 无变化时把整份 128 字节 siginfo 写 0，Linux 只清其中的几个字段（读到的值相同）；③没有 Linux 247 到原生 500 的 personality 别名（别名表目前只服务 rlimit）；④继承 hello284 的局限：没有 ptrace 停止，~~线程组只有组长的停止和继续会报告~~（hello286 已实现，见文末）。
+- 如实的局限：①~~第五个参数 rusage 不填写~~（已实现，见下一节）；②`WNOHANG` 无变化时把整份 128 字节 siginfo 写 0，Linux 只清其中的几个字段（读到的值相同）；③~~没有 Linux 247 到原生 500 的 personality 别名~~（已实现，见文末 hello289 一节）；④继承 hello284 的局限：没有 ptrace 停止，~~线程组只有组长的停止和继续会报告~~（hello286 已实现，见文末）。
 
 ## waitid 的 rusage 参数（hello285 E 段，已实现）
 
@@ -7797,7 +7797,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：改动前的内核（SMP=2）上 hello287 九项里七项失败：501 号不存在，子进程落到 `_exit(99)`（`0x6300`），主线程 `exit(5)` 之后旋转的线程继续写管道。通过的两项是 `exit(5)` 的状态本身和 `pthread_exit`。
 - 实现：新增原生系统调用 501 `exit_group(status)`（`lifecycle.exitGroup`）。`task.beginGroupExit` 在 `task_lock` 下给线程组里每个活着的成员（包括调用者）记下 `group_exit_code`，再给其他成员发 `SIGKILL`；成员经各自的致命路径进入 `exitTask`，`exitTask` 开头用 `exit_group_policy.finalStatus` 把 `128+SIGKILL` 换成组的状态并按正常退出报告。所以不管哪个线程调用，组长的 `waitpid` 状态都是 `exit_group` 的参数；两个线程同时调用时，成员上先记下的那个状态保留（`claim`）。纯函数模块 `kernel/proc/exit_group_policy.zig` 有 3 条宿主机测试。libc：`_exit` 改走 `SYS_exit_group`（与 glibc 一致），`pthread_exit` 改为直接 `SYS_exit`，只结束自己的线程。hello190–hello193 的跳过表加了 501。
 - 绿灯：hello287 九项在宿主机 Linux 上全过；目标机定向 SMP=2、SMP=4 各一份全过。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello286、hello287 都通过，hello228 的 `corrupted canaries` 都是 0。
-- 如实的局限：①`waitpid` 在组长成为僵尸时就可能报告，那时其他成员可能还在走致命路径（Linux 要等整组都退出）；hello287 A/D 段在报告后 200 ms 内没有看到写入，但没有测更短的窗口；②只在 x86_64 的系统调用表里加了 501，riscv64/aarch64 没有对应的 libc 线程实现；③Linux personality 下 231 号仍不是 `exit_group`（231 在原生表里是 `move_pages`，别名表目前只服务 rlimit）。④~~主线程已经退出之后另一个线程再调 `exit_group`，组长报告的是它自己的状态~~（已实现，见文末 hello287 G/H 一节）。
+- 如实的局限：①`waitpid` 在组长成为僵尸时就可能报告，那时其他成员可能还在走致命路径（Linux 要等整组都退出）；hello287 A/D 段在报告后 200 ms 内没有看到写入，但没有测更短的窗口；②只在 x86_64 的系统调用表里加了 501，riscv64/aarch64 没有对应的 libc 线程实现；③~~Linux personality 下 231 号仍不是 `exit_group`~~（已实现，见文末 hello289 一节）。④~~主线程已经退出之后另一个线程再调 `exit_group`，组长报告的是它自己的状态~~（已实现，见文末 hello287 G/H 一节）。
 
 ## tkill 的停止、继续和 SIGKILL 作用于整个进程（hello286 H，已实现）
 
@@ -7857,3 +7857,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：`proc_id_policy.sigqueueinfoVerdict`（宿主机测试 1 条，6 个断言）：伪造的 code 是 `EPERM`（判断"发给自己"用调用者的 tid）、目标不存在是 `ESRCH`、信号号超过 64 是 `EINVAL`、权限、sig 0 探测。`signal_syscall.rtSigqueueinfo` 拷贝 siginfo 后交给它判断；停止信号、`SIGCONT`、`SIGKILL` 经 `sendToProcessWith` 作用于整个进程，其余信号仍排给 pid 指名的任务。`tests/main.zig` 里"先读 siginfo、后查信号号"的源码断言改为定位 `sigqueueinfoVerdict(`。
 - 绿灯：目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS）。完整 smoke 第一轮四份并行（SMP 1/4/4/2）里两份 `EXIT=0`，两份失败且都与本节改动无关：SMP=1 的 hello267（`SO_REUSEPORT` 监听关闭后迁移的 12 个连接）失败，SMP=4 的 hello286 J 段 60 轮里只报告了 30 次停止和继续。随后把 hello286、hello267 提前到开机后单独跑四次（SMP 1/4/4/1），全部 PASS。第二轮完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello267、hello286、hello287、hello288 都通过，hello228 的 `corrupted canaries` 都是 0。
 - 如实的局限：传入非组长线程 tid 的普通信号（比如 `SIGUSR1`）在 Linux 上是进程级的待处理信号，可由任何未阻塞它的线程处理；这里仍排给那一个线程。hello288 F 段只测了发给自己 tid 的情形，进程级与线程级排队的区别没有测。
+
+## Linux personality 下 231 是 exit_group、247 是 waitid（hello289，已实现）
+
+- 起因：hello287 一节局限③。`personality(1)` 的进程按 Linux 的调用号发出 231（`exit_group`）和 247（`waitid`），但别名表 `rlimit.Policy.linuxAlias` 只换 160、302，于是 231 落到原生的 `move_pages`、247 落到原生的 `clock_nanosleep`。
+- Linux 依据（宿主机实测，`user/hello289.c -DHOST`）：C 段子进程起一个每毫秒写管道的线程，再调用 `231(300)`，父进程报告 `0x2c00`（只留低 8 位），之后管道没有写入；D 段子进程 fork 一个 `_exit(7)` 的孙进程，用 `247(P_PID, g, info, WEXITED)` 等它，返回 0，`si_code` 是 `CLD_EXITED`，`si_pid` 是孙进程，`si_status` 是 7。宿主机上没有改号的 personality，所以 A/B 两段（原生号不变）只在目标机上跑。
+- 红灯：改动前的内核（SMP=2）上 C、D 失败：231 当成 `move_pages` 返回后子进程继续跑，父进程 3 秒内等不到它，线程一直在写；247 当成 `clock_nanosleep` 返回错误，子进程以 1 退出（`0x100`）。A、B（原生 231 是 `move_pages`、247 是 `clock_nanosleep`）通过。
+- 实现：`LinuxAlias` 增加 `exit_group`、`waitid`，`linuxAlias` 在 Linux personality 下把 231、247 映射过去；`syscall_entry.dispatchLinuxRlimitAlias` 改名为 `dispatchLinuxAlias`，分别调用 `lifecycle.exitGroup` 和 `waitpid.waitid`。`tests/main.zig` 新增一条宿主机测试，覆盖两个新映射和原生 personality 不映射，原有的源码断言随函数改名更新。
+- 绿灯：hello289 C、D 在宿主机 Linux 上通过；目标机上 hello289 回到序列末尾后，SMP=2 定向测试四段全过。之前把它放到序列最前面跑过 SMP=2 一份、SMP=4 两份，也全过，但那三份用的是还没删掉 TEMP 行的旧 init，已经作废，所以不算在绿灯里。SMP=4 定向测试排到末尾后，300 秒内跑不到它，由完整 smoke 覆盖。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
+- 如实的局限：别名只在 x86_64 的分发入口生效；Linux personality 下其余与原生不同的号仍按原生表解释，这里只补了 231 和 247。

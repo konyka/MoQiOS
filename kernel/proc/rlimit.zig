@@ -14,6 +14,8 @@ pub const Policy = struct {
     pub const LinuxAlias = enum {
         setrlimit,
         prlimit64,
+        exit_group,
+        waitid,
     };
 
     pub const DupExplicit = enum {
@@ -79,6 +81,8 @@ pub const Policy = struct {
         return switch (syscall_nr) {
             160 => .setrlimit,
             302 => .prlimit64,
+            231 => .exit_group,
+            247 => .waitid,
             else => null,
         };
     }

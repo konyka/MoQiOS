@@ -868,6 +868,9 @@ const SchedStats = struct {
   `SIGSTOP`/`SIGCONT`/`SIGKILL` 和取默认动作的 `SIGTSTP`/`SIGTTIN`/`SIGTTOU` 经 `sendToProcessWith` 作用于整个进程。
   `rt_sigqueueinfo`（222）同样按调用者的 tid 判断"发给自己"（非主线程用 `SI_USER` 发给 `getpid()` 是 `EPERM`），检查顺序在
   `proc_id_policy.sigqueueinfoVerdict`（不存在的 pid 是 `ESRCH`，排在信号号前面），停止、继续和 `SIGKILL` 也作用于整个进程（hello288 F/G）。
+- **Linux personality 的调用号别名（hello289）**：`personality(1)` 的进程在进入原生分发表之前先经 `syscall_entry.dispatchLinuxAlias`，
+  `rlimit.Policy.linuxAlias` 把 Linux 的号换成原生实现：160→setrlimit、302→prlimit64、231→`exit_group`（原生 501）、247→`waitid`（原生 500）。
+  原生 personality 下 231 仍是 `move_pages`、247 仍是 `clock_nanosleep`。其余号仍按原生表解释。
 - **waitid（hello285，系统调用 500）**：`proc/waitpid.zig` 的 `waitid`。`idtype` 是 `P_ALL`/`P_PID`/`P_PGID`
   （`proc/waitid_policy.zig` 把它换成 waitpid 的 pid 选择：-1、正 pid、负进程组），`options` 必须含
   `WEXITED`/`WSTOPPED`/`WCONTINUED` 之一，其余位除 `WNOHANG`/`WNOWAIT` 外都是 `EINVAL`。成功返回 0，

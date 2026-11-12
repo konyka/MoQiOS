@@ -480,7 +480,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
     getPerCpu().last_syscall_nr = syscall_nr; // DIAG (§6.47)
     if (@import("../../proc/sched.zig").currentTask()) |t| t.syscall_nr = syscall_nr;
 
-    if (dispatchLinuxRlimitAlias(frame, syscall_nr)) return;
+    if (dispatchLinuxAlias(frame, syscall_nr)) return;
     if (rofsGuard(frame, syscall_nr)) return;
 
     switch (syscall_nr) {
@@ -2654,16 +2654,18 @@ fn pathOnRofs(cur: anytype, dirfd: i64, ptr: u64) union(enum) { no, yes, err: i6
     return if (vfs_mod.rofsRoute(abs) != null) .yes else .no;
 }
 
-fn dispatchLinuxRlimitAlias(frame: *SyscallFrame, syscall_nr: u64) bool {
+fn dispatchLinuxAlias(frame: *SyscallFrame, syscall_nr: u64) bool {
     const sched = @import("../../proc/sched.zig");
     const current = sched.currentTask() orelse return false;
     const policy = @import("../../proc/rlimit.zig").Policy;
     const alias = policy.linuxAlias(current.personality == .linux, syscall_nr) orelse return false;
 
-    frame.rax = @bitCast(switch (alias) {
-        .setrlimit => syscallSetrlimit(@truncate(frame.rdi), frame.rsi),
-        .prlimit64 => syscallPrlimit64(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, frame.r10),
-    });
+    switch (alias) {
+        .setrlimit => frame.rax = @bitCast(syscallSetrlimit(@truncate(frame.rdi), frame.rsi)),
+        .prlimit64 => frame.rax = @bitCast(syscallPrlimit64(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, frame.r10)),
+        .exit_group => lifecycle_mod.exitGroup(frame.rdi),
+        .waitid => frame.rax = @bitCast(waitpid_mod.waitid(@truncate(frame.rdi), frame.rsi, frame.rdx, @truncate(frame.r10), frame.r8)),
+    }
     return true;
 }
 

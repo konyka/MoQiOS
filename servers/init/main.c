@@ -405,6 +405,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello286"); /* process-directed SIGSTOP stops every thread; the parent is told once the group has stopped */
     run_test("hello287"); /* exit_group and exit() from the main thread end every thread of the process */
     run_test("hello288"); /* rt_tgsigqueueinfo queues for the named thread of the named process */
+    run_test("hello289"); /* Linux personality: 231 is exit_group, 247 is waitid */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */
