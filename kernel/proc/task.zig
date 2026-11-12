@@ -1095,6 +1095,9 @@ pub fn exitTask(requested_code: i32) void {
     task_lock.release(exit_flags);
     const exit_code = final.code;
 
+    // A held process-directed signal queued on this thread stays pending for the process: pass it to a live sibling first.
+    @import("signal_syscall.zig").handOffHeld(t);
+
     if (t.clear_tid_ptr != 0 and t.page_table_phys != 0) {
         const copy = @import("../mm/copy_from_user.zig");
         var zero: [4]u8 = .{ 0, 0, 0, 0 };

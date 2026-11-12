@@ -7901,4 +7901,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello288 新增 K 段一项，子进程用退出码说明哪一步出错。改动前的内核（SMP=2）上子进程以 2 退出：另一个线程的 `sigpending` 没有看到这个信号。
 - 实现：`shared_pending_policy.visible` 把本线程的集合和 held 集合合并（宿主机测试补了两条断言）。`rtSigpending` 报告这个合并结果。`rtSigtimedwait` 每轮先看 held 里被等待的最低位，经抽出的 `takeHeldSignal` 从兄弟线程上把待处理位和 siginfo 搬到本线程再取走；`claimHeld` 改用同一个函数。持有者自己用 `sigtimedwait` 取走时，过期的 held 位同样被清掉。`tkill` 的信号不进 held，另一个线程仍然看不到。
 - 绿灯：宿主机 Linux 上 hello288 全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS，K 段子进程以 0 退出，日志开头是 `spawned hello2`、`spawned hello288`，确认跑的是带 TEMP 的构建）。`zig build test` 通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
-- 如实的局限：①held 的信号仍挂在被点名的线程上，那个线程退出时信号随它丢失；②实时信号没有接手；③`sigaction(SIG_IGN)` 只丢弃本线程的信号，不清兄弟线程上的信号，也不清 held 位。
+- 如实的局限：①~~held 的信号仍挂在被点名的线程上，那个线程退出时信号随它丢失~~（已实现，见文末 hello288 L 一节）；②实时信号没有接手；③`sigaction(SIG_IGN)` 只丢弃本线程的信号，不清兄弟线程上的信号，也不清 held 位。
+
+## 被点名的线程退出后，held 的进程级信号仍在（hello288 L，已实现）
+
+- 起因：hello288 K 一节局限①。所有线程都阻塞时，进程级信号记进 `held_signals`，但待处理位和 siginfo 挂在被点名的线程上；那个线程退出后，信号随它一起消失，别的线程再也取不到。
+- Linux 依据（`3rd/linux-7.0.6/kernel/signal.c`：`exit_signals`（3116 行）在线程退出时经 `retarget_shared_pending`（3090 行）把共享集合里的信号重新定向给还活着的线程；宿主机实测 `/tmp/pv4.c` 与 `user/hello288.c -DHOST`）：两个线程都阻塞 `SIGUSR1`，`sigqueue` 发给第二个线程，它退出后主线程的 `sigpending` 仍看得到，解除阻塞后 handler 在主线程里运行，值是 42。
+- 红灯：hello288 新增 L 段一项，子进程用退出码说明哪一步出错。改动前的内核（SMP=2 一份、SMP=4 一份）上子进程以 3 退出：被点名的线程退出后主线程解除阻塞，handler 没有运行。
+- 实现：`shared_pending_policy.handOff` 只挑出既挂在本线程、又属于 held 集合的信号（线程级的 `tkill` 信号不转交，宿主机测试 1 条）。新的 `signal_syscall.handOffHeld` 在 `exitTask` 的开头调用：把这些信号连同 siginfo 交给还活着、且没有在退出的兄弟线程；兄弟线程不阻塞它时清掉 held 位并 `kickIfBlocked`，否则 held 位保留，等先解除阻塞的线程经 `claimHeld` 接手。没有活着的兄弟时进程正在退出，信号丢弃。
+- 绿灯：宿主机 Linux 上 hello288 全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS，L 段子进程以 0 退出，日志开头是 `spawned hello2`、`spawned hello288`，确认跑的是带 TEMP 的构建）。`zig build test` 通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
+- 如实的局限：①实时信号没有接手；②`sigaction(SIG_IGN)` 只丢弃本线程的信号，不清兄弟线程上的信号，也不清 held 位。

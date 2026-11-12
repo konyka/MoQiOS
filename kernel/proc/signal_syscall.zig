@@ -184,6 +184,48 @@ fn takeHeldSignal(cur: *task_mod.Task, signum: u32) bool {
     return false;
 }
 
+/// `t` is exiting: move every held process-directed signal queued on it, with its siginfo, to a live sibling, so the signal stays
+/// pending for the process (Linux keeps it in the shared set, which outlives any one thread). A sibling that does not block the
+/// signal takes it at once (the held bit is cleared and the sibling is woken); otherwise any live sibling keeps it and the held bit
+/// stays, so the first thread to unblock it still takes it (claimHeld). With no live sibling the process is exiting and it is dropped.
+pub fn handOffHeld(t: *task_mod.Task) void {
+    if (!t.is_user) return;
+    const g = t.grp();
+    var bits = @import("shared_pending_policy.zig").handOff(
+        @atomicLoad(u64, &t.pending_signals, .seq_cst),
+        @atomicLoad(u64, &g.held_signals, .seq_cst),
+    );
+    const group = threadGroupId(t);
+    while (bits != 0) {
+        const b: u6 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const bit = @as(u64, 1) << b;
+        var any: ?u32 = null;
+        var free: ?u32 = null;
+        for (0..task_mod.MAX_TASKS) |i| {
+            const s = task_mod.getTask(@intCast(i)) orelse continue;
+            if (s.tid == t.tid or s.state == .zombie or threadGroupId(s) != group) continue;
+            if (@atomicLoad(u32, &s.exiting, .acquire) != 0) continue;
+            if (any == null) any = @intCast(i);
+            if (s.signal_mask & bit == 0) {
+                free = @intCast(i);
+                break;
+            }
+        }
+        const dest_idx = free orelse any orelse continue;
+        const prev = @atomicRmw(u64, &t.pending_signals, .And, ~bit, .seq_cst);
+        if (prev & bit == 0) continue;
+        const dest = task_mod.getTask(dest_idx) orelse continue;
+        dest.sig_info[b] = t.sig_info[b];
+        t.sig_info[b] = .{};
+        _ = @atomicRmw(u64, &dest.pending_signals, .Or, bit, .seq_cst);
+        if (free != null) {
+            _ = @atomicRmw(u64, &g.held_signals, .And, ~bit, .seq_cst);
+            sig_mod.kickIfBlocked(dest_idx);
+        }
+    }
+}
+
 /// kill(-1, sig): every process but init and the caller's own (see
 /// kill_broadcast_policy.zig for the target and return-value rules).
 fn killAll(cur: *task_mod.Task, signum: u32) i64 {

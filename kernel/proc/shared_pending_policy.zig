@@ -31,6 +31,18 @@ pub fn visible(private: u64, held: u64) u64 {
     return private | held;
 }
 
+/// The signals an exiting thread must pass on to a live sibling: those pending for it that are held for the process. Its
+/// thread-directed signals (tkill) die with it, as in Linux.
+pub fn handOff(private: u64, held: u64) u64 {
+    return private & held;
+}
+
+test "an exiting thread passes on only the held process-directed signals" {
+    try std.testing.expectEqual(@as(u64, 1 << 9), handOff((1 << 9) | (1 << 11), 1 << 9));
+    try std.testing.expectEqual(@as(u64, 0), handOff(1 << 11, 1 << 9));
+    try std.testing.expectEqual(@as(u64, 0), handOff(1 << 9, 0));
+}
+
 test "a process-directed signal stays pending only while every thread blocks it" {
     var held: u64 = 0;
     held = hold(held, 10, false);

@@ -7,7 +7,8 @@
  * second thread of a child stop and continue the whole child (waitpid reports 0x137f and 0xffff). I: while the main thread blocks
  * SIGUSR1, kill(getpid()) and rt_sigqueueinfo(getpid()) run the handler in the other thread. J: when every thread blocks it, the
  * signal waits for the process and the first thread to unblock it runs the handler. K: such a signal shows in every thread's
- * sigpending and any thread's sigtimedwait takes it; a tkill one stays with its thread. */
+ * sigpending and any thread's sigtimedwait takes it; a tkill one stays with its thread. L: when the thread it was queued for exits,
+ * the signal stays pending for the process and the thread that unblocks it later runs it with its value. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -149,6 +150,16 @@ static void *k_thread(void *a) {
     sigpending(&p);
     k_seen_tkill = sigismember(&p, SIGUSR1_N);
     k_stage = 5;
+    return (void *)0;
+}
+
+/* L: the second thread is the one rt_sigqueueinfo names; it exits while the signal is still held for the process. */
+static volatile long l_tid;
+static void *l_thread(void *a) {
+    (void)a;
+    sigprocmask(SIG_BLOCK, &j_set, (sigset_t *)0);
+    l_tid = my_tid();
+    while (l_tid > 0) nap(1);
     return (void *)0;
 }
 
@@ -405,6 +416,42 @@ int main(void) {
     if (kw != kc) {
         kill(kc, 9);
         waitpid(kc, &kst, 0);
+    }
+
+    /* L: in a child whose two threads block SIGUSR1, rt_sigqueueinfo names the second thread. That thread exits; the signal is
+     * still pending for the process, and when the main thread unblocks it the handler runs there with the queued value. */
+    long lc = fork();
+    if (lc == 0) {
+        sigprocmask(SIG_BLOCK, &j_set, (sigset_t *)0);
+        runs = 0;
+        ran_tid = 0;
+        pthread_t lt;
+        pthread_create(&lt, (void *)0, l_thread, (void *)0);
+        while (l_tid <= 0) nap(1);
+        struct qinfo lq;
+        fill(&lq, SI_QUEUE_N, 9);
+        if (sq(l_tid, SIGUSR1_N, &lq) != 0) _exit(1);
+        l_tid = -1;
+        pthread_join(lt, (void **)0);
+        nap(50);
+        sigset_t lp;
+        sigemptyset(&lp);
+        sigpending(&lp);
+        if (!sigismember(&lp, SIGUSR1_N)) _exit(2);
+        sigprocmask(SIG_UNBLOCK, &j_set, (sigset_t *)0);
+        for (int i = 0; i < 100 && runs == 0; i++) nap(10);
+        if (runs == 0) _exit(3);
+        if (ran_tid != my_tid() || ran_value != 9) _exit(4);
+        _exit(runs == 1 ? 0 : 5);
+    }
+    int lst = 0;
+    long lw = wait_for(lc, &lst, 0);
+    snprintf(msg, sizeof msg, "L: a held signal outlives the thread it was queued for and runs when another thread unblocks it (%ld, exit %d)",
+             lw == lc ? 1L : lw, (lst >> 8) & 0xff);
+    check(lw == lc && lst == 0, msg);
+    if (lw != lc) {
+        kill(lc, 9);
+        waitpid(lc, &lst, 0);
     }
 
     /* G/H: a stop and a continue queued for one thread of another process act on the whole process. */
