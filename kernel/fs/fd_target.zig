@@ -73,14 +73,15 @@ fn wrap(n: ?usize) Result {
 pub const Resolved = union(enum) {
     /// Not a /proc/self/fd/N name: use the name as given.
     same,
-    /// The path descriptor N reads back as, inside the caller's buffer.
-    path: []const u8,
+    /// Descriptor N opened a file: reopening through this name gives a NEW open file description of the same file (its own offset,
+    /// Linux measured) — `path` is that file's path when it still has one, null when it was unlinked (the descriptor still works).
+    file: struct { fd: u32, path: ?[]const u8 },
     err: i64,
 };
 
-/// If `name` is "/proc/self/fd/N", the path descriptor N of `t` stands for (so open and stat act on the file it names, as Linux's magic link
-/// does); otherwise `.same`. A name that is not a number is ENOENT, and a descriptor that has no path (a pipe, a socket, an event object)
-/// is ENXIO: it cannot be opened or described through this name here.
+/// If `name` is "/proc/self/fd/N" and N is an open descriptor of `t` on something with a path, open and stat act on that descriptor (Linux's
+/// magic link); otherwise `.same`. A name that is not a number, or a number that is not open, is ENOENT; a descriptor with no path (a pipe,
+/// a socket, an event object) is ENXIO.
 pub fn resolveMagicLink(t: *task_mod.Task, name: []const u8, buf: *[256]u8) Resolved {
     const prefix = "/proc/self/fd/";
     if (name.len <= prefix.len or !std.mem.startsWith(u8, name, prefix)) return .same;
@@ -91,12 +92,35 @@ pub fn resolveMagicLink(t: *task_mod.Task, name: []const u8, buf: *[256]u8) Reso
         fdn = fdn * 10 + (rest[digits] - '0');
     }
     if (digits == 0 or digits != rest.len) return .{ .err = -2 };
-    switch (describe(t, fdn, buf)) {
-        .err => |e| return .{ .err = e },
-        .ok => |n| {
-            if (n == 0 or buf[0] != '/') return .{ .err = -6 };
-            return .{ .path = buf[0..n] };
+    if (fdn >= vfs_mod.MAX_FDS or t.fd_table.fds[fdn].fd_type == .none) return .{ .err = -2 };
+    // Linux: a name with no path (a pipe, a socket, an event object) is ENXIO through this route.
+    switch (t.fd_table.fds[fdn].fd_type) {
+        .tmpfs_file => {
+            // A deleted entry's path text ends in " (deleted)", but a live file can be named that too, so the flag decides, not the text.
+            const p = filePath(t, fdn, buf);
+            const gone = @import("tmpfs.zig").tmpfsIsDeleted(t.fd_table.fds[fdn].tmpfs_idx);
+            return .{ .file = .{ .fd = fdn, .path = if (gone) null else p } };
         },
+        .ext2_file, .fat32_file => {
+            const p = filePath(t, fdn, buf);
+            return .{ .file = .{ .fd = fdn, .path = p } };
+        },
+        .devfs => {
+            const p = filePath(t, fdn, buf) orelse return .{ .err = -2 };
+            return .{ .file = .{ .fd = fdn, .path = p } };
+        },
+        else => return .{ .err = -6 },
+    }
+}
+
+/// The path descriptor `fd_val` of `t` is open on, or null when it has none any more (unlinked while open). `buf` receives the text.
+fn filePath(t: *task_mod.Task, fd_val: u32, buf: *[256]u8) ?[]const u8 {
+    switch (describe(t, fd_val, buf)) {
+        .ok => |n| {
+            if (n == 0 or buf[0] != '/') return null;
+            return buf[0..n];
+        },
+        .err => return null,
     }
 }
 

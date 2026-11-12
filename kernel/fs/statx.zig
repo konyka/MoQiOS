@@ -75,16 +75,22 @@ pub fn statx(dirfd: i64, pathname_ptr: u64, flags: u32, mask: u32, statxbuf_ptr:
     const open_flags: u32 = 0;
     // stat("/proc/self/fd/N") describes the file descriptor N is open on (Linux follows the magic link); lstat describes the link itself.
     var fd_link: [256]u8 = undefined;
-    const stat_name: []const u8 = if (args.follow) switch (@import("fd_target.zig").resolveMagicLink(cur, use_name, &fd_link)) {
-        .same => use_name,
-        .path => |p| p,
+    var stat_on_fd: ?u32 = null;
+    var stat_name: []const u8 = use_name;
+    if (args.follow) switch (@import("fd_target.zig").resolveMagicLink(cur, use_name, &fd_link)) {
+        .same => {},
+        .file => |f| {
+            stat_on_fd = f.fd;
+            if (f.path) |p| stat_name = p;
+        },
         .err => |e| return e,
-    } else use_name;
-    const fd_result = cur.fd_table.openWithCredentials(stat_name, open_flags, cur.euid, cur.egid, cur.effective_caps);
+    };
+    const fd_result = if (stat_on_fd) |src| @as(i64, src) else cur.fd_table.openWithCredentials(stat_name, open_flags, cur.euid, cur.egid, cur.effective_caps);
     if (fd_result < 0) return @import("namespace_policy.zig").lookupFailureErrno(fd_result);
     const fd: u32 = @intCast(fd_result);
     const common = describe(&cur.fd_table.fds[fd], fd);
-    _ = cur.fd_table.close(fd);
+    // A descriptor we did not open ourselves must not be closed.
+    if (stat_on_fd == null) _ = cur.fd_table.close(fd);
     si.packStatx(&out, common orelse return -2);
     return if (copy.copyToUser(@ptrFromInt(statxbuf_ptr), &out, out.len) != out.len) -14 else 0;
 }

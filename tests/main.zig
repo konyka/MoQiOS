@@ -11362,9 +11362,11 @@ test "open and stat of /proc/self/fd/N act on the file the descriptor is open on
     const ft = kt.fd_target_source;
     try std.testing.expect(std.mem.indexOf(u8, fio, "fd_target.zig\").resolveMagicLink(cur, use_name, &fd_link)") != null);
     try std.testing.expect(std.mem.indexOf(u8, sx, "if (args.follow) switch (@import(\"fd_target.zig\").resolveMagicLink(cur, use_name, &fd_link))") != null);
+    // A file that still has a path reopens through it; only an unlinked one is copied from the descriptor (with its own offset).
+    try std.testing.expect(std.mem.indexOf(u8, fio, "cur.fd_table.dupFdOwnOffset(src)") != null);
     try std.testing.expect(std.mem.indexOf(u8, ft, "pub fn resolveMagicLink(") != null);
     try std.testing.expect(std.mem.indexOf(u8, ft, "pub fn describe(") != null);
-    // readlink and the resolver agree because both call describe().
+    // readlink keeps using describe() for the text (the resolver acts on the descriptor).
     try std.testing.expect(std.mem.indexOf(u8, kt.readlink_source, "@import(\"fd_target.zig\").describe(t, fd_val, &text)") != null);
 }
 

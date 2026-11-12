@@ -899,20 +899,31 @@ pub fn tmpfsDirPath(idx: u32, out: *[256]u8) PathResult {
     return tmpfsEntryPath(idx, out);
 }
 
-/// Absolute path ("/tmp/a/b") of any live tmpfs entry, file or directory, for /proc/self/fd/N. ENOENT once the entry (or an ancestor) was
-/// unlinked (Linux appends " (deleted)"; this reports the entry as gone instead).
+/// Absolute path ("/tmp/a/b") of any tmpfs entry, file or directory, for /proc/self/fd/N. A live entry reports its path; one that was
+/// unlinked while a descriptor is still open keeps its name and its parent link, so its path is rebuilt the same way with
+/// " (deleted)" appended — the descriptor keeps working, and Linux reports exactly that (measured). An anonymous entry (a memfd, which
+/// never had a name) is ENOENT, like Linux's "/memfd:name (deleted)" is not reachable here. ENOENT also when an ancestor is gone.
+/// True when tmpfs entry `idx` is unlinked while a descriptor still holds it. The /proc/self/fd/N resolver uses this rather than the
+/// path text, because a live file can itself be named "... (deleted)".
+pub fn tmpfsIsDeleted(idx: u32) bool {
+    if (idx >= MAX_FILES) return false;
+    const state_held = tmpfs_lock.acquire();
+    defer tmpfs_lock.release(state_held);
+    return entries[idx].active and entries[idx].deleted;
+}
+
 pub fn tmpfsEntryPath(idx: u32, out: *[256]u8) PathResult {
     if (idx >= MAX_FILES) return .{ .err = -9 };
     const state_held = tmpfs_lock.acquire();
     defer tmpfs_lock.release(state_held);
-    if (!entries[idx].active or entries[idx].deleted) return .{ .err = -2 };
+    if (!entries[idx].active) return .{ .err = -2 };
     var chain: [MAX_FILES]Idx = undefined;
     var depth: usize = 0;
     var cur: Idx = @intCast(idx);
     while (cur != 0) {
         if (depth >= chain.len) return .{ .err = -40 };
         const e = &entries[cur];
-        if (!e.active or e.deleted or e.parent_idx >= MAX_FILES) return .{ .err = -2 };
+        if (!e.active or e.parent_idx >= MAX_FILES) return .{ .err = -2 };
         chain[depth] = cur;
         depth += 1;
         cur = e.parent_idx;
@@ -928,6 +939,12 @@ pub fn tmpfsEntryPath(idx: u32, out: *[256]u8) PathResult {
         out[n] = '/';
         @memcpy(out[n + 1 ..][0..name.len], name);
         n += 1 + name.len;
+    }
+    // An anonymous entry (a memfd) has no name to rebuild a path from; the loop above leaves n at "/tmp", which is a directory.
+    if (entries[idx].deleted) {
+        if (n <= root.len) return .{ .err = -2 };
+        const total = @import("deleted_name_policy.zig").appendInPlace(out, n) orelse return .{ .err = -36 };
+        return .{ .ok = out[0..total] };
     }
     return .{ .ok = out[0..n] };
 }

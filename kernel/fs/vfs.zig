@@ -2356,6 +2356,31 @@ pub const FdTable = struct {
         return newfd;
     }
 
+    /// Copy descriptor `oldfd` into a fresh slot WITHOUT sharing its offset: the copy is a new open file description starting at
+    /// offset 0, like any fresh open (Linux's reopen through /proc/self/fd/N of a file that was unlinked while open). Other state is
+    /// copied as a dup, including the access mode of `oldfd`; descriptor flags start clear (the caller applies O_CLOEXEC).
+    pub fn dupFdOwnOffset(self: *FdTable, oldfd: u32) i64 {
+        if (oldfd >= MAX_FDS or !self.acquireTransferFd(oldfd)) return -9; // EBADF
+        defer self.releaseTransferFd(oldfd);
+        const slot = self.allocFd() orelse return -24;
+        self.fds[slot] = self.fds[oldfd];
+        self.fds[slot].offset_slot = 0;
+        self.fds[slot].offset = 0;
+        self.fds[slot].fd_flags = 0;
+        if (self.fds[slot].fd_type == .pipe_read or self.fds[slot].fd_type == .pipe_write) {
+            if (self.fds[slot].pipe_idx < MAX_PIPES)
+                _ = pipeRetain(self.fds[slot].pipe_idx, self.fds[slot].fd_type == .pipe_write);
+        }
+        if (self.fds[slot].fd_type == .fat32_file) {
+            @import("fat32.zig").retainFile(self.fds[slot].fat32_file_idx);
+        }
+        if (self.fds[slot].fd_type == .tmpfs_file) {
+            @import("tmpfs.zig").tmpfsRetain(@intCast(self.fds[slot].tmpfs_idx));
+        }
+        self.publishFd(slot);
+        return @intCast(slot);
+    }
+
     /// Duplicate into the lowest available slot at or above min_fd.
     pub fn dupFdAtLeast(self: *FdTable, oldfd: u32, min_fd: u32, new_flags: u32) i64 {
         if (oldfd >= MAX_FDS or !self.acquireTransferFd(oldfd)) return -9; // EBADF

@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello275`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello276`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -271,6 +271,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello273 | 一个进程超过 64 个描述符：`RLIMIT_NOFILE` 软上限不小于 100，同时打开 50 个管道共 100 个描述符（旧的管道池只有 16 个），每个管道都能传一个字节，`/proc/self/status` 的 `FDSize` 覆盖最高描述符，`dup2` 到 120 成功 |
 | hello274 | 实时信号排队：同一个实时信号 `rt_sigqueueinfo` 三次就是三次投递，按发送顺序、各带自己的值；`SIGUSR1` 发三次仍只投递一次；`kill`/`tkill` 的实时信号也排队；多个待处理时编号小的先出、同一信号先进先出；解除屏蔽后处理函数在 `sigprocmask` 返回前运行四次；装 `SIG_IGN` 丢弃所有排队的实例 |
 | hello275 | 曾经让写回池失效的两种 FAT32 写入：`unlink` 之后仍打开的文件的写入（并在 `fsync` 后按 `unlink` 前的内容读回）、`ftruncate` 加长后在旧末尾之外写入（空洞读回 0）；随后各向一个新建的 FAT32 和 ext2 文件写 4 MiB（超过整个 512 块的写回池），两者都必须完整 |
+| hello276 | 打开期间被 `unlink` 的 tmpfs 条目的 `/proc/self/fd/N`：`readlink` 返回原路径加 `" (deleted)"`（文件和目录都是），经该链接 `open` 仍能读到数据且从偏移 0 开始、不影响原描述符的偏移，`stat` 成功；仍有名字的条目不带后缀 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。

@@ -118,14 +118,28 @@ pub fn openAt(dirfd: i64, name_ptr: u64, flags: u32, requested_mode: ?u32) i64 {
     };
 
     // "/proc/self/fd/N" opens the file descriptor N stands for, again, as a new open file (its own offset); see fd_target.resolveMagicLink.
+    // All of that happens here, before openWithCreationCredentials: its procfs branch would take a descriptor slot for the magic link
+    // itself (and, for a live entry, the caller's own path would have to go through the full open again).
     var fd_link: [256]u8 = undefined;
-    const effective_name: []const u8 = switch (@import("fd_target.zig").resolveMagicLink(cur, use_name, &fd_link)) {
-        .same => use_name,
-        .path => |p| p,
+    var reopen_path: ?[]const u8 = null;
+    var unlinked_src: ?u32 = null;
+    switch (@import("fd_target.zig").resolveMagicLink(cur, use_name, &fd_link)) {
+        .same => {},
+        .file => |f| if (f.path) |p| {
+            // Still has a path: a real reopen of that path, so the new descriptor has its own offset (Linux measured).
+            reopen_path = p;
+        } else {
+            // Unlinked while open: the descriptor is the only way in; the copy keeps its own offset.
+            unlinked_src = f.fd;
+        },
         .err => |e| return e,
-    };
+    }
+    const open_name: []const u8 = reopen_path orelse use_name;
 
-    const result = cur.fd_table.openWithCreationCredentials(effective_name, flags, requested_mode, cur.fsctx().umask, cur.euid, cur.egid, cur.effective_caps);
+    const result = if (unlinked_src) |src|
+        cur.fd_table.dupFdOwnOffset(src)
+    else
+        cur.fd_table.openWithCreationCredentials(open_name, flags, requested_mode, cur.fsctx().umask, cur.euid, cur.egid, cur.effective_caps);
     if (result >= 0 and (flags & @import("fcntl_policy.zig").O_CLOEXEC) != 0 and result < vfs_mod.MAX_FDS) {
         cur.fd_table.fds[@intCast(result)].fd_flags = @import("fcntl_policy.zig").FD_CLOEXEC;
     }

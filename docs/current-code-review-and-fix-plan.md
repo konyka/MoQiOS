@@ -7230,7 +7230,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：hello257 共 10 项（实际运行计数）通过（含后加的"两个管道编号不同、同一管道两端相同"，它第一次就绿，是对编号取自对象索引的回归保护）；host 1076/1076（中途两处失败：`readlink_policy.zig` 里的新内联测试没登记进 `host_test.zig`，被仓库自己的守卫抓到；以及我前一个 `maps` 形状测试里的那行因为加了 `.fd_dir` 要同步）。
 - **一个已有探针被我改坏了（如实）**：完整冒烟 SMP=2 报 `hello86: FAIL readlink invalid fd returns EINVAL`。hello86 一直断言"不是打开描述符的数字 → `EINVAL`"，而宿主机 Linux 的答案是 `ENOENT`；我按 Linux 改了内核，所以把 hello86 的期望改成 `ENOENT`（探针头部加了一行说明）。顺带测了 Linux 对其它名字的答案：`/proc/self/fd/abc`、`/proc/self/fd/-1`、`/proc/self/fd/99999999999` 都是 `ENOENT`，只有空名字是 `EINVAL`；内核照此改了（非数字开头和超出范围的数字都返回 `ENOENT`），hello257 加了一项断言这三种名字。这是**改变了既有行为并改了既有测试**，不是内核回归：被改的断言本来就与 Linux 不一致。
 - 变异：把 TCP 套接字的文本改成 `pipe:[...]`（真编译）→ "套接字读回 socket:[inode]" 失败（`"pipe:[0]"`），其余通过；还原后通过。
-- 未验证：①管道和套接字的编号是**内核里的数组下标**，不是 Linux 那样的 inode 号，数字本身没有意义，只保证"同一对象相同、不同对象不同"，管道槽位复用后编号会重复；②`open("/proc/self/fd/N")`（重新打开同一个文件）没有做，`stat` 这些路径也没有；③被 `unlink` 的 tmpfs 文件读回 `ENOENT`，Linux 是路径加 ` (deleted)`；④ext2 的路径取的是**打开时的名字**，文件被 `rename` 之后仍是旧名字（目录描述符那边是按 inode 重建的，文件这边没有）；⑤只测了自己的进程，别的用户进程的 `fd` 目录的 `EACCES` 没有单独用例（共用 `maps` 的策略，策略有单元测试）。
+- 未验证：①管道和套接字的编号是**内核里的数组下标**，不是 Linux 那样的 inode 号，数字本身没有意义，只保证"同一对象相同、不同对象不同"，管道槽位复用后编号会重复；②`open("/proc/self/fd/N")`（重新打开同一个文件）没有做，`stat` 这些路径也没有；~~③被 `unlink` 的 tmpfs 文件读回 `ENOENT`，Linux 是路径加 ` (deleted)`~~（tmpfs 已处理，见文末 hello276 一节）；④ext2 的路径取的是**打开时的名字**，文件被 `rename` 之后仍是旧名字（目录描述符那边是按 inode 重建的，文件这边没有）；⑤只测了自己的进程，别的用户进程的 `fd` 目录的 `EACCES` 没有单独用例（共用 `maps` 的策略，策略有单元测试）。
 
 ### `/proc/self/fd/N` 作为路径：`open` 与 `stat`（hello257 续，已修）
 
@@ -7658,3 +7658,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修复：拆成两个字段。`last_cpu` 仍只作归位提示（只在入队/创建时写），新增 `Task.running_cpu` 由任务自己在每个节拍和系统调用返回时发布，停止信号的 IPI 按它瞄准。
 - 另外把“必须让出本 CPU（被钉到别处）时找谁运行”改成**优先本核 idle 线程**（`pickKernelBootstrapForCpuPrefer(cpu, true)`）：否则两颗 CPU 可能互相把对方的工作接过来、来回搬，而各自新钉住的任务在等自己。这一条在双核上的效果没有单独量化（拆分 `running_cpu` 之后已经是 200/200），只为避免同类乒乓。
 - 验证：hello245 SMP=2、两份并行各两次，全部 200/200（0 迟到）；hello259 SMP=2 0/8；host 1149/1149。完整 smoke 见提交记录。
+
+## 打开期间被 unlink 的 tmpfs 条目的 /proc/self/fd/N（hello276，已修）
+
+- 起因：hello257 一节“未验证”的第 ③ 项。宿主机 Linux 实测：文件打开后被 `unlink`，`readlink("/proc/self/fd/N")` 返回 `"/tmp/x (deleted)"`；经这个链接 `open` 仍能读到数据，新描述符从偏移 0 开始，有自己的偏移，原描述符的偏移不变；`stat` 成功；被 `rmdir` 的打开目录同样返回 `"/tmp/d (deleted)"`。
+- 红灯（新程序 hello276，五项）：旧内核上 A（readlink 返回 -1）、B（open 返回 -2）、C（stat rc -1）、D（目录 readlink 返回 -1）失败，E（仍有名字的条目不带后缀）通过。
+- 修复：
+  - `tmpfsEntryPath` 不再拒绝已删除的条目：沿保留的父链重建路径后，追加 `" (deleted)"`（新的纯函数模块 `kernel/fs/deleted_name_policy.zig`，带内联测试）。匿名条目（memfd）仍是 `ENOENT`。`tmpfsDirPath` 不变，仍拒绝已删除的目录，因为 `fchdir` 需要一个真实存在的路径。
+  - `fd_target.resolveMagicLink` 改为返回描述符和可选路径。对 tmpfs，是否已删除由新增的 `tmpfs.tmpfsIsDeleted` 判断，而不是看文本是否以后缀结尾，因为活着的文件本身也可能叫 `x (deleted)`。
+  - `openAt`：仍有路径时按路径重新打开（与以前一样）；已删除时用新增的 `FdTable.dupFdOwnOffset` 复制描述符，偏移独立并从 0 开始，描述符标志清零，再由调用方按 `O_CLOEXEC` 设置。`statx` 直接对该描述符取属性，不再按名字重开。
+- 绿灯：hello276 五项全过，hello257、hello86 照常通过；host 测试见提交记录；三个架构构建通过；完整 smoke 见提交记录。
+- 如实的局限：①只覆盖 tmpfs。ext2/FAT32 的文件被 `unlink` 后，链接仍返回 `ENOENT` 或旧名字（这两个文件系统在这里不保留已删除条目的父链）。②`dupFdOwnOffset` 沿用原描述符的访问模式，不采用调用方这次传入的 `O_RDONLY`/`O_WRONLY`。Linux 会按新的标志重新检查权限并打开，这里没有做。③经这个链接使用 `O_CREAT|O_EXCL`、`O_TRUNC` 的行为没有运行时用例。
