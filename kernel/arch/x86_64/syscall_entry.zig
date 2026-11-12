@@ -3066,6 +3066,7 @@ fn withTemporaryEpollMask(fd: u32, events: u64, max_events: i32, timeout: i32, m
     const current = sched.currentTask() orelse return -1;
     const saved_mask = current.signal_mask;
     current.signal_mask = epoll_policy.temporaryMask(mask.?);
+    signal_syscall_mod.claimHeld(current);
     const rc = epollWaitFd(fd, events, max_events, timeout);
     if (rc == -4) {
         // EINTR: keep the temporary mask until the handler that interrupted
@@ -3318,6 +3319,7 @@ pub fn checkSignalsOnSyscallReturn(frame: *SyscallFrame) void {
     if (current.restore_sigmask_pending) {
         current.restore_sigmask_pending = false;
         current.signal_mask = current.saved_sigmask;
+        signal_syscall_mod.claimHeld(current);
     }
 }
 

@@ -383,6 +383,7 @@ test {
     _ = @import("proc/sched_queue_policy.zig");
     _ = @import("proc/siginfo_policy.zig");
     _ = @import("proc/sigqueue_policy.zig");
+    _ = @import("proc/shared_pending_policy.zig");
     _ = @import("proc/uts.zig");
     _ = @import("ipc/sysv_policy.zig");
     _ = @import("ipc/posix_timer_policy.zig");

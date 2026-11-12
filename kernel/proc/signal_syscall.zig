@@ -138,8 +138,42 @@ fn processRecipient(target: *task_mod.Task, tid: u32, signum: u32) u32 {
                 break;
             }
         }
+        // Every thread blocks it: it waits for the process, and whichever thread unblocks it first takes it (claimHeld). Real-time
+        // signals keep their queued instances on the named thread and are not held.
+        if (other == null and !@import("sigqueue_policy.zig").isRealtime(signum)) {
+            // Or, not load-then-store: two CPUs can hold different signals at once.
+            _ = @atomicRmw(u64, &target.grp().held_signals, .Or, bit, .seq_cst);
+        }
     }
     return @import("group_stop_policy.zig").processRecipient(tid, named_blocks, other);
+}
+
+/// After `cur` changed its mask: take every held process-directed signal it no longer blocks from the sibling it was queued on, so
+/// the first thread to unblock a signal is the one that runs it (Linux shared pending). A held signal whose holder already took it
+/// (it unblocked it itself) is simply dropped from the held set.
+pub fn claimHeld(cur: *task_mod.Task) void {
+    const sp = @import("shared_pending_policy.zig");
+    const g = cur.grp();
+    const group = threadGroupId(cur);
+    var tried: u64 = 0;
+    while (true) {
+        const held = @atomicLoad(u64, &g.held_signals, .seq_cst) & ~tried;
+        const signum = sp.claimable(held, cur.signal_mask) orelse return;
+        const bit = @as(u64, 1) << @intCast(signum - 1);
+        tried |= bit;
+        _ = @atomicRmw(u64, &g.held_signals, .And, ~bit, .seq_cst);
+        if (@atomicLoad(u64, &cur.pending_signals, .seq_cst) & bit != 0) continue; // already queued for this thread
+        for (0..task_mod.MAX_TASKS) |i| {
+            const t = task_mod.getTask(@intCast(i)) orelse continue;
+            if (t.tid == cur.tid or t.state == .zombie or threadGroupId(t) != group) continue;
+            const prev = @atomicRmw(u64, &t.pending_signals, .And, ~bit, .seq_cst);
+            if (prev & bit == 0) continue;
+            cur.sig_info[signum - 1] = t.sig_info[signum - 1];
+            t.sig_info[signum - 1] = .{};
+            _ = @atomicRmw(u64, &cur.pending_signals, .Or, bit, .seq_cst);
+            break;
+        }
+    }
 }
 
 /// kill(-1, sig): every process but init and the caller's own (see
@@ -276,6 +310,7 @@ pub fn sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigsetsize: u64) i64
             },
             else => return -22,
         }
+        claimHeld(current);
     }
 
     return 0;
@@ -323,6 +358,7 @@ pub fn sigreturn() ?SigreturnResult {
     // added) and the interrupted x87/SSE state.
     if (sched.currentTask()) |cur| {
         cur.signal_mask = @import("signal_delivery_policy.zig").restoredMask(sig_frame.uc.sigmask);
+        claimHeld(cur);
     }
     if (comptime @import("builtin").cpu.arch == .x86_64) {
         // MXCSR comes from user memory: reserved bits set would make fxrstor
@@ -456,6 +492,7 @@ pub fn rtSigsuspend(mask_ptr: u64, sigsetsize: u64) i64 {
     // It used to return EINTR at once and leave the temporary mask in place.
     const saved = cur.signal_mask;
     cur.signal_mask = action_policy.sanitizeMask(new_mask);
+    claimHeld(cur);
     waitForSignal(cur_idx, cur);
     if (sig_mod.pendingFatal(cur)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
     cur.saved_sigmask = saved;

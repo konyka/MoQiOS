@@ -146,6 +146,7 @@ pub fn beginTempMask(m: TempMask) SavedMask {
     const cur = sched.currentTask() orelse return .{};
     const saved: SavedMask = .{ .armed = true, .old = cur.signal_mask };
     cur.signal_mask = m.mask & ~@import("../proc/signal_action_policy.zig").UNBLOCKABLE;
+    @import("../proc/signal_syscall.zig").claimHeld(cur);
     return saved;
 }
 

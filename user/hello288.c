@@ -5,7 +5,8 @@
  * rt_sigqueueinfo(pid, sig, info) (F): a forged code (SI_USER) is allowed only towards the caller's own tid, so a non-main thread gets
  * EPERM for getpid(); a missing pid is ESRCH ahead of signal 65 (EINVAL). G/H: SIGSTOP and SIGCONT queued with either call for the
  * second thread of a child stop and continue the whole child (waitpid reports 0x137f and 0xffff). I: while the main thread blocks
- * SIGUSR1, kill(getpid()) and rt_sigqueueinfo(getpid()) run the handler in the other thread. */
+ * SIGUSR1, kill(getpid()) and rt_sigqueueinfo(getpid()) run the handler in the other thread. J: when every thread blocks it, the
+ * signal waits for the process and the first thread to unblock it runs the handler. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -101,6 +102,17 @@ static void fill(struct qinfo *q, int code, int value) {
 static int wait_runs(long want) {
     for (int i = 0; i < 100 && runs < want; i++) nap(10);
     return runs >= want;
+}
+
+static volatile long j_tid, j_go;
+static sigset_t j_set;
+static void *j_thread(void *a) {
+    (void)a;
+    j_tid = my_tid();
+    while (!j_go) nap(1);
+    sigprocmask(SIG_UNBLOCK, &j_set, (sigset_t *)0);
+    for (;;) nap(10);
+    return (void *)0;
 }
 
 static long f_r1, f_r2;
@@ -288,6 +300,37 @@ int main(void) {
     nap(50);
     snprintf(msg, sizeof msg, "I: nothing is left pending for the main thread (%ld runs)", runs - n0);
     check(runs - n0 == 2, msg);
+
+    /* J: in a child whose two threads both block SIGUSR1, kill(getpid()) stays pending for the process; the thread that unblocks it
+     * first takes it, even though the signal named the main thread. The child's exit code says what went wrong. */
+    sigemptyset(&j_set);
+    sigaddset(&j_set, SIGUSR1_N);
+    long jc = fork();
+    if (jc == 0) {
+        sigprocmask(SIG_BLOCK, &j_set, (sigset_t *)0);
+        runs = 0;
+        pthread_t jt;
+        pthread_create(&jt, (void *)0, j_thread, (void *)0);
+        while (!j_tid) nap(1);
+        kill(getpid(), SIGUSR1_N);
+        nap(100);
+        if (runs != 0) _exit(1);
+        j_go = 1;
+        for (int i = 0; i < 100 && runs == 0; i++) nap(10);
+        if (runs == 0) _exit(2);
+        if (ran_tid != j_tid) _exit(3);
+        nap(50);
+        _exit(runs == 1 ? 0 : 4);
+    }
+    int jst = 0;
+    long jw = wait_for(jc, &jst, 0);
+    snprintf(msg, sizeof msg, "J: with every thread blocking it, the thread that unblocks first takes kill(getpid()) (%ld, exit %d)",
+             jw == jc ? 1L : jw, (jst >> 8) & 0xff);
+    check(jw == jc && jst == 0, msg);
+    if (jw != jc) {
+        kill(jc, 9);
+        waitpid(jc, &jst, 0);
+    }
 
     /* G/H: a stop and a continue queued for one thread of another process act on the whole process. */
     group_stop_via(0, "G: rt_sigqueueinfo");
