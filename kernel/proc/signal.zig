@@ -236,12 +236,13 @@ fn isCallerTask(idx: u32) bool {
 /// tasks transition to .blocked and stay there until SIGCONT — wait-queue
 /// wakes are suppressed while `stopped` holds (see continueTask).
 pub fn stopTask(t: *task.Task, signum: u32) void {
-    if (t.stopped) return;
-    t.stopped = true;
+    const progress = task.markStopped(t);
+    if (progress == .already) return;
     const sc = @import("sched_claim.zig");
     const s = sc.load(&t.state);
     if (s == .running or s == .ready) sc.store(&t.state, .blocked);
-    notifyParentOfChange(t, .{ .stopped = @intCast(signum) });
+    // The parent hears of the stop once the whole thread group has stopped, from whichever member stopped last, on the leader's behalf.
+    if (progress == .group_complete) if (task.groupLeaderOf(t)) |leader| notifyParentOfChange(leader, .{ .stopped = @intCast(signum) });
     if (s == .running) kickUntilStopped(t) else if (s == .ready) kickRunningCpu(t);
 }
 

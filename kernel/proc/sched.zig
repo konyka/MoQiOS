@@ -767,9 +767,10 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
             if (!force_pick and !pinned_away and countActiveOnThisCpu() == 1 and ct_state != .zombie and ct_state != .blocked) {
                 return;
             }
-            // Blocked parent in waitpid still holds cur_idx — run peers on this CPU.
+            // Blocked parent in waitpid still holds cur_idx — run peers on this CPU. A stopped task leaves even with no peer to run: it
+            // may have been interrupted in user mode, and resuming its frame would run it while stopped.
             if (!force_pick and ct_state == .blocked) {
-                if (task.hasReadyOnCpu(cpu)) {
+                if (task.hasReadyOnCpu(cpu) or ct.stopped) {
                     setSlice(0);
                 } else {
                     return;
@@ -832,8 +833,8 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
         // keeps it "current" here forever, and isCurrentOnAnyCpu then blocks
         // its reap indefinitely (observed as an SMP waitpid hang). The normal
         // pick can legitimately return null here because idle-priority (255)
-        // threads are queue-only and the BSP idle is unpinned — fall back to
-        // this CPU's idle/bootstrap kernel thread with a proper claim.
+        // threads are queue-only — fall back to this CPU's idle/bootstrap kernel thread with a proper claim. Every CPU has its own idle thread
+        // pinned to it (the BSP's included), so this fallback has one to claim.
         const cur_unrunnable = if (getCurrentIdx()) |ci0| blk2: {
             const ct0 = task.getTask(ci0) orelse break :blk2 false;
             const s0 = sched_claim.load(&ct0.state);

@@ -18,7 +18,9 @@ pub fn initBspRunQueue() void {
 /// SK-42: main.zig used to pass its own x86 `hlt` loop here — both worlds now
 /// boot the exact same idle task.
 pub fn createIdleThread() ?u32 {
-    return task.createKernelThread(sched.kernelIdleLoop, 255);
+    // Pinned to the BSP: an unpinned idle thread is the first priority-255 match any CPU's idle pick sees, so an idle AP would claim it and CPU 0
+    // would have no idle thread left to switch to (a stopped task on CPU 0 then resumes its own frame — hello286 G).
+    return task.createKernelThreadAffinity(sched.kernelIdleLoop, 255, 0);
 }
 
 /// Priority-255 idle thread with a custom body — probe-ladder milestones

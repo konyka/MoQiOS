@@ -402,6 +402,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello283"); /* orphaned process groups: SIGHUP+SIGCONT only for a newly orphaned group with a stopped member */
     run_test("hello284"); /* waitpid WUNTRACED/WCONTINUED: stopped and continued children, SIGCHLD, SA_NOCLDSTOP */
     run_test("hello285"); /* waitid: P_ALL/P_PID/P_PGID, WEXITED/WSTOPPED/WCONTINUED, WNOWAIT, siginfo */
+    run_test("hello286"); /* process-directed SIGSTOP stops every thread; the parent is told once the group has stopped */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

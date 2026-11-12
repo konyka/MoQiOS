@@ -840,6 +840,20 @@ const SchedStats = struct {
   的 SIGCHLD 动作没有 `SA_NOCLDSTOP` 时再发 SIGCHLD（`CLD_STOPPED`/`CLD_CONTINUED`）。
   `waitpid` 带 `WUNTRACED`/`WCONTINUED` 时经 `takeWaitReportLocked` 取走报告；阻塞前在同一把
   锁下再检查一次，所以变化不会从检查和阻塞之间漏掉。
+- **进程级信号作用于整个线程组（hello286）**：`kill(pid>0, sig)` 经 `signal_syscall.sendToProcess`。
+  `proc/group_stop_policy.zig` 的 `actsOnEveryThread` 决定哪些信号发给组里每一个线程：`SIGKILL`、
+  `SIGCONT` 和 `SIGSTOP` 总是，`SIGTSTP`/`SIGTTIN`/`SIGTTOU` 只在目标进程对它取默认动作时（装了
+  handler 或 `SIG_IGN` 的只发给组长）。其余信号只发给被点名的那个任务。父进程 `waitpid` 看到的
+  停止报告不取决于发送顺序：`signal.stopTask` 经 `task.markStopped` 在 `task_lock` 内置 `stopped`
+  并扫描同组，只有让整组最后一个活着的成员停下的那一次才经 `groupLeaderOf` 找到组长、由它报告
+  （`group_stop_policy.completesStop`）。`tkill`/`tgkill` 仍只作用于一个线程。停止的任务在离开 CPU 之前
+  不会回到用户态：系统调用返回路径（`syscall_entry.deliverSignalAt` 的 `.stop` 分支）循环
+  `forceReschedule` 直到 `stopped` 被清除，期间来的 `SIGKILL` 在返回用户态前就结束任务；
+  `timerTickFg` 对已停止的当前任务即使本 CPU 没有其他就绪任务也切走，不恢复原帧。
+  切走需要本 CPU 有自己的 idle 线程可认领：BSP 的 idle 由 `sched_boot.createIdleThread` 绑在 CPU 0
+  上（`createKernelThreadAffinity(..., 0)`），`task.idleThreadLocked` 优先取恰好绑在本 CPU 上的 idle。
+  此前 BSP idle 不绑定，空闲的 AP 会把它拿走，CPU 0 上被停的任务在 `pickBootstrapKernelPreferIdle`
+  返回空时继续跑自己的用户帧（hello286 G）。
 - **waitid（hello285，系统调用 500）**：`proc/waitpid.zig` 的 `waitid`。`idtype` 是 `P_ALL`/`P_PID`/`P_PGID`
   （`proc/waitid_policy.zig` 把它换成 waitpid 的 pid 选择：-1、正 pid、负进程组），`options` 必须含
   `WEXITED`/`WSTOPPED`/`WCONTINUED` 之一，其余位除 `WNOHANG`/`WNOWAIT` 外都是 `EINVAL`。成功返回 0，

@@ -3354,7 +3354,15 @@ fn deliverSignalAt(frame: *SyscallFrame, current: anytype, user_rsp: u64, resume
                 @import("../../proc/task.zig").exitTask(128 + @as(i32, @intCast(signum)));
             },
             .ignore => return,
-            .stop => sig_mod.stopTask(current, signum),
+            .stop => {
+                sig_mod.stopTask(current, signum);
+                // A stop taken on the way out of a system call leaves the CPU here: returning to user mode would run the stopped task's code.
+                const sched = @import("../../proc/sched.zig");
+                while (@atomicLoad(bool, &current.stopped, .acquire)) sched.forceReschedule();
+                sched.repairCurrentAfterBlock();
+                // SIGKILL ends a stop by clearing `stopped`; the task dies here rather than running user code first.
+                if (sig_mod.pendingFatal(current)) |s| @import("../../proc/task.zig").exitTask(128 + @as(i32, @intCast(s)));
+            },
             .cont => sig_mod.continueTask(current),
         }
         return;

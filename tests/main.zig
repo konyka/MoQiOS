@@ -11672,7 +11672,21 @@ test "SIGSTOP on a task running on another CPU kicks that CPU instead of waiting
     const start = std.mem.indexOf(u8, sig, "pub fn stopTask(t: *task.Task, signum: u32) void {") orelse return error.TestUnexpectedResult;
     const body = sig[start..][0..std.mem.indexOf(u8, sig[start..], "\n}\n").?];
     // A task marked ready can still be executing on its CPU (the scheduler marks the outgoing task ready before publishing it); the kick comes after the state change.
-    try std.testing.expect(std.mem.indexOf(u8, body, "if (s == .running or s == .ready) sc.store(&t.state, .blocked);\n    notifyParentOfChange(t, .{ .stopped = @intCast(signum) });\n    if (s == .running) kickUntilStopped(t) else if (s == .ready) kickRunningCpu(t);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (s == .running or s == .ready) sc.store(&t.state, .blocked);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\n    if (s == .running) kickUntilStopped(t) else if (s == .ready) kickRunningCpu(t);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "sc.store(&t.state, .blocked);").? < std.mem.indexOf(u8, body, "kickUntilStopped(t)").?);
+    // The parent's WUNTRACED report comes from the member that completes the group's stop, on the leader's behalf (hello286).
+    try std.testing.expect(std.mem.indexOf(u8, body, "const progress = task.markStopped(t);\n    if (progress == .already) return;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (progress == .group_complete) if (task.groupLeaderOf(t)) |leader| notifyParentOfChange(leader, .{ .stopped = @intCast(signum) });") != null);
+    // A stop taken on the syscall-return path must leave the CPU instead of returning to user mode (hello286 F).
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, ".stop => {\n                sig_mod.stopTask(current, signum);\n                // A stop taken on the way out of a system call leaves the CPU here: returning to user mode would run the stopped task's code.\n                const sched = @import(\"../../proc/sched.zig\");\n                while (@atomicLoad(bool, &current.stopped, .acquire)) sched.forceReschedule();\n                sched.repairCurrentAfterBlock();\n                // SIGKILL ends a stop by clearing `stopped`; the task dies here rather than running user code first.\n                if (sig_mod.pendingFatal(current)) |s| @import(\"../../proc/task.zig\").exitTask(128 + @as(i32, @intCast(s)));\n            },") != null);
+    // A plain tick must not resume a stopped task's frame just because this CPU has no other ready task.
+    try std.testing.expect(std.mem.indexOf(u8, kt.sched_source, "if (!force_pick and ct_state == .blocked) {\n                if (task.hasReadyOnCpu(cpu) or ct.stopped) {") != null);
+    // The BSP idle thread is pinned to CPU 0: an unpinned one is the first priority-255 match every CPU's idle pick sees, so an idle AP would
+    // take it and CPU 0 would have no idle thread to switch a stopped task out for (hello286 G).
+    try std.testing.expect(std.mem.indexOf(u8, kt.sched_boot_source, "return task.createKernelThreadAffinity(sched.kernelIdleLoop, 255, 0);") != null);
+    // And the idle pick prefers the thread pinned exactly to this CPU over an unpinned one, so a CPU keeps its own idle thread.
+    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "if (t.cpu_mask == @as(u64, 1) << @intCast(cpu)) return i;") != null);
     // One kick can be coalesced away by a scheduler pass that already started, so a running target is kicked until it leaves.
     try std.testing.expect(std.mem.indexOf(u8, sig, "while (tries < STOP_KICK_TRIES) : (tries += 1) {\n        if (@import(\"sched_claim.zig\").load(&t.state) != .running) return;\n        kickRunningCpu(t);") != null);
     // The kick aims at the CPU the target itself publishes at every tick and syscall entry.

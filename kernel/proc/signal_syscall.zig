@@ -65,7 +65,7 @@ pub fn killPosix(pid: i64, signum: u32) i64 {
         if (signum > 64) return -22;
         if (!maySignal(cur, target)) return -1;
         if (signum == 0) return 0;
-        return if (sig_mod.sendSignal(tid, signum)) 0 else -3;
+        return sendToProcess(target, tid, signum);
     }
 
     const pgid: u16 = if (pid == 0) cur.pgid else (id_policy.killTargetPgid(pid) orelse return -3);
@@ -86,6 +86,23 @@ pub fn killPosix(pid: i64, signum: u32) i64 {
     return 0;
 }
 
+/// kill(pid > 0, sig) once the target exists and may be signalled. SIGKILL, SIGCONT and a default-action stop act on every thread
+/// of the process (group_stop_policy.zig): the other threads first, the leader last. The parent's WUNTRACED report does not come
+/// from this order — it waits until the whole group has stopped (signal.stopTask). Anything else goes to the named task only.
+fn sendToProcess(target: *task_mod.Task, tid: u32, signum: u32) i64 {
+    const gsp = @import("group_stop_policy.zig");
+    if (!gsp.actsOnEveryThread(signum, target.sigact().handlers[signum - 1]))
+        return if (sig_mod.sendSignal(tid, signum)) 0 else -3;
+    const group = threadGroupId(target);
+    var reached = false;
+    for (0..task_mod.MAX_TASKS) |i| {
+        const t = task_mod.getTask(@intCast(i)) orelse continue;
+        if (!t.is_thread or t.state == .zombie or threadGroupId(t) != group) continue;
+        if (sig_mod.sendSignal(t.tid, signum)) reached = true;
+    }
+    if (sig_mod.sendSignal(group, signum)) reached = true;
+    return if (reached) 0 else -3;
+}
 
 /// kill(-1, sig): every process but init and the caller's own (see
 /// kill_broadcast_policy.zig for the target and return-value rules).

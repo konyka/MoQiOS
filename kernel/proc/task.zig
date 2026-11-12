@@ -776,9 +776,11 @@ pub fn pickKernelBootstrapForCpuPrefer(cpu: u8, prefer_idle: bool) ?u32 {
     return null;
 }
 
-/// This CPU's idle kernel thread (priority 255, pinned to `cpu`), ready to be claimed (task_lock held).
+/// This CPU's idle kernel thread (priority 255), ready to be claimed (task_lock held). A thread pinned exactly here wins over an unpinned
+/// one: an unpinned idle thread is eligible on every CPU, and taking it would leave the CPU it was created for with none.
 fn idleThreadLocked(cpu: u8) ?u32 {
     var bits = slot_bitmap;
+    var unpinned: ?u32 = null;
     while (bits != 0) {
         const i: u32 = @intCast(@ctz(bits));
         bits &= bits - 1;
@@ -786,9 +788,10 @@ fn idleThreadLocked(cpu: u8) ?u32 {
         if (t.is_user or t.priority != 255) continue;
         if (!matchesCpu(t, cpu)) continue;
         if (sched_claim.load(&t.state) != .ready or isCurrentOnOtherCpu(i, cpu)) continue;
-        return i;
+        if (t.cpu_mask == @as(u64, 1) << @intCast(cpu)) return i;
+        if (unpinned == null) unpinned = i;
     }
-    return null;
+    return unpinned;
 }
 
 /// Count active (non-zombie/non-blocked) tasks on `cpu` under task_lock.
@@ -1855,6 +1858,41 @@ pub fn publishRunnable(slot: u32) void {
     const sched = @import("sched.zig");
     sched.enqueue(t);
     sched.notifyWake(t);
+}
+
+/// A member of a thread group stops. The flag is set and the rest of the group checked under one task_lock hold, so exactly one stopping
+/// member sees `.group_complete`: the one whose stop leaves no live member of the group running (group_stop_policy.completesStop).
+pub fn markStopped(t: *Task) @import("group_stop_policy.zig").StopProgress {
+    const gsp = @import("group_stop_policy.zig");
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    const was = t.stopped;
+    t.stopped = true;
+    const gid = if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid;
+    var others_running = false;
+    var bits = slot_bitmap;
+    while (bits != 0) {
+        const j: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const m = &tasks[j];
+        if (m == t or m.state == .zombie) continue;
+        const in_group = if (m.is_thread) m.parent_tid == gid else m.tid == gid;
+        if (in_group and !m.stopped) {
+            others_running = true;
+            break;
+        }
+    }
+    return gsp.completesStop(was, others_running);
+}
+
+/// The live leader of the thread group `t` belongs to (`t` itself when it is the leader).
+pub fn groupLeaderOf(t: *Task) ?*Task {
+    if (!t.is_thread or t.parent_tid == 0) return t;
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    const li = groupLeaderLocked(t.parent_tid, MAX_TASKS) orelse return null;
+    if (tasks[li].state == .zombie) return null;
+    return &tasks[li];
 }
 
 /// A child stopped or continued: record what its parent's waitpid will report and wake the parent if it is blocked in waitpid.
