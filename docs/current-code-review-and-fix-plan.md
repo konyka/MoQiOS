@@ -8488,7 +8488,8 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
     （`TIMER_ABSTIME` 对它们没有意义，Linux 同样按相对处理）；`timerGettime`/旧值报剩余 CPU 时间；`timerTick` 在
     `cpu_armed` 为真时每个 tick 都扫，按 `cpuClockNs` 判到期，周期定时器保留相位并计 overrun；所有者消失则停止定时器。
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份，A–G 全部通过（D 触发、G 剩余 49→47 ms）。`zig build`、`zig build test` 通过。
-- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒，宿主机 load 约 1）：SMP=1、一份 SMP=4、SMP=2 `EXIT=0`、0 FAIL；另一份 SMP=4 `EXIT=1`，唯一的失败是 hello99「not enough free RAM」——它在 `sysinfo` 里读到的空闲页低于 3×16384 的前置条件就放弃了，紧接在 hello98（4 个工作者的 swap 压力测试）之后；那份日志里 hello98 本身通过，两者之间没有回收记录。另外三份 hello98 设置回收下限时的空闲页是 67687～86159，都够。与本节改动无关（CPU 定时器只在有 CPU 时钟定时器时才扫），记为新的偶发项，没有查根因。四份里 hello308 都是 PASS，`corrupted canaries` 都是 0。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒，宿主机 load 约 1）：SMP=1、一份 SMP=4、SMP=2 `EXIT=0`、0 FAIL；另一份 SMP=4 `EXIT=1`，唯一的失败是 hello99「not enough free RAM」——它在 `sysinfo` 里读到的空闲页低于 3×16384 的前置条件就放弃了，紧接在 hello98（4 个工作者的 swap 压力测试）之后；那份日志里 hello98 本身通过，两者之间没有回收记录。另外三份 hello98 设置回收下限时的空闲页是 67687～86159，都够。与本节改动无关（CPU 定时器只在有 CPU 时钟定时器时才扫），记为新的偶发项，没有查根因（那份 smoke 因此缺 `hello99: PASS` 标记，按 1400 秒超时退出）。四份里 hello308 都是 PASS，`corrupted canaries` 都是 0。
+- CI 记录：hello306 的提交 `57ef368` 在 CI 的 SMP=2 上失败，原因是 hello286 J「60 group stops while threads come and go」只有 22/60——这是文档里多次记录的 hello286 J 偶发；下一个提交 `bcdcaf8`（包含同样的代码）的 CI 全部成功。
 - 如实的局限：
   1. 到期靠调度 tick（约 10 ms 一次）检查，所以短间隔的 CPU 定时器最多晚一个 tick 才发出；Linux 用高精度 CPU 时钟事件，
      精度更高。hello308 用 20 ms 间隔，在 10 ms tick 下不受影响。
