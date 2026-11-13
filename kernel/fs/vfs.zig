@@ -562,6 +562,60 @@ pub fn pipeTransferWait(src_idx: u32, dst_idx: u32, count: usize, nonblocking: b
     }
 }
 
+/// file -> pipe splice and sendfile: wait until the pipe has room for at least one byte, or nobody reads it any more. Returns 0 when
+/// the caller may write (or must report EPIPE: the write itself raises SIGPIPE), -11 when `nonblocking`, -4 when a signal that would
+/// be acted on is pending (a fatal one too: the caller holds transfer references on both descriptors, so the task leaves through the
+/// syscall return), -1 when the pipe is gone. A default stop is taken in place and the wait goes on.
+pub fn pipeWaitWritable(pipe_idx: u32, nonblocking: bool) i64 {
+    if (pipe_idx >= pipes.len) return -1;
+    const sched = @import("../proc/sched.zig");
+    const task_mod = @import("../proc/task.zig");
+    const sig_mod = @import("../proc/signal.zig");
+    while (true) {
+        const flags = pipe_lock.acquire();
+        const pipe = &pipes[pipe_idx];
+        if (pipe.ref_count == 0) {
+            pipe_lock.release(flags);
+            return -1;
+        }
+        const used: u32 = if (pipe.tail >= pipe.head) pipe.tail - pipe.head else PIPE_BUF_SIZE - pipe.head + pipe.tail;
+        if (pipe.read_refs == 0 or used < PIPE_BUF_SIZE - 1) {
+            pipe_lock.release(flags);
+            return 0;
+        }
+        if (nonblocking) {
+            pipe_lock.release(flags);
+            return -11;
+        }
+        const cur = task_mod.getTask(sched.currentTaskIndex() orelse {
+            pipe_lock.release(flags);
+            return -1;
+        }) orelse {
+            pipe_lock.release(flags);
+            return -1;
+        };
+        if (sig_mod.pendingActionable(cur)) {
+            pipe_lock.release(flags);
+            return -4;
+        }
+        const node = &cur.pipe_write_wait_node;
+        node.granted = false;
+        node.next = null;
+        if (!sched.blockOn(&pipe_write_waiters[pipe_idx], node)) {
+            pipe_lock.release(flags);
+            return -1;
+        }
+        // A pending default stop is taken here rather than slept on (see pipeRead).
+        _ = @atomicRmw(u64, &cur.pending_signals, .Or, 0, .seq_cst);
+        const stop_now = sig_mod.pendingStop(cur);
+        pipe_lock.release(flags);
+        if (!(stop_now and sig_mod.stopWhileWaiting(cur))) sched.rescheduleAfterBlock();
+        const cleanup = pipe_lock.acquire();
+        unlinkPipeWriteWaiterLocked(pipe_idx, node);
+        pipe_lock.release(cleanup);
+    }
+}
+
 pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u32) i64 {
     if (pipe_idx >= MAX_PIPES) return -1;
     if (count == 0) return 0;

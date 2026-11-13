@@ -274,7 +274,13 @@ fn kernelTransfer(
             const state_error = tcpDestinationError(fd_table, dst_fd);
             if (state_error < 0) return if (total > 0) total else state_error;
         }
-        const capacity = destinationCapacity(fd_table, dst_fd, dst_type);
+        var capacity = destinationCapacity(fd_table, dst_fd, dst_type);
+        if (capacity == 0 and dst_type == .pipe_write and total == 0) {
+            // Linux sendfile into a full pipe waits for room (or EAGAIN under O_NONBLOCK) instead of returning 0.
+            const waited = vfs.pipeWaitWritable(fd_table.fds[dst_fd].pipe_idx, fd_table.fds[dst_fd].status_flags & 0x800 != 0);
+            if (waited < 0) return waited;
+            capacity = destinationCapacity(fd_table, dst_fd, dst_type);
+        }
         if (capacity == 0) {
             if (dst_type == .pipe_write and destinationPipeClosed(fd_table, dst_fd)) {
                 return if (total > 0) total else writePipeWrite(fd_table, dst_fd, &kbuf, 1);
@@ -530,14 +536,25 @@ fn spliceFileToPipe(fd_table: *vfs.FdTable, file_fd: u32, off_in: u64, pipe_fd: 
     var total: i64 = 0;
     var failure: i64 = 0;
     var kbuf: [CHUNK_SIZE]u8 = undefined;
+    // Linux: O_NONBLOCK on either descriptor counts as SPLICE_F_NONBLOCK.
+    const nonblocking = (flags & SPLICE_F_NONBLOCK != 0) or ((fd_table.fds[file_fd].status_flags | fd_table.fds[pipe_fd].status_flags) & 0x800 != 0);
     while (remaining > 0) {
-        const capacity = destinationCapacity(fd_table, pipe_fd, .pipe_write);
+        var capacity = destinationCapacity(fd_table, pipe_fd, .pipe_write);
+        if (capacity == 0 and total == 0) {
+            // A full pipe makes the first chunk wait for room (Linux opipe_prep / splice_file_to_pipe), not return 0.
+            const waited = vfs.pipeWaitWritable(fd_table.fds[pipe_fd].pipe_idx, nonblocking);
+            if (waited < 0) {
+                failure = waited;
+                break;
+            }
+            capacity = destinationCapacity(fd_table, pipe_fd, .pipe_write);
+        }
         if (capacity == 0) {
             if (destinationPipeClosed(fd_table, pipe_fd)) {
                 const probe = writePipeWrite(fd_table, pipe_fd, &kbuf, 1);
                 if (total == 0 and probe < 0) failure = probe;
             }
-            if (flags & SPLICE_F_NONBLOCK != 0 and total == 0) failure = -11;
+            if (nonblocking and total == 0) failure = -11;
             break;
         }
         const chunk: usize = @intCast(@min(remaining, @min(CHUNK_SIZE, capacity)));

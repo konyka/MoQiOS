@@ -8372,3 +8372,19 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 为什么没有提交：配套的 hello303（`moqipc_recv` 阻塞中停止）在**未改动的内核**上也卡在 `fork` 之后、只打印出标题和第一行 `first send`，同样的二进制在改过的内核上有相同表现。也就是说卡死来自测试的搭建方式，不是这次的改动或原来的窗口，红灯证据不成立。测试搭建上有两处具体的坑，已确认并绕开一部份：`moqipc_send` 拒绝发给调用者自己拥有的端点（`would_deadlock`，-3），所以接收方必须自己创建端点；授予能力只能由端点所有者做，所以子进程创建后把 id 经管道交给父进程并给父进程授予 send 权限。绕开之后仍然卡住，原因未查明。
 - 现状：`kernel/ipc/ipc.zig` 与实际提交保持一致，没有改动；`user/hello303.c` 没有保留。这一条仍是开放项，记录在这里以免重复走同样的路。
 - 下一步的建议：先用一个不涉及停止的 hello303（只验证 `moqipc_recv` 能收到消息、`moqipc_send` 的权限与所有权规则）把搭建跑通，再叠加停止测试；或者给 `moqipc` 加一个改变端点所有者的调用，省掉子进程创建端点这一步。
+
+## file→pipe 的 splice 和 `sendfile` 在满管道上不等待（hello304，已修）
+
+- 起因：hello297 一节的局限 1 提到 file→pipe 的 `splice` 和 `sendfile` 写管道没有覆盖。实测发现更基本的问题：管道满是 `destinationCapacity` 返回 0，函数直接 `break`，返回 0 字节——Linux 会等（写端睡在管道写队列上），只有 `SPLICE_F_NONBLOCK`/`O_NONBLOCK` 才返回 `EAGAIN`。
+- Linux 依据：`3rd/linux-7.0.6/fs/splice.c` 的 `splice_from_pipe_begin`/`splice_file_to_pipe` 走 `opipe_prep`（约 1678 行）：管道满时没有读端返回 `-EPIPE`，`SPLICE_F_NONBLOCK` 返回 `-EAGAIN`，有信号返回 `-ERESTARTSYS`，否则 `pipe_wait_writable`。`do_splice` 在任一端 `O_NONBLOCK` 时加上 `SPLICE_F_NONBLOCK`（约 1323 行）。宿主机实测（`/tmp/spfull.c`、`/tmp/sffull.c`，再以 `gcc -DHOST` 跑 hello304，普通和 `taskset -c 0` 都通过）：满管道上阻塞的 `splice` 和 `sendfile` 100 ms 后仍未返回，读端 drain 后完成并返回 16 字节；`O_NONBLOCK` 时返回 `EAGAIN`。
+- 红灯：未修改的内核（`907e193`）上定向 SMP=2（日志开头 `spawned hello2`、`spawned hello304`）：B（file→pipe `splice`）、E（`sendfile`）、F（`splice` + `SIGTERM`）都是“writer was blocked = no”，G 是“waits = no, still waiting after 2 s”（子进程其实已经返回）。A（`write()`）和 D 通过——`pipeWrite` 本来就等。
+- 实现：
+  - `kernel/fs/vfs.zig` 新增 `pipeWaitWritable(pipe_idx, nonblocking)`：满且还有读端时睡在 `pipe_write_waiters` 上；有读端但没空间、没有读端、管道已释放时返回 0/-1；非阻塞返回 `-11`；会被处理的信号返回 `-4`；默认停止用 `stopWhileWaiting` 原地处理。
+  - `kernel/fs/splice.zig` `spliceFileToPipe`：第一块遇到满管道时先 `pipeWaitWritable`，再把容量取一次；非阻塞判定改成“标志或任一端 `O_NONBLOCK`”。
+  - `kernel/fs/splice.zig` `kernelTransfer`（`sendfile`）：同样在第一块等待，按目的端描述符的 `O_NONBLOCK` 决定非阻塞。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份（日志开头 `spawned hello2`、`spawned hello304`）八项全部通过；G 的等待在 drain 后完成。`zig build`、`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒，宿主机 load 约 1.5）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello304 都是 PASS，hello286、hello288、hello290–hello302 都通过。
+- 如实的局限：
+  1. `pipeWaitWritable` 只覆盖 splice/sendfile 的第一块；之后的块在管道再次写满时返回已搬字节数（Linux 也一样）。
+  2. 等待里收到致命信号时返回 `-EINTR`，进程在系统调用返回时被杀，不在等待里直接 `exitTask`。这样 splice/sendfile 的 transfer 引用能正常释放。
+  3. 测试里 `G` 的 drain 缓冲区原本用了 8 KiB 的栈数组，在目标机上 `read` 返回 `EFAULT`（用户栈不够），测试因此先失败过；改成 512 字节后正常。
