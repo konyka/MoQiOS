@@ -1546,6 +1546,23 @@ pub fn processCpuTimes(cur_idx: u32, now_tsc: u64, tsc_mhz: u64) cpu_time_policy
     return groupTimesLocked(gid, now_tsc, tsc_mhz);
 }
 
+/// CPU time in nanoseconds that a CPU-time POSIX timer counts: the whole thread group of the task in slot `idx` (process clock), or
+/// that task alone (thread clock), including the slice it is running right now. null when the slot no longer holds the tid the
+/// timer was created for (the task exited and the slot was reused).
+pub fn cpuClockNs(idx: u32, tid: u32, thread: bool, now_tsc: u64, tsc_mhz: u64) ?u64 {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    const t = getTask(idx) orelse return null;
+    if (t.tid != tid or t.state == .zombie) return null;
+    if (thread) {
+        const running = sched_claim.load(&t.state) == .running;
+        const slice = if (running) @import("rusage_policy.zig").runtimeUs(0, t.sched_in_tsc, now_tsc, tsc_mhz) else 0;
+        return (t.utime_us +| t.stime_us +| slice) *| 1000;
+    }
+    const gid = if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid;
+    return groupTimesLocked(gid, now_tsc, tsc_mhz).selfUs() *| 1000;
+}
+
 /// CPU time waitid reports for a child it did not reap (WNOWAIT, a stop, a continue): the child's own group plus the
 /// children that child had itself waited for, the same figure a reap would hand back. Caller MUST hold task_lock.
 pub fn childUsageLocked(child_tid: u32) cpu_time_policy.Usage {

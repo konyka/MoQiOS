@@ -60,8 +60,13 @@ const PosixTimer = struct {
     valid: bool = false,
     clock_id: u32 = 0,
     interval_ns: u64 = 0,
-    /// CLOCK_MONOTONIC deadline in nanoseconds (tsc.nanos()); 0 when disarmed.
+    /// CLOCK_MONOTONIC deadline in nanoseconds (tsc.nanos()); 0 when disarmed. Unused for the CPU-time clocks, which have no
+    /// wall deadline.
     expiry_ns: u64 = 0,
+    /// For a CPU-time clock: the CPU nanoseconds counted (in the timer's clock domain) when it was armed, and the CPU count at
+    /// which it fires. `expiry_ns` is not used for these.
+    cpu_base_ns: u64 = 0,
+    cpu_due_ns: u64 = 0,
     sigev_value: u64 = 0,
     /// Bumped on every create and kept across delete: a queued signal of a deleted timer is not charged to its successor.
     generation: u32 = 0,
@@ -86,6 +91,8 @@ var timers: [MAX_TIMERS]PosixTimer = @splat(.{});
 var lock: IrqSpinlock = .{};
 /// Earliest armed expiry_ns: lets the per-tick scan skip `lock`.
 var expiry_hint: DeadlineHint = .{};
+/// Set while any CPU-time timer is armed: those have no wall deadline, so the scan must run every tick.
+var cpu_armed: bool = false;
 
 /// Fill a Timespec from nanoseconds.
 fn nsToTimespec(ns: u64, ts: *Timespec) void {
@@ -216,7 +223,10 @@ pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr:
             .it_value = .{ .tv_sec = 0, .tv_nsec = 0 },
         };
         nsToTimespec(t.interval_ns, &old_val.it_interval);
-        if (t.active and t.expiry_ns > 0) nsToTimespec(t.expiry_ns -| tsc.nanos(), &old_val.it_value);
+        if (t.active and time_policy.isCpuClock(t.clock_id)) {
+            const now_cpu = cpuClockOf(t) orelse 0;
+            nsToTimespec(t.cpu_due_ns -| now_cpu, &old_val.it_value);
+        } else if (t.active and t.expiry_ns > 0) nsToTimespec(t.expiry_ns -| tsc.nanos(), &old_val.it_value);
         var old_buf: [@sizeOf(Itimerspec)]u8 = undefined;
         @memcpy(&old_buf, @as([*]const u8, @ptrCast(&old_val))[0..@sizeOf(Itimerspec)]);
         if (copy.copyToUser(@ptrFromInt(old_value_ptr), &old_buf, @sizeOf(Itimerspec)) != @sizeOf(Itimerspec)) {
@@ -236,7 +246,23 @@ pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr:
         // Disarm the timer
         t.active = false;
         t.expiry_ns = 0;
+        t.cpu_due_ns = 0;
     } else {
+        if (time_policy.isCpuClock(t.clock_id)) {
+            // A CPU-time timer counts CPU time from now: `value_ns` is how much of it must pass (TIMER_ABSTIME is meaningless for a
+            // clock that only moves while the process runs, and Linux treats it the same way). No wall deadline is set.
+            const now_cpu = cpuClockOf(t) orelse {
+                lock.release(saved);
+                return EINVAL;
+            };
+            t.cpu_base_ns = now_cpu;
+            t.cpu_due_ns = now_cpu +| value_ns;
+            t.expiry_ns = 0;
+            t.active = true;
+            cpu_armed = true;
+            lock.release(saved);
+            return 0;
+        }
         const now_ns = tsc.nanos();
         // An absolute deadline becomes a delay from now on the monotonic clock; one already past fires at the next tick.
         const delay_ns = if ((flags & TIMER_ABSTIME) != 0)
@@ -281,7 +307,10 @@ pub fn timerGettime(timerid: u32, curr_value_ptr: u64) i64 {
     nsToTimespec(t.interval_ns, &val.it_interval);
 
     // An expired timer reports 0.
-    if (t.active and t.expiry_ns > 0) nsToTimespec(t.expiry_ns -| tsc.nanos(), &val.it_value);
+    if (t.active and time_policy.isCpuClock(t.clock_id)) {
+        const now_cpu = cpuClockOf(t) orelse 0;
+        nsToTimespec(t.cpu_due_ns -| now_cpu, &val.it_value);
+    } else if (t.active and t.expiry_ns > 0) nsToTimespec(t.expiry_ns -| tsc.nanos(), &val.it_value);
 
     var buf: [@sizeOf(Itimerspec)]u8 = undefined;
     @memcpy(&buf, @as([*]const u8, @ptrCast(&val))[0..@sizeOf(Itimerspec)]);
@@ -346,13 +375,37 @@ pub fn deleteTimersForTask(task_idx: u32) void {
 
 /// Called from the BSP timer tick with tsc.nanos(). Fires every timer whose deadline has passed.
 pub fn timerTick(now_ns: u64) void {
-    if (!expiry_hint.due(now_ns)) return;
+    if (!cpu_armed and !expiry_hint.due(now_ns)) return;
     const saved = lock.acquire();
     defer lock.release(saved);
     expiry_hint.beginScan();
+    var cpu_still_armed = false;
 
     for (&timers, 0..) |*t, i| {
         if (!t.valid or !t.active) continue;
+
+        if (time_policy.isCpuClock(t.clock_id)) {
+            // CPU-time timers are checked on every tick: their clock only moves while the owning process runs, and a short
+            // interval on a busy process is over between two ticks.
+            cpu_still_armed = true;
+            const now_cpu = cpuClockOf(t) orelse {
+                // The owning task is gone (its exit deletes its timers, so this is only a race): stop.
+                t.active = false;
+                continue;
+            };
+            if (now_cpu < t.cpu_due_ns) continue;
+            var count: u64 = 1;
+            if (t.interval_ns > 0) {
+                // Every interval that has elapsed counts; keep the original phase.
+                const over = now_cpu - t.cpu_due_ns;
+                count = 1 + over / t.interval_ns;
+                t.cpu_due_ns = t.cpu_due_ns + count * t.interval_ns;
+            } else {
+                t.active = false;
+            }
+            if ((t.sigev_notify & ~SIGEV_THREAD_ID) == SIGEV_SIGNAL and t.sigev_signo > 0 and t.sigev_signo <= 64) notifyOwner(t, @intCast(i), count);
+            continue;
+        }
 
         if (now_ns < t.expiry_ns) {
             expiry_hint.arm(t.expiry_ns);
@@ -372,6 +425,15 @@ pub fn timerTick(now_ns: u64) void {
             if ((t.sigev_notify & ~SIGEV_THREAD_ID) == SIGEV_SIGNAL and t.sigev_signo > 0 and t.sigev_signo <= 64) notifyOwner(t, @intCast(i), count);
         }
     }
+    cpu_armed = cpu_still_armed;
+}
+
+/// The CPU nanoseconds a CPU-time timer's clock reads right now, in its own domain (process or thread).
+fn cpuClockOf(t: *const PosixTimer) ?u64 {
+    const owner_idx = t.owner_task_idx orelse return null;
+    const thread = t.clock_id == time_policy.CLOCK_THREAD_CPUTIME_ID;
+    const tsc_mod = @import("../arch/arch.zig").tsc;
+    return task_mod.cpuClockNs(owner_idx, t.owner_tid, thread, tsc_mod.read(), tsc_mod.tsc_freq_mhz);
 }
 
 /// Signal the timer's owner (recorded at timer_create, the slot checked against the tid it had then) for `count` expiries. Only

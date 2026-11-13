@@ -20,6 +20,14 @@ pub const CLOCK_MONOTONIC_COARSE: u32 = 6;
 pub const CLOCK_BOOTTIME: u32 = 7;
 /// TAI counts on the realtime base: this kernel's TAI offset is 0 (no adjtimex, no leap-second table).
 pub const CLOCK_TAI: u32 = 11;
+/// CPU-time clocks: a timer on them counts the process's (or the calling thread's) CPU time, not wall time. `timerClockBase` has no
+/// base for them; posix_timer accounts their expiries from the scheduler tick.
+pub const CLOCK_PROCESS_CPUTIME_ID: u32 = 2;
+pub const CLOCK_THREAD_CPUTIME_ID: u32 = 3;
+
+pub fn isCpuClock(clock_id: u32) bool {
+    return clock_id == CLOCK_PROCESS_CPUTIME_ID or clock_id == CLOCK_THREAD_CPUTIME_ID;
+}
 
 /// Which time base a timer's TIMER_ABSTIME deadline is counted on. CLOCK_BOOTTIME shares the monotonic base: this kernel does not
 /// suspend, so boot time and monotonic time are the same clock (clock_ids.zig). A clock id a timer cannot use is null.
@@ -35,6 +43,7 @@ pub fn timerClockBase(clock_id: u32) ?u32 {
 /// Why timer_create refuses a clock id (measured on Linux): the coarse clocks and MONOTONIC_RAW are EOPNOTSUPP, anything else it
 /// does not implement is EINVAL. timerfd_create says EINVAL for all of them.
 pub fn timerCreateErrno(clock_id: u32) ?i64 {
+    if (isCpuClock(clock_id)) return null; // accepted; their expiries are counted from CPU time
     if (timerClockBase(clock_id) != null) return null;
     return switch (clock_id) {
         CLOCK_MONOTONIC_RAW, CLOCK_REALTIME_COARSE, CLOCK_MONOTONIC_COARSE => -95,
@@ -116,8 +125,12 @@ test "CLOCK_BOOTTIME timers share the monotonic base and the rest are rejected" 
     try t.expectEqual(@as(?i64, null), timerCreateErrno(CLOCK_BOOTTIME));
     try t.expectEqual(@as(?i64, -95), timerCreateErrno(CLOCK_MONOTONIC_RAW));
     try t.expectEqual(@as(?i64, -95), timerCreateErrno(CLOCK_REALTIME_COARSE));
-    try t.expectEqual(@as(?i64, -22), timerCreateErrno(2));
+    // clock 2 is CLOCK_PROCESS_CPUTIME_ID, a timer clock since hello308; only an unknown id is EINVAL without a specific reason.
     try t.expectEqual(@as(?i64, -22), timerCreateErrno(99));
+    // CPU-time clocks are timer clocks without a wall base; their count is CPU time.
+    try t.expectEqual(@as(?i64, null), timerCreateErrno(CLOCK_PROCESS_CPUTIME_ID));
+    try t.expectEqual(@as(?i64, null), timerCreateErrno(CLOCK_THREAD_CPUTIME_ID));
+    try t.expect(isCpuClock(CLOCK_PROCESS_CPUTIME_ID) and isCpuClock(CLOCK_THREAD_CPUTIME_ID) and !isCpuClock(CLOCK_MONOTONIC));
     // TAI counts on the realtime base and is a timer clock; its deadline is a wall-clock one.
     try t.expectEqual(@as(?u32, CLOCK_REALTIME), timerClockBase(CLOCK_TAI));
     try t.expectEqual(@as(?i64, null), timerCreateErrno(CLOCK_TAI));

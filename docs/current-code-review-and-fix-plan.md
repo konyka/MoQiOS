@@ -8468,3 +8468,31 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. TAI 偏移恒为 0：本内核没有 `adjtimex`，也不处理闰秒，所以 `CLOCK_TAI` 读数和 `CLOCK_REALTIME` 相同。Linux 上通常差 37 秒（由 NTP 设定）。
   2. `CLOCK_PROCESS_CPUTIME_ID`、`CLOCK_THREAD_CPUTIME_ID` 的定时器仍未实现（要按 CPU 时间调度）。
   3. `clock_settime` 的检查顺序改成「先时钟、后权限」；现有测试没有依赖旧顺序（`hello270` 等只设 REALTIME）。
+
+## `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID` 上的 POSIX 定时器（hello308，已修）
+
+- 起因：hello296 一节的局限 1（后两个要按 CPU 时间调度，此前 `timer_create` 对它们返回 `EINVAL`）。
+- Linux 依据：`kernel/time/posix-cpu-timers.c` 的 `clock_process`/`clock_thread` 提供 `timer_create`，到期由 `task_cputime` 触发，
+  与墙钟无关。宿主机实测（`/tmp/cpu.c`、`/tmp/thr2.c`、`/tmp/thr3.c`，再以 `gcc -DHOST` 跑 hello308，普通和 `taskset -c 0`
+  都通过）：
+  - 两种时钟都能建定时器；20 ms 的 CPU 定时器在进程睡眠 2 秒时不触发，进程空转 20 ms 后触发（实测第 23 ms、第 20 ms）。
+  - 线程时钟只计本线程的 CPU 时间。
+  - `timer_gettime` 报剩余的 CPU 时间，睡眠时几乎不减。
+- 红灯：未修改的内核（`bcdcaf8`）上定向 SMP=2、SMP=4（日志开头 `spawned hello2`、`spawned hello308`）：A 就是 `-22`，测试随即结束。
+- 实现：
+  - `kernel/ipc/time_policy.zig`：`CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID`、`isCpuClock`，`timerCreateErrno` 对它们返回
+    null（接受）；原来断言 `timerCreateErrno(2) == -22` 的宿主机测试改为只断言未知 id。
+  - `kernel/proc/task.zig`：新增 `cpuClockNs(idx, tid, thread, now_tsc, tsc_mhz)`——线程时钟取该任务自己（含正在运行的这一片），
+    进程时钟取整个线程组的 CPU 时间；槽位的 tid 不符或已是僵尸时返回 null。
+  - `kernel/ipc/posix_timer.zig`：`PosixTimer` 增加 `cpu_base_ns`/`cpu_due_ns`；`timerSettime` 对 CPU 时钟按 CPU 纳秒武装
+    （`TIMER_ABSTIME` 对它们没有意义，Linux 同样按相对处理）；`timerGettime`/旧值报剩余 CPU 时间；`timerTick` 在
+    `cpu_armed` 为真时每个 tick 都扫，按 `cpuClockNs` 判到期，周期定时器保留相位并计 overrun；所有者消失则停止定时器。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份，A–G 全部通过（D 触发、G 剩余 49→47 ms）。`zig build`、`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒，宿主机 load 约 1）：SMP=1、一份 SMP=4、SMP=2 `EXIT=0`、0 FAIL；另一份 SMP=4 `EXIT=1`，唯一的失败是 hello99「not enough free RAM」——它在 `sysinfo` 里读到的空闲页低于 3×16384 的前置条件就放弃了，紧接在 hello98（4 个工作者的 swap 压力测试）之后；那份日志里 hello98 本身通过，两者之间没有回收记录。另外三份 hello98 设置回收下限时的空闲页是 67687～86159，都够。与本节改动无关（CPU 定时器只在有 CPU 时钟定时器时才扫），记为新的偶发项，没有查根因。四份里 hello308 都是 PASS，`corrupted canaries` 都是 0。
+- 如实的局限：
+  1. 到期靠调度 tick（约 10 ms 一次）检查，所以短间隔的 CPU 定时器最多晚一个 tick 才发出；Linux 用高精度 CPU 时钟事件，
+     精度更高。hello308 用 20 ms 间隔，在 10 ms tick 下不受影响。
+  2. `TIMER_ABSTIME` 对 CPU 时钟按相对处理（Linux 对 CPU 时钟的 `clock_nanosleep` 是 `EOPNOTSUPP`，定时器这边没有绝对的
+     CPU 时刻可等）。
+  3. 进程时钟的到期在「组内任何一个线程用掉 CPU」时都可能触发；只有 tick 运行在 BSP，所以组在别的 CPU 上跑满一个 tick
+     的时长才必然被看到——与第 1 条同一个精度上限。
