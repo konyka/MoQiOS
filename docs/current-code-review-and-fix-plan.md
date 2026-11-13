@@ -7948,3 +7948,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：两处都改走 `signal.sendSignalInfo`，带 `SI_KERNEL` 的 siginfo，目标 tid 仍经 `owner_gen_policy.ownerMatches` 确认。`sendSignalInfo` 内部的 `ignoredAtSend` 按目标的处理方式和掩码决定丢弃还是排队，`kickIfBlocked` 也由发送路径负责，所以被阻塞的已忽略信号仍会排队，未阻塞的在发送时丢掉。
 - 绿灯：宿主机 Linux 上 hello288 全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS，P 段子进程以 0 退出，日志开头是 `spawned hello2`、`spawned hello288`，确认跑的是带 TEMP 的构建）。完整 smoke 四份并行（SMP 1/4/4/2）：a、b、d 三份 `EXIT=0`、0 FAIL，hello57、hello210、hello267、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0；c 那份（SMP=4）在 hello286 的 J 段之后、K 段之前停住，900 秒超时（`EXIT=1`，日志里没有 `: FAIL`）。hello286 不用 POSIX 定时器也不用消息队列，单独定向重跑（SMP=4）一次通过，包括 K 段，所以这是高负载下 hello286 的已知偶发卡住，不是这次改动引起的。
 - 如实的局限：①siginfo 的 `si_code` 固定是 `SI_KERNEL`，Linux 的定时器信号是 `SI_TIMER`、消息队列通知是 `SI_MESGQ`，并带发送者的 pid 和 uid；②周期定时器在被忽略且未阻塞时，Linux 把它挂到忽略列表，之后改回处理方式会补投递，这里直接丢弃，改回处理方式不会补投递。
+
+
+## 同一 socket 第二次 `listen` 不再多占监听槽（hello184 F，已修；hello267 偶发 `to m3 00` 的根因）
+
+- 起因：`d71c471`（hello288 O）的 CI 在 SMP=1 冒烟里 hello267 失败，日志 `hello267: migrated to m2 06, to m3 00`：迁到第三个监听者的 6 个连接一个也没被 `accept`。本地完整 smoke 里也见过两次，定向单跑从未复现。
+- 查因：`tcpAccept` 按 `listen_slots[i].tcb_idx == tcb_idx` 找第一个匹配的槽，找到就用。`tcpListen` 每调用一次都用 `listen_active_bitmap.firstClear()` 新占一个槽；`tcpClose`/`stopListening` 只释放找到的第一个槽就 `break`。所以对同一个 socket `listen` 两次（hello184 C 段就有“listen again is accepted”），关闭后第二个槽仍然活着：端口继续应答 SYN；之后谁再拿到这个 TCB 槽位并 `listen`，它自己的新槽排在后面，`accept` 先找到那个残留的空槽，永远返回 `EAGAIN`，SYN 和迁移却按端口分进它真正的槽。hello267 的 m3 是否恰好复用了这样的 TCB 槽位，取决于前面测试留下的表占用，所以只是偶发。这一点是根据代码推出的，hello267 本身失败时的槽位没有直接打印过；下面的 hello184 F 构造出了同一种状态并稳定复现。
+- Linux 依据（`3rd/linux-7.0.6/net/ipv4/af_inet.c`：`__inet_listen_sk`（199 行）对已在监听的 socket 只更新 backlog（207 行），只有 `old_state != TCP_LISTEN`（211 行）时才开始监听；宿主机实测 `/tmp/l2.py`）：`listen` 两次再 `close`，之后 `connect` 该端口是 `ECONNREFUSED`（111）；`listen` 两次的 socket 照常 `accept`。
+- 红灯：hello184 新增 F 段：bind、listen、再 listen，close；接着新建两个监听者（第二个通常复用刚关闭的 TCB 槽位），第二个监听者接受自己的连接；最后 `connect` 原端口应为 `ECONNREFUSED`。修复前（SMP=2 两份）：第一版只有最后一项，`connect` 返回 0（端口仍在监听）；加入中间两项后，把 `tcp.zig` 暂存构建的旧内核上“紧接着建的监听者接受自己的连接”失败（`accept` 一直 `EAGAIN`），正是 hello267 的现象。
+- 实现：`tcpListen` 先扫描活动的监听槽，已有属于这个 TCB 的槽就直接返回 0，不再新占一个。
+- 绿灯：目标机定向 SMP=2 两份、SMP=4 两份 hello184 全过（F 段四项 ok，`connect` 返回 -111；日志开头是 `spawned hello2`、`spawned hello184`）。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello184、hello210、hello267、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0，hello267 的迁移四份都是 6/6。
+- 如实的局限：①第二次 `listen` 的 backlog 参数仍被忽略（本内核的 backlog 本来就固定为 `LISTEN_BACKLOG` 32）；②`tcpAccept` 仍按第一个匹配的槽查找，正确性现在依赖“每个 TCB 至多一个槽”这一不变式，没有另加断言。

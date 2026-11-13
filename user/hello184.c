@@ -77,6 +77,7 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define EAFNOSUPPORT_ 97
 #define EISCONN_ 106
 #define ENOTCONN_ 107
+#define ECONNREFUSED_ 111
 
 struct ts { int64_t s, n; };
 static void print(const char *s) {
@@ -197,6 +198,51 @@ void _start(void) {
     syscall1(SYS_CLOSE, srv);
     syscall1(SYS_CLOSE, cl);
     if (conn >= 0) syscall1(SYS_CLOSE, conn);
+
+    /* F: a socket that listened twice stops listening when it is closed: a later connect to its port is refused (Linux, measured:
+     * ECONNREFUSED). A second listen used to take a second listen slot that close left behind, still answering SYNs for the port. */
+    {
+        int64_t l = sock4();
+        uint8_t fa[16];
+        mk_addr(fa, 18486);
+        check(syscall3(SYS_BIND, (uint64_t)l, (uint64_t)fa, 16) == 0 && syscall2(SYS_LISTEN, (uint64_t)l, 4) == 0 &&
+              syscall2(SYS_LISTEN, (uint64_t)l, 8) == 0, "F: bind, listen, listen again");
+        syscall1(SYS_CLOSE, l);
+        /* The next socket usually reuses l's TCB slot; a listener made before it takes the lowest free listen slot, so this socket's
+         * own listen slot comes after the one the second listen left behind, and accept used to find that empty one first (EAGAIN
+         * forever). This is how hello267's third listener once accepted none of the six connections migrated to it. */
+        int64_t x = sock4();
+        int64_t y = sock4();
+        uint8_t ya[16], xa[16];
+        mk_addr(ya, 18487);
+        mk_addr(xa, 18488);
+        check(syscall3(SYS_BIND, (uint64_t)y, (uint64_t)ya, 16) == 0 && syscall2(SYS_LISTEN, (uint64_t)y, 4) == 0 &&
+              syscall3(SYS_BIND, (uint64_t)x, (uint64_t)xa, 16) == 0 && syscall2(SYS_LISTEN, (uint64_t)x, 4) == 0,
+              "F: two new listeners after the close");
+        int64_t xc = sock4();
+        int64_t xr = syscall3(SYS_CONNECT, (uint64_t)xc, (uint64_t)xa, 16);
+        for (int i = 0; i < 20 && xr < 0 && xr != -EISCONN_; i++) { syscall1(SYS_NETPOLL, 0); sleep_ms(10); xr = syscall3(SYS_CONNECT, (uint64_t)xc, (uint64_t)xa, 16); }
+        int64_t xs = -1;
+        for (int i = 0; i < 40 && xs < 0; i++) { syscall1(SYS_NETPOLL, 0); xs = syscall4(SYS_ACCEPT4, (uint64_t)x, 0, 0, SOCK_NONBLOCK); if (xs < 0) sleep_ms(5); }
+        check((xr == 0 || xr == -EISCONN_) && xs >= 0, "F: the listener made right after it accepts its own connection");
+        if (xs >= 0) syscall1(SYS_CLOSE, xs);
+        syscall1(SYS_CLOSE, xc);
+        syscall1(SYS_CLOSE, x);
+        syscall1(SYS_CLOSE, y);
+        int64_t c = sock4();
+        int64_t fr = syscall3(SYS_CONNECT, (uint64_t)c, (uint64_t)fa, 16);
+        for (int i = 0; i < 20 && fr < 0 && fr != -ECONNREFUSED_ && fr != -EISCONN_; i++) {
+            syscall1(SYS_NETPOLL, 0);
+            sleep_ms(10);
+            fr = syscall3(SYS_CONNECT, (uint64_t)c, (uint64_t)fa, 16);
+        }
+        char d[64] = "hello184: F connect after close returned -NNN\n";
+        int64_t v = fr < 0 ? -fr : fr;
+        d[42] = (char)('0' + (v / 100) % 10); d[43] = (char)('0' + (v / 10) % 10); d[44] = (char)('0' + v % 10);
+        print(d);
+        check(fr == -ECONNREFUSED_, "F: after close, a connect to the port of a socket that listened twice is ECONNREFUSED");
+        syscall1(SYS_CLOSE, c);
+    }
     print(failures == 0 ? "hello184: PASS\n" : "hello184: FAIL\n");
     print("hello184 done\n");
     syscall1(SYS_EXIT, failures == 0 ? 0 : 1);

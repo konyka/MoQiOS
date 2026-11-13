@@ -4186,6 +4186,12 @@ pub fn tcpListen(tcb_idx: u32) i64 {
 
     tcb.state = .listen;
 
+    // listen() again on a socket that is already listening keeps its slot: a second slot would stay active after close, which only
+    // frees the one it finds first, and the port would keep answering SYNs (hello184 F).
+    var have = listen_active_bitmap.snapshot();
+    while (have.next()) |j| {
+        if (listen_slots[j].tcb_idx == tcbIdx(tcb)) return 0;
+    }
     // Set up listen slot for incoming SYN tracking (bitmap-driven free slot search)
     const i = listen_active_bitmap.firstClear() orelse return -1;
     listen_active_bitmap.set(i);
