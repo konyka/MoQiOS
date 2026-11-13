@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello301`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello302`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -297,6 +297,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello299 | `splice` 和 `sendfile` 读 ext2（`testdir/h299e`）和 FAT32（`h299f`）文件时能看到另一个描述符刚写入、还在写回缓存里的字节：先打开的描述符 splice 出新写的 11 字节（A），`sendfile` 从偏移 6 发出 "world"（B），中间被覆盖的字节按新内容读出（C），在新末尾返回 0（D）（宿主机 Linux 实测同结果） |
 | hello300 | 阻塞在 eventfd 读、timerfd 读、`mq_receive`、`epoll_wait`、AF_UNIX `recv`、`nanosleep` 里的进程收到 `SIGSTOP` 立即停下（`0x137f`），停止期间不运行，`SIGCONT`（`0xffff`）后等待继续并在事件到达时完成，每种 30 轮；另有 200 轮在事件之后隔一段可变时间发 `SIGSTOP`，停止信号落在子进程回到等待途中也必须停下（宿主机 Linux 实测同结果） |
 | hello301 | 阻塞在 TCP `recv` 或 SysV `semop` 里的进程收到 `SIGSTOP` 立即停下（`0x137f`），停止期间不运行，`SIGCONT`（`0xffff`）后等待继续并在事件到达时完成，每种 30 轮；另有 200 轮在事件之后隔一段可变时间发 `SIGSTOP`，落在子进程回到等待途中也必须停下（宿主机 Linux 实测同结果） |
+| hello302 | 阻塞在 400 ms 的 `nanosleep` 里的进程收到 `SIGSTOP` 后 200 ms 内就报 `0x137f`（实测最慢 1～7 ms），停止期间不运行，`SIGCONT`（`0xffff`）后睡眠继续并完成；8 轮加上 40 轮在睡眠结束后隔一段可变时间发 `SIGSTOP`（宿主机 Linux 实测同结果，目标机在未修改的内核上同样通过，是回归测试） |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。

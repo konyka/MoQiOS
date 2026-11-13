@@ -8351,3 +8351,16 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. SysV `semop` 没有红灯，是推出来的预防性改动。
   2. 竞争段是概率测试：通过不能证明窗口完全关闭，只说明这几份没有复现。改完后 SMP=4 三份并行通过，样本不大。
   3. `nanosleep` 和 `ipc.zig` 的同步 IPC 等待没有改。
+
+## `nanosleep` 中的默认停止：补上回归测试，没有发现缺陷（hello302）
+
+- 起因：hello301 一节的局限 3（`nanosleep` 的等待没有改）。睡眠中的任务在 `sleep_bm` 里，状态是 `.blocked`；这次要确认落在睡下途中的 `SIGSTOP` 是否也会被漏掉。
+- Linux 依据：`signal_wake_up` 唤醒处于 `TASK_INTERRUPTIBLE` 的任务，返回用户态前处理停止。宿主机实测（以 `gcc -DHOST` 跑 hello302，普通和 `taskset -c 0` 都通过）：睡眠 400 ms，停止后 8 轮里最慢 3 ms、40 轮可变延迟里最慢 3 ms 就报了 `0x137f`。
+- 红灯：没有。未修改的内核（`9a5ef82`）上定向 SMP=4 三份、SMP=2 一份、再并行 SMP=4 三份，全部通过，最慢 7 ms。原因是 `sleep_bm` 里的任务状态已经是 `.blocked`，发送端（`stopsBlockedTarget`）看到这个状态会自己停下任务，不依赖等待端醒来。所以这一条不需要像 eventfd、epoll 等那样加握手，也没有改内核。
+- 实现：只新增 `user/hello302.c`（回归测试）和登记：`build.zig`、`tools/qemu_run.sh`、`tools/qemu_smoke.sh`、`servers/init/main.c`、`docs/user-space.md`、`docs/moqios-architecture-current.md`。
+- 验证：目标机定向 SMP=4 三份、SMP=2 一份、并行 SMP=4 三份全部通过（最慢 7 ms）。`zig build`、`zig build test` 通过。
+- 完整 smoke：两批，每批四份并行（SMP 1/4/4/2，超时 1400 秒），`corrupted canaries` 都是 0，八份里 hello302 都是 PASS。第一批：SMP=1、两份 SMP=4 `EXIT=0`、0 FAIL；SMP=2 `EXIT=1`，失败是 hello106（控制台写延迟）和 hello107（无界迭代延迟），这两项文档里已记为宿主机负载引起的偶发失败（当时 load 6.18）。第二批：两份 SMP=1/SMP=4 `EXIT=0`；一份 SMP=4 和 SMP=2 `EXIT=1`，失败是 hello108「RT task lost the CPU to reaping」（同样记为宿主机负载引起，当时 load 7.7，失败现场 `stolen_us=10028`，即 vCPU 被宿主机调走），SMP=2 那份另有一次 hello286 J 39/60。hello302 在八份里都是 PASS。
+- 如实的局限：
+  1. 没有红灯，所以这条只证明当前实现满足要求，不证明曾经有缺陷。它会在以后改睡眠或停止逻辑时抓住回归。
+  2. 200 ms 的界限是按 400 ms 的睡眠取的；如果调度 tick 变慢或宿主机负载很高，可能偶发超过。实测最慢 7 ms，余量很大。
+  3. `ipc.zig` 的同步 IPC 等待仍然没有覆盖。
