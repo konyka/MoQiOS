@@ -8364,3 +8364,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 没有红灯，所以这条只证明当前实现满足要求，不证明曾经有缺陷。它会在以后改睡眠或停止逻辑时抓住回归。
   2. 200 ms 的界限是按 400 ms 的睡眠取的；如果调度 tick 变慢或宿主机负载很高，可能偶发超过。实测最慢 7 ms，余量很大。
   3. `ipc.zig` 的同步 IPC 等待仍然没有覆盖。
+
+## 同步 IPC（`moqipc_send`/`recv`/`call`）的等待：检查进行中，尚未改动（开放项）
+
+- 起因：hello301 一节的局限 3。`kernel/ipc/ipc.zig` 的 `sendInternal`、`receiveInternal`、`callAuthorized` 把任务状态置为 `.blocked` 后直接 `sched.forceReschedule()`，睡下前后只看 `pendingActionable`/`pendingFatal`，和 hello300/301 修掉的窗口是同一个形状。停止落在挂起之后、让出 CPU 之前时，发送端看到的还不是 `.blocked`，只会置待处理位。
+- 试过的改动：三处都加上 `pipeRead` 的握手（原子读改写读待处理位，`pendingStop` 为真就 `stopWhileWaiting` 原地停下）。`zig build` 通过，定向 SMP=4 的一份从这个握手前卡在竞争段第 0 轮推进到了 180/200 轮，说明握手本身有效。
+- 为什么没有提交：配套的 hello303（`moqipc_recv` 阻塞中停止）在**未改动的内核**上也卡在 `fork` 之后、只打印出标题和第一行 `first send`，同样的二进制在改过的内核上有相同表现。也就是说卡死来自测试的搭建方式，不是这次的改动或原来的窗口，红灯证据不成立。测试搭建上有两处具体的坑，已确认并绕开一部份：`moqipc_send` 拒绝发给调用者自己拥有的端点（`would_deadlock`，-3），所以接收方必须自己创建端点；授予能力只能由端点所有者做，所以子进程创建后把 id 经管道交给父进程并给父进程授予 send 权限。绕开之后仍然卡住，原因未查明。
+- 现状：`kernel/ipc/ipc.zig` 与实际提交保持一致，没有改动；`user/hello303.c` 没有保留。这一条仍是开放项，记录在这里以免重复走同样的路。
+- 下一步的建议：先用一个不涉及停止的 hello303（只验证 `moqipc_recv` 能收到消息、`moqipc_send` 的权限与所有权规则）把搭建跑通，再叠加停止测试；或者给 `moqipc` 加一个改变端点所有者的调用，省掉子进程创建端点这一步。
