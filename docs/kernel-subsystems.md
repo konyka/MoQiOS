@@ -2101,7 +2101,7 @@ siginfo 是 `SI_TIMER`，`si_timerid` 为定时器 id，`si_value` 为 `sigev_va
 `SIGEV_THREAD_ID`（hello295）：`sigev_notify` 为 `SIGEV_SIGNAL|SIGEV_THREAD_ID`（值 4，`SIGEV_SIGNAL` 是 0）且信号号 1..64 时，到期信号只排给 `sigev_notify_thread_id`（sigevent 偏移 16）点名的线程，不进进程共享的 held 集合；目标必须是调用者所在进程的活线程，否则 `timer_create` 返回 `EINVAL`。`posix_timer_policy.sigeventValid` 拒绝 `SIGEV_NONE|SIGEV_THREAD_ID` 和信号 0。
 
 - 16 个定时器上限，BSP 时钟中断驱动 (100Hz)
-- timer_create: 创建定时器，支持 SIGEV_NONE/SIGEV_SIGNAL/SIGEV_THREAD_ID（hello295）
+- timer_create: 创建定时器，支持 SIGEV_NONE/SIGEV_SIGNAL/SIGEV_THREAD_ID（hello295）。时钟接受 `CLOCK_REALTIME`、`CLOCK_MONOTONIC` 和 `CLOCK_BOOTTIME`（hello296，内核不挂起，boot time 与单调时钟是同一个时间基，`time_policy.timerClockBase`）；`CLOCK_MONOTONIC_RAW` 和两个 COARSE 时钟返回 `EOPNOTSUPP`（-95），其余返回 `EINVAL`。`timerfd_create` 同样接受 `CLOCK_BOOTTIME`，但不支持的时钟一律 `EINVAL`。
 - `timer_create` 在分配槽位前要求非空且可写的 `timerid` 用户指针；无效指针返回
   `EFAULT`，不会消耗 16 个定时器槽位中的任何一个。
   非空 `sigevent` 指针也必须完整可读；无效输入返回 `EFAULT`，不会静默降级为

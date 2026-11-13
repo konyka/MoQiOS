@@ -14,12 +14,38 @@ pub const TIMER_ABSTIME: u32 = 1;
 /// Convert an absolute deadline in the selected clock domain into a monotonic
 /// delay. A deadline already in the past produces zero; invalid clock IDs
 /// return null instead of silently selecting a different clock.
+pub const CLOCK_MONOTONIC_RAW: u32 = 4;
+pub const CLOCK_REALTIME_COARSE: u32 = 5;
+pub const CLOCK_MONOTONIC_COARSE: u32 = 6;
+pub const CLOCK_BOOTTIME: u32 = 7;
+
+/// Which time base a timer's TIMER_ABSTIME deadline is counted on. CLOCK_BOOTTIME shares the monotonic base: this kernel does not
+/// suspend, so boot time and monotonic time are the same clock (clock_ids.zig). A clock id a timer cannot use is null.
+pub fn timerClockBase(clock_id: u32) ?u32 {
+    return switch (clock_id) {
+        CLOCK_REALTIME => CLOCK_REALTIME,
+        CLOCK_MONOTONIC, CLOCK_BOOTTIME => CLOCK_MONOTONIC,
+        else => null,
+    };
+}
+
+/// Why timer_create refuses a clock id (measured on Linux): the coarse clocks and MONOTONIC_RAW are EOPNOTSUPP, anything else it
+/// does not implement is EINVAL. timerfd_create says EINVAL for all of them.
+pub fn timerCreateErrno(clock_id: u32) ?i64 {
+    if (timerClockBase(clock_id) != null) return null;
+    return switch (clock_id) {
+        CLOCK_MONOTONIC_RAW, CLOCK_REALTIME_COARSE, CLOCK_MONOTONIC_COARSE => -95,
+        else => -22,
+    };
+}
+
 pub fn absoluteDeltaNs(clock_id: u32, deadline_ns: u64, monotonic_now_ns: u64, realtime_offset_ns: i64) ?u64 {
-    const now_ns: u64 = if (clock_id == CLOCK_REALTIME) blk: {
+    const base = timerClockBase(clock_id) orelse return null;
+    const now_ns: u64 = if (base == CLOCK_REALTIME) blk: {
         const mono: i128 = @intCast(monotonic_now_ns);
         const wall = mono + @as(i128, realtime_offset_ns);
         break :blk if (wall <= 0) 0 else if (wall > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(wall);
-    } else if (clock_id == CLOCK_MONOTONIC) monotonic_now_ns else return null;
+    } else monotonic_now_ns;
     return if (deadline_ns > now_ns) deadline_ns - now_ns else 0;
 }
 
@@ -72,4 +98,21 @@ pub fn timerfdFlagsValid(flags: u32) bool {
     const TFD_NONBLOCK: u32 = 0x800;
     const TFD_CLOEXEC: u32 = 0x80000;
     return flags & ~(TFD_NONBLOCK | TFD_CLOEXEC) == 0;
+}
+
+test "CLOCK_BOOTTIME timers share the monotonic base and the rest are rejected" {
+    const t = std.testing;
+    try t.expectEqual(@as(?u32, CLOCK_MONOTONIC), timerClockBase(CLOCK_BOOTTIME));
+    try t.expectEqual(@as(?u32, CLOCK_MONOTONIC), timerClockBase(CLOCK_MONOTONIC));
+    try t.expectEqual(@as(?u32, CLOCK_REALTIME), timerClockBase(CLOCK_REALTIME));
+    try t.expectEqual(@as(?u32, null), timerClockBase(CLOCK_MONOTONIC_RAW));
+    try t.expectEqual(@as(?u32, null), timerClockBase(2));
+    // An absolute boot-time deadline 5 ms ahead of the monotonic clock is a 5 ms delay.
+    try t.expectEqual(@as(?u64, 5_000_000), absoluteDeltaNs(CLOCK_BOOTTIME, 1_005_000_000, 1_000_000_000, 123));
+    try t.expectEqual(@as(?u64, null), absoluteDeltaNs(CLOCK_MONOTONIC_RAW, 1, 0, 0));
+    try t.expectEqual(@as(?i64, null), timerCreateErrno(CLOCK_BOOTTIME));
+    try t.expectEqual(@as(?i64, -95), timerCreateErrno(CLOCK_MONOTONIC_RAW));
+    try t.expectEqual(@as(?i64, -95), timerCreateErrno(CLOCK_REALTIME_COARSE));
+    try t.expectEqual(@as(?i64, -22), timerCreateErrno(2));
+    try t.expectEqual(@as(?i64, -22), timerCreateErrno(99));
 }

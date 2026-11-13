@@ -389,6 +389,7 @@ test {
     _ = @import("proc/uts.zig");
     _ = @import("ipc/sysv_policy.zig");
     _ = @import("ipc/posix_timer_policy.zig");
+    _ = @import("ipc/time_policy.zig");
     _ = @import("ipc/posix_mq_policy.zig");
     _ = @import("ipc/posix_mq_receive_policy.zig");
     _ = @import("ipc/posix_mq_priority_policy.zig");

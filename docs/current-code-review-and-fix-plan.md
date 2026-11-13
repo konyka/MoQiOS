@@ -8221,3 +8221,23 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. `SIGEV_THREAD` 仍不支持（需要为通知起一个线程）。
   2. 目标线程在到期前退出时，这次到期直接丢弃，不改投给别的线程。
   3. 没有 `self_exec_id`：同一进程 `exec` 之后，旧定时器仍可能把 `SIGEV_THREAD_ID` 信号投给新镜像里碰巧得到同一个 tid 的线程。
+
+## `timer_create` 和 `timerfd_create` 只接受 `CLOCK_REALTIME` 与 `CLOCK_MONOTONIC`，`CLOCK_BOOTTIME` 被拒绝（hello296，已修）
+
+- 起因：`clock_gettime` 已经把 `CLOCK_BOOTTIME` 映射到单调时钟（内核不挂起，两者是同一个时间基，`clock_ids.zig`），但两个创建接口都把时钟 id 卡在 0 和 1。
+- Linux 依据：`3rd/linux-7.0.6/kernel/time/posix-timers.c` 的 `posix_clocks`（约 1514 行）给 `CLOCK_BOOTTIME` 配了 `common_timer_create`；`CLOCK_MONOTONIC_RAW` 和两个 COARSE 时钟没有 `timer_create`。宿主机实测（`/tmp/bt.c`、`/tmp/tc.c`、`/tmp/tf.c`，再以 `gcc -DHOST` 跑 hello296，普通和 `taskset -c 0` 都通过）：
+  - `timer_create(CLOCK_BOOTTIME)` 成功；相对 30 ms 到期，`sigtimedwait` 取到信号 10，`si_code` -2，值 0x55aa。
+  - 绝对截止时间取 `clock_gettime(CLOCK_BOOTTIME)` 加 30 ms，到期；已经过去的截止时间立即到期。
+  - `CLOCK_MONOTONIC_RAW`、`CLOCK_REALTIME_COARSE`、`CLOCK_MONOTONIC_COARSE` 是 `EOPNOTSUPP`（95）；未知 id 是 `EINVAL`（22）。
+  - `timerfd_create(CLOCK_BOOTTIME)` 成功；20 ms 周期在 210 ms 内计 10 次。`timerfd_create` 对不支持的时钟一律 `EINVAL`，包括 `CLOCK_MONOTONIC_RAW`。
+- 红灯：把 `kernel/ipc/posix_timer.zig`、`kernel/ipc/timerfd.zig`、`kernel/ipc/time_policy.zig` 恢复到上一版（`28b474d`）后定向 SMP=2 一份（日志开头 `spawned hello2`、`spawned hello296`）：`timer_create(CLOCK_MONOTONIC_RAW)` 返回 -22 而不是 -95；`timer_create(CLOCK_BOOTTIME)` 和 `timerfd_create(CLOCK_BOOTTIME)` 都是 -22；B、C 的 `timer_settime` 失败、`sigtimedwait` -11；D 的 `timerfd_settime` 是 -9。只有 `timerfd_create(CLOCK_MONOTONIC_RAW)` 的 `EINVAL` 在旧内核上本来就对。
+- 实现：
+  - `kernel/ipc/time_policy.zig`：`timerClockBase` 把 `CLOCK_BOOTTIME` 归到单调时钟，`absoluteDeltaNs` 改用这个结果；`timerCreateErrno` 对 `CLOCK_MONOTONIC_RAW` 和两个 COARSE 时钟返回 -95，其余不支持的返回 -22。宿主机测试一条。
+  - `kernel/ipc/posix_timer.zig`：`timerCreate` 用 `timerCreateErrno` 决定拒绝原因；`getClockNs`（目前没有调用者）也把 `CLOCK_BOOTTIME` 算到单调时钟。
+  - `kernel/ipc/timerfd.zig`：`timerfdCreate` 用 `timerClockBase`，不支持的时钟仍是 `EINVAL`。
+  - `kernel/host_test.zig` 登记了 `ipc/time_policy.zig`，它的内联测试此前没有运行。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份（日志开头 `spawned hello2`、`spawned hello296`）全部通过：A `timer_create` 的 RAW 是 -95、BOOTTIME 成功，`timerfd_create` 的 RAW 是 -22、BOOTTIME 成功；B `si_code` -2、值 0x55aa；C 两次都收到信号 10；D 计数 10。`zig build` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello296 都是 PASS，hello286、hello288、hello290–hello295 都通过。
+- 如实的局限：
+  1. `CLOCK_TAI`、`CLOCK_PROCESS_CPUTIME_ID`、`CLOCK_THREAD_CPUTIME_ID` 仍不支持。前一个没有 TAI 偏移，后两个要按 CPU 时间调度，而记账只有微秒。
+  2. 内核不挂起，所以 `CLOCK_BOOTTIME` 和 `CLOCK_MONOTONIC` 的读数相同。挂起时两者会分开，这里做不到。

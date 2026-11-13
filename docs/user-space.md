@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello295`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello296`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -291,6 +291,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello293 | `mq_notify` 的信号是 `SI_MESGQ`，带发送者的 pid 和 uid、以及注册时的 `sigev_value`（A）；不再注册就再发一条消息没有信号（B）；队列非空时重新注册本身不发信号，排空后再有消息到达空队列才再次投递（C）（宿主机 Linux 实测同结果） |
 | hello294 | `mq_notify(SIGEV_NONE)` 注册成功、占住注册位（再注册是 `EBUSY`）、消息到达不发信号并消耗注册（A）；`SIGEV_SIGNAL` 信号 0 同样注册、不发信号、被消耗（B）；别的进程 `mq_notify(NULL)` 返回 0 且替换是 `EBUSY`，原注册仍投递（C）；同一进程用另一个描述符能注销（D）；关闭做出注册的描述符会移除注册（E）（宿主机 Linux 实测同结果） |
 | hello295 | `timer_create(SIGEV_SIGNAL\|SIGEV_THREAD_ID)` 只接受本进程的活线程和 1..64 的信号号，别的进程的 tid、不存在的 tid、信号 0 都是 `EINVAL`（A）；到期信号只排给被点名的线程：它的 `sigpending` 是 0x200，主线程的是 0（B）；点名调用者时 `sigtimedwait` 取到 `SI_TIMER` 和 `sigev_value`（C）（宿主机 Linux 实测同结果） |
+| hello296 | `timer_create`/`timerfd_create` 接受 `CLOCK_BOOTTIME`：相对 30 ms 到期带 `SI_TIMER` 和 `sigev_value`（B），绝对截止时间按 boot time 计算，已过去的立即到期（C），20 ms 周期 timerfd 在 210 ms 内计约 10 次（D）；`CLOCK_MONOTONIC_RAW` 对 `timer_create` 是 `EOPNOTSUPP`、对 `timerfd_create` 是 `EINVAL`（A）（宿主机 Linux 实测同结果） |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。

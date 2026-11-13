@@ -97,7 +97,8 @@ fn nsToTimespec(ns: u64, ts: *Timespec) void {
 /// Creates a new POSIX timer. Writes the timer ID to *timerid.
 pub fn timerCreate(clockid: u32, sigev_ptr: u64, timerid_ptr: u64) i64 {
     // Validate clock ID
-    if (clockid > 1) return EINVAL; // only CLOCK_REALTIME(0) and CLOCK_MONOTONIC(1)
+    // CLOCK_REALTIME, CLOCK_MONOTONIC and CLOCK_BOOTTIME (hello296). The coarse clocks and MONOTONIC_RAW are EOPNOTSUPP, the rest EINVAL.
+    if (time_policy.timerCreateErrno(clockid)) |e| return e;
     if (!timer_policy.timerIdPointerValid(timerid_ptr) or
         !copy.validateUserBufferWritable(timerid_ptr, 4)) return EFAULT;
     if (!timer_policy.sigeventPointerValid(sigev_ptr)) return EFAULT;
@@ -413,7 +414,8 @@ pub fn takeSignal(idx: u32, generation: u32) u64 {
 fn getClockNs(clock_id: u32) u64 {
     return switch (clock_id) {
         time_policy.CLOCK_REALTIME => @import("../proc/time_syscall.zig").wallClockNanos(),
-        time_policy.CLOCK_MONOTONIC => tsc.nanos(),
+        // CLOCK_BOOTTIME shares the monotonic base (time_policy.timerClockBase).
+        time_policy.CLOCK_MONOTONIC, time_policy.CLOCK_BOOTTIME => tsc.nanos(),
         else => 0,
     };
 }
