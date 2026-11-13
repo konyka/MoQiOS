@@ -67,13 +67,31 @@ struct sinfo { int signo, err, code, pad, timerid, overrun; long value; char res
 static int failures;
 static char msg[220];
 static volatile long worker;
+static volatile long worker_pend;
 static void check(int ok, const char *w) {
     print(ok ? "hello295:   ok   " : "hello295:   FAIL ");
     print(w);
     print("\n");
     if (!ok) failures++;
 }
-static void *spin(void *a) { (void)a; worker = my_tid(); for (;;) pause(); return (void *)0; }
+static void *spin(void *a) {
+    (void)a;
+    worker = my_tid();
+    for (;;) {
+        if (worker_pend == 1) {
+            unsigned long set = 0;
+            pending(&set);
+            worker_pend = (long)set;
+        }
+        struct timespec d = { 0, 1000000L };
+#ifdef HOST
+        nanosleep(&d, 0);
+#else
+        syscall2(SYS_nanosleep, (long)&d, 0);
+#endif
+    }
+    return (void *)0;
+}
 static long wait_sig(struct sinfo *si, long ns) {
     unsigned long set = 1UL << (S_USR1 - 1);
     struct timespec ts = { ns / 1000000000L, ns % 1000000000L };
@@ -138,8 +156,17 @@ int main(void) {
 #endif
     unsigned long pend = 0;
     pending(&pend);
-    snprintf(msg, sizeof msg, "B: the signal is not pending for the main thread (0x%lx)", pend);
-    check((pend & usr1) == 0, msg);
+    worker_pend = 1;
+    for (int i = 0; i < 200 && worker_pend == 1; i++) {
+        struct timespec d = { 0, 1000000L };
+#ifdef HOST
+        nanosleep(&d, 0);
+#else
+        syscall2(SYS_nanosleep, (long)&d, 0);
+#endif
+    }
+    snprintf(msg, sizeof msg, "B: the signal is pending for the named thread and not for the main thread (thread 0x%lx, main 0x%lx)", worker_pend, pend);
+    check(worker_pend != 1 && (worker_pend & (long)usr1) != 0 && (pend & usr1) == 0, msg);
     tdel(id);
 
     /* C: aimed at the caller, sigtimedwait takes it with SI_TIMER and the value. */

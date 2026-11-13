@@ -8210,12 +8210,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - 点名本进程的第二个线程：`timer_create` 成功；到期后该线程 `/proc/.../status` 的 `SigPnd` 是 `0x200`（信号 10），`ShdPnd` 为 0，主线程两个都是 0。
   - 点名 tid 1、不存在的 tid、信号 0：都是 `EINVAL`（22）。
   - 点名调用者自己：`sigtimedwait` 取到信号 10，`si_code` -2，`si_value` 0x55aa。
-- 红灯：第一份定向跑在 `timer_create` 的 `EINVAL` 分支里提前 `lock.release`，而函数末尾的 `defer` 再释放一次，票据锁的 `unlock` 断言触发内核 panic（`reached unreachable code`，日志 `/tmp/moqios-smoke-last-failure-smp2.log`，hello295 刚打印“第二个线程在运行”）。这是这次改动引入的，不是被测行为；修好（目标线程在取定时器锁之前解析，错误路径不再手动释放）之后的定向 SMP=2 一份（日志开头 `spawned hello2`、`spawned hello295`）作为红灯对照的是修复前的行为预期：旧内核接受任何 tid 和信号 0，到期信号进创建者的待处理位。
+- 红灯：把 `kernel/ipc/posix_timer.zig` 和 `kernel/ipc/posix_timer_policy.zig` 恢复到上一版（`6c4de0c`）后定向 SMP=2 一份（日志开头 `spawned hello2`、`spawned hello295`）：A 三项都返回 0（旧内核不校验 `sigev_notify`，任何 tid 和信号 0 都接受）；B 被点名线程和主线程的待处理位都是 0；C `sigtimedwait` 返回 -11。notify 值 4 不等于 `SIGEV_SIGNAL`（0），旧内核的 `timerTick` 只在两者相等时才投递，所以信号根本没发。B 在 `f6a31f3` 里只检查主线程的待处理位，旧内核上也会通过；现在还要求被点名的线程确实有这个信号。
+  改动过程中的一次定向跑在 `timer_create` 的 `EINVAL` 分支里提前 `lock.release`，函数末尾的 `defer` 再释放一次，票据锁的 `unlock` 断言触发内核 panic（`reached unreachable code`，返回地址 `0xffffffff8000302e`，hello295 刚打印“第二个线程在运行”）。这是这次改动引入的，不是被测行为；目标线程改为在取定时器锁之前解析，错误路径不再手动释放。
 - 实现：
   - `kernel/ipc/posix_timer_policy.zig`：`sigeventValid`（`SIGEV_THREAD_ID` 只能与 `SIGEV_SIGNAL` 组合，信号号 1..64；`SIGEV_NONE`、`SIGEV_SIGNAL`、`SIGEV_THREAD` 的其余组合照旧）和 `signalTarget`，宿主机测试一条。
   - `kernel/ipc/posix_timer.zig`：`timerCreate` 读 sigevent 偏移 16 的线程 id，先校验再取锁；记下 `target_tid`。`notifyOwner` 在 `SIGEV_THREAD_ID` 时把信号排给那个线程（`sendSignalInfoResult` 按 tid 投递，不进 held 集合），其余仍发给创建者。
-- 绿灯：目标机定向 SMP=2、SMP=4 各一份（日志开头 `spawned hello2`、`spawned hello295`）全部通过：A 三种非法目标都是 -22；B 主线程 `sigpending` 为 0；C `si_code` -2、值 0x55aa。`zig build` 通过。
-- 完整 smoke：四份并行里 SMP=1、SMP=4、SMP=4 三份 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；SMP=2 那份在四路同时跑时 900 秒超时停在 hello269（0 FAIL，不是功能失败），单独重跑（超时放宽到 1400 秒）`EXIT=0`、0 FAIL、`corrupted canaries=0`。四份里 hello295 都是 PASS，hello286、hello288、hello290、hello291、hello292、hello293、hello294 都通过。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份（日志开头 `spawned hello2`、`spawned hello295`）全部通过：A 三种非法目标都是 -22；B 被点名线程的待处理位是 0x200、主线程是 0；C `si_code` -2、值 0x55aa。`zig build` 通过。
+- 完整 smoke：加强 B 之后四份并行（SMP 1/4/4/2，超时 1400 秒）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello295 都是 PASS，B 都是被点名线程 0x200、主线程 0。hello286、hello288、hello290–hello294 都通过。上一版（`f6a31f3`）的四份并行里 SMP=2 那份在 900 秒超时时停在 hello269（0 FAIL），单独重跑通过。
 - 如实的局限：
   1. `SIGEV_THREAD` 仍不支持（需要为通知起一个线程）。
   2. 目标线程在到期前退出时，这次到期直接丢弃，不改投给别的线程。

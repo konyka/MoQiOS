@@ -290,7 +290,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello292 | POSIX 定时器的信号带 `SI_TIMER`、定时器 id、`si_overrun` 0 和创建时的 `sigev_value`，`timer_getoverrun` 为 0（A）；20 ms 的周期定时器在信号阻塞 210 ms 期间只排一个信号，其 `si_overrun` 计入其余到期（7～11），`timer_getoverrun` 与之相同，之后不再有第二个信号（B）；`sigevent` 为空时发 `SIGALRM`，`si_value` 是定时器 id（C）；信号被忽略 100 ms 的周期定时器在恢复默认处理后仍会投递，忽略期间的到期计入 overrun（D）（宿主机 Linux 实测同结果） |
 | hello293 | `mq_notify` 的信号是 `SI_MESGQ`，带发送者的 pid 和 uid、以及注册时的 `sigev_value`（A）；不再注册就再发一条消息没有信号（B）；队列非空时重新注册本身不发信号，排空后再有消息到达空队列才再次投递（C）（宿主机 Linux 实测同结果） |
 | hello294 | `mq_notify(SIGEV_NONE)` 注册成功、占住注册位（再注册是 `EBUSY`）、消息到达不发信号并消耗注册（A）；`SIGEV_SIGNAL` 信号 0 同样注册、不发信号、被消耗（B）；别的进程 `mq_notify(NULL)` 返回 0 且替换是 `EBUSY`，原注册仍投递（C）；同一进程用另一个描述符能注销（D）；关闭做出注册的描述符会移除注册（E）（宿主机 Linux 实测同结果） |
-| hello295 | `timer_create(SIGEV_SIGNAL\|SIGEV_THREAD_ID)` 只接受本进程的活线程和 1..64 的信号号，别的进程的 tid、不存在的 tid、信号 0 都是 `EINVAL`（A）；到期信号只排给被点名的线程，主线程的 `sigpending` 看不到（B）；点名调用者时 `sigtimedwait` 取到 `SI_TIMER` 和 `sigev_value`（C）（宿主机 Linux 实测同结果） |
+| hello295 | `timer_create(SIGEV_SIGNAL\|SIGEV_THREAD_ID)` 只接受本进程的活线程和 1..64 的信号号，别的进程的 tid、不存在的 tid、信号 0 都是 `EINVAL`（A）；到期信号只排给被点名的线程：它的 `sigpending` 是 0x200，主线程的是 0（B）；点名调用者时 `sigtimedwait` 取到 `SI_TIMER` 和 `sigev_value`（C）（宿主机 Linux 实测同结果） |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。
