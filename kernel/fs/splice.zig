@@ -124,10 +124,15 @@ fn isFileFd(ft: vfs.FdType) bool {
     return ft == .ramdisk_file or ft == .fat32_file or ft == .ext2_file or ft == .tmpfs_file;
 }
 
-/// The size of the file behind `desc` as every descriptor sees it. A tmpfs file may have been grown or truncated through another
-/// descriptor since this one last looked, so its cached size is refreshed first.
+/// The size of the file behind `desc` as every descriptor sees it. Another descriptor may have grown or truncated the file since
+/// this one last looked, and ext2/FAT32 writes may still be staged in the writeback cache, so the cached size is refreshed first.
 fn currentFileSize(desc: *vfs.FileDescriptor) u64 {
-    if (desc.fd_type == .tmpfs_file) desc.file_size = @import("tmpfs.zig").tmpfsGetSize(@intCast(desc.tmpfs_idx));
+    switch (desc.fd_type) {
+        .tmpfs_file => desc.file_size = @import("tmpfs.zig").tmpfsGetSize(@intCast(desc.tmpfs_idx)),
+        .ext2_file => desc.file_size = @import("ext2.zig").currentSize(desc.ext2_file_idx),
+        .fat32_file => desc.file_size = @import("fat32.zig").currentSize(desc.fat32_file_idx),
+        else => {},
+    }
     return desc.file_size;
 }
 
@@ -166,17 +171,11 @@ fn readFileAt(fd_table: *vfs.FdTable, fd: u32, offset: *u64, buf: [*]u8, count: 
             offset.* += to_read;
             return @intCast(to_read);
         },
-        .fat32_file => {
-            if (offset.* >= desc.file_size) return 0;
-            const fat32 = @import("fat32.zig");
-            const n = fat32.readFile(desc.fat32_file_idx, @intCast(offset.*), buf, @intCast(count));
-            if (n > 0) offset.* += @intCast(n);
-            return n;
-        },
-        .ext2_file => {
-            if (offset.* >= desc.file_size) return 0;
-            const ext2 = @import("ext2.zig");
-            const n = ext2.readFile(desc.ext2_file_idx, @intCast(offset.*), buf, @intCast(count));
+        .fat32_file, .ext2_file => {
+            // The same read pread does: the on-disk bytes with the extents still staged in the writeback cache laid over them, up
+            // to the file's current size (which counts staged writes from any descriptor).
+            if (offset.* >= currentFileSize(desc)) return 0;
+            const n = fd_table.readAtOffset(fd, buf, count, offset.*);
             if (n > 0) offset.* += @intCast(n);
             return n;
         },

@@ -8290,4 +8290,22 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello298 都是 PASS，hello286、hello288、hello290–hello297 都通过。
 - 如实的局限：
   1. 只把 tmpfs 加进了 splice 和 `sendfile`。procfs、devfs 文件仍然不能做文件端；Linux 上部分可以。
-  2. ext2 和 FAT32 文件在 `readFileAt` 里仍用描述符缓存的 `file_size`，另一个描述符追加的、还在写回缓存里的字节，这两条路径看不到。普通 `read` 会合并写回缓存，splice 不会。这次没有修，也没有测试覆盖。
+  2. ext2 和 FAT32 文件在 `readFileAt` 里仍用描述符缓存的 `file_size`，另一个描述符追加的、还在写回缓存里的字节，这两条路径看不到。普通 `read` 会合并写回缓存，splice 不会。这次没有修，也没有测试覆盖。（hello299 已修。）
+
+## splice 和 `sendfile` 读 ext2/FAT32 文件时看不到写回缓存里的字节（hello299，已修）
+
+- 起因：hello298 一节的局限 2。`splice.readFileAt` 对 ext2、FAT32 直接调 `readFile` 读磁盘，用的是描述符打开时缓存的 `file_size`。另一个描述符刚写入的字节还在写回缓存里，`read`、`pread` 能读到（`ext2ReadMerged`/`fat32ReadMerged` 叠加暂存区段），splice 和 `sendfile` 读不到。
+- Linux 依据：页缓存是文件共享的，splice/`sendfile` 的 `filemap_splice_read` 和 `read` 读同一份页，另一个描述符的写入立刻可见。宿主机实测（以 `gcc -DHOST` 跑 hello299，两组都在 `/tmp`，普通和 `taskset -c 0` 都通过）：
+  - A：写之前打开的只读描述符 splice 出新写的 11 字节 "hello world"，偏移变量变为 11。
+  - B：`sendfile` 从偏移 6 发出 5 字节 "world"。
+  - C：另一个描述符 `pwrite` 覆盖中间 5 字节后，splice 读出 "hello WORLD"。
+  - D：在新末尾 splice 返回 0。
+- 红灯：未修改的内核（`43ec32c`）上定向 SMP=2（日志开头 `spawned hello2`、`spawned hello299`）：ext2 和 FAT32 的 A、B、C 都返回 0（看到的是打开时的空文件），D 通过。
+- 实现（`kernel/fs/splice.zig`）：
+  - `readFileAt` 的 ext2、FAT32 分支合并为一个，改调 `fd_table.readAtOffset`，读法和 `pread` 相同（每次最多 4 KiB，磁盘内容加暂存区段）。
+  - `currentFileSize` 对 ext2 用 `ext2.currentSize`，对 FAT32 用 `fat32.currentSize`（磁盘大小和暂存末尾取大者）。`sendfile` 和文件→管道 splice 判断 EOF 时用它，`readFileAt` 读之前也用它。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份（日志开头 `spawned hello2`、`spawned hello299`）全部通过，数值和宿主机一致。`zig build`、`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello299 都是 PASS，hello286、hello288、hello290–hello298 都通过。
+- 如实的局限：
+  1. `readAtOffset` 每次最多读 4 KiB，splice 一块是 8 KiB，所以 ext2/FAT32 的一次 splice 循环次数翻倍。结果正确，吞吐没有测。
+  2. procfs、devfs 文件仍然不能做 splice 的文件端。
