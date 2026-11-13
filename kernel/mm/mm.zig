@@ -18,9 +18,8 @@
 //! proceeds unguarded when the current task already owns the lock (the
 //! fault → swapIn → allocPage recursion) and skips on contention.
 //!
-//! Stage 1 deliberately does not select another task's Mm or switch CR3;
-//! process_vm remains self-only. Existing raw-root mapping callers are kept
-//! for compatibility and must migrate to vmLock in the cross-process stage.
+//! Cross-process access (process_vm_readv/writev) retains the target's Mm
+//! and walks its page table under the target's vm_lock without switching CR3.
 
 const std = @import("std");
 const ServicingSpinlock = @import("../sync/servicing_spinlock.zig").ServicingSpinlock;

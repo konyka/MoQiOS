@@ -35,9 +35,30 @@ const hhdm = @import("hhdm.zig");
 const pmm = @import("pmm.zig");
 const cow_pte = @import("cow_pte.zig");
 
+/// The target's side of a file-page fault: what the fault handler reads from
+/// the faulting task, taken from the target's Mm instead.
+const RemoteFaultTarget = struct {
+    page_table_phys: u64,
+    mm: *@import("mm.zig").Mm,
+    fault_sigbus: bool = false,
+
+    pub fn vma(self: *const RemoteFaultTarget) *@import("vma_table.zig").VmaTable {
+        return &self.mm.vma_tab;
+    }
+};
+
+/// Serve a not-yet-faulted file-mapped page into the target's page table.
+/// false for a page no file mapping covers, a page wholly past EOF, or an
+/// exhausted allocator. Runs under the target's vm_lock.
+fn serveRemoteFilePage(mm: *@import("mm.zig").Mm, page: u64) bool {
+    var target = RemoteFaultTarget{ .page_table_phys = mm.page_table_phys, .mm = mm };
+    return @import("../arch/arch.zig").interrupts.serveFilePage(&target, page);
+}
+
 /// Translate one page of the target and take a frame reference so it cannot
-/// be freed while the bytes are copied. A swapped-out page is swapped back in;
-/// for a write, a copy-on-write page is first made private to the target.
+/// be freed while the bytes are copied. A swapped-out page is swapped back in,
+/// a file-mapped page the target never touched is read in for it, and for a
+/// write a copy-on-write page is first made private to the target.
 /// null when the page is absent, not user accessible, or (for a write)
 /// read-only. Runs under the target's vm_lock.
 fn pinRemotePage(mm: *@import("mm.zig").Mm, page: u64, for_write: bool) ?u64 {
@@ -48,11 +69,17 @@ fn pinRemotePage(mm: *@import("mm.zig").Mm, page: u64, for_write: bool) ?u64 {
     var guard = @import("mm.zig").Mm.beginVmMutation(mm, @ptrCast(caller)) catch return null;
     defer guard.release();
     const root = mm.page_table_phys;
+    const swap = @import("swap.zig");
+    const initial = paging_mod.getPageEntryRaw(root, page);
+    if (initial == null or (initial.? & paging_mod.PRESENT == 0 and !swap.isSwapEntry(initial.?))) {
+        // A file-mapped page the target never touched is served for it, as
+        // the target's own fault would (Linux get_user_pages faults it in).
+        if (!serveRemoteFilePage(mm, page)) return null;
+    }
     var raw = paging_mod.getPageEntryRaw(root, page) orelse return null;
     if (raw & paging_mod.PRESENT == 0) {
         // A swapped-out page comes back in exactly as the target's own fault
         // would bring it (trySwapInKernelFault also reads under vm_lock).
-        const swap = @import("swap.zig");
         if (!swap.isSwapEntry(raw)) return null;
         raw = swap.swapIn(raw) orelse return null;
         paging_mod.setPageEntryRaw(root, page, raw);

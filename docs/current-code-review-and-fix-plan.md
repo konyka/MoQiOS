@@ -7729,7 +7729,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：`process_vm_policy.zig` 新增 `mayAccess`（调用者的实际 uid 必须等于目标的三个 uid，实际 gid 等于目标的三个 gid，否则需要 `CAP_SYS_PTRACE`）和 `movesNothing`。`process_vm.zig`：自身仍走普通用户拷贝；别的进程经 `pinTaskMmByTid` 持有其 Mm，`pinRemotePage` 在目标的 `vm_lock` 下逐页翻译、对物理页加引用（拷贝期间不会被释放），写入时若是 COW 页则先给目标一份私有副本（与目标自己的写缺页相同：唯一持有者直接改为可写，否则复制并做 TLB shootdown），解锁后经内核直接映射拷贝，最后 `pmm.freePage` 放掉引用。检查顺序与 Linux 相同：flags、计数、iovec 数组、本地总长、目标查找、权限。
 - hello92 里“非自身目标被拒绝（`EPERM`）”一项改为“不存在的目标是 `ESRCH`”。
 - 绿灯：hello282 十项全过（含降为 uid 1000 的子进程读 root 进程得 `EPERM`），hello92 照常通过；host 测试、三个架构构建与完整 smoke 见提交记录。
-- 如实的局限：①syscall 只在 x86_64 上接入；②被换出的远端页会在目标的 vm_lock 下换入（`swap.swapIn`，与目标自己的换入缺页相同），但**没有运行时用例**：构造换出需要 swapon（`CAP_SYS_ADMIN`）和回收下限钩子，会改变系统级状态，没有放进 hello282。尚未缺页的文件映射页不会替目标填充，返回已拷贝的字节数或 `EFAULT`；Linux 的 `get_user_pages` 会替目标缺页（宿主机实测：目标从未访问过的匿名页，读得 0、写成功）。本内核的匿名映射在 `mmap` 时立即分配，所以只有文件映射页受影响；③2 MiB 巨页不支持（`getPageEntryRaw` 拒绝下降进巨页）。
+- 如实的局限：①syscall 只在 x86_64 上接入；②被换出的远端页会在目标的 vm_lock 下换入（`swap.swapIn`，与目标自己的换入缺页相同），但**没有运行时用例**：构造换出需要 swapon（`CAP_SYS_ADMIN`）和回收下限钩子，会改变系统级状态，没有放进 hello282。~~尚未缺页的文件映射页不会替目标填充，返回已拷贝的字节数或 `EFAULT`；Linux 的 `get_user_pages` 会替目标缺页（宿主机实测：目标从未访问过的匿名页，读得 0、写成功）。本内核的匿名映射在 `mmap` 时立即分配，所以只有文件映射页受影响~~（已实现，见文末“process_vm 替目标填充尚未缺页的文件页”一节）；③2 MiB 巨页不支持（`getPageEntryRaw` 拒绝下降进巨页）。
 
 
 ## 孤儿进程组按 Linux kill_orphaned_pgrp（hello283，已修）
@@ -7989,3 +7989,33 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 查因：这一项里父进程另起一个进程 E，让它加入 D 的进程组，使 D 退出后这个组仍被会话里另一个组的父进程链接。但 D 只等 C 停下就退出，不等 E 加入；父进程等 `getpgid(E) == D` 的循环和 D 的退出之间没有先后约束。负载高时 D 先退出，那一刻组里只剩停止的 C，组确实成了孤儿，内核按 Linux `kill_orphaned_pgrp` 发 `SIGHUP`+`SIGCONT`，C 看到 "HC"。所以内核的行为是对的，是测试的时序不成立。这是根据代码推出的，CI 上的时序没有直接记录。
 - 修改：新增一个 `go` 管道。STILL_LINKED 模式下 D 在退出前读 `go`，父进程确认 `getpgid(E) == D` 之后才写；其它模式 D 不读，父进程照写，不影响它们。
 - 验证：修改前本地没能复现这次失败，所以没有红灯，这里如实记录。修改后目标机定向 SMP=4 四份并行加 SMP=2 一份 hello283 全过（日志开头 `spawned hello2`、`spawned hello283`）。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello262、hello283、hello286、hello288 都通过，hello228 的 `corrupted canaries` 都是 0。
+
+
+## process_vm 替目标填充尚未缺页的文件页（hello282，已修）
+
+- 起因：跨进程 process_vm 一节的局限②。`pinRemotePage` 遇到目标还没缺页过的文件映射页（页表项为零或页表不存在）直接返回 null，于是读和写都得到 `EFAULT`。本内核的匿名映射在 `mmap` 时就分配，所以只有文件映射页受影响。
+- Linux 依据（`3rd/linux-7.0.6/mm/process_vm_access.c`：`process_vm_rw_single_vec` 用 `pin_user_pages_remote`（106 行）取目标页；`mm/gup.c`：页不在时由 `faultin_page`（1087 行，1428 行调用）对目标的 VMA 走 `handle_mm_fault`。宿主机实测 `/tmp/pvf.c`、`/tmp/pvf2.c`）：
+  - 读子进程从没碰过的 MAP_PRIVATE 文件页，返回 10，读到文件内容 `file-bytes`。
+  - 写这个 private 页返回 4，子进程得到私有副本，文件不变。
+  - 写 MAP_SHARED 页返回 4，文件内容变成 `SHRD`。
+  - 父进程自己也没碰过的 MAP_PRIVATE 页跟着文件走，读到 `SHRD`，看不到子进程的私有写。
+  - 读整页都在 EOF 之后的页返回 -1（`EFAULT`），子进程退出码 0。
+- 红灯：hello282 新增 `file_case`，在 tmpfs（`/tmp/h282f`）和 ext2（`testdir/h282e`）上各跑一遍。修复前的内核（SMP=2，日志开头 `spawned hello2`、`spawned hello282`）两种文件系统各 6 项 FAIL：readv 和两种 writev 都返回 -14，子进程报告 `missing: 3`，文件内容仍是 `file`；只有“EOF 之后是 EFAULT”一项通过。
+- 实现：
+  - `pinRemotePage` 在已持有的目标 vm_lock 下，遇到不存在且不是 swap 项的页表项时调用 `serveRemoteFilePage`，然后重读页表项。
+  - `serveRemoteFilePage` 用一个只含 `page_table_phys`、`mm`、`fault_sigbus` 和 `vma()` 的 `RemoteFaultTarget` 调用 `idt.serveFilePage`（改为 `pub`）。这是目标自己缺页时用的同一段代码：private 页带 COW 标记映射，随后现有的写 COW 分支给目标一份私有副本；shared 写由 `serveFilePage` 按 `plan.shared_write` 把页缓存页标脏。
+  - 没有调用 `handleFileFault`，因为它自己会再拿一次 vm_lock。
+  - `kernel/mm/mm.zig` 文件头还写着“process_vm remains self-only”，已改成现状。
+- 测试期望的一处更正：第一版测试按“父进程的 private 视图不变（`file`）”判定，绿灯时得到 `(SHRD, SHRD)`。到宿主机上补测（`/tmp/pvf2.c`）发现 Linux 也是 `SHRD`：父进程自己没碰过的 private 页一直跟着文件。所以改的是测试期望，内核行为与 Linux 一致。
+- 绿灯：目标机定向 SMP=2 一份、SMP=4 两份 hello282 全过（日志开头 `spawned hello2`、`spawned hello282`），ext2 上最后的 `pread` 也读到 `SHRD`。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）两轮，第二轮全部 `EXIT=0`、0 FAIL，四份里 hello57、hello184、hello262、hello267（迁移 6/6）、hello274、hello282、hello283、hello286（J 段 60/60）、hello288（P 段 `(1, exit 0)`）、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。第一轮的 SMP=2 那份失败在 hello288 P 和 hello286 J，见下一节。
+- 如实的局限：①2 MiB 巨页仍不支持（`getPageEntryRaw` 遇到巨页 PDE 返回 null）；②FAT32 和 ramdisk 文件映射走的是同一个 `serveFilePage`，但没有运行时用例；③不替目标做匿名页的按需分配（本内核的匿名映射本来就在 `mmap` 时分配），也不替目标扩栈。
+
+
+## hello288 P 父进程等待子进程的时间短于子进程自己的等待（已修测试）
+
+- 起因：hello282 文件页一节的本地完整 smoke（SMP=2 一份）里 hello288 P 失败，输出 `(0, exit 0)`。`0` 是父进程 `wait_for` 的返回值，表示 3 秒内没等到子进程退出，并不是子进程报告了错误。
+- 查因：P 段的子进程按顺序做四次 `sigtimedwait`，正常时共约 1.4 秒（1 秒超时、立刻返回、0.4 秒超时、立刻返回），出错时最多 7.4 秒。`d00b1d4` 把子进程的定时器等待加长到 1 s 和 3 s，但父进程这边仍是一次 `wait_for`（300 次 `nap(10)`，名义 3 秒）。VM 负载高时，子进程的 1.4 秒加上调度延迟就可能超过父进程的 3 秒。这是根据代码和输出推出的，没有记录子进程实际用了多久。
+- 修改：父进程最多调用 4 次 `wait_for`（名义 12 秒），比子进程最坏的 7.4 秒长。子进程的判定和退出码都不变。
+- 验证：这次失败只在一份完整 smoke 里出现过，修改前没有做定向复现，所以没有红灯，这里如实记录。宿主机 Linux 上 hello288 全过（P 段 `(1, exit 0)`）。修改后完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello288 P 都是 `(1, exit 0)`，hello286 J 都是 60/60。
+- 同一份 smoke 里 hello286 J 再次少报告组停止（27/60，继续也是 27/60）。这是已记录的偶发开放项，与本次修改无关，根因仍没查清。
+

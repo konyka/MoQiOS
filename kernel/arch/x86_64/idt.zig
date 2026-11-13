@@ -1141,7 +1141,7 @@ fn currentFileSize(region: anytype) u64 {
 /// protection record is the region metadata), or an exhausted allocator —
 /// the caller turns the faulting page's false into SIGSEGV and treats a
 /// prefault page's false as "stop the window".
-fn serveFilePage(current: anytype, page_addr: u64) bool {
+pub fn serveFilePage(current: anytype, page_addr: u64) bool {
     const pmm = @import("../../mm/pmm.zig");
     const hhdm = @import("../../mm/hhdm.zig");
     const filemap = @import("../../mm/filemap.zig");

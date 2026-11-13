@@ -760,8 +760,10 @@ int main(void) {
         mqdone(q, pn);
         _exit(r4 == SIGUSR1_N ? 0 : 4);
     }
+    /* The child's own waits add up to 1.4 s when everything works and 7.4 s at most, longer than one wait_for. */
     int pst = 0;
-    long pw = wait_for(pc, &pst, 0);
+    long pw = 0;
+    for (int i = 0; i < 4 && pw == 0; i++) pw = wait_for(pc, &pst, 0);
     snprintf(msg, sizeof msg, "P: an ignored, unblocked timer or mq_notify signal is dropped at send; blocked, sigtimedwait takes it (%ld, exit %d)",
              pw == pc ? 1L : pw, (pst >> 8) & 0xff);
     check(pw == pc && pst == 0, msg);

@@ -1014,7 +1014,7 @@ LAPIC Timer 中断
 | 233 | epoll_ctl | 控制epoll监视集 |
 | 271 | poll | I/O多路复用 |
 | 275 | splice | 管道数据拼接 |
-| 283 | process_vm_readv | 读取进程虚拟内存（自身或调用者完全拥有的进程；跨进程见 hello282） |
+| 283 | process_vm_readv | 读取进程虚拟内存（自身或调用者完全拥有的进程；跨进程见 hello282，含替目标填充尚未缺页的文件页） |
 | 284 | process_vm_writev | 写入进程虚拟内存（写入 COW 页时先给目标私有副本） |
 | 286 | timerfd_settime | 设置定时器 |
 | 287 | timerfd_gettime | 获取定时器 |
