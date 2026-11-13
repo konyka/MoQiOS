@@ -70,6 +70,23 @@ fn pinRemotePage(mm: *@import("mm.zig").Mm, page: u64, for_write: bool) ?u64 {
     defer guard.release();
     const root = mm.page_table_phys;
     const swap = @import("swap.zig");
+    // A 2 MiB block: getPageEntryRaw refuses to descend into it, so the PDE itself answers for every 4 KiB inside (the callers walk in
+    // 4 KiB steps, so no request spans two blocks).
+    if (paging_mod.getPdEntry(root, page)) |pde| {
+        if (pde.huge_page) {
+            const raw: u64 = @bitCast(pde.*);
+            if (raw & paging_mod.PRESENT == 0) return null;
+            if (raw & paging_mod.USER == 0) return null;
+            const block = raw & ~(@as(u64, 0x1F_FFFF));
+            const phys = (block & paging_mod.ADDR_MASK) + (page & 0x1F_FFFF);
+            if (for_write and raw & paging_mod.WRITABLE == 0) {
+                // Huge pages are never COW-shared (fork demotes both sides first), so an unwritable block cannot be unshared safely.
+                return null;
+            }
+            pmm.addRef(phys);
+            return phys;
+        }
+    }
     const initial = paging_mod.getPageEntryRaw(root, page);
     if (initial == null or (initial.? & paging_mod.PRESENT == 0 and !swap.isSwapEntry(initial.?))) {
         // A file-mapped page the target never touched is served for it, as

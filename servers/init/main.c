@@ -422,6 +422,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello304"); /* a killed blocked pipe writer releases its end */
     run_test("hello303"); /* native IPC send/receive; a killed moqipc_recv waiter is reaped */
     run_test("hello305"); /* a blocking /dev/mouse read waits for an event */
+    run_test("hello306"); /* process_vm across a 2 MiB user block */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

@@ -8433,3 +8433,17 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 没有在目标机上产生真实的鼠标事件，「有事件时唤醒并读出」这一路只在代码上检查，没有测试覆盖（QEMU 的 smoke 不注入鼠标移动）。
   2. B 的 CPU 上限 50 ms 是经验值；测到的 9～24 ms 来自 `waitpid` 轮询和 300 ms 的调度开销，不是读在空转。
   3. 停止、继续之后读不会自动重启：没有数据时继续等，有处理函数的信号返回 `EINTR`，和其它设备读一致。
+
+## process_vm 访问不到 2 MiB 用户巨页（hello306，已修）
+
+- 起因：hello282 一节的局限 ③。`paging.getPageEntryRaw` 拒绝下降到 2 MiB 巨页（读取会把数据帧当成页表），于是 `process_vm_readv`/`writev` 在大块映射里一律 `EFAULT`。
+- Linux 依据：`get_user_pages` 在巨页上返回块里的普通页。宿主机实测（以 `gcc -DHOST` 跑 hello306，普通和 `taskset -c 0` 都通过）：A 读到子进程 1 MiB 处的标记；B 跨 2 MiB 边界的 8 KiB 读齐；C 写入的标记子进程能看到。
+- 测试的构造：第一版把 4 MiB 映射放在 fork 之前，结果在未修改的内核上也全部通过——临时打印显示目标页的 PDE 不是巨页：fork 会先把父进程的巨页拆成 4K（`fork.zig` 的 `demoteIfHugePde`），子进程拿到的是 4K 页。现在的版本由子进程在 fork 之后自己 `mmap`（2 MiB 对齐、≥ 4 MiB 时走 `huge_impl.mapHugeBlock`），父进程再用 `process_vm` 访问它，目标页才是真正的 2 MiB 巨页。
+- 红灯：未修改的内核（`f63b7cb`）上定向 SMP=2（日志开头 `spawned hello2`、`spawned hello306`）：A、B、C 全部 `-14`（`EFAULT`）。
+- 实现（`kernel/mm/process_vm.zig` 的 `pinRemotePage`）：先取 PDE，若是巨页就用块基址加块内偏移算物理地址、加引用返回；`PRESENT`/`USER` 位按 PDE 判，写请求要求 PDE 可写（巨页不会被 COW 共享，fork 会先拆页，所以不可写直接 `EFAULT` 而不是复制）。调用方 `transferRemote` 按 4 KiB 步进，不会跨两个块。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份，A–C 全部通过。`zig build`、`zig build test` 通过。
+- 完整 smoke：第一批四份并行（SMP 1/4/4/2）：三份 `EXIT=0`、0 FAIL；一份 SMP=4 也是 0 FAIL 并到了 shell，但脚本等了 1400 秒，缺的唯一一个标记是 `hello292: PASS`——那份日志里 hello292 的 A–D 全部 ok，打印完 D 之后被 `SIGUSR1`（`[kill] code=138`）杀掉。原因见下面“顺带修的测试”。第二批（修了 hello292 之后）：四份并行（宿主机 load 约 0.9）：SMP=1 和两份 SMP=4 `EXIT=0`、0 FAIL；SMP=2 `EXIT=1`，唯一的失败是 hello108「RT task lost the CPU to reaping」（文档里已记为 vCPU 被宿主机调走引起的偶发失败）。四份里 hello292 和 hello306 都是 PASS，`corrupted canaries` 都是 0。
+- 如实的局限：
+  1. 只处理可写的一次性访问；`mprotect` 之后部分可写的巨页块如果被拆成 4K，走原来的路径。
+  2. 巨页的 COW 写路径没有测试（本内核在 fork 时就拆页，构造不出巨页 COW）。
+- 顺带修的测试（hello292 的偶发失败）：D 段把 `SIGUSR1` 恢复成默认动作、等到一次信号后才解除周期定时器；20 ms 的周期里，等待返回和解除之间可能又排进一个 `SIGUSR1`，最后 `mask(UNBLOCK)` 就把测试进程杀掉了（退出码 138），`hello292: PASS` 打不出来。测试在解除阻塞前用 `sigtimedwait(0)` 取走残留的信号。宿主机三次通过；目标机定向 SMP=2、SMP=4 各一份通过。内核没有改。

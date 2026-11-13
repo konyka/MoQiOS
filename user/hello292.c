@@ -141,6 +141,9 @@ int main(void) {
              r, si.code, si.overrun);
     check(r == S_USR1 && si.code == SI_TIMER_CODE && si.overrun >= 2, msg);
     t_delete(id3);
+    /* The periodic timer may have queued one more SIGUSR1 between the wait above and the disarm; with SIGUSR1 back at its default
+     * action, unblocking it would kill the test (status 138). Take any such leftover first. */
+    while (wait_for(S_USR1, &si, 0) == S_USR1) {}
 
     mask(UNBLOCK, &both);
     print(failures ? "hello292: FAIL\n" : "hello292: PASS\n");
