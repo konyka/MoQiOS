@@ -408,6 +408,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello289"); /* Linux personality: 231 is exit_group, 247 is waitid */
     run_test("hello290"); /* flock and F_SETLKW sleep while blocked; locks go away with close and exit */
     run_test("hello291"); /* timerfd expiries and remaining time in nanoseconds */
+    run_test("hello292"); /* POSIX timer signals carry SI_TIMER, the timer id, the overrun and the value */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

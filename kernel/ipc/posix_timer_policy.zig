@@ -27,6 +27,30 @@ pub fn ownerMatches(owner_group_tid: u32, current_group_tid: u32) bool {
     return owner_group_tid != 0 and owner_group_tid == current_group_tid;
 }
 
+/// The signal side of one timer (Linux keeps one sigqueue per timer). `owed`: an expiry has happened whose signal has not been
+/// delivered yet; `queued`: that signal is pending on the owner; `overrun`: expiries since the owed one.
+pub const SigState = struct {
+    owed: bool = false,
+    queued: bool = false,
+    overrun: u64 = 0,
+};
+
+/// One expiry. `still_pending`: the owner still has the signal pending (if it is gone without a delivery, a kill() of the same
+/// standard signal took it or it was discarded, and the timer starts over); `ignored`: the owner ignores the signal and does not
+/// block it, so it is not sent but the expiries keep counting until it can be. Returns whether to send the signal now.
+pub fn onExpiry(s: *SigState, still_pending: bool, ignored: bool) bool {
+    if (s.queued and !still_pending) s.* = .{};
+    if (s.owed) s.overrun +|= 1 else s.owed = true;
+    return !s.queued and !ignored;
+}
+
+/// The signal was taken: its overrun is reported and the timer may queue the next one.
+pub fn onDeliver(s: *SigState) u64 {
+    const o = s.overrun;
+    s.* = .{};
+    return o;
+}
+
 test "timer_create requires a non-null user timer ID pointer" {
     const std = @import("std");
     try std.testing.expect(!timerIdPointerValid(0));
@@ -57,4 +81,35 @@ test "timer_settime rejects unknown flags and foreign owners" {
     try std.testing.expect(ownerMatches(42, 42));
     try std.testing.expect(!ownerMatches(42, 99));
     try std.testing.expect(!ownerMatches(0, 0));
+}
+
+test "a timer queues one signal and counts the expiries that come before it is taken" {
+    const std = @import("std");
+    var s: SigState = .{};
+    try std.testing.expect(onExpiry(&s, false, false));
+    s.queued = true;
+    for (0..9) |_| try std.testing.expect(!onExpiry(&s, true, false));
+    try std.testing.expectEqual(@as(u64, 9), onDeliver(&s));
+    try std.testing.expect(onExpiry(&s, false, false));
+    s.queued = true;
+    try std.testing.expectEqual(@as(u64, 0), onDeliver(&s));
+}
+
+test "an ignored timer signal is not sent, its expiries keep counting, and it is sent once it is not ignored" {
+    const std = @import("std");
+    var s: SigState = .{};
+    for (0..5) |_| try std.testing.expect(!onExpiry(&s, false, true));
+    try std.testing.expect(onExpiry(&s, false, false));
+    s.queued = true;
+    try std.testing.expectEqual(@as(u64, 5), onDeliver(&s));
+}
+
+test "a queued timer signal that vanished without a delivery starts the count over" {
+    const std = @import("std");
+    var s: SigState = .{};
+    try std.testing.expect(onExpiry(&s, false, false));
+    s.queued = true;
+    _ = onExpiry(&s, true, false);
+    try std.testing.expect(onExpiry(&s, false, false));
+    try std.testing.expectEqual(@as(u64, 0), s.overrun);
 }

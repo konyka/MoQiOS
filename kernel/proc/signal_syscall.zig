@@ -660,7 +660,7 @@ pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_s
             const bit: u6 = @intCast(@ctz(pending));
             _ = @atomicRmw(u64, &cur.pending_signals, .And, ~(@as(u64, 1) << bit), .seq_cst);
             sig_mod.claimInstance(cur, @as(u32, bit) + 1);
-            const taken = cur.sig_info[bit];
+            const taken = sig_mod.finishTimerInfo(cur.sig_info[bit]);
             cur.sig_info[bit] = .{};
             if (info_ptr != 0) {
                 const raw = si.encode(@as(u32, bit) + 1, taken);

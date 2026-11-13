@@ -13,6 +13,7 @@ const wait_status = @import("wait_status_policy.zig");
 pub const SI_USER: i32 = 0;
 pub const SI_KERNEL: i32 = 0x80;
 pub const SI_QUEUE: i32 = -1;
+pub const SI_TIMER: i32 = -2;
 pub const SI_TKILL: i32 = -6;
 pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
@@ -29,6 +30,27 @@ pub const Info = struct {
     a: u64 = 0,
     b: u64 = 0,
 };
+
+/// The info a POSIX timer queues: si_timerid@16, si_overrun@20, si_value@24. Until delivery the overrun half carries the timer slot's
+/// generation, so the delivery can tell whether the timer was deleted since (posix_timer.takeSignal).
+pub fn timerInfo(timerid: u32, generation: u32, value: u64) Info {
+    return .{ .code = SI_TIMER, .a = @as(u64, timerid) | (@as(u64, generation) << 32), .b = value };
+}
+
+pub fn timerIdOf(info: Info) u32 {
+    return @truncate(info.a);
+}
+
+pub fn timerGenerationOf(info: Info) u32 {
+    return @truncate(info.a >> 32);
+}
+
+/// The delivered form: si_overrun is the count of expiries after the one that queued the signal, clamped to INT_MAX as Linux
+/// timer_overrun_to_int does.
+pub fn withOverrun(info: Info, overrun: u64) Info {
+    const ov: u32 = @intCast(@min(overrun, 0x7fff_ffff));
+    return .{ .code = info.code, .a = (info.a & 0xffff_ffff) | (@as(u64, ov) << 32), .b = info.b };
+}
 
 pub fn pidUid(pid: u32, uid: u32) u64 {
     return @as(u64, pid) | (@as(u64, uid) << 32);
@@ -228,4 +250,19 @@ test "SIGCHLD for a stop carries CLD_STOPPED and the stop signal, for a continue
     const ct = childStateInfo(42, 1000, .continued);
     try std.testing.expectEqual(CLD_CONTINUED, ct.code);
     try std.testing.expectEqual(@as(u64, 18), ct.b);
+}
+
+test "a timer's siginfo carries the id, the slot generation until delivery, then the overrun" {
+    const t = @import("std").testing;
+    const q = timerInfo(3, 7, 0x1234abcd);
+    try t.expectEqual(SI_TIMER, q.code);
+    try t.expectEqual(@as(u32, 3), timerIdOf(q));
+    try t.expectEqual(@as(u32, 7), timerGenerationOf(q));
+    const d = withOverrun(q, 9);
+    const raw = encode(10, d);
+    try t.expectEqual(@as(u32, @bitCast(SI_TIMER)), readLe(raw[8..12]));
+    try t.expectEqual(@as(u32, 3), readLe(raw[16..20]));
+    try t.expectEqual(@as(u32, 9), readLe(raw[20..24]));
+    try t.expectEqual(@as(u64, 0x1234abcd), readLe64(raw[24..32]));
+    try t.expectEqual(@as(u32, 0x7fff_ffff), timerGenerationOf(withOverrun(q, 1 << 40)));
 }

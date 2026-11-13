@@ -3,7 +3,9 @@
 /// Deadlines are kept in TSC nanoseconds (the CLOCK_MONOTONIC clock), so timer_gettime reports the time left to the nanosecond and a
 /// lagging tick never pushes an expiry back; the BSP timer tick checks them against tsc.nanos(), so a timer is noticed within one
 /// tick (~10 ms) of its deadline. Max 16 timers.
-/// Signal delivery is simplified: overrun count is tracked, optional SIGEV_SIGNAL queued.
+/// A SIGEV_SIGNAL timer queues at most one signal at a time (Linux keeps one sigqueue per timer): it carries SI_TIMER, the timer id
+/// and the sigev_value, expiries before it is taken are counted as its si_overrun (filled in at delivery, takeSignal), and
+/// timer_getoverrun reports the overrun of the last delivered signal. A NULL sigevent means SIGALRM with the timer id as the value.
 const std = @import("std");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const DeadlineHint = @import("../lib/deadline_hint.zig").DeadlineHint;
@@ -35,6 +37,7 @@ pub const Sigevent = extern struct {
 /// Notification types
 const SIGEV_NONE: i32 = 1;
 const SIGEV_SIGNAL: i32 = 0;
+const SIGALRM: i32 = 14;
 // const SIGEV_THREAD: i32 = 2; // not supported
 
 /// Timer flags
@@ -59,7 +62,13 @@ const PosixTimer = struct {
     interval_ns: u64 = 0,
     /// CLOCK_MONOTONIC deadline in nanoseconds (tsc.nanos()); 0 when disarmed.
     expiry_ns: u64 = 0,
-    overrun: u64 = 0,
+    sigev_value: u64 = 0,
+    /// Bumped on every create and kept across delete: a queued signal of a deleted timer is not charged to its successor.
+    generation: u32 = 0,
+    /// The timer's one signal: owed / queued and the overruns piling up behind it.
+    sig: timer_policy.SigState = .{},
+    /// si_overrun of the last delivered signal (timer_getoverrun).
+    last_overrun: u64 = 0,
     sigev_signo: i32 = 0,
     sigev_notify: i32 = SIGEV_NONE,
     /// Task that created the timer — signals go here, not to the task
@@ -92,9 +101,10 @@ pub fn timerCreate(clockid: u32, sigev_ptr: u64, timerid_ptr: u64) i64 {
         !copy.validateUserBufferWritable(timerid_ptr, 4)) return EFAULT;
     if (!timer_policy.sigeventPointerValid(sigev_ptr)) return EFAULT;
 
-    // Read optional sigevent from user space
-    var sigev_notify: i32 = SIGEV_NONE;
-    var sigev_signo: i32 = 0;
+    // Read optional sigevent from user space. Without one the timer sends SIGALRM with its id as the value (Linux do_timer_create).
+    var sigev_notify: i32 = SIGEV_SIGNAL;
+    var sigev_signo: i32 = SIGALRM;
+    var sigev_value: ?u64 = null;
     if (sigev_ptr != 0) {
         var sigev_buf: [@sizeOf(Sigevent)]u8 = undefined;
         const copied = copy.copyFromUser(&sigev_buf, @ptrFromInt(sigev_ptr), @sizeOf(Sigevent));
@@ -102,6 +112,7 @@ pub fn timerCreate(clockid: u32, sigev_ptr: u64, timerid_ptr: u64) i64 {
         const sigev: *const Sigevent = @ptrCast(@alignCast(&sigev_buf));
         sigev_notify = sigev.sigev_notify;
         sigev_signo = sigev.sigev_signo;
+        sigev_value = @bitCast(sigev.sigev_value);
     }
 
     const saved = lock.acquire();
@@ -125,7 +136,8 @@ pub fn timerCreate(clockid: u32, sigev_ptr: u64, timerid_ptr: u64) i64 {
                 .clock_id = clockid,
                 .interval_ns = 0,
                 .expiry_ns = 0,
-                .overrun = 0,
+                .sigev_value = sigev_value orelse i,
+                .generation = t.generation +% 1,
                 .sigev_signo = sigev_signo,
                 .sigev_notify = sigev_notify,
                 .owner_task_idx = owner_idx,
@@ -137,7 +149,7 @@ pub fn timerCreate(clockid: u32, sigev_ptr: u64, timerid_ptr: u64) i64 {
             const id_bytes: [4]u8 = @bitCast(id);
             const written = copy.copyToUser(@ptrFromInt(timerid_ptr), &id_bytes, 4);
             if (written != 4) {
-                t.* = .{}; // roll back the slot on failure
+                t.* = .{ .generation = t.generation }; // roll back the slot on failure
                 return EFAULT;
             }
             return 0;
@@ -200,6 +212,9 @@ pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr:
 
     // Set interval
     t.interval_ns = interval_ns;
+    // Re-arming or disarming starts the overrun count over (Linux, measured: timer_getoverrun reads 0 after timer_settime).
+    t.sig = .{};
+    t.last_overrun = 0;
 
     // Set initial expiration
     if (value_ns == 0) {
@@ -222,7 +237,6 @@ pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr:
         }
         t.expiry_ns = now_ns + delay_ns;
         t.active = true;
-        t.overrun = 0;
         expiry_hint.arm(t.expiry_ns);
     }
 
@@ -263,7 +277,7 @@ pub fn timerGettime(timerid: u32, curr_value_ptr: u64) i64 {
 }
 
 /// timer_getoverrun(timerid) -> overrun count or -errno.
-/// Returns the number of extra expirations since the last notification.
+/// The si_overrun of the timer's last delivered signal (Linux it_overrun_last), clamped to INT_MAX; reading it does not reset it.
 pub fn timerGetoverrun(timerid: u32) i64 {
     if (timerid >= MAX_TIMERS) return EINVAL;
 
@@ -275,9 +289,7 @@ pub fn timerGetoverrun(timerid: u32) i64 {
     const current_group_tid = currentOwnerGroupTid() orelse return EINVAL;
     if (!timer_policy.ownerMatches(t.owner_group_tid, current_group_tid)) return EINVAL;
 
-    const result: i64 = @intCast(t.overrun);
-    t.overrun = 0; // reset after reading
-    return result;
+    return @intCast(@min(t.last_overrun, 0x7fff_ffff));
 }
 
 /// timer_delete(timerid) -> 0 or -errno.
@@ -293,7 +305,7 @@ pub fn timerDelete(timerid: u32) i64 {
     const current_group_tid = currentOwnerGroupTid() orelse return EINVAL;
     if (!timer_policy.ownerMatches(t.owner_group_tid, current_group_tid)) return EINVAL;
 
-    t.* = .{}; // reset all fields
+    t.* = .{ .generation = t.generation }; // reset all fields but the slot generation
     return 0;
 }
 
@@ -313,7 +325,7 @@ pub fn deleteTimersForTask(task_idx: u32) void {
     for (&timers) |*t| {
         if (!t.valid) continue;
         const exiting = task_mod.getTask(task_idx) orelse continue;
-        if (timer_policy.shouldDeleteForExit(t.owner_group_tid, exiting.is_thread, exiting.tid)) t.* = .{};
+        if (timer_policy.shouldDeleteForExit(t.owner_group_tid, exiting.is_thread, exiting.tid)) t.* = .{ .generation = t.generation };
     }
 }
 
@@ -324,44 +336,58 @@ pub fn timerTick(now_ns: u64) void {
     defer lock.release(saved);
     expiry_hint.beginScan();
 
-    for (&timers) |*t| {
+    for (&timers, 0..) |*t, i| {
         if (!t.valid or !t.active) continue;
 
         if (now_ns < t.expiry_ns) {
             expiry_hint.arm(t.expiry_ns);
         } else {
-            t.overrun +|= 1;
-
+            // Every interval that has ended counts: the first is this expiry, the rest are overruns. The next expiry keeps the
+            // original phase, so a late tick loses none (Linux hrtimer_forward).
+            var count: u64 = 1;
             if (t.interval_ns > 0) {
-                // Repeating timer: the next expiry is one interval from now (saturating).
-                t.expiry_ns = now_ns +| t.interval_ns;
+                const f = time_policy.forwardPeriodic(t.expiry_ns, t.interval_ns, now_ns);
+                count = f.count;
+                t.expiry_ns = f.next;
                 expiry_hint.arm(t.expiry_ns);
             } else {
                 // One-shot: stop
                 t.active = false;
             }
-
-            // Simplified signal delivery: if SIGEV_SIGNAL, queue the signal
-            // to the timer's owner (recorded at timer_create) — not to
-            // whatever task happens to be running when the tick fires.
-            // kickIfBlocked wakes an owner blocked in a wait primitive so it
-            // can die/handle on resume (same mechanism as sendSignal).
-            if (t.sigev_notify == SIGEV_SIGNAL and t.sigev_signo > 0 and t.sigev_signo <= 64) {
-                if (t.owner_task_idx) |owner_idx| {
-                    if (task_mod.getTask(owner_idx)) |owner| {
-                        // The slot may have been recycled after the owner
-                        // exited — only signal if the tid still matches.
-                        if (owner_gen_policy.ownerMatches(t.owner_tid, owner.tid)) {
-                            // Through the send path, not a raw pending bit: an ignored signal the owner does not block is dropped
-                            // (signal.ignoredAtSend), the same as a tkill of it.
-                            const signo: u32 = @intCast(t.sigev_signo);
-                            _ = @import("../proc/signal.zig").sendSignalInfo(owner.tid, signo, .{ .code = @import("../proc/siginfo_policy.zig").SI_KERNEL });
-                        }
-                    }
-                }
-            }
+            if (t.sigev_notify == SIGEV_SIGNAL and t.sigev_signo > 0 and t.sigev_signo <= 64) notifyOwner(t, @intCast(i), count);
         }
     }
+}
+
+/// Signal the timer's owner (recorded at timer_create, the slot checked against the tid it had then) for `count` expiries. Only
+/// one signal is queued at a time; expiries before it is taken are its overruns. An ignored, unblocked signal is not sent, and
+/// the expiries keep counting until it can be. Caller holds `lock`.
+fn notifyOwner(t: *PosixTimer, idx: u32, count: u64) void {
+    const owner_idx = t.owner_task_idx orelse return;
+    const owner = task_mod.getTask(owner_idx) orelse return;
+    if (!owner_gen_policy.ownerMatches(t.owner_tid, owner.tid)) return;
+    const sig_mod = @import("../proc/signal.zig");
+    const signo: u32 = @intCast(t.sigev_signo);
+    const bit = @as(u64, 1) << @intCast(signo - 1);
+    const pending = @atomicLoad(u64, &owner.pending_signals, .seq_cst) | @atomicLoad(u64, &owner.grp().held_signals, .seq_cst);
+    const send = timer_policy.onExpiry(&t.sig, pending & bit != 0, sig_mod.ignoredAtSend(owner, signo));
+    if (count > 1) t.sig.overrun +|= count - 1;
+    if (!send) return;
+    const info = @import("../proc/siginfo_policy.zig").timerInfo(idx, t.generation, t.sigev_value);
+    if (sig_mod.sendSignalInfoResult(owner.tid, signo, info) == 0) t.sig.queued = true;
+}
+
+/// A timer signal is being delivered: its overrun count, which becomes the timer's timer_getoverrun value, and the timer may queue
+/// its next signal. 0 for a timer that was deleted (or whose slot was reused) since the signal was queued.
+pub fn takeSignal(idx: u32, generation: u32) u64 {
+    if (idx >= MAX_TIMERS) return 0;
+    const saved = lock.acquire();
+    defer lock.release(saved);
+    const t = &timers[idx];
+    if (!t.valid or t.generation != generation) return 0;
+    const ov = timer_policy.onDeliver(&t.sig);
+    t.last_overrun = ov;
+    return ov;
 }
 
 /// Get current time in nanoseconds for a given clock ID.

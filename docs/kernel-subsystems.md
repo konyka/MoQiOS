@@ -2090,7 +2090,14 @@ The native `Message` ABI is an exactly 256-byte extern struct: `sender:u64`, `re
 （RTC/`clock_settime` offset）解释，`CLOCK_MONOTONIC` 按启动后单调时间解释。到期时间以
 `tsc.nanos()` 纳秒保存（`expiry_ns`），BSP 每个时钟中断按当前纳秒检查，所以定时器在到期后
 一个 tick（约 10 ms）内触发，`timer_gettime` 报告精确到纳秒的剩余时间（hello288 R）。timerfd
-仍按 tick 计数到期。
+同样按纳秒到期（hello291）。周期定时器按 `time_policy.forwardPeriodic` 保持相位。
+
+定时器信号（hello292）：每个定时器同一时间只排一个信号（`posix_timer_policy.SigState`，Linux 每个定时器一个 sigqueue）。
+siginfo 是 `SI_TIMER`，`si_timerid` 为定时器 id，`si_value` 为 `sigev_value`；信号被取走之前的到期都算作它的
+`si_overrun`，在投递时（`signal.finishTimerInfo` → `posix_timer.takeSignal`）填入，同时成为 `timer_getoverrun`
+的返回值（读取不清零，`timer_settime` 重新设定或解除时清零）。排队时 siginfo 的 overrun 位置暂存槽位代数，
+定时器被删除后残留的信号报告 overrun 0。信号被忽略且未阻塞时不发送，到期继续计数，等不再忽略时的下一次到期补发。
+`sigevent` 为空等同 `SIGEV_SIGNAL` + `SIGALRM`，`si_value` 是定时器 id。
 
 - 16 个定时器上限，BSP 时钟中断驱动 (100Hz)
 - timer_create: 创建定时器，支持 SIGEV_NONE/SIGEV_SIGNAL

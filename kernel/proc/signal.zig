@@ -275,7 +275,7 @@ pub fn kickIfBlocked(idx: u32) void {
 }
 
 /// Whether a send of `signum` to `t` is dropped because `t` ignores it and does not block it (signal_action_policy.droppedAtSend).
-fn ignoredAtSend(t: *task.Task, signum: u32) bool {
+pub fn ignoredAtSend(t: *task.Task, signum: u32) bool {
     const bit = @as(u64, 1) << @intCast(signum - 1);
     return @import("signal_action_policy.zig").droppedAtSend(
         signum,
@@ -439,6 +439,13 @@ pub fn raiseSelf(signum: u32) void {
     const t = sched.currentTask() orelse return;
     if (ignoredAtSend(t, signum)) return;
     _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
+}
+
+/// The siginfo a signal is delivered with: a POSIX timer's gets its overrun count now, which also lets the timer queue its next signal.
+pub fn finishTimerInfo(info: siginfo.Info) siginfo.Info {
+    if (info.code != siginfo.SI_TIMER) return info;
+    const ov = @import("../ipc/posix_timer.zig").takeSignal(siginfo.timerIdOf(info), siginfo.timerGenerationOf(info));
+    return siginfo.withOverrun(info, ov);
 }
 
 /// Lowest pending, unblocked signal that has no user handler installed and
@@ -663,7 +670,7 @@ pub fn pushSignalFrame(
     @memset(fb[0..@sizeOf(SignalFrame)], 0);
     frame.signum = signum;
     // The info recorded when the signal was sent; consumed by this delivery.
-    const sent = t.sig_info[signum - 1];
+    const sent = finishTimerInfo(t.sig_info[signum - 1]);
     t.sig_info[signum - 1] = .{};
     frame.info = siginfo.encode(signum, sent);
     // A deferred temporary-mask restore (epoll_pwait/pselect EINTR) means

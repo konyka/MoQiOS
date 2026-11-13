@@ -7948,7 +7948,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：两处都改走 `signal.sendSignalInfo`，带 `SI_KERNEL` 的 siginfo，目标 tid 仍经 `owner_gen_policy.ownerMatches` 确认。`sendSignalInfo` 内部的 `ignoredAtSend` 按目标的处理方式和掩码决定丢弃还是排队，`kickIfBlocked` 也由发送路径负责，所以被阻塞的已忽略信号仍会排队，未阻塞的在发送时丢掉。
 - 绿灯：宿主机 Linux 上 hello288 全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS，P 段子进程以 0 退出，日志开头是 `spawned hello2`、`spawned hello288`，确认跑的是带 TEMP 的构建）。完整 smoke 四份并行（SMP 1/4/4/2）：a、b、d 三份 `EXIT=0`、0 FAIL，hello57、hello210、hello267、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0；c 那份（SMP=4）在 hello286 的 J 段之后、K 段之前停住，900 秒超时（`EXIT=1`，日志里没有 `: FAIL`）。hello286 不用 POSIX 定时器也不用消息队列，单独定向重跑（SMP=4）一次通过，包括 K 段，所以这是高负载下 hello286 的已知偶发卡住，不是这次改动引起的。
 - CI 失败与测试调整（如实）：`c729f4a` 的 CI 在 SMP=2 冒烟里 P 段失败，子进程以 2 退出：阻塞时定时器的信号在 400 ms 内没有被 `sigtimedwait` 取到。本地并行跑 4 份定向和 4 份完整 smoke 都没有复现。我的判断（没有直接测量 CI 上的 tick 数）是：POSIX 定时器按调度器 tick（100 Hz，`idt.getTickCount`）到期，`sigtimedwait` 的超时按 TSC 计时，负载高的虚拟机上 tick 中断会落后于 TSC，50 ms 的定时器在 400 ms 的等待里还没有到期；未阻塞那一步即使定时器晚到也照样超时，所以只有阻塞那一步会暴露出来。测试改为：未阻塞的等待 1 秒，阻塞的等待 3 秒（拿到信号时立即返回，不影响用时）。改后宿主机 Linux 通过，目标机定向 SMP=4 四份并行加 SMP=2 一份全部通过。定时器按 tick 到期、tick 可能落后于真实时间，这本身是一个没有修的局限（见下）。
-- 如实的局限：①siginfo 的 `si_code` 固定是 `SI_KERNEL`，Linux 的定时器信号是 `SI_TIMER`、消息队列通知是 `SI_MESGQ`，并带发送者的 pid 和 uid；②周期定时器在被忽略且未阻塞时，Linux 把它挂到忽略列表，之后改回处理方式会补投递，这里直接丢弃，改回处理方式不会补投递；~~③定时器按调度器 tick 到期，tick 中断在负载高时会落后于 TSC，所以定时器可能比请求的时间晚到。~~（根因不是 tick 落后，见文末“`rt_sigtimedwait` 忙等时 BSP 收不到时钟中断”一节）
+- 如实的局限：①siginfo 的 `si_code` 固定是 `SI_KERNEL`，Linux 的定时器信号是 `SI_TIMER`、消息队列通知是 `SI_MESGQ`，并带发送者的 pid 和 uid（~~定时器部分~~已改，见文末“POSIX 定时器信号固定是 `SI_KERNEL`”一节；`mq_notify` 仍是 `SI_KERNEL`）；②~~周期定时器在被忽略且未阻塞时，Linux 把它挂到忽略列表，之后改回处理方式会补投递，这里直接丢弃，改回处理方式不会补投递；~~（已改，同一节）~~③定时器按调度器 tick 到期，tick 中断在负载高时会落后于 TSC，所以定时器可能比请求的时间晚到。~~（根因不是 tick 落后，见文末“`rt_sigtimedwait` 忙等时 BSP 收不到时钟中断”一节）
 
 
 ## 同一 socket 第二次 `listen` 不再多占监听槽（hello184 F，已修；hello267 偶发 `to m3 00` 的根因）
@@ -8132,3 +8132,30 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 到期仍由 BSP 的时钟中断检查，最多晚一个 tick（约 10 ms）才唤醒读者，B 段最短 19～25 ms 就是这个原因。
   2. `CLOCK_REALTIME` 的绝对时间在设定时换算成单调时钟上的延迟，之后修改墙上时间不会影响已设好的定时器，也没有实现 `TFD_TIMER_CANCEL_ON_SET`。
   3. timerfd 的阻塞 `read()` 仍只检查 `pendingActionable`，默认停止信号的窗口还在（同 futex 一节的局限 1）。
+
+## POSIX 定时器信号固定是 `SI_KERNEL`，不带定时器 id、overrun 和值；被忽略的周期定时器不再补投递（hello292，已修）
+
+- 起因：hello288 P 一节的局限 ①②。定时器到期时用 `.{ .code = SI_KERNEL }` 发信号，siginfo 里没有 `si_timerid`、`si_overrun`、`si_value`；每次到期都发一次，`overrun` 每次到期加一、`timer_getoverrun` 读后清零；`sigevent` 为空时只记 `SIGEV_NONE`，不发任何信号；信号被忽略时直接丢弃。
+- Linux 依据：`3rd/linux-7.0.6/kernel/time/posix-timers.c`。每个定时器只有一个 sigqueue，信号还在队列里时后续到期只计数；投递时 `__posixtimer_deliver_signal`（300–321 行）把 `it_overrun` 存进 `it_overrun_last` 并写进 `si_overrun`（`timer_overrun_to_int` 截到 INT_MAX）；`timer_getoverrun` 返回 `it_overrun_last`。`SI_TIMER` 为 -2（`include/uapi/asm-generic/siginfo.h` 177 行）。宿主机实测（`/tmp/tsi*.c`）：
+  - 一次性定时器：`si_code` -2，`si_timerid` 0，`si_overrun` 0，`si_value` 为 `sigev_value`。
+  - 20 ms 周期定时器、信号阻塞 210 ms：只取到一个信号，`si_overrun` 9，`timer_getoverrun` 9；`timer_settime` 之后 `timer_getoverrun` 变成 0。
+  - 信号被 `SIG_IGN` 且未阻塞 100 ms：期间 `timer_getoverrun` 为 0，恢复 `SIG_DFL` 并阻塞后取到一个信号，`si_overrun` 4。
+  - `sigevent` 为空：发 `SIGALRM`，`si_value` 为定时器 id。
+  - 宿主机 `gcc -DHOST` 跑 hello292 全部通过，`taskset -c 0` 下也通过。
+- 红灯：把内核改动 stash 之后的基线内核上定向 SMP=2 一份（日志开头 `spawned hello2`、`spawned hello292`），A、B 前两项、C、D 全部失败：
+  - A：`si_code` 128（`SI_KERNEL`），`si_value` 0，`timer_getoverrun` 1。
+  - B：`si_overrun` 0，`timer_getoverrun` 7。B 的第三项（解除之后不再有信号）是在看到完整 smoke 里解除前的窗口后又收紧的，不在这次红灯里。
+  - C：`sigevent` 为空时 1 秒内没收到 `SIGALRM`（-11）。
+  - D：`si_code` 128，overrun 0。
+- 实现：
+  - `kernel/ipc/posix_timer_policy.zig`：新增纯状态 `SigState`（`owed`/`queued`/`overrun`）和 `onExpiry`、`onDeliver`，宿主机测试三条：只排一个信号并计数、被忽略时计数并在不再忽略时发送、排队的信号没有经过投递就消失（`kill` 同号的标准信号把它取走或被丢弃）时从头计。
+  - `kernel/proc/siginfo_policy.zig`：`SI_TIMER`、`timerInfo`（`si_timerid`@16，排队时 @20 暂存槽位代数，`si_value`@24）、`timerIdOf`、`timerGenerationOf`、`withOverrun`（截到 INT_MAX），宿主机测试一条。
+  - `kernel/ipc/posix_timer.zig`：记 `sigev_value` 和槽位代数（删除、退出清理、创建失败回滚时保留代数）；`sigevent` 为空等同 `SIGEV_SIGNAL` + `SIGALRM`、值为定时器 id；到期改用 `time_policy.forwardPeriodic` 保持相位并把错过的周期计入 overrun；`notifyOwner` 按 `SigState` 决定发不发，发送成功才记为已排队；`takeSignal` 在投递时取 overrun、存为 `last_overrun`，代数不符（定时器已删）时返回 0；`timer_getoverrun` 返回 `last_overrun`，读取不清零；`timer_settime` 清零 `SigState` 和 `last_overrun`。
+  - `kernel/proc/signal.zig`：`ignoredAtSend` 改为 `pub`；新增 `finishTimerInfo`，`pushSignalFrame` 投递时调用；`kernel/proc/signal_syscall.zig` 的 `rt_sigtimedwait` 取信号时同样调用。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份（日志开头 `spawned hello2`、`spawned hello292`）全部通过：A `si_code` -2、值 0x1234abcd、overrun 0；B overrun 9、`timer_getoverrun` 9；C `SIGALRM`、值 0（定时器 id 0）；D overrun 5 / 4。`zig build`、`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello292 都是 PASS：A `si_code` -2、值 0x1234abcd、overrun 0；B overrun 8～10，`timer_getoverrun` 与之相同，解除后不再有信号；C `SIGALRM`、值 0（定时器 id 0）；D overrun 4～5。hello286、hello288、hello290、hello291 都通过。
+- 如实的局限：
+  1. 被忽略的信号只在下一次到期时才补发。Linux 在 `sigaction` 改回处理方式时立即重新排队；这里一次性定时器如果在忽略期间到期，之后不会再发。
+  2. 排队的信号判断“还在不在”只看待处理位（含线程组的 held 集合），同一进程里别的路径（`kill` 同一个标准信号）发的同号信号会被当成定时器的信号。
+  3. `mq_notify` 的信号仍是 `SI_KERNEL`，没有 `SI_MESGQ` 和发送者的 pid/uid。
+  4. `SIGEV_THREAD`、`SIGEV_THREAD_ID` 仍不支持。
