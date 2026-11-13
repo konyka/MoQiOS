@@ -443,16 +443,29 @@ fn mouseRead(ctx: *devfs.IoCtx, buf: [*]u8, count: usize) i64 {
     if (comptime builtin.cpu.arch != .x86_64) return -19; // ENODEV
     const mouse = @import("../drivers/mouse.zig");
     if (!mouse.isPresent()) return -19; // ENODEV
-    var n = mouse.read(buf[0..count]);
-    if (n > 0 or ctx.nonBlocking()) return @intCast(n);
+    const n = mouse.read(buf[0..count]);
+    if (n > 0 or count < 4) return @intCast(n);
+    if (ctx.nonBlocking()) return -11; // EAGAIN: nothing queued (Linux /dev/input/mice)
+    // Blocking read: sleep on the driver's wait queue until IRQ12 queues an event (it used to spin through 100 reschedules and then
+    // return 0, which a reader took for end of file).
     const sched = @import("../proc/sched.zig");
-    var tries: u32 = 0;
-    while (tries < 100) : (tries += 1) {
-        sched.forceReschedule();
-        n = mouse.read(buf[0..count]);
-        if (n > 0) break;
+    const sig_mod = @import("../proc/signal.zig");
+    const task_mod = @import("../proc/task.zig");
+    while (true) {
+        var node: task_mod.WaitNode = .{ .task_idx = 0 };
+        var stop_now = false;
+        switch (mouse.readOrBlock(buf[0..count], &node, &stop_now)) {
+            .ready => |got| return @intCast(got),
+            .blocked => {
+                const cur = sched.currentTask();
+                if (!(stop_now and cur != null and sig_mod.stopWhileWaiting(cur.?))) sched.rescheduleAfterBlock();
+                mouse.unlinkWaiter(&node);
+                const t = sched.currentTask() orelse return 0;
+                if (sig_mod.pendingFatal(t)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+                if (sig_mod.pendingActionable(t)) return -4; // EINTR
+            },
+        }
     }
-    return @intCast(n);
 }
 
 fn mousePoll(ctx: *const devfs.IoCtx) u32 {

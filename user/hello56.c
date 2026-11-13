@@ -5,7 +5,7 @@
 ///      framebuffer (drivers/fbdev.zig no_free path — NOT dev_map_mmio).
 ///      A recognizable pixel block is written through the mapping, then
 ///      read back via pread() on /dev/fb0 and verified byte-for-byte.
-///   3. /dev/mouse exists; an empty read with O_NONBLOCK returns 0
+///   3. /dev/mouse exists; an empty read with O_NONBLOCK returns EAGAIN (hello305: Linux's /dev/input/mice), queued events are read
 ///      (the node is present even before any IRQ12 event arrives, as long
 ///      as the boot-time aux probe found a mouse — QEMU always has one).
 ///   4. gettimeofday reports the RTC-seeded wall clock (tv_sec must be
@@ -168,13 +168,13 @@ void _start(void) {
     }
     syscall1(SYS_CLOSE, (uint64_t)fd);
 
-    /* 3. /dev/mouse exists; empty nonblocking read returns 0. */
+    /* 3. /dev/mouse exists; an empty nonblocking read is EAGAIN, a queued event reads as whole 4-byte records. */
     int64_t mfd = syscall3(SYS_OPEN, (uint64_t)"/dev/mouse", O_RDONLY | O_NONBLOCK, 0);
     if (mfd < 0) fail("mouse open");
     uint8_t mbuf[16];
     int64_t mn = syscall3(SYS_READ, (uint64_t)mfd, (uint64_t)mbuf, sizeof(mbuf));
-    if (mn < 0) fail("mouse read");
-    if (mn % 4 != 0) fail("mouse alignment"); /* events are 4-byte records */
+    if (mn < 0 && mn != -11) fail("mouse read");
+    if (mn > 0 && mn % 4 != 0) fail("mouse alignment"); /* events are 4-byte records */
     syscall1(SYS_CLOSE, (uint64_t)mfd);
 
     /* 4. RTC wall clock + monotonicity */

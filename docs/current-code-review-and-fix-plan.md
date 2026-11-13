@@ -8417,3 +8417,19 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. `moqipc_call` 的等待也加了握手，但没有专门的测试（hello303 只覆盖接收）。
   2. 被停止唤醒时返回 `not_ready` 而不是像 Linux 那样重启调用；用户态要自己重试，文档里已经写明。
   3. E 段在未修改的内核上就通过，只有 F 段有红灯。
+
+## `/dev/mouse` 的阻塞读忙等后返回 0（hello305，已修）
+
+- 起因：长期开放项「`mouseRead` 忙让出」。没有事件时，阻塞读 `forceReschedule` 100 次后返回 0。0 在读调用里表示文件结束，读者会以为设备关了；等待期间也在空转。非阻塞读空时也返回 0，而不是 `EAGAIN`。
+- Linux 依据：`/dev/input/mice`（`drivers/input/mousedev.c` 的 `mousedev_read`）：没有数据且 `O_NONBLOCK` 返回 `-EAGAIN`；否则 `wait_event_interruptible` 睡到有数据，信号返回 `-ERESTARTSYS`。这是 MoQiOS 自己的设备节点，没有直接的宿主机对照，规则照这个来。
+- 红灯：未修改的内核（`346f381`）上定向 SMP=2（日志开头 `spawned hello2`、`spawned hello305`）：A 空的非阻塞读返回 0；B 阻塞读 300 ms 内就返回了；C 读返回 0、处理函数没有运行；D 子进程已经自己退出（状态 `0x100`），`SIGKILL` 无从结束等待；E 通过（子进程在循环里反复读，停止/继续能落在它身上）。
+- 实现：
+  - `kernel/drivers/mouse.zig`：新增 `queue_lock` 和 `waiters` 等待队列；`handleInterrupt` 在锁下入队，然后 `wakeAll(&waiters)`（与 kmsg 的唤醒一样可在中断里调用）；`read` 改在锁下进行；新增 `readOrBlock`（锁下判空、挂队列、读一次待处理位）和 `unlinkWaiter`。
+  - `kernel/fs/devfs_nodes.zig` `mouseRead`：有事件就返回；`O_NONBLOCK` 空时 `-11`；否则在 `readOrBlock` 上睡，醒来后先摘除节点，致命信号退出、会被处理的信号返回 `-4`，否则回到循环。
+  - `user/hello56.c`：鼠标检查改为接受 `EAGAIN`，有事件时仍要求 4 字节对齐。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份，A–E 全部通过（B 的等待期间 CPU 9～24 ms）。`zig build`、`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒，宿主机 load 约 1.5）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello305 和改过的 hello56 都是 PASS，hello286、hello288、hello290–hello304 都通过。
+- 如实的局限：
+  1. 没有在目标机上产生真实的鼠标事件，「有事件时唤醒并读出」这一路只在代码上检查，没有测试覆盖（QEMU 的 smoke 不注入鼠标移动）。
+  2. B 的 CPU 上限 50 ms 是经验值；测到的 9～24 ms 来自 `waitpid` 轮询和 300 ms 的调度开销，不是读在空转。
+  3. 停止、继续之后读不会自动重启：没有数据时继续等，有处理函数的信号返回 `EINTR`，和其它设备读一致。

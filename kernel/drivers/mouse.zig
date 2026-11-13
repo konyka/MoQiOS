@@ -74,6 +74,10 @@ var ring_head: u32 = 0;
 var ring_tail: u32 = 0;
 var assembler: PacketAssembler = .{};
 var present: bool = false;
+/// Readers blocked on an empty queue, and the lock that orders the empty check against the IRQ's enqueue and wake.
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+var queue_lock: IrqSpinlock = .{};
+var waiters: ?*@import("../proc/task.zig").WaitNode = null;
 
 /// Probe and arm the PS/2 aux channel. Safe when no mouse is attached:
 /// every controller transaction is bounded and a missing device simply
@@ -148,10 +152,14 @@ pub fn handleInterrupt() void {
     const byte = io.inb(ps2.DATA);
     if (assembler.feed(byte)) |packet| {
         const ev = decodePacket(packet);
+        const flags = queue_lock.acquire();
+        defer queue_lock.release(flags);
         const next = (ring_head + 1) % RING_SIZE;
         if (next == ring_tail) return; // full: drop the event
         ring[ring_head] = ev;
         ring_head = next;
+        // ISR-safe (same as the kmsg wake): wakeAll only flips WaitNode/task state words and pushes onto a per-CPU runqueue.
+        @import("../proc/sched.zig").wakeAll(&waiters);
     }
 }
 
@@ -166,6 +174,12 @@ pub fn hasData() bool {
 /// Dequeue events into `buf` as 4-byte records. Returns the byte count
 /// (a multiple of 4, 0 when the queue is empty).
 pub fn read(buf: []u8) usize {
+    const flags = queue_lock.acquire();
+    defer queue_lock.release(flags);
+    return readLocked(buf);
+}
+
+fn readLocked(buf: []u8) usize {
     var n: usize = 0;
     while (n + 4 <= buf.len and ring_tail != ring_head) {
         const ev = ring[ring_tail];
@@ -177,4 +191,40 @@ pub fn read(buf: []u8) usize {
         n += 4;
     }
     return n;
+}
+
+pub const ReadOrBlock = union(enum) { ready: usize, blocked };
+
+/// Dequeue events, or (with nothing queued and room for one record) put the current task on the wait queue under the same lock the
+/// IRQ enqueues and wakes under, so an event that arrives in between is never missed. A default stop pending at that point is
+/// reported in `stop_now` (the caller takes it instead of sleeping; the sender sets the pending bit before it looks at the state).
+pub fn readOrBlock(buf: []u8, node: *@import("../proc/task.zig").WaitNode, stop_now: *bool) ReadOrBlock {
+    const flags = queue_lock.acquire();
+    defer queue_lock.release(flags);
+    const n = readLocked(buf);
+    if (n > 0 or buf.len < 4) return .{ .ready = n };
+    const sched = @import("../proc/sched.zig");
+    if (!sched.blockOn(&waiters, node)) return .{ .ready = 0 };
+    const cur = sched.currentTask() orelse return .blocked;
+    _ = @atomicRmw(u64, &cur.pending_signals, .Or, 0, .seq_cst);
+    stop_now.* = @import("../proc/signal.zig").pendingStop(cur);
+    return .blocked;
+}
+
+/// Take `node` off the wait queue if a wake has not already done so (a signal kick unblocks without touching the queue).
+pub fn unlinkWaiter(node: *@import("../proc/task.zig").WaitNode) void {
+    const flags = queue_lock.acquire();
+    defer queue_lock.release(flags);
+    var prev: ?*@import("../proc/task.zig").WaitNode = null;
+    var cur = waiters;
+    while (cur) |n| {
+        if (n == node) {
+            if (prev) |p| p.next = n.next else waiters = n.next;
+            n.next = null;
+            return;
+        }
+        prev = n;
+        cur = n.next;
+    }
+    node.next = null;
 }
