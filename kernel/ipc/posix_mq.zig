@@ -666,8 +666,10 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
                     // The slot may have been recycled after the registrant
                     // exited — only signal if the tid still matches.
                     if (owner_gen_policy.ownerMatches(notify_tid, nt.tid)) {
-                        _ = @atomicRmw(u64, &nt.pending_signals, .Or, @as(u64, 1) << @as(u6, @intCast(notify_signo - 1)), .seq_cst);
-                        @import("../proc/signal.zig").kickIfBlocked(notify_idx);
+                        // Through the send path, not a raw pending bit: an ignored signal the registrant does not block is dropped
+                        // (signal.ignoredAtSend), the same as a tkill of it.
+                        const signo: u32 = @intCast(notify_signo);
+                        _ = @import("../proc/signal.zig").sendSignalInfo(nt.tid, signo, .{ .code = @import("../proc/siginfo_policy.zig").SI_KERNEL });
                     }
                 }
             }

@@ -397,8 +397,10 @@ pub fn timerTick(current_tick: u64) void {
                         // The slot may have been recycled after the owner
                         // exited — only signal if the tid still matches.
                         if (owner_gen_policy.ownerMatches(t.owner_tid, owner.tid)) {
-                            _ = @atomicRmw(u64, &owner.pending_signals, .Or, @as(u64, 1) << @as(u6, @intCast(t.sigev_signo - 1)), .seq_cst);
-                            @import("../proc/signal.zig").kickIfBlocked(owner_idx);
+                            // Through the send path, not a raw pending bit: an ignored signal the owner does not block is dropped
+                            // (signal.ignoredAtSend), the same as a tkill of it.
+                            const signo: u32 = @intCast(t.sigev_signo);
+                            _ = @import("../proc/signal.zig").sendSignalInfo(owner.tid, signo, .{ .code = @import("../proc/siginfo_policy.zig").SI_KERNEL });
                         }
                     }
                 }

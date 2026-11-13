@@ -11,7 +11,8 @@
  * the signal stays pending for the process and the thread that unblocks it later runs it with its value. M: sigaction(SIG_IGN) discards that signal for the whole process, including a sibling's copy and the held bit;
  * a different signal tkill'd to a sibling stays. N: a real-time signal sent twice while every thread blocks it is taken, both
  * instances in send order, by the thread that unblocks it first. O: a signal that is ignored and not blocked is dropped when it is
- * sent, so sigtimedwait for it times out (EAGAIN); the same signal blocked is queued and sigtimedwait takes it. */
+ * sent, so sigtimedwait for it times out (EAGAIN); the same signal blocked is queued and sigtimedwait takes it. P: the same holds
+ * for the signal of a POSIX timer that expires and of an mq_notify registration whose queue gets a message. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -24,6 +25,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <mqueue.h>
 static void print(const char *s) { fputs(s, stdout); fflush(stdout); }
 static long tgsq(long tgid, long tid, long sig, void *info) {
     long r = syscall(SYS_rt_tgsigqueueinfo, tgid, tid, sig, info);
@@ -42,6 +44,40 @@ static long tk(long tid, long sig) {
     long r = syscall(SYS_tkill, tid, sig);
     return r < 0 ? -errno : r;
 }
+static timer_t p_timer;
+static long tcreate(int sig) {
+    struct sigevent sev;
+    memset(&sev, 0, sizeof sev);
+    sev.sigev_notify = SIGEV_SIGNAL;
+    sev.sigev_signo = sig;
+    return timer_create(CLOCK_MONOTONIC, &sev, &p_timer) < 0 ? -errno : 0;
+}
+static long tarm(long ns) {
+    struct itimerspec its = { { 0, 0 }, { 0, ns } };
+    return timer_settime(p_timer, 0, &its, (struct itimerspec *)0) < 0 ? -errno : 0;
+}
+static void tdel(void) { timer_delete(p_timer); }
+static long mqopen(const char *n) {
+    struct mq_attr a = { 0, 4, 16, 0 };
+    mqd_t q = mq_open(n, O_CREAT | O_RDWR, 0600, &a);
+    return q < 0 ? -errno : q;
+}
+static long mqnotify(long q, int sig) {
+    struct sigevent sev;
+    memset(&sev, 0, sizeof sev);
+    sev.sigev_notify = SIGEV_SIGNAL;
+    sev.sigev_signo = sig;
+    return mq_notify(q, &sev) < 0 ? -errno : 0;
+}
+static long mqsend(long q) { return mq_send(q, "hi", 2, 0) < 0 ? -errno : 0; }
+static long mqrecv(long q) {
+    char b[16];
+    return mq_receive(q, b, sizeof b, (unsigned *)0);
+}
+static void mqdone(long q, const char *n) {
+    mq_close(q);
+    mq_unlink(n);
+}
 #else
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
 #include "../lib/moqi_libc/include/stdio.h"
@@ -56,6 +92,43 @@ static long sq(long pid, long sig, void *info) { return syscall3(222, pid, sig, 
 static long my_tid(void) { return syscall0(SYS_gettid); }
 static long stw(void *set, void *info, void *ts) { return syscall4(221, (long)set, (long)info, (long)ts, 8); }
 static long tk(long tid, long sig) { return syscall2(SYS_tkill, tid, sig); }
+/* The kernel's sigevent: value, signo, notify (SIGEV_SIGNAL is 0), then padding to 64 bytes. */
+struct ksigev {
+    long value;
+    int signo, notify;
+    char pad[48];
+};
+static int p_timer;
+static long tcreate(int sig) {
+    struct ksigev sev;
+    memset(&sev, 0, sizeof sev);
+    sev.signo = sig;
+    return syscall3(192 /* timer_create */, 1 /* CLOCK_MONOTONIC */, (long)&sev, (long)&p_timer);
+}
+static long tarm(long ns) {
+    long its[4] = { 0, 0, 0, ns }; /* it_interval, then it_value */
+    return syscall4(193 /* timer_settime */, p_timer, 0, (long)its, 0);
+}
+static void tdel(void) { syscall1(196 /* timer_delete */, p_timer); }
+static long mqopen(const char *n) {
+    long a[4] = { 0, 4, 16, 0 };
+    return syscall4(186 /* mq_open */, (long)n, 02 /* O_RDWR */ | 0x40 /* O_CREAT */, 0600, (long)a);
+}
+static long mqnotify(long q, int sig) {
+    struct ksigev sev;
+    memset(&sev, 0, sizeof sev);
+    sev.signo = sig;
+    return syscall2(190 /* mq_notify */, q, (long)&sev);
+}
+static long mqsend(long q) { return syscall5(188 /* mq_timedsend */, q, (long)"hi", 2, 0, 0); }
+static long mqrecv(long q) {
+    char b[16];
+    return syscall5(189 /* mq_timedreceive */, q, (long)b, sizeof b, 0, 0);
+}
+static void mqdone(long q, const char *n) {
+    close((int)q);
+    syscall1(187 /* mq_unlink */, (long)n);
+}
 #endif
 
 #define SIGUSR1_N 10
@@ -631,6 +704,49 @@ int main(void) {
     if (ow != oc) {
         kill(oc, 9);
         waitpid(oc, &ost, 0);
+    }
+
+    /* P: in a child that ignores SIGUSR1, a POSIX timer and an mq_notify registration send it. Not blocked, each signal is dropped
+     * when it is sent and sigtimedwait (400 ms) times out; blocked, it is queued and sigtimedwait takes it. */
+    long pc = fork();
+    if (pc == 0) {
+#ifdef HOST
+        signal(SIGUSR1_N, SIG_IGN);
+#else
+        struct ksigaction pign = { (void (*)(int))1, 0, (void *)0, 0 };
+        sigaction(SIGUSR1_N, &pign, (struct ksigaction *)0);
+#endif
+        struct timespec pts = { 0, 400000000L };
+        if (tcreate(SIGUSR1_N) != 0) _exit(10);
+        if (tarm(50000000L) != 0) _exit(11);
+        if (stw(&j_set, (void *)0, &pts) != -11) _exit(1);
+        sigprocmask(SIG_BLOCK, &j_set, (sigset_t *)0);
+        tarm(50000000L);
+        if (stw(&j_set, (void *)0, &pts) != SIGUSR1_N) _exit(2);
+        tdel();
+        sigprocmask(SIG_UNBLOCK, &j_set, (sigset_t *)0);
+        const char *pn = "/h288-p";
+        long q = mqopen(pn);
+        if (q < 0) _exit(12);
+        if (mqnotify(q, SIGUSR1_N) != 0) _exit(13);
+        if (mqsend(q) != 0) _exit(14);
+        if (stw(&j_set, (void *)0, &pts) != -11) _exit(3);
+        mqrecv(q);
+        sigprocmask(SIG_BLOCK, &j_set, (sigset_t *)0);
+        mqnotify(q, SIGUSR1_N);
+        mqsend(q);
+        long r4 = stw(&j_set, (void *)0, &pts);
+        mqdone(q, pn);
+        _exit(r4 == SIGUSR1_N ? 0 : 4);
+    }
+    int pst = 0;
+    long pw = wait_for(pc, &pst, 0);
+    snprintf(msg, sizeof msg, "P: an ignored, unblocked timer or mq_notify signal is dropped at send; blocked, sigtimedwait takes it (%ld, exit %d)",
+             pw == pc ? 1L : pw, (pst >> 8) & 0xff);
+    check(pw == pc && pst == 0, msg);
+    if (pw != pc) {
+        kill(pc, 9);
+        waitpid(pc, &pst, 0);
     }
 
     /* G/H: a stop and a continue queued for one thread of another process act on the whole process. */
