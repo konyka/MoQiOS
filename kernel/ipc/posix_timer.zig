@@ -413,7 +413,7 @@ pub fn takeSignal(idx: u32, generation: u32) u64 {
 /// Get current time in nanoseconds for a given clock ID.
 fn getClockNs(clock_id: u32) u64 {
     return switch (clock_id) {
-        time_policy.CLOCK_REALTIME => @import("../proc/time_syscall.zig").wallClockNanos(),
+        time_policy.CLOCK_REALTIME, time_policy.CLOCK_TAI => @import("../proc/time_syscall.zig").wallClockNanos(),
         // CLOCK_BOOTTIME shares the monotonic base (time_policy.timerClockBase).
         time_policy.CLOCK_MONOTONIC, time_policy.CLOCK_BOOTTIME => tsc.nanos(),
         else => 0,

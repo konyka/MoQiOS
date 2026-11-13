@@ -98,8 +98,9 @@ fn currentValue(inst: *const TimerInstance) Itimerspec {
 /// Create a new timerfd instance.
 /// Returns the pool index or a negative errno on failure.
 pub fn timerfdCreate(clock_id: u32, flags: u32) i32 {
-    // CLOCK_REALTIME, CLOCK_MONOTONIC and CLOCK_BOOTTIME (hello296). Anything else is EINVAL.
-    if (time_policy.timerClockBase(clock_id) == null) return -22; // EINVAL
+    // CLOCK_REALTIME, CLOCK_MONOTONIC and CLOCK_BOOTTIME (hello296). Anything else is EINVAL, CLOCK_TAI included (hello307): Linux's
+    // timerfd_create accepts only those three and the two alarm clocks.
+    if (time_policy.timerClockBase(clock_id) == null or clock_id == time_policy.CLOCK_TAI) return -22; // EINVAL
     // Only TFD_NONBLOCK | TFD_CLOEXEC are recognized (Linux timerfd_create).
     if (!time_policy.timerfdFlagsValid(flags)) return -22; // EINVAL
 

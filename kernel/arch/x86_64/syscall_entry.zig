@@ -5943,6 +5943,8 @@ fn syscallClockSettime(clockid: u32, tp_ptr: u64) i64 {
     const tsc = @import("tsc.zig");
     const time_set_policy = @import("../../proc/time_set_policy.zig");
 
+    // Linux checks the clock first: any clock but REALTIME is EINVAL, even for an unprivileged caller (hello307).
+    if (clockid != time_set_policy.CLOCK_REALTIME) return -22;
     if (!time_set_policy.canSetRealtime(checkCapForCurrent("cap_sys_time"))) return -1;
 
     if (tp_ptr == 0 or tp_ptr >= 0x0000_8000_0000_0000) return -14;

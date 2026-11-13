@@ -8447,3 +8447,24 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 只处理可写的一次性访问；`mprotect` 之后部分可写的巨页块如果被拆成 4K，走原来的路径。
   2. 巨页的 COW 写路径没有测试（本内核在 fork 时就拆页，构造不出巨页 COW）。
 - 顺带修的测试（hello292 的偶发失败）：D 段把 `SIGUSR1` 恢复成默认动作、等到一次信号后才解除周期定时器；20 ms 的周期里，等待返回和解除之间可能又排进一个 `SIGUSR1`，最后 `mask(UNBLOCK)` 就把测试进程杀掉了（退出码 138），`hello292: PASS` 打不出来。测试在解除阻塞前用 `sigtimedwait(0)` 取走残留的信号。宿主机三次通过；目标机定向 SMP=2、SMP=4 各一份通过。内核没有改。
+
+## `CLOCK_TAI` 不被任何时间调用接受（hello307，已修）
+
+- 起因：hello296 一节的局限 1 提到 `CLOCK_TAI` 不支持。它是 Linux 的第 11 号时钟，`clock_gettime`、`clock_getres`、`clock_nanosleep`、`timer_create` 都接受。
+- Linux 依据：`kernel/time/posix-timers.c` 的 `clock_tai`（`ktime_get_clock_ts64(CLOCK_TAI)`，即 REALTIME 加 `tk->tai_offset`），没有 `clock_set`，所以 `clock_settime` 是 `EINVAL`；`timerfd_create` 只接受 REALTIME、MONOTONIC、BOOTTIME 和两个 ALARM 时钟。宿主机实测（`/tmp/tai.c`、`/tmp/tai2.c`、`/tmp/stset.c`，再以 `gcc -DHOST` 跑 hello307，普通和 `taskset -c 0` 都通过）：
+  - TAI − REALTIME 等于 `adjtimex` 报的 `tai`（宿主机 37 秒）；分辨率 1 ns。
+  - `clock_nanosleep(CLOCK_TAI)` 相对和 `TIMER_ABSTIME` 都按时睡 20 ms；`timer_create(CLOCK_TAI)` 成功；`timerfd_create(CLOCK_TAI)` 是 `EINVAL`。
+  - 非特权调用者 `clock_settime`：REALTIME 是 `EPERM`，TAI、MONOTONIC、未知 id 都是 `EINVAL`——先查时钟，后查权限。
+- 红灯：未修改的内核（`57ef368`）上定向 SMP=2（日志开头 `spawned hello2`、`spawned hello307`）：A–D、F 都是 `-22`；E 是 `-1`（`EPERM`，先查权限）；只有 G 通过。
+- 实现：
+  - `kernel/proc/clock_ids.zig`：`CLOCK_TAI = 11`，`sourceOf` 归到 `.realtime`，`sleepVerdict` 是 `.ok`。
+  - `kernel/ipc/time_policy.zig`：`CLOCK_TAI` 常量，`timerClockBase` 归到 REALTIME 基；宿主机测试加了三条断言。
+  - `kernel/ipc/posix_timer.zig` `getClockNs`：TAI 读墙钟。
+  - `kernel/ipc/timerfd.zig`：`timerfd_create` 明确拒绝 TAI。
+  - `kernel/arch/x86_64/syscall_entry.zig` `syscallClockSettime`：非 REALTIME 先返回 `EINVAL`，再查 `CAP_SYS_TIME`。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份，A–G 全部通过（偏移 0，差值 0～1 ms）。`zig build`、`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒，宿主机 load 约 0.8）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello307 都是 PASS，hello286、hello288、hello290–hello306 都通过。
+- 如实的局限：
+  1. TAI 偏移恒为 0：本内核没有 `adjtimex`，也不处理闰秒，所以 `CLOCK_TAI` 读数和 `CLOCK_REALTIME` 相同。Linux 上通常差 37 秒（由 NTP 设定）。
+  2. `CLOCK_PROCESS_CPUTIME_ID`、`CLOCK_THREAD_CPUTIME_ID` 的定时器仍未实现（要按 CPU 时间调度）。
+  3. `clock_settime` 的检查顺序改成「先时钟、后权限」；现有测试没有依赖旧顺序（`hello270` 等只设 REALTIME）。

@@ -18,6 +18,8 @@ pub const CLOCK_MONOTONIC_RAW: u32 = 4;
 pub const CLOCK_REALTIME_COARSE: u32 = 5;
 pub const CLOCK_MONOTONIC_COARSE: u32 = 6;
 pub const CLOCK_BOOTTIME: u32 = 7;
+/// TAI counts on the realtime base: this kernel's TAI offset is 0 (no adjtimex, no leap-second table).
+pub const CLOCK_TAI: u32 = 11;
 
 /// Which time base a timer's TIMER_ABSTIME deadline is counted on. CLOCK_BOOTTIME shares the monotonic base: this kernel does not
 /// suspend, so boot time and monotonic time are the same clock (clock_ids.zig). A clock id a timer cannot use is null.
@@ -25,6 +27,7 @@ pub fn timerClockBase(clock_id: u32) ?u32 {
     return switch (clock_id) {
         CLOCK_REALTIME => CLOCK_REALTIME,
         CLOCK_MONOTONIC, CLOCK_BOOTTIME => CLOCK_MONOTONIC,
+        CLOCK_TAI => CLOCK_REALTIME,
         else => null,
     };
 }
@@ -115,4 +118,8 @@ test "CLOCK_BOOTTIME timers share the monotonic base and the rest are rejected" 
     try t.expectEqual(@as(?i64, -95), timerCreateErrno(CLOCK_REALTIME_COARSE));
     try t.expectEqual(@as(?i64, -22), timerCreateErrno(2));
     try t.expectEqual(@as(?i64, -22), timerCreateErrno(99));
+    // TAI counts on the realtime base and is a timer clock; its deadline is a wall-clock one.
+    try t.expectEqual(@as(?u32, CLOCK_REALTIME), timerClockBase(CLOCK_TAI));
+    try t.expectEqual(@as(?i64, null), timerCreateErrno(CLOCK_TAI));
+    try t.expectEqual(@as(?u64, 5_000_000), absoluteDeltaNs(CLOCK_TAI, 1_005_000_000, 1_000_000_000, 0));
 }

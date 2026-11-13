@@ -17,11 +17,14 @@ pub const CLOCK_MONOTONIC_RAW: u64 = 4;
 pub const CLOCK_REALTIME_COARSE: u64 = 5;
 pub const CLOCK_MONOTONIC_COARSE: u64 = 6;
 pub const CLOCK_BOOTTIME: u64 = 7;
+/// TAI: REALTIME plus the kernel's TAI offset (0 here — the kernel has no adjtimex and never applies a leap-second table).
+pub const CLOCK_TAI: u64 = 11;
 
 pub fn sourceOf(clockid: u64) ?Source {
     return switch (clockid) {
         CLOCK_REALTIME, CLOCK_REALTIME_COARSE => .realtime,
         CLOCK_MONOTONIC, CLOCK_MONOTONIC_RAW, CLOCK_MONOTONIC_COARSE, CLOCK_BOOTTIME => .monotonic,
+        CLOCK_TAI => .realtime,
         CLOCK_PROCESS_CPUTIME_ID => .process_cpu,
         CLOCK_THREAD_CPUTIME_ID => .thread_cpu,
         else => null,
@@ -36,7 +39,7 @@ pub const SleepVerdict = enum { ok, not_supported, invalid };
 
 pub fn sleepVerdict(clockid: u64) SleepVerdict {
     return switch (clockid) {
-        CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME => .ok,
+        CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME, CLOCK_TAI => .ok,
         CLOCK_MONOTONIC_RAW, CLOCK_REALTIME_COARSE, CLOCK_MONOTONIC_COARSE, CLOCK_THREAD_CPUTIME_ID => .not_supported,
         else => .invalid,
     };
