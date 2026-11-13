@@ -370,11 +370,12 @@ pub fn sendSignalToPgrpFiltered(pgid: u16, signum: u32, sender: ?*task.Task) u32
         _ = recordSendInfo(t, signum, info);
         switch (action) {
             .stop => {
+                // Linux sig_ignored: an ignored stop signal the member does not block is dropped; a blocked one stays pending (hello262 F).
+                if (ignoredAtSend(t, signum)) continue;
                 const h = t.sigact().handlers[signum - 1];
-                if (signum != SIGSTOP and h == 1) {
-                    // SIG_IGN：忽略该成员。
-                } else if (signum != SIGSTOP and h != 0) {
-                    // 已装 handler：走普通 pending 投递（handler 运行，读得 EINTR）。
+                const blocked = (t.signal_mask & (@as(u64, 1) << @intCast(signum - 1))) != 0;
+                if (signum != SIGSTOP and (h != 0 or blocked)) {
+                    // A handler, or a blocked (possibly ignored) stop: ordinary pending delivery, decided when it is dequeued.
                     _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
                     kickIfBlocked(@intCast(i));
                 } else {

@@ -887,7 +887,7 @@ const SchedStats = struct {
   子进程时写回：utime/stime 是子进程整个线程组加上它已等待过的子孙的 CPU 时间（回收取 `Reaped.usage`，
   `WNOWAIT`、停止和继续取 `task.childUsageLocked`），其余字段为 0；`WNOHANG` 没有可报告的变化时不写。
 - **kill(-pgid) 广播**：`lifecycle.kill(pid<0)` → `signal.sendSignalToPgrp`——stop/cont 类
-  按默认处置立即生效，其余走 pending + 唤醒；返回发送计数（0 → ESRCH）。
+  按默认处置立即生效，其余走 pending + 唤醒；返回发送计数（0 → ESRCH）。停止类里被忽略且未阻塞的信号在发送时丢弃，被忽略但阻塞的仍排队（hello262 F）。
 - **孤儿组 SIGHUP（Linux `kill_orphaned_pgrp`）**：任何用户进程退出（线程退出不算）时
   `exitTask → jobctl.onExit`，由 `proc/orphan_pgrp_policy.zig` 决定哪些组新成为孤儿：
   一个组被同会话里、属于另一个组的父进程链接着；init 的子进程不算链接。检查退出进程

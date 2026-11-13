@@ -1,6 +1,7 @@
 /* hello262: signals sent to a whole process group (kill(-pgid, sig)). Measured on Linux (gcc probes): SIGSTOP stops every member; SIGTERM sent to
  * a stopped group leaves it stopped and acts only after SIGCONT (members die of signal 15); SIGKILL ends a stopped group at once (signal 9);
- * the default SIGTSTP stops sleeping members. */
+ * the default SIGTSTP stops sleeping members. F: a member that ignores SIGTSTP and blocks it keeps kill(-pgid, SIGTSTP) pending (sigpending
+ * shows it); one that ignores it without blocking drops it. */
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
 #include "../lib/moqi_libc/include/stdio.h"
 #include "../lib/moqi_libc/include/unistd.h"
@@ -63,6 +64,55 @@ static long member(long pgid) {
     return k;
 }
 
+/* F: a child in its own group that ignores SIGTSTP (and blocks it when `block`), waits for the parent's go, then blocks it and exits 7
+ * when sigpending shows SIGTSTP, 3 when it does not. */
+static int ignored_tstp(int block) {
+    int go[2], rd[2];
+    pipe(go);
+    pipe(rd);
+    long k = fork();
+    if (k == 0) {
+        setpgid(0, 0);
+        struct ksigaction ign = { (void (*)(int))1, 0, (void *)0, 0 };
+        sigaction(SIGTSTP_, &ign, (struct ksigaction *)0);
+        sigset_t s;
+        sigemptyset(&s);
+        sigaddset(&s, SIGTSTP_);
+        if (block) sigprocmask(SIG_BLOCK, &s, (sigset_t *)0);
+        write(rd[1], "r", 1);
+        char c;
+        read(go[0], &c, 1);
+        sigprocmask(SIG_BLOCK, &s, (sigset_t *)0);
+        sigset_t p;
+        sigemptyset(&p);
+        sigpending(&p);
+        _exit(sigismember(&p, SIGTSTP_) ? 7 : 3);
+    }
+    setpgid(k, k);
+    char c;
+    read(rd[0], &c, 1);
+    kill(-k, SIGTSTP_);
+    pause_ms(100);
+    write(go[1], "g", 1);
+    int st = 0;
+    long w = -1;
+    for (int i = 0; i < 300; i++) {
+        w = waitpid(k, &st, WNOHANG_);
+        if (w == k) break;
+        pause_ms(10);
+    }
+    close(go[0]);
+    close(go[1]);
+    close(rd[0]);
+    close(rd[1]);
+    if (w != k) {
+        kill(k, 9);
+        waitpid(k, &st, 0);
+        return -1;
+    }
+    return (st & 0x7f) ? -(st & 0x7f) : (st >> 8) & 0xff;
+}
+
 /* Waits for `pid` for up to two seconds; returns the signal that ended it, 0 for a normal exit, -1 when it is still there. */
 static int ended_by(long pid) {
     int st = 0;
@@ -115,6 +165,10 @@ int main(int argc, char **argv, char **envp) {
     check(se, what);
     kill(-e, SIGKILL);
     ended_by(e);
+
+    int fb = ignored_tstp(1), fu = ignored_tstp(0);
+    snprintf(what, sizeof what, "F: an ignored SIGTSTP the member blocks stays pending; unblocked it is dropped (%d, %d)", fb, fu);
+    check(fb == 7 && fu == 3, what);
 
     print(failures == 0 ? "hello262: PASS\n" : "hello262: FAIL\n");
     return failures;

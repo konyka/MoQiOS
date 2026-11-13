@@ -7937,7 +7937,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello288 新增 O 段一项，子进程用退出码说明哪一步出错（1 未阻塞时 `sigtimedwait` 没有超时，2 阻塞时没有取到）。把两处内核改动暂存后构建的旧内核（SMP=2 一份、SMP=4 一份）上子进程以 1 退出：未阻塞的已忽略信号被排队，`sigtimedwait` 取走了它。
 - 实现：新的纯函数 `signal_action_policy.droppedAtSend`（宿主机测试 1 条，并登记进 `kernel/host_test.zig` 的测试块）：目标不阻塞、处理方式是 `SIG_IGN` 或默认动作为忽略的 `SIG_DFL` 时丢弃；被阻塞的保留；`SIGKILL`、`SIGSTOP` 从不丢弃。`signal.ignoredAtSend` 用目标线程的处理方式和掩码调用它，接在三处发送路径上：`sendSignalInfoResult`（在 `SIGCONT` 已经继续目标之后、记 siginfo 之前）、`sendSignalToPgrpFiltered` 的普通分支、`raiseSelf`。缺页产生的 `SIGSEGV`/`SIGBUS` 在发送前已被重置为 `SIG_DFL` 并解除阻塞，不受影响。
 - 绿灯：宿主机 Linux 上 hello288 全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS，K 到 O 段子进程都以 0 退出，日志开头是 `spawned hello2`、`spawned hello288`，确认跑的是带 TEMP 的构建）。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello210、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
-- 如实的局限：①判断用的线程和 Linux 不同：进程级信号先经 `processRecipient` 选好线程再判断，选中的线程不阻塞就丢弃；Linux 的 `prepare_signal` 用的是调用里点名的那个任务的掩码，点名的线程阻塞而别的线程不阻塞时，Linux 会先把信号放进共享集合，等那个不阻塞的线程取出时再按忽略丢掉，这里则直接丢弃，区别只在丢弃之前那一小段时间里点名线程的 `sigpending` 能否看到它；~~另外 POSIX 定时器和消息队列通知（`posix_timer.zig`、`posix_mq.zig`）直接置位，不走这条路径，仍会排队已忽略的信号~~（已实现，见文末 hello288 P 一节）；②`sendSignalToPgrpFiltered` 的停止类分支保留原来的 `SIG_IGN` 处理，没有改用新函数。
+- 如实的局限：①判断用的线程和 Linux 不同：进程级信号先经 `processRecipient` 选好线程再判断，选中的线程不阻塞就丢弃；Linux 的 `prepare_signal` 用的是调用里点名的那个任务的掩码，点名的线程阻塞而别的线程不阻塞时，Linux 会先把信号放进共享集合，等那个不阻塞的线程取出时再按忽略丢掉，这里则直接丢弃，区别只在丢弃之前那一小段时间里点名线程的 `sigpending` 能否看到它；~~另外 POSIX 定时器和消息队列通知（`posix_timer.zig`、`posix_mq.zig`）直接置位，不走这条路径，仍会排队已忽略的信号~~（已实现，见文末 hello288 P 一节）；②~~`sendSignalToPgrpFiltered` 的停止类分支保留原来的 `SIG_IGN` 处理，没有改用新函数~~（已实现，见文末 hello262 F 一节）。
 
 
 ## POSIX 定时器和消息队列通知也走发送路径（hello288 P，已实现）
@@ -7960,3 +7960,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：`tcpListen` 先扫描活动的监听槽，已有属于这个 TCB 的槽就直接返回 0，不再新占一个。
 - 绿灯：目标机定向 SMP=2 两份、SMP=4 两份 hello184 全过（F 段四项 ok，`connect` 返回 -111；日志开头是 `spawned hello2`、`spawned hello184`）。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello184、hello210、hello267、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0，hello267 的迁移四份都是 6/6。
 - 如实的局限：①第二次 `listen` 的 backlog 参数仍被忽略（本内核的 backlog 本来就固定为 `LISTEN_BACKLOG` 32）；②`tcpAccept` 仍按第一个匹配的槽查找，正确性现在依赖“每个 TCB 至多一个槽”这一不变式，没有另加断言。
+
+
+## 进程组停止信号：忽略且阻塞时仍排队（hello262 F，已修）
+
+- 起因：hello288 O 一节的局限②。`sendSignalToPgrpFiltered` 的停止类分支对 `SIG_IGN` 无条件丢弃，不看目标是否阻塞该信号。
+- Linux 依据：`kernel/signal.c` 的 `prepare_signal`（871 行）在停止类分支之后仍调用 `sig_ignored`（106 行）：目标阻塞该信号时返回 false，信号照样排队。宿主机实测 `/tmp/pg.c`：`kill(-pgid, SIGTSTP)` 发给忽略且阻塞该信号的成员，`sigpending` 能看到它（退出 7）；忽略且未阻塞则丢弃（退出 3）。
+- 红灯：hello262 新增 F 段。修复前的内核（SMP=2）得到 `(3, 3)`：阻塞的那次也被丢掉。日志开头是 `spawned hello2`、`spawned hello262`。
+- 实现：停止类分支先走 `ignoredAtSend`（内部是 `signal_action_policy.droppedAtSend`）。丢弃的不再停任务；已装 handler 或被阻塞的走普通 pending；其余（默认动作且未阻塞）仍立刻停止。
+- 绿灯：目标机定向 SMP=2 一份、SMP=4 两份 hello262 全过（F 段 `(7, 3)`）。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello184、hello262、hello267、hello286、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
+- CI 记录（如实）：上一个提交 `573aaad`（hello184 F）的 CI 在 SMP=2 冒烟里 hello286 J 段失败（60 轮组停止只报告了 51 次，继续也是 51 次）。这一项不涉及 TCP，也不涉及本节改动；它是文档里已记录的 hello286 J 偶发项（之前本地见过 30/60），本地四份完整 smoke 里 hello286 都通过。根因没有查清，仍是开放项。
+- 如实的局限：①`SIGTTIN`/`SIGTTOU` 没有单独用例，走的是同一分支；②进程组发送仍按每个成员自己的掩码判断，没有 Linux 那种先放进共享集合再由不阻塞的线程取出的窗口。
