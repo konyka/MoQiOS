@@ -8158,7 +8158,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 被忽略的信号只在下一次到期时才补发。Linux 在 `sigaction` 改回处理方式时立即重新排队；这里一次性定时器如果在忽略期间到期，之后不会再发。
   2. 排队的信号判断“还在不在”只看待处理位（含线程组的 held 集合），同一进程里别的路径（`kill` 同一个标准信号）发的同号信号会被当成定时器的信号。
   3. ~~`mq_notify` 的信号仍是 `SI_KERNEL`，没有 `SI_MESGQ` 和发送者的 pid/uid。~~（已改，见下一节）
-  4. `SIGEV_THREAD`、`SIGEV_THREAD_ID` 仍不支持。
+  4. ~~`SIGEV_THREAD_ID` 仍不支持。~~（已改，见文末“POSIX 定时器不支持 `SIGEV_THREAD_ID`”一节；`SIGEV_THREAD` 仍不支持）
 
 ## `mq_notify` 的信号固定是 `SI_KERNEL`，不带发送者身份和注册的值（hello293，已修）
 
@@ -8202,3 +8202,21 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 如实的局限：
   1. `SIGEV_THREAD` 仍不支持（需要 netlink 通知套接字）。
   2. 注册所有权按线程组 id 比较，没有 Linux 的 `self_exec_id`：同一进程 `exec` 之后，旧注册如果描述符没关，仍可能投给新镜像。
+
+## POSIX 定时器不支持 `SIGEV_THREAD_ID`，到期信号只能发给创建者（hello295，已修）
+
+- 起因：hello292 一节的局限 ④。`timer_create` 不检查 `sigev_notify`，`SIGEV_THREAD_ID` 被当成普通通知，到期信号一律发给创建定时器的任务。
+- Linux 依据：`3rd/linux-7.0.6/kernel/time/posix-timers.c` 的 `good_sigevent`（约 391–412 行）：`SIGEV_SIGNAL | SIGEV_THREAD_ID` 时 `sigev_notify_thread_id` 必须是调用者线程组里的活线程，否则返回 `NULL`（`timer_create` 得 `EINVAL`）；信号号必须 1..`SIGRTMAX`。`SIGEV_SIGNAL` 的值是 0，所以 notify 值 4 本身就是这个组合。投递用 `PIDTYPE_PID`（约 517 行），信号只进那个线程的私有队列。宿主机实测（`/tmp/tid3.c`、`/tmp/tid4.c`，再以 `gcc -DHOST` 跑 hello295，普通和 `taskset -c 0` 都通过）：
+  - 点名本进程的第二个线程：`timer_create` 成功；到期后该线程 `/proc/.../status` 的 `SigPnd` 是 `0x200`（信号 10），`ShdPnd` 为 0，主线程两个都是 0。
+  - 点名 tid 1、不存在的 tid、信号 0：都是 `EINVAL`（22）。
+  - 点名调用者自己：`sigtimedwait` 取到信号 10，`si_code` -2，`si_value` 0x55aa。
+- 红灯：第一份定向跑在 `timer_create` 的 `EINVAL` 分支里提前 `lock.release`，而函数末尾的 `defer` 再释放一次，票据锁的 `unlock` 断言触发内核 panic（`reached unreachable code`，日志 `/tmp/moqios-smoke-last-failure-smp2.log`，hello295 刚打印“第二个线程在运行”）。这是这次改动引入的，不是被测行为；修好（目标线程在取定时器锁之前解析，错误路径不再手动释放）之后的定向 SMP=2 一份（日志开头 `spawned hello2`、`spawned hello295`）作为红灯对照的是修复前的行为预期：旧内核接受任何 tid 和信号 0，到期信号进创建者的待处理位。
+- 实现：
+  - `kernel/ipc/posix_timer_policy.zig`：`sigeventValid`（`SIGEV_THREAD_ID` 只能与 `SIGEV_SIGNAL` 组合，信号号 1..64；`SIGEV_NONE`、`SIGEV_SIGNAL`、`SIGEV_THREAD` 的其余组合照旧）和 `signalTarget`，宿主机测试一条。
+  - `kernel/ipc/posix_timer.zig`：`timerCreate` 读 sigevent 偏移 16 的线程 id，先校验再取锁；记下 `target_tid`。`notifyOwner` 在 `SIGEV_THREAD_ID` 时把信号排给那个线程（`sendSignalInfoResult` 按 tid 投递，不进 held 集合），其余仍发给创建者。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份（日志开头 `spawned hello2`、`spawned hello295`）全部通过：A 三种非法目标都是 -22；B 主线程 `sigpending` 为 0；C `si_code` -2、值 0x55aa。`zig build` 通过。
+- 完整 smoke：四份并行里 SMP=1、SMP=4、SMP=4 三份 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；SMP=2 那份在四路同时跑时 900 秒超时停在 hello269（0 FAIL，不是功能失败），单独重跑（超时放宽到 1400 秒）`EXIT=0`、0 FAIL、`corrupted canaries=0`。四份里 hello295 都是 PASS，hello286、hello288、hello290、hello291、hello292、hello293、hello294 都通过。
+- 如实的局限：
+  1. `SIGEV_THREAD` 仍不支持（需要为通知起一个线程）。
+  2. 目标线程在到期前退出时，这次到期直接丢弃，不改投给别的线程。
+  3. 没有 `self_exec_id`：同一进程 `exec` 之后，旧定时器仍可能把 `SIGEV_THREAD_ID` 信号投给新镜像里碰巧得到同一个 tid 的线程。

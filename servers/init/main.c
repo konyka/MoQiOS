@@ -411,6 +411,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello292"); /* POSIX timer signals carry SI_TIMER, the timer id, the overrun and the value */
     run_test("hello293"); /* mq_notify signals carry SI_MESGQ, the sender pid and uid, and the value */
     run_test("hello294"); /* mq_notify: SIGEV_NONE and signal 0 register without sending, only the owner removes it */
+    run_test("hello295"); /* SIGEV_THREAD_ID delivers a timer signal to one thread */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

@@ -2098,9 +2098,10 @@ siginfo 是 `SI_TIMER`，`si_timerid` 为定时器 id，`si_value` 为 `sigev_va
 的返回值（读取不清零，`timer_settime` 重新设定或解除时清零）。排队时 siginfo 的 overrun 位置暂存槽位代数，
 定时器被删除后残留的信号报告 overrun 0。信号被忽略且未阻塞时不发送，到期继续计数，等不再忽略时的下一次到期补发。
 `sigevent` 为空等同 `SIGEV_SIGNAL` + `SIGALRM`，`si_value` 是定时器 id。
+`SIGEV_THREAD_ID`（hello295）：`sigev_notify` 为 `SIGEV_SIGNAL|SIGEV_THREAD_ID`（值 4，`SIGEV_SIGNAL` 是 0）且信号号 1..64 时，到期信号只排给 `sigev_notify_thread_id`（sigevent 偏移 16）点名的线程，不进进程共享的 held 集合；目标必须是调用者所在进程的活线程，否则 `timer_create` 返回 `EINVAL`。`posix_timer_policy.sigeventValid` 拒绝 `SIGEV_NONE|SIGEV_THREAD_ID` 和信号 0。
 
 - 16 个定时器上限，BSP 时钟中断驱动 (100Hz)
-- timer_create: 创建定时器，支持 SIGEV_NONE/SIGEV_SIGNAL
+- timer_create: 创建定时器，支持 SIGEV_NONE/SIGEV_SIGNAL/SIGEV_THREAD_ID（hello295）
 - `timer_create` 在分配槽位前要求非空且可写的 `timerid` 用户指针；无效指针返回
   `EFAULT`，不会消耗 16 个定时器槽位中的任何一个。
   非空 `sigevent` 指针也必须完整可读；无效输入返回 `EFAULT`，不会静默降级为

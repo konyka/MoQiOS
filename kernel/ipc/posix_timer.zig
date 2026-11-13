@@ -35,10 +35,10 @@ pub const Sigevent = extern struct {
 };
 
 /// Notification types
-const SIGEV_NONE: i32 = 1;
-const SIGEV_SIGNAL: i32 = 0;
+const SIGEV_NONE: i32 = timer_policy.SIGEV_NONE;
+const SIGEV_SIGNAL: i32 = timer_policy.SIGEV_SIGNAL;
+const SIGEV_THREAD_ID: i32 = timer_policy.SIGEV_THREAD_ID;
 const SIGALRM: i32 = 14;
-// const SIGEV_THREAD: i32 = 2; // not supported
 
 /// Timer flags
 const TIMER_ABSTIME: u32 = timer_policy.TIMER_ABSTIME;
@@ -72,8 +72,9 @@ const PosixTimer = struct {
     sigev_signo: i32 = 0,
     sigev_notify: i32 = SIGEV_NONE,
     /// Task that created the timer — signals go here, not to the task
-    /// that happens to be running when the tick fires.
+    /// that happens to be running when the tick fires. With SIGEV_THREAD_ID the signal goes to target_tid instead.
     owner_task_idx: ?u32 = null,
+    target_tid: u32 = 0,
     /// Owner tid recorded at creation — a slot INDEX alone aliases after the
     /// owner exits and its slot is recycled; the tid match proves identity.
     owner_tid: u32 = 0,
@@ -105,6 +106,7 @@ pub fn timerCreate(clockid: u32, sigev_ptr: u64, timerid_ptr: u64) i64 {
     var sigev_notify: i32 = SIGEV_SIGNAL;
     var sigev_signo: i32 = SIGALRM;
     var sigev_value: ?u64 = null;
+    var thread_tid: u32 = 0;
     if (sigev_ptr != 0) {
         var sigev_buf: [@sizeOf(Sigevent)]u8 = undefined;
         const copied = copy.copyFromUser(&sigev_buf, @ptrFromInt(sigev_ptr), @sizeOf(Sigevent));
@@ -113,10 +115,10 @@ pub fn timerCreate(clockid: u32, sigev_ptr: u64, timerid_ptr: u64) i64 {
         sigev_notify = sigev.sigev_notify;
         sigev_signo = sigev.sigev_signo;
         sigev_value = @bitCast(sigev.sigev_value);
+        // sigev_notify_thread_id sits at offset 16 (the first int of the union).
+        thread_tid = @bitCast(sigev._pad[0..4].*);
     }
-
-    const saved = lock.acquire();
-    defer lock.release(saved);
+    if (!timer_policy.sigeventValid(sigev_notify, sigev_signo)) return EINVAL;
 
     const owner_idx = sched_mod.currentTaskIndex();
     const owner_tid: u32 = if (owner_idx) |oi|
@@ -127,6 +129,17 @@ pub fn timerCreate(clockid: u32, sigev_ptr: u64, timerid_ptr: u64) i64 {
         (if (task_mod.getTask(oi)) |ot| timer_policy.timerOwnerTid(ot.is_thread, ot.tid, ot.parent_tid) else 0)
     else
         0;
+    // SIGEV_THREAD_ID: the named tid must be a live thread of the caller's process (Linux good_sigevent). Resolved before the
+    // timer lock: findTaskByTid takes the task lock, and the early returns must not release a lock the defer also releases.
+    const target_tid = timer_policy.signalTarget(sigev_notify, thread_tid, owner_tid);
+    if ((sigev_notify & SIGEV_THREAD_ID) != 0) {
+        const ti = task_mod.findTaskByTid(target_tid) orelse return EINVAL;
+        const tt = task_mod.getTask(ti) orelse return EINVAL;
+        if (tt.state == .zombie or timer_policy.timerOwnerTid(tt.is_thread, tt.tid, tt.parent_tid) != owner_group_tid) return EINVAL;
+    }
+
+    const saved = lock.acquire();
+    defer lock.release(saved);
 
     for (&timers, 0..) |*t, i| {
         if (!t.valid) {
@@ -143,6 +156,7 @@ pub fn timerCreate(clockid: u32, sigev_ptr: u64, timerid_ptr: u64) i64 {
                 .owner_task_idx = owner_idx,
                 .owner_tid = owner_tid,
                 .owner_group_tid = owner_group_tid,
+                .target_tid = target_tid,
             };
             // Write timer ID to user space
             const id: i32 = @intCast(i);
@@ -354,7 +368,7 @@ pub fn timerTick(now_ns: u64) void {
                 // One-shot: stop
                 t.active = false;
             }
-            if (t.sigev_notify == SIGEV_SIGNAL and t.sigev_signo > 0 and t.sigev_signo <= 64) notifyOwner(t, @intCast(i), count);
+            if ((t.sigev_notify & ~SIGEV_THREAD_ID) == SIGEV_SIGNAL and t.sigev_signo > 0 and t.sigev_signo <= 64) notifyOwner(t, @intCast(i), count);
         }
     }
 }
@@ -366,15 +380,20 @@ fn notifyOwner(t: *PosixTimer, idx: u32, count: u64) void {
     const owner_idx = t.owner_task_idx orelse return;
     const owner = task_mod.getTask(owner_idx) orelse return;
     if (!owner_gen_policy.ownerMatches(t.owner_tid, owner.tid)) return;
+    // SIGEV_THREAD_ID queues the signal on the named thread; anything else goes to the creator.
+    const dest = if ((t.sigev_notify & SIGEV_THREAD_ID) != 0) blk: {
+        const di = task_mod.findTaskByTid(t.target_tid) orelse return;
+        break :blk task_mod.getTask(di) orelse return;
+    } else owner;
     const sig_mod = @import("../proc/signal.zig");
     const signo: u32 = @intCast(t.sigev_signo);
     const bit = @as(u64, 1) << @intCast(signo - 1);
-    const pending = @atomicLoad(u64, &owner.pending_signals, .seq_cst) | @atomicLoad(u64, &owner.grp().held_signals, .seq_cst);
-    const send = timer_policy.onExpiry(&t.sig, pending & bit != 0, sig_mod.ignoredAtSend(owner, signo));
+    const pending = @atomicLoad(u64, &dest.pending_signals, .seq_cst) | @atomicLoad(u64, &dest.grp().held_signals, .seq_cst);
+    const send = timer_policy.onExpiry(&t.sig, pending & bit != 0, sig_mod.ignoredAtSend(dest, signo));
     if (count > 1) t.sig.overrun +|= count - 1;
     if (!send) return;
     const info = @import("../proc/siginfo_policy.zig").timerInfo(idx, t.generation, t.sigev_value);
-    if (sig_mod.sendSignalInfoResult(owner.tid, signo, info) == 0) t.sig.queued = true;
+    if (sig_mod.sendSignalInfoResult(dest.tid, signo, info) == 0) t.sig.queued = true;
 }
 
 /// A timer signal is being delivered: its overrun count, which becomes the timer's timer_getoverrun value, and the timer may queue

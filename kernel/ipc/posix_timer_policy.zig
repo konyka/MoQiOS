@@ -23,6 +23,26 @@ pub fn flagsValid(flags: u32) bool {
     return flags & ~TIMER_ABSTIME == 0;
 }
 
+pub const SIGEV_SIGNAL: i32 = 0;
+pub const SIGEV_NONE: i32 = 1;
+pub const SIGEV_THREAD: i32 = 2;
+pub const SIGEV_THREAD_ID: i32 = 4;
+
+/// Linux good_sigevent: SIGEV_THREAD_ID only combines with SIGEV_SIGNAL, and the signal must be 1..64. The target tid is checked
+/// separately against the caller's thread group.
+pub fn sigeventValid(notify: i32, signo: i32) bool {
+    const kind = notify & ~SIGEV_THREAD_ID;
+    if (kind != SIGEV_SIGNAL and kind != SIGEV_NONE and kind != SIGEV_THREAD) return false;
+    if ((notify & SIGEV_THREAD_ID) != 0 and kind != SIGEV_SIGNAL) return false;
+    if (kind == SIGEV_SIGNAL or kind == SIGEV_THREAD) return signo > 0 and signo <= 64;
+    return true;
+}
+
+/// Where the timer's signal goes: the named thread when SIGEV_THREAD_ID is set, otherwise the creator.
+pub fn signalTarget(notify: i32, thread_tid: u32, creator_tid: u32) u32 {
+    return if ((notify & SIGEV_THREAD_ID) != 0) thread_tid else creator_tid;
+}
+
 pub fn ownerMatches(owner_group_tid: u32, current_group_tid: u32) bool {
     return owner_group_tid != 0 and owner_group_tid == current_group_tid;
 }
@@ -112,4 +132,18 @@ test "a queued timer signal that vanished without a delivery starts the count ov
     _ = onExpiry(&s, true, false);
     try std.testing.expect(onExpiry(&s, false, false));
     try std.testing.expectEqual(@as(u64, 0), s.overrun);
+}
+
+test "SIGEV_THREAD_ID only combines with SIGEV_SIGNAL and a real signal number" {
+    const t = @import("std").testing;
+    try t.expect(sigeventValid(SIGEV_SIGNAL, 10));
+    try t.expect(sigeventValid(SIGEV_NONE, 0));
+    try t.expect(sigeventValid(SIGEV_SIGNAL | SIGEV_THREAD_ID, 10));
+    try t.expect(!sigeventValid(SIGEV_SIGNAL | SIGEV_THREAD_ID, 0));
+    try t.expect(!sigeventValid(SIGEV_NONE | SIGEV_THREAD_ID, 10));
+    try t.expect(sigeventValid(SIGEV_THREAD, 10));
+    try t.expect(!sigeventValid(SIGEV_THREAD | SIGEV_THREAD_ID, 10));
+    try t.expect(!sigeventValid(3, 10));
+    try t.expectEqual(@as(u32, 77), signalTarget(SIGEV_SIGNAL | SIGEV_THREAD_ID, 77, 5));
+    try t.expectEqual(@as(u32, 5), signalTarget(SIGEV_SIGNAL, 77, 5));
 }
