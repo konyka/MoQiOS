@@ -8371,7 +8371,8 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 试过的改动：三处都加上 `pipeRead` 的握手（原子读改写读待处理位，`pendingStop` 为真就 `stopWhileWaiting` 原地停下）。`zig build` 通过，定向 SMP=4 的一份从这个握手前卡在竞争段第 0 轮推进到了 180/200 轮，说明握手本身有效。
 - 为什么没有提交：配套的 hello303（`moqipc_recv` 阻塞中停止）在**未改动的内核**上也卡在 `fork` 之后、只打印出标题和第一行 `first send`，同样的二进制在改过的内核上有相同表现。也就是说卡死来自测试的搭建方式，不是这次的改动或原来的窗口，红灯证据不成立。测试搭建上有两处具体的坑，已确认并绕开一部份：`moqipc_send` 拒绝发给调用者自己拥有的端点（`would_deadlock`，-3），所以接收方必须自己创建端点；授予能力只能由端点所有者做，所以子进程创建后把 id 经管道交给父进程并给父进程授予 send 权限。绕开之后仍然卡住，原因未查明。
 - 现状：`kernel/ipc/ipc.zig` 与实际提交保持一致，没有改动；`user/hello303.c` 没有保留。这一条仍是开放项，记录在这里以免重复走同样的路。
-- 下一步的建议：先用一个不涉及停止的 hello303（只验证 `moqipc_recv` 能收到消息、`moqipc_send` 的权限与所有权规则）把搭建跑通，再叠加停止测试；或者给 `moqipc` 加一个改变端点所有者的调用，省掉子进程创建端点这一步。
+- 后续（已处理）：这个建议是对的，先做了不涉及停止的 hello303（A–D），再在其上叠加 E/F 段；握手也随之进仓库，见下一节。
+- 原建议：先用一个不涉及停止的 hello303（只验证 `moqipc_recv` 能收到消息、`moqipc_send` 的权限与所有权规则）把搭建跑通，再叠加停止测试；或者给 `moqipc` 加一个改变端点所有者的调用，省掉子进程创建端点这一步。
 
 ## file→pipe 的 splice 和 `sendfile` 在满管道上不等待（hello304，已修）
 
@@ -8401,3 +8402,18 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 如实的局限：
   1. 这一条只修了「泄漏让父进程卡住」；`moqipc` 等待中的默认停止（hello301 一节的开放项）仍然没有改，也没有测试。
   2. hello303 没有 Linux 对照：A 的 `-1`/`-3` 是本内核自己的规则（没能力先判 `invalid_endpoint`），C 的 2 秒上限是经验值。
+
+## 同步 IPC（`moqipc_send`/`recv`/`call`）的等待漏掉落在睡下途中的默认停止（hello303 E/F，已修）
+
+- 起因：上一节留下这条开放项：三处等待把状态置为 `.blocked` 后直接 `sched.forceReschedule()`，停止落在「挂起之后、让出 CPU 之前」时发送端看到的还不是 `.blocked`，只置待处理位，等待端随后睡下。
+- Linux 依据：`signal_wake_up` 唤醒处于 `TASK_INTERRUPTIBLE` 的任务，返回用户态前处理停止。MoQiOS 原生 IPC 没有 Linux 对照，测试的 E 段（阻塞中途停止）在未修改的内核上本来就通过，落点的是 F 段的竞争窗口。
+- 红灯：未修改的内核（`6ef88a9`）上定向 SMP=2、SMP=4（日志开头 `spawned hello2`、`spawned hello303`）：A、B、E、C、D 都通过，**F 只有 2/200**（第 3 轮起子进程停在 `moqipc_recv` 里不再被停止）。加上诊断后确认第 1～2 轮能停，第 3 轮 `waitpid(WUNTRACED)` 3 秒内没有报告。
+- 实现（`kernel/ipc/ipc.zig`）：`sendInternal`、`receiveInternal`、`callInternal` 三处在释放 `ipc_lock` 之前读一次待处理位，`pendingStop` 为真就 `stopWhileWaiting` 原地停下，否则照常让出 CPU。
+- 测试侧（`user/hello303.c`）：新增 E 段（30 轮停止/继续，每次继续后必须收到一条消息）和 F 段（200 轮在消息之后立刻停止）。子进程的接收循环把 `not_ready`（-2）当作「被停止唤醒、还没有消息」，再收一次——和中断的读重试同理。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份，A–F 全部通过（F 200/200）。`zig build`、`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒，宿主机 load 约 1.3）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello303（含 E/F）都是 PASS，hello286、hello288、hello290–hello302、hello304 都通过。
+- 顺带确认：上一轮 `35bae12`（hello304）的 CI 在 SMP=2 超时，本地复跑没有复现；本节前一个提交 `6ef88a9` 包含同样的代码，它的 CI（SMP=1、SMP=2、跨架构、host tests）全部成功，可以视为那次超时是偶发的。
+- 如实的局限：
+  1. `moqipc_call` 的等待也加了握手，但没有专门的测试（hello303 只覆盖接收）。
+  2. 被停止唤醒时返回 `not_ready` 而不是像 Linux 那样重启调用；用户态要自己重试，文档里已经写明。
+  3. E 段在未修改的内核上就通过，只有 F 段有红灯。

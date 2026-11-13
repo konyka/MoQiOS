@@ -696,13 +696,20 @@ fn sendInternal(sender_idx: u32, target_ep: EndpointId, msg: *const Message, req
     task_ipc_state[sender_idx].wake_error = .success;
     task_ipc_state[sender_idx].wait_op = .send;
     task_ipc_state[sender_idx].block_start_tick = arch.interrupts.getTickCount();
+    // A default stop pending now is taken instead of sleeping (the handshake pipeRead uses): the task is .blocked and registered,
+    // and the sender sets the pending bit before it looks at the state, so either this read-modify-write sees the stop or the
+    // sender saw .blocked and stopped the task itself.
+    _ = @atomicRmw(u64, &sender_task.pending_signals, .Or, 0, .seq_cst);
+    const stop_now = @import("../proc/signal.zig").pendingStop(sender_task);
     ipc_lock.release(flags);
 
     // Actually yield the CPU — marking the task .blocked without rescheduling
     // leaves a running task flagged blocked. Lock must be released first
-    // (same pattern as receive()).
-    sched.forceReschedule();
-    sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
+    // (same pattern as receive()). A pending default stop is taken here instead.
+    if (!(stop_now and @import("../proc/signal.zig").stopWhileWaiting(sender_task))) {
+        sched.forceReschedule();
+        sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
+    }
 
     const wake_flags = ipc_lock.acquire();
     const locked_wake_error = task_ipc_state[sender_idx].wake_error;
@@ -805,11 +812,18 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
     task_ipc_state[caller_idx].wake_error = .success;
     task_ipc_state[caller_idx].wait_op = .receive;
     task_ipc_state[caller_idx].block_start_tick = arch.interrupts.getTickCount();
+    // A default stop pending now is taken instead of sleeping (the handshake pipeRead uses): the task is .blocked and registered,
+    // and the sender sets the pending bit before it looks at the state, so either this read-modify-write sees the stop or the
+    // sender saw .blocked and stopped the task itself.
+    _ = @atomicRmw(u64, &recv_task.pending_signals, .Or, 0, .seq_cst);
+    const stop_now = @import("../proc/signal.zig").pendingStop(recv_task);
     ipc_lock.release(flags);
 
-    // Force context switch — must release lock first to avoid deadlock
-    sched.forceReschedule();
-    sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
+    // Force context switch — must release lock first to avoid deadlock. A pending default stop is taken here instead.
+    if (!(stop_now and @import("../proc/signal.zig").stopWhileWaiting(recv_task))) {
+        sched.forceReschedule();
+        sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
+    }
 
     // Resumed after send() delivered the message and unblocked us
     const flags2 = ipc_lock.acquire();
@@ -982,10 +996,17 @@ fn callInternal(caller_idx: u32, target_ep: EndpointId, msg: *Message, require_c
     task_ipc_state[caller_idx].block_start_tick = arch.interrupts.getTickCount();
     ipc_lock.release(post_send_flags);
 
+    // A default stop pending now is taken instead of sleeping (the handshake pipeRead uses): the task is .blocked and registered,
+    // and the sender sets the pending bit before it looks at the state, so either this read-modify-write sees the stop or the
+    // sender saw .blocked and stopped the task itself.
+    _ = @atomicRmw(u64, &caller_task.pending_signals, .Or, 0, .seq_cst);
+    const call_stop = @import("../proc/signal.zig").pendingStop(caller_task);
     // Actually yield the CPU — marking the task .blocked without rescheduling
-    // leaves a running task flagged blocked. No lock is held here.
-    sched.forceReschedule();
-    sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
+    // leaves a running task flagged blocked. No lock is held here. A pending default stop is taken here instead.
+    if (!(call_stop and @import("../proc/signal.zig").stopWhileWaiting(caller_task))) {
+        sched.forceReschedule();
+        sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
+    }
 
     // Woken by reply() or by a signal kick. A fatal signal kills the caller
     // either way (same as before). (.timeout is -4 == -EINTR.)

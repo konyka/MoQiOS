@@ -299,7 +299,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello301 | 阻塞在 TCP `recv` 或 SysV `semop` 里的进程收到 `SIGSTOP` 立即停下（`0x137f`），停止期间不运行，`SIGCONT`（`0xffff`）后等待继续并在事件到达时完成，每种 30 轮；另有 200 轮在事件之后隔一段可变时间发 `SIGSTOP`，落在子进程回到等待途中也必须停下（宿主机 Linux 实测同结果） |
 | hello302 | 阻塞在 400 ms 的 `nanosleep` 里的进程收到 `SIGSTOP` 后 200 ms 内就报 `0x137f`（实测最慢 1～7 ms），停止期间不运行，`SIGCONT`（`0xffff`）后睡眠继续并完成；8 轮加上 40 轮在睡眠结束后隔一段可变时间发 `SIGSTOP`（宿主机 Linux 实测同结果，目标机在未修改的内核上同样通过，是回归测试） |
 | hello304 | 写进满管道的进程被杀后释放它的写端：`write()`（A）、文件→管道 `splice`（B）、`sendfile`（E）都停住（Linux 在满管道上阻塞，不是返回 0），`SIGKILL` 与 `SIGTERM` 都让管道随后读到 EOF；file→pipe 的 `splice` 在满管道上等待，读端 drain 后返回全部 16 字节（G）；连杀十次后仍能新建 32 个管道（C） |
-| hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
+| hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。

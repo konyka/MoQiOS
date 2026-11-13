@@ -2,7 +2,11 @@
  * A a send into the caller's own endpoint is refused: without a send capability for it the kernel answers invalid_endpoint (-1), and
  * after granting itself one it answers would_deadlock (-3); B a child that owns an endpoint and grants the parent a
  * send capability receives every message the parent sends, in order (30 rounds); C a child blocked in moqipc_recv is killed by
- * SIGKILL and reaped promptly; D after the receiver is gone a send to its endpoint fails instead of blocking. */
+ * SIGKILL and reaped promptly; D after the receiver is gone a send to its endpoint fails instead of blocking. E a SIGSTOP that lands
+ * while the child blocks in moqipc_recv stops it at once (waitpid reports 0x137f), nothing runs while it is stopped, SIGCONT
+ * (0xffff) puts it back in the wait and the next message is received (30 rounds); F 200 rounds where the stop is sent right after a
+ * message, so some land as the child goes back into the wait. A stop and continue that wake the wait before a message make
+ * moqipc_recv return not_ready (-2); the child's loop receives again, as a server loop would. */
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
 #include "../lib/moqi_libc/include/stdio.h"
 #include "../lib/moqi_libc/include/string.h"
@@ -11,7 +15,12 @@
 #include "../lib/moqi_libc/include/time.h"
 
 #define S_KILL 9
+#define S_STOP 19
+#define S_CONT 18
 #define O_WNOHANG 1
+#define O_WUNTRACED 2
+#define O_WCONTINUED 8
+#define RACE_ROUNDS 200
 #define ROUNDS 30
 
 static int failures;
@@ -32,6 +41,24 @@ static long grant_to(long tid, long e, long rights) { return syscall3(486 /* moq
  * word[3] is the first payload word and carries the sequence number. */
 struct msg { long word[32]; };
 
+/* Wait up to `ms` for a report matching `opt` (WUNTRACED / WCONTINUED); returns the pid or 0. */
+static long reap_within_opt(long c, int *st, int opt, int ms) {
+    for (int i = 0; i < ms / 5; i++) {
+        long r = waitpid(c, st, opt | O_WNOHANG);
+        if (r != 0) return r;
+        nap(5);
+    }
+    return 0;
+}
+/* Whether the pipe has data to read now (the read end is left blocking). */
+static int pending(int fd) {
+    int fl = (int)fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    long v = 0;
+    long r = read(fd, &v, sizeof v);
+    fcntl(fd, F_SETFL, fl);
+    return r > 0;
+}
 /* Wait up to `ms` for the child; returns its pid or 0. */
 static long reap_within(long c, int *st, int ms) {
     for (int i = 0; i < ms / 5; i++) {
@@ -70,6 +97,9 @@ int main(void) {
         struct msg in;
         for (;;) {
             long r = ep_recv(mine, &in);
+            /* A stop and continue wake the wait without a message: moqipc_recv reports not_ready (-2), and a receive loop simply
+             * receives again, the way an interrupted read is retried. */
+            if (r == -2) continue;
             long out = r == 0 ? in.word[3] : -1000 + r;
             write(rp[1], &out, sizeof out);
         }
@@ -92,6 +122,44 @@ int main(void) {
     snprintf(what, sizeof what, "B: the child receives every message in order (%d/%d, child endpoint %ld, first bad send %ld got %ld)", in_order, ROUNDS,
              child_ep, sent_bad, first_bad);
     check(child_ep > 0 && in_order == ROUNDS, what);
+
+    /* E: stop and continue the child while it blocks in moqipc_recv; each continue is followed by a message it must receive. */
+    int stops = 0, quiet = 0, conts = 0, back = 0;
+    for (int round = 0; child_ep > 0 && in_order == ROUNDS && round < ROUNDS; round++) {
+        nap(5);
+        kill(c, S_STOP);
+        int sst = 0;
+        if (reap_within_opt(c, &sst, O_WUNTRACED, 3000) == c && sst == 0x137f) stops++;
+        else break;
+        if (!pending(rp[0])) quiet++;
+        kill(c, S_CONT);
+        if (reap_within_opt(c, &sst, O_WCONTINUED, 3000) == c && sst == 0xffff) conts++;
+        else break;
+        m.word[3] = 2000 + round;
+        long got = 0;
+        if (ep_send(child_ep, &m) == 0 && read(rp[0], &got, sizeof got) == (long)sizeof got && got == 2000 + round) back++;
+        else break;
+    }
+    snprintf(what, sizeof what, "E: a SIGSTOP stops the child blocked in moqipc_recv (%d/%d), nothing runs while stopped (%d), SIGCONT (%d), the next message arrives (%d)",
+             stops, ROUNDS, quiet, conts, back);
+    check(stops == ROUNDS && quiet == ROUNDS && conts == ROUNDS && back == ROUNDS, what);
+
+    /* F: the stop is sent right after a message, so some land while the child is on its way back into moqipc_recv. */
+    int rstops = 0;
+    for (int round = 0; back == ROUNDS && round < RACE_ROUNDS; round++) {
+        m.word[3] = 3000 + round;
+        if (ep_send(child_ep, &m) != 0) break;
+        kill(c, S_STOP);
+        int sst = 0;
+        if (reap_within_opt(c, &sst, O_WUNTRACED, 3000) == c && sst == 0x137f) rstops++;
+        else break;
+        kill(c, S_CONT);
+        if (reap_within_opt(c, &sst, O_WCONTINUED, 3000) != c) break;
+        long got = 0;
+        if (read(rp[0], &got, sizeof got) != (long)sizeof got || got != 3000 + round) break;
+    }
+    snprintf(what, sizeof what, "F: a SIGSTOP sent just after a message, as the child goes back into the wait, stops it (%d/%d)", rstops, RACE_ROUNDS);
+    check(rstops == RACE_ROUNDS, what);
 
     /* C: the child is now blocked in moqipc_recv; SIGKILL must end it. */
     nap(20);
