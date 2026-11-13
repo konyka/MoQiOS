@@ -121,7 +121,14 @@ fn writeUserOffset(ptr: u64, offset: u64) bool {
 /// True if the fd type represents a seekable file that can act as a
 /// sendfile input (ramdisk / FAT32 / ext2).
 fn isFileFd(ft: vfs.FdType) bool {
-    return ft == .ramdisk_file or ft == .fat32_file or ft == .ext2_file;
+    return ft == .ramdisk_file or ft == .fat32_file or ft == .ext2_file or ft == .tmpfs_file;
+}
+
+/// The size of the file behind `desc` as every descriptor sees it. A tmpfs file may have been grown or truncated through another
+/// descriptor since this one last looked, so its cached size is refreshed first.
+fn currentFileSize(desc: *vfs.FileDescriptor) u64 {
+    if (desc.fd_type == .tmpfs_file) desc.file_size = @import("tmpfs.zig").tmpfsGetSize(@intCast(desc.tmpfs_idx));
+    return desc.file_size;
 }
 
 /// A file that can be the SOURCE of sendfile / splice. A file on a mounted
@@ -170,6 +177,15 @@ fn readFileAt(fd_table: *vfs.FdTable, fd: u32, offset: *u64, buf: [*]u8, count: 
             if (offset.* >= desc.file_size) return 0;
             const ext2 = @import("ext2.zig");
             const n = ext2.readFile(desc.ext2_file_idx, @intCast(offset.*), buf, @intCast(count));
+            if (n > 0) offset.* += @intCast(n);
+            return n;
+        },
+        .tmpfs_file => {
+            const tmpfs = @import("tmpfs.zig");
+            if (@import("namespace_policy.zig").readGate(if (tmpfs.tmpfsGetMetadata(@intCast(desc.tmpfs_idx))) |m| m.is_dir else false) != 0) return -21;
+            if (offset.* >= currentFileSize(desc)) return 0;
+            const want: u32 = @intCast(@min(@as(u64, count), desc.file_size - offset.*));
+            const n = tmpfs.tmpfsRead(@intCast(desc.tmpfs_idx), offset.*, buf, want);
             if (n > 0) offset.* += @intCast(n);
             return n;
         },
@@ -358,7 +374,7 @@ pub fn sysSendfile(out_fd: u32, in_fd: u32, offset_ptr: u64, count: u64) i64 {
 
     // If offset is past EOF, nothing to do, but still honor explicit offset
     // writeback because the pointer is an in/out argument.
-    if (offset >= fd_table.fds[in_fd].file_size) {
+    if (offset >= currentFileSize(&fd_table.fds[in_fd])) {
         if (update_user_offset and !writeUserOffset(offset_ptr, offset)) return EFAULT;
         return 0;
     }
@@ -506,7 +522,7 @@ fn spliceFileToPipe(fd_table: *vfs.FdTable, file_fd: u32, off_in: u64, pipe_fd: 
     if (offset > 0xFFFF_FFFF or len > 0xFFFF_FFFF - offset) return EINVAL;
 
     // If offset is past EOF, nothing to do.
-    if (offset >= fd_table.fds[file_fd].file_size) {
+    if (offset >= currentFileSize(&fd_table.fds[file_fd])) {
         if (update_user_offset and !writeUserOffset(off_in, offset)) return EFAULT;
         return 0;
     }

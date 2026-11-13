@@ -8266,5 +8266,28 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 如实的局限：
   1. 文件→管道 splice 和 `sendfile` 写管道时走 `pipeWrite`，信号和停止的处理和管道写一样；但那里的致命信号直接 `exitTask`，此时 splice 还持有描述符的 transfer 引用。这条路径这次没有改，也没有测试覆盖。
   2. 等待里收到致命信号时返回 `-EINTR`，进程在系统调用返回时被杀；用户态看不到 `EINTR`，效果和 Linux 一样，只是路径不同。
-  3. splice 的文件端不接受 tmpfs 文件（`isFileFd` 只有 ramdisk、FAT32、ext2），Linux 可以。没有在这一节修。
+  3. splice 的文件端不接受 tmpfs 文件（`isFileFd` 只有 ramdisk、FAT32、ext2），Linux 可以。没有在这一节修。（hello298 已修。）
   4. socket、`epoll`、`nanosleep`、消息队列、eventfd、timerfd 的等待仍只检查 `pendingActionable`，默认停止的窗口还在。
+
+## splice 和 `sendfile` 不接受 tmpfs 文件（hello298，已修）
+
+- 起因：hello297 一节的局限 3。`splice.isFileFd` 只认 ramdisk、FAT32、ext2，`/tmp` 下的文件做 splice 或 `sendfile` 的文件端时一律 `EINVAL`。`copy_file_range` 早就接受 tmpfs。
+- Linux 依据：tmpfs 的 `shmem_file_operations` 提供 `splice_read`（`filemap_splice_read`）和 `splice_write`（`iter_file_splice_write`），`sendfile` 走同一条路径。宿主机实测（以 `gcc -DHOST` 跑 hello298，宿主机 `/tmp` 也是 tmpfs，普通和 `taskset -c 0` 都通过）：
+  - A：文件→管道 splice 4 字节，文件偏移变为 4。
+  - B：显式偏移 6 读 3 字节，偏移变量变为 9，文件偏移不变。
+  - C：管道→文件 splice 2 字节写在文件偏移 4 处，文件偏移变为 6。
+  - D：显式输出偏移 1 写 2 字节，偏移变量变为 3，文件偏移不变。
+  - E：`sendfile` 从偏移 0 搬 5 字节到管道。
+  - F：另一个 `O_APPEND` 描述符追加的 3 字节能从第一个描述符 splice 出来。
+  - G：在末尾和越过末尾 splice 返回 0。
+- 红灯：未修改的内核（`c73fe0d`）上定向 SMP=2（日志开头 `spawned hello2`、`spawned hello298`），A–G 全部是 `-22`。第一版测试的读端是阻塞的，A 失败后 `read` 卡住，跑满 300 秒；测试改为先把管道读端设成 `O_NONBLOCK`。
+- 实现（`kernel/fs/splice.zig`）：
+  - `isFileFd` 加上 `tmpfs_file`。
+  - `readFileAt` 新增 tmpfs 分支：目录返回 `EISDIR`，否则用 `tmpfsRead` 读，不超过文件末尾。
+  - 新增 `currentFileSize`：tmpfs 文件先用 `tmpfsGetSize` 刷新描述符里缓存的大小。`sendfile` 和文件→管道 splice 判断 EOF 时用它，F 段依赖这一点。
+  - 写入方向不用改，`fd_table.write` 和 `writeAtOffset` 本来就支持 tmpfs。`O_APPEND` 的 tmpfs 文件仍按 hello268 的规则 `EINVAL`。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份（日志开头 `spawned hello2`、`spawned hello298`）全部通过，数值和宿主机一致。`zig build`、`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello298 都是 PASS，hello286、hello288、hello290–hello297 都通过。
+- 如实的局限：
+  1. 只把 tmpfs 加进了 splice 和 `sendfile`。procfs、devfs 文件仍然不能做文件端；Linux 上部分可以。
+  2. ext2 和 FAT32 文件在 `readFileAt` 里仍用描述符缓存的 `file_size`，另一个描述符追加的、还在写回缓存里的字节，这两条路径看不到。普通 `read` 会合并写回缓存，splice 不会。这次没有修，也没有测试覆盖。
