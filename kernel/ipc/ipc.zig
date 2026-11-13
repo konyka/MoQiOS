@@ -861,11 +861,14 @@ fn receiveInternal(caller_idx: u32, ep: EndpointId, buf: *Message, require_cap: 
     // signal via the same exit-by-signal path the timer tick uses, or report
     // EINTR so the handler can run on return. (.timeout is -4 == -EINTR.)
     const sig_mod = @import("../proc/signal.zig");
-    const wake_pin = task.pinTaskByIndex(caller_idx, true) orelse return .not_ready;
-    var resumed_task = wake_pin;
-    defer resumed_task.release();
-    if (sig_mod.pendingFatal(resumed_task.task)) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
-    if (sig_mod.pendingActionable(resumed_task.task)) return .timeout;
+    // The pin is released before exitTask: exitTask never returns, so a `defer release()` would leave operation_refs at 1 and the
+    // zombie could never be reaped (waitpid spins on it forever).
+    var resumed_task = task.pinTaskByIndex(caller_idx, true) orelse return .not_ready;
+    const fatal = sig_mod.pendingFatal(resumed_task.task);
+    const actionable = sig_mod.pendingActionable(resumed_task.task);
+    resumed_task.release();
+    if (fatal) |sig| task.exitTask(128 + @as(i32, @intCast(sig)));
+    if (actionable) return .timeout;
     return .not_ready;
 }
 

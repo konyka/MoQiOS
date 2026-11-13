@@ -8388,3 +8388,16 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. `pipeWaitWritable` 只覆盖 splice/sendfile 的第一块；之后的块在管道再次写满时返回已搬字节数（Linux 也一样）。
   2. 等待里收到致命信号时返回 `-EINTR`，进程在系统调用返回时被杀，不在等待里直接 `exitTask`。这样 splice/sendfile 的 transfer 引用能正常释放。
   3. 测试里 `G` 的 drain 缓冲区原本用了 8 KiB 的栈数组，在目标机上 `read` 返回 `EFAULT`（用户栈不够），测试因此先失败过；改成 512 字节后正常。
+
+## `moqipc` 等待者被信号杀掉时泄漏一次任务 pin，父进程随后卡在 `waitpid`（hello303，已修）
+
+- 起因：上一轮做同步 IPC 停止测试时，父进程在子进程（阻塞在 `moqipc_recv`）被 `SIGKILL` 之后的下一次 `waitpid(WNOHANG)` 卡住，基线内核和改过的内核都一样，当时没有查出来。
+- 定位：临时在 `task.waitpid` 的 `.busy` 分支打印僵尸的任务视图，得到 `refs=1 cur=false exit_cpu=0 epoch=95 entries=97`——`entries` 早已超过门槛，唯一挡住收尸的是 `operation_refs=1`。`ipc.zig` 的接收唤醒路径 `pinTaskByIndex(caller_idx, true)` 后用 `defer release()`，随后致命信号调 `task.exitTask()`；它不返回，`defer` 不执行，pin 永久泄漏。
+- Linux 依据：没有直接对应（MoQiOS 原生 IPC）。`waitpid` 不在有未归还 pin 的僵尸上做收尸是本内核自己的门禁（防止回收仍被使用的任务槽），所以泄漏必须由持 pin 的一方修复。
+- 红灯：未修改的内核（`35bae12`）上定向 SMP=2（日志开头 `spawned hello2`、`spawned hello303`）：hello303 A、B 通过，C 段在子进程被 `SIGKILL` 之后的第一次轮询里就卡住，4 秒超时后测试进程被 harness 杀掉，C、D 没有输出。
+- 实现（`kernel/ipc/ipc.zig` 的 `receiveInternal` 唤醒后）：先读出 `pendingFatal` 和 `pendingActionable`，`resumed_task.release()` 之后再 `exitTask` 或返回 `-EINTR`。全仓扫过 `defer <x>.release();` 后跟 `exitTask` 的组合，没有第二处。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份全部通过（A–D）。`zig build`、`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒，宿主机 load 约 5）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello303 和 hello304 都是 PASS，hello286、hello288、hello290–hello302 都通过。
+- 如实的局限：
+  1. 这一条只修了「泄漏让父进程卡住」；`moqipc` 等待中的默认停止（hello301 一节的开放项）仍然没有改，也没有测试。
+  2. hello303 没有 Linux 对照：A 的 `-1`/`-3` 是本内核自己的规则（没能力先判 `invalid_endpoint`），C 的 2 秒上限是经验值。
