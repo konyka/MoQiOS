@@ -42,9 +42,10 @@ enum { D_SETSID_C_OWN_GROUP = 6, D_SETSID_C_SAME_GROUP = 7, D_OWN_GROUP = 2, C_O
 
 /* D forks C; C reports "R" and (except NOT_STOPPED) stops itself; D waits for "R", gives C time to stop, and exits. Returns what C saw. */
 static void scenario(int mode, char *seen, int seen_len) {
-    int rep[2], rdy[2];
+    int rep[2], rdy[2], go[2];
     pipe(rep);
     pipe(rdy);
+    pipe(go);
     long e = -1;
     long d = fork();
     if (d == 0) {
@@ -67,6 +68,12 @@ static void scenario(int mode, char *seen, int seen_len) {
         for (int i = 0; i < 400 && read(rdy[0], &r, 1) != 1; i++) nap(5);
         if (mode == NOT_STOPPED) nap(150);
         else for (int i = 0; i < 400 && !is_stopped(c); i++) nap(5);
+        /* STILL_LINKED: E must be in this group before D exits, or the group is orphaned after all (a loaded VM once let D exit
+         * first and the stopped child got SIGHUP and SIGCONT). The parent writes `go` once getpgid(E) is D. */
+        if (mode == STILL_LINKED) {
+            char g = 0;
+            read(go[0], &g, 1);
+        }
         _exit(0);
     }
     if (mode == STILL_LINKED) {
@@ -79,6 +86,8 @@ static void scenario(int mode, char *seen, int seen_len) {
         }
         for (int i = 0; i < 400 && getpgid(e) != d; i++) nap(5);
     }
+    char g = 'g';
+    write(go[1], &g, 1);
     close(rep[1]);
     int st = 0;
     waitpid(d, &st, 0);
@@ -93,6 +102,8 @@ static void scenario(int mode, char *seen, int seen_len) {
     close(rep[0]);
     close(rdy[0]);
     close(rdy[1]);
+    close(go[0]);
+    close(go[1]);
     if (e > 0) {
         kill(e, SIGKILL);
         waitpid(e, &st, 0);

@@ -7981,3 +7981,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：`sigqueue_policy.withinSigpendingLimit`（宿主机测试 1 条，文件已登记在 `kernel/host_test.zig`）。`recordSendInfo` 在 `rt_queue_lock` 下统计该真实 uid 所有存活任务的 `rt_queue.count`，达到目标的软上限就不再入队；`kill`/`SI_KERNEL` 仍走原来的“队列满也置位、丢掉 siginfo”分支。每线程队列容量 32 不变，先到者为限。
 - 绿灯：宿主机 Linux 上 hello288 全过（含新用户命名空间一份）。目标机定向 SMP=2 一份、SMP=4 两份全过（Q 段子进程以 0 退出）。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello184、hello262、hello267、hello274、hello286、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
 - 如实的局限：①计数是本内核里该 uid 的全部任务，没有用户命名空间；②每线程队列仍是 32，软上限再高也排不进去；③标准信号在这里不占实例，不计入这个上限（Linux 的标准信号也会分配 sigqueue 记录）。
+
+
+## hello283 “仍被另一个成员链接”一项的测试竞态（已修测试）
+
+- 起因：`d00b1d4` 的 CI（43343466271）在 SMP=2 冒烟里 hello283 失败：`group still linked by another member: the stopped child saw "HC" (Linux: "")`。
+- 查因：这一项里父进程另起一个进程 E，让它加入 D 的进程组，使 D 退出后这个组仍被会话里另一个组的父进程链接。但 D 只等 C 停下就退出，不等 E 加入；父进程等 `getpgid(E) == D` 的循环和 D 的退出之间没有先后约束。负载高时 D 先退出，那一刻组里只剩停止的 C，组确实成了孤儿，内核按 Linux `kill_orphaned_pgrp` 发 `SIGHUP`+`SIGCONT`，C 看到 "HC"。所以内核的行为是对的，是测试的时序不成立。这是根据代码推出的，CI 上的时序没有直接记录。
+- 修改：新增一个 `go` 管道。STILL_LINKED 模式下 D 在退出前读 `go`，父进程确认 `getpgid(E) == D` 之后才写；其它模式 D 不读，父进程照写，不影响它们。
+- 验证：修改前本地没能复现这次失败，所以没有红灯，这里如实记录。修改后目标机定向 SMP=4 四份并行加 SMP=2 一份 hello283 全过（日志开头 `spawned hello2`、`spawned hello283`）。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello262、hello283、hello286、hello288 都通过，hello228 的 `corrupted canaries` 都是 0。
