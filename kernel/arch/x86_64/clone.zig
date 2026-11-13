@@ -261,6 +261,13 @@ pub fn clone(
     if (clone_flags_policy.checkPointers(flags, new_stack, tls) != .ok) return -22; // EINVAL
     const parent_idx = sched.currentTaskIndex() orelse return -1;
     const parent = task_mod.getTask(parent_idx) orelse return -1;
+    // A signal already pending is acted on before the child exists, as Linux does by restarting the call (fork.c ERESTARTNOINTR).
+    // A default stop stops the caller here: a thread created first would not have it pending and the group stop would never
+    // complete. A fatal signal, including the SIGKILL that ended such a stop, ends the call instead of leaving behind a thread the
+    // kill never reached; it is delivered on the way out.
+    const signal_mod = @import("../../proc/signal.zig");
+    _ = signal_mod.stopWhileWaiting(parent);
+    if (signal_mod.pendingFatal(parent) != null) return -4; // EINTR
     // Only the pointers the flags name are consulted; an unused argument
     // register may hold anything.
     if (flags & clone_flags_policy.CLONE_PARENT_SETTID != 0) {

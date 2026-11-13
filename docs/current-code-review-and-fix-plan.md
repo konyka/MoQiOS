@@ -8037,7 +8037,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - 发送端 `sendSignalInfoResult` 置位之后，如果目标已经变成 `.blocked`，就按“睡着的目标”的路径直接把它停下。等待端是先存 `.blocked` 再读待处理位，发送端是先置位再读状态，两边至少有一边能看到对方，所以停止不会被两边同时漏掉。
 - 绿灯：目标机定向 SMP=2 六份、SMP=4 两份 hello286 全部通过，J 段都是 60/60。`zig build test` 通过，三个架构都能构建。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello286 J 都是 60/60，hello288 P 都是 `(1, exit 0)`，hello228 的 `corrupted canaries` 都是 0。
 - 如实的局限：
-  1. 只修了 futex 等待。其它阻塞点（管道、socket、`waitpid`、`nanosleep`、`epoll`、消息队列等）的等待循环同样只看 `pendingActionable`，理论上存在同样的窗口。这些没有逐个修改，也没有测试覆盖。
+  1. 只修了 futex 等待。其它阻塞点（~~管道、`waitpid`、~~socket、`nanosleep`、`epoll`、消息队列等）的等待循环同样只看 `pendingActionable`，理论上存在同样的窗口。这些没有逐个修改，也没有测试覆盖。（管道读写和 `waitpid`/`waitid` 已改，见文末“clone 时已待处理的停止信号”一节）
   2. 停下的方式和 Linux 不同：不是返回 `-ERESTARTSYS` 再重启系统调用，而是在内核里原地等待。对用户态的效果一样，但停止期间超时时间照样在走。
   3. 上一个提交 `cc5c1b3` 的 CI（43355489709）在 SMP=2 冒烟里 hello288 P 失败，子进程以 2 退出：信号被阻塞时，50 ms 的定时器信号在 3 秒内没有被 `sigtimedwait` 取到。这与本节无关。~~属于开放项“定时器按 tick 到期，负载高时会晚到”，原因还没有查清。~~（已查清并修复，见下一节）
 
@@ -8081,3 +8081,29 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   4. `devfs_nodes.mouseRead` 仍是最多 100 次的忙让出，没有改。
   5. 共享打开文件描述的判定用的是共享偏移槽：描述符还没被 `dup`/`fork` 过时偏移是私有的，关闭它就算最后一次，符合 `flock` 的语义；偏移池满了退回私有偏移时，两个描述符会被当成各自独立的打开文件描述。
 
+
+## clone 时已待处理的停止信号让新线程漏掉整组停止；管道和 `waitpid` 的等待不处理默认停止（hello286 L、M，已修）
+
+- 起因：futex 一节的局限 1。新增 hello286 两段：
+  - L：子进程起一个旋转线程，主线程循环阻塞在 `read()`。父进程做 200 轮 `SIGSTOP` → 等到 `0x137f` → 确认停止期间没有写入 → `SIGCONT` → 等到 `0xffff` → 写管道 → 等子进程回写。
+  - M：20 轮，每轮 `fork` 之后立刻 `kill(c, SIGSTOP)`，子进程随后 `pthread_create` 一个旋转线程。期望报告 `0x137f`，停止期间新线程不写。
+- Linux 依据：`3rd/linux-7.0.6/kernel/fork.c` 2046–2048 行，`copy_process` 发现有待处理信号时返回 `-ERESTARTNOINTR`，先处理信号（包括停止）再重做 `clone`；2404 行，有致命信号时返回 `-EINTR`。宿主机 `gcc -DHOST` 跑 hello286：L 200/200、M 20/20，`taskset -c 0` 下同样通过。另用 `/tmp/pstop.c` 实测，阻塞在 `read` 里的进程收到 `SIGSTOP` 后，`waitpid` 0 ms 内就报告 `0x137f`。
+- 红灯：未修改的内核上定向 SMP=4 一份（日志开头 `spawned hello2`、`spawned hello286`）：J 60/60，L 200/200，**M 0/20**。L 段在未修改的内核上通过；早先见过的 L 0/200 是 M 的同一个问题（K 段遗留的管道数据让“线程已开始”过早成立，`SIGSTOP` 落在线程创建之前），测试在 `fork` 之前加了 `nap(50); drain();` 之后就不再出现。所以**管道和 `waitpid` 的改动没有红灯证据，属于预防性改动**。
+- 根因（临时诊断打印，已撤掉）：
+  1. `SIGSTOP` 到达时子进程还是 `.ready`，没跑起来，发送端只置待处理位。
+  2. 子进程跑起来后先进入 `clone`，创建了新线程。新线程没有待处理的停止信号。
+  3. 组长在系统调用返回时才停下，`markStopped` 返回 `partial`。新线程一直在跑，整组停止永远完不成，父进程等不到 `0x137f`。
+  4. 第一版修复（只在 `clone` 开头处理待处理的停止）之后，M 卡在 `kill(c, 9)`：`sendSignalInfoResult` 先清 `stopped` 再置 `SIGKILL` 的待处理位，停在 `clone` 里的子进程看到 `stopped` 清零就继续创建线程，那时还看不到 kill，这个线程就没有收到 `SIGKILL`。
+- 实现：
+  - `kernel/arch/x86_64/clone.zig`：取到父任务后先调 `signal.stopWhileWaiting(parent)`，有待处理的默认停止就当场停下；之后如果有致命信号（包括结束这次停止的 `SIGKILL`），返回 `-EINTR`，信号在返回路径上投递。
+  - `kernel/proc/signal.zig`：单目标发送路径里，`SIGKILL` 结束停止改为先置待处理位、再用 release 存储清 `stopped`（`kill_ends_stop`）。`stopsBlockedTarget` 改用 `sched_claim.load` 读状态。进程组广播路径没有改。
+  - `kernel/fs/vfs.zig`：`pipeRead` 和 `pipeWrite` 挂上等待队列、状态成为 `.blocked` 之后，用一次原子读改写读待处理位；有默认停止就释放 `pipe_lock`，调 `stopWhileWaiting` 原地停下，继续后回到循环重新检查。和 futex 一样：等待端先存 `.blocked` 再读位，发送端先置位再看 `.blocked`，两边至少有一边拿到这次停止。
+  - `kernel/proc/waitpid.zig`：`waitpid` 和 `waitid` 在检查 `pendingActionable` 之后，如果有待处理的默认停止就调 `stopWhileWaiting`；两处 `hlt` 等待循环的条件加上 `!pendingStop(parent)`，不会在停止信号挂着时睡下去。
+  - `tests/main.zig` 的形状测试改为：`if (signum == SIGKILL and t.stopped) t.stopped = false;` 只剩一处（进程组路径），并断言 `kill_ends_stop` 的两行存在。
+- 绿灯：目标机定向 SMP=4、SMP=2 各一份（日志开头 `spawned hello2`、`spawned hello286`）：J 60/60，L 200/200，M 20/20，PASS。`zig build`、`zig build test` 通过。完整 smoke 结果见下一行。
+- 完整 smoke：四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello286 都是 PASS（J 60/60，L 200/200，M 20/20），hello187、hello288、hello290 都通过。
+- 如实的局限：
+  1. 管道和 `waitpid` 的停止处理没有红灯，是按同一个窗口推出来的预防性改动。
+  2. `pipeReserveReadWait`（splice 读）在等待中不检查任何信号，没有改。
+  3. socket、`epoll`、`nanosleep`、消息队列、eventfd、timerfd 的等待仍只检查 `pendingActionable`，同样的窗口还在。
+  4. `clone` 遇到致命信号时返回 `EINTR`，不像 Linux 那样重启调用。进程反正会被杀掉，用户态看不到差别。

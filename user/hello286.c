@@ -131,6 +131,7 @@ static long wait_report(long c, int *st, int opt) {
     return r;
 }
 static int kp[2];
+static int rp[2];
 static void on_cont(int sig, void *info, void *uc) {
     (void)sig;
     (void)uc;
@@ -477,6 +478,84 @@ int main(void) {
     check(n == 1 && codes[0] == 'T' && r == c && st == 0xffff, msg);
     kill(c, 9);
     waitpid(c, &st, 0);
+
+    /* L: a SIGSTOP that lands while a thread is blocked in read() stops the group, and SIGCONT puts it back in the read. */
+    pipe(rp);
+    nap(50);
+    drain();
+    c = fork();
+    if (c == 0) {
+        pthread_t th;
+        pthread_create(&th, (void *)0, spin, (void *)0);
+        for (;;) {
+            char b;
+            read(rp[0], &b, 1);
+            write(bp[1], "r", 1);
+        }
+    }
+    started = 0;
+    for (int i = 0; i < 300 && !started; i++) {
+        started = drain();
+        if (!started) nap(10);
+    }
+    int read_stops = 0, read_quiet = 0, read_conts = 0, read_back = 0;
+    for (int round = 0; round < 200; round++) {
+        kill(c, SIGSTOP);
+        st = 0;
+        if (wait_report(c, &st, WUNTRACED) == c && st == 0x137f) read_stops++;
+        else break;
+        drain();
+        nap(5);
+        if (!drain()) read_quiet++;
+        kill(c, SIGCONT);
+        st = 0;
+        if (wait_report(c, &st, WCONTINUED) == c && st == 0xffff) read_conts++;
+        else break;
+        write(rp[1], "x", 1);
+        int back = 0;
+        for (int i = 0; i < 100 && !back; i++) {
+            back = drain();
+            if (!back) nap(10);
+        }
+        if (back) read_back++;
+        else break;
+    }
+    snprintf(msg, sizeof msg, "L: a SIGSTOP while a thread blocks in read() is reported (%d/200)", read_stops);
+    check(started && read_stops == 200, msg);
+    snprintf(msg, sizeof msg, "L: and nothing runs while it is stopped (%d/%d)", read_quiet, read_stops);
+    check(read_quiet == read_stops && read_stops > 0, msg);
+    snprintf(msg, sizeof msg, "L: and SIGCONT puts it back in the read (%d/200)", read_conts);
+    check(read_conts == 200 && read_back == 200, msg);
+    kill(c, 9);
+    waitpid(c, &st, 0);
+
+    /* M: a SIGSTOP sent right after fork, before the child has created its thread, still stops the whole group: a thread created
+     * while the stop is pending does not escape it (Linux restarts the clone after the stop, fork.c ERESTARTNOINTR). */
+    int early_stops = 0, early_quiet = 0;
+    for (int round = 0; round < 20; round++) {
+        nap(20);
+        drain();
+        c = fork();
+        if (c == 0) {
+            pthread_t th;
+            pthread_create(&th, (void *)0, spin, (void *)0);
+            for (;;) pause();
+        }
+        kill(c, SIGSTOP);
+        st = 0;
+        if (wait_report(c, &st, WUNTRACED) == c && st == 0x137f) {
+            early_stops++;
+            drain();
+            nap(30);
+            if (!drain()) early_quiet++;
+        }
+        kill(c, 9);
+        waitpid(c, &st, 0);
+    }
+    snprintf(msg, sizeof msg, "M: a SIGSTOP right after fork stops the child and the thread it creates (%d/20)", early_stops);
+    check(early_stops == 20, msg);
+    snprintf(msg, sizeof msg, "M: and that thread writes nothing while stopped (%d/%d)", early_quiet, early_stops);
+    check(early_quiet == early_stops && early_stops > 0, msg);
 
     print(failures == 0 ? "hello286: PASS\n" : "hello286: FAIL\n");
     return failures;

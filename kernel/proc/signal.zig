@@ -228,7 +228,9 @@ pub fn sendSignalInfoResult(target_tid: u32, signum: u32, info: siginfo.Info) i6
             // handler 在恢复后投递。Only SIGKILL (and SIGCONT) act on a stopped task at once; any other signal, fatal or handled, stays pending
             // until SIGCONT (Linux, measured: SIGTERM leaves a stopped process in T, then it dies or runs its handler after the continue).
             if (signum == SIGCONT) continueTask(t);
-            if (signum == SIGKILL and t.stopped) t.stopped = false;
+            // SIGKILL ends a stop, but only once it is pending: a task stopped inside clone() that saw `stopped` clear first would
+            // go on to create its thread before it noticed the kill (clone.zig checks for a fatal signal after the stop).
+            const kill_ends_stop = signum == SIGKILL and t.stopped;
             // Linux sig_ignored: an ignored signal the target does not block is dropped here, after SIGCONT has continued it.
             if (ignoredAtSend(t, signum)) return 0;
             if (!recordSendInfo(t, signum, info)) return -11;
@@ -240,6 +242,7 @@ pub fn sendSignalInfoResult(target_tid: u32, signum: u32, info: siginfo.Info) i6
                 return 0;
             }
             _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
+            if (kill_ends_stop) @atomicStore(bool, &t.stopped, false, .release);
             // The target may have gone back to sleep between the check above and the bit: a wait loop that re-blocks after
             // checking for a pending stop would otherwise keep it pending forever (futex.zig pairs with this).
             if (stopsBlockedTarget(t, signum, @intCast(i))) {
@@ -286,7 +289,7 @@ fn ignoredAtSend(t: *task.Task, signum: u32) bool {
 /// one) and does not block it (SIGSTOP cannot be blocked), and `t` is asleep and is not the task running this call.
 fn stopsBlockedTarget(t: *task.Task, signum: u32, idx: u32) bool {
     if (defaultAction(signum) != .stop) return false;
-    if (t.stopped or t.state != .blocked) return false;
+    if (t.stopped or @import("sched_claim.zig").load(&t.state) != .blocked) return false;
     const sched = @import("sched.zig");
     if (sched.currentTaskIndex()) |cur| {
         if (cur == idx) return false;

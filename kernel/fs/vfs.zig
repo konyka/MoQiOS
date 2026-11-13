@@ -273,8 +273,13 @@ pub fn pipeRead(pipe_idx: u32, buf: [*]u8, count: usize, status_flags: u32) i64 
                 pipe_lock.release(flags);
                 return -1;
             }
+            // A default stop pending now is taken instead of sleeping: the task is already queued as .blocked, and the sender sets the
+            // pending bit before it looks at the state, so either this read-modify-write sees the stop or the sender sees .blocked and
+            // stops the task itself (the same handshake futex waits use). The stop returns after SIGCONT and the loop reads again.
+            _ = @atomicRmw(u64, &current_task.pending_signals, .Or, 0, .seq_cst);
+            const stop_now = sig_mod.pendingStop(current_task);
             pipe_lock.release(flags);
-            sched.rescheduleAfterBlock();
+            if (!(stop_now and sig_mod.stopWhileWaiting(current_task))) sched.rescheduleAfterBlock();
             // A signal or timeout can make this task runnable without touching
             // the pipe queue. Detach in either case before rechecking or
             // returning, so no waker can retain this stack address.
@@ -546,12 +551,15 @@ pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u3
             pipe_lock.release(flags);
             return if (n > 0) @intCast(n) else -1;
         }
+        // A pending default stop is taken here rather than slept on (see pipeRead).
+        _ = @atomicRmw(u64, &cur.pending_signals, .Or, 0, .seq_cst);
+        const stop_now = sig_mod.pendingStop(cur);
         pipe_lock.release(flags);
         if (n > before) {
             const epoll_w = @import("../net/epoll.zig");
             epoll_w.epollNotify(.pipe_read, pipe_idx, epoll_w.EPOLLIN);
         }
-        sched.rescheduleAfterBlock();
+        if (!(stop_now and sig_mod.stopWhileWaiting(cur))) sched.rescheduleAfterBlock();
         const cleanup = pipe_lock.acquire();
         unlinkPipeWriteWaiterLocked(pipe_idx, node);
         pipe_lock.release(cleanup);

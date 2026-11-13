@@ -11493,7 +11493,10 @@ test "capget/capset speak Linux's header versions and capability numbers, and st
 test "only SIGKILL takes a task out of the stopped state at once; other fatal or handled signals wait for SIGCONT" {
     // hello261: SIGTERM sent to a stopped process cleared the stop and killed it on the spot; on Linux it stays T until SIGCONT.
     const sg = kt.signal_source;
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, sg, "if (signum == SIGKILL and t.stopped) t.stopped = false;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, sg, "if (signum == SIGKILL and t.stopped) t.stopped = false;"));
+    // The single-target path clears the stop only after the SIGKILL bit is pending (hello286 M: a task stopped in clone()).
+    try std.testing.expect(std.mem.indexOf(u8, sg, "const kill_ends_stop = signum == SIGKILL and t.stopped;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sg, "if (kill_ends_stop) @atomicStore(bool, &t.stopped, false, .release);") != null);
     try std.testing.expect(std.mem.indexOf(u8, sg, "defaultAction(signum) == .terminate and t.stopped") == null);
 }
 

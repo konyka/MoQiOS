@@ -115,7 +115,7 @@ pub fn waitpidUsage(pid_raw: u64, status_ptr: u64, options: u32, usage_out: ?*cp
             },
         }
 
-        while (@as(*volatile bool, @ptrCast(&parent.waiting_for_child)).* and !sig_mod.pendingActionable(parent)) {
+        while (@as(*volatile bool, @ptrCast(&parent.waiting_for_child)).* and !sig_mod.pendingActionable(parent) and !sig_mod.pendingStop(parent)) {
             asm volatile ("sti");
             asm volatile ("hlt" ::: .{ .memory = true });
         }
@@ -153,6 +153,9 @@ pub fn waitpidUsage(pid_raw: u64, status_ptr: u64, options: u32, usage_out: ?*cp
         // or report EINTR so the handler can run on return.
         if (sig_mod.pendingFatal(parent)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
         if (sig_mod.pendingActionable(parent)) return -4; // -EINTR
+        // A default stop is not "actionable", but a parent that goes back to sleep with one pending never stops and its group stop
+        // never completes. Take it here; the sender can only stop a task it already sees blocked.
+        if (sig_mod.pendingStop(parent)) _ = sig_mod.stopWhileWaiting(parent);
         // Non-target child exit (or spurious wake): loop and re-block.
     }
 }
@@ -217,7 +220,7 @@ pub fn waitid(idtype: u32, id: u64, infop: u64, options: u32, ru: u64) i64 {
         task_mod.kickChildCpus(parent.tid, parent.wait_cpu);
         sched_mod.requestReschedule();
 
-        while (@as(*volatile bool, @ptrCast(&parent.waiting_for_child)).* and !sig_mod.pendingActionable(parent)) {
+        while (@as(*volatile bool, @ptrCast(&parent.waiting_for_child)).* and !sig_mod.pendingActionable(parent) and !sig_mod.pendingStop(parent)) {
             asm volatile ("sti");
             asm volatile ("hlt" ::: .{ .memory = true });
         }
@@ -231,6 +234,8 @@ pub fn waitid(idtype: u32, id: u64, infop: u64, options: u32, ru: u64) i64 {
         if (collectWaitid(cur_idx, req)) |got| return publishWaitid(infop, ru, got);
         if (sig_mod.pendingFatal(parent)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
         if (sig_mod.pendingActionable(parent)) return -4;
+        // A default stop is not "actionable"; take it before re-blocking or the group stop never completes (see waitpid above).
+        if (sig_mod.pendingStop(parent)) _ = sig_mod.stopWhileWaiting(parent);
     }
 }
 
