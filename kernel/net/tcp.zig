@@ -3521,6 +3521,7 @@ fn tcpRecvBlockingWait(tcb_idx: u32, buf: [*]u8, len: u32, nonblock: bool) i64 {
     var deadline_set = false;
     while (true) {
         var node: RecvWaitNode = .{ .task_idx = 0 };
+        var stop_now = false;
         const cur_idx = sched.currentTaskIndex() orelse return -1;
         {
             const lock_flags = tcp_lock.acquire();
@@ -3548,10 +3549,16 @@ fn tcpRecvBlockingWait(tcb_idx: u32, buf: [*]u8, len: u32, nonblock: bool) i64 {
             recv_waiters[tcb_idx] = &node;
             task_mod.blockTask(cur_idx);
             if (deadline) |d| armRecvDeadline(cur_idx, d);
+            // A default stop pending now is taken instead of sleeping (the handshake pipeRead uses): the task is .blocked and
+            // queued, and the sender sets the pending bit before it looks at the state.
+            _ = @atomicRmw(u64, &task_mod.getTask(cur_idx).?.pending_signals, .Or, 0, .seq_cst);
+            stop_now = sig_mod.pendingStop(task_mod.getTask(cur_idx).?);
         }
 
-        sched.forceReschedule();
-        sched.repairCurrentAfterBlock();
+        if (!(stop_now and sig_mod.stopWhileWaiting(task_mod.getTask(cur_idx).?))) {
+            sched.forceReschedule();
+            sched.repairCurrentAfterBlock();
+        }
 
         {
             const lock_flags = tcp_lock.acquire();
@@ -3588,6 +3595,7 @@ fn waitSendSpace(tcb_idx: u32, st: *SendWait) i64 {
     const tsc = @import("../arch/arch.zig").tsc;
 
     var node: RecvWaitNode = .{ .task_idx = 0 };
+    var stop_now = false;
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     {
         const lock_flags = tcp_lock.acquire();
@@ -3613,10 +3621,14 @@ fn waitSendSpace(tcb_idx: u32, st: *SendWait) i64 {
         send_waiters[tcb_idx] = &node;
         task_mod.blockTask(cur_idx);
         if (st.deadline) |d| armRecvDeadline(cur_idx, d);
+        _ = @atomicRmw(u64, &task_mod.getTask(cur_idx).?.pending_signals, .Or, 0, .seq_cst);
+        stop_now = sig_mod.pendingStop(task_mod.getTask(cur_idx).?);
     }
 
-    sched.forceReschedule();
-    sched.repairCurrentAfterBlock();
+    if (!(stop_now and sig_mod.stopWhileWaiting(task_mod.getTask(cur_idx).?))) {
+        sched.forceReschedule();
+        sched.repairCurrentAfterBlock();
+    }
 
     {
         const lock_flags = tcp_lock.acquire();

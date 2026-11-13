@@ -8332,7 +8332,22 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - 第五批（epoll 已改，内核 23:20）：SMP=1 和两份 SMP=4 `EXIT=0`、0 FAIL；SMP=2 那份卡在 hello300 的消息队列一段：日志停在 `[posix_mq] created mq=/h300q` 之后的 `[fork] parent=9270 child=9273`，此后 15 分钟没有输出。QEMU 没有开 gdb 端口，没有抓到现场。随后用同一内核定向 SMP=2 跑了 29 份（其中 6 份在 fork 前后、10 份在打开队列和每轮前后加了标记），全部通过，没有复现。
   - 最终一批：去掉标记后同一内核四份并行（SMP 1/4/4/2，超时 1400 秒）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello300 都是 PASS，hello286、hello288、hello290–hello299 都通过。
 - 如实的局限：
-  1. `nanosleep`、TCP、SysV 信号量和消息、`ipc.zig` 的同步 IPC 的等待没有改。hello300 的 `nanosleep` 在所有运行里都是 200/200，没有失败证据；TCP 等其余几种没有测试覆盖。epoll 的每次睡下（包括第一次）都经过循环里那一处，所以只改一处就够了。
+  1. `nanosleep`、TCP、SysV 信号量和消息、`ipc.zig` 的同步 IPC 的等待没有改。（hello301：TCP 和 SysV 信号量已改，见该节。）hello300 的 `nanosleep` 在所有运行里都是 200/200，没有失败证据；TCP 等其余几种没有测试覆盖。epoll 的每次睡下（包括第一次）都经过循环里那一处，所以只改一处就够了。
   2. 竞争段是概率测试：失败只在 SMP=4 上出现，而且不是每份都出现。通过不能证明窗口完全关闭，只说明这几份没有复现。
   3. 第五批 SMP=2 那次卡在消息队列一段的 fork 之后，原因不明，之后 29 份定向和最终一批都没有复现。它可能和这次的改动有关（消息队列的等待改了），也可能是 fork 本身的偶发问题，现有证据分不开。
 - 顺带修的测试：hello290 A/B 原来要求阻塞调用至少等 200 ms。本节第二批完整 smoke 的一份 SMP=4 里 B 只等了 131 ms 就成功返回（`-11` 之后 `r 0`，CPU 2 ms），原因是宿主机负载下父进程开始等待时持有者的 300 ms 已经过去一大半，这是计时假设，不是锁的错误。断言改为：持有者解锁前先把解锁时刻写进管道，父进程的调用必须在这个时刻之后才返回，输出里多了“解锁后多少 ms”。宿主机 Linux 两次通过（0 ms）；目标机定向 SMP=4、SMP=2 各一份通过（解锁后 1～2 ms 返回）。
+
+## TCP recv 和 SysV semop 的等待漏掉落在睡下途中的默认停止（hello301，已修）
+
+- 起因：hello300 一节的局限 1。TCP 的接收（`tcpRecvBlocking`）、发送腾空间的等待（`waitSendSpace`）和 SysV `semop` 的等待睡下前后只看 `pendingActionable`，`SIGSTOP` 落在挂上等待栈之后、真正让出 CPU 之前时，发送端看到的状态还不是 `.blocked`，只置待处理位，等待端随后睡下，停止要等下一次唤醒才处理。
+- Linux 依据：`signal_wake_up` 唤醒处于 `TASK_INTERRUPTIBLE` 的任务，等待返回 `-ERESTARTSYS`，任务在返回用户态前处理停止，之后重启调用。宿主机实测（以 `gcc -DHOST` 跑 hello301，普通和 `taskset -c 0` 都通过）：TCP `recv` 和 SysV `semop` 两种等待，每种 30 轮阻塞中停止（`0x137f`、停止期间不写、`0xffff`、之后等待完成）和 200 轮事件之后的可变延迟停止，全部通过。
+- 红灯：未修改的内核（`1281ce9`，hello300 的改动已在里面）上并行三份定向 SMP=4（日志开头 `spawned hello2`、`spawned hello301`）：一份 TCP `recv` 196/200、一份 116/200，第三份 200/200 通过；SysV `semop` 三份都是 200/200。最初的单份 SMP=4、SMP=2 也都能通过，所以这个窗口在 TCP 上是概率出现的。SysV 没有红灯证据，是按同一个窗口推出的预防性改动。
+- 实现：三处等待都改成 `pipeRead` 的握手——状态置为 `.blocked`、节点在等待队列上之后，用一次 `@atomicRmw(.Or, 0)` 读待处理位，`pendingStop` 为真就释放锁、`stopWhileWaiting` 原地停下，否则照常让出 CPU。发送端先置位再看状态，两边至少有一边处理这次停止。
+  - `kernel/net/tcp.zig` `tcpRecvBlocking` 和 `waitSendSpace`。
+  - `kernel/ipc/sysv_sem.zig` `semop` 的等待。
+- 绿灯：目标机定向 SMP=4 三份并行、SMP=2 一份（日志开头 `spawned hello2`、`spawned hello301`）全部通过，两种等待都是 30/30 和 200/200。`zig build`、`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello301 都是 PASS，hello286、hello288、hello290–hello300 都通过。
+- 如实的局限：
+  1. SysV `semop` 没有红灯，是推出来的预防性改动。
+  2. 竞争段是概率测试：通过不能证明窗口完全关闭，只说明这几份没有复现。改完后 SMP=4 三份并行通过，样本不大。
+  3. `nanosleep` 和 `ipc.zig` 的同步 IPC 等待没有改。

@@ -206,9 +206,15 @@ pub fn semop(semid: u32, sem_num: u32, op: i16) i64 {
         s.wait_queue = &node;
         s.waiter_count += 1;
         cur_task.state = .blocked;
+        // A default stop pending now is taken instead of sleeping (the handshake pipeRead uses): the task is .blocked and queued,
+        // and the sender sets the pending bit before it looks at the state.
+        _ = @atomicRmw(u64, &cur_task.pending_signals, .Or, 0, .seq_cst);
+        const stop_now = @import("../proc/signal.zig").pendingStop(cur_task);
         sem_lock.release(flags);
-        sched.forceReschedule();
-        sched.repairCurrentAfterBlock(); // forceReschedule may return without switching
+        if (!(stop_now and @import("../proc/signal.zig").stopWhileWaiting(cur_task))) {
+            sched.forceReschedule();
+            sched.repairCurrentAfterBlock(); // forceReschedule may return without switching
+        }
 
         const flags2 = sem_lock.acquire();
         // Our node lives on this stack: take it off the queue unless a waker
