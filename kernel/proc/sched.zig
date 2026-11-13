@@ -330,7 +330,7 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
         _ = vfs.writebackTimerTick();
         // Drive timerfd expiration checks
         const timerfd = @import("../ipc/timerfd.zig");
-        timerfd.timerTick(idt.getTickCount());
+        timerfd.timerTick(@import("../arch/arch.zig").tsc.nanos());
         // Drive POSIX timer expiration checks
         const posix_timer = @import("../ipc/posix_timer.zig");
         posix_timer.timerTick(@import("../arch/arch.zig").tsc.nanos());
@@ -626,7 +626,7 @@ fn bspTimedWaitTick() void {
     @import("../ipc/posix_mq.zig").timerTick(now_ns);
     @import("../net/epoll.zig").timerTick(now_ns);
     @import("../net/tcp.zig").recvTimerTick(now_ns);
-    @import("../ipc/timerfd.zig").timerTick(now_tick);
+    @import("../ipc/timerfd.zig").timerTick(now_ns);
     @import("../ipc/posix_timer.zig").timerTick(now_ns);
     @import("../ipc/ipc.zig").timeoutTick(now_tick);
     alarmTimerTick(now_ns);

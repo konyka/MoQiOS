@@ -6811,6 +6811,35 @@ test "time policy: timespec→ns guards overflow and invalid fields" {
     try std.testing.expectEqual(@as(?u64, 999_999_999), time_policy.timespecToNs(0, 999_999_999));
 }
 
+test "time policy: a periodic timer forwarded past now counts every ended interval and keeps its phase" {
+    // hello291 D: a 20 ms timerfd counted 4 expirations over 210 ms when it re-armed from the tick that noticed it.
+    const f = time_policy.forwardPeriodic(1000, 20, 1000);
+    try std.testing.expectEqual(@as(u64, 1), f.count);
+    try std.testing.expectEqual(@as(u64, 1020), f.next);
+    // A tick 55 late: the expiries at 1000, 1020 and 1040 have all ended; the next is 1060, not 1075.
+    const late = time_policy.forwardPeriodic(1000, 20, 1055);
+    try std.testing.expectEqual(@as(u64, 3), late.count);
+    try std.testing.expectEqual(@as(u64, 1060), late.next);
+    // Exactly on an expiry counts it and moves to the one after.
+    const on = time_policy.forwardPeriodic(1000, 20, 1040);
+    try std.testing.expectEqual(@as(u64, 3), on.count);
+    try std.testing.expectEqual(@as(u64, 1060), on.next);
+    // The next expiry saturates instead of wrapping.
+    const big = time_policy.forwardPeriodic(std.math.maxInt(u64) - 5, 100, std.math.maxInt(u64) - 5);
+    try std.testing.expectEqual(@as(u64, 1), big.count);
+    try std.testing.expectEqual(std.math.maxInt(u64), big.next);
+}
+
+test "timerfd keeps its deadline in nanoseconds and is driven with tsc.nanos()" {
+    const tf = kt.timerfd_source;
+    try std.testing.expect(std.mem.indexOf(u8, tf, "expiry_tick") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tf, "getTickCount") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tf, "pub fn timerTick(now_ns: u64) void {") != null);
+    const sc = kt.sched_source;
+    try std.testing.expect(std.mem.indexOf(u8, sc, "timerfd.zig\").timerTick(now_ns);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sc, "timerfd.timerTick(idt.getTickCount());") == null);
+}
+
 test "time policy: ns→ticks reports overflow, ticks→ns saturates" {
     try std.testing.expectEqual(@as(?u64, 0), time_policy.nsToTicks(0, 100));
     try std.testing.expectEqual(@as(?u64, 1), time_policy.nsToTicks(1, 100));

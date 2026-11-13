@@ -306,6 +306,7 @@ pub const aarch64_trap_source = @embedFile("arch/aarch64/trap.zig");
 pub const riscv64_trap_source = @embedFile("arch/riscv64/trap.zig");
 pub const riscv64_start_source = @embedFile("arch/riscv64/start.zig");
 pub const sched_source = @embedFile("proc/sched.zig");
+pub const timerfd_source = @embedFile("ipc/timerfd.zig");
 pub const vfs_source = @embedFile("fs/vfs.zig");
 pub const fcntl_source = @embedFile("fs/fcntl.zig");
 pub const fcntl_policy = @import("fs/fcntl_policy.zig");

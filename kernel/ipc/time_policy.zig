@@ -46,6 +46,18 @@ pub fn nsToTicks(ns: u64, ticks_per_sec: u64) ?u64 {
     return ticks_from_sec + ticks_from_rem;
 }
 
+/// A periodic timer whose expiry `expiry` (ns) has been reached at `now`: how many intervals have ended (the one at `expiry` and every
+/// later one at or before `now`), and the first expiry after `now` on the same schedule, saturating. Linux hrtimer_forward keeps the
+/// phase the same way, so a check that comes late counts the expiries it missed instead of restarting the period.
+pub const Forward = struct { count: u64, next: u64 };
+pub fn forwardPeriodic(expiry: u64, interval: u64, now: u64) Forward {
+    if (interval == 0 or now < expiry) return .{ .count = if (now < expiry) 0 else 1, .next = expiry };
+    const extra = (now - expiry) / interval;
+    const count = extra +| 1;
+    const step = std.math.mul(u64, count, interval) catch return .{ .count = count, .next = std.math.maxInt(u64) };
+    return .{ .count = count, .next = expiry +| step };
+}
+
 /// Scheduler ticks → nanoseconds, saturating at u64 max.
 pub fn ticksToNs(ticks: u64, ticks_per_sec: u64) u64 {
     const ns_per_tick = NS_PER_SEC / ticks_per_sec;

@@ -8058,7 +8058,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - POSIX 定时器到期时间改为 `tsc.nanos()` 纳秒（`expiry_ns`）。`timer_settime` 直接记 `现在 + 延迟`，`TIMER_ABSTIME` 先经 `time_policy.absoluteDeltaNs` 换成延迟；周期定时器的下一次是 `现在 + 间隔`；`timer_gettime` 和 `timer_settime` 的旧值都按纳秒报告剩余时间；BSP 时钟中断（以及旧调度路径的维护分支）用当前纳秒调 `posix_timer.timerTick`。删掉了不再使用的 tick 换算。
 - 绿灯：目标机定向 SMP=2 四份、SMP=4 两份 hello288 全部通过（日志开头 `spawned hello2`、`spawned hello288`），R 段 20 个定时器没有提前也没有丢失，最短用时 17.9～51.5 ms。`zig build test` 通过，三个架构都能构建。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello288 P 都是 `(1, exit 0)`，R 段都是“提前 0、丢失 0”（最短 18.7～31.6 ms），`timer_gettime` 读到 1233430535～1233815639 ns；hello282、hello286（J 段 60/60）都通过，hello228 的 `corrupted canaries` 都是 0。
 - 如实的局限：
-  1. timerfd 仍按 tick 计数到期，`timerfd_gettime` 报告的剩余时间是 10 ms 的整数倍；没有改，也没有新测试。
+  1. ~~timerfd 仍按 tick 计数到期，`timerfd_gettime` 报告的剩余时间是 10 ms 的整数倍；没有改，也没有新测试。~~（已改，见文末“timerfd 按 tick 计数到期”一节）
   2. 定时器仍由 BSP 的时钟中断检查，到期后最多晚一个 tick（约 10 ms）才发信号。
   3. 其它在系统调用里只靠 `forceReschedule()` 让出、不把自己标成 `.blocked` 的等待循环，同样会让所在 CPU 收不到时钟中断。~~这次只改了 `rt_sigtimedwait`，没有逐个排查。~~（`flock` 和 `fcntl F_SETLKW` 已改，见下一节；`devfs_nodes.mouseRead` 仍是忙让出，最多 100 次）
 
@@ -8107,3 +8107,28 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   2. `pipeReserveReadWait`（splice 读）在等待中不检查任何信号，没有改。
   3. socket、`epoll`、`nanosleep`、消息队列、eventfd、timerfd 的等待仍只检查 `pendingActionable`，同样的窗口还在。
   4. `clone` 遇到致命信号时返回 `EINTR`，不像 Linux 那样重启调用。进程反正会被杀掉，用户态看不到差别。
+
+## timerfd 按 tick 计数到期：剩余时间多报、一次性定时器提前醒、周期定时器少计次数（hello291，已修）
+
+- 起因：posix_timer 一节的局限 1。timerfd 的到期时间是调度 tick 计数（`expiry_tick`），设定值向上取整到 10 ms，剩余时间按 tick 折算。
+- Linux 依据：`3rd/linux-7.0.6/fs/timerfd.c` 用 hrtimer 计时。`timerfd_get_remaining`（175–185 行）按纳秒报告剩余时间，负值截到 0；周期定时器到期时用 `hrtimer_forward_now`（304 行）向前推进，保持原来的相位，并把错过的次数一起计入。宿主机 `gcc -DHOST` 跑 hello291 全部通过，`taskset -c 0` 下也通过：设好 1.234567891 s 后立刻读到 1234566622 ns；20 个 15 ms 定时器最短 15.008 ms；20 ms 的周期定时器 210 ms 内计 10 次。
+- 新测试 hello291：
+  - A：`timerfd_gettime` 和 `timerfd_settime` 的旧值不超过设定值，且与设定值相差在 5 ms 以内（旧值放宽到 50 ms）。
+  - B：20 个 15 ms 的一次性定时器，阻塞的 `read()` 都不提前返回。
+  - C：`TFD_TIMER_ABSTIME` 下 30 ms 后的 `CLOCK_MONOTONIC` 截止时间不提前到。
+  - D：20 ms 的周期定时器 210 ms 内计 9～11 次。
+- 红灯：未修改的内核上定向 SMP=2 一份（日志开头 `spawned hello2`、`spawned hello291`），A 两项、B、D 失败：
+  - A：剩余时间读到 1240000000 ns，比设定值多 5.4 ms，是 10 ms 的整数倍。
+  - B：20 次里 1 次提前醒，最短 11.199 ms。
+  - D：只计到 4 次。原来每次到期都从“注意到它的那个 tick”起重新算一个周期，周期本身也向上取整到 tick，所以 210 ms 里只剩 4 次。
+- 实现：
+  - `kernel/ipc/timerfd.zig`：`expiry_tick` 换成 `expiry_ns`（`tsc.nanos()` 纳秒）。`timerfd_settime` 记“现在 + 延迟”；`TFD_TIMER_ABSTIME` 先经 `time_policy.absoluteDeltaNs` 换成延迟，已过去的截止时间立刻到期。`currentValue` 统一给 `gettime` 和 `settime` 的旧值使用，剩余时间按纳秒报告，截止时间已过但 tick 还没处理时报 0。解除（`it_value` 为 0）时同时清零已累计的到期次数。删掉了 tick 换算和 `TICKS_PER_SEC`。
+  - 周期到期改用新的纯函数 `time_policy.forwardPeriodic(expiry, interval, now)`：返回已经结束的周期数，以及按原相位排在 `now` 之后的下一次到期，乘法溢出时饱和。
+  - `kernel/proc/sched.zig`：`bspTimedWaitTick` 和旧调度路径的维护分支改用 `tsc.nanos()` 调 `timerfd.timerTick`。
+  - 宿主机测试：`forwardPeriodic` 的四种情况（刚到期、晚 55、正好落在到期点、溢出饱和），以及 timerfd 源码里不再有 `expiry_tick`/`getTickCount`、`sched.zig` 按纳秒驱动它。`kernel/host_test.zig` 新增 `timerfd_source`。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份（日志开头 `spawned hello2`、`spawned hello291`）全部通过：A 读到 1233414573 / 1233717383 ns；B 无提前，最短 20.897 / 19.347 ms；C 46.3 / 53.7 ms；D 11 / 10 次。这两份跑的是“截止时间已过报 1 ns”的版本，之后改成和 Linux 一样报 0，完整 smoke 覆盖的是最终版本。`zig build`、`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello291 都是 PASS：A 读到 1234505547～1234509329 ns（旧值 1231114029～1232020273 ns）；B 无提前，最短 21.7～24.9 ms；C 52.0～59.2 ms；D 9～11 次。hello286、hello288、hello290 都通过。
+- 如实的局限：
+  1. 到期仍由 BSP 的时钟中断检查，最多晚一个 tick（约 10 ms）才唤醒读者，B 段最短 19～25 ms 就是这个原因。
+  2. `CLOCK_REALTIME` 的绝对时间在设定时换算成单调时钟上的延迟，之后修改墙上时间不会影响已设好的定时器，也没有实现 `TFD_TIMER_CANCEL_ON_SET`。
+  3. timerfd 的阻塞 `read()` 仍只检查 `pendingActionable`，默认停止信号的窗口还在（同 futex 一节的局限 1）。

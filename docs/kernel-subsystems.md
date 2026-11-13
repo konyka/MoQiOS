@@ -581,7 +581,8 @@ wakeup 前释放 pin；slot 只有在 zombie、无 operation refs 且满足调�
 - **超时扫描每 tick 一次**：BSP 每个硬件 tick 运行 `bspTimedWaitTick`（futex / POSIX mq /
   epoll / timerfd / POSIX timer / alarm / itimer / **MoqIPC 超时**——§6.51 起
   timeoutTick 仅由此处驱动，`bspSlowMaintenance` 不再重复扫描），timerfd 与 POSIX timer 用
-  `lib/deadline_hint.zig` 无锁门控；reap、writeback、TCP、ICMPv6 留在
+  `lib/deadline_hint.zig` 无锁门控；timerfd 的到期时间是 `tsc.nanos()` 纳秒（`expiry_ns`），周期 timerfd 按
+  `time_policy.forwardPeriodic` 保持相位、补齐错过的到期次数（hello291）；reap、writeback、TCP、ICMPv6 留在
   `bspSlowMaintenance`（100 ms）。epoll 超时改用 TSC 纳秒截止时间，阻塞时立即让出 CPU。
 - **RT 带宽限流（2026-10 第二轮）**：每 CPU 每 100 个硬件 tick 允许 RT 类跑 95 tick
   （`rt_bandwidth_policy`）。空转的 SCHED_FIFO 过了预算必须把 CPU 给 OTHER。RR 保持 POSIX：
