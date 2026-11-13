@@ -917,8 +917,9 @@ test "POSIX MQ descriptor policy validates access and flags" {
     try std.testing.expect(posix_mq_descriptor_policy.accessAllows(posix_mq_descriptor_policy.O_RDWR, .send));
     try std.testing.expect(posix_mq_descriptor_policy.accessAllows(posix_mq_descriptor_policy.O_RDWR, .receive));
     try std.testing.expectEqual(posix_mq_descriptor_policy.O_NONBLOCK, posix_mq_descriptor_policy.statusFlags(posix_mq_descriptor_policy.O_NONBLOCK | posix_mq_descriptor_policy.O_CLOEXEC));
-    try std.testing.expect(posix_mq_descriptor_policy.sigevNotifyValid(0));
-    try std.testing.expect(!posix_mq_descriptor_policy.sigevNotifyValid(1));
+    try std.testing.expect(posix_mq_descriptor_policy.sigevNotifyValid(posix_mq_descriptor_policy.SIGEV_SIGNAL));
+    try std.testing.expect(posix_mq_descriptor_policy.sigevNotifyValid(posix_mq_descriptor_policy.SIGEV_NONE));
+    try std.testing.expect(!posix_mq_descriptor_policy.sigevNotifyValid(posix_mq_descriptor_policy.SIGEV_THREAD));
 }
 
 test "CLONE_FILES preserves MQ handle usability until shared sidecar ownership exists" {
@@ -1082,9 +1083,11 @@ test "unlinked MQ closes can reclaim a nonempty queue" {
 }
 
 test "POSIX MQ notify registration is exclusive" {
-    try std.testing.expect(std.mem.indexOf(u8, kt.posix_mq_source, "const notify_kind = bo.readU32Le(buf[12..16])") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.posix_mq_source, "notify_kind = bo.readU32Le(buf[12..16])") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.posix_mq_source, "sigevNotifyValid(notify_kind)") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.posix_mq_source, "return -16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.posix_mq_source, "notifyOwnedBy(q, owner_idx)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.posix_mq_source, "descriptor_policy.notifySends(notify_kind, notify_signo)") != null);
 }
 
 test "POSIX MQ getsetattr invalid descriptor releases the lock" {

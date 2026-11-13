@@ -8176,5 +8176,29 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份（日志开头 `spawned hello2`、`spawned hello293`）全部通过：A `si_code` -3、pid 与 `getpid()` 相同、uid 1000、值 0x55aa；B 不再注册返回 -11；C 非空时注册和排空都不发信号，排空后再发送再次投递，`si_code` -3、值 0x55aa。`zig build` 通过。
 - 完整 smoke：四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello293 都是 PASS：A `si_code` -3、pid 与 `getpid()` 相同、uid 1000、值 0x55aa；B 不再注册返回 -11；C 非空时注册和排空都不发信号，排空后再发送再次投递，`si_code` -3、值 0x55aa。hello286、hello288、hello290、hello291、hello292 都通过。
 - 如实的局限：
-  1. `SIGEV_THREAD` 和 `SIGEV_NONE` 仍不支持，`mq_notify` 只接受 `SIGEV_SIGNAL`。
+  1. ~~`SIGEV_NONE` 仍不支持，`mq_notify` 只接受 `SIGEV_SIGNAL`。~~（`SIGEV_NONE` 已改，见下一节；`SIGEV_THREAD` 仍不支持）
   2. 没有用户命名空间，`si_uid` 是内核记录的 uid，不做 `from_kuid_munged` 那一层映射。
+
+## `mq_notify` 只接受 `SIGEV_SIGNAL`，信号 0 被拒绝，注销不看是谁注册的，关闭描述符也不移除注册（hello294，已修）
+
+- 起因：hello293 一节的局限 ①，以及对照 Linux `do_mq_notify` / `mqueue_flush_file` 时看到的另外三处差异。
+- Linux 依据：`3rd/linux-7.0.6/ipc/mqueue.c`。`do_mq_notify`（约 1276–1365 行）接受 `SIGEV_NONE`、`SIGEV_SIGNAL`、`SIGEV_THREAD`；`SIGEV_SIGNAL` 只要求 `valid_signal`，信号 0 合法。`__do_notify`（约 789–823 行）对 `SIGEV_NONE` 什么都不发，对 `SIGEV_SIGNAL` 且 `sigev_signo == 0` 直接跳过，两种情况都会在消息到达后注销。`notification == NULL` 时只有 `notify_owner == task_tgid(current)` 才 `remove_notification`，否则返回 0。`mqueue_flush_file`（约 663 行）在关闭注册所用的文件时移除注册。宿主机实测（`/tmp/mqp6.c`、`/tmp/mqp7.c`，再以 `gcc -DHOST` 跑 hello294，普通和 `taskset -c 0` 都通过）：
+  - `SIGEV_NONE` 注册成功，再注册是 `EBUSY`（-16）；消息到达后没有信号，注册被消耗，之后可以再注册。
+  - 信号 0 注册成功（不是 `EINVAL`），同样不发信号、被消耗。
+  - 子进程 `mq_notify(NULL)` 返回 0，替换是 `EBUSY`（16）；父进程仍收到原来的信号。
+  - 同一进程用另一个描述符 `mq_notify(NULL)` 能注销，下一条消息没有信号。
+  - 关闭做出注册的描述符后，另一个描述符上的发送不再有信号。
+- 红灯：未改内核上定向 SMP=2 一份（日志开头 `spawned hello2`、`spawned hello294`）：
+  - A：`SIGEV_NONE` 失败（被当成非法），随后的注册成功并发了信号 10。
+  - B：信号 0 返回 -22。
+  - C：子进程把注册注销掉了（退出状态 `0x200`），父进程等信号超时（-11）。
+  - E：关闭注册描述符后信号 10 仍然到达。
+  - D 在旧内核上碰巧通过：同一进程的 `mq_notify(NULL)` 本来就会清掉注册。
+- 实现：
+  - `kernel/ipc/posix_mq_descriptor_policy.zig`：`sigevNotifyValid` 接受 `SIGEV_NONE`（1），仍拒绝 `SIGEV_THREAD`（2）；`notifyUnregister` 只在调用者拥有注册时移除；`notifySends` 只在 `SIGEV_SIGNAL` 且信号号大于 0 时为真。宿主机测试并入原有一条。
+  - `kernel/ipc/posix_mq.zig`：记下 `notify_kind` 和做出注册的 open description。`mqNotify` 不再拒绝信号 0；`NULL` 经 `notifyOwnedBy`（注册者或其同线程组的任务，fork 出的子进程不算）才 `clearNotify`。投递前用 `notifySends` 决定发不发，不发也消耗注册。`closeHandleLocked` 在该 description 的最后一个引用关闭时，若注册是通过它做出的，就移除注册。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份（日志开头 `spawned hello2`、`spawned hello294`）全部通过：A `EBUSY` -16、无信号 -11、消耗后可再注册；B 信号 0 注册成功、无信号、被消耗；C 子进程状态 `0x0`，父进程仍收到信号 10；D、E 注销后都是 -11。`zig build` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello294 都是 PASS。hello286、hello288、hello290、hello291、hello292、hello293 都通过。
+- 如实的局限：
+  1. `SIGEV_THREAD` 仍不支持（需要 netlink 通知套接字）。
+  2. 注册所有权按线程组 id 比较，没有 Linux 的 `self_exec_id`：同一进程 `exec` 之后，旧注册如果描述符没关，仍可能投给新镜像。

@@ -6,6 +6,8 @@ pub const O_RDWR: u32 = 2;
 pub const O_NONBLOCK: u32 = 0o4000;
 pub const O_CLOEXEC: u32 = 0o2000000;
 pub const SIGEV_SIGNAL: u32 = 0;
+pub const SIGEV_NONE: u32 = 1;
+pub const SIGEV_THREAD: u32 = 2;
 pub const ACCESS_MASK: u32 = 3;
 pub const O_ACCMODE: u32 = ACCESS_MASK;
 pub const O_CREAT: u32 = 0o100;
@@ -55,8 +57,22 @@ pub fn survivesExec(cloexec: bool) bool {
     return !cloexec;
 }
 
+/// SIGEV_THREAD needs a netlink socket this kernel has no path for, so it stays rejected. SIGEV_NONE is a real registration
+/// that simply sends nothing (Linux do_mq_notify).
 pub fn sigevNotifyValid(kind: u32) bool {
-    return kind == SIGEV_SIGNAL;
+    return kind == SIGEV_SIGNAL or kind == SIGEV_NONE;
+}
+
+/// Linux do_mq_notify: a NULL notification removes the registration only when the caller owns it, and returns success either way.
+/// Replacing someone else's registration is EBUSY.
+pub fn notifyUnregister(caller_owns: bool) enum { removed, kept } {
+    return if (caller_owns) .removed else .kept;
+}
+
+/// Linux __do_notify: SIGEV_NONE sends nothing, and SIGEV_SIGNAL with signo 0 is accepted (valid_signal allows 0) but skipped at
+/// delivery. Either way the first message consumes the registration.
+pub fn notifySends(kind: u32, signo: i32) bool {
+    return kind == SIGEV_SIGNAL and signo > 0;
 }
 
 test "MQ descriptor policy isolates access and exec flags" {
@@ -71,6 +87,11 @@ test "MQ descriptor policy isolates access and exec flags" {
     try std.testing.expect(survivesExec(false));
     try std.testing.expect(!survivesExec(true));
     try std.testing.expect(sigevNotifyValid(SIGEV_SIGNAL));
-    try std.testing.expect(!sigevNotifyValid(1));
-    try std.testing.expect(!sigevNotifyValid(2));
+    try std.testing.expect(sigevNotifyValid(SIGEV_NONE));
+    try std.testing.expect(!sigevNotifyValid(SIGEV_THREAD));
+    try std.testing.expect(notifyUnregister(true) == .removed);
+    try std.testing.expect(notifyUnregister(false) == .kept);
+    try std.testing.expect(notifySends(SIGEV_SIGNAL, 10));
+    try std.testing.expect(!notifySends(SIGEV_SIGNAL, 0));
+    try std.testing.expect(!notifySends(SIGEV_NONE, 10));
 }
