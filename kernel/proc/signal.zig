@@ -28,9 +28,30 @@ fn recordSendInfo(t: *task.Task, signum: u32, info: siginfo.Info) bool {
     }
     const flags = rt_queue_lock.acquire();
     defer rt_queue_lock.release(flags);
-    if (t.rt_queue.push(signum, info)) return true;
+    if (sigqueue.withinSigpendingLimit(queuedForUid(t.uid), sigpendingLimit(t)) and t.rt_queue.push(signum, info)) return true;
     return sigqueue.pendingWithoutInfoWhenFull(info.code);
 }
+
+/// Real-time instances queued on every live task whose real uid is `uid` (Linux charges them to the uid's ucounts). Caller holds
+/// rt_queue_lock.
+fn queuedForUid(uid: u32) u64 {
+    var n: u64 = 0;
+    for (0..task.MAX_TASKS) |i| {
+        const o = task.getTask(@intCast(i)) orelse continue;
+        if (o.state == .zombie or o.uid != uid) continue;
+        n += o.rt_queue.count;
+    }
+    return n;
+}
+
+/// The target's RLIMIT_SIGPENDING soft limit.
+fn sigpendingLimit(t: *task.Task) u64 {
+    const rl = @import("rlimit.zig");
+    const slot = rl.recordedSlot(RLIMIT_SIGPENDING) orelse return rl.RLIM_INFINITY;
+    return t.lim().recorded.get(slot).cur;
+}
+
+const RLIMIT_SIGPENDING: u32 = 11;
 
 /// Called after the pending bit of `signum` was cleared to take one instance:
 /// stage the oldest queued instance's siginfo in sig_info (where delivery reads

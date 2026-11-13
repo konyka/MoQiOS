@@ -7618,7 +7618,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - `sigaction` 装 `SIG_IGN`（或对默认忽略的信号装 `SIG_DFL`）时丢弃待处理位与所有排队实例（`discardPending`）。
   - `sigreturn` 之后检查待处理信号（`checkSignalsAfterSigreturn`），把下一个处理函数的帧压在**恢复后的**上下文上。原来 sigreturn 返回时不检查，处理函数要等下一次系统调用或时钟中断才再跑，hello274 E 里 `sigprocmask` 返回时只跑了 2 次（Linux 是 4 次）。
 - 改后 hello274 全部通过，与 hello136、hello137 一起单独跑两份，全部 PASS；host 1148/1148。
-- 如实的局限：①队列容量 32，不读 `RLIMIT_SIGPENDING`；②POSIX 定时器和 `mq_notify` 的信号仍直接置位，不排队、不带 siginfo（与改之前一样）；③线程组共享的待处理集合仍不存在（这个内核的待处理信号按任务记），与本节无关。
+- 如实的局限：①~~队列容量 32，不读 `RLIMIT_SIGPENDING`~~（已实现，见文末 hello288 Q 一节；每线程队列仍是 32）；②POSIX 定时器和 `mq_notify` 的信号仍直接置位，不排队、不带 siginfo（与改之前一样）；③线程组共享的待处理集合仍不存在（这个内核的待处理信号按任务记），与本节无关。
 - 门禁记录（如实）：本节改动后的第一轮本地完整 smoke（SMP=1 一份、SMP=2 两份，宿主机负载约 5，CPU 调速策略 powersave）三份都失败：都是 hello108（“RT task lost the CPU to reaping”），其中一份还有 hello107；SMP=2 的一份另在 hello210 的 `pthread_exit` → `dead_push`（`pthread.c:122`）处出现上文记录过的用户态崩溃（`r8 == 0`，地址 0x13f），之后超时。对照：上一次推送的 `1e19238` 上单独跑 hello108 三次，三次也都失败，回收窗口里最长的单次定时器中断 3.0–4.9 ms（阈值 4 ms），与新内核同一形状，所以 hello108 的失败与本节无关；新内核上 hello210 连跑三次都通过，崩溃没有复现，原因仍未查清（libc 本节没有改）。第二轮 SMP=1 通过；SMP=2 的一份 hello108/hello107/hello274 都通过，失败的是 hello174 C 的“没设 `SO_RCVBUF` 的接收方缓冲超过 20000 字节”。
 - hello174 C 的这一项是在 `fill()` 返回后立即读一次 `FIONREAD`，而本机回环的投递由时钟节拍推动，SMP=2 下接收方可能还没收完。改为最多等 5 秒、每 50 ms 推一次回环再读，并在失败时打印 `big_avail`、`big_total`（测试的写法问题，不是内核改动）。单独跑两份、每份两次，都通过。
 - 第三轮本地完整 smoke（hello174 改后）：SMP=1 一份、SMP=2 两份，全部 PASS。
@@ -7971,3 +7971,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2 一份、SMP=4 两份 hello262 全过（F 段 `(7, 3)`）。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello184、hello262、hello267、hello286、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
 - CI 记录（如实）：上一个提交 `573aaad`（hello184 F）的 CI 在 SMP=2 冒烟里 hello286 J 段失败（60 轮组停止只报告了 51 次，继续也是 51 次）。这一项不涉及 TCP，也不涉及本节改动；它是文档里已记录的 hello286 J 偶发项（之前本地见过 30/60），本地四份完整 smoke 里 hello286 都通过。根因没有查清，仍是开放项。
 - 如实的局限：①`SIGTTIN`/`SIGTTOU` 没有单独用例，走的是同一分支；②进程组发送仍按每个成员自己的掩码判断，没有 Linux 那种先放进共享集合再由不阻塞的线程取出的窗口。
+
+
+## 实时信号入队受 `RLIMIT_SIGPENDING` 限制（hello288 Q，已修）
+
+- 起因：实时信号队列一节的局限①。`RLIMIT_SIGPENDING` 只被记录、往返 `getrlimit`/`setrlimit`，发送路径不看它，一个 uid 可以一直排到每线程 32 个实例。
+- Linux 依据（`3rd/linux-7.0.6/kernel/signal.c`：`sig_get_ucounts`（402 行）先把该 uid 的计数加 1，超过 `task_rlimit(t, RLIMIT_SIGPENDING)`（424 行）就退回并拒绝；`__send_signal_locked`（1083 行）对实时信号从不放行这个限制。宿主机实测 `/tmp/sp2`：新用户命名空间里上限 5/10/20 分别成功 5/10/20 次；默认命名空间里少 1 次，因为同一 uid 的其它进程已经占了一个实例）：`rt_sigqueueinfo` 在达到上限时返回 `EAGAIN`（-11）；`kill` 一个实时信号在达到上限时仍成功并把信号标为待处理，只是丢掉 siginfo；排空之后又能再入队。
+- 红灯：hello288 新增 Q 段。修复前的内核（SMP=2）上子进程以 1 退出：软上限 3 时仍能继续入队。日志开头是 `spawned hello2`、`spawned hello288`。
+- 实现：`sigqueue_policy.withinSigpendingLimit`（宿主机测试 1 条，文件已登记在 `kernel/host_test.zig`）。`recordSendInfo` 在 `rt_queue_lock` 下统计该真实 uid 所有存活任务的 `rt_queue.count`，达到目标的软上限就不再入队；`kill`/`SI_KERNEL` 仍走原来的“队列满也置位、丢掉 siginfo”分支。每线程队列容量 32 不变，先到者为限。
+- 绿灯：宿主机 Linux 上 hello288 全过（含新用户命名空间一份）。目标机定向 SMP=2 一份、SMP=4 两份全过（Q 段子进程以 0 退出）。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello184、hello262、hello267、hello274、hello286、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
+- 如实的局限：①计数是本内核里该 uid 的全部任务，没有用户命名空间；②每线程队列仍是 32，软上限再高也排不进去；③标准信号在这里不占实例，不计入这个上限（Linux 的标准信号也会分配 sigqueue 记录）。

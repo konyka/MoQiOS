@@ -26,6 +26,14 @@ pub fn pendingWithoutInfoWhenFull(code: i32) bool {
     return code >= 0 or code == siginfo.SI_USER or code == siginfo.SI_KERNEL;
 }
 
+/// RLIMIT_SIGPENDING (Linux sig_get_ucounts, kernel/signal.c 402): a send may queue one more real-time instance only while the
+/// instances already queued for the target's real uid, across all its processes, stay below the target's soft limit. `limit` is
+/// RLIM_INFINITY (all ones) when unlimited.
+pub fn withinSigpendingLimit(queued_for_uid: u64, limit: u64) bool {
+    if (limit == ~@as(u64, 0)) return true;
+    return queued_for_uid < limit;
+}
+
 pub const Entry = struct {
     signo: u8 = 0,
     info: siginfo.Info = .{},
@@ -108,4 +116,11 @@ test "which full-queue sends still mark the signal pending" {
     try testing.expect(!pendingWithoutInfoWhenFull(siginfo.SI_QUEUE));
     try testing.expect(!pendingWithoutInfoWhenFull(siginfo.SI_TKILL));
     try testing.expect(isRealtime(32) and isRealtime(64) and !isRealtime(31) and !isRealtime(65));
+}
+
+test "RLIMIT_SIGPENDING counts every queued instance of the uid" {
+    try testing.expect(withinSigpendingLimit(4, 5));
+    try testing.expect(!withinSigpendingLimit(5, 5));
+    try testing.expect(!withinSigpendingLimit(0, 0));
+    try testing.expect(withinSigpendingLimit(1 << 40, ~@as(u64, 0)));
 }

@@ -12,7 +12,9 @@
  * a different signal tkill'd to a sibling stays. N: a real-time signal sent twice while every thread blocks it is taken, both
  * instances in send order, by the thread that unblocks it first. O: a signal that is ignored and not blocked is dropped when it is
  * sent, so sigtimedwait for it times out (EAGAIN); the same signal blocked is queued and sigtimedwait takes it. P: the same holds
- * for the signal of a POSIX timer that expires and of an mq_notify registration whose queue gets a message. */
+ * for the signal of a POSIX timer that expires and of an mq_notify registration whose queue gets a message. Q: RLIMIT_SIGPENDING
+ * caps the real-time instances queued for the uid: past it rt_sigqueueinfo is EAGAIN, raising the limit by 2 lets exactly 2 more in,
+ * kill() of a real-time signal at the limit still makes it pending, and draining the queue lets sends in again. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -26,6 +28,7 @@
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <mqueue.h>
+#include <sys/resource.h>
 static void print(const char *s) { fputs(s, stdout); fflush(stdout); }
 static long tgsq(long tgid, long tid, long sig, void *info) {
     long r = syscall(SYS_rt_tgsigqueueinfo, tgid, tid, sig, info);
@@ -78,6 +81,13 @@ static void mqdone(long q, const char *n) {
     mq_close(q);
     mq_unlink(n);
 }
+/* Sets only the soft limit: lowering the hard limit would keep an unprivileged process from raising it again. */
+static long setlim(long resource, unsigned long v) {
+    struct rlimit rl;
+    getrlimit(resource, &rl);
+    rl.rlim_cur = v;
+    return setrlimit(resource, &rl) < 0 ? -errno : 0;
+}
 #else
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
 #include "../lib/moqi_libc/include/stdio.h"
@@ -128,6 +138,13 @@ static long mqrecv(long q) {
 static void mqdone(long q, const char *n) {
     close((int)q);
     syscall1(187 /* mq_unlink */, (long)n);
+}
+/* Sets only the soft limit: lowering the hard limit would keep an unprivileged process from raising it again. */
+static long setlim(long resource, unsigned long v) {
+    unsigned long rl[2] = { 0, 0 };
+    syscall2(SYS_getrlimit, resource, (long)rl);
+    rl[0] = v;
+    return syscall2(SYS_setrlimit, resource, (long)rl);
 }
 #endif
 
@@ -751,6 +768,50 @@ int main(void) {
     if (pw != pc) {
         kill(pc, 9);
         waitpid(pc, &pst, 0);
+    }
+
+    /* Q: in a child that blocks every signal, RLIMIT_SIGPENDING 3 caps rt_sigqueueinfo of signal 40 (the count can be below 3 when
+     * another process of the uid has instances queued, as on the host); raising the limit to 5 lets exactly 2 more in. kill() of
+     * signal 41 at the limit still makes it pending (without its siginfo). After draining 40, a send is queued again. */
+    long qc = fork();
+    if (qc == 0) {
+        sigset_t qall;
+        sigfillset(&qall);
+        sigprocmask(SIG_SETMASK, &qall, (sigset_t *)0);
+        struct qinfo qq;
+        fill(&qq, SI_QUEUE_N, 1);
+        qq.signo = 40;
+        if (setlim(11 /* RLIMIT_SIGPENDING */, 3) != 0) _exit(10);
+        int first = 0;
+        while (first < 10 && sq(getpid(), 40, &qq) == 0) first++;
+        if (first < 1 || first > 3) _exit(1);
+        if (sq(getpid(), 40, &qq) != -11) _exit(1);
+        if (setlim(11, 5) != 0) _exit(11);
+        int more = 0;
+        while (more < 10 && sq(getpid(), 40, &qq) == 0) more++;
+        if (more != 2) _exit(2);
+        if (kill(getpid(), 41) != 0) _exit(3);
+        sigset_t qp;
+        sigemptyset(&qp);
+        sigpending(&qp);
+        if (!sigismember(&qp, 41)) _exit(3);
+        sigset_t w40;
+        sigemptyset(&w40);
+        sigaddset(&w40, 40);
+        struct timespec qz = { 0, 0 };
+        int drained = 0;
+        while (drained < 20 && stw(&w40, (void *)0, &qz) == 40) drained++;
+        if (drained != first + more) _exit(4);
+        _exit(sq(getpid(), 40, &qq) == 0 ? 0 : 5);
+    }
+    int qst = 0;
+    long qw = wait_for(qc, &qst, 0);
+    snprintf(msg, sizeof msg, "Q: RLIMIT_SIGPENDING caps queued real-time instances; kill still marks the signal pending (%ld, exit %d)",
+             qw == qc ? 1L : qw, (qst >> 8) & 0xff);
+    check(qw == qc && qst == 0, msg);
+    if (qw != qc) {
+        kill(qc, 9);
+        waitpid(qc, &qst, 0);
     }
 
     /* G/H: a stop and a continue queued for one thread of another process act on the whole process. */
