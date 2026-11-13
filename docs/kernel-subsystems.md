@@ -2081,13 +2081,15 @@ The native `Message` ABI is an exactly 256-byte extern struct: `sender:u64`, `re
 
 ### 5.8 POSIX 定时器 ✅ (v18.2)
 
-文件: `posix_timer.zig` (318 行)
+文件: `posix_timer.zig` (374 行)
 
 `TIMER_ABSTIME` 使用 timer 创建时选定的 clock domain：`CLOCK_REALTIME` 按墙上时钟
-（RTC/`clock_settime` offset）解释，`CLOCK_MONOTONIC` 按启动后单调时间解释；relative
-timer 仍使用 scheduler tick delta。timerfd 遵循同一规则。
+（RTC/`clock_settime` offset）解释，`CLOCK_MONOTONIC` 按启动后单调时间解释。到期时间以
+`tsc.nanos()` 纳秒保存（`expiry_ns`），BSP 每个时钟中断按当前纳秒检查，所以定时器在到期后
+一个 tick（约 10 ms）内触发，`timer_gettime` 报告精确到纳秒的剩余时间（hello288 R）。timerfd
+仍按 tick 计数到期。
 
-- 16 个定时器上限，复用 timerfd 的 tick 驱动机制 (100Hz)
+- 16 个定时器上限，BSP 时钟中断驱动 (100Hz)
 - timer_create: 创建定时器，支持 SIGEV_NONE/SIGEV_SIGNAL
 - `timer_create` 在分配槽位前要求非空且可写的 `timerid` 用户指针；无效指针返回
   `EFAULT`，不会消耗 16 个定时器槽位中的任何一个。

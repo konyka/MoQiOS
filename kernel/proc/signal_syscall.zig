@@ -675,13 +675,28 @@ pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_s
         if (deadline) |d| {
             if (tsc.nanos() >= d) return -11; // EAGAIN: timed out
         }
-        // Sleep until the next tick (timed wait) or a signal kick. The waited
-        // signals are normally blocked by the caller, so kickIfBlocked does not
-        // wake us for them: yield one tick at a time and re-check. Coarse but
-        // bounded (tick = 10 ms) and lost-wakeup free by construction.
+        // Sleep until the next tick or the deadline, whichever is sooner. A bare yield does not sleep: the task stays .running, the
+        // scheduler picks it again at once, and this syscall runs with interrupts masked, so a CPU with nothing else to run took no
+        // timer interrupt for the whole wait. On the BSP that stopped every POSIX timer, alarm and timed wait too (hello288 P/R).
+        // The waited signals are normally blocked, so a send does not wake us; the tick does (sched.sleepTimerTick), within 10 ms.
+        const now = tsc.nanos();
+        const wake = if (deadline) |d| @min(d, now +| SIGWAIT_POLL_NS) else now +| SIGWAIT_POLL_NS;
+        const bit = @as(u64, 1) << @intCast(cur_idx);
+        @atomicStore(u64, &cur.sleep_deadline_ns, wake, .release);
+        _ = @atomicRmw(u64, &sched.sleep_bm, .Or, bit, .seq_cst);
+        task_mod.blockTask(cur_idx);
+        // A signal that arrived between the checks above and the block does not wait for the tick.
+        if ((@atomicLoad(u64, &cur.pending_signals, .seq_cst) & mask) != 0 or sig_mod.pendingActionable(cur) or sig_mod.pendingFatal(cur) != null)
+            task_mod.unblockTask(cur_idx);
         sched.forceReschedule();
+        sched.repairCurrentAfterBlock();
+        cur.sleep_deadline_ns = 0;
+        _ = @atomicRmw(u64, &sched.sleep_bm, .And, ~bit, .seq_cst);
     }
 }
+
+/// How long rt_sigtimedwait sleeps before it looks at the pending set again: one scheduler tick.
+const SIGWAIT_POLL_NS: u64 = 10_000_000;
 
 /// rt_sigqueueinfo(tgid, sig, uinfo_ptr) → 0 or -errno
 pub fn rtSigqueueinfo(tgid: u32, sig: u32, uinfo_ptr: u64) i64 {

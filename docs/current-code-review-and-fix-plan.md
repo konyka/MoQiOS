@@ -7948,7 +7948,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：两处都改走 `signal.sendSignalInfo`，带 `SI_KERNEL` 的 siginfo，目标 tid 仍经 `owner_gen_policy.ownerMatches` 确认。`sendSignalInfo` 内部的 `ignoredAtSend` 按目标的处理方式和掩码决定丢弃还是排队，`kickIfBlocked` 也由发送路径负责，所以被阻塞的已忽略信号仍会排队，未阻塞的在发送时丢掉。
 - 绿灯：宿主机 Linux 上 hello288 全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS，P 段子进程以 0 退出，日志开头是 `spawned hello2`、`spawned hello288`，确认跑的是带 TEMP 的构建）。完整 smoke 四份并行（SMP 1/4/4/2）：a、b、d 三份 `EXIT=0`、0 FAIL，hello57、hello210、hello267、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0；c 那份（SMP=4）在 hello286 的 J 段之后、K 段之前停住，900 秒超时（`EXIT=1`，日志里没有 `: FAIL`）。hello286 不用 POSIX 定时器也不用消息队列，单独定向重跑（SMP=4）一次通过，包括 K 段，所以这是高负载下 hello286 的已知偶发卡住，不是这次改动引起的。
 - CI 失败与测试调整（如实）：`c729f4a` 的 CI 在 SMP=2 冒烟里 P 段失败，子进程以 2 退出：阻塞时定时器的信号在 400 ms 内没有被 `sigtimedwait` 取到。本地并行跑 4 份定向和 4 份完整 smoke 都没有复现。我的判断（没有直接测量 CI 上的 tick 数）是：POSIX 定时器按调度器 tick（100 Hz，`idt.getTickCount`）到期，`sigtimedwait` 的超时按 TSC 计时，负载高的虚拟机上 tick 中断会落后于 TSC，50 ms 的定时器在 400 ms 的等待里还没有到期；未阻塞那一步即使定时器晚到也照样超时，所以只有阻塞那一步会暴露出来。测试改为：未阻塞的等待 1 秒，阻塞的等待 3 秒（拿到信号时立即返回，不影响用时）。改后宿主机 Linux 通过，目标机定向 SMP=4 四份并行加 SMP=2 一份全部通过。定时器按 tick 到期、tick 可能落后于真实时间，这本身是一个没有修的局限（见下）。
-- 如实的局限：①siginfo 的 `si_code` 固定是 `SI_KERNEL`，Linux 的定时器信号是 `SI_TIMER`、消息队列通知是 `SI_MESGQ`，并带发送者的 pid 和 uid；②周期定时器在被忽略且未阻塞时，Linux 把它挂到忽略列表，之后改回处理方式会补投递，这里直接丢弃，改回处理方式不会补投递；③定时器按调度器 tick 到期，tick 中断在负载高时会落后于 TSC，所以定时器可能比请求的时间晚到。
+- 如实的局限：①siginfo 的 `si_code` 固定是 `SI_KERNEL`，Linux 的定时器信号是 `SI_TIMER`、消息队列通知是 `SI_MESGQ`，并带发送者的 pid 和 uid；②周期定时器在被忽略且未阻塞时，Linux 把它挂到忽略列表，之后改回处理方式会补投递，这里直接丢弃，改回处理方式不会补投递；~~③定时器按调度器 tick 到期，tick 中断在负载高时会落后于 TSC，所以定时器可能比请求的时间晚到。~~（根因不是 tick 落后，见文末“`rt_sigtimedwait` 忙等时 BSP 收不到时钟中断”一节）
 
 
 ## 同一 socket 第二次 `listen` 不再多占监听槽（hello184 F，已修；hello267 偶发 `to m3 00` 的根因）
@@ -8039,5 +8039,26 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 如实的局限：
   1. 只修了 futex 等待。其它阻塞点（管道、socket、`waitpid`、`nanosleep`、`epoll`、消息队列等）的等待循环同样只看 `pendingActionable`，理论上存在同样的窗口。这些没有逐个修改，也没有测试覆盖。
   2. 停下的方式和 Linux 不同：不是返回 `-ERESTARTSYS` 再重启系统调用，而是在内核里原地等待。对用户态的效果一样，但停止期间超时时间照样在走。
-  3. 上一个提交 `cc5c1b3` 的 CI（43355489709）在 SMP=2 冒烟里 hello288 P 失败，子进程以 2 退出：信号被阻塞时，50 ms 的定时器信号在 3 秒内没有被 `sigtimedwait` 取到。这与本节无关，属于开放项“定时器按 tick 到期，负载高时会晚到”，原因还没有查清。
+  3. 上一个提交 `cc5c1b3` 的 CI（43355489709）在 SMP=2 冒烟里 hello288 P 失败，子进程以 2 退出：信号被阻塞时，50 ms 的定时器信号在 3 秒内没有被 `sigtimedwait` 取到。这与本节无关。~~属于开放项“定时器按 tick 到期，负载高时会晚到”，原因还没有查清。~~（已查清并修复，见下一节）
+
+
+## `rt_sigtimedwait` 忙等时 BSP 收不到时钟中断，POSIX 定时器整段停走（hello288 P、R，已修）
+
+- 起因：hello288 P 在 CI 的 SMP=2 冒烟里反复失败（43355489709、43362841339），子进程以 2 退出：信号被阻塞时，50 ms 的定时器信号在 3 秒内没被 `sigtimedwait` 取到。之前的判断是“tick 在负载高时落后于 TSC”，没有测量过。
+- 查因：
+  1. 先在 hello288 新增 R 段（见下），并把 POSIX 定时器的到期时间从 tick 计数改成 TSC 纳秒（`expiry_ns`）。定向 SMP=2 一份里 R 段 20 个 15 ms 定时器有 19 个“提前”到期、1 个丢失，最短 152 µs；SMP=4 一份里 P 段仍以 2 退出。所以只改计时单位不够。
+  2. 在 `bspTimedWaitTick` 里临时打印两次调用之间的间隔，在 `posix_timer.timerTick` 里打印定时器晚到的时间。定向 SMP=2 六份，每份都有多行 `[tickgap] ms=1000`～`1022`、`[tmrlate] ms=985`。再加上当时的 tick 计数和当前任务：`[tickgap] ms=1000 ticks=1 cur=25`。也就是说 BSP 整整 1 秒只收到 1 个时钟中断，那段时间 BSP 上的当前任务是 hello288 的子进程。
+  3. 1 秒正好是 P 段未阻塞那一次 `sigtimedwait` 的超时。`rt_sigtimedwait` 的等待循环在没有信号时只调 `sched.forceReschedule()`：任务仍是 `.running`，调度器马上又选中它，系统调用里中断是关着的（`SFMASK` 清 IF），让出用的是 252 号陷阱，这种调度不算时钟 tick（`sched_pass_policy.isTimeTick`）。BSP 上没有别的可运行任务时，整段等待里时钟中断一直进不来，BSP 上的定时器、`alarm`、超时等待都停住。阻塞那一次 3 秒的等待同样如此，50 ms 的定时器到不了期，于是以 2 退出。子进程落在别的 CPU 上时不受影响，所以只是偶发。R 段的“提前”是上一轮晚到约 985 ms 的定时器信号留在队列里，被下一轮立刻取走。
+- Linux 依据：`3rd/linux-7.0.6/kernel/signal.c` 的 `do_sigtimedwait`（3743 行）没有信号时用 `schedule_hrtimeout_range`（3780 行）真正睡下，期间 CPU 照常收时钟中断。宿主机实测 `/tmp/tmr2.c`：20 个 15 ms 一次性定时器最短用时 15.009 ms，没有提前到期的；设好 1.234567891 s 后立刻 `timer_gettime` 读到 1.234565256 s。宿主机 hello288（`-DHOST`）R 段两项都通过。
+- 红灯：
+  - R 段第二项（`timer_gettime` 精确到纳秒、不超过设定值）：未修改的内核上定向 SMP=2、SMP=4 各一份都失败，读到 1240000000 ns，比设定值多，且是 10 ms 的整数倍。
+  - P 段：本地没有在未修改的内核上复现，红灯来自上面两次 CI。只改计时单位后，本地 SMP=4 一份复现了 P 段以 2 退出，SMP=2 一份 R 段第一项失败（19 个提前、1 个丢失）。
+- 实现：
+  - `rt_sigtimedwait` 没有信号时真正睡下：发布 `sleep_deadline_ns`（截止时间和“现在 + 10 ms”中较早的一个），置 `sched.sleep_bm` 位，`blockTask` 后再查一次待处理信号，有就立刻 `unblockTask`，然后让出；醒来后清掉这两项。等待的信号通常是阻塞的，发送时不会唤醒它，最迟由下一次 `sleepTimerTick` 叫醒，间隔仍是一个 tick。
+  - POSIX 定时器到期时间改为 `tsc.nanos()` 纳秒（`expiry_ns`）。`timer_settime` 直接记 `现在 + 延迟`，`TIMER_ABSTIME` 先经 `time_policy.absoluteDeltaNs` 换成延迟；周期定时器的下一次是 `现在 + 间隔`；`timer_gettime` 和 `timer_settime` 的旧值都按纳秒报告剩余时间；BSP 时钟中断（以及旧调度路径的维护分支）用当前纳秒调 `posix_timer.timerTick`。删掉了不再使用的 tick 换算。
+- 绿灯：目标机定向 SMP=2 四份、SMP=4 两份 hello288 全部通过（日志开头 `spawned hello2`、`spawned hello288`），R 段 20 个定时器没有提前也没有丢失，最短用时 17.9～51.5 ms。`zig build test` 通过，三个架构都能构建。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello288 P 都是 `(1, exit 0)`，R 段都是“提前 0、丢失 0”（最短 18.7～31.6 ms），`timer_gettime` 读到 1233430535～1233815639 ns；hello282、hello286（J 段 60/60）都通过，hello228 的 `corrupted canaries` 都是 0。
+- 如实的局限：
+  1. timerfd 仍按 tick 计数到期，`timerfd_gettime` 报告的剩余时间是 10 ms 的整数倍；没有改，也没有新测试。
+  2. 定时器仍由 BSP 的时钟中断检查，到期后最多晚一个 tick（约 10 ms）才发信号。
+  3. 其它在系统调用里只靠 `forceReschedule()` 让出、不把自己标成 `.blocked` 的等待循环，同样会让所在 CPU 收不到时钟中断。这次只改了 `rt_sigtimedwait`，没有逐个排查。
 

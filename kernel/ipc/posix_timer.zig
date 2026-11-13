@@ -1,12 +1,12 @@
 /// POSIX Timers — timer_create / timer_settime / timer_gettime / timer_getoverrun / timer_delete.
 ///
-/// Provides the POSIX timer API using the same tick-driven mechanism as timerfd.
-/// Max 16 timers, tick resolution ~10ms (100Hz LAPIC timer).
+/// Deadlines are kept in TSC nanoseconds (the CLOCK_MONOTONIC clock), so timer_gettime reports the time left to the nanosecond and a
+/// lagging tick never pushes an expiry back; the BSP timer tick checks them against tsc.nanos(), so a timer is noticed within one
+/// tick (~10 ms) of its deadline. Max 16 timers.
 /// Signal delivery is simplified: overrun count is tracked, optional SIGEV_SIGNAL queued.
 const std = @import("std");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const DeadlineHint = @import("../lib/deadline_hint.zig").DeadlineHint;
-const idt = @import("../arch/arch.zig").interrupts;
 const copy = @import("../mm/copy_from_user.zig");
 const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
@@ -16,7 +16,6 @@ const timer_policy = @import("posix_timer_policy.zig");
 const tsc = @import("../arch/arch.zig").tsc;
 
 const MAX_TIMERS: u32 = 16;
-const TICKS_PER_SEC: u64 = 100;
 
 // Error codes
 const errno = @import("../lib/errno.zig");
@@ -58,7 +57,8 @@ const PosixTimer = struct {
     valid: bool = false,
     clock_id: u32 = 0,
     interval_ns: u64 = 0,
-    expiry_tick: u64 = 0,
+    /// CLOCK_MONOTONIC deadline in nanoseconds (tsc.nanos()); 0 when disarmed.
+    expiry_ns: u64 = 0,
     overrun: u64 = 0,
     sigev_signo: i32 = 0,
     sigev_notify: i32 = SIGEV_NONE,
@@ -74,13 +74,8 @@ const PosixTimer = struct {
 // Global pool
 var timers: [MAX_TIMERS]PosixTimer = @splat(.{});
 var lock: IrqSpinlock = .{};
-/// Earliest armed expiry_tick: lets the per-tick scan skip `lock`.
+/// Earliest armed expiry_ns: lets the per-tick scan skip `lock`.
 var expiry_hint: DeadlineHint = .{};
-
-/// Convert ticks to nanoseconds (saturating).
-fn ticksToNs(ticks: u64) u64 {
-    return time_policy.ticksToNs(ticks, TICKS_PER_SEC);
-}
 
 /// Fill a Timespec from nanoseconds.
 fn nsToTimespec(ns: u64, ts: *Timespec) void {
@@ -129,7 +124,7 @@ pub fn timerCreate(clockid: u32, sigev_ptr: u64, timerid_ptr: u64) i64 {
                 .valid = true,
                 .clock_id = clockid,
                 .interval_ns = 0,
-                .expiry_tick = 0,
+                .expiry_ns = 0,
                 .overrun = 0,
                 .sigev_signo = sigev_signo,
                 .sigev_notify = sigev_notify,
@@ -169,7 +164,6 @@ pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr:
     // EINVAL, never a wrapped (or Debug-panicking) u64 multiply.
     const interval_ns = time_policy.timespecToNs(new_val.it_interval.tv_sec, new_val.it_interval.tv_nsec) orelse return EINVAL;
     const value_ns = time_policy.timespecToNs(new_val.it_value.tv_sec, new_val.it_value.tv_nsec) orelse return EINVAL;
-    const value_ticks = time_policy.nsToTicks(value_ns, TICKS_PER_SEC) orelse return EINVAL;
 
     if (old_value_ptr != 0 and !copy.validateUserBufferWritable(old_value_ptr, @sizeOf(Itimerspec))) return EFAULT;
     const saved = lock.acquire();
@@ -195,13 +189,7 @@ pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr:
             .it_value = .{ .tv_sec = 0, .tv_nsec = 0 },
         };
         nsToTimespec(t.interval_ns, &old_val.it_interval);
-        if (t.active and t.expiry_tick > 0) {
-            const cur_tick = idt.getTickCount();
-            if (t.expiry_tick > cur_tick) {
-                const remaining_ns = ticksToNs(t.expiry_tick - cur_tick);
-                nsToTimespec(remaining_ns, &old_val.it_value);
-            }
-        }
+        if (t.active and t.expiry_ns > 0) nsToTimespec(t.expiry_ns -| tsc.nanos(), &old_val.it_value);
         var old_buf: [@sizeOf(Itimerspec)]u8 = undefined;
         @memcpy(&old_buf, @as([*]const u8, @ptrCast(&old_val))[0..@sizeOf(Itimerspec)]);
         if (copy.copyToUser(@ptrFromInt(old_value_ptr), &old_buf, @sizeOf(Itimerspec)) != @sizeOf(Itimerspec)) {
@@ -217,47 +205,25 @@ pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr:
     if (value_ns == 0) {
         // Disarm the timer
         t.active = false;
-        t.expiry_tick = 0;
+        t.expiry_ns = 0;
     } else {
-        const cur_tick = idt.getTickCount();
-        if ((flags & TIMER_ABSTIME) != 0) {
-            // Absolute time: convert to relative ticks
-            const delta_ns = time_policy.absoluteDeltaNs(
-                t.clock_id,
-                value_ns,
-                tsc.nanos(),
-                @import("../proc/time_syscall.zig").wallClockOffset(),
-            ) orelse {
-                lock.release(saved);
-                return EINVAL;
-            };
-            if (delta_ns == 0) {
-                // Already past — fire immediately
-                t.expiry_tick = cur_tick;
-            } else {
-                // Monotonic: nsToTicks(value_ns) already validated, so the
-                // smaller delta always converts.
-                const delta = time_policy.nsToTicks(delta_ns, TICKS_PER_SEC) orelse {
-                    lock.release(saved);
-                    return EINVAL;
-                };
-                if (delta > std.math.maxInt(u64) - cur_tick) {
-                    lock.release(saved);
-                    return EINVAL;
-                }
-                t.expiry_tick = cur_tick + delta;
-            }
-        } else {
-            // Relative time
-            if (value_ticks > std.math.maxInt(u64) - cur_tick) {
+        const now_ns = tsc.nanos();
+        // An absolute deadline becomes a delay from now on the monotonic clock; one already past fires at the next tick.
+        const delay_ns = if ((flags & TIMER_ABSTIME) != 0)
+            time_policy.absoluteDeltaNs(t.clock_id, value_ns, now_ns, @import("../proc/time_syscall.zig").wallClockOffset()) orelse {
                 lock.release(saved);
                 return EINVAL;
             }
-            t.expiry_tick = cur_tick + value_ticks;
+        else
+            value_ns;
+        if (delay_ns > std.math.maxInt(u64) - now_ns) {
+            lock.release(saved);
+            return EINVAL;
         }
+        t.expiry_ns = now_ns + delay_ns;
         t.active = true;
         t.overrun = 0;
-        expiry_hint.arm(t.expiry_tick);
+        expiry_hint.arm(t.expiry_ns);
     }
 
     lock.release(saved);
@@ -285,14 +251,8 @@ pub fn timerGettime(timerid: u32, curr_value_ptr: u64) i64 {
 
     nsToTimespec(t.interval_ns, &val.it_interval);
 
-    if (t.active and t.expiry_tick > 0) {
-        const cur_tick = idt.getTickCount();
-        if (t.expiry_tick > cur_tick) {
-            const remaining_ns = ticksToNs(t.expiry_tick - cur_tick);
-            nsToTimespec(remaining_ns, &val.it_value);
-        }
-        // else: expired, value stays 0
-    }
+    // An expired timer reports 0.
+    if (t.active and t.expiry_ns > 0) nsToTimespec(t.expiry_ns -| tsc.nanos(), &val.it_value);
 
     var buf: [@sizeOf(Itimerspec)]u8 = undefined;
     @memcpy(&buf, @as([*]const u8, @ptrCast(&val))[0..@sizeOf(Itimerspec)]);
@@ -357,9 +317,9 @@ pub fn deleteTimersForTask(task_idx: u32) void {
     }
 }
 
-/// Called from scheduler timer tick. Checks POSIX timers for expiration.
-pub fn timerTick(current_tick: u64) void {
-    if (!expiry_hint.due(current_tick)) return;
+/// Called from the BSP timer tick with tsc.nanos(). Fires every timer whose deadline has passed.
+pub fn timerTick(now_ns: u64) void {
+    if (!expiry_hint.due(now_ns)) return;
     const saved = lock.acquire();
     defer lock.release(saved);
     expiry_hint.beginScan();
@@ -367,20 +327,15 @@ pub fn timerTick(current_tick: u64) void {
     for (&timers) |*t| {
         if (!t.valid or !t.active) continue;
 
-        if (current_tick < t.expiry_tick) {
-            expiry_hint.arm(t.expiry_tick);
+        if (now_ns < t.expiry_ns) {
+            expiry_hint.arm(t.expiry_ns);
         } else {
             t.overrun +|= 1;
 
             if (t.interval_ns > 0) {
-                // Repeating timer: schedule next expiration. The interval was
-                // validated at settime; saturate (like timerfd) defensively.
-                const interval_ticks = time_policy.nsToTicks(t.interval_ns, TICKS_PER_SEC) orelse std.math.maxInt(u64);
-                t.expiry_tick = if (interval_ticks > std.math.maxInt(u64) - current_tick)
-                    std.math.maxInt(u64)
-                else
-                    current_tick + interval_ticks;
-                expiry_hint.arm(t.expiry_tick);
+                // Repeating timer: the next expiry is one interval from now (saturating).
+                t.expiry_ns = now_ns +| t.interval_ns;
+                expiry_hint.arm(t.expiry_ns);
             } else {
                 // One-shot: stop
                 t.active = false;

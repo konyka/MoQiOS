@@ -14,7 +14,8 @@
  * sent, so sigtimedwait for it times out (EAGAIN); the same signal blocked is queued and sigtimedwait takes it. P: the same holds
  * for the signal of a POSIX timer that expires and of an mq_notify registration whose queue gets a message. Q: RLIMIT_SIGPENDING
  * caps the real-time instances queued for the uid: past it rt_sigqueueinfo is EAGAIN, raising the limit by 2 lets exactly 2 more in,
- * kill() of a real-time signal at the limit still makes it pending, and draining the queue lets sends in again. */
+ * kill() of a real-time signal at the limit still makes it pending, and draining the queue lets sends in again. R: a POSIX timer
+ * never fires before its time, and timer_gettime reports the time left to the nanosecond, never more than was armed. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -60,6 +61,15 @@ static long tarm(long ns) {
     return timer_settime(p_timer, 0, &its, (struct itimerspec *)0) < 0 ? -errno : 0;
 }
 static void tdel(void) { timer_delete(p_timer); }
+static long tarm2(long sec, long ns) {
+    struct itimerspec its = { { 0, 0 }, { sec, ns } };
+    return timer_settime(p_timer, 0, &its, (struct itimerspec *)0) < 0 ? -errno : 0;
+}
+static long tleft(void) {
+    struct itimerspec its;
+    if (timer_gettime(p_timer, &its) < 0) return -errno;
+    return its.it_value.tv_sec * 1000000000L + its.it_value.tv_nsec;
+}
 static long mqopen(const char *n) {
     struct mq_attr a = { 0, 4, 16, 0 };
     mqd_t q = mq_open(n, O_CREAT | O_RDWR, 0600, &a);
@@ -120,6 +130,15 @@ static long tarm(long ns) {
     return syscall4(193 /* timer_settime */, p_timer, 0, (long)its, 0);
 }
 static void tdel(void) { syscall1(196 /* timer_delete */, p_timer); }
+static long tarm2(long sec, long ns) {
+    long its[4] = { 0, 0, sec, ns };
+    return syscall4(193 /* timer_settime */, p_timer, 0, (long)its, 0);
+}
+static long tleft(void) {
+    long its[4] = { 0, 0, 0, 0 };
+    long r = syscall2(194 /* timer_gettime */, p_timer, (long)its);
+    return r < 0 ? r : its[2] * 1000000000L + its[3];
+}
 static long mqopen(const char *n) {
     long a[4] = { 0, 4, 16, 0 };
     return syscall4(186 /* mq_open */, (long)n, 02 /* O_RDWR */ | 0x40 /* O_CREAT */, 0600, (long)a);
@@ -172,6 +191,11 @@ static void check(int ok, const char *w) {
     if (!ok) failures++;
 }
 static void nap(int ms) { struct timespec t = { ms / 1000, (ms % 1000) * 1000000L }; nanosleep(&t, 0); }
+static long mono_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000000000L + t.tv_nsec;
+}
 
 /* The kernel's 128-byte siginfo: signo, errno, code, then the kill/queue union (pid, uid, value). */
 struct qinfo {
@@ -815,6 +839,51 @@ int main(void) {
         kill(qc, 9);
         waitpid(qc, &qst, 0);
     }
+
+    /* R: a POSIX timer never fires before its time (Linux: of 20 one-shot 15 ms timers, the earliest took 15.009 ms), and
+     * timer_gettime right after arming 1.234567891 s reports at most that much and nanosecond detail (Linux: 1.234565256). In a
+     * child that blocks SIGUSR2; the results come back through a pipe. */
+    int rp[2];
+    pipe(rp);
+    long rc = fork();
+    if (rc == 0) {
+        sigset_t r2;
+        sigemptyset(&r2);
+        sigaddset(&r2, SIGUSR2_N);
+        sigprocmask(SIG_BLOCK, &r2, (sigset_t *)0);
+        long res[4] = { 0, 0, 1L << 60, 0 };
+        if (tcreate(SIGUSR2_N) != 0) _exit(10);
+        for (int i = 0; i < 20; i++) {
+            struct timespec w = { 1, 0 };
+            long t0 = mono_ns();
+            tarm(15000000L);
+            long g = stw(&r2, (void *)0, &w);
+            long el = mono_ns() - t0;
+            if (g != SIGUSR2_N) {
+                res[1]++;
+            } else {
+                if (el < 15000000L) res[0]++;
+                if (el < res[2]) res[2] = el;
+            }
+            nap(3 + i % 7);
+        }
+        tarm2(1, 234567891L);
+        res[3] = tleft();
+        tdel();
+        write(rp[1], res, sizeof res);
+        _exit(0);
+    }
+    long rres[4] = { -1, -1, -1, -1 };
+    read(rp[0], rres, sizeof rres);
+    int rst = 0;
+    waitpid(rc, &rst, 0);
+    close(rp[0]);
+    close(rp[1]);
+    snprintf(msg, sizeof msg, "R: no 15 ms timer fires early and none is missed (early %ld, missed %ld, shortest %ld us, exit %d)",
+             rres[0], rres[1], rres[2] / 1000, (rst >> 8) & 0xff);
+    check(rst == 0 && rres[0] == 0 && rres[1] == 0, msg);
+    snprintf(msg, sizeof msg, "R: timer_gettime after arming 1.234567891 s reports no more than that, to the nanosecond (%ld ns)", rres[3]);
+    check(rres[3] <= 1234567891L && rres[3] > 1234567891L - 50000000L && rres[3] % 1000000L != 0, msg);
 
     /* G/H: a stop and a continue queued for one thread of another process act on the whole process. */
     group_stop_via(0, "G: rt_sigqueueinfo");
