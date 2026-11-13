@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello292`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello293`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -288,6 +288,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello290 | 阻塞的 `flock(LOCK_EX)` 和 `fcntl(F_SETLKW)` 在持有者解锁后返回 0，等待期间几乎不消耗 CPU；`flock` 在持有者退出时释放，`fcntl` 锁在持有者关闭描述符或被 `SIGKILL` 时释放；两个不同的 `/tmp` 文件的锁互不影响（宿主机 Linux 实测同结果） |
 | hello291 | `timerfd_gettime` 和 `timerfd_settime` 的旧值按纳秒报告剩余时间，不超过设定值（A）；20 个 15 ms 的一次性 timerfd 没有一个让阻塞的 `read()` 提前返回（B）；`TFD_TIMER_ABSTIME` 的 `CLOCK_MONOTONIC` 截止时间不会提前到（C）；20 ms 的周期 timerfd 在 210 ms 内计满 10 次到期（D）（宿主机 Linux 实测同结果） |
 | hello292 | POSIX 定时器的信号带 `SI_TIMER`、定时器 id、`si_overrun` 0 和创建时的 `sigev_value`，`timer_getoverrun` 为 0（A）；20 ms 的周期定时器在信号阻塞 210 ms 期间只排一个信号，其 `si_overrun` 计入其余到期（7～11），`timer_getoverrun` 与之相同，之后不再有第二个信号（B）；`sigevent` 为空时发 `SIGALRM`，`si_value` 是定时器 id（C）；信号被忽略 100 ms 的周期定时器在恢复默认处理后仍会投递，忽略期间的到期计入 overrun（D）（宿主机 Linux 实测同结果） |
+| hello293 | `mq_notify` 的信号是 `SI_MESGQ`，带发送者的 pid 和 uid、以及注册时的 `sigev_value`（A）；不再注册就再发一条消息没有信号（B）；队列非空时重新注册本身不发信号，排空后再有消息到达空队列才再次投递（C）（宿主机 Linux 实测同结果） |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。

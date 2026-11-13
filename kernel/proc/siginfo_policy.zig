@@ -14,6 +14,7 @@ pub const SI_USER: i32 = 0;
 pub const SI_KERNEL: i32 = 0x80;
 pub const SI_QUEUE: i32 = -1;
 pub const SI_TIMER: i32 = -2;
+pub const SI_MESGQ: i32 = -3;
 pub const SI_TKILL: i32 = -6;
 pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
@@ -54,6 +55,12 @@ pub fn withOverrun(info: Info, overrun: u64) Info {
 
 pub fn pidUid(pid: u32, uid: u32) u64 {
     return @as(u64, pid) | (@as(u64, uid) << 32);
+}
+
+/// The info mq_notify queues when a message arrives on an empty queue (Linux ipc/mqueue.c __do_notify): SI_MESGQ, the sender's
+/// pid and uid, and the sigev_value registered with mq_notify.
+pub fn mesgqInfo(pid: u32, uid: u32, value: u64) Info {
+    return .{ .code = SI_MESGQ, .a = pidUid(pid, uid), .b = value };
 }
 
 /// The siginfo_t bytes for `signo` carrying `info`.
@@ -265,4 +272,15 @@ test "a timer's siginfo carries the id, the slot generation until delivery, then
     try t.expectEqual(@as(u32, 9), readLe(raw[20..24]));
     try t.expectEqual(@as(u64, 0x1234abcd), readLe64(raw[24..32]));
     try t.expectEqual(@as(u32, 0x7fff_ffff), timerGenerationOf(withOverrun(q, 1 << 40)));
+}
+
+test "an mq_notify signal carries SI_MESGQ, the sender's pid and uid, and the registered value" {
+    const t = @import("std").testing;
+    const info = mesgqInfo(0x31a5, 1000, 0x55aa);
+    try t.expectEqual(SI_MESGQ, info.code);
+    const raw = encode(10, info);
+    try t.expectEqual(@as(u32, @bitCast(SI_MESGQ)), readLe(raw[8..12]));
+    try t.expectEqual(@as(u32, 0x31a5), readLe(raw[16..20]));
+    try t.expectEqual(@as(u32, 1000), readLe(raw[20..24]));
+    try t.expectEqual(@as(u64, 0x55aa), readLe64(raw[24..32]));
 }

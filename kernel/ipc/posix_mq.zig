@@ -67,6 +67,8 @@ pub const MqQueue = struct {
     /// identity at delivery time.
     notify_tid: u32 = 0,
     notify_signo: i32 = 0,
+    /// sigev_value registered with mq_notify; delivered as si_value of the SI_MESGQ signal.
+    notify_value: u64 = 0,
     /// Senders blocked on a full queue (mq_timedsend without O_NONBLOCK)
     send_waiters: ?*task.MqWaiter = null,
     send_waiters_tail: ?*task.MqWaiter = null,
@@ -471,6 +473,7 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
     q.notify_task_idx = null;
     q.notify_tid = 0;
     q.notify_signo = 0;
+    q.notify_value = 0;
 
     // Apply optional attributes (only honored at creation)
     if (create_requested and attr_ptr != 0) {
@@ -657,19 +660,28 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
             const notify_idx = commit_q.?.notify_task_idx.?;
             const notify_tid = commit_q.?.notify_tid;
             const notify_signo = commit_q.?.notify_signo;
+            const notify_value = commit_q.?.notify_value;
             commit_q.?.notify_pid = 0;
             commit_q.?.notify_task_idx = null;
             commit_q.?.notify_tid = 0;
             commit_q.?.notify_signo = 0;
+            commit_q.?.notify_value = 0;
             if (notify_signo > 0 and notify_signo <= 64) {
                 if (task.getTask(notify_idx)) |nt| {
                     // The slot may have been recycled after the registrant
                     // exited — only signal if the tid still matches.
                     if (owner_gen_policy.ownerMatches(notify_tid, nt.tid)) {
-                        // Through the send path, not a raw pending bit: an ignored signal the registrant does not block is dropped
-                        // (signal.ignoredAtSend), the same as a tkill of it.
+                        // Linux __do_notify: SI_MESGQ, the sender's pid and uid, and the registered sigev_value.
+                        // An ignored signal the registrant does not block is still dropped (signal.ignoredAtSend).
                         const signo: u32 = @intCast(notify_signo);
-                        _ = @import("../proc/signal.zig").sendSignalInfo(nt.tid, signo, .{ .code = @import("../proc/siginfo_policy.zig").SI_KERNEL });
+                        const sender = sched.currentTask();
+                        const pid: u32 = if (sender) |st|
+                            (if (st.is_thread and st.parent_tid != 0) st.parent_tid else st.tid)
+                        else
+                            0;
+                        const uid: u32 = if (sender) |st| st.uid else 0;
+                        const info = @import("../proc/siginfo_policy.zig").mesgqInfo(pid, uid, notify_value);
+                        _ = @import("../proc/signal.zig").sendSignalInfo(nt.tid, signo, info);
                     }
                 }
             }
@@ -843,10 +855,12 @@ pub fn mqNotify(mqd: u32, notif_ptr: u64) i64 {
     // page tables). Layout matches posix_timer.Sigevent: value@0, signo@8,
     // notify@12.
     var signo: i32 = 0;
+    var value: u64 = 0;
     if (notif_ptr != 0) {
         if (notif_ptr >= 0x0000_8000_0000_0000) return EFAULT;
         var buf: [16]u8 = undefined;
         if (copy.copyFromUser(&buf, @ptrFromInt(notif_ptr), 16) != 16) return EFAULT;
+        value = bo.readU64Le(buf[0..8]);
         signo = @bitCast(bo.readU32Le(buf[8..12]));
         const notify_kind = bo.readU32Le(buf[12..16]);
         if (!descriptor_policy.sigevNotifyValid(notify_kind)) return EINVAL;
@@ -864,6 +878,7 @@ pub fn mqNotify(mqd: u32, notif_ptr: u64) i64 {
         q.notify_task_idx = null;
         q.notify_tid = 0;
         q.notify_signo = 0;
+        q.notify_value = 0;
         return 0;
     }
 
@@ -877,6 +892,7 @@ pub fn mqNotify(mqd: u32, notif_ptr: u64) i64 {
     else
         0;
     q.notify_signo = signo;
+    q.notify_value = value;
     return 0;
 }
 
@@ -893,6 +909,7 @@ pub fn clearNotifyForTask(task_idx: u32) void {
             q.notify_task_idx = null;
             q.notify_tid = 0;
             q.notify_signo = 0;
+            q.notify_value = 0;
         }
     }
 }

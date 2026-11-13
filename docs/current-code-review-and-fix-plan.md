@@ -7948,7 +7948,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：两处都改走 `signal.sendSignalInfo`，带 `SI_KERNEL` 的 siginfo，目标 tid 仍经 `owner_gen_policy.ownerMatches` 确认。`sendSignalInfo` 内部的 `ignoredAtSend` 按目标的处理方式和掩码决定丢弃还是排队，`kickIfBlocked` 也由发送路径负责，所以被阻塞的已忽略信号仍会排队，未阻塞的在发送时丢掉。
 - 绿灯：宿主机 Linux 上 hello288 全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS，P 段子进程以 0 退出，日志开头是 `spawned hello2`、`spawned hello288`，确认跑的是带 TEMP 的构建）。完整 smoke 四份并行（SMP 1/4/4/2）：a、b、d 三份 `EXIT=0`、0 FAIL，hello57、hello210、hello267、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0；c 那份（SMP=4）在 hello286 的 J 段之后、K 段之前停住，900 秒超时（`EXIT=1`，日志里没有 `: FAIL`）。hello286 不用 POSIX 定时器也不用消息队列，单独定向重跑（SMP=4）一次通过，包括 K 段，所以这是高负载下 hello286 的已知偶发卡住，不是这次改动引起的。
 - CI 失败与测试调整（如实）：`c729f4a` 的 CI 在 SMP=2 冒烟里 P 段失败，子进程以 2 退出：阻塞时定时器的信号在 400 ms 内没有被 `sigtimedwait` 取到。本地并行跑 4 份定向和 4 份完整 smoke 都没有复现。我的判断（没有直接测量 CI 上的 tick 数）是：POSIX 定时器按调度器 tick（100 Hz，`idt.getTickCount`）到期，`sigtimedwait` 的超时按 TSC 计时，负载高的虚拟机上 tick 中断会落后于 TSC，50 ms 的定时器在 400 ms 的等待里还没有到期；未阻塞那一步即使定时器晚到也照样超时，所以只有阻塞那一步会暴露出来。测试改为：未阻塞的等待 1 秒，阻塞的等待 3 秒（拿到信号时立即返回，不影响用时）。改后宿主机 Linux 通过，目标机定向 SMP=4 四份并行加 SMP=2 一份全部通过。定时器按 tick 到期、tick 可能落后于真实时间，这本身是一个没有修的局限（见下）。
-- 如实的局限：①siginfo 的 `si_code` 固定是 `SI_KERNEL`，Linux 的定时器信号是 `SI_TIMER`、消息队列通知是 `SI_MESGQ`，并带发送者的 pid 和 uid（~~定时器部分~~已改，见文末“POSIX 定时器信号固定是 `SI_KERNEL`”一节；`mq_notify` 仍是 `SI_KERNEL`）；②~~周期定时器在被忽略且未阻塞时，Linux 把它挂到忽略列表，之后改回处理方式会补投递，这里直接丢弃，改回处理方式不会补投递；~~（已改，同一节）~~③定时器按调度器 tick 到期，tick 中断在负载高时会落后于 TSC，所以定时器可能比请求的时间晚到。~~（根因不是 tick 落后，见文末“`rt_sigtimedwait` 忙等时 BSP 收不到时钟中断”一节）
+- 如实的局限：①siginfo 的 `si_code` 固定是 `SI_KERNEL`，Linux 的定时器信号是 `SI_TIMER`、消息队列通知是 `SI_MESGQ`，并带发送者的 pid 和 uid（~~定时器部分~~已改，见文末“POSIX 定时器信号固定是 `SI_KERNEL`”一节；~~`mq_notify` 仍是 `SI_KERNEL`~~已改，见文末“`mq_notify` 的信号固定是 `SI_KERNEL`”一节）；②~~周期定时器在被忽略且未阻塞时，Linux 把它挂到忽略列表，之后改回处理方式会补投递，这里直接丢弃，改回处理方式不会补投递；~~（已改，同一节）~~③定时器按调度器 tick 到期，tick 中断在负载高时会落后于 TSC，所以定时器可能比请求的时间晚到。~~（根因不是 tick 落后，见文末“`rt_sigtimedwait` 忙等时 BSP 收不到时钟中断”一节）
 
 
 ## 同一 socket 第二次 `listen` 不再多占监听槽（hello184 F，已修；hello267 偶发 `to m3 00` 的根因）
@@ -8157,5 +8157,24 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 如实的局限：
   1. 被忽略的信号只在下一次到期时才补发。Linux 在 `sigaction` 改回处理方式时立即重新排队；这里一次性定时器如果在忽略期间到期，之后不会再发。
   2. 排队的信号判断“还在不在”只看待处理位（含线程组的 held 集合），同一进程里别的路径（`kill` 同一个标准信号）发的同号信号会被当成定时器的信号。
-  3. `mq_notify` 的信号仍是 `SI_KERNEL`，没有 `SI_MESGQ` 和发送者的 pid/uid。
+  3. ~~`mq_notify` 的信号仍是 `SI_KERNEL`，没有 `SI_MESGQ` 和发送者的 pid/uid。~~（已改，见下一节）
   4. `SIGEV_THREAD`、`SIGEV_THREAD_ID` 仍不支持。
+
+## `mq_notify` 的信号固定是 `SI_KERNEL`，不带发送者身份和注册的值（hello293，已修）
+
+- 起因：hello292 一节的局限 ③。消息到达空队列时，`posix_mq` 用 `.{ .code = SI_KERNEL }` 发注册的信号，siginfo 里没有发送者的 pid、uid，也没有注册时的 `sigev_value`。
+- Linux 依据：`3rd/linux-7.0.6/ipc/mqueue.c` 的 `__do_notify`（约 789–823 行）：`si_code = SI_MESGQ`（-3，`include/uapi/asm-generic/siginfo.h` 178 行），`si_value` 取注册的 `sigev_value`，`si_pid`/`si_uid` 是发送者的。投递一次后注销，必须再 `mq_notify` 才重新生效；队列非空时注册，要等队列排空后再有消息到达才发。宿主机实测（`/tmp/mqp.c`，再以 `gcc -DHOST` 跑 hello293，普通和 `taskset -c 0` 都通过）：
+  - 空队列上 `mq_send`：信号 10，`si_code` -3，`si_pid` 等于 `getpid()`，`si_uid` 等于 `getuid()`（1000），`si_value` 0x55aa。
+  - 不再注册就再发一条：`rt_sigtimedwait` 返回 -11。
+  - 队列非空时重新注册本身不发信号；排空后也不发；下一条到达空队列的消息再次投递，`si_code` -3、值 0x55aa。
+- 红灯：未改内核上定向 SMP=2 一份（日志开头 `spawned hello2`、`spawned hello293`）。打开、注册、发送、一次性注销、重新注册和排空都成功，只有 siginfo 内容不对：
+  - A：信号到了，但 `si_code` 128（`SI_KERNEL`），pid 0（自己的 pid 是 7），uid 0（自己的 uid 是 1000），value 0。
+  - C：再次投递同样是 `si_code` 128、value 0。
+- 实现：
+  - `kernel/proc/siginfo_policy.zig`：`SI_MESGQ` 和 `mesgqInfo(pid, uid, value)`（`si_pid`@16、`si_uid`@20、`si_value`@24），宿主机测试一条。
+  - `kernel/ipc/posix_mq.zig`：队列记下注册的 `notify_value`（创建、注销、投递后、任务退出时清零）。`mqNotify` 读 sigevent 前 16 字节里的值。投递时取当前发送者的线程组 id 和 uid，用 `mesgqInfo` 发出去；被忽略且未阻塞仍由 `ignoredAtSend` 丢弃。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份（日志开头 `spawned hello2`、`spawned hello293`）全部通过：A `si_code` -3、pid 与 `getpid()` 相同、uid 1000、值 0x55aa；B 不再注册返回 -11；C 非空时注册和排空都不发信号，排空后再发送再次投递，`si_code` -3、值 0x55aa。`zig build` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello293 都是 PASS：A `si_code` -3、pid 与 `getpid()` 相同、uid 1000、值 0x55aa；B 不再注册返回 -11；C 非空时注册和排空都不发信号，排空后再发送再次投递，`si_code` -3、值 0x55aa。hello286、hello288、hello290、hello291、hello292 都通过。
+- 如实的局限：
+  1. `SIGEV_THREAD` 和 `SIGEV_NONE` 仍不支持，`mq_notify` 只接受 `SIGEV_SIGNAL`。
+  2. 没有用户命名空间，`si_uid` 是内核记录的 uid，不做 `from_kuid_munged` 那一层映射。

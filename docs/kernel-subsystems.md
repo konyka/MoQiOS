@@ -2074,7 +2074,7 @@ The native `Message` ABI is an exactly 256-byte extern struct: `sender:u64`, `re
 - MQ descriptor 按 task handle 解析到带 queue slot、单调 queue generation、访问模式、`O_NONBLOCK`、`O_CLOEXEC` 的 open description；因此同一名字的两次 `mq_open` 有独立 mqd、访问权限和非阻塞状态。send/receive 分别检查 `O_WRONLY`/`O_RDONLY`，发送超过 `mq_msgsize` 返回 `EMSGSIZE`。
 - 只有持有该 task handle 的 task 才能执行 MQ 操作或 `mq_close`。fork/clone 复制 handle 并共享同一个 open description（关闭任一引用只减少该 description 的引用计数）；这保持现有 inheritRefs 行为，但不声称实现 VFS `CLONE_FILES` 的完整跨表语义。task 退出时自动释放其 handles。
 - `mq_getsetattr` 报告调用者自己的 `mq_flags`，坏的 newattr 指针返回 `EFAULT`，只允许改变 `O_NONBLOCK`。`O_CLOEXEC` 在 exec 地址空间切换前关闭当前 task 标记的 MQ handles；未标记的 handles 跨 exec 保留。
-- mq_notify: 注册/注销通知
+- mq_notify: 注册/注销通知。队列从空变为非空、且没有接收者正在等待时，给注册者发一次信号，之后必须重新注册。信号是 `SI_MESGQ`（-3），`si_pid`/`si_uid` 是发送者的，`si_value` 是注册时的 `sigev_value`（hello293）。被忽略且未阻塞的信号仍在发送时丢弃。
 - mq_getsetattr: 获取/设置队列属性
 - 系统调用: #186-191（与 x86_64 dispatcher 一致）
 
