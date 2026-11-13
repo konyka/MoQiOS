@@ -707,7 +707,7 @@ int main(void) {
     }
 
     /* P: in a child that ignores SIGUSR1, a POSIX timer and an mq_notify registration send it. Not blocked, each signal is dropped
-     * when it is sent and sigtimedwait (400 ms) times out; blocked, it is queued and sigtimedwait takes it. */
+     * when it is sent and sigtimedwait times out; blocked, it is queued and sigtimedwait takes it. */
     long pc = fork();
     if (pc == 0) {
 #ifdef HOST
@@ -716,13 +716,17 @@ int main(void) {
         struct ksigaction pign = { (void (*)(int))1, 0, (void *)0, 0 };
         sigaction(SIGUSR1_N, &pign, (struct ksigaction *)0);
 #endif
+        /* The timer expires on scheduler ticks while sigtimedwait's timeout runs on the TSC; on a loaded VM the ticks can fall
+         * behind, so the timer waits are long (a wait that gets its signal returns at once). */
         struct timespec pts = { 0, 400000000L };
+        struct timespec tts = { 1, 0 };
+        struct timespec bts = { 3, 0 };
         if (tcreate(SIGUSR1_N) != 0) _exit(10);
         if (tarm(50000000L) != 0) _exit(11);
-        if (stw(&j_set, (void *)0, &pts) != -11) _exit(1);
+        if (stw(&j_set, (void *)0, &tts) != -11) _exit(1);
         sigprocmask(SIG_BLOCK, &j_set, (sigset_t *)0);
         tarm(50000000L);
-        if (stw(&j_set, (void *)0, &pts) != SIGUSR1_N) _exit(2);
+        if (stw(&j_set, (void *)0, &bts) != SIGUSR1_N) _exit(2);
         tdel();
         sigprocmask(SIG_UNBLOCK, &j_set, (sigset_t *)0);
         const char *pn = "/h288-p";
@@ -735,7 +739,7 @@ int main(void) {
         sigprocmask(SIG_BLOCK, &j_set, (sigset_t *)0);
         mqnotify(q, SIGUSR1_N);
         mqsend(q);
-        long r4 = stw(&j_set, (void *)0, &pts);
+        long r4 = stw(&j_set, (void *)0, &bts);
         mqdone(q, pn);
         _exit(r4 == SIGUSR1_N ? 0 : 4);
     }

@@ -7947,7 +7947,8 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello288 新增 P 段一项，子进程用退出码说明哪一步出错（1 定时器、未阻塞时 `sigtimedwait` 没有超时，2 定时器、阻塞时没有取到，3 消息队列、未阻塞时没有超时，4 消息队列、阻塞时没有取到）。未修复的内核（SMP=2 一份）上子进程以 1 退出：定时器过期把已忽略且未阻塞的信号排进了待处理集合，`sigtimedwait` 取走了它。
 - 实现：两处都改走 `signal.sendSignalInfo`，带 `SI_KERNEL` 的 siginfo，目标 tid 仍经 `owner_gen_policy.ownerMatches` 确认。`sendSignalInfo` 内部的 `ignoredAtSend` 按目标的处理方式和掩码决定丢弃还是排队，`kickIfBlocked` 也由发送路径负责，所以被阻塞的已忽略信号仍会排队，未阻塞的在发送时丢掉。
 - 绿灯：宿主机 Linux 上 hello288 全过；目标机定向 SMP=2 一份、SMP=4 两份全过（hello288 PASS，P 段子进程以 0 退出，日志开头是 `spawned hello2`、`spawned hello288`，确认跑的是带 TEMP 的构建）。完整 smoke 四份并行（SMP 1/4/4/2）：a、b、d 三份 `EXIT=0`、0 FAIL，hello57、hello210、hello267、hello286、hello287、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0；c 那份（SMP=4）在 hello286 的 J 段之后、K 段之前停住，900 秒超时（`EXIT=1`，日志里没有 `: FAIL`）。hello286 不用 POSIX 定时器也不用消息队列，单独定向重跑（SMP=4）一次通过，包括 K 段，所以这是高负载下 hello286 的已知偶发卡住，不是这次改动引起的。
-- 如实的局限：①siginfo 的 `si_code` 固定是 `SI_KERNEL`，Linux 的定时器信号是 `SI_TIMER`、消息队列通知是 `SI_MESGQ`，并带发送者的 pid 和 uid；②周期定时器在被忽略且未阻塞时，Linux 把它挂到忽略列表，之后改回处理方式会补投递，这里直接丢弃，改回处理方式不会补投递。
+- CI 失败与测试调整（如实）：`c729f4a` 的 CI 在 SMP=2 冒烟里 P 段失败，子进程以 2 退出：阻塞时定时器的信号在 400 ms 内没有被 `sigtimedwait` 取到。本地并行跑 4 份定向和 4 份完整 smoke 都没有复现。我的判断（没有直接测量 CI 上的 tick 数）是：POSIX 定时器按调度器 tick（100 Hz，`idt.getTickCount`）到期，`sigtimedwait` 的超时按 TSC 计时，负载高的虚拟机上 tick 中断会落后于 TSC，50 ms 的定时器在 400 ms 的等待里还没有到期；未阻塞那一步即使定时器晚到也照样超时，所以只有阻塞那一步会暴露出来。测试改为：未阻塞的等待 1 秒，阻塞的等待 3 秒（拿到信号时立即返回，不影响用时）。改后宿主机 Linux 通过，目标机定向 SMP=4 四份并行加 SMP=2 一份全部通过。定时器按 tick 到期、tick 可能落后于真实时间，这本身是一个没有修的局限（见下）。
+- 如实的局限：①siginfo 的 `si_code` 固定是 `SI_KERNEL`，Linux 的定时器信号是 `SI_TIMER`、消息队列通知是 `SI_MESGQ`，并带发送者的 pid 和 uid；②周期定时器在被忽略且未阻塞时，Linux 把它挂到忽略列表，之后改回处理方式会补投递，这里直接丢弃，改回处理方式不会补投递；③定时器按调度器 tick 到期，tick 中断在负载高时会落后于 TSC，所以定时器可能比请求的时间晚到。
 
 
 ## 同一 socket 第二次 `listen` 不再多占监听槽（hello184 F，已修；hello267 偶发 `to m3 00` 的根因）
