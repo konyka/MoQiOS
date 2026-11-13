@@ -79,10 +79,10 @@ pub fn splicePipeToFileReadResult(flags: u32, total: i64, nread: i64, write_open
     return 0;
 }
 
+/// Result of a pipe -> pipe splice whose last transfer moved nothing: the bytes already moved, else the transfer's own result
+/// (0 = EOF, or a negative errno).
 pub fn pipeTransferResult(total: i64, moved: i64) i64 {
     if (total > 0) return total;
-    if (moved < 0) return moved;
-    if (moved == 0) return -11;
     return moved;
 }
 
@@ -458,8 +458,9 @@ fn splicePipeToSocket(fd_table: *vfs.FdTable, pipe_fd: u32, sock_fd: u32, len: u
         const chunk: usize = @intCast(@min(remaining, @min(CHUNK_SIZE, capacity)));
 
         var reservation: vfs.PipeReadToken = .{};
+        // Only the first chunk waits: once bytes moved, an empty pipe ends the call with what it has (Linux splice_from_pipe_next).
         const nread = vfs.pipeReserveReadWait(fd_table.fds[pipe_fd].pipe_idx, &kbuf, chunk, &reservation,
-            (flags & SPLICE_F_NONBLOCK != 0) or (fd_table.fds[pipe_fd].status_flags & 0x800 != 0));
+            (flags & SPLICE_F_NONBLOCK != 0) or (fd_table.fds[pipe_fd].status_flags & 0x800 != 0) or total > 0);
         if (nread <= 0) {
             if (total > 0) return total;
             return if (nread < 0) nread else if (flags & SPLICE_F_NONBLOCK != 0) -11 else total;
@@ -578,8 +579,9 @@ fn splicePipeToFile(fd_table: *vfs.FdTable, pipe_fd: u32, file_fd: u32, off_out:
 
         const read_state = file_offset;
         var reservation: vfs.PipeReadToken = .{};
+        // Only the first chunk waits: once bytes moved, an empty pipe ends the call with what it has (Linux splice_from_pipe_next).
         const nread = vfs.pipeReserveReadWait(fd_table.fds[pipe_fd].pipe_idx, &kbuf, chunk, &reservation,
-            (flags & SPLICE_F_NONBLOCK != 0) or (fd_table.fds[pipe_fd].status_flags & 0x800 != 0));
+            (flags & SPLICE_F_NONBLOCK != 0) or (fd_table.fds[pipe_fd].status_flags & 0x800 != 0) or total > 0);
         if (nread <= 0) {
             const pipe_state = vfs.pipeState(fd_table.fds[pipe_fd].pipe_idx);
             failure = splicePipeToFileReadResult(flags, total, nread, if (pipe_state) |state| state.write_open else false);
@@ -619,12 +621,14 @@ fn splicePipeToFile(fd_table: *vfs.FdTable, pipe_fd: u32, file_fd: u32, off_out:
 
 /// pipe → pipe: read from one pipe, write to another.
 fn splicePipeToPipe(fd_table: *vfs.FdTable, in_fd: u32, out_fd: u32, len: u64, flags: u32) i64 {
-    _ = flags;
+    // Linux: O_NONBLOCK on either pipe counts as SPLICE_F_NONBLOCK. Only the first chunk waits; once bytes moved the call returns
+    // what it has rather than waiting for more.
+    const nonblocking = (flags & SPLICE_F_NONBLOCK != 0) or ((fd_table.fds[in_fd].status_flags | fd_table.fds[out_fd].status_flags) & 0x800 != 0);
     var remaining: u64 = len;
     var total: i64 = 0;
 
     while (remaining > 0) {
-        const moved = vfs.pipeTransfer(fd_table.fds[in_fd].pipe_idx, fd_table.fds[out_fd].pipe_idx, @intCast(@min(remaining, CHUNK_SIZE)));
+        const moved = vfs.pipeTransferWait(fd_table.fds[in_fd].pipe_idx, fd_table.fds[out_fd].pipe_idx, @intCast(@min(remaining, CHUNK_SIZE)), nonblocking or total > 0);
         if (moved <= 0) {
             if (total > 0) return total;
             return pipeTransferResult(total, moved);

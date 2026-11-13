@@ -8104,7 +8104,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello286 都是 PASS（J 60/60，L 200/200，M 20/20），hello187、hello288、hello290 都通过。
 - 如实的局限：
   1. 管道和 `waitpid` 的停止处理没有红灯，是按同一个窗口推出来的预防性改动。
-  2. `pipeReserveReadWait`（splice 读）在等待中不检查任何信号，没有改。
+  2. `pipeReserveReadWait`（splice 读）在等待中不检查任何信号，没有改。（hello297 已修。）
   3. socket、`epoll`、`nanosleep`、消息队列、eventfd、timerfd 的等待仍只检查 `pendingActionable`，同样的窗口还在。
   4. `clone` 遇到致命信号时返回 `EINTR`，不像 Linux 那样重启调用。进程反正会被杀掉，用户态看不到差别。
 
@@ -8241,3 +8241,30 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 如实的局限：
   1. `CLOCK_TAI`、`CLOCK_PROCESS_CPUTIME_ID`、`CLOCK_THREAD_CPUTIME_ID` 仍不支持。前一个没有 TAI 偏移，后两个要按 CPU 时间调度，而记账只有微秒。
   2. 内核不挂起，所以 `CLOCK_BOOTTIME` 和 `CLOCK_MONOTONIC` 的读数相同。挂起时两者会分开，这里做不到。
+
+## splice 等空管道时不理信号；pipe→pipe splice 从空管道零进度返回 `EAGAIN`（hello297，已修）
+
+- 起因：hello286 一节的局限 2。`vfs.pipeReserveReadWait`（pipe→文件、pipe→socket 的读）睡下前后都不看信号，处理函数、`SIGSTOP`、`SIGKILL` 都结束不了等待。pipe→pipe 的 `pipeTransfer` 不会等，源管道空时返回 `EAGAIN`。
+- Linux 依据：`3rd/linux-7.0.6/fs/splice.c` 的 `splice_from_pipe_next`（约 516 行）：先查 `signal_pending`，管道空时没有写端返回 0，已经搬过字节返回 0（调用返回已搬的数），`SPLICE_F_NONBLOCK` 返回 `-EAGAIN`，有信号返回 `-ERESTARTSYS`，否则等。`ipipe_prep`/`opipe_prep`（约 1642、1678 行）在 pipe→pipe 时分别等源有数据、目的有空间，规则相同；`do_splice` 在任一端 `O_NONBLOCK` 时加上 `SPLICE_F_NONBLOCK`（约 1323 行）。宿主机实测（`/tmp/sp.c`，再以 `gcc -DHOST` 跑 hello297，普通和 `taskset -c 0` 都通过）：
+  - A：没有 `SA_RESTART` 的处理函数让阻塞在空管道上的 pipe→文件 splice 返回 `EINTR`。
+  - B：有 `SA_RESTART` 时 splice 重新执行，返回之后写入的 3 字节。
+  - C：`SIGSTOP` 0 ms 内让进程停下（`waitpid` 报 `0x137f`），`SIGCONT` 报 `0xffff`，之后 splice 拿到数据返回 2。
+  - D：`SIGKILL` 杀死它（状态 9）。
+  - E：pipe→pipe 从空管道 splice 会等，处理函数以 `EINTR` 结束它。F：`SPLICE_F_NONBLOCK` 是 `EAGAIN`。G：数据到达后返回 4 字节。H：写端全关返回 0。
+- 测试的文件端：目标机用 ext2 的 `testdir/h297`。第一版用 `/tmp/h297`，在修过的内核上 A–D 仍失败，原因是 `splice.isFileFd` 不认 tmpfs 文件，splice 直接 `EINVAL`（见局限 3）。
+- 红灯：把 `kernel/fs/vfs.zig`、`kernel/fs/splice.zig`、`kernel/proc/syscall_restart_policy.zig` 恢复到上一版（`8e6ded7`）后定向 SMP=2：
+  - 用 `/tmp` 文件的一份：A–D 是 `0x100`（splice 立即 `EINVAL`，见上），E 的 pipe→pipe splice 不等待（"returned"），F–H 通过。
+  - 用 ext2 文件的一份（日志开头 `spawned hello2`、`spawned hello297`）：A 是 `0x7f00`，即处理函数结束不了等待，测试写入数据后 splice 才返回；随后 B 的子进程停在 splice 里，跑满 300 秒上限。
+- 实现：
+  - `kernel/fs/vfs.zig` `pipeReserveReadWait`：睡下前 `pendingActionable` 为真就返回 `-EINTR`，致命信号也一样。splice 持有两端描述符的 transfer 引用，等待里不能直接 `exitTask`，所以致命信号由系统调用返回路径投递。挂上等待队列之后，用和 `pipeRead` 一样的原子读改写看待处理位，有默认停止就 `stopWhileWaiting` 原地停下，`SIGCONT` 后回到循环。
+  - `kernel/fs/vfs.zig` 新增 `pipeTransferWait`：源空且有写端时睡在源的读者队列上，目的满时睡在目的的写者队列上；源空且没有写端返回 0，目的没有读者 `SIGPIPE` + `-EPIPE`，不能等时零进度 `-EAGAIN`；信号和停止的处理同上。有字节可搬时调用原来的 `pipeTransfer`，它返回 0（被别人抢先）就再等。
+  - `kernel/fs/splice.zig`：`splicePipeToPipe` 改用 `pipeTransferWait`，任一端 `O_NONBLOCK` 算作非阻塞；三条 pipe 读路径都只让第一块等，已经搬过字节后管道空就返回已搬的数。`pipeTransferResult` 不再把 0 改成 `EAGAIN`（0 现在只表示 EOF）。
+  - `kernel/proc/syscall_restart_policy.zig`：`splice`（145）加入可重启调用，`syscall_entry` 的 145 分支本来就调 `checkSignalsOnSyscallReturn`（`tests/main.zig` 的形状测试会检查）。
+  - `tests/main.zig`：splice 的形状测试改为检查三处 `or total > 0` 和 pipe→pipe 的两端 `O_NONBLOCK`；`pipeTransferResult` 的断言按新语义改写。`lib/moqi_libc/include/signal.h` 和 `docs/kernel-subsystems.md` 的可重启列表加上 `splice`。
+- 绿灯：目标机定向 SMP=2 两份、SMP=4 一份（日志开头 `spawned hello2`、`spawned hello297`）全部通过：A–D 状态分别是 0、0、`0x137f`/`0xffff`/0、9；E 等待中、`EINTR`；F -11；G 4 字节 "wxyz"；H 0。`zig build`、`zig build test` 通过。
+- 完整 smoke：两批，每批四份并行（SMP 1/4/4/2，超时 1400 秒），`corrupted canaries` 都是 0，八份里 hello297 都是 PASS。第一批：SMP=1、SMP=2 和一份 SMP=4 `EXIT=0`、0 FAIL；另一份 SMP=4 `EXIT=1`，唯一的失败是 hello286 M「fork 之后立刻 `SIGSTOP`」19/20（20 轮里有一轮 3 秒内没等到 `0x137f`，那一轮的子进程随后被 `SIGKILL` 正常回收）。M 段只用 fork、`pthread_create`、`pause` 和管道写，不经过这次改动的 splice 路径。这是已知的 hello286 偶发问题，这次没有查根因。第二批同一个内核：四份全部 `EXIT=0`、0 FAIL，hello286（M 都是 20/20）、hello288、hello290–hello297 都通过。
+- 如实的局限：
+  1. 文件→管道 splice 和 `sendfile` 写管道时走 `pipeWrite`，信号和停止的处理和管道写一样；但那里的致命信号直接 `exitTask`，此时 splice 还持有描述符的 transfer 引用。这条路径这次没有改，也没有测试覆盖。
+  2. 等待里收到致命信号时返回 `-EINTR`，进程在系统调用返回时被杀；用户态看不到 `EINTR`，效果和 Linux 一样，只是路径不同。
+  3. splice 的文件端不接受 tmpfs 文件（`isFileFd` 只有 ramdisk、FAT32、ext2），Linux 可以。没有在这一节修。
+  4. socket、`epoll`、`nanosleep`、消息队列、eventfd、timerfd 的等待仍只检查 `pendingActionable`，默认停止的窗口还在。

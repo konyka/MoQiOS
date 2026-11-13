@@ -373,6 +373,13 @@ pub fn pipeReserveReadWait(pipe_idx: u32, buf: [*]u8, count: usize, token: *Pipe
                 pipe_lock.release(flags);
                 return -1;
             };
+            // A signal that would be acted on ends the wait with EINTR, a fatal one too: splice holds transfer references on both
+            // descriptors, so the task must leave through the syscall return (which drops them) rather than exit here.
+            const sig_mod = @import("../proc/signal.zig");
+            if (sig_mod.pendingActionable(current)) {
+                pipe_lock.release(flags);
+                return -4; // EINTR
+            }
             const node = &current.pipe_read_wait_node;
             node.granted = false;
             node.next = null;
@@ -380,8 +387,11 @@ pub fn pipeReserveReadWait(pipe_idx: u32, buf: [*]u8, count: usize, token: *Pipe
                 pipe_lock.release(flags);
                 return -1;
             }
+            // A pending default stop is taken here rather than slept on (see pipeRead).
+            _ = @atomicRmw(u64, &current.pending_signals, .Or, 0, .seq_cst);
+            const stop_now = sig_mod.pendingStop(current);
             pipe_lock.release(flags);
-            sched.rescheduleAfterBlock();
+            if (!(stop_now and sig_mod.stopWhileWaiting(current))) sched.rescheduleAfterBlock();
             const cleanup = pipe_lock.acquire();
             unlinkPipeReadWaiterLocked(pipe_idx, node);
             pipe_lock.release(cleanup);
@@ -476,6 +486,80 @@ pub fn pipeTransfer(src_idx: u32, dst_idx: u32, count: usize) i64 {
         epoll_r.epollNotify(.pipe_read, dst_idx, epoll_r.EPOLLIN);
     }
     return @intCast(n);
+}
+
+/// pipe -> pipe splice: move a FIFO prefix, waiting while the source is empty (and has writers) or the destination is full. Returns the
+/// bytes moved, 0 when the source is empty and has no writers, -EAGAIN when `nonblocking` and nothing can move (or another splice
+/// reader holds the source head), -EPIPE (with SIGPIPE) when the destination has no readers, and -EINTR when a signal that would be
+/// acted on is pending; a default stop is taken in place and the wait goes on.
+pub fn pipeTransferWait(src_idx: u32, dst_idx: u32, count: usize, nonblocking: bool) i64 {
+    if (src_idx >= pipes.len or dst_idx >= pipes.len or src_idx == dst_idx) return -1;
+    const sched = @import("../proc/sched.zig");
+    const task_mod = @import("../proc/task.zig");
+    const sig_mod = @import("../proc/signal.zig");
+    while (true) {
+        const flags = pipe_lock.acquire();
+        const src = &pipes[src_idx];
+        const dst = &pipes[dst_idx];
+        if (src.ref_count == 0 or dst.ref_count == 0) {
+            pipe_lock.release(flags);
+            return -1;
+        }
+        if (dst.read_refs == 0) {
+            pipe_lock.release(flags);
+            sig_mod.raiseSelf(sig_mod.SIGPIPE);
+            return -32;
+        }
+        if (src.read_reservation != 0) {
+            pipe_lock.release(flags);
+            return -11;
+        }
+        const readable: u32 = if (src.tail >= src.head) src.tail - src.head else PIPE_BUF_SIZE - src.head + src.tail;
+        if (readable == 0 and src.write_refs == 0) {
+            pipe_lock.release(flags);
+            return 0;
+        }
+        const dst_readable: u32 = if (dst.tail >= dst.head) dst.tail - dst.head else PIPE_BUF_SIZE - dst.head + dst.tail;
+        const writable = (PIPE_BUF_SIZE - 1) - dst_readable;
+        if (readable > 0 and writable > 0) {
+            pipe_lock.release(flags);
+            const moved = pipeTransfer(src_idx, dst_idx, count);
+            // Another reader or writer may have emptied the source or filled the destination in between: wait again.
+            if (moved != 0) return moved;
+            continue;
+        }
+        if (nonblocking) {
+            pipe_lock.release(flags);
+            return -11;
+        }
+        const current = task_mod.getTask(sched.currentTaskIndex() orelse {
+            pipe_lock.release(flags);
+            return -1;
+        }) orelse {
+            pipe_lock.release(flags);
+            return -1;
+        };
+        if (sig_mod.pendingActionable(current)) {
+            pipe_lock.release(flags);
+            return -4; // EINTR; a fatal signal is delivered on the syscall return, after splice drops its descriptor holds
+        }
+        const wait_source = readable == 0;
+        const node = if (wait_source) &current.pipe_read_wait_node else &current.pipe_write_wait_node;
+        const queue = if (wait_source) &pipe_read_waiters[src_idx] else &pipe_write_waiters[dst_idx];
+        node.granted = false;
+        node.next = null;
+        if (!sched.blockOn(queue, node)) {
+            pipe_lock.release(flags);
+            return -1;
+        }
+        _ = @atomicRmw(u64, &current.pending_signals, .Or, 0, .seq_cst);
+        const stop_now = sig_mod.pendingStop(current);
+        pipe_lock.release(flags);
+        if (!(stop_now and sig_mod.stopWhileWaiting(current))) sched.rescheduleAfterBlock();
+        const cleanup = pipe_lock.acquire();
+        if (wait_source) unlinkPipeReadWaiterLocked(src_idx, node) else unlinkPipeWriteWaiterLocked(dst_idx, node);
+        pipe_lock.release(cleanup);
+    }
 }
 
 pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u32) i64 {

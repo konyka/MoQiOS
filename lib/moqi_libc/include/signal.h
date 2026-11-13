@@ -6,7 +6,7 @@
  *
  * signal(sig, handler) installs the handler with BSD semantics, like glibc: the handler stays installed after it runs, the
  * signal is blocked while it runs, and SA_RESTART is requested (the kernel then re-runs an interrupted read, write, waitpid,
- * wait4, readv, writev, accept or socket send/receive after the handler returns; connect, sleeps, pause, sigsuspend and the
+ * wait4, readv, writev, accept, socket send/receive or splice after the handler returns; connect, sleeps, pause, sigsuspend and the
  * poll/epoll waits still fail with EINTR). It returns the previous handler, or SIG_ERR with errno EINVAL for a signal number
  * outside 1..64 or the reserved 32 and 33, or for SIGKILL and SIGSTOP, which cannot be caught or ignored.
  *

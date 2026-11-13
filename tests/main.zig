@@ -755,8 +755,13 @@ test "splice pipe-to-file nonblocking result distinguishes live pipe from EOF" {
 
 test "pipe-to-pipe splice honors descriptor nonblocking status" {
     const source = kt.splice_source;
-    try std.testing.expect(std.mem.count(u8, source, "(flags & SPLICE_F_NONBLOCK != 0) or (fd_table.fds[pipe_fd].status_flags & 0x800 != 0)") >= 2);
-    try std.testing.expectEqual(@as(i64, -11), splice.pipeTransferResult(0, 0));
+    try std.testing.expect(std.mem.count(u8, source, "(flags & SPLICE_F_NONBLOCK != 0) or (fd_table.fds[pipe_fd].status_flags & 0x800 != 0) or total > 0") == 2);
+    try std.testing.expect(std.mem.indexOf(u8, source, "(fd_table.fds[in_fd].status_flags | fd_table.fds[out_fd].status_flags) & 0x800 != 0") != null);
+    // An empty source with no writers is EOF (0); the waiting transfer reports EAGAIN itself when it may not wait.
+    try std.testing.expectEqual(@as(i64, 0), splice.pipeTransferResult(0, 0));
+    try std.testing.expectEqual(@as(i64, -11), splice.pipeTransferResult(0, -11));
+    try std.testing.expectEqual(@as(i64, -4), splice.pipeTransferResult(0, -4));
+    try std.testing.expectEqual(@as(i64, 9), splice.pipeTransferResult(9, -4));
     try std.testing.expectEqual(@as(i64, 17), splice.pipeTransferResult(0, 17));
 }
 
