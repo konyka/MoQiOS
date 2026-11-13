@@ -7969,7 +7969,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：hello262 新增 F 段。修复前的内核（SMP=2）得到 `(3, 3)`：阻塞的那次也被丢掉。日志开头是 `spawned hello2`、`spawned hello262`。
 - 实现：停止类分支先走 `ignoredAtSend`（内部是 `signal_action_policy.droppedAtSend`）。丢弃的不再停任务；已装 handler 或被阻塞的走普通 pending；其余（默认动作且未阻塞）仍立刻停止。
 - 绿灯：目标机定向 SMP=2 一份、SMP=4 两份 hello262 全过（F 段 `(7, 3)`）。`zig build test` 通过，三个架构构建通过。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello57、hello184、hello262、hello267、hello286、hello288、hello289 都通过，hello228 的 `corrupted canaries` 都是 0。
-- CI 记录（如实）：上一个提交 `573aaad`（hello184 F）的 CI 在 SMP=2 冒烟里 hello286 J 段失败（60 轮组停止只报告了 51 次，继续也是 51 次）。这一项不涉及 TCP，也不涉及本节改动；它是文档里已记录的 hello286 J 偶发项（之前本地见过 30/60），本地四份完整 smoke 里 hello286 都通过。根因没有查清，仍是开放项。
+- CI 记录（如实）：上一个提交 `573aaad`（hello184 F）的 CI 在 SMP=2 冒烟里 hello286 J 段失败（60 轮组停止只报告了 51 次，继续也是 51 次）。这一项不涉及 TCP，也不涉及本节改动；它是文档里已记录的 hello286 J 偶发项（之前本地见过 30/60），本地四份完整 smoke 里 hello286 都通过。~~根因没有查清，仍是开放项。~~（根因已查清并修复，见文末“futex 等待中的线程不处理默认停止信号”一节）
 - 如实的局限：①`SIGTTIN`/`SIGTTOU` 没有单独用例，走的是同一分支；②进程组发送仍按每个成员自己的掩码判断，没有 Linux 那种先放进共享集合再由不阻塞的线程取出的窗口。
 
 
@@ -8017,5 +8017,27 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 查因：P 段的子进程按顺序做四次 `sigtimedwait`，正常时共约 1.4 秒（1 秒超时、立刻返回、0.4 秒超时、立刻返回），出错时最多 7.4 秒。`d00b1d4` 把子进程的定时器等待加长到 1 s 和 3 s，但父进程这边仍是一次 `wait_for`（300 次 `nap(10)`，名义 3 秒）。VM 负载高时，子进程的 1.4 秒加上调度延迟就可能超过父进程的 3 秒。这是根据代码和输出推出的，没有记录子进程实际用了多久。
 - 修改：父进程最多调用 4 次 `wait_for`（名义 12 秒），比子进程最坏的 7.4 秒长。子进程的判定和退出码都不变。
 - 验证：这次失败只在一份完整 smoke 里出现过，修改前没有做定向复现，所以没有红灯，这里如实记录。宿主机 Linux 上 hello288 全过（P 段 `(1, exit 0)`）。修改后完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello288 P 都是 `(1, exit 0)`，hello286 J 都是 60/60。
-- 同一份 smoke 里 hello286 J 再次少报告组停止（27/60，继续也是 27/60）。这是已记录的偶发开放项，与本次修改无关，根因仍没查清。
+- 同一份 smoke 里 hello286 J 再次少报告组停止（27/60，继续也是 27/60）。这是已记录的偶发开放项，与本次修改无关。~~根因仍没查清。~~（已查清并修复，见下一节）
+
+
+## futex 等待中的线程不处理默认停止信号，整组停止停在半路（hello286 J，已修）
+
+- 起因：hello286 J 偶尔少报告组停止。CI 上见过 51/60，本地见过 30/60、27/60、40/60。
+- 复现：把 hello286 临时放到开机后第一个跑，并在 J 段加诊断。失败的那一轮，`SIGSTOP` 发出后等了 3 秒都没有停止报告，再等 200 ms 子进程也不再写管道。再发一次 `SIGSTOP`，立刻报出 `0x137f`。
+- 查因：在 `task.markStopped` 和 `exitTask` 里临时打印“谁停了、组里还在等谁”。定向 SMP=2 跑了六份，其中两份失败（32/60、2/60），最后一轮的现象相同：组长和新线程都停了，只剩 tid 25 没停，它处于 `.ready`，之后再也没有停下。tid 25 是 J 段的 churn 线程，几乎一直睡在 `pthread_join` 的 `FUTEX_WAIT` 里。经过如下：
+  1. 上一轮的 `SIGCONT` 把 tid 25 的 `stopped` 清零并调用 `unblockTask`，它变成 `.ready`，但这次 futex 等待并没有被 grant。
+  2. 它还没跑起来，下一轮的 `SIGSTOP` 就到了。发送端看到它不是 `.blocked`，只置待处理位，然后踢它所在的 CPU。
+  3. tid 25 回到 futex 等待循环。这个循环只检查 `pendingFatal` 和 `pendingActionable`，默认停止信号两者都不算，所以它重新标成 `.blocked` 接着睡，`SIGSTOP` 一直挂在待处理位上。
+  4. 它不再执行用户代码，所以管道没有写入；但它的 `stopped` 也没有置上，`markStopped` 就一直认为组里还有成员在跑，停止报告始终不发。等下一次 `SIGSTOP` 到达时它已经是 `.blocked`，发送端直接把它停下，报告这才补上。
+- Linux 依据：`3rd/linux-7.0.6/kernel/futex/waitwake.c` 里，`futex_wait` 遇到 `signal_pending` 时返回 `-ERESTARTSYS`（700–703 行）；`kernel/signal.c` 的 `get_signal` 调用 `do_signal_stop`（2985 行）让线程停下，继续之后再重启这次系统调用。也就是说，Linux 上任何待处理信号（包括停止信号）都会让 futex 等待退出。宿主机实测 hello286（`-DHOST`）J 段为 60/60。
+- 红灯：在未修复的内核上（只加了诊断打印），定向 SMP=2 六份里有两份 J 段失败（32/60、2/60），日志开头是 `spawned hello2`、`spawned hello286`。
+- 实现：
+  - `pendingStop` 和 `stopWhileWaiting` 从 `signal_syscall.zig` 搬到 `signal.zig` 并改为 `pub`。`pause`/`sigsuspend` 的等待循环继续调用它们，行为不变。
+  - futex 等待循环在重新标成 `.blocked` 之后，用一次原子读改写读出待处理位。如果有默认停止信号，就释放桶锁，当场停下；继续之后回到循环开头，重新判断 `granted`、超时和信号。等待节点始终挂在桶上，停止期间发生的唤醒会置 `granted`，下一轮能看到。
+  - 发送端 `sendSignalInfoResult` 置位之后，如果目标已经变成 `.blocked`，就按“睡着的目标”的路径直接把它停下。等待端是先存 `.blocked` 再读待处理位，发送端是先置位再读状态，两边至少有一边能看到对方，所以停止不会被两边同时漏掉。
+- 绿灯：目标机定向 SMP=2 六份、SMP=4 两份 hello286 全部通过，J 段都是 60/60。`zig build test` 通过，三个架构都能构建。完整 smoke 四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，四份里 hello286 J 都是 60/60，hello288 P 都是 `(1, exit 0)`，hello228 的 `corrupted canaries` 都是 0。
+- 如实的局限：
+  1. 只修了 futex 等待。其它阻塞点（管道、socket、`waitpid`、`nanosleep`、`epoll`、消息队列等）的等待循环同样只看 `pendingActionable`，理论上存在同样的窗口。这些没有逐个修改，也没有测试覆盖。
+  2. 停下的方式和 Linux 不同：不是返回 `-ERESTARTSYS` 再重启系统调用，而是在内核里原地等待。对用户态的效果一样，但停止期间超时时间照样在走。
+  3. 上一个提交 `cc5c1b3` 的 CI（43355489709）在 SMP=2 冒烟里 hello288 P 失败，子进程以 2 退出：信号被阻塞时，50 ms 的定时器信号在 3 秒内没有被 `sigtimedwait` 取到。这与本节无关，属于开放项“定时器按 tick 到期，负载高时会晚到”，原因还没有查清。
 

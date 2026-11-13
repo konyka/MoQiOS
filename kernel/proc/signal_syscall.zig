@@ -590,7 +590,7 @@ pub fn waitForSignal(cur_idx: u32, cur: *task_mod.Task) void {
     while (!sig_mod.pendingActionable(cur) and sig_mod.pendingFatal(cur) == null) {
         if (stopWhileWaiting(cur)) continue;
         task_mod.blockTask(cur_idx);
-        if (sig_mod.pendingActionable(cur) or sig_mod.pendingFatal(cur) != null or pendingStop(cur)) {
+        if (sig_mod.pendingActionable(cur) or sig_mod.pendingFatal(cur) != null or sig_mod.pendingStop(cur)) {
             task_mod.unblockTask(cur_idx);
             continue;
         }
@@ -599,27 +599,9 @@ pub fn waitForSignal(cur_idx: u32, cur: *task_mod.Task) void {
     }
 }
 
-fn pendingStop(cur: *task_mod.Task) bool {
-    const pending = @atomicLoad(u64, &cur.pending_signals, .seq_cst) & ~cur.signal_mask;
-    var bits = pending;
-    while (bits != 0) {
-        const bit: u6 = @intCast(@ctz(bits));
-        bits &= bits - 1;
-        const signum = @as(u32, bit) + 1;
-        if (sig_mod.defaultAction(signum) != .stop) continue;
-        if (signum == sig_mod.SIGSTOP or cur.sigact().handlers[bit] == 0) return true;
-    }
-    return false;
-}
-
-/// A default stop that is pending while the task waits for a signal stops it here (it is not a signal pause() returns for); the task
-/// stays off the CPU until SIGCONT or SIGKILL, then the wait goes on. Returns whether it stopped.
+/// A default stop that is pending while the task waits for a signal stops it here (it is not a signal pause() returns for).
 fn stopWhileWaiting(cur: *task_mod.Task) bool {
-    const signum = sig_mod.takePendingStop(cur) orelse return false;
-    sig_mod.stopTask(cur, signum);
-    while (@atomicLoad(bool, &cur.stopped, .acquire)) sched.forceReschedule();
-    sched.repairCurrentAfterBlock();
-    return true;
+    return sig_mod.stopWhileWaiting(cur);
 }
 
 /// pause() → -EINTR once a signal has been caught (the dispatcher runs the handler before returning to user mode). A signal

@@ -240,6 +240,12 @@ pub fn sendSignalInfoResult(target_tid: u32, signum: u32, info: siginfo.Info) i6
                 return 0;
             }
             _ = @atomicRmw(u64, &t.pending_signals, .Or, @as(u64, 1) << @intCast(signum - 1), .seq_cst);
+            // The target may have gone back to sleep between the check above and the bit: a wait loop that re-blocks after
+            // checking for a pending stop would otherwise keep it pending forever (futex.zig pairs with this).
+            if (stopsBlockedTarget(t, signum, @intCast(i))) {
+                if (takePendingStop(t)) |s| stopTask(t, s);
+                return 0;
+            }
             kickIfBlocked(@intCast(i));
             if (t.state == .running and defaultAction(signum) == .stop) {
                 // A running target notices the pending bit only at its next entry; keep kicking until it is off the CPU. The caller
@@ -495,6 +501,33 @@ pub fn takePendingStop(t: *task.Task) ?u32 {
         return signum;
     }
     return null;
+}
+
+/// Whether a pending, unblocked signal would stop `t` by its default action (SIGSTOP always; SIGTSTP/SIGTTIN/SIGTTOU without a handler).
+pub fn pendingStop(t: *task.Task) bool {
+    const pending = @atomicLoad(u64, &t.pending_signals, .seq_cst) & ~t.signal_mask;
+    var bits = pending;
+    while (bits != 0) {
+        const bit: u6 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const signum = @as(u32, bit) + 1;
+        if (defaultAction(signum) != .stop) continue;
+        if (signum == SIGSTOP or t.sigact().handlers[bit] == 0) return true;
+    }
+    return false;
+}
+
+/// A task inside a blocking wait takes a pending default stop where it is: it stops, stays off the CPU until SIGCONT or SIGKILL,
+/// and then the caller re-checks its wait condition (Linux interrupts the wait, handles the stop and restarts the call). A wait that
+/// re-blocked with the stop still pending would never stop, and its group stop would never complete. The caller must not hold a
+/// lock. Returns whether the task stopped.
+pub fn stopWhileWaiting(t: *task.Task) bool {
+    const signum = takePendingStop(t) orelse return false;
+    stopTask(t, signum);
+    const sched = @import("sched.zig");
+    while (@atomicLoad(bool, &t.stopped, .acquire)) sched.forceReschedule();
+    sched.repairCurrentAfterBlock();
+    return true;
 }
 
 /// Check if a task has any pending, non-blocked signals.

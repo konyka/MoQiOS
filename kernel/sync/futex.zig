@@ -394,7 +394,16 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
                     // A linked, ungranted futex node must remain blocked so an
                     // exact-key wake sees it as eligible rather than losing it.
                     cur_task.state = .blocked;
+                    // A default stop is not a reason to return, but it must be taken here: re-blocking with it pending would leave
+                    // this thread running as far as its group stop is concerned (hello286 J: a SIGCONT readies a joiner without
+                    // granting its wait, and a SIGSTOP sent before it re-blocks was never acted on). The read-modify-write orders
+                    // the .blocked store before the pending check; the sender sets the bit and then checks for .blocked
+                    // (signal.sendSignalInfoResult), so one of the two sides takes the stop. A wake while stopped sets `granted`,
+                    // which the next pass sees.
+                    _ = @atomicRmw(u64, &cur_task.pending_signals, .Or, 0, .seq_cst);
+                    const stop_now = sig_mod.pendingStop(cur_task);
                     bucket.lock.release(flags2);
+                    if (stop_now) _ = sig_mod.stopWhileWaiting(cur_task);
                     continue;
                 }
 
