@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello289`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello290`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -285,6 +285,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello287 | `exit_group`（原生 501）结束进程的每一个线程：主线程 `exit_group(42)` 报告为 `0x2a00`，之后旋转的线程不再写管道；只保留状态的低 8 位（300 报告为 44）；非主线程调用时主线程也随之结束，报告的是它给的状态；主线程 `exit(5)` 同样结束其他线程（libc 的 `_exit` 走 `exit_group`）；`pthread_exit` 只结束自己的线程；连续 40 个进程（宿主机 Linux 实测同结果）；主线程 `SYS_exit` 后另一个线程还在跑时，进程要等最后一个线程退出才被报告，状态是那个线程的（G/H） |
 | hello288 | `rt_tgsigqueueinfo`（226）按线程投递：发给另一个线程时 handler 在那个线程里运行，带调用者的 value 和 `SI_QUEUE`；发给自己时在自己线程里运行；tgid 不对或 tid 不属于 tgid 是 `ESRCH`；tid/tgid 为 0 或负数是 `EINVAL`；信号号 65 是 `EINVAL`；sig 0 只探测；坏 siginfo 指针是 `EFAULT`；`rt_sigqueueinfo`（222）只允许向调用者自己的 tid 伪造 `SI_USER`（非主线程发给 `getpid()` 是 `EPERM`），不存在的 pid 配信号 65 是 `ESRCH`（F）；两个调用对子进程第二个线程发 `SIGSTOP`/`SIGCONT` 都停下、继续整个子进程，报告 `0x137f`/`0xffff`（G/H）；主线程阻塞 `SIGUSR1` 时，`kill(getpid())` 和 `rt_sigqueueinfo(getpid())` 的 handler 在另一个线程里运行，主线程上没有留下待处理信号（I）；两个线程都阻塞时 `kill(getpid())` 等着，先解除阻塞的那个线程运行 handler（J）；另一个线程的 `sigpending` 看得到这个信号，它的 `sigtimedwait` 取走信号和值，`tkill` 发给主线程的信号另一个线程看不到（K）；被点名的线程退出后信号仍在，主线程解除阻塞后 handler 在主线程里运行，值还在（L）；`SIG_IGN` 把 held 的进程级信号从所有线程上丢掉，`tkill` 给兄弟线程的另一个信号保留（M）；都阻塞的实时信号发两次，先解除阻塞的线程按顺序运行两个实例（N）；忽略且未阻塞的信号在发送时丢弃，`sigtimedwait` 超时，阻塞时则能取到（O）；POSIX 定时器过期和 `mq_notify` 的信号同样如此（P）；`RLIMIT_SIGPENDING` 限制该 uid 已排队的实时信号实例，超出后 `rt_sigqueueinfo` 是 `EAGAIN`，`kill` 仍置待处理位（Q）；20 个 15 ms 的一次性定时器没有一个提前到期或丢失，刚设好 1.234567891 s 的定时器 `timer_gettime` 报告的剩余时间不超过设定值、精确到纳秒（R）（宿主机 Linux 实测同结果） |
 | hello289 | Linux personality（`personality(1)`）下 231 号是 `exit_group`：子进程调用 `231(300)` 后整个进程结束，报告 `0x2c00`，另一个线程之后不再写管道；247 号是 `waitid`，报告孙进程为 `CLD_EXITED`、`si_status` 7。原生 personality 下 231 仍是 `move_pages`（status-only 形状返回 0）、247 仍是 `clock_nanosleep`（20 ms 睡眠返回 0）（C/D 宿主机 Linux 实测同结果） |
+| hello290 | 阻塞的 `flock(LOCK_EX)` 和 `fcntl(F_SETLKW)` 在持有者解锁后返回 0，等待期间几乎不消耗 CPU；`flock` 在持有者退出时释放，`fcntl` 锁在持有者关闭描述符或被 `SIGKILL` 时释放；两个不同的 `/tmp` 文件的锁互不影响（宿主机 Linux 实测同结果） |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。

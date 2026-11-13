@@ -685,7 +685,9 @@ testing.
 并没有任何中断被投递。
 
 这不是 `sched_yield` 独有的问题：`forceReschedule` 的所有调用方（futex 等待、SysV 信号量、
-`ipc`、阻塞 `flock`、`pause`）都走同一条路径，因此修正落在 `forceReschedule` 自身而非调用点。
+`ipc`、阻塞的文件锁、`pause`）都走同一条路径，因此修正落在 `forceReschedule` 自身而非调用点。
+阻塞的 `flock` 和 `fcntl F_SETLKW` 现在不再只靠让出：冲突时把自己标成 `.blocked` 并发布
+`sleep_deadline_ns`，由锁释放或下一个时钟 tick 唤醒（`fs/file_lock.zig`，hello290）。
 此前无法触及是因为**没有任何用户程序调用过 `sched_yield`**，`hello31` 是第一个。
 
 **实时调度类 SCHED_FIFO / SCHED_RR（F3，2026-08-02 完成 ✅）**

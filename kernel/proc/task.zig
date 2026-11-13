@@ -1299,6 +1299,8 @@ pub fn exitTask(requested_code: i32) void {
         }
     }
     task_lock.release(flags);
+    // fcntl locks belong to the process and outlive any one descriptor: they go when the process does, which is this exit when it reports to its parent. flock locks already went with the last close of their open file description.
+    if (notify_parent) @import("../fs/file_lock.zig").releaseProcess(reporter.tid);
     for (0..death_n) |k| _ = @import("signal.zig").sendSignal(death_tids[k], death_sigs[k]);
     if (completes_stop) |leader| @import("signal.zig").reportGroupStop(leader, if (completes_sig != 0) completes_sig else 19);
 
@@ -1597,6 +1599,8 @@ pub fn abortUnpublishedChild(slot: u32) bool {
             }
             vfs.freeFdTable(t.fd_table);
         }
+        // The unpublished child never ran, but a lock could only exist if it had; releasing by its pid is a no-op unless one does.
+        @import("../fs/file_lock.zig").releaseProcess(t.tid);
     }
     if (t.page_table_phys != 0 and t.mm != null) {
         const shared = t.mm.?.isShared();

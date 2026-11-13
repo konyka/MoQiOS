@@ -662,11 +662,13 @@ pub fn setOffsetOf(desc: *FileDescriptor, v: u64) void {
     syncOffsetOut(desc);
 }
 
-fn releaseOffsetSlot(slot: u16) void {
-    if (slot == 0) return;
+/// Drop one holder of a shared open-file offset. True when that was the last
+/// holder, so the open file description itself is gone.
+fn releaseOffsetSlot(slot: u16) bool {
+    if (slot == 0) return true;
     const f = shared_offsets_lock.acquire();
     defer shared_offsets_lock.release(f);
-    _ = shared_offsets.release(slot);
+    return shared_offsets.release(slot);
 }
 
 /// Open file descriptor.
@@ -2157,8 +2159,11 @@ pub const FdTable = struct {
         var desc = self.fds[fd];
         const fd_generation = self.fd_generations[fd];
         // This descriptor stops holding its shared offset (the slot is reusable
-        // once every holder is gone).
-        releaseOffsetSlot(desc.offset_slot);
+        // once every holder is gone). A private offset, or the last holder of a
+        // shared one, is the end of that open file description, so its flock
+        // goes with it; fcntl locks are released by the process instead.
+        const last_ofd = releaseOffsetSlot(desc.offset_slot);
+        if (last_ofd) if (@import("file_lock.zig").lockKey(&desc)) |key| @import("file_lock.zig").releaseFlock(key);
         // Elect the owner while this slot is still CLOSING. CLEANING is an
         // owner marker, not another live reference: a peer that closes after
         // this decision must drop its slot rather than skip teardown too.
@@ -2625,7 +2630,7 @@ fn releaseResource(desc: *const FileDescriptor) void {
 /// socket closed, or the receiver had no room): give back everything it held.
 pub fn releaseDescriptor(desc: *const FileDescriptor) void {
     releaseResource(desc);
-    releaseOffsetSlot(desc.offset_slot);
+    if (releaseOffsetSlot(desc.offset_slot)) if (@import("file_lock.zig").lockKey(desc)) |key| @import("file_lock.zig").releaseFlock(key);
 }
 
 /// Copy of `table.fds[fd]` for passing to another process, holding its own

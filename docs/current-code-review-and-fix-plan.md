@@ -8060,5 +8060,24 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 如实的局限：
   1. timerfd 仍按 tick 计数到期，`timerfd_gettime` 报告的剩余时间是 10 ms 的整数倍；没有改，也没有新测试。
   2. 定时器仍由 BSP 的时钟中断检查，到期后最多晚一个 tick（约 10 ms）才发信号。
-  3. 其它在系统调用里只靠 `forceReschedule()` 让出、不把自己标成 `.blocked` 的等待循环，同样会让所在 CPU 收不到时钟中断。这次只改了 `rt_sigtimedwait`，没有逐个排查。
+  3. 其它在系统调用里只靠 `forceReschedule()` 让出、不把自己标成 `.blocked` 的等待循环，同样会让所在 CPU 收不到时钟中断。~~这次只改了 `rt_sigtimedwait`，没有逐个排查。~~（`flock` 和 `fcntl F_SETLKW` 已改，见下一节；`devfs_nodes.mouseRead` 仍是忙让出，最多 100 次）
+
+
+## 阻塞的 `flock`/`F_SETLKW` 忙等后放弃，锁在关闭和退出时也不释放（hello290，已修）
+
+- 起因：上一节的局限 3。逐个看 `forceReschedule()` 的调用点，`kernel/fs/file_lock.zig` 的 `sysFlock` 和 `setLock`（`F_SETLKW`）在冲突时只让出再重试，而且最多 128 次，之后返回 `EAGAIN`。顺带发现两处更基本的问题：锁表里的锁在 `close` 和进程退出时都不释放；tmpfs 描述符的 `inode_id` 恒为 0，所有 tmpfs 文件共用一把锁。
+- Linux 依据：`3rd/linux-7.0.6/fs/locks.c` 的 `flock_lock_inode_wait`（1161 行）和 `posix_lock_inode_wait`（1340 行）都用 `wait_event_interruptible` 睡下，锁释放时由 `locks_wake_up_blocks`（899 行）唤醒。`flock` 挂在打开文件描述上，最后一次 `close` 释放（`filp_close` → `locks_remove_flock`）；`fcntl` 锁挂在进程上，进程退出时由 `locks_remove_posix` 释放。宿主机实测 `/tmp/fl.c`：父子都绑在 CPU 0，子进程持锁 300 ms，`flock(LOCK_EX)` 和 `fcntl(F_SETLKW)` 都返回 0、都等了 300 ms。宿主机 hello290（`-DHOST`）六项全部通过，其中阻塞等待的 CPU 时间是 0 ms。
+- 红灯：未修改的内核上定向 SMP=2 一份 hello290 六项全失败（日志开头 `spawned hello2`、`spawned hello290`）：A/B 的阻塞调用 4 ms 后返回 `-11`，自己消耗了 3 ms CPU；C/D/E 的非阻塞获取返回 `-11`（锁还在）；F 里两个不同的 `/tmp` 文件互相冲突。
+- 实现：
+  - 冲突时按 `rt_sigtimedwait` 的写法睡下：发布 `sleep_deadline_ns`（现在 + 10 ms），置 `sched.sleep_bm` 位和新增的 `lock_waiter_bm` 位，`blockTask` 后如果已有致命或可处理信号就立刻 `unblockTask`，然后让出；醒来后清掉这三项。`LOCK_UN`、`F_UNLCK`、`releaseFlock`、`releaseProcess` 释放锁后对 `lock_waiter_bm` 里的任务调 `unblockTask`，最迟也由下一次 `sleepTimerTick` 叫醒。去掉了 128 次的上限。
+  - 锁的归属改成进程（`getpid()` 的 id），不再是单个线程的 tid。
+  - 文件标识改用和 `O_APPEND` 相同的规则（`lockKey`）：tmpfs 用 `0x1000… + tmpfs_idx`，FAT32 用首簇，其它用 `inode_id`。`inode_id` 为 0 的描述符不能加锁。
+  - `flock` 随打开文件描述走：`finishClose` 和 `releaseDescriptor` 在释放共享偏移时，如果这是最后一个持有者，就调 `releaseFlock`。`fcntl` 锁随进程走：`exitTask` 在进程向父进程报告退出时调 `releaseProcess`，`abortUnpublishedChild` 也按 pid 释放（未运行的子进程没有锁，是空操作）。
+- 绿灯：目标机定向 SMP=2 一份 hello290 六项全部通过（日志开头 `spawned hello2`、`spawned hello290`）：阻塞的 `flock` 等了 311 ms、CPU 时间 4 ms，`F_SETLKW` 等了 310 ms、CPU 时间 5 ms；退出、关闭、被 `SIGKILL` 后锁都消失；两个 `/tmp` 文件互不干扰。
+- 如实的局限：
+  1. `flock` 锁和覆盖整个文件的 `fcntl` 锁在表里长得一样（`start` 0、`len` 0），`releaseFlock` 分不出两者，所以整文件的 `fcntl` 锁也会在最后一次 `close` 时释放。部分范围的 `fcntl` 锁不受影响。
+  2. 空的 FAT32 文件首簇都是 0，它们的锁标识相同，会互相冲突；文件写过之后首簇才不同。tmpfs 不受影响。
+  3. 等待仍是每 10 ms 醒来重查一次，不是纯事件驱动；释放方会主动唤醒，所以通常不用等满这 10 ms。
+  4. `devfs_nodes.mouseRead` 仍是最多 100 次的忙让出，没有改。
+  5. 共享打开文件描述的判定用的是共享偏移槽：描述符还没被 `dup`/`fork` 过时偏移是私有的，关闭它就算最后一次，符合 `flock` 的语义；偏移池满了退回私有偏移时，两个描述符会被当成各自独立的打开文件描述。
 
