@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello299`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello300`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -295,6 +295,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello297 | `splice` 等空管道时对信号的反应：没有 `SA_RESTART` 的处理函数让 pipe→文件的 splice 返回 `EINTR`（A），有 `SA_RESTART` 时重新执行并返回之后写入的 3 字节（B），`SIGSTOP` 让阻塞的进程停下（`0x137f`），`SIGCONT` 后继续并拿到数据（C），`SIGKILL` 杀死它（D）；pipe→pipe 的 splice 在源管道空时等待、被处理函数以 `EINTR` 结束（E），`SPLICE_F_NONBLOCK` 是 `EAGAIN`（F），数据到达后返回 4 字节（G），写端全关返回 0（H）。文件端在目标机上是 ext2 的 `testdir/h297`（宿主机 Linux 实测同结果） |
 | hello298 | tmpfs 文件可以做 `splice` 和 `sendfile` 的文件端：文件→管道搬 4 字节并推进文件偏移（A），显式偏移只改偏移变量（B），管道→文件写在文件偏移处（C）或显式偏移处（D），`sendfile` 从 tmpfs 文件到管道（E），另一个描述符追加的字节也能 splice 出来（F），在末尾和越过末尾返回 0（G）（宿主机 Linux 实测同结果） |
 | hello299 | `splice` 和 `sendfile` 读 ext2（`testdir/h299e`）和 FAT32（`h299f`）文件时能看到另一个描述符刚写入、还在写回缓存里的字节：先打开的描述符 splice 出新写的 11 字节（A），`sendfile` 从偏移 6 发出 "world"（B），中间被覆盖的字节按新内容读出（C），在新末尾返回 0（D）（宿主机 Linux 实测同结果） |
+| hello300 | 阻塞在 eventfd 读、timerfd 读、`mq_receive`、`epoll_wait`、AF_UNIX `recv`、`nanosleep` 里的进程收到 `SIGSTOP` 立即停下（`0x137f`），停止期间不运行，`SIGCONT`（`0xffff`）后等待继续并在事件到达时完成，每种 30 轮；另有 200 轮在事件之后隔一段可变时间发 `SIGSTOP`，停止信号落在子进程回到等待途中也必须停下（宿主机 Linux 实测同结果） |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
 每个测试在结束前打印 `helloN: PASS` / `helloN done` 等标记，由 init 顺序回收，构成自动化回归。

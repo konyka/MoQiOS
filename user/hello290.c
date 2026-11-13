@@ -82,6 +82,9 @@ static void blocked_wait(int posix, const char *name) {
         lock_ex(f, posix, 0);
         ready();
         nap(300);
+        /* Tell the parent when the lock goes away: its call must not return before this. */
+        long unlock_at = ms_of(CLOCK_MONOTONIC);
+        write(sp[1], &unlock_at, sizeof unlock_at);
         if (posix) posix_lock(f, C_SETLK, 2);
         else do_flock(f, L_UN);
         nap(100);
@@ -92,10 +95,14 @@ static void blocked_wait(int posix, const char *name) {
     long busy = lock_ex(fd, posix, 0);
     long t0 = ms_of(CLOCK_MONOTONIC), c0 = ms_of(CPU_CLOCK);
     long r = lock_ex(fd, posix, 1);
-    long waited = ms_of(CLOCK_MONOTONIC) - t0, cpu = ms_of(CPU_CLOCK) - c0;
-    snprintf(msg, sizeof msg, "%s: a blocked lock returns 0 once the holder unlocks, asleep (busy %ld, r %ld, waited %ld ms, cpu %ld ms)",
-             name, busy, r, waited, cpu);
-    check(busy == -11 && r == 0 && waited >= 200 && cpu < 100, msg);
+    long done_at = ms_of(CLOCK_MONOTONIC);
+    long waited = done_at - t0, cpu = ms_of(CPU_CLOCK) - c0;
+    long unlock_at = 0;
+    read(sp[0], &unlock_at, sizeof unlock_at);
+    /* The bound is the holder's unlock time, not a fixed 200 ms: under load the parent can start waiting late. */
+    snprintf(msg, sizeof msg, "%s: a blocked lock returns 0 once the holder unlocks, asleep (busy %ld, r %ld, waited %ld ms, %ld ms after the unlock, cpu %ld ms)",
+             name, busy, r, waited, done_at - unlock_at, cpu);
+    check(busy == -11 && r == 0 && unlock_at > 0 && done_at >= unlock_at && cpu < 100, msg);
     close(fd);
     reap(c);
 }

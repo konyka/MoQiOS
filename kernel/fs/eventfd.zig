@@ -162,12 +162,24 @@ fn blockOn(stack: *?*WaitNode, inst: *EventfdInstance, saved: anytype) i64 {
     stack.* = &node;
 
     task_mod.blockTask(cur_idx);
+    // A default stop pending now is taken instead of sleeping: the task is already .blocked and on the wait stack, and the sender
+    // sets the pending bit before it looks at the state, so either this read-modify-write sees the stop or the sender sees .blocked
+    // and stops the task itself (the handshake pipeRead and futex use).
+    const sig_stop = @import("../proc/signal.zig");
+    const me = task_mod.getTask(cur_idx);
+    var stop_now = false;
+    if (me) |t| {
+        _ = @atomicRmw(u64, &t.pending_signals, .Or, 0, .seq_cst);
+        stop_now = sig_stop.pendingStop(t);
+    }
     inst.spin.release(saved);
 
-    // Yield — reschedule will pick another task
-    asm volatile ("int $240");
-    // 阻塞后状态修复：yield 未切换时本任务仍以 .blocked 继续运行
-    sched.repairCurrentAfterBlock();
+    if (!(stop_now and sig_stop.stopWhileWaiting(me.?))) {
+        // Yield — reschedule will pick another task
+        asm volatile ("int $240");
+        // 阻塞后状态修复：yield 未切换时本任务仍以 .blocked 继续运行
+        sched.repairCurrentAfterBlock();
+    }
 
     // Woken — unlink defensively (wake paths already popped the node; a
     // signal kick leaves it linked), then handle signals like timerfdRead.

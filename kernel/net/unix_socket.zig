@@ -1362,6 +1362,7 @@ fn parkOn(idx: u32, kind: WaitKind, min_room: u32, deadline: ?u64) i64 {
     const cur = task_mod.getTask(cur_idx) orelse return -1;
     const bit = @as(u64, 1) << @intCast(cur_idx);
     var node: WaitNode = .{ .task_idx = cur_idx };
+    var stop_now = false;
     {
         const saved = unix_lock.acquire();
         const sock = &unix_sockets[idx];
@@ -1395,11 +1396,18 @@ fn parkOn(idx: u32, kind: WaitKind, min_room: u32, deadline: ?u64) i64 {
             _ = @atomicRmw(u64, &sched.sleep_bm, .Or, bit, .seq_cst);
         }
         task_mod.blockTask(cur_idx);
+        // A default stop pending now is taken instead of sleeping: the task is already .blocked and on the wait stack, and the sender
+        // sets the pending bit before it looks at the state, so either this read-modify-write sees the stop or the sender sees .blocked
+        // and stops the task itself (the handshake pipeRead and futex use).
+        _ = @atomicRmw(u64, &cur.pending_signals, .Or, 0, .seq_cst);
+        stop_now = @import("../proc/signal.zig").pendingStop(cur);
         unix_lock.release(saved);
     }
 
-    asm volatile ("int $240");
-    sched.repairCurrentAfterBlock();
+    if (!(stop_now and @import("../proc/signal.zig").stopWhileWaiting(cur))) {
+        asm volatile ("int $240");
+        sched.repairCurrentAfterBlock();
+    }
     if (deadline != null) {
         cur.sleep_deadline_ns = 0;
         _ = @atomicRmw(u64, &sched.sleep_bm, .And, ~bit, .seq_cst);

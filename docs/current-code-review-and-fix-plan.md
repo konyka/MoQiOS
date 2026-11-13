@@ -8267,7 +8267,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 文件→管道 splice 和 `sendfile` 写管道时走 `pipeWrite`，信号和停止的处理和管道写一样；但那里的致命信号直接 `exitTask`，此时 splice 还持有描述符的 transfer 引用。这条路径这次没有改，也没有测试覆盖。
   2. 等待里收到致命信号时返回 `-EINTR`，进程在系统调用返回时被杀；用户态看不到 `EINTR`，效果和 Linux 一样，只是路径不同。
   3. splice 的文件端不接受 tmpfs 文件（`isFileFd` 只有 ramdisk、FAT32、ext2），Linux 可以。没有在这一节修。（hello298 已修。）
-  4. socket、`epoll`、`nanosleep`、消息队列、eventfd、timerfd 的等待仍只检查 `pendingActionable`，默认停止的窗口还在。
+  4. socket、`epoll`、`nanosleep`、消息队列、eventfd、timerfd 的等待仍只检查 `pendingActionable`，默认停止的窗口还在。（hello300：eventfd、timerfd、消息队列、AF_UNIX 已修，见该节。）
 
 ## splice 和 `sendfile` 不接受 tmpfs 文件（hello298，已修）
 
@@ -8309,3 +8309,30 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 如实的局限：
   1. `readAtOffset` 每次最多读 4 KiB，splice 一块是 8 KiB，所以 ext2/FAT32 的一次 splice 循环次数翻倍。结果正确，吞吐没有测。
   2. procfs、devfs 文件仍然不能做 splice 的文件端。
+
+## eventfd、timerfd、消息队列、AF_UNIX、epoll 的等待漏掉落在睡下途中的默认停止（hello300，已修）
+
+- 起因：hello297 一节的局限 4。这些等待睡下前后只看 `pendingActionable`，默认停止不算在内。`SIGSTOP` 如果在任务挂上等待栈之后、真正让出 CPU 之前到达，发送端看到的状态还不是 `.blocked`，只置待处理位；等待端随后睡下，停止要等下一次唤醒才处理，`waitpid(WUNTRACED)` 等不到 `0x137f`。
+- Linux 依据：`signal_wake_up` 唤醒处于 `TASK_INTERRUPTIBLE` 的任务，等待返回 `-ERESTARTSYS`，任务在返回用户态前处理停止，之后重启调用。宿主机实测（以 `gcc -DHOST -lrt` 跑 hello300，普通和 `taskset -c 0` 都通过）：eventfd 读、timerfd 读、`mq_receive`、`epoll_wait`、AF_UNIX `recv`、`nanosleep` 六种等待，每种：
+  - 30 轮：阻塞中发 `SIGSTOP`，`waitpid` 报 `0x137f`，停止期间子进程不写，`SIGCONT` 报 `0xffff`，之后触发事件，等待完成。
+  - 200 轮竞争：触发事件后空转 0 到 19500 次再发 `SIGSTOP`，让它落在子进程回到等待的途中，每轮都必须报 `0x137f`。
+- 红灯：未修改的内核（`0562bfa`）上定向。SMP=1、SMP=2、SMP=4 的第一版（只有 30 轮）全部通过，说明阻塞中途的停止原本就能处理（发送端看到 `.blocked` 会自己停下任务）。加上竞争段后：SMP=2 一份通过；**SMP=4 一份 eventfd 15/200、AF_UNIX `recv` 79/200**，其余四种 200/200。改完 eventfd、timerfd、AF_UNIX 之后的第一份 SMP=4 又出现 **`mq_receive` 30/200**，另一份 SMP=4 和一份 SMP=2 通过，于是把消息队列也改了。
+- 实现：四处等待都改成 `pipeRead` 用的握手：任务状态置为 `.blocked`、节点已在等待栈上之后，用一次 `@atomicRmw(.Or, 0)` 读待处理位；`pendingStop` 为真就释放锁、调 `stopWhileWaiting` 原地停下，否则照常让出 CPU。发送端先置位再看状态，两边至少有一边处理这次停止。
+  - `kernel/fs/eventfd.zig` `blockOn`（读写共用）。
+  - `kernel/ipc/timerfd.zig` `timerfdRead`。
+  - `kernel/ipc/posix_mq.zig` 发送和接收的两处等待。
+  - `kernel/net/unix_socket.zig` `parkOn`（读、写、`accept` 共用）。
+  - `kernel/net/epoll.zig` 等待循环里睡下的那一处（`ct.state = .blocked` 之后；第一次睡下也在循环里，先在锁下重新检查）。
+- 绿灯：目标机定向 SMP=4 五份、SMP=2 两份（日志开头 `spawned hello2`、`spawned hello300`）。改完前三处后 SMP=4 两份里一份 `mq_receive` 失败（见上）；改完消息队列后 SMP=4 三份、SMP=2 一份全部通过，六种等待 30/30 和 200/200。但随后的第四批完整 smoke 里一份 SMP=4 出现 **`epoll_wait` 159/200**（未修改的内核上定向时它是 200/200），于是 epoll 也改了；改完后定向 SMP=4 三份、SMP=2 一份全部通过。`zig build`、`zig build test` 通过。
+- 完整 smoke 的过程（如实）：
+  - 第一批（只改了前四处，内核 22:25）：SMP=1、SMP=2 和一份 SMP=4 `EXIT=0`、0 FAIL；另一份 SMP=4 `EXIT=1`，失败是 hello108「RT task lost the CPU to reaping」，文档里已记为宿主机负载引起的偶发失败。四份里 hello300 都是 PASS。
+  - 第二批（同一内核）：一份 SMP=4 的 hello290 B 失败（见下面“顺带修的测试”），其余通过，hello300 都是 PASS。
+  - 第三批（同一内核，hello290 已改）：一份 SMP=4 的 hello286 M 19/20，其余通过。
+  - 第四批（同一内核）：一份 SMP=4 的 hello300 `epoll_wait` 159/200，促成了 epoll 的修改；同批还有 SMP=2 的 hello286 J 30/60、SMP=1 的 hello237 K 和 hello256 A（`make_pair` 的 `accept` 返回 `-22`，文档里记过的 TCP 回环偶发失败）。这一批在修改 epoll 时被中途停掉，结果作废。
+  - 第五批（epoll 已改，内核 23:20）：SMP=1 和两份 SMP=4 `EXIT=0`、0 FAIL；SMP=2 那份卡在 hello300 的消息队列一段：日志停在 `[posix_mq] created mq=/h300q` 之后的 `[fork] parent=9270 child=9273`，此后 15 分钟没有输出。QEMU 没有开 gdb 端口，没有抓到现场。随后用同一内核定向 SMP=2 跑了 29 份（其中 6 份在 fork 前后、10 份在打开队列和每轮前后加了标记），全部通过，没有复现。
+  - 最终一批：去掉标记后同一内核四份并行（SMP 1/4/4/2，超时 1400 秒）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello300 都是 PASS，hello286、hello288、hello290–hello299 都通过。
+- 如实的局限：
+  1. `nanosleep`、TCP、SysV 信号量和消息、`ipc.zig` 的同步 IPC 的等待没有改。hello300 的 `nanosleep` 在所有运行里都是 200/200，没有失败证据；TCP 等其余几种没有测试覆盖。epoll 的每次睡下（包括第一次）都经过循环里那一处，所以只改一处就够了。
+  2. 竞争段是概率测试：失败只在 SMP=4 上出现，而且不是每份都出现。通过不能证明窗口完全关闭，只说明这几份没有复现。
+  3. 第五批 SMP=2 那次卡在消息队列一段的 fork 之后，原因不明，之后 29 份定向和最终一批都没有复现。它可能和这次的改动有关（消息队列的等待改了），也可能是 fork 本身的偶发问题，现有证据分不开。
+- 顺带修的测试：hello290 A/B 原来要求阻塞调用至少等 200 ms。本节第二批完整 smoke 的一份 SMP=4 里 B 只等了 131 ms 就成功返回（`-11` 之后 `r 0`，CPU 2 ms），原因是宿主机负载下父进程开始等待时持有者的 300 ms 已经过去一大半，这是计时假设，不是锁的错误。断言改为：持有者解锁前先把解锁时刻写进管道，父进程的调用必须在这个时刻之后才返回，输出里多了“解锁后多少 ms”。宿主机 Linux 两次通过（0 ms）；目标机定向 SMP=4、SMP=2 各一份通过（解锁后 1～2 ms 返回）。

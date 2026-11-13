@@ -1250,8 +1250,12 @@ fn blockOnEpoll(inst: *EpollInstance, deadline_ns: ?u64) BlockOutcome {
         const actionable = sig_mod.pendingActionable(ct);
         if (!expired and !actionable and @atomicLoad(bool, &inst.valid, .acquire)) {
             ct.state = .blocked;
+            // A default stop pending now is taken instead of sleeping (the handshake pipeRead uses): the task is .blocked and
+            // queued, and the sender sets the pending bit before it looks at the state.
+            _ = @atomicRmw(u64, &ct.pending_signals, .Or, 0, .seq_cst);
+            const stop_now = sig_mod.pendingStop(ct);
             inst.spin.release(s2);
-            sched.rescheduleAfterBlock();
+            if (!(stop_now and sig_mod.stopWhileWaiting(ct))) sched.rescheduleAfterBlock();
             continue;
         }
         removeWaiterLocked(inst, &node);

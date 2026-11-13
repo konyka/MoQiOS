@@ -604,9 +604,15 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
             enqueueWaiter(q, waiter, 0);
             if (deadlineNs(abs_timeout_ns)) |deadline| armWaitDeadline(cur_idx, deadline, cur_pin.incarnation, waiter.queue_idx, waiter.queue_generation, waiter.direction, waiter.waiter_generation);
             cur_pin.task.state = .blocked;
+            // A default stop pending now is taken instead of sleeping (the handshake pipeRead uses): the task is already .blocked
+            // and queued, and the sender sets the pending bit before it looks at the state.
+            _ = @atomicRmw(u64, &cur_pin.task.pending_signals, .Or, 0, .seq_cst);
+            const stop_now = @import("../proc/signal.zig").pendingStop(cur_pin.task);
             mq_lock.release(flags);
-            sched.forceReschedule();
-            sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
+            if (!(stop_now and @import("../proc/signal.zig").stopWhileWaiting(cur_pin.task))) {
+                sched.forceReschedule();
+                sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
+            }
             if (deadlineNs(abs_timeout_ns) != null) disarmWaitDeadline(cur_idx);
             const flags2 = mq_lock.acquire();
             if (waiter.linked) _ = claimAndDetach(&queues[waiter.queue_idx], waiter, 0, .cancelled);
@@ -757,9 +763,15 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
             enqueueWaiter(q, waiter, 1);
             if (deadlineNs(abs_timeout_ns)) |deadline| armWaitDeadline(cur_idx, deadline, cur_pin.incarnation, waiter.queue_idx, waiter.queue_generation, waiter.direction, waiter.waiter_generation);
             cur_pin.task.state = .blocked;
+            // A default stop pending now is taken instead of sleeping (the handshake pipeRead uses): the task is already .blocked
+            // and queued, and the sender sets the pending bit before it looks at the state.
+            _ = @atomicRmw(u64, &cur_pin.task.pending_signals, .Or, 0, .seq_cst);
+            const stop_now = @import("../proc/signal.zig").pendingStop(cur_pin.task);
             mq_lock.release(flags);
-            sched.forceReschedule();
-            sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
+            if (!(stop_now and @import("../proc/signal.zig").stopWhileWaiting(cur_pin.task))) {
+                sched.forceReschedule();
+                sched.repairCurrentAfterBlock(); // 阻塞后状态修复（yield 未切换情形）
+            }
             if (deadlineNs(abs_timeout_ns) != null) disarmWaitDeadline(cur_idx);
             const flags2 = mq_lock.acquire();
             if (waiter.linked) _ = claimAndDetach(&queues[waiter.queue_idx], waiter, 1, .cancelled);
