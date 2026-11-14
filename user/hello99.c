@@ -292,10 +292,18 @@ static void phase_swap(void) {
         fail_exit("swapon scratch device");
     swap_armed = 1;
 
+    /* The process before this one (hello98) is torn down by the reaper thread after its waitpid returns, so its memory can still be
+     * missing here. Give the count up to 3 s to settle before judging it; a stable count that is too small is a real failure. */
     u64 sinfo[16];
-    for (int i = 0; i < 16; i++) sinfo[i] = 0;
-    if (syscall1(SYS_SYSINFO, (u64)sinfo) != 0) fail_exit("sysinfo");
-    const u64 freeram_pages = sinfo[5] / 4096;
+    u64 freeram_pages = 0;
+    for (int round = 0; round < 30; round++) {
+        for (int i = 0; i < 16; i++) sinfo[i] = 0;
+        if (syscall1(SYS_SYSINFO, (u64)sinfo) != 0) fail_exit("sysinfo");
+        freeram_pages = sinfo[5] / 4096;
+        if (freeram_pages >= MARGIN_PAGES * 3) break;
+        struct { s64 s, ns; } wait = { 0, 100000000L };
+        syscall2(35 /* nanosleep */, (u64)&wait, 0);
+    }
     if (freeram_pages < MARGIN_PAGES * 3) fail_exit("not enough free RAM");
     saved_floor = syscall1(SYS_PMM_SET_RECLAIM_FLOOR, freeram_pages - MARGIN_PAGES);
     print("hello99:   swap armed, reclaim floor set\n");

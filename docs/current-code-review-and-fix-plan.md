@@ -8201,7 +8201,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello294 都是 PASS。hello286、hello288、hello290、hello291、hello292、hello293 都通过。
 - 如实的局限：
   1. `SIGEV_THREAD` 仍不支持（需要 netlink 通知套接字）。
-  2. 注册所有权按线程组 id 比较，没有 Linux 的 `self_exec_id`：同一进程 `exec` 之后，旧注册如果描述符没关，仍可能投给新镜像。
+  2. 注册所有权按线程组 id 比较，没有 Linux 的 `self_exec_id`：同一进程 `exec` 之后，旧注册如果描述符没关，仍可能投给新镜像。（hello309：`exec` 时直接移除注册，已修。）
 
 ## POSIX 定时器不支持 `SIGEV_THREAD_ID`，到期信号只能发给创建者（hello295，已修）
 
@@ -8220,7 +8220,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 如实的局限：
   1. `SIGEV_THREAD` 仍不支持（需要为通知起一个线程）。
   2. 目标线程在到期前退出时，这次到期直接丢弃，不改投给别的线程。
-  3. 没有 `self_exec_id`：同一进程 `exec` 之后，旧定时器仍可能把 `SIGEV_THREAD_ID` 信号投给新镜像里碰巧得到同一个 tid 的线程。
+  3. 没有 `self_exec_id`：同一进程 `exec` 之后，旧定时器仍可能把 `SIGEV_THREAD_ID` 信号投给新镜像里碰巧得到同一个 tid 的线程。（hello309：`exec` 时删除旧镜像的全部定时器，已修。）
 
 ## `timer_create` 和 `timerfd_create` 只接受 `CLOCK_REALTIME` 与 `CLOCK_MONOTONIC`，`CLOCK_BOOTTIME` 被拒绝（hello296，已修）
 
@@ -8488,7 +8488,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
     （`TIMER_ABSTIME` 对它们没有意义，Linux 同样按相对处理）；`timerGettime`/旧值报剩余 CPU 时间；`timerTick` 在
     `cpu_armed` 为真时每个 tick 都扫，按 `cpuClockNs` 判到期，周期定时器保留相位并计 overrun；所有者消失则停止定时器。
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份，A–G 全部通过（D 触发、G 剩余 49→47 ms）。`zig build`、`zig build test` 通过。
-- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒，宿主机 load 约 1）：SMP=1、一份 SMP=4、SMP=2 `EXIT=0`、0 FAIL；另一份 SMP=4 `EXIT=1`，唯一的失败是 hello99「not enough free RAM」——它在 `sysinfo` 里读到的空闲页低于 3×16384 的前置条件就放弃了，紧接在 hello98（4 个工作者的 swap 压力测试）之后；那份日志里 hello98 本身通过，两者之间没有回收记录。另外三份 hello98 设置回收下限时的空闲页是 67687～86159，都够。与本节改动无关（CPU 定时器只在有 CPU 时钟定时器时才扫），记为新的偶发项，没有查根因（那份 smoke 因此缺 `hello99: PASS` 标记，按 1400 秒超时退出）。四份里 hello308 都是 PASS，`corrupted canaries` 都是 0。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒，宿主机 load 约 1）：SMP=1、一份 SMP=4、SMP=2 `EXIT=0`、0 FAIL；另一份 SMP=4 `EXIT=1`，唯一的失败是 hello99「not enough free RAM」——它在 `sysinfo` 里读到的空闲页低于 3×16384 的前置条件就放弃了，紧接在 hello98（4 个工作者的 swap 压力测试）之后；那份日志里 hello98 本身通过，两者之间没有回收记录。另外三份 hello98 设置回收下限时的空闲页是 67687～86159，都够。与本节改动无关（CPU 定时器只在有 CPU 时钟定时器时才扫），记为新的偶发项（那份 smoke 因此缺 `hello99: PASS` 标记，按 1400 秒超时退出）。**根因已查明**：hello98 退出后由 reaper 线程异步拆除地址空间，`waitpid` 返回时它刚释放的 4 个工作者区域还没全部回到空闲池，hello99 只读一次就判了内存不足。hello99 现在最多等 3 秒（每 100 ms 重读）再判；连续三次 hello96→hello99 定向全过。四份里 hello308 都是 PASS，`corrupted canaries` 都是 0。
 - CI 记录：hello306 的提交 `57ef368` 在 CI 的 SMP=2 上失败，原因是 hello286 J「60 group stops while threads come and go」只有 22/60——这是文档里多次记录的 hello286 J 偶发；下一个提交 `bcdcaf8`（包含同样的代码）的 CI 全部成功。
 - 如实的局限：
   1. 到期靠调度 tick（约 10 ms 一次）检查，所以短间隔的 CPU 定时器最多晚一个 tick 才发出；Linux 用高精度 CPU 时钟事件，
@@ -8497,3 +8497,16 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
      CPU 时刻可等）。
   3. 进程时钟的到期在「组内任何一个线程用掉 CPU」时都可能触发；只有 tick 运行在 BSP，所以组在别的 CPU 上跑满一个 tick
      的时长才必然被看到——与第 1 条同一个精度上限。
+
+## `exec` 之后旧镜像的 POSIX 定时器和 `mq_notify` 注册仍然有效（hello309，已修）
+
+- 起因：hello294、hello295 两节的局限（没有 `self_exec_id`）。实测发现问题比「同 tid 的线程」更直接：`execve` 根本不删旧镜像的定时器，也不移除它的 `mq_notify` 注册。exec 前武装的定时器到期时把信号送进新镜像；新镜像对同一个队列再 `mq_notify` 得到 `EBUSY`。
+- Linux 依据：`fs/exec.c` 的 `begin_new_exec` 调 `exit_itimers()`（删除 POSIX 定时器）；`mq_notify` 的注册挂在 `struct pid` 和 open description 上，exec 之后旧注册不再属于这个镜像。宿主机实测（`/tmp/exid.c`，再以 `gcc -DHOST -lrt` 跑 hello309）：exec 前武装的 100 ms 定时器在新镜像 300 ms 的等待里没有送来信号；新镜像再 `mq_notify` 返回 0。
+- 红灯：未修改的内核（`4991801`）上定向 SMP=2（日志开头 `spawned hello2`、`spawned hello309`）：A 收到了信号 10，B 是 `-16`（`EBUSY`）。
+- 实现（`kernel/proc/execve.zig` 的提交点，紧接 `closeCloexecForTask`）：调 `posix_timer.deleteTimersForTask` 和 `posix_mq.clearNotifyForTask`，两者本来就是退出路径用的。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份，A、B 都通过。`zig build`、`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒）全部 `EXIT=0`、0 FAIL，hello228 corrupted canaries 都是 0；hello309 和改过的 hello99 四份都 PASS。
+- 顺带修正 hello99 偶发：上一个测试退出后地址空间由 reaper 线程异步拆除，hello99 只读一次 `sysinfo` 时可能读到偏低的 freeram（实测一次 49951，正常约 86959，门槛 3×16384）。现在最多重读 30 次、间隔 100 ms（最多等 3 秒）再判断。
+- 如实的局限：
+  1. 这不是 Linux 的 `self_exec_id` 本身（那个计数还用于判断父进程 exec 后 `SIGCHLD`/`pdeath_signal` 是否还该发）；只覆盖了定时器和 `mq_notify` 这两个开放项。
+  2. `timerfd`、`alarm`/`setitimer(ITIMER_REAL)` 在 Linux 上 exec 后保留（前者是描述符，后者按 POSIX 继承），本节没有改动它们。

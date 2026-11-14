@@ -425,6 +425,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello306"); /* process_vm across a 2 MiB user block */
     run_test("hello307"); /* CLOCK_TAI */
     run_test("hello308"); /* POSIX timers on CPU-time clocks */
+    run_test("hello309"); /* exec drops the old image's timers and mq_notify */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

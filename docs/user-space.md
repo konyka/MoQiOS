@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello308`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello309`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -303,6 +303,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello306 | `process_vm_readv`/`process_vm_writev` 访问另一个进程 4 MiB 匿名映射里的 2 MiB 巨页块（映射在 fork 之后建立，避免 fork 拆页）：读到分叉后写入的标记（A），跨 2 MiB 边界的 8 KiB 整块读出（B），写入的标记子进程能看到（C）（宿主机 Linux 实测同结果） |
 | hello307 | `CLOCK_TAI`（11）：`clock_gettime` 等于 REALTIME 加 TAI 偏移（本内核没有 `adjtimex`，偏移是 0；宿主机是 37 秒）（A），`clock_getres` 是 1 ns（B），`clock_nanosleep` 相对和 `TIMER_ABSTIME` 都按 20 ms 睡（C、D），`clock_settime` 是 `EINVAL`（E），`timer_create` 成功（F），`timerfd_create` 是 `EINVAL`（G）（宿主机 Linux 实测同结果） |
 | hello308 | `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID` 上的 POSIX 定时器按 CPU 时间计：两种时钟都能建（A、E）；20 ms 的定时器在进程睡眠时不触发（C），进程用掉 20 ms CPU 后触发（D）；线程时钟只计本线程（F）；`timer_gettime` 报剩余的 CPU 时间，睡眠时不减少（G）（宿主机 Linux 实测同结果） |
+| hello309 | `execve` 丢掉旧镜像留下的东西：exec 前武装的 100 ms POSIX 定时器不会把信号送进新镜像（A，新镜像 300 ms 内收不到），旧镜像的 `mq_notify` 注册也被移除，新镜像可以重新注册而不是 `EBUSY`（B）（宿主机 Linux 实测同结果） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
