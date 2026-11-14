@@ -16,6 +16,7 @@ const receive_policy = @import("posix_mq_receive_policy.zig");
 const priority_policy = @import("posix_mq_priority_policy.zig");
 const wait_policy = @import("posix_mq_wait_policy.zig");
 const descriptor_policy = @import("posix_mq_descriptor_policy.zig");
+const vfs = @import("../fs/vfs.zig");
 
 const MAX_QUEUES: u32 = 16;
 const MAX_MSGS: u32 = 8;
@@ -96,7 +97,15 @@ const TaskHandle = struct {
 
 var descriptions: [MAX_OPEN_DESCRIPTIONS]OpenDescription = @splat(.{});
 var description_generations: [MAX_OPEN_DESCRIPTIONS]u64 = @splat(0);
-var task_handles: [task.MAX_TASKS][MAX_TASK_MQ_DESCRIPTORS]TaskHandle = @splat(@splat(.{}));
+/// mq descriptors per descriptor table (vfs.tableIndex), not per task: CLONE_FILES threads share one table and so one set of mq
+/// descriptors (Linux: an mqd_t is a file descriptor in files_struct). A forked child gets its own table and a copy.
+var table_handles: [vfs.MAX_FD_TABLES][MAX_TASK_MQ_DESCRIPTORS]TaskHandle = @splat(@splat(.{}));
+
+/// The descriptor table of task `task_idx`, as an index into table_handles.
+fn tableOf(task_idx: u32) ?u32 {
+    const t = task.getTask(task_idx) orelse return null;
+    return vfs.tableIndex(t.fd_table);
+}
 
 // ── O_* flags ──
 const O_RDONLY = descriptor_policy.O_RDONLY;
@@ -953,36 +962,36 @@ pub fn mqClose(mqd: u32) i64 {
         return EBADF;
     }
     var wakes = WakeBatch{};
-    closeHandleLocked(owner_idx, handle.handle_idx, true, &wakes);
+    closeHandleLocked(tableOf(owner_idx).?, owner_idx, handle.handle_idx, &wakes);
     mq_lock.release(flags);
     wakes.wake();
     return 0;
 }
 
-/// Release all MQ references held by an exiting task. Called before the task
-/// becomes a zombie so unlinked queues cannot retain dead open references.
-/// A thread's mirrored handles go without a flush: its process keeps the descriptors (Linux shares the file table).
-pub fn closeRefsForTask(task_idx: u32) void {
-    if (task_idx >= task.MAX_TASKS) return;
-    const flush = if (task.getTask(task_idx)) |t| descriptor_policy.exitDropsNotify(t.is_thread) else true;
+/// The last reference to descriptor table `table` is going away (task `task_idx` is the last user, exiting): close its mq
+/// descriptors, as the fd close loop does for the others. Must run before vfs.freeFdTable lets the slot be reused.
+pub fn closeTable(table: *const vfs.FdTable, task_idx: u32) void {
+    const ti = vfs.tableIndex(table);
     var wakes = WakeBatch{};
     const flags = mq_lock.acquire();
     for (0..MAX_TASK_MQ_DESCRIPTORS) |handle_idx| {
-        if (task_handles[task_idx][handle_idx].open) closeHandleLocked(task_idx, @intCast(handle_idx), flush, &wakes);
+        if (table_handles[ti][handle_idx].open) closeHandleLocked(ti, task_idx, @intCast(handle_idx), &wakes);
     }
     mq_lock.release(flags);
     wakes.wake();
 }
 
-/// Fork duplicates every MQ reference held by the parent task.
+/// Fork copies every mq descriptor of the parent's table into the child's. A CLONE_FILES child shares the table: nothing to copy.
 pub fn inheritRefs(parent_idx: u32, child_idx: u32) void {
-    if (parent_idx >= task.MAX_TASKS or child_idx >= task.MAX_TASKS) return;
+    const pt = tableOf(parent_idx) orelse return;
+    const ct = tableOf(child_idx) orelse return;
+    if (pt == ct) return;
     const flags = mq_lock.acquire();
     defer mq_lock.release(flags);
     for (0..MAX_TASK_MQ_DESCRIPTORS) |handle_idx| {
-        const parent_handle = task_handles[parent_idx][handle_idx];
+        const parent_handle = table_handles[pt][handle_idx];
         if (!parent_handle.open) continue;
-        const child_handle = &task_handles[child_idx][handle_idx];
+        const child_handle = &table_handles[ct][handle_idx];
         if (child_handle.open) continue;
         const desc = &descriptions[parent_handle.desc_idx];
         if (!desc.active or description_generations[parent_handle.desc_idx] != parent_handle.desc_generation) continue;
@@ -1037,7 +1046,8 @@ const Resolved = struct { queue: *MqQueue, description: *OpenDescription };
 fn descriptorHandle(task_idx: u32, mqd: u32) ?HandleRef {
     const handle_idx = descriptor_policy.decodeToken(mqd) orelse return null;
     if (handle_idx >= MAX_TASK_MQ_DESCRIPTORS) return null;
-    const handle = task_handles[task_idx][handle_idx];
+    const ti = tableOf(task_idx) orelse return null;
+    const handle = table_handles[ti][handle_idx];
     if (!handle.open or handle.desc_idx >= MAX_OPEN_DESCRIPTIONS) return null;
     const desc = descriptions[handle.desc_idx];
     if (!desc.active or description_generations[handle.desc_idx] != handle.desc_generation) return null;
@@ -1058,9 +1068,10 @@ fn findQueueForDescription(task_idx: u32, mqd: u32) ?*MqQueue {
 }
 
 fn openDescription(queue_idx: u32, q: *MqQueue, owner_idx: u32, oflag: u32) i64 {
+    const ti = tableOf(owner_idx) orelse return EMFILE;
     var handle_idx: ?u32 = null;
     for (0..MAX_TASK_MQ_DESCRIPTORS) |i| {
-        if (!task_handles[owner_idx][i].open) {
+        if (!table_handles[ti][i].open) {
             handle_idx = @intCast(i);
             break;
         }
@@ -1082,22 +1093,22 @@ fn openDescription(queue_idx: u32, q: *MqQueue, owner_idx: u32, oflag: u32) i64 
         .cloexec = oflag & O_CLOEXEC != 0,
         .refs = 1,
     };
-    task_handles[owner_idx][handle_idx.?] = .{ .desc_idx = di, .desc_generation = description_generations[di], .open = true };
+    table_handles[ti][handle_idx.?] = .{ .desc_idx = di, .desc_generation = description_generations[di], .open = true };
     q.open_count += 1;
     return @intCast(descriptor_policy.tokenValue(handle_idx.?));
 }
 
-/// `flush`: the close is a flush by task `task_idx`'s process (close, exec's close-on-exec, process exit), not a thread's
-/// mirrored handle going away at its exit.
-fn closeHandleLocked(task_idx: u32, handle_idx: u32, flush: bool, wakes: *WakeBatch) void {
-    const handle = &task_handles[task_idx][handle_idx];
+/// Close mq descriptor `handle_idx` of descriptor table `ti`; task `task_idx` is the closer (close, exec's close-on-exec, the last
+/// user's exit).
+fn closeHandleLocked(ti: u32, task_idx: u32, handle_idx: u32, wakes: *WakeBatch) void {
+    const handle = &table_handles[ti][handle_idx];
     if (!handle.open) return;
     const desc_idx = handle.desc_idx;
     const desc = &descriptions[desc_idx];
     handle.* = .{};
     // Linux mqueue_flush_file: any close of a descriptor of the queue by the process that owns the registration removes it,
     // whichever descriptor it was made through (a dup, another open). A forked child is another process and leaves it.
-    if (flush and desc.queue_idx < MAX_QUEUES) {
+    if (desc.queue_idx < MAX_QUEUES) {
         const fq = &queues[desc.queue_idx];
         const closer = task.getTask(task_idx);
         if (fq.active and closer != null and descriptor_policy.notifyOwner(fq.notify_tgid, groupId(closer.?))) clearNotify(fq);
@@ -1113,12 +1124,12 @@ fn closeHandleLocked(task_idx: u32, handle_idx: u32, flush: bool, wakes: *WakeBa
 
 /// Close current-task MQ descriptions marked O_CLOEXEC before a new image runs.
 pub fn closeCloexecForTask(task_idx: u32) void {
-    if (task_idx >= task.MAX_TASKS) return;
+    const ti = tableOf(task_idx) orelse return;
     var wakes = WakeBatch{};
     const flags = mq_lock.acquire();
     for (0..MAX_TASK_MQ_DESCRIPTORS) |i| {
-        const h = task_handles[task_idx][i];
-        if (h.open and descriptions[h.desc_idx].cloexec) closeHandleLocked(task_idx, @intCast(i), true, &wakes);
+        const h = table_handles[ti][i];
+        if (h.open and descriptions[h.desc_idx].cloexec) closeHandleLocked(ti, task_idx, @intCast(i), &wakes);
     }
     mq_lock.release(flags);
     wakes.wake();

@@ -3026,6 +3026,12 @@ fn tableSlot(table: *const FdTable) usize {
     return (@intFromPtr(table) - @intFromPtr(&fd_table_pool)) / @sizeOf(FdTable);
 }
 
+/// The pool slot of `table`: the index side tables keyed by descriptor table use (posix_mq's descriptor handles). A slot is reused
+/// only after freeFdTable, so a side table must be emptied in the last-reference close loop, before that call.
+pub fn tableIndex(table: *const FdTable) u32 {
+    return @intCast(tableSlot(table));
+}
+
 /// Allocation generation of a live table (stable for its whole lifetime).
 pub fn tableGeneration(table: *const FdTable) u64 {
     return @atomicLoad(u64, &fd_table_gen[tableSlot(table)], .seq_cst);

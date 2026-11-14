@@ -9104,4 +9104,33 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒）全部 `EXIT=0`、0 FAIL，四份都有 hello332 PASS 和 `hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
 - 局限：
   1. `SIGEV_THREAD` 仍不支持：Linux 把 32 字节 cookie 送到一个 AF_NETLINK 套接字（宿主机实测：触发时最后一字节是 1，注销时是 2），这个内核没有 netlink 套接字。
-  2. mq 描述符仍是每个任务一份镜像（clone 时复制），不在 `FdTable` 里；线程关闭描述符只关自己那份镜像，其他线程手里的仍可用。Linux 上 CLONE_FILES 的线程共享同一张表。
+  2. mq 描述符仍是每个任务一份镜像（clone 时复制），不在 `FdTable` 里；线程关闭描述符只关自己那份镜像，其他线程手里的仍可用。Linux 上 CLONE_FILES 的线程共享同一张表。（hello333 一节已改）
+
+### mq 描述符按描述符表存放，CLONE_FILES 线程共享（hello333，已修）
+
+- 问题：mq 描述符存放在每个任务一份的 `task_handles[task.MAX_TASKS]` 里，clone 时把父任务的句柄复制给子任务，CLONE_FILES 也一样。
+  - 线程打开的描述符只在线程自己那份里，线程退出时被关闭，主线程拿不到（A）。
+  - 线程关闭描述符只关自己那份，主线程手里的仍可用，号码也不会被重用（B）。
+  - Linux 上 mq 描述符就是普通 fd，放在 `files_struct` 里，CLONE_FILES 的线程共享同一张表。
+- Linux 依据：`3rd/linux-7.0.6/ipc/mqueue.c` 的 `do_mq_open` 用 `get_unused_fd_flags` 和 `fd_install` 把描述符装进当前进程的 fd 表；`kernel/fork.c` 的 `copy_files` 在 CLONE_FILES 时只增加 `files_struct` 的引用计数，否则 `dup_fd` 复制一份。
+- 宿主机实测（`gcc -DHOST -O1 -Wall -pthread user/hello333.c -lrt`，连续 3 次 A–D 全过）：
+  - A 线程打开的描述符（fd 4）在线程退出后，主线程收发一轮返回 2。
+  - B 主线程打开的描述符被线程关闭（close 返回 0）后，主线程收发返回 -9（EBADF），下一次 `mq_open` 拿到同一个号码（5→5）。
+  - C 线程用过描述符再退出，主线程的描述符仍可用。
+  - D fork 的子进程关闭继承的描述符不影响父进程，子进程自己打开的描述符不是父进程的；子进程退出状态 0x0。
+- 红灯：内核未改，定向 SMP=2，hello333 的 A、B 失败，C、D 通过。A：线程打开的是 301，线程退出后主线程收发得到 -9。B：线程 close 返回 0，主线程收发仍返回 2，下一次 `mq_open` 拿到 302 而不是 301。
+- 修复：
+  - `kernel/ipc/posix_mq.zig`：
+    - `task_handles[task.MAX_TASKS]` 换成 `table_handles[vfs.MAX_FD_TABLES][MAX_TASK_MQ_DESCRIPTORS]`，按任务的 `fd_table` 在表池里的下标（`tableOf`）存放。CLONE_FILES 的线程用同一张表，看到同一组 mq 描述符。
+    - `inheritRefs` 只在子任务拿到自己的表（fork）时复制，同一张表直接返回。
+    - `closeRefsForTask` 换成 `closeTable(table, task_idx)`：在这张表的最后一个引用释放时关闭表里所有 mq 描述符。
+    - `closeHandleLocked` 去掉 `flush` 参数：现在每次关闭都由一张表的属主进程做出，统一按 hello332 的属主规则移除注册。
+  - `kernel/fs/vfs.zig`：新增 `tableIndex`，返回描述符表在表池里的下标。
+  - `kernel/proc/task.zig`：`exitTask` 和 `abortUnpublishedChild` 在关闭最后一个引用的 fd、`freeFdTable` 之前调用 `closeTable`；原来按任务关闭的两处调用删掉。
+  - `kernel/arch/x86_64/clone.zig`：注释改为说明按表存放。
+  - `tests/main.zig`：新增源码单测；「per-open descriptions」那条改查 `table_handles`。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份，hello333 通过；同样定向跑 hello332、hello294、hello293、hello288，SMP=2、SMP=4 都通过；`zig build test` 通过。
+- 完整 smoke：四份（SMP=1、4、4、2）全部 EXIT=0，无 FAIL，hello333 在每份里都通过，`corrupted canaries=0`；riscv64、aarch64 smoke 通过。
+- 局限：
+  1. mq 描述符仍用独立的号码空间（从 300 起），不和普通 fd 共用号码。Linux 上它就是普通 fd 号（宿主机拿到 4、5），`dup`、`fcntl`、`poll` 对它的行为这里没有覆盖。
+  2. 每张表最多 32 个 mq 描述符（`descriptor_policy.MAX_DESCRIPTORS`），表池共 64 张（`vfs.MAX_FD_TABLES`）。

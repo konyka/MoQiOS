@@ -370,9 +370,8 @@ pub fn clone(
         // v53.50: Copy free_bm bitmap — child inherits parent's fd occupancy state.
         parent.fd_table.inheritFdTable(child.fd_table);
     }
-    // The current MQ sidecar is task-local, so mirror handles for both fork
-    // and CLONE_FILES. This preserves usability for a new thread; full shared
-    // close semantics require making the sidecar part of FdTable ownership.
+    // MQ descriptors live per descriptor table: a CLONE_FILES child shares them with the parent, and inheritRefs
+    // copies them only when the child got its own table (fork).
     const current_idx = sched.currentTaskIndex() orelse {
         _ = task_mod.abortUnpublishedChild(child_idx);
         return -1;

@@ -928,9 +928,16 @@ test "POSIX MQ descriptor policy validates access and flags" {
     try std.testing.expect(!posix_mq_descriptor_policy.sigevNotifyValid(posix_mq_descriptor_policy.SIGEV_THREAD));
 }
 
-test "CLONE_FILES preserves MQ handle usability until shared sidecar ownership exists" {
-    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "posix_mq.zig").? >= 0);
+test "MQ descriptors live per descriptor table: CLONE_FILES threads share them, fork copies them" {
+    const src = kt.posix_mq_source;
+    try std.testing.expect(std.mem.indexOf(u8, src, "var table_handles: [vfs.MAX_FD_TABLES]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "task_handles") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (pt == ct) return;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "inheritRefs(") != null);
+    // The table's descriptors close with its last reference (exit and the unpublished-child abort), not per task.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.task_source, "closeTable(t.fd_table, "));
+    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "closeRefsForTask") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "closeRefsForTask") == null);
 }
 
 test "parent TID copyout aborts an unpublished child before publication" {
@@ -3265,7 +3272,7 @@ test "new task creation restores NOFILE defaults after zeroSlot" {
 test "POSIX MQ uses per-open descriptions and validates descriptor semantics" {
     const source = kt.posix_mq_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "var descriptions:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "var task_handles:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "var table_handles:") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "q.fd") == null);
     try std.testing.expect(std.mem.indexOf(u8, source, "q.flags") == null);
     try std.testing.expect(std.mem.indexOf(u8, source, "return EMSGSIZE") != null);

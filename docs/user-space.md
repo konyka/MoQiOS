@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello332`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello333`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -327,6 +327,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello330 | SO_REUSEPORT 端口组的属主是 `socket()` 时创建者的 fsuid（TCP、UDP 各一遍）：root 创建、降到 1000 后绑定，1000 的套接字加不进来（A）；1000 创建、回到 root 后绑定，root 加不进来（B）；root 在 fsuid 1000 时创建，root 加不进来（C）；两个 root 能共享（D）；1000 创建的和 fsuid 1000 时创建的能共享（E） |
 | hello331 | fd 0 作为控制台终端保留 `O_ASYNC`：读回原值加 0x2000（A）；默认 owner 是调用者或前台组（B）；TIOCSTI 注入发 POLL_IN、band 0x41、si_fd 0（C）；dup 共享，关掉 dup 后 fd 0 仍生效（D）；fork 的子进程看到 `O_ASYNC`，子进程退出后父进程仍收到（E）；子进程清除后父进程也清除（F）；清除后不发（G） |
 | hello332 | `mq_notify` 的注册属于进程：属主关闭同一队列的另一次 open 会移除注册（A）；fork 的子进程关闭继承的或自己的描述符不移除（B）；属主的线程关闭会移除（C）；线程做出的注册在它退出后仍在，主线程接到信号（D）；做出注册的线程阻塞信号时由主线程接（E）；子进程注册后退出不留注册（F） |
+| hello333 | POSIX mq 描述符由 CLONE_FILES 线程共享：线程打开的描述符在线程退出后主线程能用（A）；线程关闭后主线程得到 EBADF，号码被重用（B）；线程用过再退出不关闭描述符（C）；fork 的子进程有自己的一份（D） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
