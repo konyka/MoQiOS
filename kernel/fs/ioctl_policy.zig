@@ -14,6 +14,7 @@ pub const TIOCSPGRP: u64 = 0x5410;
 pub const TIOCGWINSZ: u64 = 0x5413;
 pub const TIOCSWINSZ: u64 = 0x5414;
 pub const TIOCOUTQ: u64 = 0x5411;
+pub const TIOCSTI: u64 = 0x5412;
 pub const FIONREAD: u64 = 0x541B;
 pub const FIONBIO: u64 = 0x5421;
 pub const FIONCLEX: u64 = 0x5450;
@@ -21,7 +22,7 @@ pub const FIOCLEX: u64 = 0x5451;
 
 pub fn isTerminalRequest(cmd: u64) bool {
     return switch (cmd) {
-        TCGETS, TCSETS, TCSETSW, TCSETSF, TIOCGPGRP, TIOCSPGRP, TIOCGWINSZ, TIOCSWINSZ => true,
+        TCGETS, TCSETS, TCSETSW, TCSETSF, TIOCGPGRP, TIOCSPGRP, TIOCGWINSZ, TIOCSWINSZ, TIOCSTI => true,
         else => false,
     };
 }
@@ -33,6 +34,12 @@ pub const Target = enum { terminal, other };
 pub fn terminalCheck(cmd: u64, target: Target) i64 {
     if (isTerminalRequest(cmd) and target != .terminal) return -25;
     return 0;
+}
+
+/// TIOCSTI (Linux tiocsti, with LEGACY_TIOCSTI as upstream defaults): only on the caller's controlling terminal, unless it holds
+/// CAP_SYS_ADMIN; anyone else gets EPERM (-1).
+pub fn tiocstiPermission(is_ctty: bool, cap_sys_admin: bool) i64 {
+    return if (is_ctty or cap_sys_admin) 0 else -1;
 }
 
 /// FIONREAD on a file: bytes between the offset and the end, never negative.

@@ -22,6 +22,7 @@ pub const TIOCGPGRP = 0x540F; // Get foreground process group
 pub const TIOCSPGRP = 0x5410; // Set foreground process group
 pub const FIONREAD = 0x541B; // Get number of readable bytes
 pub const SIOCOUTQNSD = 0x894B; // Bytes written to a TCP socket that have not been sent yet
+pub const TIOCSTI = 0x5412; // Insert a byte into the terminal's input queue
 pub const TIOCOUTQ = 0x5411; // Bytes sent on a socket that the peer has not consumed (SIOCOUTQ)
 pub const FIONBIO = 0x5421; // Set/clear non-blocking mode
 
@@ -209,6 +210,21 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
             const pid_t_val: u32 = pgid;
             const pgid_bytes: [*]const u8 = @ptrCast(&pid_t_val);
             if (copy.copyToUser(@ptrFromInt(arg), pgid_bytes[0..4], 4) != 4) return -14;
+            return 0;
+        },
+        TIOCSTI => {
+            // Linux tiocsti: only on the caller's controlling terminal (the console belongs to ctty_owner_sid; an unclaimed one is
+            // claimed, as reading fd 0 or TIOCSPGRP does), unless the caller holds CAP_SYS_ADMIN.
+            const jc = @import("../proc/jobctl.zig");
+            if (jc.ctty_owner_sid == 0) jc.ctty_owner_sid = cur0.sid;
+            const allowed = ip.tiocstiPermission(cur0.sid == jc.ctty_owner_sid, @import("../proc/cap_check.zig").capable(cur0, "cap_sys_admin"));
+            if (allowed != 0) return allowed;
+            if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;
+            var ch: [1]u8 = undefined;
+            if (copy.copyFromUser(&ch, @ptrFromInt(arg), 1) != 1) return -14;
+            // Console input is the PS/2 keyboard ring, which only x86_64 has (devfs_nodes ttyRead).
+            if (comptime @import("builtin").cpu.arch != .x86_64) return -5; // EIO: no input queue
+            _ = @import("../drivers/keyboard.zig").inject(ch[0]);
             return 0;
         },
         TIOCSPGRP => {

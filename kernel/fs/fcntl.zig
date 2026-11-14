@@ -80,9 +80,15 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
             const cur_flags = vfs.statusFlagsOf(d);
             var next = policy.applySetfl(cur_flags & ~policy.O_ASYNC, arg);
             // O_ASYNC is kept only where the file can act on it (Linux setfl → f_op->fasync); elsewhere F_SETFL still succeeds.
-            if (policy.keepsAsync(@tagName(d.fd_type))) {
+            if (policy.keepsAsync(vfs.asyncTag(d))) {
                 const want = @as(u32, @truncate(arg)) & policy.O_ASYNC;
+                const turning_on = want != 0 and cur_flags & policy.O_ASYNC == 0;
                 if (want != cur_flags & policy.O_ASYNC and !vfs.setAsync(t.fd_table, @intCast(fd), want != 0)) return -12; // ENOMEM
+                // A terminal gives an unowned description an owner (Linux __tty_fasync): its foreground group, else the caller.
+                if (turning_on and vfs.isConsoleTty(d)) {
+                    const pid: i32 = @intCast(if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid);
+                    vfs.setFownOf(d, policy.ttyAsyncOwner(@import("../proc/jobctl.zig").foreground_pgid, pid), null, true);
+                }
                 next |= want;
             }
             vfs.setStatusFlags(d, next);

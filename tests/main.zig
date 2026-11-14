@@ -12517,6 +12517,24 @@ test "fcntl policy: F_SETOWN_EX owner types TID/PID/PGRP and what F_GETOWN_EX an
     try std.testing.expectEqual(@as(u8, 1), fp.setownKind(0));
 }
 
+test "tty O_ASYNC: the console tty keeps it, enabling it picks the foreground group or the caller, TIOCSTI needs the ctty or CAP_SYS_ADMIN" {
+    const fp = kt.fcntl_policy;
+    try std.testing.expect(fp.keepsAsync("tty"));
+    // other devfs nodes (/dev/null, /dev/zero, ...) still drop it, as Linux does where f_op->fasync is missing
+    try std.testing.expect(!fp.keepsAsync("devfs"));
+    // __tty_fasync: the terminal's foreground group when it has one, else the caller's process
+    try std.testing.expectEqual(@as(i32, -7), fp.ttyAsyncOwner(7, 42));
+    try std.testing.expectEqual(@as(i32, 42), fp.ttyAsyncOwner(0, 42));
+    const ip = kt.ioctl_policy;
+    try std.testing.expectEqual(@as(u64, 0x5412), ip.TIOCSTI);
+    // a terminal request: a pipe or a file answers ENOTTY
+    try std.testing.expectEqual(@as(i64, -25), ip.terminalCheck(ip.TIOCSTI, .other));
+    // tiocsti: the caller's controlling terminal, or CAP_SYS_ADMIN; anyone else is EPERM
+    try std.testing.expectEqual(@as(i64, 0), ip.tiocstiPermission(true, false));
+    try std.testing.expectEqual(@as(i64, 0), ip.tiocstiPermission(false, true));
+    try std.testing.expectEqual(@as(i64, -1), ip.tiocstiPermission(false, false));
+}
+
 test "fcntl policy: O_ASYNC is kept by pipes, AF_UNIX, UDP and TCP sockets, and SIGIO carries POLL_IN / POLL_OUT / POLL_ERR / POLL_HUP with their bands" {
     const fp = kt.fcntl_policy;
     try std.testing.expectEqual(@as(u32, 0x2000), fp.O_ASYNC);

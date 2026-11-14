@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello325`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello326`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -320,6 +320,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello323 | AF_UNIX 套接字的 `O_ASYNC`：socketpair 读回 0x2002（A）；对端发送发 POLL_IN、sig 0 发 SIGIO（B、C）；自己读写不发（D）；写满 EAGAIN 后对端读空发一次 POLL_OUT（E）；对端 shutdown：RD 不发、WR 发 POLL_IN、RDWR 发 POLL_HUP（F）；对端 close 发 POLL_HUP，band 0x18（G）；数据报（H）；新连接通知监听套接字（I）；监听套接字关闭时队列里的客户端收到 POLL_HUP（J）；清除后不发（K）；子进程发送（L）；阻塞的流式读者不收、数据报读者收（M）；`O_NONBLOCK` 经 dup 的 `F_SETFL`/`FIONBIO` 设置后对原描述符生效（N）；`RWF_NOWAIT` 不改描述的标志（O） |
 | hello324 | UDP 套接字的 `O_ASYNC`（127.0.0.1）：读回 0x2002、无 owner 不发（A）；sig 0 发 SIGIO（B）；每个数据报发 POLL_IN、band 0x41（C）；自己发送不发（D）；bind 前设置在 bind 后仍生效（E）；端口不可达发 POLL_ERR、band 0x8，recv 返回 ECONNREFUSED（F）；清除后不发（G）；dup、fork 共享（H）；关闭一个描述符照常发（I）；同端口的新套接字不收到（J） |
 | hello325 | TCP 套接字的 `O_ASYNC`（127.0.0.1）：监听套接字读回 0x2002（A）；握手完成时监听套接字收到 POLL_IN、band 0x41，accept 出来的不带（B）；客户端收到 POLL_OUT、band 0x304（C）；每次数据到达发 POLL_IN（D）；自己读写不发（E）；清除后不发（F）；写满到 EAGAIN、对端读空后发 POLL_OUT（G）；对端 SHUT_WR 发 POLL_IN（H）；dup 共享（I）；复位发 POLL_ERR、band 0x8（J）；连接被拒绝发 POLL_ERR，阻塞 connect 返回 ECONNREFUSED（K） |
+| hello326 | 控制台 `/dev/tty` 的 `O_ASYNC` 与 TIOCSTI：读回 0x2002（A）；开启时没有 owner 就设成调用者或前台组，已有的 owner 保留（B）；TIOCSTI 注入的每个字符发 POLL_IN、band 0x41（C、D）；自己读写不发（E）；sig 0 发 SIGIO（F）；清除后不发（G）；dup 共享（H）；再 open 一次是另一个描述（I）；TIOCSTI 在管道上返回 ENOTTY、NULL 返回 EFAULT、其他会话且无 CAP_SYS_ADMIN 返回 EPERM（J） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

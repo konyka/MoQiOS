@@ -761,8 +761,8 @@ pub fn pipeClose(pipe_idx: u32, write_end: bool) void {
 
 // ── O_ASYNC on pipes and AF_UNIX, UDP and TCP sockets (Linux fasync_helper / kill_fasync) ──
 /// What an O_ASYNC open file description is attached to: one end of a pipe, an AF_UNIX, UDP or TCP socket (`idx` is the pipe
-/// index, the AF_UNIX socket index, the UDP socket key: port | discriminator << 16, or the TCB index).
-pub const FasyncKind = enum(u8) { pipe_read, pipe_write, unix_socket, udp_socket, tcp_socket };
+/// index, the AF_UNIX socket index, the UDP socket key: port | discriminator << 16, or the TCB index), or the console tty (idx 0).
+pub const FasyncKind = enum(u8) { pipe_read, pipe_write, unix_socket, udp_socket, tcp_socket, tty };
 /// One open file description with O_ASYNC set: its shared slot (the owner and signal live there) and the descriptor F_SETFL went
 /// through, which becomes si_fd (Linux fasync_struct.fa_fd).
 const Fasync = struct { used: bool = false, kind: FasyncKind = .pipe_read, idx: u32 = 0, slot: u16 = 0, fd: u32 = 0 };
@@ -777,6 +777,7 @@ fn fasyncTarget(desc: *const FileDescriptor) ?struct { kind: FasyncKind, idx: u3
         .unix_socket => .{ .kind = .unix_socket, .idx = desc.unix_sock_idx },
         .udp_socket => .{ .kind = .udp_socket, .idx = desc.udpKey() },
         .tcp_socket => .{ .kind = .tcp_socket, .idx = desc.tcb_idx },
+        .devfs => if (isConsoleTty(desc)) .{ .kind = .tty, .idx = 0 } else null,
         else => null,
     };
 }
@@ -865,6 +866,23 @@ pub fn tcpFasyncNotify(tcb_idx: u32, reason: i32) void {
     fasyncNotify(.tcp_socket, tcb_idx, reason);
 }
 
+/// The console received input (a key or TIOCSTI): POLL_IN for every O_ASYNC description of /dev/tty. May run in the IRQ1 handler.
+pub fn ttyFasyncNotify() void {
+    fasyncNotify(.tty, 0, @import("fcntl_policy.zig").POLL_IN);
+}
+
+/// /dev/tty, the console terminal (the only devfs node that keeps O_ASYNC).
+pub fn isConsoleTty(desc: *const FileDescriptor) bool {
+    // An unregistered tty reports DIR_IDX, which is also what a descriptor of the /dev directory carries.
+    const tty = @import("devfs_nodes.zig").ttyNodeIdx();
+    return desc.fd_type == .devfs and tty != @import("devfs.zig").DIR_IDX and desc.devfs_idx == tty;
+}
+
+/// The name fcntl_policy.keepsAsync knows a descriptor by: its FdType, or "tty" for the console terminal.
+pub fn asyncTag(desc: *const FileDescriptor) []const u8 {
+    return if (isConsoleTty(desc)) "tty" else @tagName(desc.fd_type);
+}
+
 /// bind() moved a UDP socket from key `old` to key `new`: its O_ASYNC registrations follow it.
 pub fn udpFasyncRekey(old: u32, new: u32) void {
     const f = fasync_lock.acquire();
@@ -891,11 +909,17 @@ fn usesSharedOffset(t: FdType) bool {
     };
 }
 
+/// Does `desc` keep its open file description in a shared slot? The kinds above, and /dev/tty (its status flags, owner, signal and
+/// O_ASYNC registration; other devfs nodes keep per-descriptor state).
+fn usesSharedSlot(desc: *const FileDescriptor) bool {
+    return usesSharedOffset(desc.fd_type) or isConsoleTty(desc);
+}
+
 /// Make `desc` share its offset with the descriptor about to be copied from
 /// it, and count that copy as a holder. Returns the slot the copy must carry
 /// (0 = copy privately: not an offset-bearing kind, or the pool is full).
 fn shareOffsetFor(desc: *FileDescriptor) u16 {
-    if (!usesSharedOffset(desc.fd_type)) return 0;
+    if (!usesSharedSlot(desc)) return 0;
     const f = shared_offsets_lock.acquire();
     defer shared_offsets_lock.release(f);
     if (desc.offset_slot == 0) {
@@ -1066,7 +1090,7 @@ pub fn posixLockOwner(table: *const FdTable) u64 {
 /// Other kinds have no description object here and own the lock per descriptor. Null when the offset pool is full.
 pub fn flockOwner(table: *FdTable, fd: u32) ?u64 {
     const desc = &table.fds[fd];
-    if (!usesSharedOffset(desc.fd_type)) return privateFlockOwner(table, fd);
+    if (!usesSharedSlot(desc)) return privateFlockOwner(table, fd);
     const f = shared_offsets_lock.acquire();
     defer shared_offsets_lock.release(f);
     if (desc.offset_slot == 0) {

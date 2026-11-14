@@ -8708,7 +8708,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello318 A–L 全过（F：`sig 35 code 3 band 0x441 fd 3/3`；G：`sig 29 code 128 fd 0`）；回归 hello316 定向 SMP=2、SMP=4 都 PASS。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello318 PASS、hello316 PASS 和 `hello228: corrupted canaries=0`。
 - 局限：
-  1. owner 和 sig 只用于租约打破。没有 `O_ASYNC`/`FASYNC`，socket、pipe、tty 的 I/O 就绪不发 `SIGIO`。（pipe 已在 hello320 一节实现；socket、tty 仍未做）
+  1. owner 和 sig 只用于租约打破。没有 `O_ASYNC`/`FASYNC`，socket、pipe、tty 的 I/O 就绪不发 `SIGIO`。（pipe 已在 hello320 一节实现；socket 已在 hello323–hello325 各节实现；控制台 `/dev/tty` 已在 hello326 一节实现）
   2. 没有 `F_SETOWN_EX`/`F_GETOWN_EX`，也没有 `sigio_perm` 的 uid 权限检查。（`F_SETOWN_EX`/`F_GETOWN_EX` 已在 hello321 一节实现；`sigio_perm` 已在 hello322 一节实现）
   3. pipe 等不走共享 offset 槽的描述符，dup 后 owner/sig 是各自的副本，不共享。（pipe 已在 hello320 一节修复：管道两端也用共享槽；eventfd、socket 等仍是副本）
   4. pgid 是 u16；只做了 x86_64 的 fcntl 分派。（`CAP_LEASE` 和属主检查已在 hello319 一节实现）
@@ -8747,7 +8747,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello320 A–L 全过。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello320、hello319、hello318、hello316、hello87、hello273 PASS 和 `hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过（已有的 fcntl 源码检查单测改为匹配新的 `F_SETFL` 代码）。
 - 局限：
-  1. 只做了管道；socket、tty、eventfd 等的 `O_ASYNC` 仍然不保留、不发信号。（AF_UNIX 套接字已在 hello323 一节实现，UDP 套接字已在 hello324 一节实现，TCP 套接字已在 hello325 一节实现；tty 仍未做；eventfd、timerfd、epoll 在 Linux 上也不保留）
+  1. 只做了管道；socket、tty、eventfd 等的 `O_ASYNC` 仍然不保留、不发信号。（AF_UNIX 套接字已在 hello323 一节实现，UDP 套接字已在 hello324 一节实现，TCP 套接字已在 hello325 一节实现，控制台 `/dev/tty` 已在 hello326 一节实现；eventfd、timerfd、epoll 在 Linux 上也不保留）
   2. `open(O_ASYNC)` 不保留这一位（`OPEN_STATUS_MASK` 不含它）；Linux 在普通文件上保留但不起作用，管道不能用 `open` 打开（FIFO 除外，这里没有 FIFO 的 `O_ASYNC`）。
   3. 登记表 128 项、共享槽池 512 槽；管道描述现在也占共享槽，池满时 dup、fork 退化为私有副本，`F_SETFL O_ASYNC` 返回 `ENOMEM`。
   4. 没有 `sigio_perm` 的 uid 检查，也没有 `F_SETOWN_EX`；只做了 x86_64 的 close 系列信号检查。（`F_SETOWN_EX` 已在 hello321 一节实现）
@@ -8832,7 +8832,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello323 A–O 全过；`zig build test` 通过。
 - 完整 smoke：SMP=1、SMP=4 两份、SMP=2 共四份全部 `EXIT=0`，没有失败项，hello323 全过，`corrupted canaries=0`；riscv64、aarch64 smoke 通过。
 - 局限：
-  1. TCP、UDP 套接字和 tty 仍然不保留 `O_ASYNC`，也不发信号（Linux 会保留）。（UDP 已在 hello324 一节实现，TCP 已在 hello325 一节实现）
+  1. TCP、UDP 套接字和 tty 仍然不保留 `O_ASYNC`，也不发信号（Linux 会保留）。（UDP 已在 hello324 一节实现，TCP 已在 hello325 一节实现，`/dev/tty` 已在 hello326 一节实现）
   2. POLL_OUT 的阈值按接收方环的占用（8 KiB 环的四分之一）计算；Linux 按发送方的 `sk_wmem_alloc` 计算。一个发送方只记一个 `nospace_on` 目标。
   3. 「流式读者已在等数据」用对端有没有 `read_waiters` 近似 `SOCKWQ_ASYNC_WAITDATA`；读者被唤醒后、真正读走之前到达的数据也不发信号。
   4. dup 或 fork 的套接字描述现在也占用共享槽（512 个，和管道、普通文件共用）；槽用完时复制退回私有，状态标志不再共享。
@@ -8859,7 +8859,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello324 A–J 全过；`zig build test` 通过。
 - 完整 smoke：SMP=1、SMP=4 两份、SMP=2 共四份全部 `EXIT=0`，没有失败项，hello323、hello324 全过，`corrupted canaries=0`；riscv64、aarch64 smoke 通过。
 - 局限：
-  1. TCP 套接字和 tty 仍然不保留 `O_ASYNC`（Linux 会保留）。（TCP 已在 hello325 一节实现）
+  1. TCP 套接字和 tty 仍然不保留 `O_ASYNC`（Linux 会保留）。（TCP 已在 hello325 一节实现，`/dev/tty` 已在 hello326 一节实现）
   2. UDP 没有发送缓冲上限，不会遇到 EAGAIN，所以没有 POLL_OUT。
   3. 接收队列满（8 个）时丢弃的数据报不发信号，这和 Linux 一致，但 Linux 的队列按字节计算、要大得多。
   4. IPv6 UDP 走同一条路径，测试只覆盖了 IPv4 回环。
@@ -8888,8 +8888,41 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello325 A–K 全过；`zig build test` 通过。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都有 hello325 PASS 和 `hello228: corrupted canaries=0`。SMP=1、SMP=2 和一份 SMP=4 `EXIT=0`、0 FAIL；另一份 SMP=4 `EXIT=1`，只有已记录的偶发项 hello286 J（18/60 次组停止被报告）失败。随后单独重跑一份 SMP=4 完整 smoke，`EXIT=0`、0 FAIL；hello286 在 SMP=4 定向跑两次都 PASS。riscv64、aarch64 smoke 通过。
 - 局限：
-  1. tty 仍然不保留 `O_ASYNC`（Linux 会保留）。
+  1. tty 仍然不保留 `O_ASYNC`（Linux 会保留）。（`/dev/tty` 已在 hello326 一节实现）
   2. `fasync_queue` 只有 32 项，满了会丢掉后面的通知（SIGIO 只是提示，但一次处理大量连接时可能少发）。
   3. 阻塞 connect 遇到信号时先看握手结果，握手还在进行中时仍返回 EINTR（宿主机上同样如此）；调用方需要像测试里一样重试。
   4. 本端写入被对端 RST 引起的 POLL_ERR 和 Linux 一样走收 RST 的路径；双方都关闭后的 POLL_HUP（Linux 的 SHUT_WR 序列里有一次）没有实现。
   5. IPv6 TCP 走同一条路径，测试只覆盖了 IPv4 回环。
+
+### 控制台 tty 的 `O_ASYNC` 与 TIOCSTI（hello326，已修）
+
+- 问题：`/dev/tty` 上 `F_SETFL O_ASYNC` 返回 0，但不保留这一位（`F_GETFL` 读回 0x2），键盘输入不发 `SIGIO`。`/dev/tty` 的描述也没有共享槽，dup 后的副本读不到对方设的状态标志。另外不支持 TIOCSTI（返回 ENOTTY），没有办法从用户态向控制台注入输入。
+- Linux 依据：`drivers/tty/tty_io.c` 的 `__tty_fasync`：开启时调用 `__f_setown(force=0)`，描述还没有 owner 时，有前台进程组就设成 `-pgrp`，没有就设成调用进程；已经有 owner 的保留不动。`drivers/tty/n_tty.c` 的 `n_tty_receive_buf_common` 每次收到输入都调用 `kill_fasync(POLL_IN)`。`tiocsti`：开启 `LEGACY_TIOCSTI`（上游默认值）时，只允许在自己的控制终端上调用，否则需要 CAP_SYS_ADMIN，不满足返回 EPERM；指针无效返回 EFAULT。
+- 宿主机实测（`/tmp/atty.c`、`/tmp/atty2.c`、`/tmp/atty3.c`、`/tmp/tpipe.c`，再以 `gcc -DHOST` 跑 `user/hello326.c`，A–J 连续 3 次全过；宿主机用 raw 模式的 pty 从端代替 `/dev/tty`，主端写入代替 TIOCSTI）：
+  - 设 `O_ASYNC` 后读回 O_RDWR|O_ASYNC（宿主机上另有 O_LARGEFILE，测试里去掉了）。
+  - 没有 owner 时开启，owner 变成调用进程；在新会话里打开、成为控制终端的 pty 上开启，owner 变成 `-pgrp`。之前已设的 owner 保留，开着时再设 owner 也照常生效。
+  - F_SETSIG 40 时每个到达的字符都发 POLL_IN，band 0x41，si_fd 是这个描述的 fd，前一个还没读也照发；终端自己的读写不发。sig 为 0 时发普通 SIGIO（si_code 128）。
+  - 清除后不发；dup 共享；同一个终端再 open 一次是另一个描述，只有设了 `O_ASYNC` 的那个收到，两个都设了就各发一次。
+  - 输出缓冲写满后，对端读空时发 POLL_OUT，band 0x304；canonical 模式下，没有换行时不发。主端关闭时从端不发。
+  - TIOCSTI 在管道上返回 ENOTTY。这台宿主机把 `dev.tty.legacy_tiocsti` 设为 0，普通用户调用返回 EIO，所以 EPERM 的规则按 7.0.6 源码确定。
+- 红灯：
+  - 宿主机单测先编译失败，因为缺 `fcntl_policy.ttyAsyncOwner`。
+  - 在未修改的内核上定向 SMP=2（新内核改动 stash 掉），hello326 A–F、H–J 失败：读回 0x2，没有任何信号，TIOCSTI 返回 ENOTTY。
+- 修复：
+  - `kernel/fs/fcntl_policy.zig`：`keepsAsync` 加入 `"tty"`；新增 `ttyAsyncOwner(fg_pgid, pid)`。
+  - `kernel/fs/ioctl_policy.zig`：新增 `TIOCSTI = 0x5412`，归为终端请求，所以在非终端上返回 ENOTTY；新增 `tiocstiPermission(is_ctty, cap_sys_admin)`。
+  - `kernel/fs/ioctl.zig`：TIOCSTI 先检查权限：调用者的会话必须是 `ctty_owner_sid`（控制台还没被认领时由调用者认领，和读 fd 0、TIOCSPGRP 一样），或者持有 CAP_SYS_ADMIN。然后读一个字节放进键盘环。非 x86_64 没有控制台输入队列，返回 EIO。
+  - `kernel/drivers/keyboard.zig`：`push` 加了 `IrqSpinlock`，因为 IRQ1 处理和其他 CPU 上的 TIOCSTI 都会写环。入队成功后调用 `vfs.ttyFasyncNotify()`。新增 `inject`。
+  - `kernel/fs/vfs.zig`：
+    - `FasyncKind` 加入 `tty`，登记项的 idx 固定为 0；新增 `ttyFasyncNotify`、`isConsoleTty`、`asyncTag`。
+    - 新增 `usesSharedSlot`：`/dev/tty` 也占用共享槽，`shareOffsetFor` 和 `flockOwner` 改用这个判断。
+  - `kernel/fs/fcntl.zig`：F_SETFL 用 `asyncTag` 判断是否保留 `O_ASYNC`。在 `/dev/tty` 上从关到开时，用 `setFownOf(…, only_if_unowned=true)` 设默认 owner：有 `jobctl.foreground_pgid` 时是前台组，否则是调用进程（线程取 tgid）。
+  - `tests/main.zig`：新增 tty O_ASYNC 和 TIOCSTI 的策略单测。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份，hello326 A–J 全过；`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），SMP=1、SMP=4 两份、SMP=2 全部 `EXIT=0`，没有失败项，四份都有 hello326 PASS 和 `hello228: corrupted canaries=0`；riscv64、aarch64 smoke 通过。完整 smoke 之后，`isConsoleTty` 又加了一个检查：tty 节点没有注册时（`ttyNodeIdx` 返回 `DIR_IDX`），`/dev` 目录的描述不会被误认成 tty。加上这个检查后重新构建，`zig build test` 通过，hello326 在 SMP=2、SMP=4 定向各一份 PASS。
+- 局限：
+  1. 只有 `/dev/tty` 保留 `O_ASYNC`。fd 0、1、2 是 `.special` 类型，没有描述对象和共享槽，仍然不保留（Linux 上它们就是同一个终端）。
+  2. 没有 pty，也没有输出队列：控制台写入同步发到串口，永远不会 EAGAIN，所以 tty 不发 POLL_OUT。
+  3. 没有 canonical 行规程：每个字符都单独发 POLL_IN，Linux 的 canonical 模式要等到换行才发。
+  4. 控制台输入只有 x86_64 的 PS/2 键盘环。riscv64、aarch64 上 TIOCSTI 返回 EIO，也不会有 tty 的 POLL_IN。
+  5. 宿主机关闭了 legacy TIOCSTI，所以 EPERM 规则只核对了源码，没有在宿主机上实测。

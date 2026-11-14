@@ -54,8 +54,9 @@ pub fn reportedFlags(tag: []const u8, stored: u32) u32 {
 
 /// Descriptor kinds whose O_ASYNC is kept and acted on (Linux keeps FASYNC only where f_op->fasync exists; elsewhere F_SETFL
 /// succeeds and the bit reads back clear, measured on /dev/null and a regular file).
+/// `tag` is the descriptor's FdType name, or "tty" for the console terminal (/dev/tty).
 pub fn keepsAsync(tag: []const u8) bool {
-    return eql(tag, "pipe_read") or eql(tag, "pipe_write") or eql(tag, "unix_socket") or eql(tag, "udp_socket") or eql(tag, "tcp_socket");
+    return eql(tag, "pipe_read") or eql(tag, "pipe_write") or eql(tag, "unix_socket") or eql(tag, "udp_socket") or eql(tag, "tcp_socket") or eql(tag, "tty");
 }
 
 fn eql(a: []const u8, b: []const u8) bool {
@@ -109,6 +110,12 @@ pub fn setownEx(kind: i32, pid: i32) error{ InvalidType, NoSuchOwner }!OwnerEx {
 /// F_GETOWN_EX (Linux f_getown_ex): the type and the positive id.
 pub fn getownEx(owner: i32, kind: u8) struct { type: i32, pid: i32 } {
     return .{ .type = kind, .pid = if (owner < 0) -owner else owner };
+}
+
+/// The owner a terminal takes when O_ASYNC is switched on for a description that has none (Linux __tty_fasync → __f_setown with
+/// force 0): the terminal's foreground process group when it has one (`fg_pgid`), else the calling process `pid`.
+pub fn ttyAsyncOwner(fg_pgid: u32, pid: i32) i32 {
+    return if (fg_pgid != 0) -@as(i32, @intCast(fg_pgid)) else pid;
 }
 
 /// The type F_SETOWN gives (Linux f_setown → __f_setown with PIDTYPE_TGID or PIDTYPE_PGID): a group for -pgrp, else a process.

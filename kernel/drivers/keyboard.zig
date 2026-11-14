@@ -1,6 +1,7 @@
 const serial = @import("../arch/arch.zig").serial;
 const io = @import("../arch/arch.zig").io;
 const ps2_policy = @import("ps2_policy.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 const PS2_DATA: u16 = 0x60;
 const PS2_STATUS: u16 = 0x64;
@@ -10,6 +11,8 @@ const BUF_SIZE = 256;
 var ring: [BUF_SIZE]u8 = undefined;
 var ring_head: u32 = 0;
 var ring_tail: u32 = 0;
+/// Serializes producers: the IRQ1 handler and TIOCSTI from any CPU.
+var push_lock: IrqSpinlock = .{};
 var shift_pressed: bool = false;
 var ctrl_pressed: bool = false;
 var extended: bool = false;
@@ -163,24 +166,39 @@ pub fn handleInterrupt() void {
             const fg = jobctl.foreground_pgid;
             if (fg != 0) _ = signal.sendSignalToPgrp(fg, signal.SIGINT);
 
-            push(ch);
+            _ = push(ch);
             extended = false;
             return;
         }
 
         if (ch != 0) {
-            push(ch);
+            _ = push(ch);
         }
     }
 
     extended = false;
 }
 
-fn push(ch: u8) void {
-    const next = (ring_head + 1) % BUF_SIZE;
-    if (next == ring_tail) return; // buffer full, drop
-    ring[ring_head] = ch;
-    ring_head = next;
+fn push(ch: u8) bool {
+    const queued = blk: {
+        const f = push_lock.acquire();
+        defer push_lock.release(f);
+        const next = (ring_head + 1) % BUF_SIZE;
+        if (next == ring_tail) break :blk false; // buffer full, drop
+        ring[ring_head] = ch;
+        @atomicStore(u32, &ring_head, next, .release);
+        break :blk true;
+    };
+    // The console became readable: O_ASYNC owners of /dev/tty get POLL_IN (Linux n_tty_receive_buf_common → kill_fasync). The
+    // fasync, task and signal locks on that path are IrqSpinlocks, so this is safe from the IRQ handler too.
+    if (queued) @import("../fs/vfs.zig").ttyFasyncNotify();
+    return queued;
+}
+
+/// TIOCSTI: queue `ch` as if it had been typed. False when the ring is full.
+pub fn inject(ch: u8) bool {
+    if (ch == 0) return true; // readChar treats 0 as "empty"; nothing to queue
+    return push(ch);
 }
 
 /// Read a character from the keyboard buffer. Returns 0 if empty.
