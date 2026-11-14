@@ -941,6 +941,7 @@ const SchedStats = struct {
 - **`getrusage` 报真实 CPU 时间**：`RUSAGE_SELF/THREAD` 返回 `utime_us`（含当前这一段
   运行的 TSC 增量）与 `stime_us`；`RUSAGE_CHILDREN` 返回 0；其他 `who` → EINVAL，坏指针
   → EFAULT（纯函数 `proc/rusage_policy.zig`）。验收程序 `hello102`。
+  `clock_nanosleep` 只看 flags 的 `TIMER_ABSTIME` 一位，其它位忽略（与 Linux 实测一致，hello102 D）。
   `ru_nvcsw`/`ru_nivcsw`（偏移 128/136）：上下文切换时出让方仍是 `.running` 记为非自愿（被抢占），
   否则（阻塞、睡眠、退出）记为自愿（`rusage_policy.switchKind`）。此前两个字段恒为 0，`nivcsw` 还把所有切换都算成非自愿。
 

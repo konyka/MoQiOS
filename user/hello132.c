@@ -146,7 +146,8 @@ void _start(void) {
     fut.sec = base / 1000000000LL; fut.nsec = base % 1000000000LL;
     check(syscall4(SYS_CLOCK_NANOSLEEP, CLOCK_MONOTONIC, TIMER_ABSTIME, (uint64_t)&fut, 0) == 0 && now_ns(CLOCK_MONOTONIC) >= base, "D: an absolute deadline in the future is honoured");
     check(syscall4(SYS_CLOCK_NANOSLEEP, 99, 0, (uint64_t)&req, 0) == -EINVAL_, "D: clock_nanosleep with an unknown clock is EINVAL");
-    check(syscall4(SYS_CLOCK_NANOSLEEP, CLOCK_MONOTONIC, 0x4, (uint64_t)&req, 0) == -EINVAL_, "D: clock_nanosleep with unknown flags is EINVAL");
+    /* Linux ignores flag bits other than TIMER_ABSTIME (measured: flags 0x4 sleeps and returns 0). */
+    check(syscall4(SYS_CLOCK_NANOSLEEP, CLOCK_MONOTONIC, 0x4, (uint64_t)&req, 0) == 0, "D: clock_nanosleep ignores an unknown flag bit");
 
     print(failures == 0 ? "hello132: PASS\n" : "hello132: FAIL\n");
     print("hello132 done\n");

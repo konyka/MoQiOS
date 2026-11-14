@@ -4478,7 +4478,7 @@ fn syscallClockNanosleep(clockid: u32, flags: u32, req_ptr: u64, rem_ptr: u64) i
     const clock_ids = @import("../../proc/clock_ids.zig");
     const sleep_verdict = clock_ids.sleepVerdict(clockid);
     if (sleep_verdict != .ok and sleep_verdict != .process_cpu) return clock_ids.sleepErrno(sleep_verdict);
-    if (flags & ~time_policy.TIMER_ABSTIME != 0) return -22;
+    // Flag bits other than TIMER_ABSTIME are ignored (Linux common_nsleep, measured).
     const ts = readUserTimespec(req_ptr) orelse return -14;
     if (sleep_verdict == .process_cpu) {
         const value_ns = time_policy.timespecToNs(ts.sec, ts.nsec) orelse return -22;

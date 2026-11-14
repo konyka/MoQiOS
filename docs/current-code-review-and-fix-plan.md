@@ -8624,7 +8624,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 如实的局限：
   1. CPU 时钟的推进按 10 ms 轮询检查，返回可能比截止时间晚最多约一个轮询周期（加上调度延迟）；Linux 由 CPU 定时器在 tick 上唤醒，精度相近。
   2. `TIMER_ABSTIME` 被信号打断时不写 `rem`，与 Linux 一致；被打断后不会自动重启。
-  3. 未知的 flags 位仍是 `EINVAL`；Linux 对 MONOTONIC 等时钟忽略未知位、返回 0。hello102 断言了 `EINVAL`，这里没有改。
+  3. 未知的 flags 位当时仍是 `EINVAL`；Linux 对 MONOTONIC 等时钟忽略未知位、返回 0。（已修，见下文「`clock_nanosleep` 忽略未知的 flags 位」）
   4. 只做了 x86_64：riscv64、aarch64 没有自己的 `clock_nanosleep` 分派。
 
 ## 文件租约 `F_SETLEASE`/`F_GETLEASE`（hello316，已修）
@@ -8648,4 +8648,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   4. 租约表 32 项，满了返回 `ENOLCK`；一次打破最多通知 8 个进程。
   5. rofs（ext4/NTFS 只读卷）、procfs 不支持租约（`EINVAL`）；只做了 x86_64 的 fcntl 分派。
   6. 拿租约时的打开数统计在 `fl_lock` 之外进行，与并发的 open 之间有一个窄窗口；Linux 在插入后会重新检查一次。
+
+## `clock_nanosleep` 忽略未知的 flags 位（hello102 D，已修）
+
+- 问题：`syscallClockNanosleep` 和 `sleep_policy.planClock` 对 `TIMER_ABSTIME`(1) 以外的任何 flags 位都返回 `EINVAL`，hello102 D 还把这个错误行为断言成了期望值。
+- 宿主机实测（原始 syscall，1 ms 请求）：`CLOCK_REALTIME`(0)、`CLOCK_MONOTONIC`(1)、`CLOCK_BOOTTIME`(7)、`CLOCK_TAI`(11) 上 flags 为 2、0x80、-1 都返回 0；-1 含 `TIMER_ABSTIME`，按绝对时间处理，已过去的截止时间立刻返回。有线程烧 CPU 时 `CLOCK_PROCESS_CPUTIME_ID`(2) 上 0x80、-1、0x81 也都返回 0。不支持的时钟（3–6）仍是 `-EOPNOTSUPP`，非法时钟（8、9）仍是 `EINVAL`；flags 带未知位时非法 timespec（nsec ≥ 1e9）仍是 `EINVAL`。
+- 红灯：hello102 D 改为 Linux 的期望值（flags 2 返回 0；flags -1 加已过去的绝对截止时间返回 0；flags 0x80 加 nsec = 1e9 仍为 `EINVAL`）。在未修改的内核上定向 SMP=2，前两项 FAIL（`count=2`）。宿主机新增单测「sleep policy: clock_nanosleep ignores flag bits other than TIMER_ABSTIME」也是红的。
+- 修复：删掉 `kernel/arch/x86_64/syscall_entry.zig` 的 `if (flags & ~time_policy.TIMER_ABSTIME != 0) return -22;`，以及 `kernel/proc/sleep_policy.zig` 里 `planClock` 的同一检查；只看 `TIMER_ABSTIME` 一位（`writesRemaining` 本来就只看这一位）。`tests/rt_hardening_test.zig` 中原来断言 flags 2 为 `.invalid` 的那项改为断言按相对睡眠规划。hello132 D 原来断言 flags 0x4 为 `EINVAL`（第一次完整 smoke 四份都因此 FAIL），宿主机实测 Linux 对 flags 0x4 的 20 ms 相对睡眠返回 0，改为断言返回 0；定向 SMP=2、SMP=4 各一份 PASS。
+- 绿灯：hello102 定向 SMP=2、SMP=4 各一份 PASS；`zig build test` 通过。
+- 完整 smoke：第一次四份都只因 hello132 D（同一个旧断言）FAIL；改完后重跑四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello102、hello132、hello316 PASS 和 `hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
+- 如实的局限：只改了 x86_64 的分派；`timerfd_settime`、`timer_settime` 等的 flags 检查没有动（各自另有实测依据）。
 

@@ -13,7 +13,8 @@
 ///      thread sleeps in clock_nanosleep.
 ///   C. TIMER_ABSTIME sleeps until the deadline and leaves `rem` untouched; a
 ///      deadline in the past returns at once.
-///   D. invalid clocks, flags and timespecs are EINVAL for both syscalls.
+///   D. invalid clocks and timespecs are EINVAL for both syscalls; flag bits
+///      other than TIMER_ABSTIME are ignored, as on Linux.
 ///   E. alarm(1) interrupts a 5 s clock_nanosleep with EINTR and a sane `rem`.
 ///   F. an unrepresentably long nanosleep is interrupted by alarm(1) instead
 ///      of overflowing.
@@ -253,7 +254,10 @@ static void probe_abstime(void) {
 
 static void probe_invalid(void) {
     check(clock_sleep(99, 0, 0, 1000, 0) == -EINVAL, "unknown clock EINVAL");
-    check(clock_sleep(CLOCK_MONOTONIC, 2, 0, 1000, 0) == -EINVAL, "unknown flags EINVAL");
+    /* Linux ignores flag bits other than TIMER_ABSTIME (measured: 0 for 2, 0x80 and -1 on CLOCK_MONOTONIC). */
+    check(clock_sleep(CLOCK_MONOTONIC, 2, 0, 1000, 0) == 0, "unknown flag bit 2 ignored");
+    check(clock_sleep(CLOCK_MONOTONIC, -1, 0, 1, 0) == 0, "all flag bits set: absolute deadline in the past returns 0");
+    check(clock_sleep(CLOCK_MONOTONIC, 0x80, 0, NS_PER_SEC, 0) == -EINVAL, "unknown flag bit still checks the timespec");
     check(clock_sleep(CLOCK_MONOTONIC, 0, 0, NS_PER_SEC, 0) == -EINVAL, "clock_nanosleep nsec>=1e9 EINVAL");
     check(clock_sleep(CLOCK_MONOTONIC, 0, -1, 0, 0) == -EINVAL, "clock_nanosleep negative sec EINVAL");
 

@@ -36,10 +36,11 @@ test "relative sleep validates the timespec and saturates the deadline" {
     try expectSleep(p.planRelative(1, 0, maxU64 - 10), maxU64);
 }
 
-test "clock sleep rejects unknown clocks and flags" {
+test "clock sleep rejects unknown clocks and ignores unknown flag bits" {
     const p = sleep_policy;
     try std.testing.expect(p.planClock(2, 0, 0, 100, 1_000, 0) == .invalid);
-    try std.testing.expect(p.planClock(time_policy.CLOCK_MONOTONIC, 2, 0, 100, 1_000, 0) == .invalid);
+    // Linux ignores flag bits other than TIMER_ABSTIME (measured).
+    try expectSleep(p.planClock(time_policy.CLOCK_MONOTONIC, 2, 0, 100, 1_000, 0), 1_100);
     try std.testing.expect(p.planClock(time_policy.CLOCK_MONOTONIC, 0, 0, 1_000_000_000, 1_000, 0) == .invalid);
     try std.testing.expect(p.planClock(time_policy.CLOCK_MONOTONIC, time_policy.TIMER_ABSTIME, -1, 0, 1_000, 0) == .invalid);
 }

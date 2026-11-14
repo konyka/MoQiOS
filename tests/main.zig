@@ -12445,3 +12445,18 @@ test "lease policy: a read open downgrades a write lease, and deadlines force th
     try std.testing.expectEqual(lp.UNLCK, t.get(1, 10, 3 * lp.BREAK_NS + 1));
     try std.testing.expectEqual(@as(i64, -11), t.unlock(1, 10, 3 * lp.BREAK_NS + 1));
 }
+
+test "sleep policy: clock_nanosleep ignores flag bits other than TIMER_ABSTIME (Linux measured)" {
+    const sp = kt.sleep_policy;
+    // relative: an unknown bit plans the same sleep as flags 0
+    try std.testing.expectEqual(sp.Plan{ .sleep = 1_000 + 1_000_000 }, sp.planClock(1, 0x80, 0, 1_000_000, 1_000, 0));
+    try std.testing.expectEqual(sp.Plan{ .sleep = 1_000 + 1_000_000 }, sp.planClock(1, 0xffff_fffe, 0, 1_000_000, 1_000, 0));
+    // TIMER_ABSTIME with extra bits is still absolute: a deadline in the past returns at once
+    try std.testing.expectEqual(sp.Plan.immediate, sp.planClock(1, 0x81, 0, 1, 5_000_000_000, 0));
+    try std.testing.expect(sp.writesRemaining(0x80));
+    try std.testing.expect(!sp.writesRemaining(0x81));
+    // the timespec is still checked
+    try std.testing.expectEqual(sp.Plan.invalid, sp.planClock(1, 0x80, 0, 1_000_000_000, 0, 0));
+    // the syscall no longer rejects the bits itself
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "if (flags & ~time_policy.TIMER_ABSTIME != 0) return -22;") == null);
+}

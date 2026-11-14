@@ -27,7 +27,7 @@ pub fn planRelative(sec: i64, nsec: i64, now_ns: u64) Plan {
 
 pub fn planClock(clock_id: u32, flags: u32, sec: i64, nsec: i64, now_ns: u64, realtime_offset_ns: i64) Plan {
     if (clock_id != time_policy.CLOCK_REALTIME and clock_id != time_policy.CLOCK_MONOTONIC) return .invalid;
-    if (flags & ~time_policy.TIMER_ABSTIME != 0) return .invalid;
+    // Only TIMER_ABSTIME means anything; Linux ignores every other bit.
     if (flags & time_policy.TIMER_ABSTIME == 0) return planRelative(sec, nsec, now_ns);
     const target = requestNs(sec, nsec) orelse return .invalid;
     const delta = time_policy.absoluteDeltaNs(clock_id, target, now_ns, realtime_offset_ns) orelse return .invalid;
