@@ -12535,6 +12535,19 @@ test "tty O_ASYNC: the console tty keeps it, enabling it picks the foreground gr
     try std.testing.expectEqual(@as(i64, -1), ip.tiocstiPermission(false, false));
 }
 
+test "F_GETOWN after the owner is gone: a live or zombie owner reads back, a reaped one reads 0 and keeps its type" {
+    const fp = kt.fcntl_policy;
+    // Linux f_getown / f_getown_ex: pid_task() non-NULL, else 0
+    try std.testing.expectEqual(@as(i32, 42), fp.reportedOwner(42, true));
+    try std.testing.expectEqual(@as(i32, -7), fp.reportedOwner(-7, true));
+    try std.testing.expectEqual(@as(i32, 0), fp.reportedOwner(42, false));
+    try std.testing.expectEqual(@as(i32, 0), fp.reportedOwner(-7, false));
+    try std.testing.expectEqual(@as(i32, 0), fp.reportedOwner(0, true));
+    const ex = fp.getownEx(fp.reportedOwner(-7, false), 2);
+    try std.testing.expectEqual(@as(i32, 2), ex.type);
+    try std.testing.expectEqual(@as(i32, 0), ex.pid);
+}
+
 test "fcntl policy: O_ASYNC is kept by pipes, AF_UNIX, UDP and TCP sockets, and SIGIO carries POLL_IN / POLL_OUT / POLL_ERR / POLL_HUP with their bands" {
     const fp = kt.fcntl_policy;
     try std.testing.expectEqual(@as(u32, 0x2000), fp.O_ASYNC);

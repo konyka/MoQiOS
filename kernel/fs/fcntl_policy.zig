@@ -107,6 +107,12 @@ pub fn setownEx(kind: i32, pid: i32) error{ InvalidType, NoSuchOwner }!OwnerEx {
     return .{ .owner = if (k == F_OWNER_PGRP) -pid else pid, .kind = k };
 }
 
+/// The owner F_GETOWN / F_GETOWN_EX report (Linux f_getown, f_getown_ex: the id only while pid_task() finds a task): the stored
+/// one while a task with that tid, or a member of that group, still exists (`alive`; a zombie counts), else 0.
+pub fn reportedOwner(owner: i32, alive: bool) i32 {
+    return if (alive) owner else 0;
+}
+
 /// F_GETOWN_EX (Linux f_getown_ex): the type and the positive id.
 pub fn getownEx(owner: i32, kind: u8) struct { type: i32, pid: i32 } {
     return .{ .type = kind, .pid = if (owner < 0) -owner else owner };

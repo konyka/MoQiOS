@@ -8768,7 +8768,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello321、hello320、hello319、hello318、hello316 PASS 和 `hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
 - 局限：
   1. 仍然没有 `sigio_perm` 的 uid 检查（Linux 要求发送时 owner 的凭据允许给目标发信号）。（已在 hello322 一节实现）
-  2. TID owner 的线程退出后，Linux 的 pid 引用会让信号落空；这里按 tid 查找，tid 被重用时可能发给新任务。
+  2. TID owner 的线程退出后，Linux 的 pid 引用会让信号落空；这里按 tid 查找，tid 被重用时可能发给新任务。（hello327 一节：tid 只增不减，不会重用，信号随 owner 消失而落空；F_GETOWN 也改为报 0）
   3. pgid 仍是 u16；只做了 x86_64 的 fcntl 分派。
 
 ### SIGIO 的发送权限 `sigio_perm`（hello322，已修）
@@ -8926,3 +8926,25 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   3. 没有 canonical 行规程：每个字符都单独发 POLL_IN，Linux 的 canonical 模式要等到换行才发。
   4. 控制台输入只有 x86_64 的 PS/2 键盘环。riscv64、aarch64 上 TIOCSTI 返回 EIO，也不会有 tty 的 POLL_IN。
   5. 宿主机关闭了 legacy TIOCSTI，所以 EPERM 规则只核对了源码，没有在宿主机上实测。
+
+### owner 消失后 F_GETOWN / F_GETOWN_EX 报 0（hello327，已修）
+
+- 问题：`F_GETOWN`、`F_GETOWN_EX` 直接返回存下来的 owner。owner 进程被回收、owner 线程退出、owner 进程组的成员全部回收之后，仍然报旧的 pid 或 -pgrp。Linux 报 0。hello321 一节局限 2 担心的「tid 被重用时发给新任务」在 MoQiOS 上不会发生：`task.zig` 的 `next_tid` 只增不减，tid 不会重用。
+- Linux 依据：`fs/fcntl.c` 的 `f_getown`、`f_getown_ex`：只有 `pid_task(pid, type)` 找到任务时才报 id，否则报 0，类型不变。zombie 在回收前仍挂在它的 `struct pid` 上，所以仍然报。
+- 宿主机实测（`/tmp/oreuse.c`、`/tmp/oreuse2.c`，再以 `gcc -DHOST -pthread` 跑 `user/hello327.c`，A–F 全过）：
+  - PID owner 被杀、未回收时仍报它的 pid；waitpid 之后 F_GETOWN 报 0，F_GETOWN_EX 报类型 1、pid 0。
+  - TID owner 的线程 join 之后，F_GETOWN_EX 报类型 0、pid 0，F_GETOWN 报 0；再用 F_SETOWN_EX 设这个 tid 返回 ESRCH。
+  - PGRP owner：唯一成员是 zombie 时仍报 -pgrp，回收后报 0；组长已回收而另一个成员活着时仍报 -pgrp，成员也没了之后报 0。
+- 红灯：
+  - 宿主机单测先编译失败，因为缺 `fcntl_policy.reportedOwner`。
+  - 在未修改的内核上定向 SMP=2，hello327 B、C、E、F 失败：回收后仍报 8、tid 9、-10、-11。A、D 本来就和 Linux 一致。
+- 修复：
+  - `kernel/fs/fcntl_policy.zig`：新增 `reportedOwner(owner, alive)`。
+  - `kernel/fs/fcntl.zig`：新增 `ownerAlive(who)`：存在 tid 相同的任务，或 pgid 相同的成员，就算存在。进程 zombie 算；非组长线程的 zombie 和已交给 reaper（`reap_pending`）的 zombie 不算，因为 Linux 上它们已经释放。F_GETOWN 和 F_GETOWN_EX 都经过 `reportedOwner`，F_GETOWN_EX 的类型不变。
+  - `tests/main.zig`：新增 `reportedOwner` 的单测。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份，hello327 A–F 全过；`zig build test` 通过。
+- 完整 smoke：SMP=1、4、4、2 四份并行，全部 EXIT=0、0 FAIL，每份都有 `hello327: PASS`，`corrupted canaries=0`；riscv64、aarch64 smoke 通过。
+- 局限：
+  1. 只改了读回。存下来的 owner 本身不清除，发信号时 `sendToOwner` 按 tid 或 pgid 查找，找不到就不发，效果和 Linux 一样；这依赖 tid 不重用。如果以后 tid 改成回绕分配，需要给 owner 加 incarnation 一类的引用。
+  2. `Task.pgid`、`Task.sid` 是 u16（`task.zig` 230、232 行），tid 超过 65535 之后不能再作为组号（`jobctl.zig` 147 行是 `@intCast`）。本节没有处理这个问题，改动前后行为相同。
+  3. 检查是在不持有 task_lock 的情况下扫描 64 个槽，和 `ownerExists` 一样；扫描期间 owner 正好被回收时，可能报出刚消失的 id 一次。

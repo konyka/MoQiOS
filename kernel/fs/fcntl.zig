@@ -94,7 +94,10 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
             vfs.setStatusFlags(d, next);
             return 0;
         },
-        F_GETOWN => return vfs.fownOf(&t.fd_table.fds[fd]).owner,
+        F_GETOWN => {
+            const owner = vfs.fownOf(&t.fd_table.fds[fd]).owner;
+            return policy.reportedOwner(owner, ownerAlive(owner));
+        },
         F_GETSIG => return vfs.fownOf(&t.fd_table.fds[fd]).sig,
         F_SETOWN => {
             const who = policy.setownArg(arg) orelse return -22;
@@ -104,7 +107,7 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
         },
         F_GETOWN_EX => {
             const fo = vfs.fownOf(&t.fd_table.fds[fd]);
-            const ex = policy.getownEx(fo.owner, fo.kind);
+            const ex = policy.getownEx(policy.reportedOwner(fo.owner, ownerAlive(fo.owner)), fo.kind);
             var out: [8]u8 = undefined;
             std.mem.writeInt(i32, out[0..4], ex.type, .little);
             std.mem.writeInt(i32, out[4..8], ex.pid, .little);
@@ -170,6 +173,22 @@ fn ownerExists(who: i32) bool {
     for (0..task_mod.MAX_TASKS) |i| {
         const t = task_mod.getTask(@intCast(i)) orelse continue;
         if (t.state == .zombie) continue;
+        if (who > 0 and t.tid == @as(u32, @intCast(who))) return true;
+        if (who < 0 and @as(i64, t.pgid) == -@as(i64, who)) return true;
+    }
+    return false;
+}
+
+/// A stored owner still names a task (Linux pid_task() on the owner's struct pid): a task with that tid, or a member of group
+/// -who, process zombies included, since an unreaped zombie keeps its pid. A dead non-leader thread, or a zombie already handed
+/// to the reaper, does not count: Linux releases both at once. Tids are never reused (next_tid only grows), so a tid that is
+/// found is the original task.
+fn ownerAlive(who: i32) bool {
+    if (who == 0) return false;
+    const task_mod = @import("../proc/task.zig");
+    for (0..task_mod.MAX_TASKS) |i| {
+        const t = task_mod.getTask(@intCast(i)) orelse continue;
+        if (t.state == .zombie and (t.reap_pending or t.is_thread)) continue;
         if (who > 0 and t.tid == @as(u32, @intCast(who))) return true;
         if (who < 0 and @as(i64, t.pgid) == -@as(i64, who)) return true;
     }
