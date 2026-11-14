@@ -634,8 +634,9 @@ test "FIONBIO updates status flags without changing descriptor flags" {
     const start = std.mem.indexOf(u8, source, "FIONBIO =>").?;
     const end = std.mem.indexOfPos(u8, source, start, "else => return -25").?;
     const body = source[start..end];
-    try std.testing.expect(std.mem.indexOf(u8, body, "status_flags |= 0x800") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "status_flags &= ~@as(u32, 0x800)") != null);
+    // O_NONBLOCK is changed on the open file description, so dup()s see it
+    try std.testing.expect(std.mem.indexOf(u8, body, "vfs.setStatusFlags(d, if (nonblock != 0) flags | 0x800 else flags & ~@as(u32, 0x800));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "const flags = vfs.statusFlagsOf(d);") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "fd_flags |= 0x800") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "fd_flags &= ~@as(u32, 0x800)") == null);
 }
@@ -742,7 +743,7 @@ test "splice propagates nonblocking flags to transfer helpers" {
     const source = kt.splice_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "splicePipeToPipe(fd_table, fd_in, fd_out, len, flags)") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "splicePipeToFile(fd_table, fd_in, fd_out, off_out, len, flags)") != null);
-    try std.testing.expect(std.mem.count(u8, source, "(flags & SPLICE_F_NONBLOCK != 0) or (fd_table.fds[pipe_fd].status_flags & 0x800 != 0)") >= 2);
+    try std.testing.expect(std.mem.count(u8, source, "(flags & SPLICE_F_NONBLOCK != 0) or (vfs.statusFlagsOf(&fd_table.fds[pipe_fd]) & 0x800 != 0)") >= 2);
 }
 
 test "splice pipe-to-file nonblocking result distinguishes live pipe from EOF" {
@@ -755,8 +756,8 @@ test "splice pipe-to-file nonblocking result distinguishes live pipe from EOF" {
 
 test "pipe-to-pipe splice honors descriptor nonblocking status" {
     const source = kt.splice_source;
-    try std.testing.expect(std.mem.count(u8, source, "(flags & SPLICE_F_NONBLOCK != 0) or (fd_table.fds[pipe_fd].status_flags & 0x800 != 0) or total > 0") == 2);
-    try std.testing.expect(std.mem.indexOf(u8, source, "(fd_table.fds[in_fd].status_flags | fd_table.fds[out_fd].status_flags) & 0x800 != 0") != null);
+    try std.testing.expect(std.mem.count(u8, source, "(flags & SPLICE_F_NONBLOCK != 0) or (vfs.statusFlagsOf(&fd_table.fds[pipe_fd]) & 0x800 != 0) or total > 0") == 2);
+    try std.testing.expect(std.mem.indexOf(u8, source, "(vfs.statusFlagsOf(&fd_table.fds[in_fd]) | vfs.statusFlagsOf(&fd_table.fds[out_fd])) & 0x800 != 0") != null);
     // An empty source with no writers is EOF (0); the waiting transfer reports EAGAIN itself when it may not wait.
     try std.testing.expectEqual(@as(i64, 0), splice.pipeTransferResult(0, 0));
     try std.testing.expectEqual(@as(i64, -11), splice.pipeTransferResult(0, -11));
@@ -12516,7 +12517,7 @@ test "fcntl policy: F_SETOWN_EX owner types TID/PID/PGRP and what F_GETOWN_EX an
     try std.testing.expectEqual(@as(u8, 1), fp.setownKind(0));
 }
 
-test "fcntl policy: O_ASYNC is kept by pipes only, and SIGIO carries POLL_IN / POLL_OUT with their bands" {
+test "fcntl policy: O_ASYNC is kept by pipes and AF_UNIX sockets, and SIGIO carries POLL_IN / POLL_OUT / POLL_HUP with their bands" {
     const fp = kt.fcntl_policy;
     try std.testing.expectEqual(@as(u32, 0x2000), fp.O_ASYNC);
     // F_SETFL's own mask does not carry it: the pipe path adds the bit when it registers the description
@@ -12525,6 +12526,14 @@ test "fcntl policy: O_ASYNC is kept by pipes only, and SIGIO carries POLL_IN / P
     try std.testing.expect(fp.keepsAsync("pipe_write"));
     try std.testing.expect(!fp.keepsAsync("ramdisk"));
     try std.testing.expect(!fp.keepsAsync("devnull"));
+    // AF_UNIX sockets keep it too (sock_fasync); tcp/udp sockets and ttys are not wired up here
+    try std.testing.expect(fp.keepsAsync("unix_socket"));
+    try std.testing.expect(!fp.keepsAsync("eventfd"));
+    // a hang-up (peer closed, shutdown(SHUT_RDWR)) is POLL_HUP with band POLLERR|POLLHUP
+    const hup = fp.sigioSignal(40, 5, fp.POLL_HUP);
+    try std.testing.expectEqual(@as(i32, 6), hup.info.code);
+    try std.testing.expectEqual(@as(u64, 0x18), hup.info.a);
+    try std.testing.expectEqual(@as(u64, 5), hup.info.b);
     // signal 0: plain SIGIO, SI_KERNEL, band 0, fd 0, whatever the reason
     const s0 = fp.sigioSignal(0, 3, fp.POLL_IN);
     try std.testing.expectEqual(@as(u32, 29), s0.signo);

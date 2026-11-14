@@ -82,7 +82,7 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
             // O_ASYNC is kept only where the file can act on it (Linux setfl → f_op->fasync); elsewhere F_SETFL still succeeds.
             if (policy.keepsAsync(@tagName(d.fd_type))) {
                 const want = @as(u32, @truncate(arg)) & policy.O_ASYNC;
-                if (want != cur_flags & policy.O_ASYNC and !vfs.setPipeAsync(t.fd_table, @intCast(fd), want != 0)) return -12; // ENOMEM
+                if (want != cur_flags & policy.O_ASYNC and !vfs.setAsync(t.fd_table, @intCast(fd), want != 0)) return -12; // ENOMEM
                 next |= want;
             }
             vfs.setStatusFlags(d, next);

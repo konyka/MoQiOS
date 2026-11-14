@@ -759,26 +759,37 @@ pub fn pipeClose(pipe_idx: u32, write_end: bool) void {
     }
 }
 
-// ── O_ASYNC on pipes (Linux pipe_fasync / kill_fasync) ─────────────────────
-/// One open file description of a pipe end with O_ASYNC set: its shared slot (the owner and signal live there) and the
-/// descriptor F_SETFL went through, which becomes si_fd (Linux fasync_struct.fa_fd).
-const PipeFasync = struct { used: bool = false, pipe_idx: u8 = 0, write_end: bool = false, slot: u16 = 0, fd: u32 = 0 };
-const PIPE_FASYNC_MAX = 128;
-var pipe_fasync: [PIPE_FASYNC_MAX]PipeFasync = @splat(.{});
-var pipe_fasync_lock: IrqSpinlock = .{};
+// ── O_ASYNC on pipes and AF_UNIX sockets (Linux fasync_helper / kill_fasync) ──
+/// What an O_ASYNC open file description is attached to: one end of a pipe, or an AF_UNIX socket (`idx` is the pipe or socket index).
+pub const FasyncKind = enum(u8) { pipe_read, pipe_write, unix_socket };
+/// One open file description with O_ASYNC set: its shared slot (the owner and signal live there) and the descriptor F_SETFL went
+/// through, which becomes si_fd (Linux fasync_struct.fa_fd).
+const Fasync = struct { used: bool = false, kind: FasyncKind = .pipe_read, idx: u16 = 0, slot: u16 = 0, fd: u32 = 0 };
+const FASYNC_MAX = 128;
+var fasync_table: [FASYNC_MAX]Fasync = @splat(.{});
+var fasync_lock: IrqSpinlock = .{};
 
-/// F_SETFL changing O_ASYNC on pipe descriptor `fd` of `table`: (un)register its open file description. The description is
-/// given a shared slot first (as flockOwner does) so dup()/fork() copies share the registration. False when the slot pool or the
-/// registry is full (ENOMEM, as fasync_helper's allocation failing).
-pub fn setPipeAsync(table: *FdTable, fd: u32, on: bool) bool {
+fn fasyncTarget(desc: *const FileDescriptor) ?struct { kind: FasyncKind, idx: u16 } {
+    return switch (desc.fd_type) {
+        .pipe_read => .{ .kind = .pipe_read, .idx = @intCast(desc.pipe_idx) },
+        .pipe_write => .{ .kind = .pipe_write, .idx = @intCast(desc.pipe_idx) },
+        .unix_socket => .{ .kind = .unix_socket, .idx = @intCast(desc.unix_sock_idx) },
+        else => null,
+    };
+}
+
+/// F_SETFL changing O_ASYNC on descriptor `fd` of `table` (a pipe end or an AF_UNIX socket): (un)register its open file
+/// description. The description is given a shared slot first (as flockOwner does) so dup()/fork() copies share the registration.
+/// False when the slot pool or the registry is full (ENOMEM, as fasync_helper's allocation failing).
+pub fn setAsync(table: *FdTable, fd: u32, on: bool) bool {
     const desc = &table.fds[fd];
-    if (desc.fd_type != .pipe_read and desc.fd_type != .pipe_write) return false;
+    const target = fasyncTarget(desc) orelse return false;
     _ = flockOwner(table, fd) orelse return false;
     const slot = desc.offset_slot;
-    const f = pipe_fasync_lock.acquire();
-    defer pipe_fasync_lock.release(f);
+    const f = fasync_lock.acquire();
+    defer fasync_lock.release(f);
     var free: ?usize = null;
-    for (&pipe_fasync, 0..) |*e, i| {
+    for (&fasync_table, 0..) |*e, i| {
         if (e.used and e.slot == slot) {
             if (on) {
                 e.fd = fd;
@@ -789,29 +800,29 @@ pub fn setPipeAsync(table: *FdTable, fd: u32, on: bool) bool {
     }
     if (!on) return true;
     const i = free orelse return false;
-    pipe_fasync[i] = .{ .used = true, .pipe_idx = @intCast(desc.pipe_idx), .write_end = desc.fd_type == .pipe_write, .slot = slot, .fd = fd };
+    fasync_table[i] = .{ .used = true, .kind = target.kind, .idx = target.idx, .slot = slot, .fd = fd };
     return true;
 }
 
 /// The open file description in `slot` is gone: drop its O_ASYNC registration (Linux __fput → fasync(-1)).
-fn dropPipeFasync(slot: u16) void {
-    const f = pipe_fasync_lock.acquire();
-    defer pipe_fasync_lock.release(f);
-    for (&pipe_fasync) |*e| {
+fn dropFasync(slot: u16) void {
+    const f = fasync_lock.acquire();
+    defer fasync_lock.release(f);
+    for (&fasync_table) |*e| {
         if (e.used and e.slot == slot) e.* = .{};
     }
 }
 
-/// kill_fasync for one end of a pipe: signal the owner of every O_ASYNC description of that end (POLL_OUT for the write end,
-/// POLL_IN for the read end). Collected under the registry lock, sent outside it; a description with no owner signals nobody.
-fn pipeFasyncNotify(pipe_idx: u32, write_end: bool) void {
-    var hits: [PIPE_FASYNC_MAX]PipeFasync = undefined;
+/// kill_fasync: signal the owner of every O_ASYNC description of (`kind`, `idx`) for `reason` (fcntl_policy.POLL_*). Collected
+/// under the registry lock, sent outside it; a description with no owner signals nobody.
+fn fasyncNotify(kind: FasyncKind, idx: u32, reason: i32) void {
+    var hits: [FASYNC_MAX]Fasync = undefined;
     var n: usize = 0;
     {
-        const f = pipe_fasync_lock.acquire();
-        defer pipe_fasync_lock.release(f);
-        for (pipe_fasync) |e| {
-            if (e.used and e.pipe_idx == pipe_idx and e.write_end == write_end) {
+        const f = fasync_lock.acquire();
+        defer fasync_lock.release(f);
+        for (fasync_table) |e| {
+            if (e.used and e.kind == kind and e.idx == idx) {
                 hits[n] = e;
                 n += 1;
             }
@@ -822,9 +833,21 @@ fn pipeFasyncNotify(pipe_idx: u32, write_end: bool) void {
     for (hits[0..n]) |e| {
         const fo = fownOfDescription(0x4000_0000_0000_0000 | @as(u64, e.slot)) orelse continue;
         if (fo.owner == 0) continue;
-        const s = fp.sigioSignal(fo.sig, e.fd, if (write_end) fp.POLL_OUT else fp.POLL_IN);
+        const s = fp.sigioSignal(fo.sig, e.fd, reason);
         sendToOwner(fo, s.signo, s.info);
     }
+}
+
+/// One end of a pipe changed: POLL_OUT for the write end, POLL_IN for the read end.
+fn pipeFasyncNotify(pipe_idx: u32, write_end: bool) void {
+    const fp = @import("fcntl_policy.zig");
+    fasyncNotify(if (write_end) .pipe_write else .pipe_read, pipe_idx, if (write_end) fp.POLL_OUT else fp.POLL_IN);
+}
+
+/// AF_UNIX socket `sock_idx` became readable, writable or hung up (sock_wake_async): `reason` is POLL_IN, POLL_OUT or POLL_HUP.
+/// Called with unix_lock released.
+pub fn unixFasyncNotify(sock_idx: u32, reason: i32) void {
+    fasyncNotify(.unix_socket, sock_idx, reason);
 }
 
 
@@ -834,12 +857,12 @@ var shared_offsets: shared_offset.Pool(512) = .{};
 var shared_offsets_lock: IrqSpinlock = .{};
 
 /// Descriptor kinds whose open file description is shared through a slot: those with a byte offset into a regular object, and
-/// pipe ends (shared status flags, owner, signal and O_ASYNC registration).
+/// pipe ends and AF_UNIX sockets (shared status flags, owner, signal and O_ASYNC registration).
 fn usesSharedOffset(t: FdType) bool {
     return switch (t) {
         .ramdisk_file, .fat32_file, .ext2_file, .tmpfs_file, .rofs_file, .proc_file => true,
         // No offset, but the status flags (O_NONBLOCK, O_ASYNC), owner and signal belong to the description all the same.
-        .pipe_read, .pipe_write => true,
+        .pipe_read, .pipe_write, .unix_socket => true,
         else => false,
     };
 }
@@ -870,7 +893,7 @@ pub fn syncOffsetIn(desc: *FileDescriptor) void {
     const f = shared_offsets_lock.acquire();
     defer shared_offsets_lock.release(f);
     desc.offset = shared_offsets.load(desc.offset_slot);
-    desc.status_flags = shared_offsets.flags(desc.offset_slot);
+    desc.status_flags = shared_offsets.flags(desc.offset_slot) | (if (desc.force_nonblock) @as(u32, 0x800) else 0);
 }
 
 /// F_SETFL: change the status flags of the whole open file description.
@@ -1067,7 +1090,7 @@ fn releaseOffsetSlot(slot: u16) bool {
         defer shared_offsets_lock.release(f);
         break :blk shared_offsets.release(slot);
     };
-    if (last) dropPipeFasync(slot);
+    if (last) dropFasync(slot);
     return last;
 }
 
@@ -1117,6 +1140,8 @@ pub const FileDescriptor = struct {
     writable: bool = false,
     fd_flags: u32 = 0,
     status_flags: u32 = 0,
+    /// RWF_NOWAIT for the call in progress: this descriptor acts as O_NONBLOCK without changing the shared description's flags.
+    force_nonblock: bool = false,
     /// F_SETOWN / F_SETSIG while the description has no shared slot (afterwards the slot holds them).
     fown: i32 = 0,
     fsig: u8 = 0,

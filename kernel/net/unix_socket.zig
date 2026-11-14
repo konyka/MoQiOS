@@ -141,6 +141,9 @@ pub const UnixSocket = struct {
     backlog: [UNIX_BACKLOG_MAX]u8 = @splat(255),
     backlog_count: u8 = 0,
     accept_waiters: ?*WaitNode = null,
+    /// A send from this socket found the ring of socket `nospace_on` full (EAGAIN, or a blocking send about to wait): once that
+    /// ring drains to a quarter it gets one POLL_OUT for O_ASYNC (Linux SOCKWQ_ASYNC_NOSPACE + unix_write_space). 255 = none.
+    nospace_on: u8 = 255,
 };
 
 var unix_sockets: [MAX_UNIX_SOCKETS]UnixSocket = @splat(.{});
@@ -320,10 +323,15 @@ fn queuedRightsLocked(owner: u32, rx_pos: u64) struct { first: ?u64, second: ?u6
 /// released (epoll's pool_lock -> inst.spin never nests inside unix_lock).
 /// They are wake-up hints only: epoll recomputes the real readiness with
 /// unixEpollEvents, so over-notifying is harmless.
+/// `sig_*` are the O_ASYNC signals (sock_wake_async POLL_IN / POLL_OUT / POLL_HUP), sent to the owners of the sockets' O_ASYNC
+/// descriptions after the lock is dropped too; unlike the epoll hints these follow Linux exactly.
 const EpollWake = struct {
     in: u32 = 0,
     out: u32 = 0,
     hup: u32 = 0,
+    sig_in: u32 = 0,
+    sig_out: u32 = 0,
+    sig_hup: u32 = 0,
 
     comptime {
         if (MAX_UNIX_SOCKETS > 32) @compileError("EpollWake masks hold 32 sockets");
@@ -348,8 +356,30 @@ const EpollWake = struct {
             if (self.hup & b != 0) events |= epoll.EPOLLIN | epoll.EPOLLOUT | epoll.EPOLLHUP | epoll.EPOLLRDHUP;
             epoll.epollNotify(.unix_socket, i, events);
         }
+        const fp = @import("../fs/fcntl_policy.zig");
+        const masks = [_]struct { m: u32, reason: i32 }{ .{ .m = self.sig_in, .reason = fp.POLL_IN }, .{ .m = self.sig_out, .reason = fp.POLL_OUT }, .{ .m = self.sig_hup, .reason = fp.POLL_HUP } };
+        for (masks) |e| {
+            var m = e.m;
+            while (m != 0) {
+                const i: u32 = @ctz(m);
+                m &= m - 1;
+                vfs.unixFasyncNotify(i, e.reason);
+            }
+        }
     }
 };
+
+/// Senders that hit a full ring on `idx` and can now write again (Linux unix_writable: a quarter or less of the buffer in use)
+/// get their single POLL_OUT (unix_lock held).
+fn writeSpaceLocked(idx: u32, wake: *EpollWake) void {
+    if (unix_sockets[idx].buf_count * 4 > UNIX_SOCK_BUF_SIZE) return;
+    for (&unix_sockets, 0..) |*o, i| {
+        if (o.active and o.nospace_on == idx) {
+            o.nospace_on = 255;
+            wake.sig_out |= EpollWake.bit(@intCast(i));
+        }
+    }
+}
 
 /// Create a new Unix domain socket.
 /// Returns socket index (>= 0) or negative errno on failure.
@@ -647,6 +677,7 @@ pub fn unixConnect(idx: u32, path: [*]const u8, path_len: usize) i32 {
         peer.backlog[peer.backlog_count] = @intCast(idx);
         peer.backlog_count += 1;
         wake.in |= EpollWake.bit(peer_i);
+        wake.sig_in |= EpollWake.bit(peer_i);
 
         // Wake any accept waiter
         if (peer.accept_waiters) |node| {
@@ -867,6 +898,8 @@ pub fn unixSendRightsTo(idx: u32, data: [*]const u8, len: usize, rights: ?*Right
         // Wake any read waiter on peer
         if (n > 0) {
             wake.in |= EpollWake.bit(peer_i);
+            // SOCK_WAKE_WAITD: a stream reader already waiting for data (SOCKWQ_ASYNC_WAITDATA) gets no SIGIO.
+            if (peer.read_waiters == null) wake.sig_in |= EpollWake.bit(peer_i);
             if (peer.read_waiters) |node| {
                 peer.read_waiters = node.next;
                 node.next = null;
@@ -876,7 +909,10 @@ pub fn unixSendRightsTo(idx: u32, data: [*]const u8, len: usize, rights: ?*Right
             }
         }
 
-        if (n == 0 and len > 0) return -11; // EAGAIN
+        if (n == 0 and len > 0) {
+            sock.nospace_on = @intCast(peer_i);
+            return -11; // EAGAIN
+        }
         return @intCast(n);
     } else {
         // DGRAM / SEQPACKET
@@ -919,7 +955,10 @@ pub fn unixSendRightsTo(idx: u32, data: [*]const u8, len: usize, rights: ?*Right
         }
         // For DGRAM, write the datagram length prefix (2 bytes LE) + data
         const total = 2 + len;
-        if (peer.buf_count + total > UNIX_SOCK_BUF_SIZE) return -11; // EAGAIN
+        if (peer.buf_count + total > UNIX_SOCK_BUF_SIZE) {
+            sock.nospace_on = @intCast(peer_i);
+            return -11; // EAGAIN
+        }
         if (carrying) {
             const slot = freeRightsSlotLocked() orelse return -105; // ENOBUFS
             const r = rights.?;
@@ -943,6 +982,7 @@ pub fn unixSendRightsTo(idx: u32, data: [*]const u8, len: usize, rights: ?*Right
         peer.buf_write = (peer.buf_write + @as(u32, @intCast(len))) % UNIX_SOCK_BUF_SIZE;
         peer.buf_count += @as(u32, @intCast(len));
         wake.in |= EpollWake.bit(peer_i);
+        wake.sig_in |= EpollWake.bit(peer_i);
 
         // Wake any read waiter on peer
         if (peer.read_waiters) |node| {
@@ -1133,6 +1173,7 @@ pub fn unixRecvRights(idx: u32, buf: [*]u8, len_in: usize, out: ?*RightsOut) i64
         sock.buf_read = (sock.buf_read + @as(u32, @intCast(n))) % UNIX_SOCK_BUF_SIZE;
         sock.buf_count -= @as(u32, @intCast(n));
         sock.rx_pos += n;
+        if (n > 0) writeSpaceLocked(idx, &wake);
 
         if (n > 0 and sock.peer_idx < MAX_UNIX_SOCKETS) {
             const peer = &unix_sockets[sock.peer_idx];
@@ -1185,6 +1226,7 @@ pub fn unixRecvRights(idx: u32, buf: [*]u8, len_in: usize, out: ?*RightsOut) i64
             sock.rx_pos += actual_discard;
         }
         wake.out |= sendersIntoLocked(idx);
+        writeSpaceLocked(idx, &wake);
 
         // Wake any write waiter on peer
         if (sock.peer_idx < MAX_UNIX_SOCKETS) {
@@ -1263,6 +1305,7 @@ pub fn unixClose(idx: u32) void {
     if (sock.listening) {
         for (sock.backlog[0..sock.backlog_count]) |queued| {
             wake.hup |= EpollWake.bit(queued);
+            wake.sig_hup |= EpollWake.bit(queued);
             // A client that had already closed was only kept for this listener to accept: free its slot.
             if (queued < MAX_UNIX_SOCKETS and unix_sockets[queued].closed_queued) unix_sockets[queued] = .{};
         }
@@ -1296,6 +1339,8 @@ pub fn unixClose(idx: u32) void {
             peer.connected = false;
             peer.peer_idx = 255;
             wake.hup |= EpollWake.bit(sock.peer_idx);
+            // unix_release_sock: a stream or seqpacket peer is told POLL_HUP (a datagram peer nothing).
+            if (connectionOriented(sock.sock_type)) wake.sig_hup |= EpollWake.bit(sock.peer_idx);
             // Wake peer's read waiters so they can detect EOF
             var cur = peer.read_waiters;
             while (cur) |node| {
@@ -1317,6 +1362,10 @@ pub fn unixClose(idx: u32) void {
         }
     }
 
+    // A sender still waiting for room in this ring must not get a POLL_OUT from whatever socket reuses the slot.
+    for (&unix_sockets) |*o| {
+        if (o.nospace_on == idx) o.nospace_on = 255;
+    }
     sock.* = .{};
 }
 
@@ -1508,7 +1557,10 @@ pub fn unixSendBlocking(idx: u32, data: [*]const u8, len: usize, nonblock: bool)
                 const saved = unix_lock.acquire();
                 defer unix_lock.release(saved);
                 const room = sendRoomLocked(idx) orelse break :blk true;
-                break :blk room >= len + np.DGRAM_PREFIX;
+                if (room >= len + np.DGRAM_PREFIX) break :blk true;
+                // The datagram waits (or fails EAGAIN) for room in the peer's ring: its drain owes this sender a POLL_OUT.
+                unix_sockets[idx].nospace_on = unix_sockets[idx].peer_idx;
+                break :blk false;
             };
             if (fits) return unixSendRights(idx, data, len, null);
             if (nonblock) return -11;
@@ -1607,6 +1659,13 @@ pub fn unixShutdown(idx: u32, how: u32) i64 {
         const peer = &unix_sockets[sock.peer_idx];
         if (peer.active and peer.peer_idx == @as(u8, @intCast(idx))) {
             wake.hup |= EpollWake.bit(sock.peer_idx);
+            // unix_shutdown: the peer of a connection-oriented socket gets POLL_HUP when both directions shut, POLL_IN when it can
+            // no longer receive more (this end stopped sending), nothing for SHUT_RD alone; a stream reader already waiting gets none.
+            if (connectionOriented(sock.sock_type) and !(sock.sock_type == SOCK_STREAM and peer.read_waiters != null)) {
+                if (shut_rd and shut_wr) {
+                    wake.sig_hup |= EpollWake.bit(sock.peer_idx);
+                } else if (shut_wr) wake.sig_in |= EpollWake.bit(sock.peer_idx);
+            }
             wakeWaitList(&peer.read_waiters);
             wakeWaitList(&peer.write_waiters);
         }

@@ -242,15 +242,19 @@ const NowaitGuard = struct {
             .pipe_read, .pipe_write, .unix_socket, .tcp_socket, .udp_socket => {},
             else => return error.NotSupported,
         }
-        const saved = d.status_flags;
+        // Only this descriptor's copy changes: the open file description (shared by dup()s) keeps its own O_NONBLOCK, and
+        // syncOffsetIn keeps the bit while force_nonblock is set.
+        const saved = vfs_mod.statusFlagsOf(d);
         if (saved & 0x800 != 0) return .{};
+        d.force_nonblock = true;
         d.status_flags = saved | 0x800;
         return .{ .desc = d, .saved = saved };
     }
 
     fn end(self: NowaitGuard) void {
         const d = self.desc orelse return;
-        d.status_flags = (d.status_flags & ~@as(u32, 0x800)) | (self.saved & 0x800);
+        d.force_nonblock = false;
+        d.status_flags = (vfs_mod.statusFlagsOf(d) & ~@as(u32, 0x800)) | (self.saved & 0x800);
     }
 };
 

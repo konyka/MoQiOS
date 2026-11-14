@@ -342,7 +342,7 @@ pub fn accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) i64 {
     // AF_UNIX accept
     if (t.fd_table.fds[fd].fd_type == .unix_socket) {
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
-        const new_sock_idx = net_mod.unix_socket.unixAcceptBlocking(unix_idx, @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, 0));
+        const new_sock_idx = net_mod.unix_socket.unixAcceptBlocking(unix_idx, @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), 0));
         if (new_sock_idx < 0) return @as(i64, new_sock_idx);
         net_mod.unix_socket.unixSetCred(@intCast(new_sock_idx), .{ .pid = @intCast(if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid), .uid = t.euid, .gid = t.egid });
         const new_fd = allocUnixFd(t.fd_table, @intCast(new_sock_idx));
@@ -427,7 +427,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
     if (t.fd_table.fds[fd].fd_type == .tcp_socket) {
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         const tcb_idx = t.fd_table.fds[fd].tcb_idx;
-        return @import("../fs/namespace_policy.zig").sendResult(net_mod.tcp.tcpSendBlocking(tcb_idx, buf, true, len, net_mod.tcp_recv_policy.nonblockRequested(t.fd_table.fds[fd].status_flags, flags)), flags);
+        return @import("../fs/namespace_policy.zig").sendResult(net_mod.tcp.tcpSendBlocking(tcb_idx, buf, true, len, net_mod.tcp_recv_policy.nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), flags)), flags);
     } else if (t.fd_table.fds[fd].fd_type == .udp_socket) {
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         const is_v6 = t.fd_table.fds[fd].udp_is_v6;
@@ -503,9 +503,9 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
                 .ok => |n| n,
                 .err => |e| return e,
             };
-            return @import("../fs/namespace_policy.zig").sendResult(net_mod.unix_socket.unixSendToBlocking(unix_idx, &tmp_unix, n_unix, dest_buf[2..][0..dlen], @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, flags)), flags);
+            return @import("../fs/namespace_policy.zig").sendResult(net_mod.unix_socket.unixSendToBlocking(unix_idx, &tmp_unix, n_unix, dest_buf[2..][0..dlen], @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), flags)), flags);
         }
-        return @import("../fs/namespace_policy.zig").sendResult(net_mod.unix_socket.unixSendBlocking(unix_idx, &tmp_unix, n_unix, @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, flags)), flags);
+        return @import("../fs/namespace_policy.zig").sendResult(net_mod.unix_socket.unixSendBlocking(unix_idx, &tmp_unix, n_unix, @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), flags)), flags);
     } else {
         // Not a socket — use regular write
         var tmp_buf: [4096]u8 = undefined;
@@ -568,7 +568,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         if (!copy.validateUserBufferWritable(buf, to_read)) return -14; // EFAULT
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
         const rf = @import("recv_flags_policy.zig");
-        const nonblock_u = @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, flags);
+        const nonblock_u = @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), flags);
         var full_len_u: usize = 0;
         var src_u: net_mod.unix_socket.SrcName = .{};
         var result: i64 = undefined;
@@ -620,7 +620,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         const to_read = @min(len, 4096);
         if (!copy.validateUserBufferWritable(buf, to_read)) return -14; // EFAULT
         const tcb_idx = t.fd_table.fds[fd].tcb_idx;
-        const nonblock = net_mod.tcp_recv_policy.nonblockRequested(t.fd_table.fds[fd].status_flags, flags);
+        const nonblock = net_mod.tcp_recv_policy.nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), flags);
         const rf = @import("recv_flags_policy.zig");
         var result: i64 = undefined;
         if (rf.peek(flags)) {
@@ -656,7 +656,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         // reported once, before any queued data (Linux: the next call fails).
         const pending = udp.takePendingError(sock_key);
         if (pending != 0) return -@as(i64, pending);
-        const wait_rc = udpWaitForDatagram(sock_key, is_v6, @import("../fs/namespace_policy.zig").nonblockRequested(t.fd_table.fds[fd].status_flags, flags));
+        const wait_rc = udpWaitForDatagram(sock_key, is_v6, @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), flags));
         if (wait_rc != 0) return wait_rc;
         var user_addr_len: u32 = 0;
         if (addr_ptr != 0) {
@@ -827,7 +827,7 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
 /// reason in SO_ERROR), otherwise it waits for the outcome.
 fn finishTcpConnect(t: *task_mod.Task, fd: u32, started: i64) i64 {
     if (started != 0) return started;
-    if (net_mod.tcp_recv_policy.nonblockRequested(t.fd_table.fds[fd].status_flags, 0)) return -115; // EINPROGRESS
+    if (net_mod.tcp_recv_policy.nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), 0)) return -115; // EINPROGRESS
     return net_mod.tcp.tcpWaitConnected(t.fd_table.fds[fd].tcb_idx);
 }
 
@@ -1061,7 +1061,7 @@ fn unixRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8
     var data: [8192]u8 = undefined;
     var out: net_mod.unix_socket.RightsOut = .{};
     const idx = cur.fd_table.fds[fd].unix_sock_idx;
-    const nonblock = @import("../fs/namespace_policy.zig").nonblockRequested(cur.fd_table.fds[fd].status_flags, flags);
+    const nonblock = @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(&cur.fd_table.fds[fd]), flags);
     const rf = @import("recv_flags_policy.zig");
     const is_stream = net_mod.unix_socket.unixIsStream(idx);
     var n: i64 = undefined;
@@ -1265,7 +1265,7 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
     const d = &cur.fd_table.fds[fd];
     const is_v6 = d.udp_is_v6;
     const port = d.udpKey();
-    const wait_rc = udpWaitForDatagram(port, is_v6, @import("../fs/namespace_policy.zig").nonblockRequested(d.status_flags, flags));
+    const wait_rc = udpWaitForDatagram(port, is_v6, @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(d), flags));
     if (wait_rc != 0) return wait_rc;
 
     var data: [1472]u8 = undefined;
@@ -1359,7 +1359,7 @@ pub fn sendmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
         if (iov_base == 0 or iov_base >= 0x0000_8000_0000_0000 or iov_sz == 0) continue;
 
         const to_send: u32 = @intCast(@min(iov_sz, @as(u64, 0xffff_ffff)));
-        const result = net_mod.tcp.tcpSendBlocking(tcb_idx, iov_base, true, to_send, net_mod.tcp_recv_policy.nonblockRequested(cur.fd_table.fds[fd].status_flags, flags));
+        const result = net_mod.tcp.tcpSendBlocking(tcb_idx, iov_base, true, to_send, net_mod.tcp_recv_policy.nonblockRequested(vfs_mod.statusFlagsOf(&cur.fd_table.fds[fd]), flags));
         if (result <= 0) {
             if (total == 0) return @import("../fs/namespace_policy.zig").sendResult(result, flags);
             break;
@@ -1403,7 +1403,7 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
     if (iov_len == 0 or iov_len > 1024) return -22;
 
     const tcb_idx = cur.fd_table.fds[fd].tcb_idx;
-    const base_nonblock = net_mod.tcp_recv_policy.nonblockRequested(cur.fd_table.fds[fd].status_flags, flags);
+    const base_nonblock = net_mod.tcp_recv_policy.nonblockRequested(vfs_mod.statusFlagsOf(&cur.fd_table.fds[fd]), flags);
     const want_all = rf_tcp.waitAll(flags, true, base_nonblock);
 
     // Validate every iovec and total the room first (nothing is consumed yet).

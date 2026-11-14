@@ -277,7 +277,7 @@ fn kernelTransfer(
         var capacity = destinationCapacity(fd_table, dst_fd, dst_type);
         if (capacity == 0 and dst_type == .pipe_write and total == 0) {
             // Linux sendfile into a full pipe waits for room (or EAGAIN under O_NONBLOCK) instead of returning 0.
-            const waited = vfs.pipeWaitWritable(fd_table.fds[dst_fd].pipe_idx, fd_table.fds[dst_fd].status_flags & 0x800 != 0);
+            const waited = vfs.pipeWaitWritable(fd_table.fds[dst_fd].pipe_idx, vfs.statusFlagsOf(&fd_table.fds[dst_fd]) & 0x800 != 0);
             if (waited < 0) return waited;
             capacity = destinationCapacity(fd_table, dst_fd, dst_type);
         }
@@ -481,7 +481,7 @@ fn splicePipeToSocket(fd_table: *vfs.FdTable, pipe_fd: u32, sock_fd: u32, len: u
         var reservation: vfs.PipeReadToken = .{};
         // Only the first chunk waits: once bytes moved, an empty pipe ends the call with what it has (Linux splice_from_pipe_next).
         const nread = vfs.pipeReserveReadWait(fd_table.fds[pipe_fd].pipe_idx, &kbuf, chunk, &reservation,
-            (flags & SPLICE_F_NONBLOCK != 0) or (fd_table.fds[pipe_fd].status_flags & 0x800 != 0) or total > 0);
+            (flags & SPLICE_F_NONBLOCK != 0) or (vfs.statusFlagsOf(&fd_table.fds[pipe_fd]) & 0x800 != 0) or total > 0);
         if (nread <= 0) {
             if (total > 0) return total;
             return if (nread < 0) nread else if (flags & SPLICE_F_NONBLOCK != 0) -11 else total;
@@ -537,7 +537,7 @@ fn spliceFileToPipe(fd_table: *vfs.FdTable, file_fd: u32, off_in: u64, pipe_fd: 
     var failure: i64 = 0;
     var kbuf: [CHUNK_SIZE]u8 = undefined;
     // Linux: O_NONBLOCK on either descriptor counts as SPLICE_F_NONBLOCK.
-    const nonblocking = (flags & SPLICE_F_NONBLOCK != 0) or ((fd_table.fds[file_fd].status_flags | fd_table.fds[pipe_fd].status_flags) & 0x800 != 0);
+    const nonblocking = (flags & SPLICE_F_NONBLOCK != 0) or ((vfs.statusFlagsOf(&fd_table.fds[file_fd]) | vfs.statusFlagsOf(&fd_table.fds[pipe_fd])) & 0x800 != 0);
     while (remaining > 0) {
         var capacity = destinationCapacity(fd_table, pipe_fd, .pipe_write);
         if (capacity == 0 and total == 0) {
@@ -613,7 +613,7 @@ fn splicePipeToFile(fd_table: *vfs.FdTable, pipe_fd: u32, file_fd: u32, off_out:
         var reservation: vfs.PipeReadToken = .{};
         // Only the first chunk waits: once bytes moved, an empty pipe ends the call with what it has (Linux splice_from_pipe_next).
         const nread = vfs.pipeReserveReadWait(fd_table.fds[pipe_fd].pipe_idx, &kbuf, chunk, &reservation,
-            (flags & SPLICE_F_NONBLOCK != 0) or (fd_table.fds[pipe_fd].status_flags & 0x800 != 0) or total > 0);
+            (flags & SPLICE_F_NONBLOCK != 0) or (vfs.statusFlagsOf(&fd_table.fds[pipe_fd]) & 0x800 != 0) or total > 0);
         if (nread <= 0) {
             const pipe_state = vfs.pipeState(fd_table.fds[pipe_fd].pipe_idx);
             failure = splicePipeToFileReadResult(flags, total, nread, if (pipe_state) |state| state.write_open else false);
@@ -655,7 +655,7 @@ fn splicePipeToFile(fd_table: *vfs.FdTable, pipe_fd: u32, file_fd: u32, off_out:
 fn splicePipeToPipe(fd_table: *vfs.FdTable, in_fd: u32, out_fd: u32, len: u64, flags: u32) i64 {
     // Linux: O_NONBLOCK on either pipe counts as SPLICE_F_NONBLOCK. Only the first chunk waits; once bytes moved the call returns
     // what it has rather than waiting for more.
-    const nonblocking = (flags & SPLICE_F_NONBLOCK != 0) or ((fd_table.fds[in_fd].status_flags | fd_table.fds[out_fd].status_flags) & 0x800 != 0);
+    const nonblocking = (flags & SPLICE_F_NONBLOCK != 0) or ((vfs.statusFlagsOf(&fd_table.fds[in_fd]) | vfs.statusFlagsOf(&fd_table.fds[out_fd])) & 0x800 != 0);
     var remaining: u64 = len;
     var total: i64 = 0;
 

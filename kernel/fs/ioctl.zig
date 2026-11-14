@@ -317,11 +317,10 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
             const copied = copy.copyFromUser(nb_bytes[0..4], @ptrFromInt(arg), 4);
             if (copied < 4) return -14;
 
-            if (nonblock != 0) {
-                cur.fd_table.fds[fd_idx].status_flags |= 0x800; // O_NONBLOCK
-            } else {
-                cur.fd_table.fds[fd_idx].status_flags &= ~@as(u32, 0x800);
-            }
+            // O_NONBLOCK belongs to the open file description, so a dup()'d or inherited descriptor sees the change.
+            const d = &cur.fd_table.fds[fd_idx];
+            const flags = vfs.statusFlagsOf(d);
+            vfs.setStatusFlags(d, if (nonblock != 0) flags | 0x800 else flags & ~@as(u32, 0x800));
             return 0;
         },
         ip.FIOCLEX, ip.FIONCLEX => {

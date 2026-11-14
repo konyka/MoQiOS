@@ -8747,7 +8747,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello320 A–L 全过。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello320、hello319、hello318、hello316、hello87、hello273 PASS 和 `hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过（已有的 fcntl 源码检查单测改为匹配新的 `F_SETFL` 代码）。
 - 局限：
-  1. 只做了管道；socket、tty、eventfd 等的 `O_ASYNC` 仍然不保留、不发信号。
+  1. 只做了管道；socket、tty、eventfd 等的 `O_ASYNC` 仍然不保留、不发信号。（AF_UNIX 套接字已在 hello323 一节实现；TCP、UDP、tty 仍未做；eventfd、timerfd、epoll 在 Linux 上也不保留）
   2. `open(O_ASYNC)` 不保留这一位（`OPEN_STATUS_MASK` 不含它）；Linux 在普通文件上保留但不起作用，管道不能用 `open` 打开（FIFO 除外，这里没有 FIFO 的 `O_ASYNC`）。
   3. 登记表 128 项、共享槽池 512 槽；管道描述现在也占共享槽，池满时 dup、fork 退化为私有副本，`F_SETFL O_ASYNC` 返回 `ENOMEM`。
   4. 没有 `sigio_perm` 的 uid 检查，也没有 `F_SETOWN_EX`；只做了 x86_64 的 close 系列信号检查。（`F_SETOWN_EX` 已在 hello321 一节实现）
@@ -8787,3 +8787,52 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 没有用户命名空间，euid 0 一律视为 `GLOBAL_ROOT_UID`。
   2. 没有 LSM 的 `security_file_send_sigiotask`。
   3. `F_SETOWN 0` 清除 owner 时也会更新记录的凭据（Linux 只在 pid 非空时更新）；清除后不发信号，所以没有可见差别。
+
+### AF_UNIX 套接字的 `O_ASYNC`，以及 dup 共享的状态标志（hello323，已修）
+
+- 问题：
+  - `F_SETFL O_ASYNC` 在 AF_UNIX 套接字上返回 0，但不保留这一位，`F_GETFL` 读回 0x2，也从不发 `SIGIO`。
+  - 套接字描述不共享状态标志：通过 dup 出来的描述符设 `O_NONBLOCK`（`F_SETFL` 或 `FIONBIO`），对原描述符的 read/recv 仍然阻塞。
+  - 管道上 `FIONBIO` 只改本描述符的副本，dup 看不到。
+  - `RWF_NOWAIT` 在已共享的管道上不生效：`preadv2` 会阻塞。
+- Linux 依据：
+  - `net/socket.c` 的 `sock_fasync` 和 `sock_wake_async`；
+  - `net/unix/af_unix.c`：`unix_stream_sendmsg`/`unix_dgram_sendmsg` 用 `sk_data_ready` 发 POLL_IN；`unix_write_space` 在 `SOCKWQ_ASYNC_NOSPACE` 置位、且缓冲已用不超过四分之一时发一次 POLL_OUT；`unix_shutdown` 和 `unix_release_sock` 给对端发 POLL_IN 或 POLL_HUP；`unix_stream_connect` 唤醒监听套接字。
+  - 流式读者已在等数据时（`SOCKWQ_ASYNC_WAITDATA`），`SOCK_WAKE_WAITD` 不发信号。
+  - `O_NONBLOCK` 属于打开文件描述（`struct file.f_flags`），dup 和 fork 共享。
+- 宿主机实测（`/tmp/aus.c`、`/tmp/ash.c`、`/tmp/ash2.c`、`/tmp/ash3.c`，再以 `gcc -DHOST` 跑 `user/hello323.c`，A–O 全过）：
+  - socketpair 设 `O_ASYNC` 后 `F_GETFL` 读回 0x2002；eventfd、timerfd、epoll 不保留这一位。
+  - 对端每次发送都发 POLL_IN，band 0x41，si_fd 是本套接字的 fd；sig 为 0 时发 `SIGIO`，si_code 128，band 0，fd 0。
+  - 自己读写、对端读走自己发的数据都不发。
+  - 非阻塞发送写满到 EAGAIN 后，对端只读一点不发，读空时发一次 POLL_OUT，band 0x304；stream、seqpacket、dgram 相同。
+  - 对端 `shutdown`：SHUT_RD 不发，SHUT_WR 发 POLL_IN，SHUT_RDWR 发 POLL_HUP（6），band 0x18。
+  - 对端 close：stream 和 seqpacket 发 POLL_HUP，band 0x18；dgram 不发。
+  - 新连接到达监听套接字时发 POLL_IN，fd 是监听套接字的 fd；accept 前到达的数据和 accept 本身都不发。
+  - 监听套接字关闭时，仍在队列里的客户端收到 POLL_HUP。
+  - 流式读者阻塞在 recv 时，对端发送不发 POLL_IN；数据报读者阻塞时照常发。
+  - 通过 dup 设 `O_NONBLOCK`（`F_SETFL` 或 `FIONBIO`）后，对原描述符 read/recv 返回 EAGAIN，套接字和管道都一样；`RWF_NOWAIT` 返回 EAGAIN，且不改变描述的标志。
+- 红灯：在未修改的内核上定向 SMP=2，hello323 除 K 以外全部失败（A 读回 0x2，没有任何信号；N 中 dup 读回 0x2，经 dup 设的非阻塞对原描述符无效，探针子进程阻塞被杀；O 中 `RWF_NOWAIT` 阻塞）。宿主机单测先编译失败（缺 `fcntl_policy.POLL_HUP`）。
+- 修复：
+  - `kernel/fs/fcntl_policy.zig`：新增 `POLL_HUP = 6`，band 0x18；`keepsAsync` 加入 `unix_socket`。
+  - `kernel/fs/vfs.zig`：
+    - 管道专用的 fasync 登记表改为通用的 `fasync_table`，按 `FasyncKind`（pipe_read、pipe_write、unix_socket）加 `idx` 登记；
+    - `setPipeAsync` 改名为 `setAsync`，`dropPipeFasync` 改名为 `dropFasync`；
+    - 新增 `fasyncNotify(kind, idx, reason)`，`pipeFasyncNotify` 和新的 `unixFasyncNotify` 都调用它；
+    - `usesSharedOffset` 加入 `.unix_socket`，套接字描述的状态标志、owner 和 fasync 登记在 dup、fork 和 SCM_RIGHTS 传递后共享。
+  - `kernel/net/unix_socket.zig`：
+    - `EpollWake` 新增 `sig_in`/`sig_out`/`sig_hup` 三个掩码，在锁外调用 `vfs.unixFasyncNotify`。epoll 提示照旧。
+    - 设置信号的地方：流式发送时对端没有读者在等才设 sig_in；数据报发送设 sig_in；connect 到达监听套接字设 sig_in；监听套接字关闭时给队列里的客户端设 sig_hup；关闭时连接型对端设 sig_hup；`shutdown` 时连接型对端在 SHUT_RDWR 时设 sig_hup，只有 SHUT_WR 时设 sig_in。
+    - 新字段 `nospace_on`：发送遇到满环（EAGAIN，或阻塞数据报发送要等待）时记下对端；对端读到已用不超过四分之一时，`writeSpaceLocked` 发一次 POLL_OUT 并清除。槽被释放时清掉指向它的记录。
+  - `O_NONBLOCK` 改为读描述的标志：
+    - `kernel/net/socket_syscall.zig` 的 accept、send、recv、sendmsg、recvmsg、connect 等改用 `vfs_mod.statusFlagsOf`；
+    - `kernel/fs/ioctl.zig` 的 `FIONBIO` 改用 `statusFlagsOf`/`setStatusFlags`；
+    - `kernel/fs/splice.zig` 的非阻塞判断改用 `statusFlagsOf`。
+  - `RWF_NOWAIT`：`FileDescriptor` 新增 `force_nonblock`，`syncOffsetIn` 在它置位时保留 0x800。`kernel/fs/readv.zig` 的 `NowaitGuard` 只改本描述符的副本，不改共享槽。
+  - `tests/main.zig`：fcntl policy 单测加入 unix_socket 和 POLL_HUP；FIONBIO 和两个 splice 的源码匹配单测按新写法更新。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello323 A–O 全过；`zig build test` 通过。
+- 完整 smoke：SMP=1、SMP=4 两份、SMP=2 共四份全部 `EXIT=0`，没有失败项，hello323 全过，`corrupted canaries=0`；riscv64、aarch64 smoke 通过。
+- 局限：
+  1. TCP、UDP 套接字和 tty 仍然不保留 `O_ASYNC`，也不发信号（Linux 会保留）。
+  2. POLL_OUT 的阈值按接收方环的占用（8 KiB 环的四分之一）计算；Linux 按发送方的 `sk_wmem_alloc` 计算。一个发送方只记一个 `nospace_on` 目标。
+  3. 「流式读者已在等数据」用对端有没有 `read_waiters` 近似 `SOCKWQ_ASYNC_WAITDATA`；读者被唤醒后、真正读走之前到达的数据也不发信号。
+  4. dup 或 fork 的套接字描述现在也占用共享槽（512 个，和管道、普通文件共用）；槽用完时复制退回私有，状态标志不再共享。
