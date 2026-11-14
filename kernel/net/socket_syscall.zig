@@ -77,10 +77,12 @@ pub fn socket(domain: u32, type_and_flags: u32, protocol: u32) i64 {
 fn udpRebind(t: *task_mod.Task, fd: u32, new_port: u16) i64 {
     const d = &t.fd_table.fds[fd];
     var disc: u16 = 0;
-    const rc = udp.rebind(d.udpKey(), new_port, t.euid, &disc);
+    const old_key = d.udpKey();
+    const rc = udp.rebind(old_key, new_port, t.euid, &disc);
     if (rc != 0) return rc;
     d.udp_port = new_port;
     d.udp_disc = disc;
+    if (d.udpKey() != old_key) vfs_mod.udpFasyncRekey(old_key, d.udpKey());
     return 0;
 }
 

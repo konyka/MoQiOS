@@ -8747,7 +8747,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello320 A–L 全过。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello320、hello319、hello318、hello316、hello87、hello273 PASS 和 `hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过（已有的 fcntl 源码检查单测改为匹配新的 `F_SETFL` 代码）。
 - 局限：
-  1. 只做了管道；socket、tty、eventfd 等的 `O_ASYNC` 仍然不保留、不发信号。（AF_UNIX 套接字已在 hello323 一节实现；TCP、UDP、tty 仍未做；eventfd、timerfd、epoll 在 Linux 上也不保留）
+  1. 只做了管道；socket、tty、eventfd 等的 `O_ASYNC` 仍然不保留、不发信号。（AF_UNIX 套接字已在 hello323 一节实现，UDP 套接字已在 hello324 一节实现；TCP、tty 仍未做；eventfd、timerfd、epoll 在 Linux 上也不保留）
   2. `open(O_ASYNC)` 不保留这一位（`OPEN_STATUS_MASK` 不含它）；Linux 在普通文件上保留但不起作用，管道不能用 `open` 打开（FIFO 除外，这里没有 FIFO 的 `O_ASYNC`）。
   3. 登记表 128 项、共享槽池 512 槽；管道描述现在也占共享槽，池满时 dup、fork 退化为私有副本，`F_SETFL O_ASYNC` 返回 `ENOMEM`。
   4. 没有 `sigio_perm` 的 uid 检查，也没有 `F_SETOWN_EX`；只做了 x86_64 的 close 系列信号检查。（`F_SETOWN_EX` 已在 hello321 一节实现）
@@ -8832,7 +8832,34 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello323 A–O 全过；`zig build test` 通过。
 - 完整 smoke：SMP=1、SMP=4 两份、SMP=2 共四份全部 `EXIT=0`，没有失败项，hello323 全过，`corrupted canaries=0`；riscv64、aarch64 smoke 通过。
 - 局限：
-  1. TCP、UDP 套接字和 tty 仍然不保留 `O_ASYNC`，也不发信号（Linux 会保留）。
+  1. TCP、UDP 套接字和 tty 仍然不保留 `O_ASYNC`，也不发信号（Linux 会保留）。（UDP 已在 hello324 一节实现）
   2. POLL_OUT 的阈值按接收方环的占用（8 KiB 环的四分之一）计算；Linux 按发送方的 `sk_wmem_alloc` 计算。一个发送方只记一个 `nospace_on` 目标。
   3. 「流式读者已在等数据」用对端有没有 `read_waiters` 近似 `SOCKWQ_ASYNC_WAITDATA`；读者被唤醒后、真正读走之前到达的数据也不发信号。
   4. dup 或 fork 的套接字描述现在也占用共享槽（512 个，和管道、普通文件共用）；槽用完时复制退回私有，状态标志不再共享。
+
+### UDP 套接字的 `O_ASYNC`（hello324，已修）
+
+- 问题：UDP 套接字上 `F_SETFL O_ASYNC` 返回 0，但不保留这一位（`F_GETFL` 读回 0x2），数据报到达和 ICMP 端口不可达都不发 `SIGIO`。
+- Linux 依据：`net/socket.c` 的 `sock_fasync`；`net/core/sock.c` 的 `sock_def_readable`（每个入队的数据报都调用 `sk_wake_async(POLL_IN)`）和 `sock_def_error_report`（`POLL_ERR`）；`net/ipv4/udp.c` 的 `__udp4_lib_err` 在已连接套接字上记下 ECONNREFUSED 并报告错误。
+- 宿主机实测（`/tmp/audp.c`、`/tmp/audp2.c`，再以 `gcc -DHOST` 跑 `user/hello324.c`，A–J 全过，都在 127.0.0.1 上）：
+  - 设 `O_ASYNC` 后读回 0x2002，没有 owner 时不发。
+  - sig 为 0 时数据报到达发 `SIGIO`（si_code 128，band 0，fd 0）；F_SETSIG 40 时每个数据报都发 POLL_IN，band 0x41，si_fd 是本套接字的 fd，前一个还没读也照发。
+  - 自己发送不发。
+  - bind 之前设的 `O_ASYNC` 在 bind 之后仍然生效。
+  - 已连接套接字收到端口不可达时发 POLL_ERR（4），band 0x8，之后 recv 返回 ECONNREFUSED。
+  - 清除后不发；dup 和 fork 的子进程看到这一位，子进程发来的数据报通知 owner；关闭两个描述符中的一个后照常发；全部关闭后同端口的新套接字不收到。
+  - TCP 套接字同样保留这一位（本节没有做）。
+- 红灯：在未修改的内核上定向 SMP=2，hello324 A–C、E、F、H、I 失败（读回 0x2，没有任何信号）。宿主机单测先编译失败（缺 `fcntl_policy.POLL_ERR`）。
+- 修复：
+  - `kernel/fs/fcntl_policy.zig`：新增 `POLL_ERR = 4`，band 0x8；`keepsAsync` 加入 `udp_socket`。
+  - `kernel/fs/vfs.zig`：`FasyncKind` 加入 `udp_socket`，登记项的 `idx` 放宽为 u32，存 UDP 套接字键（端口 | 区分号 << 16）；新增 `udpFasyncNotify` 和 `udpFasyncRekey`；`usesSharedOffset` 加入 `.udp_socket`，UDP 描述的状态标志、owner 和登记在 dup、fork 后共享。
+  - `kernel/net/udp.zig`：`enqueue` 在数据报入队、释放 `udp_lock` 之后调用 `udpFasyncNotify(key, POLL_IN)`；`notifyUnreachable` 对每个记下错误的套接字调用 `udpFasyncNotify(key, POLL_ERR)`。这两处可能在 e1000 中断下半部或时钟 tick 的 `lo.drain` 里运行；发送路径上的锁（`fasync_lock`、`shared_offsets_lock`、`task_lock`、信号队列锁）都是 `IrqSpinlock`，posix 定时器也在 tick 里发信号。
+  - `kernel/net/socket_syscall.zig`：`udpRebind` 在 bind 改变套接字键后调用 `udpFasyncRekey`，登记跟着新键走。
+  - `tests/main.zig`：fcntl policy 单测加入 udp_socket、tcp_socket 和 POLL_ERR。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello324 A–J 全过；`zig build test` 通过。
+- 完整 smoke：SMP=1、SMP=4 两份、SMP=2 共四份全部 `EXIT=0`，没有失败项，hello323、hello324 全过，`corrupted canaries=0`；riscv64、aarch64 smoke 通过。
+- 局限：
+  1. TCP 套接字和 tty 仍然不保留 `O_ASYNC`（Linux 会保留）。
+  2. UDP 没有发送缓冲上限，不会遇到 EAGAIN，所以没有 POLL_OUT。
+  3. 接收队列满（8 个）时丢弃的数据报不发信号，这和 Linux 一致，但 Linux 的队列按字节计算、要大得多。
+  4. IPv6 UDP 走同一条路径，测试只覆盖了 IPv4 回环。

@@ -12517,7 +12517,7 @@ test "fcntl policy: F_SETOWN_EX owner types TID/PID/PGRP and what F_GETOWN_EX an
     try std.testing.expectEqual(@as(u8, 1), fp.setownKind(0));
 }
 
-test "fcntl policy: O_ASYNC is kept by pipes and AF_UNIX sockets, and SIGIO carries POLL_IN / POLL_OUT / POLL_HUP with their bands" {
+test "fcntl policy: O_ASYNC is kept by pipes, AF_UNIX and UDP sockets, and SIGIO carries POLL_IN / POLL_OUT / POLL_ERR / POLL_HUP with their bands" {
     const fp = kt.fcntl_policy;
     try std.testing.expectEqual(@as(u32, 0x2000), fp.O_ASYNC);
     // F_SETFL's own mask does not carry it: the pipe path adds the bit when it registers the description
@@ -12529,6 +12529,12 @@ test "fcntl policy: O_ASYNC is kept by pipes and AF_UNIX sockets, and SIGIO carr
     // AF_UNIX sockets keep it too (sock_fasync); tcp/udp sockets and ttys are not wired up here
     try std.testing.expect(fp.keepsAsync("unix_socket"));
     try std.testing.expect(!fp.keepsAsync("eventfd"));
+    try std.testing.expect(fp.keepsAsync("udp_socket"));
+    try std.testing.expect(!fp.keepsAsync("tcp_socket"));
+    // an asynchronous error (ICMP port unreachable) is POLL_ERR with band POLLERR
+    const err = fp.sigioSignal(40, 6, fp.POLL_ERR);
+    try std.testing.expectEqual(@as(i32, 4), err.info.code);
+    try std.testing.expectEqual(@as(u64, 0x8), err.info.a);
     // a hang-up (peer closed, shutdown(SHUT_RDWR)) is POLL_HUP with band POLLERR|POLLHUP
     const hup = fp.sigioSignal(40, 5, fp.POLL_HUP);
     try std.testing.expectEqual(@as(i32, 6), hup.info.code);

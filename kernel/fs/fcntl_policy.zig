@@ -55,7 +55,7 @@ pub fn reportedFlags(tag: []const u8, stored: u32) u32 {
 /// Descriptor kinds whose O_ASYNC is kept and acted on (Linux keeps FASYNC only where f_op->fasync exists; elsewhere F_SETFL
 /// succeeds and the bit reads back clear, measured on /dev/null and a regular file).
 pub fn keepsAsync(tag: []const u8) bool {
-    return eql(tag, "pipe_read") or eql(tag, "pipe_write") or eql(tag, "unix_socket");
+    return eql(tag, "pipe_read") or eql(tag, "pipe_write") or eql(tag, "unix_socket") or eql(tag, "udp_socket");
 }
 
 fn eql(a: []const u8, b: []const u8) bool {
@@ -122,16 +122,18 @@ const SIGIO: u32 = 29;
 pub const POLL_IN: i32 = 1;
 pub const POLL_OUT: i32 = 2;
 pub const POLL_MSG: i32 = 3;
+pub const POLL_ERR: i32 = 4;
 pub const POLL_HUP: i32 = 6;
 const SI_SIGIO: i32 = -5;
 
 /// Linux band_table: POLL_IN → POLLIN|POLLRDNORM, POLL_OUT → POLLOUT|POLLWRNORM|POLLWRBAND, POLL_MSG → POLLIN|POLLRDNORM|POLLMSG,
-/// POLL_HUP → POLLERR|POLLHUP.
+/// POLL_ERR → POLLERR, POLL_HUP → POLLERR|POLLHUP.
 fn band(reason: i32) u64 {
     return switch (reason) {
         POLL_IN => 0x41,
         POLL_OUT => 0x304,
         POLL_MSG => 0x441,
+        POLL_ERR => 0x8,
         POLL_HUP => 0x18,
         else => 0,
     };

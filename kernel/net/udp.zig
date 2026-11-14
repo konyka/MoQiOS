@@ -131,7 +131,11 @@ pub fn notifyUnreachable(local_port: u16, peer_port: u16) void {
             n += 1;
         }
     }
-    for (hits[0..n]) |key| @import("epoll.zig").epollNotify(.udp_socket, key, @import("epoll.zig").EPOLLERR);
+    for (hits[0..n]) |key| {
+        @import("epoll.zig").epollNotify(.udp_socket, key, @import("epoll.zig").EPOLLERR);
+        // sock_def_error_report: an O_ASYNC owner gets POLL_ERR.
+        @import("../fs/vfs.zig").udpFasyncNotify(key, @import("../fs/fcntl_policy.zig").POLL_ERR);
+    }
 }
 
 /// True when a socket is bound to `port`.
@@ -380,6 +384,8 @@ fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, payload: []c
     // so epoll_wait blocks forever even though a datagram is queued. Notified
     // with udp_lock released — epollNotify walks pool/instance locks.
     @import("epoll.zig").epollNotify(.udp_socket, notify_key, @import("epoll.zig").EPOLLIN);
+    // sock_def_readable: every queued datagram signals an O_ASYNC owner with POLL_IN.
+    @import("../fs/vfs.zig").udpFasyncNotify(notify_key, @import("../fs/fcntl_policy.zig").POLL_IN);
 }
 
 pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) void {

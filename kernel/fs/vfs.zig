@@ -760,20 +760,22 @@ pub fn pipeClose(pipe_idx: u32, write_end: bool) void {
 }
 
 // ── O_ASYNC on pipes and AF_UNIX sockets (Linux fasync_helper / kill_fasync) ──
-/// What an O_ASYNC open file description is attached to: one end of a pipe, or an AF_UNIX socket (`idx` is the pipe or socket index).
-pub const FasyncKind = enum(u8) { pipe_read, pipe_write, unix_socket };
+/// What an O_ASYNC open file description is attached to: one end of a pipe, an AF_UNIX socket or a UDP socket (`idx` is the pipe
+/// index, the socket index, or the UDP socket key: port | discriminator << 16).
+pub const FasyncKind = enum(u8) { pipe_read, pipe_write, unix_socket, udp_socket };
 /// One open file description with O_ASYNC set: its shared slot (the owner and signal live there) and the descriptor F_SETFL went
 /// through, which becomes si_fd (Linux fasync_struct.fa_fd).
-const Fasync = struct { used: bool = false, kind: FasyncKind = .pipe_read, idx: u16 = 0, slot: u16 = 0, fd: u32 = 0 };
+const Fasync = struct { used: bool = false, kind: FasyncKind = .pipe_read, idx: u32 = 0, slot: u16 = 0, fd: u32 = 0 };
 const FASYNC_MAX = 128;
 var fasync_table: [FASYNC_MAX]Fasync = @splat(.{});
 var fasync_lock: IrqSpinlock = .{};
 
-fn fasyncTarget(desc: *const FileDescriptor) ?struct { kind: FasyncKind, idx: u16 } {
+fn fasyncTarget(desc: *const FileDescriptor) ?struct { kind: FasyncKind, idx: u32 } {
     return switch (desc.fd_type) {
         .pipe_read => .{ .kind = .pipe_read, .idx = @intCast(desc.pipe_idx) },
         .pipe_write => .{ .kind = .pipe_write, .idx = @intCast(desc.pipe_idx) },
-        .unix_socket => .{ .kind = .unix_socket, .idx = @intCast(desc.unix_sock_idx) },
+        .unix_socket => .{ .kind = .unix_socket, .idx = desc.unix_sock_idx },
+        .udp_socket => .{ .kind = .udp_socket, .idx = desc.udpKey() },
         else => null,
     };
 }
@@ -850,6 +852,21 @@ pub fn unixFasyncNotify(sock_idx: u32, reason: i32) void {
     fasyncNotify(.unix_socket, sock_idx, reason);
 }
 
+/// The UDP socket with key `key` got a datagram (POLL_IN) or an asynchronous error (POLL_ERR). Called with udp_lock released; may
+/// run from the receive path in interrupt context (every lock it takes is an IrqSpinlock).
+pub fn udpFasyncNotify(key: u32, reason: i32) void {
+    fasyncNotify(.udp_socket, key, reason);
+}
+
+/// bind() moved a UDP socket from key `old` to key `new`: its O_ASYNC registrations follow it.
+pub fn udpFasyncRekey(old: u32, new: u32) void {
+    const f = fasync_lock.acquire();
+    defer fasync_lock.release(f);
+    for (&fasync_table) |*e| {
+        if (e.used and e.kind == .udp_socket and e.idx == old) e.idx = new;
+    }
+}
+
 
 // ── shared open-file offsets (dup/fork) ────────────────────────────────────
 const shared_offset = @import("shared_offset.zig");
@@ -857,12 +874,12 @@ var shared_offsets: shared_offset.Pool(512) = .{};
 var shared_offsets_lock: IrqSpinlock = .{};
 
 /// Descriptor kinds whose open file description is shared through a slot: those with a byte offset into a regular object, and
-/// pipe ends and AF_UNIX sockets (shared status flags, owner, signal and O_ASYNC registration).
+/// pipe ends, AF_UNIX and UDP sockets (shared status flags, owner, signal and O_ASYNC registration).
 fn usesSharedOffset(t: FdType) bool {
     return switch (t) {
         .ramdisk_file, .fat32_file, .ext2_file, .tmpfs_file, .rofs_file, .proc_file => true,
         // No offset, but the status flags (O_NONBLOCK, O_ASYNC), owner and signal belong to the description all the same.
-        .pipe_read, .pipe_write, .unix_socket => true,
+        .pipe_read, .pipe_write, .unix_socket, .udp_socket => true,
         else => false,
     };
 }
