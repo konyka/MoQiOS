@@ -122,15 +122,15 @@ pub fn openAt(dirfd: i64, name_ptr: u64, flags: u32, requested_mode: ?u32) i64 {
     // itself (and, for a live entry, the caller's own path would have to go through the full open again).
     var fd_link: [256]u8 = undefined;
     const result = switch (@import("fd_target.zig").resolveMagicLink(cur, use_name, &fd_link)) {
-        .same => cur.fd_table.openWithCreationCredentials(use_name, flags, requested_mode, cur.fsctx().umask, cur.euid, cur.egid, cur.effective_caps),
+        .same => cur.fd_table.openWithCreationCredentials(use_name, flags, requested_mode, cur.fsctx().umask, cur.fsuid, cur.fsgid, cur.effective_caps),
         // Still has a path: a real reopen of that path with the new flags, so the new descriptor has its own offset (Linux measured).
         .file => |f| if (f.path) |p|
-            cur.fd_table.openWithCreationCredentials(p, flags, requested_mode, cur.fsctx().umask, cur.euid, cur.egid, cur.effective_caps)
+            cur.fd_table.openWithCreationCredentials(p, flags, requested_mode, cur.fsctx().umask, cur.fsuid, cur.fsgid, cur.effective_caps)
         else if (cur.fd_table.fds[f.fd].fd_type == .tmpfs_file)
             // Unlinked while open: reopen the entry itself, with the same checks as an open by name.
-            cur.fd_table.reopenTmpfsIdx(cur.fd_table.fds[f.fd].tmpfs_idx, flags, cur.euid, cur.egid, cur.effective_caps)
+            cur.fd_table.reopenTmpfsIdx(cur.fd_table.fds[f.fd].tmpfs_idx, flags, cur.fsuid, cur.fsgid, cur.effective_caps)
         else if (cur.fd_table.fds[f.fd].fd_type == .ext2_file)
-            cur.fd_table.reopenExt2Slot(cur.fd_table.fds[f.fd].ext2_file_idx, flags, cur.euid, cur.egid, cur.effective_caps)
+            cur.fd_table.reopenExt2Slot(cur.fd_table.fds[f.fd].ext2_file_idx, flags, cur.fsuid, cur.fsgid, cur.effective_caps)
         else if (cur.fd_table.fds[f.fd].fd_type == .fat32_file)
             cur.fd_table.reopenFat32Pending(cur.fd_table.fds[f.fd].fat32_file_idx, flags)
         else

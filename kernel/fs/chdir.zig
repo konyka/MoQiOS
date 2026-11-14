@@ -47,7 +47,7 @@ fn checkDirectory(cur: *task_mod.Task, path: []const u8) i64 {
     if (path.len == 1 and path[0] == '/') return 0;
     // A target inside a mounted ext4/NTFS volume.
     if (vfs_mod.rofsRoute(path)) |route| {
-        switch (@import("rofs.zig").open(route.slot, route.rest, true, .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] })) {
+        switch (@import("rofs.zig").open(route.slot, route.rest, true, .{ .euid = cur.fsuid, .egid = cur.fsgid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] })) {
             .err => |e| return e,
             .ok => |o| return if (o.kind != .directory) -20 else 0, // ENOTDIR
         }
@@ -62,19 +62,19 @@ fn checkDirectory(cur: *task_mod.Task, path: []const u8) i64 {
     }
     const ext2 = @import("ext2.zig");
     if (!ext2.isActive()) return 0;
-    return ext2.dirCheckAs(path, .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] });
+    return ext2.dirCheckAs(path, .{ .euid = cur.fsuid, .egid = cur.fsgid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] });
 }
 
 fn tmpfsDirectory(cur: *task_mod.Task, path: []const u8) i64 {
     const tmpfs = @import("tmpfs.zig");
-    const r = tmpfs.tmpfsOpenAuthorized(path, false, false, cur.euid, cur.egid, cur.effective_caps, 0, null, cur.fsctx().umask);
+    const r = tmpfs.tmpfsOpenAuthorized(path, false, false, cur.fsuid, cur.fsgid, cur.effective_caps, 0, null, cur.fsctx().umask);
     if (r < 0) return if (r == -13) -13 else -2;
     const idx: u16 = @intCast(r);
     defer tmpfs.tmpfsClose(idx);
     const meta = tmpfs.tmpfsGetMetadata(idx) orelse return -2;
     if (!meta.is_dir) return -20;
     const dac = @import("dac.zig");
-    if (!dac.allows(.{ .mode = meta.mode, .uid = meta.uid, .gid = meta.gid }, .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] }, dac.Access.search)) return -13;
+    if (!dac.allows(.{ .mode = meta.mode, .uid = meta.uid, .gid = meta.gid }, .{ .euid = cur.fsuid, .egid = cur.fsgid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] }, dac.Access.search)) return -13;
     return 0;
 }
 

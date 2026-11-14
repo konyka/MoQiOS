@@ -86,6 +86,8 @@
 #define SYS_exit_group  501
 #define SYS_adjtimex    502
 #define SYS_clock_adjtime 503
+#define SYS_setfsuid    504
+#define SYS_setfsgid    505
 
 /* Processes, identity and terminals */
 #define SYS_pause       34

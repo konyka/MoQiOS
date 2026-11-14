@@ -7283,7 +7283,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修改：新增纯函数模块 `kernel/fs/pid_status.zig`（`render`、`stateOf`，宿主机测试 4 条）；`procfs.generatePidStatus` 在持有任务锁时对目标做一次快照（线程数要扫描所有槽位），再渲染；`stat` 的状态字母改用同一个 `stateOf`，原来各自一份的 `stateStr`/`stateChar` 删除（它们把 `ready` 记为 `S`，`blocked` 记为 `D`，停止的任务也不会显示 `T`）。`capability_profile.zig` 给 hello259 与 hello253 相同的 `CAP_SETUID|CAP_SETGID`，它要在子进程里 `setgroups`。
 - **顺带发现并修了一个真实的信号缺陷**：`kill(pid, SIGSTOP)` 发给一个阻塞在等待里的进程时，只是置位 pending，而 `kickIfBlocked` 认为停止信号"不可操作"，不会唤醒它，进程继续留在原来的等待里，直到别的原因把它唤醒才停止——所以 `status` 里看不到 `T`。现在 `sendSignalInfo` 对"默认动作是停止、目标有 handler 之外且未屏蔽、正在睡眠、且不是调用者自己"的情形直接 `stopTask`，并且**不再留下 pending 位**（否则 `SIGCONT` 唤醒时会第二次停止它）。`SIGSTOP` 不能被屏蔽也不能有 handler，所以对它无条件适用。
 - 绿灯：hello259 25 项（实际运行计数，后来又补了 3 项，见 ⑦，共 28 项）通过；host 1088/1088。变异：①让 `stopsBlockedTarget` 永远返回 false（真编译）→ "after SIGSTOP it is T" 和 "a sleeper stopped and continued…" 失败；②停止之后仍留下 pending 位（真编译）→ **第一次存活**：当时的测试没有断言"继续后不被第二次停止"；我加了两处断言（子进程在睡眠后再忙算 300 ms 并报告，父进程等不到就杀掉），再次变异后 "sleeps its 600 ms" 和 "keeps running after the continue" 都失败，还原后通过。该变异的失败是靠测试变强才抓到的，不是第一版测试就有的保护。
-- 如实的局限：①`Uid`/`Gid` 的"文件系统"一栏取有效 id（本内核没有独立的 fsuid）；②`FDSize` 报告 `MAX_FDS`（x86_64 当时为 64，现为 128；非 x86 为 8，见 cross-arch-port-plan.md SK-39），Linux 是当前描述符表的容量，会随打开的描述符增长（我在宿主机上看到 64 变 256）；③`Threads` 不统计已退出但未回收的线程；④`State` 里没有 `D`（磁盘睡眠）、`I`（空闲）、`t`（被跟踪停止）；`TracerPid` 恒为 0（没有 ptrace 跟踪关系的查询）；⑤`Name` 不转义特殊字符；⑥对"带 handler 的停止信号"和"被屏蔽的 SIGTSTP/SIGTTIN/SIGTTOU"仍走原来的 pending 路径，没有单独的运行用例；⑦对**另一个正在运行**的目标发 `SIGSTOP` 仍走 pending 路径（下一次调度点才停止）。后补的用例（一个不断计算的子进程）第一次运行就通过——2 秒轮询窗口内 `status` 变为 `T`，停止期间没有任何进展，`SIGCONT` 后继续运行——所以功能是对的；但从发信号到变成 `T` 的**延迟没有测量**，这一条是回归保护，不是修复。
+- 如实的局限：①`Uid`/`Gid` 的"文件系统"一栏取有效 id（本内核没有独立的 fsuid）（hello328 一节起显示真正的 fsuid/fsgid）；②`FDSize` 报告 `MAX_FDS`（x86_64 当时为 64，现为 128；非 x86 为 8，见 cross-arch-port-plan.md SK-39），Linux 是当前描述符表的容量，会随打开的描述符增长（我在宿主机上看到 64 变 256）；③`Threads` 不统计已退出但未回收的线程；④`State` 里没有 `D`（磁盘睡眠）、`I`（空闲）、`t`（被跟踪停止）；`TracerPid` 恒为 0（没有 ptrace 跟踪关系的查询）；⑤`Name` 不转义特殊字符；⑥对"带 handler 的停止信号"和"被屏蔽的 SIGTSTP/SIGTTIN/SIGTTOU"仍走原来的 pending 路径，没有单独的运行用例；⑦对**另一个正在运行**的目标发 `SIGSTOP` 仍走 pending 路径（下一次调度点才停止）。后补的用例（一个不断计算的子进程）第一次运行就通过——2 秒轮询窗口内 `status` 变为 `T`，停止期间没有任何进展，`SIGCONT` 后继续运行——所以功能是对的；但从发信号到变成 `T` 的**延迟没有测量**，这一条是回归保护，不是修复。
 
 ### 挂载点的祖先目录超过 64 字节打不开（hello114 K2，已修）
 
@@ -8728,7 +8728,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello319 A–F 全过（C：`eff 0x10000000`）；hello316、hello318 定向 SMP=2、SMP=4 都 PASS。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello319、hello318、hello316 PASS 和 `hello228: corrupted canaries=0`。
 - 局限：
-  1. 内核没有 fsuid，比较用的是 euid。
+  1. 内核没有 fsuid，比较用的是 euid。（hello328 一节已加入 fsuid，租约改用 fsuid 比较）
   2. FAT32 和 ramdisk 文件没有属主，一律按 root 处理，所以普通用户不能在 FAT32 文件上拿租约（Linux 上 FAT 卷的属主由挂载参数 `uid=` 决定）。
   3. 管道、套接字之外，procfs 文件也一律 `EINVAL`；Linux 对 `/proc/meminfo` 这类 root 文件先报 `EACCES`。
   4. memfd 在这里是 tmpfs 文件，属主是创建者，与 Linux 一致；rofs（ext4/NTFS 只读卷）仍然不支持租约（`EINVAL`）。
@@ -8946,5 +8946,42 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：SMP=1、4、4、2 四份并行，全部 EXIT=0、0 FAIL，每份都有 `hello327: PASS`，`corrupted canaries=0`；riscv64、aarch64 smoke 通过。
 - 局限：
   1. 只改了读回。存下来的 owner 本身不清除，发信号时 `sendToOwner` 按 tid 或 pgid 查找，找不到就不发，效果和 Linux 一样；这依赖 tid 不重用。如果以后 tid 改成回绕分配，需要给 owner 加 incarnation 一类的引用。
-  2. `Task.pgid`、`Task.sid` 是 u16（`task.zig` 230、232 行），tid 超过 65535 之后不能再作为组号（`jobctl.zig` 147 行是 `@intCast`）。本节没有处理这个问题，改动前后行为相同。
+  2. `Task.pgid`、`Task.sid` 是 u16（`task.zig` 230、232 行）。tid 超过 65535 的任务不能成为组长或会话首进程，`setpgid`、`setsid` 返回 EINVAL（`pgrp.zig` 68–74、151–152 行）；因此 -pgrp owner 一定在 u16 范围内，`sendToOwner` 的 `@intCast` 不会越界。这个上限是原有的，本节没有改动。
   3. 检查是在不持有 task_lock 的情况下扫描 64 个槽，和 `ownerExists` 一样；扫描期间 owner 正好被回收时，可能报出刚消失的 id 一次。
+
+### setfsuid / setfsgid 与文件系统 id（hello328，已修）
+
+- 问题：内核没有 fsuid/fsgid。setfsuid、setfsgid 返回 ENOSYS（-38），所有文件系统权限检查和新文件的属主都用 euid/egid；`/proc/<pid>/status` 的 Uid/Gid 第四栏只是 euid/egid 的副本。另外 access() 的特权规则和 Linux 不同：以前真实 id 等于有效 id 时保留有效集里的 CAP_DAC_OVERRIDE，否则一律丢掉。
+- Linux 依据：
+  - `kernel/sys.c` 的 `__sys_setfsuid`、`__sys_setfsgid`：总是返回旧的 fs id；新 id 必须是 real、effective、saved 或当前 fs id 之一，否则需要 CAP_SETUID/CAP_SETGID；-1 和当前值不改。setuid、setreuid、setresuid（以及 gid 一族）都把 fs id 设成新的有效 id；setresuid 的 no-op 检查要求给出的 euid 同时等于 fsuid，满足时 fs id 保持不变。
+  - `security/commoncap.c` 的 `cap_task_fix_setuid(LSM_SETID_FS)`：fsuid 从 0 变成非 0 时，从有效集去掉 `CAP_FS_MASK`（CHOWN、MKNOD、DAC_OVERRIDE、DAC_READ_SEARCH、FOWNER、FSETID、MAC_OVERRIDE）；变回 0 时从 permitted 补回。
+  - `fs/open.c` 的 `access_override_creds`：access() 按真实 id 判定，真实 uid 为 0 时有效集换成 permitted，否则清空；AT_EACCESS 用调用者自己的 fs id 和有效集。
+  - execve 时 `security/commoncap.c` 963 行（`cap_bprm_creds_from_file`）执行 `new->suid = new->fsuid = new->euid`。
+- 宿主机实测（无 sudo，在 `unshare --map-auto --map-root-user` 里跑 `/tmp/fsu.c`–`/tmp/fsu4.c`，再以 `gcc -DHOST` 跑 `user/hello328.c`，A–J 全过）：
+  - setfsuid(1000) 返回 0，之后读回 1000；status 显示 `Uid: 0 0 0 1000`，CapEff 从 `1ffffffffff` 变成 `1fef7fffde0`（去掉第 0–4、9、27、32 位，差值 `0x10800021f`）；setfsuid(0) 后恢复。
+  - fsuid 1000 打不开 root 的 0600 文件（EACCES），新建文件属主是 1000/2000，chmod root 的文件 EPERM、自己的文件成功。
+  - access() 仍按真实 root 放行；AT_EACCESS 按 fs id 返回 EACCES。真实 uid 0 但有效集没有 CAP_DAC_OVERRIDE 时 access() 仍放行，AT_EACCESS 拒绝；非 root 用户有效集里有 CAP_DAC_OVERRIDE 时 access() 拒绝、AT_EACCESS 放行。
+  - setresuid(-1,-1,-1)、setresgid(-1,-1,-1) 保留 fs id；setreuid(-1,-1)、setuid、给出 euid 的 setresuid 都把 fs id 重设为 euid。
+  - 没有 CAP_SETUID 时 setfsuid(1234) 返回旧值且不改，setfsuid(真实 uid 0) 成功；setfsgid 同理。
+  - fork 的子进程继承 fs id，execve 后 fs id 变回有效 id。
+- 红灯：
+  - 宿主机单测先编译失败，缺 `cred_policy.setFs`、`capsAfterFsuidChange`、`resIsNoop` 和 `access_policy.Ids.fsuid`。
+  - 在未修改的内核上定向 SMP=2（内核改动 stash 掉，只保留 hello328 的启动 profile），hello328 A–J 全部失败：setfsuid 返回 -38，root 的 0600 文件照常打开，新文件属主是 0/0。
+- 修复：
+  - `kernel/proc/task.zig`：`Task` 新增 `fsuid`、`fsgid`，启动时等于 profile 的 uid/gid；`fork.zig`、`clone.zig` 继承。
+  - `kernel/proc/cred_policy.zig`：新增 `setFs`、`capsAfterFsuidChange`、`resIsNoop`。
+  - `kernel/proc/credentials.zig`：`applyUids`/`applyGids` 让 fs id 跟随有效 id；setresuid/setresgid 先做 no-op 检查；`applyExec` 把 fs id 设成有效 id；新增 `setfsuid`、`setfsgid`，文件系统 capability 掩码 `FS_CAPS` 取 SysCap 里有的 CHOWN、MKNOD、DAC_OVERRIDE、FOWNER。
+  - 系统调用：原生号 504（setfsuid）、505（setfsgid），`moqi_syscalls.h` 加 `SYS_setfsuid`/`SYS_setfsgid`；Linux personality 下 122、123 经 `rlimit.Policy.linuxAlias` 转到同一实现。
+  - 文件系统检查改用 fs id：open/creat（`file_io.zig`、`statx.zig`、truncate、statfs、memfd）、mkdir、unlink/rmdir、rename、chdir、getdents、readlink、chmod/chown/utimensat（`ext2Who`、`tmpfsWho`、`ext2Creator`）、只读卷、POSIX MQ、租约。`current_groups.forCaller` 改为比较 fs id，否则补充组会丢失。
+  - `kernel/fs/access_policy.zig`：`Ids` 加 `fsuid`、`fsgid`、`permitted_dac_override`；`credsFor` 按 `access_override_creds` 实现。access() 的只读卷路径也用同一份凭证。
+  - `kernel/fs/procfs.zig`：status 的 Uid/Gid 第四栏显示 fsuid/fsgid。
+  - `kernel/proc/capability_profile.zig`：hello328 以 root 启动，持有 SETUID、SETGID、DAC_OVERRIDE、FOWNER、CHOWN。
+  - `tests/main.zig`：新增 setfsuid 和 access 凭证的单测；原有 access 单测按新规则改写，两处检查源码字符串的单测改成 fs id。
+- 绿灯：目标机定向 SMP=2（两份）、SMP=4 一份，hello328 A–J 全过；`zig build test` 通过。
+- 完整 smoke：SMP=1、4、4、2 四份并行，全部 EXIT=0、0 FAIL，每份都有 `hello328: PASS`，access 相关的 hello126、hello114 也都 PASS，`corrupted canaries=0`；riscv64、aarch64 smoke 通过。
+- 局限：
+  1. SysCap 没有 DAC_READ_SEARCH、FSETID、MAC_OVERRIDE，这几位本来就不存在，所以 `FS_CAPS` 只含四位。
+  2. 进程间的权限检查（kill、kcmp、调度、ptrace 风格的 `/proc/<pid>` 访问、SysV IPC）仍用 euid，和 Linux 一致；`/proc/<pid>/maps` 这类 `PTRACE_MODE_FSCREDS` 检查在 Linux 上用 fsuid，这里仍用 euid。
+  3. 套接字凭证（SO_PEERCRED、UDP/TCP 端口共享的属主）仍用 euid；unix 套接字绑定路径时创建的文件没有属主，不受影响。
+  4. 仍然没有用户命名空间，setfsuid 不做 `make_kuid` 映射，所以超出映射范围的 id 不会被拒绝。
+  5. 只有 x86_64 分发 504/505；riscv64、aarch64 没有这两个调用。

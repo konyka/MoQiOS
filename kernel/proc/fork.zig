@@ -114,6 +114,8 @@ pub fn fork(frame: *SyscallFrame) i64 {
     child.egid = parent.egid;
     child.suid = parent.suid;
     child.sgid = parent.sgid;
+    child.fsuid = parent.fsuid;
+    child.fsgid = parent.fsgid;
     child.groups = parent.groups;
     child.ngroups = parent.ngroups;
     child.pgid = parent.pgid;

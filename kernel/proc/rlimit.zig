@@ -16,6 +16,8 @@ pub const Policy = struct {
         prlimit64,
         exit_group,
         waitid,
+        setfsuid,
+        setfsgid,
     };
 
     pub const DupExplicit = enum {
@@ -83,6 +85,8 @@ pub const Policy = struct {
             302 => .prlimit64,
             231 => .exit_group,
             247 => .waitid,
+            122 => .setfsuid,
+            123 => .setfsgid,
             else => null,
         };
     }

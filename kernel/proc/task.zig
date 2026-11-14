@@ -244,6 +244,11 @@ pub const Task = struct {
     suid: u32 = 0,
     /// Saved set-group-ID. Default 0 (root).
     sgid: u32 = 0,
+    /// Filesystem user ID (setfsuid): what filesystem permission checks and new files use. Follows euid on every euid change
+    /// and on execve. Inherited on fork.
+    fsuid: u32 = 0,
+    /// Filesystem group ID (setfsgid), likewise following egid.
+    fsgid: u32 = 0,
     /// Supplementary groups (setgroups/getgroups); `ngroups` entries of
     /// `groups` are valid. Inherited on fork/clone, kept across execve.
     groups: [@import("group_policy.zig").NGROUPS_MAX]u32 = @splat(0),
@@ -1925,6 +1930,8 @@ pub fn createUserProcess(
         tasks[slot].egid = profile.gid;
         tasks[slot].suid = profile.uid;
         tasks[slot].sgid = profile.gid;
+        tasks[slot].fsuid = profile.uid;
+        tasks[slot].fsgid = profile.gid;
         tasks[slot].user_entry = user_entry;
         tasks[slot].user_stack_top = user_stack_top;
         tasks[slot].stack_limit = @import("rlimit.zig").Policy.initialStackLimit(

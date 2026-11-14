@@ -2583,6 +2583,12 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
             const ts_mod = @import("../../proc/time_syscall.zig");
             frame.rax = @bitCast(ts_mod.adjtimex(frame.rdi, checkCapForCurrent("cap_sys_time")));
         },
+        504 => { // setfsuid(uid) — returns the old fs uid
+            frame.rax = @bitCast(cred_mod.setfsuid(@truncate(frame.rdi)));
+        },
+        505 => { // setfsgid(gid) — returns the old fs gid
+            frame.rax = @bitCast(cred_mod.setfsgid(@truncate(frame.rdi)));
+        },
         503 => { // clock_adjtime(clockid, buf)
             const ts_mod = @import("../../proc/time_syscall.zig");
             frame.rax = @bitCast(ts_mod.clockAdjtime(frame.rdi, frame.rsi, checkCapForCurrent("cap_sys_time")));
@@ -2679,6 +2685,8 @@ fn dispatchLinuxAlias(frame: *SyscallFrame, syscall_nr: u64) bool {
         .prlimit64 => frame.rax = @bitCast(syscallPrlimit64(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, frame.r10)),
         .exit_group => lifecycle_mod.exitGroup(frame.rdi),
         .waitid => frame.rax = @bitCast(waitpid_mod.waitid(@truncate(frame.rdi), frame.rsi, frame.rdx, @truncate(frame.r10), frame.r8)),
+        .setfsuid => frame.rax = @bitCast(@import("../../proc/credentials.zig").setfsuid(@truncate(frame.rdi))),
+        .setfsgid => frame.rax = @bitCast(@import("../../proc/credentials.zig").setfsgid(@truncate(frame.rdi))),
     }
     return true;
 }
@@ -2760,13 +2768,13 @@ fn idArg(raw: u64) ?u32 {
 
 fn tmpfsWho() @import("../../fs/tmpfs.zig").Remover {
     const cur = @import("../../proc/sched.zig").currentTask() orelse return .{ .euid = 1000, .egid = 1000, .effective_caps = .{} };
-    return .{ .euid = cur.euid, .egid = cur.egid, .effective_caps = cur.effective_caps };
+    return .{ .euid = cur.fsuid, .egid = cur.fsgid, .effective_caps = cur.effective_caps };
 }
 
 /// Owner of a new ext2 object created by the current task.
 fn ext2Creator() @import("../../fs/ext2.zig").Creator {
     const cur = @import("../../proc/sched.zig").currentTask() orelse return @import("../../fs/ext2.zig").kernelCreator(0o777);
-    return .{ .uid = cur.euid, .gid = cur.egid, .perm = 0o777 };
+    return .{ .uid = cur.fsuid, .gid = cur.fsgid, .perm = 0o777 };
 }
 
 /// The current task's credentials for ext2 chmod/chown authorization. With
@@ -2774,8 +2782,8 @@ fn ext2Creator() @import("../../fs/ext2.zig").Creator {
 fn ext2Who() @import("../../fs/ext2.zig").Who {
     const cur = @import("../../proc/sched.zig").currentTask() orelse return .{ .euid = 1000, .egid = 1000 };
     return .{
-        .euid = cur.euid,
-        .egid = cur.egid,
+        .euid = cur.fsuid,
+        .egid = cur.fsgid,
         .cap_fowner = cur.effective_caps.cap_fowner,
         .cap_chown = cur.effective_caps.cap_chown,
         .cap_dac_override = cur.effective_caps.cap_dac_override,
@@ -3652,12 +3660,13 @@ fn syscallAccessAt(dirfd: i64, pathname_ptr: u64, mode: u32, flags: u32) i64 {
         .err => |e| return e,
     };
 
-    // Mounted ext4/NTFS volumes answer from the file's real mode and owner.
-    if (rofsAccess(cur, use_name, mode)) |r| return r;
+    // The identity access() judges as: the real ids (or the filesystem ones with AT_EACCESS), see access_policy.credsFor.
+    const creds = ap.credsFor(.{ .uid = cur.uid, .gid = cur.gid, .euid = cur.euid, .egid = cur.egid, .fsuid = cur.fsuid, .fsgid = cur.fsgid, .cap_dac_override = cur.effective_caps.cap_dac_override, .permitted_dac_override = cur.permitted_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] }, fl.effective);
 
-    // ext2 and tmpfs keep owner and mode: judge R/W/X against them, as the
-    // real ids (or the effective ones with AT_EACCESS).
-    const creds = ap.credsFor(.{ .uid = cur.uid, .gid = cur.gid, .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] }, fl.effective);
+    // Mounted ext4/NTFS volumes answer from the file's real mode and owner.
+    if (rofsAccess(cur, use_name, mode, .{ .euid = creds.euid, .egid = creds.egid, .cap_dac_override = creds.cap_dac_override, .groups = creds.groups })) |r| return r;
+
+    // ext2 and tmpfs keep owner and mode: judge R/W/X against them.
     if (len == 0) {
         if (!fl.empty_path) return -2;
         if (dirfd < 0 or dirfd >= vfs_mod.MAX_FDS) return -9;
@@ -3686,7 +3695,7 @@ fn syscallAccessAt(dirfd: i64, pathname_ptr: u64, mode: u32, flags: u32) i64 {
     }
 
     // Everything else: existence only.
-    const fd_result = cur.fd_table.openWithCredentials(use_name, 0, cur.euid, cur.egid, cur.effective_caps);
+    const fd_result = cur.fd_table.openWithCredentials(use_name, 0, cur.fsuid, cur.fsgid, cur.effective_caps);
     if (fd_result >= 0) {
         const fd: u32 = @intCast(fd_result);
         _ = cur.fd_table.close(fd);
@@ -3706,7 +3715,7 @@ fn accessVerdictErrno(v: @import("../../fs/access_policy.zig").Verdict) i64 {
 /// access(2) for a path on a read-only volume; null when it is not on one.
 /// Directories on the way need search permission, the target is judged by
 /// rofs_access_policy.accessVerdict (write is always EROFS).
-fn rofsAccess(cur: anytype, name: []const u8, mode: u32) ?i64 {
+fn rofsAccess(cur: anytype, name: []const u8, mode: u32, creds: @import("../../fs/rofs.zig").Creds) ?i64 {
     const rofs = @import("../../fs/rofs.zig");
     const policy = @import("../../fs/rofs_access_policy.zig");
     if (!rofs.anyActive() or name.len == 0) return null;
@@ -3724,7 +3733,6 @@ fn rofsAccess(cur: anytype, name: []const u8, mode: u32) ?i64 {
     var norm: [256]u8 = undefined;
     const abs = vfs_mod.normalizeAbs(full, &norm) orelse return null;
     const route = vfs_mod.rofsRoute(abs) orelse return null;
-    const creds: rofs.Creds = .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] };
     // Resolve through search checks only: the target's own bits are judged below.
     const reach = rofs.reach(route.slot, route.rest, creds);
     if (reach < 0) return reach;
@@ -3926,7 +3934,7 @@ fn syscallTruncate(path_ptr: u64, length: u64) i64 {
         .err => |e| return e,
     };
     // O_WRONLY (0x01): truncate requires write access to the file.
-    const fd_result = cur.fd_table.openWithCredentials(use_name, 1, cur.euid, cur.egid, cur.effective_caps);
+    const fd_result = cur.fd_table.openWithCredentials(use_name, 1, cur.fsuid, cur.fsgid, cur.effective_caps);
     if (fd_result < 0) return fd_result;
     const fd: u32 = @intCast(fd_result);
     // truncate breaks leases like an open for writing, and waits for them (Linux do_truncate -> break_lease).
@@ -4035,7 +4043,7 @@ fn syscallRenameFlagsAt(old_dirfd: i64, old_ptr: u64, new_dirfd: i64, new_ptr: u
         .cross => return -18, // EXDEV
         .tmpfs => {
             const cur = @import("../../proc/sched.zig").currentTask() orelse return -1;
-            return @import("../../fs/tmpfs.zig").tmpfsRename(old_path, new_path, mode, .{ .euid = cur.euid, .egid = cur.egid, .effective_caps = cur.effective_caps });
+            return @import("../../fs/tmpfs.zig").tmpfsRename(old_path, new_path, mode, .{ .euid = cur.fsuid, .egid = cur.fsgid, .effective_caps = cur.effective_caps });
         },
         .other => {},
     }
@@ -4812,7 +4820,7 @@ fn syscallStatfs(path_ptr: u64, buf_ptr: u64) i64 {
         .path => |p| p,
         .err => |e| return e,
     };
-    const fd_result = cur.fd_table.openWithCredentials(use_name, 0, cur.euid, cur.egid, cur.effective_caps);
+    const fd_result = cur.fd_table.openWithCredentials(use_name, 0, cur.fsuid, cur.fsgid, cur.effective_caps);
     if (fd_result < 0) return @import("../../fs/namespace_policy.zig").lookupFailureErrno(fd_result);
     const fd: u32 = @intCast(fd_result);
     const kind = cur.fd_table.fds[fd].fd_type;
@@ -4845,7 +4853,7 @@ fn rofsStatfsByPath(path_ptr: u64, buf_ptr: u64) ?i64 {
     const route = vfs_mod.rofsRoute(abs) orelse return null;
     // The path must exist and be searchable by this caller (statfs needs no
     // read permission on the file itself, as on Linux).
-    const creds: rofs.Creds = .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] };
+    const creds: rofs.Creds = .{ .euid = cur.fsuid, .egid = cur.fsgid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] };
     const reach = rofs.reach(route.slot, route.rest, creds);
     if (reach < 0) return reach;
     return rofsStatfsReply(rofs.statFs(route.slot, null), buf_ptr);
@@ -5189,7 +5197,7 @@ fn syscallMemfdCreate(name_ptr: u64, flags: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = tm.getTask(cur_idx) orelse return -1;
     const fd_slot = t.fd_table.allocFd() orelse return -24; // EMFILE
-    const idx = tmpfs.tmpfsCreateAnonymous(t.euid, t.egid) orelse {
+    const idx = tmpfs.tmpfsCreateAnonymous(t.fsuid, t.fsgid) orelse {
         t.fd_table.freeFd(fd_slot);
         return -23; // ENFILE: tmpfs table full
     };

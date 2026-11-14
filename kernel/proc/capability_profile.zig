@@ -135,6 +135,11 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // hello322 (SIGIO permission) has children take uid/euid/suid combinations with setresuid.
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_setuid = true }, .initial_init = false };
     }
+    if (std.mem.eql(u8, name, "hello328")) {
+        // setfsuid/setfsgid test: root holding the id capabilities and the file-system ones (DAC override, fowner, chown), so moving
+        // fsuid away from 0 visibly drops the latter from CapEff and an unprivileged child sees the setfsuid refusals.
+        return .{ .uid = 0, .gid = 0, .caps = .{ .cap_setuid = true, .cap_setgid = true, .cap_dac_override = true, .cap_fowner = true, .cap_chown = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello179")) {
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_admin = true, .cap_setuid = true }, .initial_init = false };
     }

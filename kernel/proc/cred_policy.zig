@@ -106,3 +106,27 @@ pub fn afterExec(uid: Ids, gid: Ids, caps: Caps) ExecCreds {
     }
     return .{ .uid = new_uid, .gid = new_gid, .caps = out };
 }
+
+/// setfsuid/setfsgid (Linux __sys_setfsuid): the new fs id, or null when nothing changes. `want` must be the real, effective,
+/// saved or current fs id unless `privileged` (CAP_SETUID / CAP_SETGID); -1 and the current fs id change nothing. The call
+/// always returns the old fs id, changed or not.
+pub fn setFs(ids: Ids, cur_fs: u32, want: u32, privileged: bool) ?u32 {
+    if (want == KEEP or want == cur_fs) return null;
+    if (!privileged and !isCurrent(ids, want)) return null;
+    return want;
+}
+
+/// cap_task_fix_setuid LSM_SETID_FS: fsuid 0 -> non-0 drops the file-system capabilities `fs_mask` from the effective set;
+/// non-0 -> 0 raises the permitted ones among them back into it.
+pub fn capsAfterFsuidChange(old_fs: u32, new_fs: u32, caps: Caps, fs_mask: u32) Caps {
+    var out = caps;
+    if (old_fs == 0 and new_fs != 0) out.effective &= ~fs_mask;
+    if (old_fs != 0 and new_fs == 0) out.effective |= caps.permitted & fs_mask;
+    return out;
+}
+
+/// setresuid/setresgid's no-op check (Linux kernel/sys.c): every given id equals the current one, and a given effective id also
+/// equals the fs id. Only then does the fs id stay; otherwise it becomes the new effective id.
+pub fn resIsNoop(ids: Ids, fs: u32, r: u32, e: u32, s: u32) bool {
+    return (r == KEEP or r == ids.r) and (e == KEEP or (e == ids.e and e == fs)) and (s == KEEP or s == ids.s);
+}

@@ -2,10 +2,10 @@
 //! keep owner and mode (ext2, tmpfs). The read-only volumes have the same
 //! rules in rofs_access_policy.zig; this variant additionally allows W_OK.
 //!
-//! access() judges the caller by its REAL ids, not the effective ones
-//! (AT_EACCESS in faccessat2 switches to the effective ids). Privilege comes
-//! from the effective identity, so judging as the real ids drops it unless
-//! the two agree.
+//! access() judges the caller by its REAL ids, not the filesystem ones
+//! (AT_EACCESS in faccessat2 switches to the filesystem ids). Judged as the
+//! real ids, a real root keeps its permitted capabilities and anyone else has
+//! none (see credsFor).
 
 pub const R: u32 = 4;
 pub const W: u32 = 2;
@@ -29,7 +29,13 @@ pub const Ids = struct {
     gid: u32,
     euid: u32,
     egid: u32,
+    /// The filesystem ids (setfsuid/setfsgid): what every other filesystem check uses, and AT_EACCESS too.
+    fsuid: u32,
+    fsgid: u32,
+    /// CAP_DAC_OVERRIDE in the effective set.
     cap_dac_override: bool = false,
+    /// CAP_DAC_OVERRIDE in the permitted set.
+    permitted_dac_override: bool = false,
     groups: []const u32 = &.{},
 };
 
@@ -55,13 +61,12 @@ pub fn verdict(m: Meta, c: Creds, mode: u32) Verdict {
     return if (((m.mode >> shift) & 0o7 & mode) == mode) .ok else .denied;
 }
 
-/// The identity access() is judged as: real ids by default, effective ones
-/// with AT_EACCESS. Dropping to the real ids drops privilege unless they match.
+/// The identity access() is judged as (Linux fs/open.c access_override_creds): by default the real ids, with the permitted
+/// capabilities when the real uid is 0 and none otherwise; with AT_EACCESS the caller's own filesystem ids and effective
+/// capabilities.
 pub fn credsFor(ids: Ids, effective: bool) Creds {
-    if (effective or (ids.uid == ids.euid and ids.gid == ids.egid)) {
-        return .{ .euid = ids.euid, .egid = ids.egid, .cap_dac_override = ids.cap_dac_override, .groups = ids.groups };
-    }
-    return .{ .euid = ids.uid, .egid = ids.gid, .cap_dac_override = false, .groups = ids.groups };
+    if (effective) return .{ .euid = ids.fsuid, .egid = ids.fsgid, .cap_dac_override = ids.cap_dac_override, .groups = ids.groups };
+    return .{ .euid = ids.uid, .egid = ids.gid, .cap_dac_override = ids.uid == 0 and ids.permitted_dac_override, .groups = ids.groups };
 }
 
 pub const Flags = struct {

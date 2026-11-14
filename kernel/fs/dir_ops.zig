@@ -247,15 +247,15 @@ fn mkdirName(name: []const u8, requested_mode: ?u32) i64 {
         const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
         const cur = task_mod.getTask(cur_idx) orelse return -1;
         const mode = requested_mode orelse @import("../proc/creation_metadata.zig").DEFAULT_DIRECTORY_MODE;
-        return @import("tmpfs.zig").tmpfsMkdirAuthorized(name, mode, cur.fsctx().umask, cur.euid, cur.egid, cur.effective_caps);
+        return @import("tmpfs.zig").tmpfsMkdirAuthorized(name, mode, cur.fsctx().umask, cur.fsuid, cur.fsgid, cur.effective_caps);
     }
 
     const ext2 = @import("ext2.zig");
     if (ext2.isActive()) {
         const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
         const cur = task_mod.getTask(cur_idx) orelse return -1;
-        const cm = @import("../proc/creation_metadata.zig").decide(null, .directory, requested_mode, cur.fsctx().umask, cur.euid, cur.egid).metadata;
-        const result = ext2.createDir(name, .{ .uid = cm.uid, .gid = cm.gid, .perm = @truncate(cm.mode) }, .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] });
+        const cm = @import("../proc/creation_metadata.zig").decide(null, .directory, requested_mode, cur.fsctx().umask, cur.fsuid, cur.fsgid).metadata;
+        const result = ext2.createDir(name, .{ .uid = cm.uid, .gid = cm.gid, .perm = @truncate(cm.mode) }, .{ .euid = cur.fsuid, .egid = cur.fsgid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] });
         if (result > 0) {
             ext2.closeFile(@intCast(result));
             return 0;

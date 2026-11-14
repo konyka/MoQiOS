@@ -61,7 +61,7 @@ pub fn statx(dirfd: i64, pathname_ptr: u64, flags: u32, mask: u32, statxbuf_ptr:
     if (!args.follow) {
         const ext2 = @import("ext2.zig");
         if (ext2.isActive() and !isSpecialTree(use_name)) {
-            if (ext2.statPathNoFollow(use_name, .{ .euid = cur.euid, .egid = cur.egid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] })) |r| {
+            if (ext2.statPathNoFollow(use_name, .{ .euid = cur.fsuid, .egid = cur.fsgid, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] })) |r| {
                 switch (r) {
                     .ok => |info| {
                         si.packStatx(&out, .{ .mode = info.mode, .nlink = info.nlink, .uid = info.uid, .gid = info.gid, .ino = info.ino, .size = info.size, .blocks = info.blocks, .times = .{ .atime = info.atime, .mtime = info.mtime, .ctime = info.ctime } });
@@ -86,7 +86,7 @@ pub fn statx(dirfd: i64, pathname_ptr: u64, flags: u32, mask: u32, statxbuf_ptr:
         .object => |o| stat_on_fd = o.fd,
         .err => |e| return e,
     };
-    const fd_result = if (stat_on_fd) |src| @as(i64, src) else cur.fd_table.openWithCredentials(stat_name, open_flags, cur.euid, cur.egid, cur.effective_caps);
+    const fd_result = if (stat_on_fd) |src| @as(i64, src) else cur.fd_table.openWithCredentials(stat_name, open_flags, cur.fsuid, cur.fsgid, cur.effective_caps);
     if (fd_result < 0) return @import("namespace_policy.zig").lookupFailureErrno(fd_result);
     const fd: u32 = @intCast(fd_result);
     const common = describe(&cur.fd_table.fds[fd], fd);

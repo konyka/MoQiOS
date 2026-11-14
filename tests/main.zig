@@ -3467,6 +3467,9 @@ test "Linux RLIMIT aliases preserve native syscall numbers" {
     try std.testing.expectEqual(rlimit.Policy.LinuxAlias.setrlimit, rlimit.Policy.linuxAlias(true, 160).?);
     try std.testing.expectEqual(rlimit.Policy.LinuxAlias.prlimit64, rlimit.Policy.linuxAlias(true, 302).?);
     try std.testing.expectEqual(@as(?rlimit.Policy.LinuxAlias, null), rlimit.Policy.linuxAlias(false, 160));
+    try std.testing.expectEqual(rlimit.Policy.LinuxAlias.setfsuid, rlimit.Policy.linuxAlias(true, 122).?);
+    try std.testing.expectEqual(rlimit.Policy.LinuxAlias.setfsgid, rlimit.Policy.linuxAlias(true, 123).?);
+    try std.testing.expectEqual(@as(?rlimit.Policy.LinuxAlias, null), rlimit.Policy.linuxAlias(false, 122));
     try std.testing.expectEqual(@as(?rlimit.Policy.LinuxAlias, null), rlimit.Policy.linuxAlias(false, 302));
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "dispatchLinuxAlias(frame, syscall_nr)") != null);
 }
@@ -3627,11 +3630,11 @@ test "UID 1000 create ownership remains outside DAC phase one" {
     try std.testing.expect(!dac.enforcesOwnershipOnCreate);
 }
 
-test "user metadata probes forward effective DAC credentials" {
+test "user metadata probes forward the filesystem DAC credentials" {
     // statx and access resolve their paths through at_path (a volume directory
-    // fd or cwd may rewrite the name) but must retain the caller's credentials.
-    const forwarding = "openWithCredentials(use_name, 0, cur.euid, cur.egid, cur.effective_caps)";
-    try std.testing.expect(std.mem.indexOf(u8, kt.statx_source, "openWithCredentials(stat_name, open_flags, cur.euid, cur.egid, cur.effective_caps)") != null);
+    // fd or cwd may rewrite the name) but must retain the caller's filesystem ids (setfsuid).
+    const forwarding = "openWithCredentials(use_name, 0, cur.fsuid, cur.fsgid, cur.effective_caps)";
+    try std.testing.expect(std.mem.indexOf(u8, kt.statx_source, "openWithCredentials(stat_name, open_flags, cur.fsuid, cur.fsgid, cur.effective_caps)") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, forwarding) != null);
 }
 
@@ -7839,6 +7842,50 @@ test "credentials: execve copies euid into the saved uid and drops capabilities 
     try std.testing.expectEqual(@as(u32, 0), d.caps.effective);
 }
 
+test "setfsuid/setfsgid: the fs id takes a current id (or any with the capability), follows the effective id, and moves the fs capabilities" {
+    const cp = kt.cred_policy;
+    const K = cp.KEEP;
+    const ids: cp.Ids = .{ .r = 0, .e = 1000, .s = 0 };
+    // Linux __sys_setfsuid: real, effective, saved or current fs id; anything with CAP_SETUID; -1 and the current value change nothing
+    try std.testing.expectEqual(@as(?u32, 0), cp.setFs(ids, 1000, 0, false));
+    try std.testing.expectEqual(@as(?u32, null), cp.setFs(ids, 1000, 1234, false));
+    try std.testing.expectEqual(@as(?u32, 1234), cp.setFs(ids, 1000, 1234, true));
+    try std.testing.expectEqual(@as(?u32, null), cp.setFs(ids, 1000, 1000, true));
+    try std.testing.expectEqual(@as(?u32, null), cp.setFs(ids, 1000, K, true));
+    try std.testing.expectEqual(@as(?u32, null), cp.setFs(.{ .r = 1, .e = 2, .s = 3 }, 7, 7, false)); // already the fs id
+    try std.testing.expectEqual(@as(?u32, 7), cp.setFs(.{ .r = 1, .e = 2, .s = 7 }, 4, 7, false)); // the saved id
+    // cap_task_fix_setuid LSM_SETID_FS: fsuid 0 -> non-0 drops the fs set from effective, back to 0 raises it from permitted
+    const caps: cp.Caps = .{ .effective = 0xFF, .permitted = 0xFF };
+    const dropped = cp.capsAfterFsuidChange(0, 1000, caps, 0x0F);
+    try std.testing.expectEqual(@as(u32, 0xF0), dropped.effective);
+    try std.testing.expectEqual(@as(u32, 0xFF), dropped.permitted);
+    try std.testing.expectEqual(@as(u32, 0xFF), cp.capsAfterFsuidChange(1000, 0, dropped, 0x0F).effective);
+    try std.testing.expectEqual(@as(u32, 0xF0), cp.capsAfterFsuidChange(1000, 2000, dropped, 0x0F).effective);
+    // raising takes only the permitted part of the fs set
+    try std.testing.expectEqual(@as(u32, 0x32), cp.capsAfterFsuidChange(5, 0, .{ .effective = 0x30, .permitted = 0x32 }, 0x0F).effective);
+    // setresuid's no-op check: nothing given differs, and an effective id equal to the fs id too; then the fs id stays
+    try std.testing.expect(cp.resIsNoop(.{ .r = 0, .e = 0, .s = 0 }, 1000, K, K, K));
+    try std.testing.expect(!cp.resIsNoop(.{ .r = 0, .e = 0, .s = 0 }, 1000, K, 0, K));
+    try std.testing.expect(cp.resIsNoop(.{ .r = 0, .e = 0, .s = 0 }, 0, 0, 0, 0));
+    try std.testing.expect(!cp.resIsNoop(.{ .r = 0, .e = 0, .s = 0 }, 0, 5, K, K));
+}
+
+test "access(2): the real ids by default, with root's permitted capabilities; AT_EACCESS uses the fs ids and effective capabilities" {
+    const ap = kt.access_policy;
+    // Linux access_override_creds: fsuid = uid, and the effective set becomes permitted for root, empty for anyone else
+    const root_fs1000 = ap.credsFor(.{ .uid = 0, .gid = 0, .euid = 0, .egid = 0, .fsuid = 1000, .fsgid = 2000, .cap_dac_override = false, .permitted_dac_override = true }, false);
+    try std.testing.expectEqual(@as(u32, 0), root_fs1000.euid);
+    try std.testing.expect(root_fs1000.cap_dac_override);
+    const eacc = ap.credsFor(.{ .uid = 0, .gid = 0, .euid = 0, .egid = 0, .fsuid = 1000, .fsgid = 2000, .cap_dac_override = false, .permitted_dac_override = true }, true);
+    try std.testing.expectEqual(@as(u32, 1000), eacc.euid);
+    try std.testing.expectEqual(@as(u32, 2000), eacc.egid);
+    try std.testing.expect(!eacc.cap_dac_override);
+    // a non-root caller loses an effective CAP_DAC_OVERRIDE for access() even when its ids agree (host: EACCES, AT_EACCESS allowed)
+    const user = ap.credsFor(.{ .uid = 5, .gid = 6, .euid = 5, .egid = 6, .fsuid = 5, .fsgid = 6, .cap_dac_override = true, .permitted_dac_override = true }, false);
+    try std.testing.expect(!user.cap_dac_override);
+    try std.testing.expect(ap.credsFor(.{ .uid = 5, .gid = 6, .euid = 5, .egid = 6, .fsuid = 5, .fsgid = 6, .cap_dac_override = true, .permitted_dac_override = true }, true).cap_dac_override);
+}
+
 test "procfs: /proc/PID/maps pins the target address space before walking it" {
     const src = kt.procfs_source;
     const start = std.mem.indexOf(u8, src, "fn generatePidMaps(").?;
@@ -8447,14 +8494,14 @@ test "access(2) policy: mode bits, real vs effective ids, faccessat2 flags" {
     try std.testing.expectEqual(ap.Verdict.ok, ap.verdict(.{ .mode = 0o040000, .uid = 1, .gid = 1 }, root, ap.X)); // directories: search
 
     // Real ids are the default; AT_EACCES (0x200) switches to the effective ids.
-    const c = ap.credsFor(.{ .uid = 1000, .gid = 1000, .euid = 0, .egid = 0, .cap_dac_override = true }, false);
+    const c = ap.credsFor(.{ .uid = 1000, .gid = 1000, .euid = 0, .egid = 0, .fsuid = 0, .fsgid = 0, .cap_dac_override = true, .permitted_dac_override = true }, false);
     try std.testing.expectEqual(@as(u32, 1000), c.euid);
-    try std.testing.expect(!c.cap_dac_override); // privilege belongs to the effective identity
-    const e = ap.credsFor(.{ .uid = 1000, .gid = 1000, .euid = 0, .egid = 0, .cap_dac_override = true }, true);
+    try std.testing.expect(!c.cap_dac_override); // a non-root real uid gets no capabilities
+    const e = ap.credsFor(.{ .uid = 1000, .gid = 1000, .euid = 0, .egid = 0, .fsuid = 0, .fsgid = 0, .cap_dac_override = true, .permitted_dac_override = true }, true);
     try std.testing.expectEqual(@as(u32, 0), e.euid);
     try std.testing.expect(e.cap_dac_override);
-    const same = ap.credsFor(.{ .uid = 5, .gid = 6, .euid = 5, .egid = 6, .cap_dac_override = true }, false);
-    try std.testing.expect(same.cap_dac_override); // ids agree: nothing to drop
+    const same = ap.credsFor(.{ .uid = 0, .gid = 0, .euid = 0, .egid = 0, .fsuid = 0, .fsgid = 0, .cap_dac_override = false, .permitted_dac_override = true }, false);
+    try std.testing.expect(same.cap_dac_override); // real root: the permitted set
 
     try std.testing.expectEqual(@as(i64, 0), ap.checkFlags(0).err_or_zero());
     try std.testing.expect(ap.checkFlags(0x200).effective);
@@ -11487,7 +11534,7 @@ test "/proc/<pid>/status is rendered by pid_status.zig from one snapshot of the 
     const ps = kt.procfs_source;
     try std.testing.expect(std.mem.indexOf(u8, ps, "return ps.render(buf, max_len, st);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ps, ".umask = tt.fsctx().umask,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ps, ".uid = .{ tt.uid, tt.euid, tt.suid, tt.euid },") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ps, ".uid = .{ tt.uid, tt.euid, tt.suid, tt.fsuid },") != null);
     try std.testing.expect(std.mem.indexOf(u8, ps, "if (tt.is_thread and m.tid == tgid and !m.is_thread) ppid = m.parent_tid;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ps, "ps.stateOf(tt.state == .zombie, tt.stopped, tt.state == .blocked)") != null);
     try std.testing.expect(std.mem.indexOf(u8, ps, "pid_status.zig\").stateOf(t.state == .zombie, t.stopped, t.state == .blocked).letter()") != null);

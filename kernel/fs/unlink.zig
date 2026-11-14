@@ -26,12 +26,12 @@ fn copyPath(path_ptr: u64, buf: *[256]u8) PathCopy {
 
 fn tmpfsCaller() ?@import("../fs/tmpfs.zig").Remover {
     const cur = sched.currentTask() orelse return null;
-    return .{ .euid = cur.euid, .egid = cur.egid, .effective_caps = cur.effective_caps };
+    return .{ .euid = cur.fsuid, .egid = cur.fsgid, .effective_caps = cur.effective_caps };
 }
 
 fn caller() ?@import("../fs/ext2.zig").Who {
     const cur = sched.currentTask() orelse return null;
-    return .{ .euid = cur.euid, .egid = cur.egid, .cap_fowner = cur.effective_caps.cap_fowner, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] };
+    return .{ .euid = cur.fsuid, .egid = cur.fsgid, .cap_fowner = cur.effective_caps.cap_fowner, .cap_dac_override = cur.effective_caps.cap_dac_override, .groups = cur.groups[0..cur.ngroups] };
 }
 
 /// unlink(path_ptr) -> 0 or -errno.

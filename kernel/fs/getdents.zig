@@ -39,7 +39,7 @@ pub fn getdents64(fd: u32, buf_ptr: u64, buf_size: u64) i64 {
 
     // tmpfs directory
     if (desc.fd_type == .tmpfs_file) {
-        return getdents64Tmpfs(desc, buf_ptr, buf_size, cur.euid, cur.egid, cur.effective_caps);
+        return getdents64Tmpfs(desc, buf_ptr, buf_size, cur.fsuid, cur.fsgid, cur.effective_caps);
     }
 
     // procfs directories (/proc and /proc/<pid>) and the synthetic directories above mount points

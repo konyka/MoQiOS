@@ -438,7 +438,7 @@ pub fn setLease(fd: u64, arg: u64) i64 {
     if (@import("dir_ops.zig").descriptorKind(desc) == .directory or leaseIsDir(desc)) return EINVAL;
     if (arg != lp.RDLCK and arg != lp.WRLCK and arg != lp.UNLCK) return EINVAL;
     const file_uid = leaseOwnerUid(desc) orelse return EINVAL;
-    const may = lp.mayLease(file_uid, t.euid, t.effective_caps.cap_lease);
+    const may = lp.mayLease(file_uid, t.fsuid, t.effective_caps.cap_lease);
     if (may != 0) return may;
     if (!leaseable(desc)) return EINVAL;
     const key = lockKey(desc) orelse return EINVAL;
