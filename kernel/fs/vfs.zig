@@ -1729,21 +1729,37 @@ pub const FdTable = struct {
                 return -2; // ENOENT
             }
 
-            // The memory map and the descriptor table of another user's process need ptrace access to it (EACCES otherwise); see
-            // procfs_policy.zig.
+            // The memory map needs ptrace read access with the fs ids, the descriptor directory the target's effective uid or
+            // CAP_DAC_OVERRIDE (EACCES otherwise); see procfs_policy.zig. `euid` and `egid` are the caller's fs ids here.
             if (pfile == .pid_maps or pfile == .fd_dir) {
                 const task_mod = @import("../proc/task.zig");
-                var same_user = false;
+                const procfs_policy = @import("procfs_policy.zig");
+                var target: ?procfs_policy.Target = null;
                 var i: u32 = 0;
                 while (i < task_mod.MAX_TASKS) : (i += 1) {
                     if (task_mod.getTask(i)) |t| {
                         if (t.tid == pid) {
-                            same_user = t.euid == euid;
+                            target = .{
+                                .tgid = if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid,
+                                .uid = t.uid,
+                                .euid = t.euid,
+                                .suid = t.suid,
+                                .gid = t.gid,
+                                .egid = t.egid,
+                                .sgid = t.sgid,
+                            };
                             break;
                         }
                     }
                 }
-                if (@import("procfs_policy.zig").pidFile(true, same_user, effective_caps.cap_sys_ptrace) == .deny) {
+                const caller: procfs_policy.Caller = .{
+                    .tgid = @intCast(@max(@import("../proc/process_mgmt.zig").getpid(), 0)),
+                    .fsuid = euid,
+                    .fsgid = egid,
+                    .cap_sys_ptrace = effective_caps.cap_sys_ptrace,
+                    .cap_dac_override = effective_caps.cap_dac_override,
+                };
+                if (procfs_policy.pidFile(if (pfile == .pid_maps) .maps else .fd_dir, caller, target) == .deny) {
                     self.freeFd(slot);
                     return -13; // EACCES
                 }

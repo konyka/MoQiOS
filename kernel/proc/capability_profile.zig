@@ -140,6 +140,11 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // fsuid away from 0 visibly drops the latter from CapEff and an unprivileged child sees the setfsuid refusals.
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_setuid = true, .cap_setgid = true, .cap_dac_override = true, .cap_fowner = true, .cap_chown = true }, .initial_init = false };
     }
+    if (std.mem.eql(u8, name, "hello329")) {
+        // /proc/<pid>/maps and fd access test: root holding the id capabilities plus CAP_SYS_PTRACE and CAP_DAC_OVERRIDE, so observers
+        // can keep exactly one of the latter two with capset.
+        return .{ .uid = 0, .gid = 0, .caps = .{ .cap_setuid = true, .cap_setgid = true, .cap_sys_ptrace = true, .cap_dac_override = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello179")) {
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_admin = true, .cap_setuid = true }, .initial_init = false };
     }

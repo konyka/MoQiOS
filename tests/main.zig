@@ -11409,10 +11409,14 @@ test "procfs: /proc/self is the caller's pid and every procfs miss is ENOENT" {
 }
 
 test "procfs: another user's maps needs ptrace access and the open path enforces it" {
-    // hello253: any process could read any other process's /proc/<pid>/maps (its memory layout).
+    // hello253: any process could read any other process's /proc/<pid>/maps (its memory layout). hello329: the check compared only
+    // the effective uid; it now passes the target's three uids and gids, the caller's thread group and fs ids, and CAP_DAC_OVERRIDE
+    // for the fd directory.
     const src = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, src, "if (pfile == .pid_maps or pfile == .fd_dir) {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, src, "@import(\"procfs_policy.zig\").pidFile(true, same_user, effective_caps.cap_sys_ptrace) == .deny") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "procfs_policy.pidFile(if (pfile == .pid_maps) .maps else .fd_dir, caller, target) == .deny") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, ".cap_dac_override = effective_caps.cap_dac_override,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, ".suid = t.suid,") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "return -13; // EACCES") != null);
 }
 

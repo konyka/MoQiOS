@@ -2202,6 +2202,7 @@ const SysCap = packed struct {
   r/e/s 中原本有 0、变化后都不为 0 → 清空 permitted 和 effective；euid 0→非 0 → 清空 effective；euid 非 0→0 → effective 恢复为
   permitted。real uid 变化时 RLIMIT_NPROC 的按 uid 计数随之迁移。
 - `setfsuid`/`setfsgid`（原生 504/505，hello328）：`Task.fsuid`/`fsgid` 是所有文件系统权限检查和新文件属主用的 id，每次有效 id 变化和 execve 时设成有效 id，fork 继承；setresuid/setresgid 全部参数不变（给出的 euid 也等于 fsuid）时不动它。`cred_policy.setFs`：新 id 必须是 real/effective/saved/当前 fs id 之一，否则要 `CAP_SETUID`/`CAP_SETGID`；调用总是返回旧值。fsuid 0→非 0 时从有效集去掉 CHOWN、MKNOD、DAC_OVERRIDE、FOWNER，回到 0 时从 permitted 补回（`capsAfterFsuidChange`）。`current_groups.forCaller` 按 fs id 匹配。`/proc/<pid>/status` 的 Uid/Gid 第四栏是 fs id。
+- `/proc/<pid>/maps` 与 `/proc/<pid>/fd`（`fs/procfs_policy.zig`，hello329）：maps 按 Linux `__ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`，同一线程组放行，否则调用者 fsuid 要等于目标的 uid/euid/suid、fsgid 要等于 gid/egid/sgid，或持有 `CAP_SYS_PTRACE`；fd 目录按 0500、属主为目标 euid 判定，fsuid 等于目标 euid 或持有 `CAP_DAC_OVERRIDE` 放行，同一线程组总是放行。拒绝时 `EACCES`。没有 dumpable 标志。
 - 特权只看 capability，不看 uid：文件 DAC（ext2/tmpfs/只读卷，`fs/dac.zig`、`fs/rofs_access_policy.zig`）用 `CAP_DAC_OVERRIDE`，
   chmod/sticky 目录删除用 `CAP_FOWNER`，chown 用 `CAP_CHOWN`，SysV IPC 用 `CAP_SYS_ADMIN`，POSIX MQ unlink 用 `CAP_DAC_OVERRIDE`，
   nice/调度用 `CAP_SYS_NICE`，kcmp 用 `CAP_SYS_PTRACE`。root 启动时持有全部 capability，因此行为不变；用 `capset` 或降权丢掉

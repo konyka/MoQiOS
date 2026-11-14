@@ -7123,7 +7123,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 ### 其他用户进程的 /proc/<pid>/maps（hello253 续，已修）
 
 - 发现方式：写 `/proc/self` 的文档时记下"任何进程能读任何进程的 `maps`"，随后核对：宿主机 Linux 实测，非特权用户读 root 进程的 `/proc/1/maps` 是 `EACCES`（读内存布局需要对目标的 ptrace 访问权），而 `status`、`stat`、`cmdline` 能打开；自己的进程全部能打开。这个内核没有任何检查，等于把每个进程的地址空间布局（ASLR 位置、堆栈、库映射）泄露给所有用户。
-- 修改：新增纯策略 `fs/procfs_policy.zig`（`pidFile(names_maps, same_user, ptrace_cap)`，只有"别的用户的 `maps` 且没有 `CAP_SYS_PTRACE`"才拒绝，加一个 host 单元测试）；`vfs.zig` 的 procfs 打开分支在 `pfile == .pid_maps` 时按目标 `tid == pid` 找到任务比较有效 uid，拒绝时返回 `-13`（`EACCES`）。
+- 修改（hello329 一节已重写这条策略）：新增纯策略 `fs/procfs_policy.zig`（`pidFile(names_maps, same_user, ptrace_cap)`，只有"别的用户的 `maps` 且没有 `CAP_SYS_PTRACE`"才拒绝，加一个 host 单元测试）；`vfs.zig` 的 procfs 打开分支在 `pfile == .pid_maps` 时按目标 `tid == pid` 找到任务比较有效 uid，拒绝时返回 `-13`（`EACCES`）。
 - 红灯：hello253 新增两项，第一项（root 父进程、`setuid(1000)` 的子进程读父进程的 `maps`）修改前 `denied 0`。
 - **探针设计上踩的两个坑（如实）**：①这个内核里普通探针本来就是 uid 1000，没有 `CAP_SETUID`，子进程 `setuid(1000)` 之后和父进程是**同一个用户**，所以"另一个用户"的场景造不出来——我加了一段临时串口诊断才看清（`same_user=yes`，目标 euid 与调用者都是 1000），诊断已删除；正确做法是仿照 hello115/119/123/126，在 `capability_profile.zig` 里让 hello253 以 root + 仅 `CAP_SETUID` 启动，子进程再降到 1000。②第一次我写的诊断用了不存在的 `serial.writeDecimal`，编译失败，改用 `lib/fmt.zig` 的函数。
 - 绿灯：hello253 共 8 项通过（拒绝项 `denied 1`，同用户的 `status`/自己的 `maps` 仍能打开）；host 1068/1068。
@@ -8981,7 +8981,35 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：SMP=1、4、4、2 四份并行，全部 EXIT=0、0 FAIL，每份都有 `hello328: PASS`，access 相关的 hello126、hello114 也都 PASS，`corrupted canaries=0`；riscv64、aarch64 smoke 通过。
 - 局限：
   1. SysCap 没有 DAC_READ_SEARCH、FSETID、MAC_OVERRIDE，这几位本来就不存在，所以 `FS_CAPS` 只含四位。
-  2. 进程间的权限检查（kill、kcmp、调度、ptrace 风格的 `/proc/<pid>` 访问、SysV IPC）仍用 euid，和 Linux 一致；`/proc/<pid>/maps` 这类 `PTRACE_MODE_FSCREDS` 检查在 Linux 上用 fsuid，这里仍用 euid。
+  2. 进程间的权限检查（kill、kcmp、调度、ptrace 风格的 `/proc/<pid>` 访问、SysV IPC）仍用 euid，和 Linux 一致；`/proc/<pid>/maps` 这类 `PTRACE_MODE_FSCREDS` 检查在 Linux 上用 fsuid，这里仍用 euid。（hello329 一节已改：maps 按完整的 ptrace 规则、fd 目录按属主和 `CAP_DAC_OVERRIDE`，都用 fs id）
   3. 套接字凭证（SO_PEERCRED、UDP/TCP 端口共享的属主）仍用 euid；unix 套接字绑定路径时创建的文件没有属主，不受影响。
   4. 仍然没有用户命名空间，setfsuid 不做 `make_kuid` 映射，所以超出映射范围的 id 不会被拒绝。
   5. 只有 x86_64 分发 504/505；riscv64、aarch64 没有这两个调用。
+
+### /proc/<pid>/maps 与 /proc/<pid>/fd 的访问检查（hello329，已修）
+
+- 问题：hello253 加的检查只比较调用者的 fsuid（hello328 之前是 euid）和目标的 euid，`maps` 和 `fd` 用同一条规则，`CAP_SYS_PTRACE` 两者都放行。和 Linux 的差别：
+  - 目标的真实 uid 或 saved uid 是 0（典型是 setuid 程序降权后），或任何一个 gid 和调用者的 fsgid 不同时，Linux 拒绝读 `maps`，这里放行，会泄露这类进程的地址空间布局。
+  - `CAP_DAC_OVERRIDE` 能打开别人的 `fd` 目录，这里拒绝；只有 `CAP_SYS_PTRACE` 时 Linux 拒绝 `fd`，这里放行。
+  - 进程自己的 `maps`、`fd` 在 fsuid 改成别的 id 后被拒绝（同一线程组本应总是放行）。
+- Linux 依据：
+  - `fs/proc/task_mmu.c` 的 `proc_maps_open` → `proc_mem_open` → `mm_access(PTRACE_MODE_READ_FSCREDS)`；`kernel/ptrace.c` 的 `__ptrace_may_access`：同一线程组直接放行；否则调用者的 fsuid 必须同时等于目标的 uid、euid、suid，fsgid 必须同时等于目标的 gid、egid、sgid，或者持有 `CAP_SYS_PTRACE`。
+  - `fs/proc/base.c`：`fd` 目录模式 0500，属主由 `task_dump_owner` 定为目标的 euid/egid；`fs/proc/fd.c` 的 `proc_fd_permission` 先做普通 DAC 检查（fsuid 是属主，或持有 `CAP_DAC_OVERRIDE`），失败时同一线程组仍然放行。
+- 宿主机实测（`unshare --map-auto --map-root-user`，探针 `/tmp/pm2.c`，再以 `gcc -DHOST` 跑 `user/hello329.c`，A–K 全过；目标进程调用 `PR_SET_DUMPABLE` 抵消 setresuid 带来的 non-dumpable）：
+  - A 双方都是 1000：maps、fd 都能打开。
+  - B 目标 saved uid 0、C 目标真实 uid 0、D 目标 saved gid 0、E 目标 egid 不同：maps 是 EACCES，fd 能打开。
+  - F 无 capability 的 root：两者 EACCES；G 同上但 fsuid 1000：两者都能打开。
+  - H 只有 `CAP_SYS_PTRACE`：maps 能打开，fd 是 EACCES；I 只有 `CAP_DAC_OVERRIDE`：maps 是 EACCES，fd 能打开。
+  - K 自己的进程（root、fsuid 1000、无 capability）：两者都能打开。
+- 红灯：内核改动 stash 掉、只保留 hello329 的启动 profile，定向 SMP=2：B、C、D、E、H、I、K 失败（B–E 的 maps 被放行；H 的 fd 被放行；I 的 fd 被拒绝；K 的两项都被拒绝）。
+- 修复：
+  - `kernel/fs/procfs_policy.zig` 重写：`pidFile(file, caller, target)`，`File` 区分 `maps`、`fd_dir`、`other`；`Caller` 带线程组号、fsuid、fsgid、`CAP_SYS_PTRACE`、`CAP_DAC_OVERRIDE`；`Target` 带线程组号和三组 uid、gid。找不到目标任务时只有对应的 capability 放行。
+  - `kernel/fs/vfs.zig` 的 procfs 打开分支按 `tid == pid` 填 `Target`（线程报告所属进程的线程组号），调用者线程组用 `getpid()`。
+  - `kernel/proc/capability_profile.zig`：hello329 以 root 启动，持有 SETUID、SETGID、SYS_PTRACE、DAC_OVERRIDE。
+  - `tests/main.zig`：源码形状单测跟着新调用改写；`procfs_policy.zig` 新增五条宿主机单测。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份，hello329 A–K 全过；`zig build test` 通过。
+- 完整 smoke：SMP=1、SMP=4 两份、SMP=2 共四份，三份 EXIT=0、0 FAIL；SMP=2 那份 hello286 J 的组停止计数 41/60 失败（已记录的偶发项，与本修改无关），单独重跑 SMP=2 一份 EXIT=0、0 FAIL。四份里 hello329 都通过，`corrupted canaries=0`。riscv64、aarch64 smoke 通过。
+- 局限：
+  1. MoQiOS 没有 dumpable 标志。Linux 上 setuid 降权后进程变成 non-dumpable，`fd` 目录属主变成 root，`maps` 还要求 `CAP_SYS_PTRACE`；这里这类进程的 `fd` 仍按 euid 判定。
+  2. `fd` 目录只做属主和 `CAP_DAC_OVERRIDE` 检查，没有 `CAP_DAC_READ_SEARCH`（SysCap 没有这一位），组和其他人位按 0500 固定为无权限。
+  3. `/proc/<pid>/fd/N` 的 readlink 只支持 `/proc/self/fd/N`，不经过这条检查；`environ`、`mem` 这些同样需要 ptrace 访问的文件本来就不存在。
