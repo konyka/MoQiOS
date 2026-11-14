@@ -8510,3 +8510,4 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 如实的局限：
   1. 这不是 Linux 的 `self_exec_id` 本身（那个计数还用于判断父进程 exec 后 `SIGCHLD`/`pdeath_signal` 是否还该发）；只覆盖了定时器和 `mq_notify` 这两个开放项。
   2. `timerfd`、`alarm`/`setitimer(ITIMER_REAL)` 在 Linux 上 exec 后保留（前者是描述符，后者按 POSIX 继承），本节没有改动它们。
+- CI 记录（如实）：上一个纯文档提交 `4991801` 的 CI 在 SMP=2 冒烟里 1500 秒超时。失败步骤打印的串口尾部显示最后启动的是 hello21（ext2 写入测试，init 里倒数第一个），停在 `hello21: create=3` 之后，`write=` 没有出现，没有 panic；完成的探针数是 468（本地完整 smoke 是 469）。同样代码的 `0365e24` CI 两个冒烟都通过，本地这次四份 smoke 的 hello21 都通过。CI 没有保留完整串口日志和寄存器转储，卡在哪个块设备、哪一行无法确认；文档前面记录过停在下一次落盘处的 NVMe 中断等待竞态（已修），这次是否同类没有证据。记为新的偶发项：hello21 在 CI SMP=2 上写盘时卡住，根因未查清。
