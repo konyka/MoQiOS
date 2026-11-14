@@ -14,7 +14,6 @@ const mq_timeout_policy = @import("posix_mq_policy.zig");
 const attr_policy = @import("posix_mq_attr_policy.zig");
 const receive_policy = @import("posix_mq_receive_policy.zig");
 const priority_policy = @import("posix_mq_priority_policy.zig");
-const owner_gen_policy = @import("owner_gen_policy.zig");
 const wait_policy = @import("posix_mq_wait_policy.zig");
 const descriptor_policy = @import("posix_mq_descriptor_policy.zig");
 
@@ -57,22 +56,15 @@ pub const MqQueue = struct {
     /// Open references (mq_open). The slot is freed only when an unlinked,
     /// drained queue's last reference is dropped via mq_close.
     open_count: u32 = 0,
-    /// Notification registered (pid of notifier, 0 = none)
-    notify_pid: u32 = 0,
-    /// Task that registered mq_notify, and the requested signal number
-    /// (delivered once when a message arrives on an empty queue).
-    notify_task_idx: ?u32 = null,
-    /// Tid of the registering task — a slot INDEX alone aliases after the
-    /// registrant exits and its slot is recycled; the tid match proves
-    /// identity at delivery time.
-    notify_tid: u32 = 0,
+    /// The process that registered mq_notify, by thread group id (0 = none), and the requested signal number (delivered once when a
+    /// message arrives on an empty queue). Linux keeps task_tgid: the registration belongs to the process, not to the thread that
+    /// made it. Tids are never reused, so the id names that process for as long as it lives.
+    notify_tgid: u32 = 0,
     notify_signo: i32 = 0,
     /// sigev_value registered with mq_notify; delivered as si_value of the SI_MESGQ signal.
     notify_value: u64 = 0,
     /// sigev_notify (SIGEV_SIGNAL or SIGEV_NONE). SIGEV_NONE is a real registration that sends nothing.
     notify_kind: u32 = 0,
-    /// The open description the registration was made through. Closing it removes the registration (Linux mqueue_flush_file).
-    notify_desc_idx: u32 = 0,
     /// Senders blocked on a full queue (mq_timedsend without O_NONBLOCK)
     send_waiters: ?*task.MqWaiter = null,
     send_waiters_tail: ?*task.MqWaiter = null,
@@ -473,15 +465,12 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
     q.gid = creds.egid;
     q.mode = (mode & 0o777) & ~(umask_val & 0o777);
     q.open_count = 0;
-    q.notify_pid = 0;
-    q.notify_task_idx = null;
-    q.notify_tid = 0;
+    q.notify_tgid = 0;
     q.notify_signo = 0;
     q.notify_value = 0;
+    q.notify_kind = 0;
 
     // Apply optional attributes (only honored at creation)
-    q.notify_kind = 0;
-    q.notify_desc_idx = 0;
     if (create_requested and attr_ptr != 0) {
         q.max_msg = @intCast(maxmsg);
         q.msg_size = @intCast(msgsize);
@@ -668,33 +657,13 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
         // mq_notify: a message arriving on an empty queue (with no blocked
         // receiver about to consume it) delivers the registered signal once;
         // Linux requires re-arming via another mq_notify.
-        if (commit_q.?.count == 1 and commit_q.?.recv_waiters == null and commit_q.?.notify_task_idx != null) {
-            const notify_idx = commit_q.?.notify_task_idx.?;
-            const notify_tid = commit_q.?.notify_tid;
+        var notice: ?struct { tgid: u32, signo: u32, value: u64 } = null;
+        if (commit_q.?.count == 1 and commit_q.?.recv_waiters == null and commit_q.?.notify_tgid != 0) {
             const notify_signo = commit_q.?.notify_signo;
-            const notify_value = commit_q.?.notify_value;
-            const notify_kind = commit_q.?.notify_kind;
-            clearNotify(commit_q.?);
             // SIGEV_NONE, and SIGEV_SIGNAL with signal 0, are consumed here without a signal (Linux __do_notify).
-            if (descriptor_policy.notifySends(notify_kind, notify_signo) and notify_signo <= 64) {
-                if (task.getTask(notify_idx)) |nt| {
-                    // The slot may have been recycled after the registrant
-                    // exited — only signal if the tid still matches.
-                    if (owner_gen_policy.ownerMatches(notify_tid, nt.tid)) {
-                        // Linux __do_notify: SI_MESGQ, the sender's pid and uid, and the registered sigev_value.
-                        // An ignored signal the registrant does not block is still dropped (signal.ignoredAtSend).
-                        const signo: u32 = @intCast(notify_signo);
-                        const sender = sched.currentTask();
-                        const pid: u32 = if (sender) |st|
-                            (if (st.is_thread and st.parent_tid != 0) st.parent_tid else st.tid)
-                        else
-                            0;
-                        const uid: u32 = if (sender) |st| st.uid else 0;
-                        const info = @import("../proc/siginfo_policy.zig").mesgqInfo(pid, uid, notify_value);
-                        _ = @import("../proc/signal.zig").sendSignalInfo(nt.tid, signo, info);
-                    }
-                }
-            }
+            if (descriptor_policy.notifySends(commit_q.?.notify_kind, notify_signo) and notify_signo <= 64)
+                notice = .{ .tgid = commit_q.?.notify_tgid, .signo = @intCast(notify_signo), .value = commit_q.?.notify_value };
+            clearNotify(commit_q.?);
         }
 
         // Wake a receiver blocked on the empty queue
@@ -702,6 +671,16 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
 
         mq_lock.release(commit_flags);
         if (wake) |token| wakeTask(token);
+        if (notice) |n| {
+            // Linux __do_notify: SI_MESGQ, the sender's pid and uid, and the registered sigev_value, sent to the process
+            // (PIDTYPE_TGID): a thread that does not block it takes it. An ignored, unblocked signal is still dropped
+            // (signal.ignoredAtSend). Sent after mq_lock is released, as the process lookup takes task_lock.
+            const sender = sched.currentTask();
+            const pid: u32 = if (sender) |st| groupId(st) else 0;
+            const uid: u32 = if (sender) |st| st.uid else 0;
+            const info = @import("../proc/siginfo_policy.zig").mesgqInfo(pid, uid, n.value);
+            _ = @import("../proc/signal_syscall.zig").sendToProcessInfo(n.tgid, n.signo, info);
+        }
         return 0;
     }
 }
@@ -888,7 +867,7 @@ pub fn mqNotify(mqd: u32, notif_ptr: u64) i64 {
     const flags = mq_lock.acquire();
     defer mq_lock.release(flags);
 
-    const handle = descriptorHandle(owner_idx, mqd) orelse return EBADF;
+    _ = descriptorHandle(owner_idx, mqd) orelse return EBADF;
     const q = findQueueForDescription(owner_idx, mqd) orelse return EBADF;
 
     if (notif_ptr == 0) {
@@ -897,61 +876,60 @@ pub fn mqNotify(mqd: u32, notif_ptr: u64) i64 {
         return 0;
     }
 
-    if (q.notify_task_idx != null) return -16; // EBUSY
+    if (q.notify_tgid != 0) return -16; // EBUSY
 
-    // Register: one-shot, re-armed by another mq_notify after delivery.
-    q.notify_pid = 1;
-    q.notify_task_idx = sched.currentTaskIndex();
-    q.notify_tid = if (sched.currentTaskIndex()) |ci|
-        (if (task.getTask(ci)) |ct| ct.tid else 0)
-    else
-        0;
+    // Register: one-shot, re-armed by another mq_notify after delivery. The owner is the caller's process.
+    const caller = task.getTask(owner_idx) orelse return EBADF;
+    q.notify_tgid = groupId(caller);
     q.notify_signo = signo;
     q.notify_value = value;
     q.notify_kind = notify_kind;
-    q.notify_desc_idx = handle.desc_idx;
     return 0;
+}
+
+/// The thread group id of `t`: its own tid for a process, the creator's for a thread.
+fn groupId(t: *const task.Task) u32 {
+    return if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid;
 }
 
 /// The registration belongs to the caller's process: the registering task, or one that shares its thread group (Linux compares
 /// task_tgid). A forked child is its own process and does not qualify.
 fn notifyOwnedBy(q: *MqQueue, caller_idx: u32) bool {
-    const idx = q.notify_task_idx orelse return false;
-    const owner = task.getTask(idx) orelse return false;
+    if (q.notify_tgid == 0) return false;
     const caller = task.getTask(caller_idx) orelse return false;
-    if (!owner_gen_policy.ownerMatches(q.notify_tid, owner.tid)) return false;
-    const og = if (owner.is_thread and owner.parent_tid != 0) owner.parent_tid else owner.tid;
-    const cg = if (caller.is_thread and caller.parent_tid != 0) caller.parent_tid else caller.tid;
-    return og == cg;
+    return descriptor_policy.notifyOwner(q.notify_tgid, groupId(caller));
 }
 
 fn clearNotify(q: *MqQueue) void {
-    q.notify_pid = 0;
-    q.notify_task_idx = null;
-    q.notify_tid = 0;
+    q.notify_tgid = 0;
     q.notify_signo = 0;
     q.notify_value = 0;
     q.notify_kind = 0;
-    q.notify_desc_idx = 0;
 }
 
-/// Clear every mq_notify registration made by `task_idx`. Called from
-/// task.exitTask so an exited task's registration can't signal an unrelated
-/// task after its slot is recycled.
+/// Task `task_idx` is exiting: a process (not one of its threads) drops every mq_notify registration it holds, wherever it was
+/// made. A thread's exit leaves the process's registrations (Linux: the owner is the tgid, which outlives the thread).
 pub fn clearNotifyForTask(task_idx: u32) void {
+    const t = task.getTask(task_idx) orelse return;
+    if (!descriptor_policy.exitDropsNotify(t.is_thread)) return;
+    clearNotifyForProcess(t.tid);
+}
+
+/// Drop every mq_notify registration owned by process `tgid` (its exit, or its exec: Linux checks self_exec_id at delivery, so a
+/// registration from the old image never fires into the new one).
+pub fn clearNotifyForProcess(tgid: u32) void {
+    if (tgid == 0) return;
     const flags = mq_lock.acquire();
     defer mq_lock.release(flags);
-
     for (&queues) |*q| {
-        if (q.active and q.notify_task_idx != null and q.notify_task_idx.? == task_idx) {
-            q.notify_pid = 0;
-            q.notify_task_idx = null;
-            q.notify_tid = 0;
-            q.notify_signo = 0;
-            q.notify_value = 0;
-            q.notify_kind = 0;
-        }
+        if (q.active and q.notify_tgid == tgid) clearNotify(q);
     }
+}
+
+/// Exec of task `task_idx`: its process's registrations go.
+pub fn clearNotifyForExec(task_idx: u32) void {
+    const t = task.getTask(task_idx) orelse return;
+    clearNotifyForProcess(groupId(t));
 }
 
 /// mq_close(mqd) -> 0 or -errno.
@@ -975,7 +953,7 @@ pub fn mqClose(mqd: u32) i64 {
         return EBADF;
     }
     var wakes = WakeBatch{};
-    closeHandleLocked(owner_idx, handle.handle_idx, &wakes);
+    closeHandleLocked(owner_idx, handle.handle_idx, true, &wakes);
     mq_lock.release(flags);
     wakes.wake();
     return 0;
@@ -983,12 +961,14 @@ pub fn mqClose(mqd: u32) i64 {
 
 /// Release all MQ references held by an exiting task. Called before the task
 /// becomes a zombie so unlinked queues cannot retain dead open references.
+/// A thread's mirrored handles go without a flush: its process keeps the descriptors (Linux shares the file table).
 pub fn closeRefsForTask(task_idx: u32) void {
     if (task_idx >= task.MAX_TASKS) return;
+    const flush = if (task.getTask(task_idx)) |t| descriptor_policy.exitDropsNotify(t.is_thread) else true;
     var wakes = WakeBatch{};
     const flags = mq_lock.acquire();
     for (0..MAX_TASK_MQ_DESCRIPTORS) |handle_idx| {
-        if (task_handles[task_idx][handle_idx].open) closeHandleLocked(task_idx, @intCast(handle_idx), &wakes);
+        if (task_handles[task_idx][handle_idx].open) closeHandleLocked(task_idx, @intCast(handle_idx), flush, &wakes);
     }
     mq_lock.release(flags);
     wakes.wake();
@@ -1107,18 +1087,24 @@ fn openDescription(queue_idx: u32, q: *MqQueue, owner_idx: u32, oflag: u32) i64 
     return @intCast(descriptor_policy.tokenValue(handle_idx.?));
 }
 
-fn closeHandleLocked(task_idx: u32, handle_idx: u32, wakes: *WakeBatch) void {
+/// `flush`: the close is a flush by task `task_idx`'s process (close, exec's close-on-exec, process exit), not a thread's
+/// mirrored handle going away at its exit.
+fn closeHandleLocked(task_idx: u32, handle_idx: u32, flush: bool, wakes: *WakeBatch) void {
     const handle = &task_handles[task_idx][handle_idx];
     if (!handle.open) return;
     const desc_idx = handle.desc_idx;
     const desc = &descriptions[desc_idx];
     handle.* = .{};
+    // Linux mqueue_flush_file: any close of a descriptor of the queue by the process that owns the registration removes it,
+    // whichever descriptor it was made through (a dup, another open). A forked child is another process and leaves it.
+    if (flush and desc.queue_idx < MAX_QUEUES) {
+        const fq = &queues[desc.queue_idx];
+        const closer = task.getTask(task_idx);
+        if (fq.active and closer != null and descriptor_policy.notifyOwner(fq.notify_tgid, groupId(closer.?))) clearNotify(fq);
+    }
     if (desc.refs > 0) desc.refs -= 1;
     if (desc.refs == 0) {
         const q = &queues[desc.queue_idx];
-        // Linux mqueue_flush_file: closing the descriptor the registration was made on removes it. A fork shares the
-        // description, so the registration survives until the last reference closes.
-        if (q.notify_task_idx != null and q.notify_desc_idx == desc_idx) clearNotify(q);
         q.open_count -|= 1;
         if (q.marked_removed and q.open_count == 0) freeQueue(q, wakes);
         desc.* = .{};
@@ -1132,7 +1118,7 @@ pub fn closeCloexecForTask(task_idx: u32) void {
     const flags = mq_lock.acquire();
     for (0..MAX_TASK_MQ_DESCRIPTORS) |i| {
         const h = task_handles[task_idx][i];
-        if (h.open and descriptions[h.desc_idx].cloexec) closeHandleLocked(task_idx, @intCast(i), &wakes);
+        if (h.open and descriptions[h.desc_idx].cloexec) closeHandleLocked(task_idx, @intCast(i), true, &wakes);
     }
     mq_lock.release(flags);
     wakes.wake();

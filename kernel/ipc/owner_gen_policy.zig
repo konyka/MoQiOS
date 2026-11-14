@@ -1,7 +1,8 @@
 //! Owner-identity generation check for task-slot registrations.
 //!
-//! posix_timer and posix_mq record the raw task SLOT INDEX of the
-//! registering task (owner_task_idx / notify_task_idx). After the owner
+//! posix_timer records the raw task SLOT INDEX of the creating task
+//! (owner_task_idx); posix_mq keys mq_notify on the owner's thread group id
+//! instead and does not need this check. After the owner
 //! exits and reapZombies recycles the slot, an unrelated new task occupies
 //! it: getTask() proves occupancy, not identity. Recording the owner's tid
 //! (monotonically increasing, never reused while the kernel runs) alongside

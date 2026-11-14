@@ -69,6 +69,18 @@ pub fn notifyUnregister(caller_owns: bool) enum { removed, kept } {
     return if (caller_owns) .removed else .kept;
 }
 
+/// The registration is owned by process `owner_tgid` (0: none): is the caller's process `caller_tgid` that owner? Linux
+/// compares task_tgid in do_mq_notify (NULL removes it) and mqueue_flush_file (a close by the owner removes it).
+pub fn notifyOwner(owner_tgid: u32, caller_tgid: u32) bool {
+    return owner_tgid != 0 and owner_tgid == caller_tgid;
+}
+
+/// Does a task's exit drop its process's registrations? Only the process's own exit: a thread shares the descriptors and the
+/// owner (the tgid) outlives it.
+pub fn exitDropsNotify(exiting_is_thread: bool) bool {
+    return !exiting_is_thread;
+}
+
 /// Linux __do_notify: SIGEV_NONE sends nothing, and SIGEV_SIGNAL with signo 0 is accepted (valid_signal allows 0) but skipped at
 /// delivery. Either way the first message consumes the registration.
 pub fn notifySends(kind: u32, signo: i32) bool {
@@ -90,6 +102,11 @@ test "MQ descriptor policy isolates access and exec flags" {
     try std.testing.expect(sigevNotifyValid(SIGEV_NONE));
     try std.testing.expect(!sigevNotifyValid(SIGEV_THREAD));
     try std.testing.expect(notifyUnregister(true) == .removed);
+    try std.testing.expect(notifyOwner(41, 41));
+    try std.testing.expect(!notifyOwner(41, 42));
+    try std.testing.expect(!notifyOwner(0, 0));
+    try std.testing.expect(exitDropsNotify(false));
+    try std.testing.expect(!exitDropsNotify(true));
     try std.testing.expect(notifyUnregister(false) == .kept);
     try std.testing.expect(notifySends(SIGEV_SIGNAL, 10));
     try std.testing.expect(!notifySends(SIGEV_SIGNAL, 0));

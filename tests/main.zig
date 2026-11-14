@@ -1093,7 +1093,24 @@ test "POSIX MQ notify registration is exclusive" {
     try std.testing.expect(std.mem.indexOf(u8, kt.posix_mq_source, "sigevNotifyValid(notify_kind)") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.posix_mq_source, "return -16") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.posix_mq_source, "notifyOwnedBy(q, owner_idx)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.posix_mq_source, "descriptor_policy.notifySends(notify_kind, notify_signo)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.posix_mq_source, "descriptor_policy.notifySends(commit_q.?.notify_kind, notify_signo)") != null);
+}
+
+test "an mq_notify registration belongs to the process: closes by the owner flush it, threads neither own nor drop it" {
+    const src = kt.posix_mq_source;
+    // The owner is the thread group id, not the registering task slot.
+    try std.testing.expect(std.mem.indexOf(u8, src, "q.notify_tgid = groupId(caller);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "notify_task_idx") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "notify_desc_idx") == null);
+    // Any close of the queue by the owning process removes it (mqueue_flush_file); a thread's exit does not flush.
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (fq.active and closer != null and descriptor_policy.notifyOwner(fq.notify_tgid, groupId(closer.?))) clearNotify(fq);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (!descriptor_policy.exitDropsNotify(t.is_thread)) return;") != null);
+    // The signal is process-directed and sent after mq_lock is released.
+    try std.testing.expect(std.mem.indexOf(u8, src, "sendToProcessInfo(n.tgid, n.signo, info)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "posix_mq.zig\").clearNotifyForExec(task_idx);") != null);
+    try std.testing.expect(posix_mq_descriptor_policy.notifyOwner(7, 7));
+    try std.testing.expect(!posix_mq_descriptor_policy.notifyOwner(0, 0));
+    try std.testing.expect(!posix_mq_descriptor_policy.exitDropsNotify(true));
 }
 
 test "POSIX MQ getsetattr invalid descriptor releases the lock" {

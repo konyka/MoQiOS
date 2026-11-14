@@ -8196,7 +8196,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - D 在旧内核上碰巧通过：同一进程的 `mq_notify(NULL)` 本来就会清掉注册。
 - 实现：
   - `kernel/ipc/posix_mq_descriptor_policy.zig`：`sigevNotifyValid` 接受 `SIGEV_NONE`（1），仍拒绝 `SIGEV_THREAD`（2）；`notifyUnregister` 只在调用者拥有注册时移除；`notifySends` 只在 `SIGEV_SIGNAL` 且信号号大于 0 时为真。宿主机测试并入原有一条。
-  - `kernel/ipc/posix_mq.zig`：记下 `notify_kind` 和做出注册的 open description。`mqNotify` 不再拒绝信号 0；`NULL` 经 `notifyOwnedBy`（注册者或其同线程组的任务，fork 出的子进程不算）才 `clearNotify`。投递前用 `notifySends` 决定发不发，不发也消耗注册。`closeHandleLocked` 在该 description 的最后一个引用关闭时，若注册是通过它做出的，就移除注册。
+  - `kernel/ipc/posix_mq.zig`：记下 `notify_kind` 和做出注册的 open description。`mqNotify` 不再拒绝信号 0；`NULL` 经 `notifyOwnedBy`（注册者或其同线程组的任务，fork 出的子进程不算）才 `clearNotify`。投递前用 `notifySends` 决定发不发，不发也消耗注册。`closeHandleLocked` 在该 description 的最后一个引用关闭时，若注册是通过它做出的，就移除注册。（hello332 一节改为：属主进程的任何一次关闭都移除注册，注册按线程组 id 记）
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份（日志开头 `spawned hello2`、`spawned hello294`）全部通过：A `EBUSY` -16、无信号 -11、消耗后可再注册；B 信号 0 注册成功、无信号、被消耗；C 子进程状态 `0x0`，父进程仍收到信号 10；D、E 注销后都是 -11。`zig build` 通过。
 - 完整 smoke：四份并行（SMP 1/4/4/2）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello294 都是 PASS。hello286、hello288、hello290、hello291、hello292、hello293 都通过。
 - 如实的局限：
@@ -9073,3 +9073,35 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   2. 在 fd 0 上调用 `close()` 仍然不会真正关闭它，只是交回共享的描述，`O_ASYNC` 随之清除。
   3. 只有开过 `O_ASYNC` 的标准描述符才在 fork 时共享描述；没开过的仍是私有拷贝，在一个进程里改 `O_NONBLOCK` 不影响另一个进程。
   4. hello326 的其余局限（没有 POLL_OUT、没有 canonical 行规程、只有 x86_64 有控制台输入）不变。
+
+### mq_notify 的注册属于进程（hello332，已修）
+
+- 问题：注册记的是做出注册的任务槽位和那个 open description。
+  - 属主进程关闭同一队列的另一个描述符（另一次 `mq_open`、dup 的副本）时，注册没被移除；Linux 上属主的任何一次关闭都会移除。
+  - 属主的线程关闭队列的描述符时，注册也没被移除。
+  - 线程做出注册后退出时，`clearNotifyForTask` 按任务槽位把注册清掉了；Linux 上注册属于进程，线程退出后仍在。
+  - 信号用 `sendSignalInfo` 发给做出注册的那个线程。那个线程阻塞这个信号时，别的线程拿不到。
+- Linux 依据：`3rd/linux-7.0.6/ipc/mqueue.c`。`do_mq_notify`（约 1276–1365 行）把属主记为 `get_pid(task_tgid(current))`；`mqueue_flush_file`（约 658 行）在关闭时只要 `task_tgid(current) == info->notify_owner` 就 `remove_notification`，不管是哪个描述符；`__do_notify`（约 789–823 行）用 `pid_task(info->notify_owner, PIDTYPE_TGID)` 找进程，`do_send_sig_info(…, PIDTYPE_TGID)` 发进程级信号。
+- 宿主机实测（探针 `/tmp/mqc.c`、`/tmp/mqt.c`，再以 `gcc -DHOST -pthread` 跑 `user/hello332.c`，连续 3 次 A–F 全过）：
+  - A 属主关闭同一队列的另一次 open，注册被移除。
+  - B fork 的子进程关闭继承的描述符和自己的 open，注册仍在。
+  - C 属主的线程关闭队列的一次 open，注册被移除。
+  - D 线程做出注册后退出，注册仍在，消息到达时主线程处理信号。
+  - E 做出注册的线程阻塞信号，主线程接到。
+  - F 子进程注册后退出，不留注册。
+- 红灯：内核未改，定向 SMP=2，hello332 的 A、C、D、E 失败，B、F 通过。A、C 关闭后注册仍在；D 的线程注册得到 EBUSY，是 C 留下的注册造成的连带失败；E 没有收到信号（只发给阻塞它的那个线程）。
+- 修复：
+  - `kernel/ipc/posix_mq.zig`：
+    - 队列的 `notify_pid`、`notify_task_idx`、`notify_tid`、`notify_desc_idx` 换成一个 `notify_tgid`（线程组 id，0 表示没有注册）。tid 不会重用，所以不再需要 `owner_gen_policy` 的槽位核对。
+    - `closeHandleLocked` 多一个 `flush` 参数：`close`、exec 的 close-on-exec、进程退出都算 flush，关闭者所在进程是属主就移除注册，不管是哪个描述符。线程退出时它镜像出来的句柄不算 flush。
+    - `clearNotifyForTask` 只在进程（非线程）退出时按 tgid 清注册；新增 `clearNotifyForProcess`、`clearNotifyForExec`，`execve` 改调后者，按进程清注册。
+    - 投递在释放 `mq_lock` 之后调用 `signal_syscall.sendToProcessInfo`，发进程级信号：被点名的线程阻塞时由别的线程接。
+  - `kernel/ipc/posix_mq_descriptor_policy.zig`：新增 `notifyOwner`、`exitDropsNotify`，宿主机测试并入原有一条。
+  - `kernel/proc/execve.zig`：改调 `clearNotifyForExec`。
+  - `kernel/ipc/owner_gen_policy.zig`：注释改为只有 posix_timer 用它。
+  - `tests/main.zig`：新增源码单测；「registration is exclusive」那条按新写法更新。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份，hello332 通过；同样定向跑 hello288、hello293、hello294（其他用 mq_notify 的测试），SMP=2、SMP=4 都通过；`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒）全部 `EXIT=0`、0 FAIL，四份都有 hello332 PASS 和 `hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
+- 局限：
+  1. `SIGEV_THREAD` 仍不支持：Linux 把 32 字节 cookie 送到一个 AF_NETLINK 套接字（宿主机实测：触发时最后一字节是 1，注销时是 2），这个内核没有 netlink 套接字。
+  2. mq 描述符仍是每个任务一份镜像（clone 时复制），不在 `FdTable` 里；线程关闭描述符只关自己那份镜像，其他线程手里的仍可用。Linux 上 CLONE_FILES 的线程共享同一张表。
