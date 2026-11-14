@@ -54,6 +54,28 @@ pub fn lengthOf(l: *const Lock) i64 {
     return if (n > std.math.maxInt(i64)) 0 else @intCast(n);
 }
 
+/// One blocked F_SETLKW: lock owner `owner` waits for a lock held by `waits_for` (0 = slot unused).
+pub const Wait = struct { owner: u64 = 0, waits_for: u64 = 0 };
+
+/// Linux MAX_DEADLK_ITERATIONS: how many owners deep the cycle search follows before it gives up and lets the caller wait.
+pub const MAX_DEADLK_ITERATIONS = 10;
+
+/// Linux posix_locks_deadlock: would `caller` waiting for `blocker` close a cycle? Follows what each blocking owner is itself
+/// waiting for; true when the chain comes back to `caller`.
+pub fn wouldDeadlock(caller: u64, blocker: u64, waits: []const Wait) bool {
+    var cur = blocker;
+    var i: usize = 0;
+    while (true) {
+        if (cur == caller) return true;
+        if (i > MAX_DEADLK_ITERATIONS) return false;
+        i += 1;
+        const next = for (waits) |w| {
+            if (w.owner != 0 and w.owner == cur) break w.waits_for;
+        } else return false;
+        cur = next;
+    }
+}
+
 pub fn Table(comptime N: usize) type {
     return struct {
         const Self = @This();

@@ -8535,10 +8535,27 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2 两份、SMP=4 一份 hello310 十二项全过；后两份同时跑了 hello290，也 PASS（日志开头 `spawned hello2`、`spawned hello310`、`spawned hello290`）。`zig build`、`zig build test` 通过。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒）全部 `EXIT=0`、0 FAIL，hello228 corrupted canaries 都是 0；四份里 hello310、hello290 都 PASS，hello187（`fcntl` 锁的 EFAULT 检查）也通过。`zig build -Darch=riscv64 smoke-riscv`、`zig build -Darch=aarch64 smoke-aarch64` 通过。
 - 如实的局限：
-  1. 没有死锁检测：两个进程交叉 `F_SETLKW` 时 Linux 返回 `EDEADLK`，这里两个都会一直等，直到被信号打断。
+  1. 没有死锁检测：两个进程交叉 `F_SETLKW` 时 Linux 返回 `EDEADLK`，这里两个都会一直等，直到被信号打断。（hello311 已修）
   2. 锁表固定 128 项，满了返回 `ENOLCK`。
   3. 偏移池（512 槽）满时 `flock` 返回 `ENOLCK`，Linux 不会。
   4. 等待仍是每 10 ms 重查一次，释放方会主动唤醒；没有 Linux 的阻塞者链表和公平性。
   5. K 段在红灯上通过，所以 FAT32 首簇 0 冲突这条只有代码层面的论证，没有目标机红灯证据：本内核的 `createFile` 会先分配首簇，只有从磁盘读到的空文件首簇才是 0。
   6. 没做 OFD 锁（`F_OFD_SETLK`）和 `F_SETLK64` 之外的变体，也没做租约（`F_SETLEASE`）。
+
+
+## 交叉的 `F_SETLKW` 永远互相等待，没有 `EDEADLK`（hello311，已修）
+
+- 起因：hello310 一节的局限 1。
+- Linux 依据：`3rd/linux-7.0.6/fs/locks.c` 1083–1124 行。`posix_locks_deadlock` 从挡住请求的锁出发，用 `what_owner_is_waiting_for` 沿着「这个属主又在等谁」往下找，找到请求者自己就返回 `EDEADLK`，超过 `MAX_DEADLK_ITERATIONS`（10）层就放弃，让请求者照常等待。
+- 宿主机实测：hello311（`gcc -DHOST`）A、B、C 全过，`taskset -c 0` 下同样通过。A 中先等的那个等了 300 ms，对方得到 `-35` 后退出，它随即拿到锁。
+- 红灯：未修改的内核（`7aeb9b2`）上定向 SMP=2（日志开头 `spawned hello2`、`spawned hello311`）：hello311 停在第一个 `fork` 之后，300 秒内既没有 PASS 也没有 FAIL，两个进程互相等待。
+- 实现：
+  - `kernel/fs/lock_table.zig` 新增 `Wait` 和 `wouldDeadlock`，规则和层数上限照搬 Linux；`tests/main.zig` 加了一个宿主机单测，覆盖两方环、三方环、等待自己、以及不含请求者的环（10 层后放弃）。
+  - `kernel/fs/file_lock.zig`：`waits[任务槽位]` 记录阻塞在 `F_SETLKW` 里的属主在等哪个属主，在 `fl_lock` 内读写。睡下之前先检查，会成环就返回 `EDEADLK`。`setLock` 用 `defer` 在每条返回路径上清掉自己的记录；致命信号走 `exitTask` 不会返回，所以在调用它之前单独清。
+- 绿灯：目标机定向 SMP=2 一份 hello311 PASS（A 等了 316 ms，B 等了 314 ms，C 得到 `-35`）；SMP=4 一份同时跑 hello311、hello310、hello290，三个都 PASS。`zig build`、`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒）：三份 `EXIT=0`、0 FAIL；一份 SMP=4 `EXIT=1`，唯一的失败是 hello286 M「a SIGSTOP right after fork stops the child and the thread it creates」19/20，是文档里已记录的 hello286 M 偶发项（这一段不用文件锁）。hello286 单独定向重跑两份（SMP=4）都 PASS，M 都是 20/20。四份里 hello311、hello310、hello290 都 PASS，hello228 corrupted canaries 都是 0。`zig build -Darch=riscv64 smoke-riscv`、`zig build -Darch=aarch64 smoke-aarch64` 通过。
+- 如实的局限：
+  1. 只检查 `F_SETLKW`；`flock` 的阻塞等待和 Linux 一样不做死锁检测。
+  2. 记录的是「在等哪个属主」，不是哪一把锁。持有者释放后，等待者到下一次重查（最多 10 ms）才更新记录，这期间的检查可能用到过期的边。Linux 用阻塞者链表，每次释放都会重新挂接。
+  3. 记录按任务槽位存（64 个），线程共享描述符表时，多个线程会各自记录同一个属主；查链时取第一条匹配的。
 

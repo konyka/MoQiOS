@@ -31,12 +31,23 @@ const EFAULT: i64 = -14;
 const EINVAL: i64 = -22;
 const ENOLCK: i64 = -37;
 const EOVERFLOW: i64 = -75;
+const EDEADLK: i64 = -35;
 
 var table: lt.Table(128) = .{};
 var fl_lock: IrqSpinlock = .{};
 /// Tasks parked in a blocking flock/F_SETLKW, by task index. Releasing a lock
 /// unblocks them; the scheduler tick does too, so a missed wake still ends.
 var lock_waiter_bm: u64 = 0;
+
+/// What each task blocked in F_SETLKW is waiting for, by task index (under fl_lock), for the EDEADLK check.
+var waits: [64]lt.Wait = @splat(.{});
+
+fn clearWait(cur_idx: u32) void {
+    if (cur_idx >= waits.len) return;
+    const flags = fl_lock.acquire();
+    waits[cur_idx] = .{};
+    fl_lock.release(flags);
+}
 
 /// How long a blocked lock sleeps before it looks again: one scheduler tick.
 const LOCK_POLL_NS: u64 = 10_000_000;
@@ -93,7 +104,10 @@ pub fn wakeLockWaiters() void {
 /// "look again".
 fn waitOrInterrupt(t: *task_mod.Task, cur_idx: u32) ?i64 {
     const sig_mod = @import("../proc/signal.zig");
-    if (sig_mod.pendingFatal(t)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+    if (sig_mod.pendingFatal(t)) |sig| {
+        clearWait(cur_idx); // exitTask does not return, so setLock's defer would not run
+        task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+    }
     if (sig_mod.pendingActionable(t)) return -4; // EINTR
     sleepForLock(t, cur_idx);
     return null;
@@ -214,6 +228,8 @@ pub fn setLock(fd: u64, cmd: u64, flock_ptr: u64) i64 {
     if (l_whence < 0 or l_whence > 2) return EINVAL;
     const fdt = t.fd_table;
     const owner = vfs.posixLockOwner(fdt);
+    // Every way out of a blocking F_SETLKW (lock taken, EDEADLK, EINTR, a descriptor closed under the wait) ends the wait.
+    defer if (cmd == 7) clearWait(cur_idx);
 
     while (true) {
         if (!fdt.acquireTransferFd(fd_u)) return EBADF;
@@ -252,17 +268,30 @@ pub fn setLock(fd: u64, cmd: u64, flock_ptr: u64) i64 {
             return if (ok) 0 else ENOLCK;
         }
 
-        if (table.conflict(key, .posix, owner, write, range.start, range.end) == null) {
+        const hit = table.conflict(key, .posix, owner, write, range.start, range.end) orelse {
+            if (cur_idx < waits.len) waits[cur_idx] = .{};
             const ok = table.setPosix(key, owner, reportedPid(t), write, range.start, range.end);
             fl_lock.release(flags);
             fdt.releaseTransferFd(fd_u);
             // Turning a write lock into a read lock can let readers in.
             if (ok) wakeLockWaiters();
             return if (ok) 0 else ENOLCK;
+        };
+        if (cmd != 7) {
+            fl_lock.release(flags);
+            fdt.releaseTransferFd(fd_u);
+            return EAGAIN;
         }
+        // Waiting for `hit`'s owner, who may itself be waiting (in a chain) for us: report that instead of sleeping forever.
+        if (lt.wouldDeadlock(owner, hit.owner, &waits)) {
+            if (cur_idx < waits.len) waits[cur_idx] = .{};
+            fl_lock.release(flags);
+            fdt.releaseTransferFd(fd_u);
+            return EDEADLK;
+        }
+        if (cur_idx < waits.len) waits[cur_idx] = .{ .owner = owner, .waits_for = hit.owner };
         fl_lock.release(flags);
         fdt.releaseTransferFd(fd_u);
-        if (cmd != 7) return EAGAIN;
         if (waitOrInterrupt(t, cur_idx)) |r| return r;
     }
 }

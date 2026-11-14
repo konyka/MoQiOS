@@ -12313,3 +12313,22 @@ test "lock table: struct flock ranges" {
     try std.testing.expectEqual(@as(i64, 0), lt.lengthOf(&m));
 }
 
+test "lock table: EDEADLK when a wait would close a cycle of owners" {
+    const lt = kt.lock_table;
+    var w = [_]lt.Wait{.{}} ** 4;
+    // nobody waits: waiting for 2 is fine, waiting for yourself is a deadlock
+    try std.testing.expect(!lt.wouldDeadlock(1, 2, &w));
+    try std.testing.expect(lt.wouldDeadlock(1, 1, &w));
+    // 2 waits for 1: 1 waiting for 2 closes the cycle
+    w[0] = .{ .owner = 2, .waits_for = 1 };
+    try std.testing.expect(lt.wouldDeadlock(1, 2, &w));
+    try std.testing.expect(!lt.wouldDeadlock(3, 2, &w));
+    // three owners: 2 -> 3 -> 1, and 1 asks for 2
+    w[0] = .{ .owner = 2, .waits_for = 3 };
+    w[1] = .{ .owner = 3, .waits_for = 1 };
+    try std.testing.expect(lt.wouldDeadlock(1, 2, &w));
+    // a cycle that does not include the caller ends the search after MAX_DEADLK_ITERATIONS
+    var c = [_]lt.Wait{ .{ .owner = 5, .waits_for = 6 }, .{ .owner = 6, .waits_for = 5 } };
+    try std.testing.expect(!lt.wouldDeadlock(1, 5, &c));
+}
+
