@@ -451,6 +451,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello332"); /* an mq_notify registration belongs to the process: closes, threads, signal target */
     run_test("hello333"); /* POSIX mq descriptors are shared by the threads of a process, not copied per thread */
     run_test("hello334"); /* a POSIX mq descriptor is an ordinary file descriptor: lowest number, dup, fcntl, poll, read, fstat */
+    run_test("hello335"); /* an mq descriptor's read offset belongs to its open description: dup and fork share it */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

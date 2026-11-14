@@ -88,6 +88,8 @@ const OpenDescription = struct {
     cloexec: bool = false,
     /// One per file descriptor naming this description (open, dup, dup2, fork, SCM_RIGHTS); the last close drops it.
     refs: u32 = 0,
+    /// read()/lseek() position into the status line (Linux f_pos): shared by every descriptor naming this description.
+    offset: u64 = 0,
 };
 
 var descriptions: [MAX_OPEN_DESCRIPTIONS]OpenDescription = @splat(.{});
@@ -1103,6 +1105,22 @@ pub fn statusRead(idx: u32, gen: u64, offset: u64, buf: [*]u8, count: usize) i64
     const n = @min(count, len - start);
     @memcpy(buf[0..n], line[start..][0..n]);
     return @intCast(n);
+}
+
+/// The read position of description `idx` (Linux f_pos of the mqueue file); null once the description is gone.
+pub fn descriptionOffset(idx: u32, gen: u64) ?u64 {
+    const flags = mq_lock.acquire();
+    defer mq_lock.release(flags);
+    const desc = liveDescription(.{ .idx = idx, .gen = gen }) orelse return null;
+    return desc.offset;
+}
+
+/// Move the read position of description `idx` for every descriptor that names it.
+pub fn setDescriptionOffset(idx: u32, gen: u64, offset: u64) void {
+    const flags = mq_lock.acquire();
+    defer mq_lock.release(flags);
+    const desc = liveDescription(.{ .idx = idx, .gen = gen }) orelse return;
+    desc.offset = offset;
 }
 
 /// poll/epoll readiness of description `idx` (Linux mqueue_poll_file); POLLERR once it is gone.

@@ -968,6 +968,13 @@ test "an mq descriptor is reference counted per fd and supports fcntl, poll, rea
     try std.testing.expectEqualStrings("QSIZE:3          NOTIFY:0     SIGNO:0     NOTIFY_PID:0     \n", p.statusLine(&line, 3, false, 0, 0, 0));
 }
 
+test "an mq descriptor's read offset lives in its open description, shared by dup and fork copies" {
+    const v = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, v, "posix_mq.zig\").descriptionOffset(desc.mq_desc_idx, desc.mq_desc_gen)) |off| desc.offset = off;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "posix_mq.zig\").setDescriptionOffset(desc.mq_desc_idx, desc.mq_desc_gen, desc.offset);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.posix_mq_source, "    offset: u64 = 0,\n};") != null);
+}
+
 test "parent TID copyout aborts an unpublished child before publication" {
     const source = kt.clone_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "abortUnpublishedChild(child_idx)") != null);

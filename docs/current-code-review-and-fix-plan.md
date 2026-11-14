@@ -9186,7 +9186,20 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - 同一次定向里 hello80 失败，原因是定向时它排在 init 创建 `/h80-root`、`/h80-open` 夹具之前，与本修复无关，完整 smoke 按正式顺序运行。hello235 G（向 SLIRP 网关的阻塞 connect 被信号打断）在这次定向里失败，完整 smoke 按正式顺序运行时，hello80 与 hello235 G 在四份中都通过，定向失败只与运行顺序和网络时序有关。
 - 完整 smoke：四份（SMP=1、4、4、2）全部 EXIT=0，`:   FAIL` 计数为 0，`hello334: PASS` 每份 1 次，hello80、hello235 均 PASS，hello228 `corrupted canaries=0`。riscv64、aarch64 smoke 通过。
 - 局限：
-  1. read 的偏移在 fd 上：`dup` 的副本不共享偏移（mq 不在 `usesSharedOffset` 里）。Linux 上副本共享 `f_pos`。
+  1. read 的偏移在 fd 上：`dup` 的副本不共享偏移（mq 不在 `usesSharedOffset` 里）。Linux 上副本共享 `f_pos`。（hello335 已修）
   2. epoll 唤醒是每次发送或接收后对这个队列的所有 description 各通知一次，不区分 POLLIN、POLLOUT 是否真的变化。
   3. `SIGEV_THREAD` 仍不支持（需要 AF_NETLINK）。
   4. description 池共 256 个（`MAX_OPEN_DESCRIPTIONS`），每张表 `MAX_FDS`（x86_64 上 128）个描述符。
+
+## 补充：mq 描述符的 read 偏移属于 open description（hello335）
+
+- 问题：hello334 之后 mq 描述符的 read 偏移存在每个 fd 上（`FileDescriptor.offset`），`dup`、`dup2`、fork 出来的副本各有一份。Linux 上这些副本共用同一个 `struct file`，`f_pos` 只有一个。
+- Linux 实测（`gcc -DHOST user/hello335.c`）：A 原 fd 读 10 字节后，dup 副本 SEEK_CUR 为 10，接着读到剩下的 50；B 通过副本 lseek 到 5，原 fd 也是 5；C 第二次 mq_open 从 0 开始，不影响第一个；D fork 的子进程读 20 字节，父进程 SEEK_CUR 变成 20；E SEEK_END 是 80（inode 大小），seek 到负位置失败且偏移不变；F 通过副本 pread 不动共享偏移。
+- 红灯：旧内核上 A–D 失败（`dup SEEK_CUR 0, dup read 60`；`original SEEK_CUR 10`；`parent SEEK_CUR 0`），E、F 通过。
+- 修复：`posix_mq.OpenDescription` 加 `offset` 字段，新增 `descriptionOffset`、`setDescriptionOffset`（在 mq_lock 内按 generation 校验）。`vfs.syncOffsetIn`/`syncOffsetOut` 对 `.mqueue` 从 description 读入、写回偏移，read、lseek 等已有的同步点因此自动共享；pread 不经过这两个函数，不改偏移。
+- 测试：hello335（QEMU，6 项）；host 测试 `an mq descriptor's read offset lives in its open description, shared by dup and fork copies`。变异：把写回的偏移改成 0，该测试失败，文件已恢复。
+- 绿灯：定向 SMP=2、SMP=4 各一份，hello335 通过；`zig build test` 通过。
+- 完整 smoke：四份（SMP=1、4、4、2）全部 EXIT=0，`:   FAIL` 计数为 0，`hello335: PASS`、`hello334: PASS` 每份各 1 次，hello228 `corrupted canaries=0`。riscv64、aarch64 smoke 通过。
+- 局限：
+  1. 偏移的读改写不是原子的：两个进程同时 read 同一个 description 时更新可能交错，和这个内核其他共享偏移一样（vfs.read 的注释已写明）。Linux 用 `f_pos_lock` 串行化。
+  2. hello334 局限 2（epoll 唤醒粒度粗）、3（`SIGEV_THREAD`）、4（固定容量）不变。

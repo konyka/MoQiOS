@@ -951,6 +951,11 @@ fn shareOffsetFor(desc: *FileDescriptor) u16 {
 
 /// Bring the descriptor's offset up to date with the shared one (no-op for a private offset).
 pub fn syncOffsetIn(desc: *FileDescriptor) void {
+    if (desc.fd_type == .mqueue) {
+        // The mq open description keeps its own position (Linux f_pos), shared by dup, dup2 and fork copies.
+        if (@import("../ipc/posix_mq.zig").descriptionOffset(desc.mq_desc_idx, desc.mq_desc_gen)) |off| desc.offset = off;
+        return;
+    }
     if (desc.offset_slot == 0) return;
     const f = shared_offsets_lock.acquire();
     defer shared_offsets_lock.release(f);
@@ -1075,6 +1080,10 @@ pub fn fownOfDescription(owner_id: u64) ?Fown {
 
 /// Publish the descriptor's offset to everyone who shares it.
 pub fn syncOffsetOut(desc: *FileDescriptor) void {
+    if (desc.fd_type == .mqueue) {
+        @import("../ipc/posix_mq.zig").setDescriptionOffset(desc.mq_desc_idx, desc.mq_desc_gen, desc.offset);
+        return;
+    }
     if (desc.offset_slot == 0) return;
     const f = shared_offsets_lock.acquire();
     defer shared_offsets_lock.release(f);
