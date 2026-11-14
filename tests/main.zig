@@ -11908,7 +11908,7 @@ test "TCP SO_REUSEPORT: shared ports need both sides to opt in, same user; conne
     // Wiring: a listener owns its slot (by TCB), bind consults the rule, SYNs pick through pickListenSlot.
     const t = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, t, "listen_slots[i].tcb_idx = tcbIdx(tcb);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, t, "tcp_port_policy.reusePortMayShare(tcb.options.extra_flags, tcbs[i].options.extra_flags, tcbOwnerUid(tcb), tcbBoundUid(&tcbs[i]))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t, "tcp_port_policy.reusePortMayShare(tcb.options.extra_flags, tcbs[i].options.extra_flags, tcb.sock_uid, tcbs[i].sock_uid)") != null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, t, "pickListenSlot(dst_port, "));
     try std.testing.expect(std.mem.indexOf(u8, t, "if (listen_slots[i].tcb_idx == tcb_idx) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, t, "if (ls.tcb_idx == tcbIdx(tcb)) {") != null);
@@ -11972,7 +11972,7 @@ test "udp port sharing: without SO_REUSEPORT on every socket the newest bound on
 
 test "udp: bind moves the registration with its options and sharing goes through udp.rebind" {
     const us = kt.udp_source;
-    try std.testing.expect(std.mem.indexOf(u8, us, "pub fn rebind(old_key: u32, new_port: u16, uid: u32, out_disc: *u16) i64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "pub fn rebind(old_key: u32, new_port: u16, out_disc: *u16) i64") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "@import(\"udp_port_policy.zig\").mayShare(mine.flags, port_opts[j].flags, uid, port_uid[j])") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "port_opts[ni] = mine;") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "policy.pickReceiverConnected(info[0..n], src_ip, src_port)") != null);
@@ -12162,11 +12162,21 @@ test "tcp: a closing SO_REUSEPORT listener spreads its queued children over the 
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (sib.pending_tail -% sib.pending_head >= LISTEN_RING) continue;\n        sibs[n] = sib;") != null);
 }
 
-test "tcp SO_REUSEPORT: the owner uid is recorded at bind() and checked from the socket, not from the binding task" {
+test "tcp SO_REUSEPORT: the owner is the creator's fsuid fixed at socket() and checked from the socket, not from the binding task" {
+    // hello183 J: the owner outlives the task. hello330: Linux fixes it at socket() from the fsuid (sock_alloc), not at bind() from the euid.
     const ts = kt.tcp_source;
-    try std.testing.expect(std.mem.indexOf(u8, ts, "tcb.bound_uid = tcbOwnerUid(tcb);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ts, "tcbOwnerUid(tcb), tcbBoundUid(&tcbs[i]))") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ts, "return if (tcb.bound_explicitly) tcb.bound_uid else tcbOwnerUid(tcb);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "tcb.owner_task = owner_task;\n    tcb.sock_uid = creatorFsuid(owner_task);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "tcb.sock_uid, tcbs[i].sock_uid)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "return t.fsuid;") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ts, "new_tcb.sock_uid = listenerSockUid(ls);"));
+    try std.testing.expect(std.mem.indexOf(u8, ts, "child.sock_uid = listenerSockUid(sib);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "bound_uid") == null);
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "const uid = port_uid[oi];") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "udp.ensurePortExclusive(port") );
+    try std.testing.expect(std.mem.indexOf(u8, ss, "udp.ensurePortExclusive(port, false, t.fsuid)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "udp.ensurePortExclusive(port6, true, t.fsuid)") != null);
 }
 
 test "AF_UNIX: an unbound datagram sender with SO_PASSCRED autobinds at its first send" {

@@ -333,9 +333,9 @@ const TcpTcb = struct {
     async_nospace: bool = false,
     /// local_port was set by bind(); otherwise connect() treats it as stale.
     bound_explicitly: bool = false,
-    /// Effective uid of the task that bound the socket (SO_REUSEPORT groups only share between equal uids); kept with the socket so it
-    /// outlives the binding task.
-    bound_uid: u32 = 0,
+    /// The socket's owner (Linux sk_uid): the fsuid of the task that created it, fixed at socket() and copied to accepted children.
+    /// SO_REUSEPORT groups only share between equal owners; kept with the socket so it outlives the creating task.
+    sock_uid: u32 = 0,
     /// Zero-window persist probe timer (SK-110).
     persist_timer_ms: u32,
     /// Current persist probe interval (SK-110); doubles after each probe.
@@ -602,6 +602,7 @@ fn migrateToSiblingListener(from: *const ListenSlot, child_idx: u32) bool {
     sib.pending_tpbs[sib.pending_tail % LISTEN_RING] = child_idx;
     sib.pending_tail += 1;
     child.owner_task = sib.owner_task;
+    child.sock_uid = listenerSockUid(sib);
     return true;
 }
 
@@ -979,7 +980,7 @@ fn initTcbState(t: *TcpTcb) void {
     t.refused = false;
     t.async_nospace = false;
     t.bound_explicitly = false;
-    t.bound_uid = 0;
+    t.sock_uid = 0;
     t.persist_timer_ms = 0;
     t.persist_rto_ms = RETRANSMIT_MS;
     t.delayed_ack_pending = false;
@@ -2152,6 +2153,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
             reuse_tcb.accecn_ok = peer_ecn;
 
             reuse_tcb.owner_task = ls.owner_task;
+            reuse_tcb.sock_uid = listenerSockUid(ls);
             _ = sendSegment(reuse_tcb, probeEcnSynAckFlags(peer_ecn), undefined, 0);
             tcpLog("[tcp] TIME_WAIT reuse → SYN-ACK\n");
             // Queue it like a fresh SYN_RECEIVED child, or accept() would never see the new connection.
@@ -2173,6 +2175,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
     new_tcb.remote_port = src_port;
     new_tcb.remote_ip = src_ip;
     new_tcb.owner_task = ls.owner_task;
+    new_tcb.sock_uid = listenerSockUid(ls);
     new_tcb.iss = generateIss();
     new_tcb.snd_una = new_tcb.iss;
     new_tcb.snd_nxt = new_tcb.iss;
@@ -2271,6 +2274,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
     new_tcb.is_v6 = true;
     new_tcb.remote_ip6 = src_ip;
     new_tcb.owner_task = ls.owner_task;
+    new_tcb.sock_uid = listenerSockUid(ls);
     new_tcb.iss = generateIss();
     new_tcb.snd_una = new_tcb.iss;
     new_tcb.snd_nxt = new_tcb.iss;
@@ -3097,6 +3101,7 @@ pub fn tcpConnect(remote_ip: [4]u8, remote_port: u16, owner_task: u32) i64 {
     tcb.remote_port = remote_port;
     tcb.remote_ip = remote_ip;
     tcb.owner_task = owner_task;
+    tcb.sock_uid = creatorFsuid(owner_task);
     tcb.iss = generateIss();
     tcb.snd_una = tcb.iss;
     tcb.snd_nxt = tcb.iss;
@@ -4209,6 +4214,7 @@ pub fn tcpSocket(owner_task: u32) i64 {
     defer tcp_lock.release(lock_flags);
     const tcb = allocTcb() orelse return -1;
     tcb.owner_task = owner_task;
+    tcb.sock_uid = creatorFsuid(owner_task);
     tcb.state = .closed;
 
     return @intCast(tcbIdx(tcb));
@@ -4225,16 +4231,18 @@ pub fn tcpSetIpv6(tcb_idx: u32) i64 {
     return 0;
 }
 
-/// Real uid of the task that owns a TCB (0 when the owner is gone), for the SO_REUSEPORT same-user rule.
-fn tcbOwnerUid(tcb: *const TcpTcb) u32 {
-    const task_mod = @import("../proc/task.zig");
-    const t = task_mod.getTask(tcb.owner_task) orelse return 0;
-    return t.euid;
+/// The owner of the listening socket a listen slot belongs to: a connection it accepts inherits it (Linux sk_clone_lock copies sk_uid).
+fn listenerSockUid(slot: *const ListenSlot) u32 {
+    if (slot.tcb_idx >= MAX_CONNECTIONS) return creatorFsuid(slot.owner_task);
+    return tcbs[slot.tcb_idx].sock_uid;
 }
 
-/// The uid a SO_REUSEPORT port share is checked against: the binder's, recorded at bind().
-fn tcbBoundUid(tcb: *const TcpTcb) u32 {
-    return if (tcb.bound_explicitly) tcb.bound_uid else tcbOwnerUid(tcb);
+/// The fsuid of the task in slot `task_idx` (0 when there is none): the owner a socket it creates gets (Linux sock_alloc,
+/// current_fsuid()).
+fn creatorFsuid(task_idx: u32) u32 {
+    const task_mod = @import("../proc/task.zig");
+    const t = task_mod.getTask(task_idx) orelse return 0;
+    return t.fsuid;
 }
 
 /// Bind a TCB to a local port.
@@ -4257,7 +4265,7 @@ pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
             if (tcp_port_policy.reuseMayShare(tcb.options.reuse_addr, @intFromEnum(tcbs[i].state) == @intFromEnum(TcpState.time_wait))) {
                 continue;
             }
-            if (tcp_port_policy.reusePortMayShare(tcb.options.extra_flags, tcbs[i].options.extra_flags, tcbOwnerUid(tcb), tcbBoundUid(&tcbs[i]))) {
+            if (tcp_port_policy.reusePortMayShare(tcb.options.extra_flags, tcbs[i].options.extra_flags, tcb.sock_uid, tcbs[i].sock_uid)) {
                 continue;
             }
             return tcp_port_policy.BIND_EADDRINUSE;
@@ -4266,7 +4274,6 @@ pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
 
     tcb.local_port = port;
     tcb.bound_explicitly = port != 0;
-    tcb.bound_uid = tcbOwnerUid(tcb);
     return 0;
 }
 

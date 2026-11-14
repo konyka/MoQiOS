@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello329`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello330`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -324,6 +324,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello327 | owner 消失后的 F_GETOWN / F_GETOWN_EX：PID owner 被杀未回收时仍报 pid（A），回收后报 0、类型保留（B）；join 后的 TID owner 报 TID/0（C），再设这个 tid 返回 ESRCH（D）；PGRP owner 成员为 zombie 时报 -pgrp、回收后报 0（E）；组长回收而成员活着时仍报 -pgrp，全部回收后报 0（F） |
 | hello328 | setfsuid / setfsgid（原生 504/505）：-1 只读回（A）；设成 1000/2000 返回旧值、status 第四栏显示（B）；fsuid 1000 打不开 root 的 0600 文件且 CapEff 去掉文件系统 capability（C）；新文件属主是 fs id（D）；access 按真实 id、AT_EACCESS 按 fs id（E）；chmod 按 fsuid 判属主（F）；setfsuid(0) 恢复（G）；setres[ug]id 全 -1 保留 fs id、给出 euid 时跟随（H）；无 CAP_SETUID 只能取现有 id（I）；fork 继承、execve 重置（J） |
 | hello329 | `/proc/<pid>/maps` 与 `/proc/<pid>/fd` 的访问：双方同为 1000 都能打开（A）；目标 saved/real uid 为 0、saved gid 为 0 或 egid 不同时 maps 是 EACCES、fd 能打开（B–E）；无 capability 的 root 都被拒（F），fsuid 改成 1000 后都能打开（G）；只有 CAP_SYS_PTRACE 时 maps 放行、fd 拒绝（H），只有 CAP_DAC_OVERRIDE 时相反（I）；自己的进程总能打开（K） |
+| hello330 | SO_REUSEPORT 端口组的属主是 `socket()` 时创建者的 fsuid（TCP、UDP 各一遍）：root 创建、降到 1000 后绑定，1000 的套接字加不进来（A）；1000 创建、回到 root 后绑定，root 加不进来（B）；root 在 fsuid 1000 时创建，root 加不进来（C）；两个 root 能共享（D）；1000 创建的和 fsuid 1000 时创建的能共享（E） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

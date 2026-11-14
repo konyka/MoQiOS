@@ -446,6 +446,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello327"); /* F_GETOWN reports 0 once the owner is gone */
     run_test("hello328"); /* setfsuid / setfsgid: filesystem checks use the fs ids */
     run_test("hello329"); /* /proc/<pid>/maps and fd: ptrace access with the fs ids, fd directory owned by the target */
+    run_test("hello330"); /* SO_REUSEPORT owner: the socket creator's fsuid, fixed at socket() */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

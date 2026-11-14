@@ -33,7 +33,8 @@ const UdpEntry = struct {
 /// Socket key per slot: the local port in the low 16 bits and a discriminator in the high 16 bits. The discriminator is 0 for the first
 /// socket on a port; sockets that share the port (SO_REUSEADDR / SO_REUSEPORT) get the smallest unused nonzero value.
 var ports: [MAX_PORTS]u32 = @splat(0);
-/// Effective uid that bound each slot (SO_REUSEPORT only shares between equal uids) and its bind order (later = larger).
+/// Owner of each slot (Linux sk_uid: the creator's fsuid at socket(), kept across bind; SO_REUSEPORT only shares between equal owners)
+/// and its bind order (later = larger).
 var port_uid: [MAX_PORTS]u32 = @splat(0);
 var port_seq: [MAX_PORTS]u32 = @splat(0);
 var next_seq: u32 = 1;
@@ -213,7 +214,7 @@ pub fn ensurePortExclusive(port: u16, is_v6: bool, uid: u32) u16 {
 /// bind() on a UDP socket already registered under `old_key`: move it to `new_port`, keeping its options (SO_REUSEADDR / SO_REUSEPORT are
 /// set before bind). A port another socket holds can be joined only when the sharing policy allows it with every holder. On success returns
 /// 0 and the socket's new discriminator in `out_disc`; -98 (EADDRINUSE) when the port is taken or the table is full, -9 when `old_key` is gone.
-pub fn rebind(old_key: u32, new_port: u16, uid: u32, out_disc: *u16) i64 {
+pub fn rebind(old_key: u32, new_port: u16, out_disc: *u16) i64 {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
 
@@ -223,6 +224,7 @@ pub fn rebind(old_key: u32, new_port: u16, uid: u32, out_disc: *u16) i64 {
         return 0;
     }
     const mine = port_opts[oi];
+    const uid = port_uid[oi];
     var used: u64 = 0;
     for (0..num_ports) |j| {
         if (portNumber(ports[j]) != new_port) continue;

@@ -7579,7 +7579,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 ## 剩余开放项收口（hello183 J/K、hello134 I、hello236 G、hello267、hello271、hello272）
 
 - **`RWF_HIPRI`（核实后保持）**：本机 Linux 上 `pwritev2(..., RWF_HIPRI)` 对缓冲文件、`O_DIRECT` 文件、管道、AF_UNIX 数据报都返回成功（只是没有轮询 I/O 时不起作用），所以本内核“接受、不做额外动作”与 Linux 一致，不是缺口。
-- **TCP `SO_REUSEPORT` 的属主 uid 在 `bind` 时记录（已修）**：hello183 J：一个 uid 1000 的子进程绑定 `SO_REUSEPORT` 端口，再 `fork` 一个孙进程持有套接字后自己退出；之后 uid 0 的父进程再绑同一端口。旧代码检查共享时按 `owner_task` 实时查任务的 `euid`，绑定的任务已退出就读到 0，于是 uid 0 被允许加入（红灯）。修改：`TcpTcb.bound_uid` 在 `tcpBind` 时记录，共享判断用 `tcbBoundUid`。（第一版测试用 `int64_t` 接 `pipe2` 写回的两个 32 位描述符，子进程拿到错误的描述符，我一度以为是 `fork` 不继承管道；hello271 验证了 `fork` 继承管道和文件都正常，问题在测试。）
+- **TCP `SO_REUSEPORT` 的属主 uid 在 `bind` 时记录（已修）**：hello183 J：一个 uid 1000 的子进程绑定 `SO_REUSEPORT` 端口，再 `fork` 一个孙进程持有套接字后自己退出；之后 uid 0 的父进程再绑同一端口。旧代码检查共享时按 `owner_task` 实时查任务的 `euid`，绑定的任务已退出就读到 0，于是 uid 0 被允许加入（红灯）。修改：`TcpTcb.bound_uid` 在 `tcpBind` 时记录，共享判断用 `tcbBoundUid`。（hello330 一节改为 `socket()` 时记录创建者的 fsuid，字段改名 `sock_uid`）（第一版测试用 `int64_t` 接 `pipe2` 写回的两个 32 位描述符，子进程拿到错误的描述符，我一度以为是 `fork` 不继承管道；hello271 验证了 `fork` 继承管道和文件都正常，问题在测试。）
 - **AF_UNIX 数据报的源地址与自动绑定（已实现）**：本机 Linux 实测：设了 `SO_PASSCRED` 的未绑定发送者在第一次发送时自动绑定一个抽象名，接收方 `recvfrom` 拿到这个名字；已绑定路径名的发送者，接收方拿到路径名；没设 `SO_PASSCRED` 的未绑定发送者保持无名。红灯：hello134 I 段，自动绑定两项和“`recvfrom` 报告发送者名字”两项失败——本内核的 AF_UNIX `recvfrom` 从来不填源地址。实现：`unixSendToBlocking` 在发送前对设了 `SO_PASSCRED` 的套接字调用 `unixAutobind`；每个数据报套接字有一个 32 项的源名字队列（`src_names`，按数据报序号配对，队列满或发送者未绑定时该数据报报告无地址，不会把名字错配到别的数据报），`recvfrom` 与 `recvmsg` 的 `msg_name` 用它填写。
 - **epoll：被 `EPOLLONESHOT` 禁用的链接仍计入环与深度（已修）**：本机 Linux 实测：四层链的底部链接是 `EPOLLONESHOT` 并已触发（禁用）后，把这条链加到另一个 epoll 下仍是 `ELOOP`；经过一个已触发的 one-shot 链接闭合的环也是 `ELOOP`；`EPOLL_CTL_MOD` 可以重新启用它。旧代码在环检测和深度计算里跳过 `is_disabled` 的条目，所以这两种情况都被放行（红灯，两项），之后 `MOD` 重新启用就得到一个超深的链或一个环。修改：三处遍历不再跳过禁用条目。
 - **UDP 套接字表 16 → 64（已修）**：hello183 K：40 个 UDP 套接字同时打开并各自绑定、各收一个数据报。旧表只有 16 项，第 16 个之后 `socket()` 失败（实测打开 15 个）。改为 64（接收队列约 750 KiB）；同端口共享的区分位图由 32 位改为 64 位。测试里每发 8 个数据报让本机回环队列（16 帧）排空一次。
@@ -8982,7 +8982,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 局限：
   1. SysCap 没有 DAC_READ_SEARCH、FSETID、MAC_OVERRIDE，这几位本来就不存在，所以 `FS_CAPS` 只含四位。
   2. 进程间的权限检查（kill、kcmp、调度、ptrace 风格的 `/proc/<pid>` 访问、SysV IPC）仍用 euid，和 Linux 一致；`/proc/<pid>/maps` 这类 `PTRACE_MODE_FSCREDS` 检查在 Linux 上用 fsuid，这里仍用 euid。（hello329 一节已改：maps 按完整的 ptrace 规则、fd 目录按属主和 `CAP_DAC_OVERRIDE`，都用 fs id）
-  3. 套接字凭证（SO_PEERCRED、UDP/TCP 端口共享的属主）仍用 euid；unix 套接字绑定路径时创建的文件没有属主，不受影响。
+  3. 套接字凭证（SO_PEERCRED、UDP/TCP 端口共享的属主）仍用 euid；unix 套接字绑定路径时创建的文件没有属主，不受影响。（核实后：SO_PEERCRED 在 Linux 上本来就取 euid/egid（`cred_to_ucred`），不用改；端口共享的属主在 hello330 一节改成 `socket()` 时的 fsuid）
   4. 仍然没有用户命名空间，setfsuid 不做 `make_kuid` 映射，所以超出映射范围的 id 不会被拒绝。
   5. 只有 x86_64 分发 504/505；riscv64、aarch64 没有这两个调用。
 
@@ -9013,3 +9013,26 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. MoQiOS 没有 dumpable 标志。Linux 上 setuid 降权后进程变成 non-dumpable，`fd` 目录属主变成 root，`maps` 还要求 `CAP_SYS_PTRACE`；这里这类进程的 `fd` 仍按 euid 判定。
   2. `fd` 目录只做属主和 `CAP_DAC_OVERRIDE` 检查，没有 `CAP_DAC_READ_SEARCH`（SysCap 没有这一位），组和其他人位按 0500 固定为无权限。
   3. `/proc/<pid>/fd/N` 的 readlink 只支持 `/proc/self/fd/N`，不经过这条检查；`environ`、`mem` 这些同样需要 ptrace 访问的文件本来就不存在。
+
+### SO_REUSEPORT 端口组的属主取创建者的 fsuid（hello330，已修）
+
+- 问题：TCP 在 `bind` 时用绑定任务的 euid 记录属主（`TcpTcb.bound_uid`），自己这一方则实时按 `owner_task` 查 euid；UDP 在 `socket()` 分配临时端口时记 euid，`bind` 时又换成当时的 euid。Linux 的属主（`sk_uid`）在 `socket()` 时由创建者的 fsuid 固定，之后改 uid 不影响。因此先创建再降权（或反过来）的套接字，以及 fsuid 和 euid 不同时创建的套接字，判定结果和 Linux 相反。
+- Linux 依据：`net/socket.c` 的 `sock_alloc` 把 inode 属主设成 `current_fsuid()`；`net/core/sock.c` 的 `sock_init_data` 从这个 inode 取 `sk_uid`；`net/ipv4/inet_connection_sock.c`（TCP）和 `net/ipv4/udp.c`（UDP）的端口冲突检查比较 `sk_uid`；`sk_clone_lock` 让 accept 出来的连接继承监听套接字的 `sk_uid`。
+- 宿主机实测（`unshare --map-auto --map-root-user --net`，`ip link set lo up` 后跑探针 `/tmp/rp.c`，再以 `gcc -DHOST` 跑 `user/hello330.c`，TCP、UDP 各 A–E 全过）：
+  - A root 创建、降到 uid 1000 后绑定：绑定成功，再来一个 uid 1000 的套接字是 EADDRINUSE。
+  - B uid 1000 创建、回到 root 后绑定：root 的套接字是 EADDRINUSE。
+  - C root 在 fsuid 1000 时创建、fsuid 改回 0 后绑定：root 的套接字是 EADDRINUSE。
+  - D 两个 root 套接字能共享端口。
+  - E uid 1000 创建的套接字和 root 在 fsuid 1000 时创建的套接字能共享端口。
+- 红灯：内核改动 stash 掉、只保留 hello330 的启动 profile，定向 SMP=2：TCP、UDP 的 A、B、C、E 都失败（A–C 的第二个套接字被放行，E 被拒绝），只有 D 通过。
+- 修复：
+  - `kernel/net/tcp.zig`：`bound_uid` 换成 `sock_uid`，`tcpSocket` 和 `tcpConnect` 建 TCB 时用 `creatorFsuid(owner_task)` 填；端口共享判断比较双方的 `sock_uid`；被动打开的连接（IPv4、IPv6、TIME_WAIT 复用、迁移到兄弟监听者）经 `listenerSockUid` 继承监听 TCB 的 `sock_uid`。去掉了实时查任务的 `tcbOwnerUid` 和 `tcbBoundUid`。
+  - `kernel/net/udp.zig`：`rebind` 不再接收 uid 参数，沿用槽位里 `socket()` 时记下的属主；`kernel/net/socket_syscall.zig` 在 `socket()` 分配临时端口时传 fsuid。
+  - `kernel/proc/capability_profile.zig`：hello330 以 root 启动，只持有 SETUID。
+  - `tests/main.zig`：hello183 J 对应的源码单测按新字段改写，并检查 `bound_uid` 已经不存在；UDP rebind 的签名单测同步。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份，hello330 通过；`zig build test` 通过。
+- 完整 smoke：跑了两轮，每轮 SMP=1、SMP=4 两份、SMP=2 共四份。第一轮 SMP=1、SMP=2 是 EXIT=0、0 FAIL；两份 SMP=4 都只有 hello325 G 失败（`hits 0`：发送方填满缓冲区后，对端读空时没有收到 POLL_OUT），hello330 在四份里都通过。随后 hello325 单独在 SMP=4 跑两份都通过，第二轮四份全部 EXIT=0、0 FAIL，hello325 G 和 hello330 都通过，`corrupted canaries=0`。hello325 不用 SO_REUSEPORT，本次改动只动了属主字段，没有找到和它的联系；原因没有确认，记为偶发项。一个可能的方向是 tcp `fasync_queue` 只有 32 项、满了就丢通知，并行负载下 POLL_OUT 可能被丢掉，这一点未验证。riscv64、aarch64 smoke 通过。
+- 局限：
+  1. SO_PEERCRED 和 SCM_CREDENTIALS 继续用 euid/egid，和 Linux 的 `cred_to_ucred` 一致，不属于这次改动。
+  2. raw 套接字和 AF_UNIX 套接字没有端口共享，所以没有属主字段。
+  3. 内核自己开的 UDP 端口（DHCP、DNS）属主是 0。

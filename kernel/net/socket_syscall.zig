@@ -73,12 +73,13 @@ pub fn socket(domain: u32, type_and_flags: u32, protocol: u32) i64 {
 }
 
 /// bind() of a UDP socket to `new_port`: the registration moves with its options, joining a port other sockets hold only when
-/// udp_port_policy allows it (both SO_REUSEADDR, or both SO_REUSEPORT with the same uid). The ephemeral port from socket() is dropped.
+/// udp_port_policy allows it (both SO_REUSEADDR, or both SO_REUSEPORT with the same owner, the fsuid recorded when socket() created it).
+/// The ephemeral port from socket() is dropped.
 fn udpRebind(t: *task_mod.Task, fd: u32, new_port: u16) i64 {
     const d = &t.fd_table.fds[fd];
     var disc: u16 = 0;
     const old_key = d.udpKey();
-    const rc = udp.rebind(old_key, new_port, t.euid, &disc);
+    const rc = udp.rebind(old_key, new_port, &disc);
     if (rc != 0) return rc;
     d.udp_port = new_port;
     d.udp_disc = disc;
@@ -110,7 +111,7 @@ fn socketCreate(domain: u32, sock_type: u32) i64 {
             // ensurePortExclusive: an already-registered port (0xFFFE) must be
             // skipped — plain ensurePort would hand the new socket the EXISTING
             // slot, sharing the first socket's receive queue and refcount.
-            const idx = udp.ensurePortExclusive(port, false, t.euid);
+            const idx = udp.ensurePortExclusive(port, false, t.fsuid);
             switch (udp_util.scanAction(idx)) {
                 .skip_in_use => continue,
                 .abort_full => return -1,
@@ -155,7 +156,7 @@ fn socketCreate(domain: u32, sock_type: u32) i64 {
             var port6: u16 = 49152;
             while (port6 < 65535) : (port6 += 1) {
                 // Same exclusivity rule as the IPv4 scan above.
-                const idx6 = udp.ensurePortExclusive(port6, true, t.euid);
+                const idx6 = udp.ensurePortExclusive(port6, true, t.fsuid);
                 switch (udp_util.scanAction(idx6)) {
                     .skip_in_use => continue,
                     .abort_full => return -1,
