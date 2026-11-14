@@ -441,6 +441,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello322"); /* SIGIO permission: the owner setter's uid/euid against the target's uid/saved uid */
     run_test("hello323"); /* O_ASYNC on AF_UNIX sockets: POLL_IN/POLL_OUT/POLL_HUP, listener; flags shared by dup */
     run_test("hello324"); /* O_ASYNC on UDP sockets: POLL_IN per datagram, POLL_ERR on port unreachable */
+    run_test("hello325"); /* O_ASYNC on TCP sockets: POLL_IN to the listener and on data/FIN, POLL_OUT on connect and after EAGAIN, POLL_ERR on reset/refusal */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

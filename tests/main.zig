@@ -12517,7 +12517,7 @@ test "fcntl policy: F_SETOWN_EX owner types TID/PID/PGRP and what F_GETOWN_EX an
     try std.testing.expectEqual(@as(u8, 1), fp.setownKind(0));
 }
 
-test "fcntl policy: O_ASYNC is kept by pipes, AF_UNIX and UDP sockets, and SIGIO carries POLL_IN / POLL_OUT / POLL_ERR / POLL_HUP with their bands" {
+test "fcntl policy: O_ASYNC is kept by pipes, AF_UNIX, UDP and TCP sockets, and SIGIO carries POLL_IN / POLL_OUT / POLL_ERR / POLL_HUP with their bands" {
     const fp = kt.fcntl_policy;
     try std.testing.expectEqual(@as(u32, 0x2000), fp.O_ASYNC);
     // F_SETFL's own mask does not carry it: the pipe path adds the bit when it registers the description
@@ -12526,11 +12526,11 @@ test "fcntl policy: O_ASYNC is kept by pipes, AF_UNIX and UDP sockets, and SIGIO
     try std.testing.expect(fp.keepsAsync("pipe_write"));
     try std.testing.expect(!fp.keepsAsync("ramdisk"));
     try std.testing.expect(!fp.keepsAsync("devnull"));
-    // AF_UNIX sockets keep it too (sock_fasync); tcp/udp sockets and ttys are not wired up here
+    // sockets keep it too (sock_fasync); ttys are not wired up here
     try std.testing.expect(fp.keepsAsync("unix_socket"));
     try std.testing.expect(!fp.keepsAsync("eventfd"));
     try std.testing.expect(fp.keepsAsync("udp_socket"));
-    try std.testing.expect(!fp.keepsAsync("tcp_socket"));
+    try std.testing.expect(fp.keepsAsync("tcp_socket"));
     // an asynchronous error (ICMP port unreachable) is POLL_ERR with band POLLERR
     const err = fp.sigioSignal(40, 6, fp.POLL_ERR);
     try std.testing.expectEqual(@as(i32, 4), err.info.code);

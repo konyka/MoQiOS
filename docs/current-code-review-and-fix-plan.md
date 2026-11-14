@@ -8747,7 +8747,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello320 A–L 全过。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello320、hello319、hello318、hello316、hello87、hello273 PASS 和 `hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过（已有的 fcntl 源码检查单测改为匹配新的 `F_SETFL` 代码）。
 - 局限：
-  1. 只做了管道；socket、tty、eventfd 等的 `O_ASYNC` 仍然不保留、不发信号。（AF_UNIX 套接字已在 hello323 一节实现，UDP 套接字已在 hello324 一节实现；TCP、tty 仍未做；eventfd、timerfd、epoll 在 Linux 上也不保留）
+  1. 只做了管道；socket、tty、eventfd 等的 `O_ASYNC` 仍然不保留、不发信号。（AF_UNIX 套接字已在 hello323 一节实现，UDP 套接字已在 hello324 一节实现，TCP 套接字已在 hello325 一节实现；tty 仍未做；eventfd、timerfd、epoll 在 Linux 上也不保留）
   2. `open(O_ASYNC)` 不保留这一位（`OPEN_STATUS_MASK` 不含它）；Linux 在普通文件上保留但不起作用，管道不能用 `open` 打开（FIFO 除外，这里没有 FIFO 的 `O_ASYNC`）。
   3. 登记表 128 项、共享槽池 512 槽；管道描述现在也占共享槽，池满时 dup、fork 退化为私有副本，`F_SETFL O_ASYNC` 返回 `ENOMEM`。
   4. 没有 `sigio_perm` 的 uid 检查，也没有 `F_SETOWN_EX`；只做了 x86_64 的 close 系列信号检查。（`F_SETOWN_EX` 已在 hello321 一节实现）
@@ -8832,7 +8832,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello323 A–O 全过；`zig build test` 通过。
 - 完整 smoke：SMP=1、SMP=4 两份、SMP=2 共四份全部 `EXIT=0`，没有失败项，hello323 全过，`corrupted canaries=0`；riscv64、aarch64 smoke 通过。
 - 局限：
-  1. TCP、UDP 套接字和 tty 仍然不保留 `O_ASYNC`，也不发信号（Linux 会保留）。（UDP 已在 hello324 一节实现）
+  1. TCP、UDP 套接字和 tty 仍然不保留 `O_ASYNC`，也不发信号（Linux 会保留）。（UDP 已在 hello324 一节实现，TCP 已在 hello325 一节实现）
   2. POLL_OUT 的阈值按接收方环的占用（8 KiB 环的四分之一）计算；Linux 按发送方的 `sk_wmem_alloc` 计算。一个发送方只记一个 `nospace_on` 目标。
   3. 「流式读者已在等数据」用对端有没有 `read_waiters` 近似 `SOCKWQ_ASYNC_WAITDATA`；读者被唤醒后、真正读走之前到达的数据也不发信号。
   4. dup 或 fork 的套接字描述现在也占用共享槽（512 个，和管道、普通文件共用）；槽用完时复制退回私有，状态标志不再共享。
@@ -8859,7 +8859,37 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello324 A–J 全过；`zig build test` 通过。
 - 完整 smoke：SMP=1、SMP=4 两份、SMP=2 共四份全部 `EXIT=0`，没有失败项，hello323、hello324 全过，`corrupted canaries=0`；riscv64、aarch64 smoke 通过。
 - 局限：
-  1. TCP 套接字和 tty 仍然不保留 `O_ASYNC`（Linux 会保留）。
+  1. TCP 套接字和 tty 仍然不保留 `O_ASYNC`（Linux 会保留）。（TCP 已在 hello325 一节实现）
   2. UDP 没有发送缓冲上限，不会遇到 EAGAIN，所以没有 POLL_OUT。
   3. 接收队列满（8 个）时丢弃的数据报不发信号，这和 Linux 一致，但 Linux 的队列按字节计算、要大得多。
   4. IPv6 UDP 走同一条路径，测试只覆盖了 IPv4 回环。
+
+### TCP 套接字的 `O_ASYNC`（hello325，已修）
+
+- 问题：TCP 套接字上 `F_SETFL O_ASYNC` 返回 0，但不保留这一位（`F_GETFL` 读回 0x2），握手完成、数据到达、FIN、发送空间释放、连接复位和连接被拒绝都不发 `SIGIO`。TCP 描述也没有共享槽，dup 后的副本读不到对方设置的状态标志。
+- Linux 依据：`net/socket.c` 的 `sock_fasync`；`net/core/sock.c` 的 `sock_def_readable`（POLL_IN）和 `sock_def_error_report`（POLL_ERR）；`net/core/stream.c` 的 `sk_stream_write_space`（设过 SOCK_NOSPACE 才发 POLL_OUT）；`net/ipv4/tcp_input.c` 的 `tcp_finish_connect`（客户端 POLL_OUT）、`tcp_fin`、`tcp_reset`；`tcp_child_process` 在子连接建立后唤醒监听套接字。`net/ipv4/af_inet.c` 的 `inet_wait_for_connect` 先看连接状态，再看信号。
+- 宿主机实测（`/tmp/atcp.c`、`/tmp/atcp3.c`、`/tmp/cretry.c`，再以 `gcc -DHOST` 跑 `user/hello325.c`，A–K 连续 3 次全过，都在 127.0.0.1 上）：
+  - 监听套接字设 `O_ASYNC` 后读回 0x2002；连接完成握手时监听套接字收到 POLL_IN，band 0x41，si_fd 是监听套接字的 fd；accept 出来的套接字不带 `O_ASYNC`（读回 0x2），accept 本身不发。
+  - 客户端握手完成收到 POLL_OUT，band 0x304。
+  - 每次数据到达都发 POLL_IN，前面的还没读也照发；自己读写不发。
+  - 发送写满到 EAGAIN 后，对端读空时发送方收到一次 POLL_OUT（只读一部分时不发）。
+  - 对端 SHUT_WR 发 POLL_IN（Linux 上有时是 2 次）；对端带着未读数据 close 引起复位，发 POLL_ERR，band 0x8；连接被拒绝发 POLL_ERR，band 0x8。
+  - 阻塞 connect 期间 O_ASYNC 信号到达时，宿主机上 connect 返回 EINTR（测试里按 EINPROGRESS 一样重试）；非阻塞套接字被拒绝后再 connect 返回 ECONNREFUSED。
+- 红灯：在未修改的内核上定向 SMP=2，hello325 A–E、G–K 失败（读回 0x2，没有任何信号）。第一版修复后 K 仍失败：阻塞 connect 被自己的 POLL_ERR 信号打断，返回 EINTR，重试又被拒绝信号打断，循环了 101 次。宿主机单测 `keepsAsync("tcp_socket")` 原来断言为 false。
+- 修复：
+  - `kernel/fs/fcntl_policy.zig`：`keepsAsync` 加入 `tcp_socket`。
+  - `kernel/fs/vfs.zig`：`FasyncKind` 加入 `tcp_socket`，`idx` 是 TCB 下标；新增 `tcpFasyncNotify`；`usesSharedOffset` 加入 `.tcp_socket`，TCP 描述的状态标志、owner 和登记在 dup、fork 后共享。
+  - `kernel/net/tcp.zig`：
+    - 新增 `fasync_queue`（32 项）、`noteFasync`、`flushFasync`：状态机在持有 `tcp_lock` 时记下原因，`handlePacket`、`handlePacketV6` 的 defer 和 `timerTick` 在释放锁之后统一发送。一次处理可以同时通知监听套接字和子连接，不受 `pending_idx` 只记一个的限制。
+    - 通知点：SYN_SENT 收到 SYN-ACK 发 POLL_OUT；SYN_RECEIVED 收到 ACK 时 `noteListenerReadable` 在 backlog 里找到监听套接字，发 POLL_IN；三处数据入环和 ESTABLISHED 的 FIN 发 POLL_IN；三处 RST（含 SYN_SENT 的拒绝）和重传超时放弃发 POLL_ERR。
+    - TCB 新增 `async_nospace`：`tcpSendBlocking` 一次没能放下全部数据时置位；ACK 腾出空间、空闲空间不少于仍排队数据的一半时（`sk_stream_wspace >= sk_stream_min_wspace`）清位并发一次 POLL_OUT。
+    - `tcpWaitConnected` 拆出 `connectOutcome`：等待被信号打断时先看握手结果，已经建立或失败就返回结果而不是 EINTR。
+  - `tests/main.zig`：fcntl policy 单测改为 `tcp_socket` 保留 `O_ASYNC`。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello325 A–K 全过；`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都有 hello325 PASS 和 `hello228: corrupted canaries=0`。SMP=1、SMP=2 和一份 SMP=4 `EXIT=0`、0 FAIL；另一份 SMP=4 `EXIT=1`，只有已记录的偶发项 hello286 J（18/60 次组停止被报告）失败。随后单独重跑一份 SMP=4 完整 smoke，`EXIT=0`、0 FAIL；hello286 在 SMP=4 定向跑两次都 PASS。riscv64、aarch64 smoke 通过。
+- 局限：
+  1. tty 仍然不保留 `O_ASYNC`（Linux 会保留）。
+  2. `fasync_queue` 只有 32 项，满了会丢掉后面的通知（SIGIO 只是提示，但一次处理大量连接时可能少发）。
+  3. 阻塞 connect 遇到信号时先看握手结果，握手还在进行中时仍返回 EINTR（宿主机上同样如此）；调用方需要像测试里一样重试。
+  4. 本端写入被对端 RST 引起的 POLL_ERR 和 Linux 一样走收 RST 的路径；双方都关闭后的 POLL_HUP（Linux 的 SHUT_WR 序列里有一次）没有实现。
+  5. IPv6 TCP 走同一条路径，测试只覆盖了 IPv4 回环。

@@ -34,6 +34,7 @@ const tcp_stats = @import("tcp_stats.zig");
 const TcbSet = @import("tcb_bitset.zig").Bitset(MAX_CONNECTIONS);
 const tcp_port_policy = @import("tcp_port_policy.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+const fcntl_policy = @import("../fs/fcntl_policy.zig");
 
 // v53.13: Global TCP lock — protects TCB array, tcb_active_bitmap, and all TCB fields.
 // v53.15: tcb_active_bitmap uses atomic RMW for all accesses (lock-free snapshot in timerTick); it is a TcbSet of u64 words (tcb_bitset.zig).
@@ -328,6 +329,8 @@ const TcpTcb = struct {
     shut_rd: bool = false,
     /// A RST answered our SYN: connect() fails with ECONNREFUSED.
     refused: bool = false,
+    /// A send found the ring full (Linux SOCK_NOSPACE): the ACK that frees enough of it sends O_ASYNC owners POLL_OUT once.
+    async_nospace: bool = false,
     /// local_port was set by bind(); otherwise connect() treats it as stale.
     bound_explicitly: bool = false,
     /// Effective uid of the task that bound the socket (SO_REUSEPORT groups only share between equal uids); kept with the socket so it
@@ -495,6 +498,69 @@ fn tcbIdx(tcb: *const TcpTcb) u32 {
     const base: usize = @intFromPtr(&tcbs[0]);
     const elem: usize = @intFromPtr(tcb);
     return @intCast((elem - base) / @sizeOf(TcpTcb));
+}
+
+/// O_ASYNC (SIGIO) reasons raised under tcp_lock, sent by flushFasync once it is released: signalling takes the fasync and task
+/// locks. Every path that queues one flushes it (handlePacket*, timerTick). A full queue drops the note (SIGIO is a hint).
+const FasyncNote = struct { idx: u32, reason: i32 };
+const FASYNC_QUEUE = 32;
+var fasync_queue: [FASYNC_QUEUE]FasyncNote = undefined;
+var fasync_queue_len: u32 = 0;
+
+/// Caller holds tcp_lock: queue `reason` (fcntl_policy.POLL_*) for the O_ASYNC owners of TCB `idx`.
+fn noteFasync(idx: u32, reason: i32) void {
+    const n = @atomicLoad(u32, &fasync_queue_len, .monotonic);
+    if (n >= FASYNC_QUEUE) return;
+    fasync_queue[n] = .{ .idx = idx, .reason = reason };
+    @atomicStore(u32, &fasync_queue_len, n + 1, .release);
+}
+
+/// Caller holds tcp_lock: a backlog child finished its handshake, so its listener becomes readable (POLL_IN, Linux
+/// sk_data_ready on the listener from tcp_child_process).
+fn noteListenerReadable(child_idx: u32) void {
+    var lbm = listen_active_bitmap.snapshot();
+    while (lbm.next()) |i| {
+        const ls = &listen_slots[i];
+        var scan = ls.pending_head;
+        while (scan != ls.pending_tail) : (scan += 1) {
+            if (ls.pending_tpbs[scan % LISTEN_RING] == child_idx) {
+                if (ls.tcb_idx < MAX_CONNECTIONS) noteFasync(ls.tcb_idx, fcntl_policy.POLL_IN);
+                return;
+            }
+        }
+    }
+}
+
+/// Caller holds tcp_lock: an ACK freed send space. A sender that found the ring full gets one POLL_OUT once the free room is at
+/// least half of what is still queued (Linux sk_stream_write_space: sk_stream_wspace >= sk_stream_min_wspace).
+fn noteWriteSpace(tcb: *TcpTcb) void {
+    if (!tcb.async_nospace) return;
+    const used = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
+    if (tcp_util.roomUnder(used, sendLimit(tcb)) * 2 < used) return;
+    tcb.async_nospace = false;
+    noteFasync(tcbIdx(tcb), fcntl_policy.POLL_OUT);
+}
+
+/// A send on TCB `idx` found the send ring full (Linux sets SOCK_NOSPACE there).
+fn markNoSpace(idx: u32) void {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcbs[idx].active) tcbs[idx].async_nospace = true;
+}
+
+/// Send the queued O_ASYNC notes. Called with tcp_lock released.
+fn flushFasync() void {
+    if (@atomicLoad(u32, &fasync_queue_len, .acquire) == 0) return;
+    var local: [FASYNC_QUEUE]FasyncNote = undefined;
+    var n: u32 = 0;
+    {
+        const lock_flags = tcp_lock.acquire();
+        defer tcp_lock.release(lock_flags);
+        n = fasync_queue_len;
+        @memcpy(local[0..n], fasync_queue[0..n]);
+        @atomicStore(u32, &fasync_queue_len, 0, .release);
+    }
+    for (local[0..n]) |e| @import("../fs/vfs.zig").tcpFasyncNotify(e.idx, e.reason);
 }
 
 /// Deactivate a TCB and clear its bitmap bit (single call site for consistency).
@@ -911,6 +977,7 @@ fn initTcbState(t: *TcpTcb) void {
     t.was_established = false;
     t.shut_rd = false;
     t.refused = false;
+    t.async_nospace = false;
     t.bound_explicitly = false;
     t.bound_uid = 0;
     t.persist_timer_ms = 0;
@@ -1494,6 +1561,7 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
         if (pending_events != 0) {
             epoll.epollNotify(.tcp_socket, pending_idx, pending_events);
         }
+        flushFasync();
     }
 
     const lock_flags = tcp_lock.acquire();
@@ -2281,6 +2349,7 @@ fn driveTcbStateMachine(
             if (ack_num == tcb.iss +% 1) {
                 tcb.options.so_error = 111; // ECONNREFUSED
                 tcb.refused = true;
+                noteFasync(tcbIdx(tcb), fcntl_policy.POLL_ERR); // Linux tcp_reset → sk_error_report
                 closeTcbRemote(tcb);
                 tcpLog("[tcp] RST in SYN_SENT, connection reset\n");
                 return;
@@ -2297,6 +2366,7 @@ fn driveTcbStateMachine(
                 };
                 pending_events.* |= epoll.EPOLLIN | epoll.EPOLLERR | epoll.EPOLLHUP | epoll.EPOLLRDHUP;
                 pending_idx.* = tcbIdx(tcb);
+                noteFasync(tcbIdx(tcb), fcntl_policy.POLL_ERR);
                 closeTcbRemote(tcb);
                 tcpLog("[tcp] RST received, connection reset\n");
                 return;
@@ -2365,6 +2435,7 @@ fn driveTcbStateMachine(
                 // v53.41: Defer epoll notification outside tcp_lock
                 pending_events.* |= epoll.EPOLLOUT;
                 pending_idx.* = tcbIdx(tcb);
+                noteFasync(tcbIdx(tcb), fcntl_policy.POLL_OUT); // Linux tcp_finish_connect → sk_wake_async(POLL_OUT)
             } else if (flags & SYN != 0) {
                 // v53.5: Simultaneous open not supported — send RST and close
                 _ = sendSegment(tcb, RST, undefined, 0);
@@ -2383,6 +2454,7 @@ fn driveTcbStateMachine(
                 tcb.was_established = true;
                 tcb.retransmit_timer = 0;
                 tcpLog("[tcp] server: connection established (ACK received)\n");
+                noteListenerReadable(tcbIdx(tcb));
 
                 // v53.41: Defer epoll notification outside tcp_lock
                 pending_events.* |= epoll.EPOLLOUT;
@@ -2400,6 +2472,7 @@ fn driveTcbStateMachine(
                     // sweep matches ERR and HUP whatever the registration asked for, and IN/RDHUP for those that did).
                     pending_events.* |= epoll.EPOLLIN | epoll.EPOLLERR | epoll.EPOLLHUP | epoll.EPOLLRDHUP;
                     pending_idx.* = tcbIdx(tcb);
+                    noteFasync(tcbIdx(tcb), fcntl_policy.POLL_ERR);
                     closeTcbRemote(tcb);
                     tcpLog("[tcp] RST received, connection reset\n");
                     return;
@@ -2550,6 +2623,7 @@ fn driveTcbStateMachine(
                         // v53.41: Defer epoll notification outside tcp_lock
                         pending_events.* |= epoll.EPOLLOUT;
                         pending_idx.* = tcbIdx(tcb);
+                        noteWriteSpace(tcb);
                     }
                 } else {
                     // Duplicate ACK (ack_num == snd_una)
@@ -2657,6 +2731,7 @@ fn driveTcbStateMachine(
                     // v53.41: Defer epoll notification outside tcp_lock
                     pending_events.* |= epoll.EPOLLIN;
                     pending_idx.* = tcbIdx(tcb);
+                    noteFasync(tcbIdx(tcb), fcntl_policy.POLL_IN);
                 }
             }
 
@@ -2677,6 +2752,7 @@ fn driveTcbStateMachine(
                     // v53.41: Defer epoll notification outside tcp_lock
                     pending_events.* |= epoll.EPOLLIN | epoll.EPOLLHUP | epoll.EPOLLRDHUP;
                     pending_idx.* = tcbIdx(tcb);
+                    noteFasync(tcbIdx(tcb), fcntl_policy.POLL_IN); // Linux tcp_fin → sk_wake_async(POLL_IN)
                 }
                 // else: FIN deferred — peer will retransmit after we ACK the partial data
             }
@@ -2743,6 +2819,7 @@ fn driveTcbStateMachine(
                 if (processIncomingData(tcb, data + payload_offset, payload_len, seq_num) > 0) {
                     pending_events.* |= epoll.EPOLLIN;
                     pending_idx.* = tcbIdx(tcb);
+                    noteFasync(tcbIdx(tcb), fcntl_policy.POLL_IN);
                 }
             }
             if (flags & FIN != 0) {
@@ -2775,6 +2852,7 @@ fn driveTcbStateMachine(
                 if (processIncomingData(tcb, data + payload_offset, payload_len, seq_num) > 0) {
                     pending_events.* |= epoll.EPOLLIN;
                     pending_idx.* = tcbIdx(tcb);
+                    noteFasync(tcbIdx(tcb), fcntl_policy.POLL_IN);
                 }
             }
             // Bytes queued before the peer's FIN still need ACK progress and
@@ -2829,6 +2907,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, e
         if (pending_events != 0) {
             epoll.epollNotify(.tcp_socket, pending_idx, pending_events);
         }
+        flushFasync();
     }
 
     // v53.13: Acquire TCP lock for the entire packet processing
@@ -3123,24 +3202,30 @@ pub fn tcpWaitConnected(tcb_idx: u32) i64 {
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const poll = @import("../fs/poll.zig");
     while (true) {
-        {
-            const lock_flags = tcp_lock.acquire();
-            defer tcp_lock.release(lock_flags);
-            const tcb = &tcbs[tcb_idx];
-            if (!tcb.active) return -9;
-            switch (tcp_recv_policy.connectProgress(tcb.state)) {
-                .connected => return 0,
-                .failed => {
-                    const e = tcp_recv_policy.connectFailure(tcb.options.so_error);
-                    tcb.options.so_error = 0;
-                    return e;
-                },
-                .keep_waiting => {},
-            }
-        }
+        if (connectOutcome(tcb_idx)) |r| return r;
         _ = lo_dev.drain();
         const w = poll.waitSlice(null);
-        if (w < 0) return w;
+        // The handshake's own outcome wins over a signal that arrived with it (Linux inet_wait_for_connect checks the state
+        // first): an O_ASYNC owner connecting itself gets its POLL_OUT / POLL_ERR and still sees connect() succeed or fail.
+        if (w < 0) return connectOutcome(tcb_idx) orelse w;
+    }
+}
+
+/// Where a blocking connect on `tcb_idx` stands: 0 connected, a negative errno when it failed (SO_ERROR is consumed), null while
+/// the handshake is still running.
+fn connectOutcome(tcb_idx: u32) ?i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active) return -9;
+    switch (tcp_recv_policy.connectProgress(tcb.state)) {
+        .connected => return 0,
+        .failed => {
+            const e = tcp_recv_policy.connectFailure(tcb.options.so_error);
+            tcb.options.so_error = 0;
+            return e;
+        },
+        .keep_waiting => return null,
     }
 }
 
@@ -3682,6 +3767,7 @@ pub fn tcpSendBlocking(tcb_idx: u32, addr: u64, is_user: bool, len: u32, nonbloc
         else
             tcpSendKernel(tcb_idx, @ptrFromInt(addr + done), rest);
         const result: i64 = if (r == 0) -11 else r;
+        if (r >= 0 and r < rest) markNoSpace(tcb_idx);
         switch (np.writeProgress(len, done, result, nonblock)) {
             .done => return len,
             .again => {
@@ -3869,6 +3955,7 @@ pub fn timerTick(ms_elapsed: u32) void {
         timerTickOne(idx, ms_elapsed);
     }
     tcp_lock.release(lock_flags);
+    flushFasync();
 }
 
 /// Process timer events for a single TCB. Must be called with tcp_lock held.
@@ -3936,6 +4023,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
                 // Give up
                 tcpLog("[tcp] retransmit timeout, closing\n");
                 if (tcb.state == .syn_sent) tcb.options.so_error = 110; // ETIMEDOUT: connect() fails
+                noteFasync(idx, fcntl_policy.POLL_ERR); // Linux tcp_write_err → sk_error_report
                 closeTcbRemote(tcb);
                 return;
             }

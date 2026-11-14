@@ -55,7 +55,7 @@ pub fn reportedFlags(tag: []const u8, stored: u32) u32 {
 /// Descriptor kinds whose O_ASYNC is kept and acted on (Linux keeps FASYNC only where f_op->fasync exists; elsewhere F_SETFL
 /// succeeds and the bit reads back clear, measured on /dev/null and a regular file).
 pub fn keepsAsync(tag: []const u8) bool {
-    return eql(tag, "pipe_read") or eql(tag, "pipe_write") or eql(tag, "unix_socket") or eql(tag, "udp_socket");
+    return eql(tag, "pipe_read") or eql(tag, "pipe_write") or eql(tag, "unix_socket") or eql(tag, "udp_socket") or eql(tag, "tcp_socket");
 }
 
 fn eql(a: []const u8, b: []const u8) bool {
