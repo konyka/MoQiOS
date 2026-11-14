@@ -89,6 +89,33 @@ pub fn setownArg(arg: u64) ?i32 {
     return if (v == std.math.minInt(i32)) null else v;
 }
 
+/// F_SETOWN_EX / F_GETOWN_EX owner types (struct f_owner_ex.type).
+pub const F_OWNER_TID: u8 = 0;
+pub const F_OWNER_PID: u8 = 1;
+pub const F_OWNER_PGRP: u8 = 2;
+
+/// The owner as stored: `owner` keeps F_SETOWN's encoding (pid, -pgrp or 0) and `kind` says how it is signalled.
+pub const OwnerEx = struct { owner: i32, kind: u8 };
+
+/// F_SETOWN_EX(type, pid) (Linux f_setown_ex): a type other than TID/PID/PGRP is EINVAL; a negative id is ESRCH (the lookup
+/// finds nothing); id 0 clears the owner and keeps the type. Whether a positive id exists is the caller's check.
+pub fn setownEx(kind: i32, pid: i32) error{ InvalidType, NoSuchOwner }!OwnerEx {
+    if (kind < 0 or kind > F_OWNER_PGRP) return error.InvalidType;
+    if (pid < 0) return error.NoSuchOwner;
+    const k: u8 = @intCast(kind);
+    return .{ .owner = if (k == F_OWNER_PGRP) -pid else pid, .kind = k };
+}
+
+/// F_GETOWN_EX (Linux f_getown_ex): the type and the positive id.
+pub fn getownEx(owner: i32, kind: u8) struct { type: i32, pid: i32 } {
+    return .{ .type = kind, .pid = if (owner < 0) -owner else owner };
+}
+
+/// The type F_SETOWN gives (Linux f_setown → __f_setown with PIDTYPE_TGID or PIDTYPE_PGID): a group for -pgrp, else a process.
+pub fn setownKind(who: i32) u8 {
+    return if (who < 0) F_OWNER_PGRP else F_OWNER_PID;
+}
+
 const siginfo = @import("../proc/siginfo_policy.zig");
 const SIGIO: u32 = 29;
 /// The reasons kill_fasync passes, which become si_code when F_SETSIG chose a signal.

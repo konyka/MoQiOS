@@ -121,6 +121,16 @@ fn sendToProcessWith(target: *task_mod.Task, tid: u32, signum: u32, info: @impor
     return if (reached) 0 else -3;
 }
 
+/// A process-directed signal with `info` to the process of task `tid` (an F_SETOWN / F_OWNER_PID owner, Linux send_sigio with
+/// PIDTYPE_TGID): the named thread unless it blocks the signal, then another (processRecipient). False when no live task has `tid`.
+pub fn sendToProcessInfo(tid: u32, signum: u32, info: @import("siginfo_policy.zig").Info) bool {
+    if (signum == 0 or signum > 64) return false;
+    const idx = task_mod.findTaskByTid(tid) orelse return false;
+    const target = task_mod.getTask(idx) orelse return false;
+    if (target.state == .zombie) return false;
+    return sendToProcessWith(target, tid, signum, info) == 0;
+}
+
 /// The thread of `target`'s process that takes a process-directed signal delivered once: `tid` unless it blocks the signal, then
 /// the first other live thread that does not (group_stop_policy.processRecipient). Thread-directed calls (tkill, rt_tgsigqueueinfo)
 /// do not come here.

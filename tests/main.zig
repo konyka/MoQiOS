@@ -12472,6 +12472,36 @@ test "fcntl policy: F_SETOWN and F_SETSIG arguments, and the siginfo a lease bre
     for ([_]u8{ 4, 5, 7, 8, 11, 17, 31 }) |sig| try std.testing.expectEqual(@as(i32, -5), fp.leaseBreakSignal(sig, 5).info.code);
 }
 
+test "fcntl policy: F_SETOWN_EX owner types TID/PID/PGRP and what F_GETOWN_EX and F_GETOWN report" {
+    const fp = kt.fcntl_policy;
+    try std.testing.expectEqual(@as(u8, 0), fp.F_OWNER_TID);
+    try std.testing.expectEqual(@as(u8, 1), fp.F_OWNER_PID);
+    try std.testing.expectEqual(@as(u8, 2), fp.F_OWNER_PGRP);
+    // the stored owner keeps -pgrp for a group, so F_GETOWN reads it directly
+    const t = try fp.setownEx(0, 42);
+    try std.testing.expectEqual(@as(i32, 42), t.owner);
+    try std.testing.expectEqual(@as(u8, 0), t.kind);
+    const g = try fp.setownEx(2, 7);
+    try std.testing.expectEqual(@as(i32, -7), g.owner);
+    try std.testing.expectEqual(@as(u8, 2), g.kind);
+    // id 0 keeps the type
+    const z = try fp.setownEx(2, 0);
+    try std.testing.expectEqual(@as(i32, 0), z.owner);
+    try std.testing.expectEqual(@as(u8, 2), z.kind);
+    try std.testing.expectError(error.InvalidType, fp.setownEx(3, 42));
+    try std.testing.expectError(error.InvalidType, fp.setownEx(-1, 42));
+    try std.testing.expectError(error.NoSuchOwner, fp.setownEx(1, -42));
+    try std.testing.expectError(error.NoSuchOwner, fp.setownEx(2, -7));
+    // F_GETOWN_EX gives the positive id with the type
+    try std.testing.expectEqual(@as(i32, 7), fp.getownEx(-7, 2).pid);
+    try std.testing.expectEqual(@as(i32, 2), fp.getownEx(-7, 2).type);
+    try std.testing.expectEqual(@as(i32, 0), fp.getownEx(0, 0).type);
+    // F_SETOWN: a pid is PID, -pgrp PGRP, 0 PID
+    try std.testing.expectEqual(@as(u8, 1), fp.setownKind(42));
+    try std.testing.expectEqual(@as(u8, 2), fp.setownKind(-7));
+    try std.testing.expectEqual(@as(u8, 1), fp.setownKind(0));
+}
+
 test "fcntl policy: O_ASYNC is kept by pipes only, and SIGIO carries POLL_IN / POLL_OUT with their bands" {
     const fp = kt.fcntl_policy;
     try std.testing.expectEqual(@as(u32, 0x2000), fp.O_ASYNC);

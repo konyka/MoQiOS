@@ -335,7 +335,6 @@ pub fn setLock(fd: u64, cmd_in: u64, flock_ptr: u64) i64 {
 /// names the owner (F_SETOWN: a pid, -pgrp, or 0 for nobody) and the signal (F_SETSIG; 0 is a plain SIGIO). A standard signal
 /// goes to an owner once (it would coalesce anyway); a real-time one is queued per lease, each with its own si_fd.
 fn signalBreak(notify: *const lp.Notify) void {
-    const sig_mod = @import("../proc/signal.zig");
     const fp = @import("fcntl_policy.zig");
     var done: [8]struct { owner: i32, signo: u32 } = undefined;
     var nd: usize = 0;
@@ -348,11 +347,7 @@ fn signalBreak(notify: *const lp.Notify) void {
             done[nd] = .{ .owner = fo.owner, .signo = s.signo };
             nd += 1;
         }
-        if (fo.owner > 0) {
-            _ = sig_mod.sendSignalInfo(@intCast(fo.owner), s.signo, s.info);
-        } else if (-fo.owner <= 0xffff) {
-            _ = sig_mod.sendSignalToPgrpInfo(@intCast(-fo.owner), s.signo, null, s.info);
-        }
+        vfs.sendToOwner(fo, s.signo, s.info);
     }
 }
 

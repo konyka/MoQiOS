@@ -8709,7 +8709,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello318 PASS、hello316 PASS 和 `hello228: corrupted canaries=0`。
 - 局限：
   1. owner 和 sig 只用于租约打破。没有 `O_ASYNC`/`FASYNC`，socket、pipe、tty 的 I/O 就绪不发 `SIGIO`。（pipe 已在 hello320 一节实现；socket、tty 仍未做）
-  2. 没有 `F_SETOWN_EX`/`F_GETOWN_EX`，也没有 `sigio_perm` 的 uid 权限检查。
+  2. 没有 `F_SETOWN_EX`/`F_GETOWN_EX`，也没有 `sigio_perm` 的 uid 权限检查。（`F_SETOWN_EX`/`F_GETOWN_EX` 已在 hello321 一节实现；`sigio_perm` 仍未做）
   3. pipe 等不走共享 offset 槽的描述符，dup 后 owner/sig 是各自的副本，不共享。（pipe 已在 hello320 一节修复：管道两端也用共享槽；eventfd、socket 等仍是副本）
   4. pgid 是 u16；只做了 x86_64 的 fcntl 分派。（`CAP_LEASE` 和属主检查已在 hello319 一节实现）
 
@@ -8750,4 +8750,23 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 只做了管道；socket、tty、eventfd 等的 `O_ASYNC` 仍然不保留、不发信号。
   2. `open(O_ASYNC)` 不保留这一位（`OPEN_STATUS_MASK` 不含它）；Linux 在普通文件上保留但不起作用，管道不能用 `open` 打开（FIFO 除外，这里没有 FIFO 的 `O_ASYNC`）。
   3. 登记表 128 项、共享槽池 512 槽；管道描述现在也占共享槽，池满时 dup、fork 退化为私有副本，`F_SETFL O_ASYNC` 返回 `ENOMEM`。
-  4. 没有 `sigio_perm` 的 uid 检查，也没有 `F_SETOWN_EX`；只做了 x86_64 的 close 系列信号检查。
+  4. 没有 `sigio_perm` 的 uid 检查，也没有 `F_SETOWN_EX`；只做了 x86_64 的 close 系列信号检查。（`F_SETOWN_EX` 已在 hello321 一节实现）
+
+### `F_SETOWN_EX`/`F_GETOWN_EX` 与按线程投递的 `SIGIO`（hello321，已修）
+
+- 问题：`F_SETOWN_EX`(15)、`F_GETOWN_EX`(16) 返回 `EINVAL`，owner 没有类型。`F_SETOWN` 设的 pid 也被当作线程 id 直接投递：这个线程屏蔽了信号时，信号就停在它身上，不会转给进程里其他没屏蔽的线程。
+- Linux 依据：`fs/fcntl.c` 的 `f_setown_ex` 把 `F_OWNER_TID`/`PID`/`PGRP` 映射为 `PIDTYPE_PID`/`TGID`/`PGID`，其他类型 `EINVAL`，找不到 id（含负数）返回 `ESRCH`，id 0 清除 owner；`f_getown_ex` 写回类型和正的 id；`f_setown` 用 `PIDTYPE_TGID`（-pgrp 用 `PGID`）；`send_sigio` 按类型发线程定向、进程定向或进程组信号；`lease_setup` 只在没有 owner 时设置，用 `PIDTYPE_TGID`。
+- 宿主机实测（`/tmp/oex2.c`–`/tmp/oex4.c`，再以 `gcc -DHOST -pthread` 跑 `user/hello321.c`，A–K 全过）：新打开的是 TID 0；`F_SETOWN` pid 读回 PID、-pgrp 读回 PGRP 和正的组 id；三种类型都能设置，`F_GETOWN` 分别报 pid、pid、-pgrp；类型 3、-1 是 `EINVAL`；不存在或负的 id 对三种类型都 `ESRCH`，原值不变；id 0 保留类型，之后 `F_SETOWN 0` 把类型改成 PID；坏指针 `EFAULT`，坏 fd `EBADF`；dup 和 fork 共享；`F_SETLEASE` 设 PID owner，已有 TID owner 时保留；TID owner 只由那个线程收到，它屏蔽时其他线程收不到；PID owner 在主线程屏蔽时由另一线程收到，否则由主线程收到。
+- 红灯：在未修改的内核上定向 SMP=2，hello321 A–K 全部失败（两个命令都返回 `EINVAL`）。宿主机单测「fcntl policy: F_SETOWN_EX owner types…」先编译失败（缺 `F_OWNER_TID`）。
+- 修复：
+  - `kernel/fs/fcntl_policy.zig`：`F_OWNER_TID`/`PID`/`PGRP`、`setownEx`、`getownEx`、`setownKind`。
+  - `kernel/fs/shared_offset.zig`：每个槽新增 `kinds`；`kernel/fs/vfs.zig`：`FileDescriptor.fown_kind`，promote 时一起搬进槽；`Fown.kind`；`setOwnerEx`；`setFownOf` 按 `setownKind` 设类型；`sendToOwner` 按类型投递。
+  - `kernel/proc/signal_syscall.zig`：`sendToProcessInfo(tid, sig, info)`，走 kill 的 `sendToProcessWith`，被屏蔽时转给其他线程。
+  - `kernel/fs/fcntl.zig`：`F_SETOWN_EX`/`F_GETOWN_EX`，先检查指针再检查参数。
+  - `kernel/fs/file_lock.zig` 的租约打破和 `vfs.pipeFasyncNotify` 都改用 `sendToOwner`。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello321 A–K 全过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello321、hello320、hello319、hello318、hello316 PASS 和 `hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
+- 局限：
+  1. 仍然没有 `sigio_perm` 的 uid 检查（Linux 要求发送时 owner 的凭据允许给目标发信号）。
+  2. TID owner 的线程退出后，Linux 的 pid 引用会让信号落空；这里按 tid 查找，tid 被重用时可能发给新任务。
+  3. pgid 仍是 u16；只做了 x86_64 的 fcntl 分派。

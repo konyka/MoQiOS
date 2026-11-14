@@ -16,6 +16,8 @@ pub fn Pool(comptime N: usize) type {
         /// F_SETOWN / F_SETSIG of the shared description: pid (> 0), -pgrp (< 0) or 0; the signal, 0 for SIGIO.
         owners: [N + 1]i32 = @splat(0),
         signals: [N + 1]u8 = @splat(0),
+        /// F_SETOWN_EX type of the owner: 0 TID, 1 PID, 2 PGRP.
+        kinds: [N + 1]u8 = @splat(0),
 
         /// Move `offset` into a fresh slot with one holder. Null when the pool is full.
         pub fn promote(self: *Self, offset: u64) ?u16 {
@@ -27,6 +29,7 @@ pub fn Pool(comptime N: usize) type {
                     self.status[i] = 0;
                     self.owners[i] = 0;
                     self.signals[i] = 0;
+                    self.kinds[i] = 0;
                     return @intCast(i);
                 }
             }
@@ -76,6 +79,14 @@ pub fn Pool(comptime N: usize) type {
 
         pub fn setSignal(self: *Self, slot: u16, v: u8) void {
             self.signals[slot] = v;
+        }
+
+        pub fn kind(self: *const Self, slot: u16) u8 {
+            return self.kinds[slot];
+        }
+
+        pub fn setKind(self: *Self, slot: u16, v: u8) void {
+            self.kinds[slot] = v;
         }
     };
 }

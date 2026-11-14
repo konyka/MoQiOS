@@ -6,7 +6,9 @@
 ///   - F_GETFL / F_SETFL: get/set file status flags (O_NONBLOCK, O_APPEND)
 ///   - F_DUPFD_CLOEXEC: duplicate fd with FD_CLOEXEC set
 ///   - F_SETLEASE / F_GETLEASE: file leases (file_lock.zig, lease_policy.zig)
-///   - F_SETOWN / F_GETOWN / F_SETSIG / F_GETSIG: who a lease break signals, and with which signal (per open file description)
+///   - F_SETOWN / F_GETOWN / F_SETSIG / F_GETSIG: who a lease break or O_ASYNC signals, and with which signal (per open file description)
+///   - F_SETOWN_EX / F_GETOWN_EX: the owner with its type (a thread, a process or a process group)
+const std = @import("std");
 const vfs = @import("vfs.zig");
 const policy = @import("fcntl_policy.zig");
 
@@ -22,6 +24,8 @@ pub const F_SETOWN: u64 = 8;
 pub const F_GETOWN: u64 = 9;
 pub const F_SETSIG: u64 = 10;
 pub const F_GETSIG: u64 = 11;
+pub const F_SETOWN_EX: u64 = 15;
+pub const F_GETOWN_EX: u64 = 16;
 pub const F_OFD_GETLK: u64 = 36;
 pub const F_OFD_SETLK: u64 = 37;
 pub const F_OFD_SETLKW: u64 = 38;
@@ -90,6 +94,31 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
             const who = policy.setownArg(arg) orelse return -22;
             if (who != 0 and !ownerExists(who)) return -3; // ESRCH
             vfs.setFownOf(&t.fd_table.fds[fd], who, null, false);
+            return 0;
+        },
+        F_GETOWN_EX => {
+            const fo = vfs.fownOf(&t.fd_table.fds[fd]);
+            const ex = policy.getownEx(fo.owner, fo.kind);
+            var out: [8]u8 = undefined;
+            std.mem.writeInt(i32, out[0..4], ex.type, .little);
+            std.mem.writeInt(i32, out[4..8], ex.pid, .little);
+            const copy = @import("../mm/copy_from_user.zig");
+            if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;
+            return if (copy.copyToUser(@ptrFromInt(arg), out[0..], 8) == 8) 0 else -14; // EFAULT
+        },
+        F_SETOWN_EX => {
+            const copy = @import("../mm/copy_from_user.zig");
+            if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;
+            var in: [8]u8 = undefined;
+            if (copy.copyFromUser(in[0..], @ptrFromInt(arg), 8) != 8) return -14; // EFAULT
+            const kind = std.mem.readInt(i32, in[0..4], .little);
+            const pid = std.mem.readInt(i32, in[4..8], .little);
+            const ex = policy.setownEx(kind, pid) catch |e| return switch (e) {
+                error.InvalidType => -22, // EINVAL
+                error.NoSuchOwner => -3, // ESRCH
+            };
+            if (ex.owner != 0 and !ownerExists(ex.owner)) return -3; // ESRCH
+            vfs.setOwnerEx(&t.fd_table.fds[fd], ex.owner, ex.kind);
             return 0;
         },
         F_SETSIG => {
