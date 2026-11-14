@@ -8643,7 +8643,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello316 PASS 和 `hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
 - 如实的局限：
   1. 没有 `F_SETSIG`，通知固定是 `SIGIO`；没有属主和 `CAP_LEASE` 检查（Linux 对非属主返回 `EACCES`）。
-  2. `ftruncate` 不打破租约（没有在宿主机上实测 Linux 的行为）；45 s 的强制解除只有宿主机单测，目标机没有测。
+  2. `ftruncate` 不打破租约（没有在宿主机上实测 Linux 的行为）；45 s 的强制解除只有宿主机单测，目标机没有测。（`ftruncate` 一项已实测核对，与 Linux 一致，见下文「`ftruncate` 与租约（hello316 K）」）
   3. 撤回因租约失败的新 fd 用的是普通 `close`，会同时删掉本进程在该文件上的 fcntl 记录锁；Linux 的失败 open 不会这样。
   4. 租约表 32 项，满了返回 `ENOLCK`；一次打破最多通知 8 个进程。
   5. rofs（ext4/NTFS 只读卷）、procfs 不支持租约（`EINVAL`）；只做了 x86_64 的 fcntl 分派。
@@ -8680,3 +8680,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   3. 特权路径（B、C、D、H）没有在宿主机上实测，按 Linux 源码实现。
   4. 只做了 x86_64；Linux 编号 159（adjtimex）和 305（clock_adjtime）在 native 表里分别是 msgctl 和 kcmp，没有为 Linux personality 加别名。
   5. `ADJ_SETOFFSET` 只改墙钟偏移，与 `clock_settime` 一样不通知已有的 REALTIME 定时器（timerfd 的 `TFD_TIMER_CANCEL_ON_SET` 不触发）。
+
+## `ftruncate` 与租约（hello316 K，核对，无需修改）
+
+- 开放项：hello316 一节的局限 2 记着「`ftruncate` 不打破租约，没有实测 Linux 的行为」。
+- Linux 依据：`fs/open.c` 的 `do_ftruncate` 没有调用 `break_lease`（只有路径版的 `vfs_truncate` 调用 `break_lease(inode, O_WRONLY)`）。原因是 `ftruncate` 要求 fd 以写方式打开，而有写打开时别人拿不到读租约，写租约也只能由这唯一的打开自己持有，所以不存在能被打破的租约。
+- 宿主机实测（`/tmp/ftl.c`，再以 `gcc -DHOST` 跑 hello316，A–K 全过）：唯一的 `O_RDWR` 打开持写租约时，自己 `ftruncate` 和 fork 出的子进程通过继承的 fd `ftruncate` 都返回 0，`F_GETLEASE` 仍是 1，没有 `SIGIO`；有写打开时另一个只读打开拿读租约是 `EAGAIN`。
+- 新增 hello316 K 断言上述行为。没有红灯：在未修改的内核上定向 SMP=2、SMP=4 各一份 hello316 A–K 全过（K：`0 0 child 0 lease 1 sigio 0`），说明本内核的 `ftruncate` 已与 Linux 一致，原来的局限是没核对，不是实现缺陷。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都有 hello316 PASS（K 都 ok）和 `hello228: corrupted canaries=0`。一份 SMP=4 `EXIT=0`；其余三份 `EXIT=1`，都是 hello108「RT task lost the CPU to reaping」（文档里已记的偶发项），其中一份 SMP=4 另有 hello286 M 19/20（同样是已记的偶发项）。这次只改了测试和文档，内核没有变。对照：hello108 单独定向在当前内核上跑六次（SMP 1/2/4 各两次）全部失败；在上一个提交 `67681b1`（本节之前，也在 adjtimex 之前）的 worktree 里定向跑三次（SMP 1/2/4）也全部失败，形状相同（窗口内被占用 5.4–8.4 ms，阈值 4 ms；最长单次中断 2.8–4.4 ms）。当时宿主机上另有一个项目在跑 cmake 构建，负载 2–38，CPU 调速策略是 powersave，所以 hello108 的失败与本节无关，仍按宿主机负载引起的偶发项记录。riscv64、aarch64 smoke 在上一节已通过，本节内核未变；`zig build`、`zig build test` 通过。
+- 局限：45 s 的强制解除仍然只有宿主机单测。

@@ -17,7 +17,10 @@
  *   H. a dup shares the lease, which stays when one copy is closed and goes with the last close; another open of the file
  *      reports 2 and F_UNLCK there is EAGAIN;
  *   I. the holder's own O_WRONLY|O_NONBLOCK open is EAGAIN and its SIGIO has run when open returns;
- *   J. two read leases held by one process: one conflicting open delivers SIGIO once. */
+ *   J. two read leases held by one process: one conflicting open delivers SIGIO once;
+ *   K. ftruncate does not break a lease (Linux do_ftruncate has no break_lease: the fd is already open for writing, so any
+ *      lease it can coexist with is its own): under a write lease on the only O_RDWR open, ftruncate there and in a forked
+ *      child through the inherited fd both return 0, F_GETLEASE stays 1 and no SIGIO arrives. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -235,6 +238,22 @@ int main(void) {
     close(r2);
     snprintf(msg, sizeof msg, "J: two read leases of one process, one conflicting open, one SIGIO (%ld %ld %ld sigio %ld)", j0, j1, j2, jh);
     check(j0 == 0 && j1 == 0 && j2 == -11 && jh == 1, msg);
+
+    fd = (int)op(F, M_RW);
+    long k0 = setl(fd, T_WRLCK);
+    arm(fd, 0);
+    long k1 = ftruncate(fd, 2);
+    long kc = fork();
+    if (kc == 0) _exit(ftruncate(fd, 1) == 0 ? 0 : 1);
+    int kst = -1;
+    while (waitpid(kc, &kst, 0) != kc) {}
+    usleep(50000);
+    long k2 = getl(fd), kh = hits;
+    setl(fd, T_UNLCK);
+    close(fd);
+    snprintf(msg, sizeof msg, "K: ftruncate does not break the caller's write lease (%ld %ld child %d lease %ld sigio %ld)", k0, k1, (kst >> 8) & 0xff,
+             k2, kh);
+    check(k0 == 0 && k1 == 0 && kst == 0 && k2 == 1 && kh == 0, msg);
 
     unlink(F);
     rmdir(D);
