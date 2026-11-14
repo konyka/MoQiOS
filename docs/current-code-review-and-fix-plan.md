@@ -8540,7 +8540,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   3. 偏移池（512 槽）满时 `flock` 返回 `ENOLCK`，Linux 不会。
   4. 等待仍是每 10 ms 重查一次，释放方会主动唤醒；没有 Linux 的阻塞者链表和公平性。
   5. K 段在红灯上通过，所以 FAT32 首簇 0 冲突这条只有代码层面的论证，没有目标机红灯证据：本内核的 `createFile` 会先分配首簇，只有从磁盘读到的空文件首簇才是 0。
-  6. 没做 OFD 锁（`F_OFD_SETLK`）和 `F_SETLK64` 之外的变体，也没做租约（`F_SETLEASE`）。
+  6. 没做 OFD 锁（`F_OFD_SETLK`）和 `F_SETLK64` 之外的变体，也没做租约（`F_SETLEASE`）。（OFD 锁 hello313 已做；租约仍没有）
 
 
 ## 交叉的 `F_SETLKW` 永远互相等待，没有 `EDEADLK`（hello311，已修）
@@ -8571,3 +8571,20 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 如实的局限：
   1. 已过去的截止时间在下一个 tick（约 10 ms）触发，Linux 在 `timer_settime` 返回前就触发。hello312 C 的等待窗口是 300 ms，不受影响。
   2. `clock_nanosleep` 在 CPU 时钟上的行为没有改：`CLOCK_PROCESS_CPUTIME_ID` 仍是 `EINVAL`（Linux 会真的去睡），`CLOCK_THREAD_CPUTIME_ID` 是 `EOPNOTSUPP`（与 Linux 相同），见 `kernel/proc/clock_ids.zig` 的说明。
+
+## 没有 OFD 锁（`F_OFD_GETLK`/`F_OFD_SETLK`/`F_OFD_SETLKW`）（hello313，已修）
+
+- 问题：`fcntl` 命令 36/37/38 直接落到 `else => EINVAL`。Linux（`fs/locks.c`）把它们当作区间锁处理，和普通 `fcntl` 锁共用同一个区间空间，但属主是打开文件描述（`flc_owner = filp`，`FL_OFDLCK`）：同一进程里两次 `open` 的 OFD 锁互相冲突，`dup` 和 `fork` 出来的副本共享，关闭别的描述符不会释放它，最后一次关闭这个打开文件描述时才释放；`F_GETLK`/`F_OFD_GETLK` 报告它时 `l_pid` 为 -1；`l_pid` 不为 0 是 `EINVAL`；等待不做死锁检测。
+- 新测试 hello313：A 同一进程两次 `open`，OFD 写锁互相冲突；B OFD 锁和同进程的普通 `fcntl` 锁互相冲突；C 关闭同一文件的另一个描述符不释放 OFD 锁；D `dup` 共享锁，最后一次关闭后释放；E `F_OFD_GETLK`、`F_GETLK` 报告别处持有的 OFD 锁，`l_pid` 为 -1；F `l_pid` 非 0 时 `F_OFD_SETLK`、`F_OFD_GETLK` 返回 `EINVAL`；G `F_OFD_SETLKW` 等子进程解锁后拿到锁；H `fork` 出的子进程共享锁，它退出后锁还在；I 解锁区间中段，两端仍锁着。
+- 宿主机实测：hello313（`gcc -DHOST`）A–I 全过，`taskset -c 0` 下同样通过（G 等了 300 ms）。
+- 红灯：未修改的内核（`497ba27`）上定向 SMP=2（日志开头 `spawned hello2`、`spawned hello313`）：除 F 外全部 FAIL，所有 OFD 命令都返回 `-22`。F 只是碰巧通过，原因是所有 OFD 命令本来就返回 `EINVAL`。
+- 修复：
+  - `kernel/fs/fcntl.zig`：36/37/38 交给 `file_lock.setLock`。
+  - `kernel/fs/file_lock.zig`：`setLock` 识别 OFD 命令，`l_pid` 非 0 返回 `EINVAL`，然后按 5/6/7 的逻辑走。属主改用 `vfs.flockOwner`（打开文件描述，与 `flock` 同一个属主），记录的 pid 为 `0xffffffff`（`F_GETLK` 读出 -1）。等待时不查 `wouldDeadlock`，也不登记 `waits`。`releaseOnClose` 在打开文件描述最后一次关闭时，除了 `flock` 外，也删掉这个属主的区间锁。
+  - 两类属主的取值范围不重叠（`posixLockOwner` 远小于 `0x2000…`/`0x4000…`），所以 `lock_table` 不需要改：OFD 锁就是一个属主不同的 `.posix` 锁。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份，A–I 全过（G 等了 353/343 ms）；另跑一份 SMP=4，hello310、hello311、hello313 依次全过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒）：SMP=1 和两份 SMP=4 `EXIT=0`、0 FAIL，都有 hello313 PASS；SMP=2 那份卡在 hello300 的 AF_UNIX `recv` 一项（`epoll_wait` 两项通过后的那个 `fork` 之后再无输出），按 1400 秒超时退出，没有 FAIL。这是文档里已记录的 hello300 偶发卡住，hello300 不用 OFD 锁（只有一处 `F_SETFL`）；随后单独跑 hello300 定向 SMP=2 三份并行全过，再单独重跑一份完整 SMP=2 smoke `EXIT=0`、0 FAIL、hello313 PASS。所有份 `hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
+- 如实的局限：
+  1. 不使用共享偏移的描述符类型（`vfs.usesSharedOffset` 为假），`flockOwner` 给的是逐描述符的属主（`privateFlockOwner`），所以在这类描述符上，`dup` 出来的副本不共享 OFD 锁。普通文件（tmpfs、FAT32、ext2）使用共享偏移，不受影响。
+  2. 打开文件描述的属主取自共享偏移池（512 槽），池满时 OFD 命令返回 `ENOLCK`，与 `flock` 相同。
+  3. 和普通 `fcntl` 锁一样，等待仍是每 10 ms 重查一次。

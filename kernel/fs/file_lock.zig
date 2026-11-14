@@ -4,9 +4,11 @@
 ///   - the file is lockKey(), the same for every open of one file;
 ///   - a flock is owned by the open file description: its shared-offset slot (a descriptor is moved to a shared slot when it
 ///     takes a flock, so a later dup/fork keeps the owner), or the descriptor itself for kinds without a byte offset;
-///   - an fcntl lock is owned by the descriptor table (Linux: current->files), so every thread sharing the table shares it.
+///   - an fcntl lock is owned by the descriptor table (Linux: current->files), so every thread sharing the table shares it;
+///   - an OFD lock (F_OFD_GETLK/SETLK/SETLKW) is a byte-range lock like an fcntl lock, in the same range space, but owned by the
+///     open file description (the flock owner), and reports l_pid -1.
 /// Releasing (vfs.releaseOpenFile): any close drops the table's fcntl locks on that file; the last close of an open file
-/// description drops its flock. A blocked flock/F_SETLKW parks the task (sleep_bm) and is woken when a lock is released, or by
+/// description drops its flock and its OFD locks. A blocked flock/F_SETLKW parks the task (sleep_bm) and is woken when a lock is released, or by
 /// the scheduler tick within 10 ms.
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const vfs = @import("vfs.zig");
@@ -125,6 +127,7 @@ pub fn releaseOnClose(key: ?u64, posix_owner: ?u64, ofd_owner: ?u64, slot: u16, 
         if (posix_owner) |po| dropped = table.dropOwner(k, .posix, po) or dropped;
         if (last) if (ofd_owner) |o| {
             dropped = table.dropFlock(k, o) or dropped;
+            dropped = table.dropOwner(k, .posix, o) or dropped;
         };
     }
     fl_lock.release(flags);
@@ -202,11 +205,18 @@ fn fileSize(desc: *vfs.FileDescriptor) u64 {
     };
 }
 
+/// F_GETLK/F_SETLK/F_SETLKW and their open file description forms.
+pub const F_OFD_GETLK: u64 = 36;
+pub const F_OFD_SETLK: u64 = 37;
+pub const F_OFD_SETLKW: u64 = 38;
+/// The l_pid an OFD lock reports: it belongs to no process (Linux locks_translate_pid).
+const OFD_PID: u32 = 0xffff_ffff;
+
 /// fcntl F_SETLK / F_SETLKW / F_GETLK (byte-range locks)
 /// fd     — file descriptor
-/// cmd    — 5=F_GETLK, 6=F_SETLK, 7=F_SETLKW
+/// cmd    — 5=F_GETLK, 6=F_SETLK, 7=F_SETLKW; 36/37/38 the same for a lock owned by the open file description, whose l_pid must be 0
 /// flock_ptr — user-space pointer to struct flock
-pub fn setLock(fd: u64, cmd: u64, flock_ptr: u64) i64 {
+pub fn setLock(fd: u64, cmd_in: u64, flock_ptr: u64) i64 {
     const sched_mod = @import("../proc/sched.zig");
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
@@ -226,8 +236,10 @@ pub fn setLock(fd: u64, cmd: u64, flock_ptr: u64) i64 {
     const l_len: i64 = @bitCast(bo.readU64At(&kbuf, 16));
     if (l_type != F_RDLCK and l_type != F_WRLCK and l_type != F_UNLCK) return EINVAL;
     if (l_whence < 0 or l_whence > 2) return EINVAL;
+    const ofd = cmd_in == F_OFD_GETLK or cmd_in == F_OFD_SETLK or cmd_in == F_OFD_SETLKW;
+    if (ofd and bo.readU32Le(kbuf[24..28]) != 0) return EINVAL;
+    const cmd: u64 = if (ofd) cmd_in - 31 else cmd_in;
     const fdt = t.fd_table;
-    const owner = vfs.posixLockOwner(fdt);
     // Every way out of a blocking F_SETLKW (lock taken, EDEADLK, EINTR, a descriptor closed under the wait) ends the wait.
     defer if (cmd == 7) clearWait(cur_idx);
 
@@ -247,6 +259,11 @@ pub fn setLock(fd: u64, cmd: u64, flock_ptr: u64) i64 {
             fdt.releaseTransferFd(fd_u);
             return if (e == error.Overflow) EOVERFLOW else EINVAL;
         };
+        const owner = if (ofd) vfs.flockOwner(fdt, fd_u) orelse {
+            fdt.releaseTransferFd(fd_u);
+            return ENOLCK;
+        } else vfs.posixLockOwner(fdt);
+        const pid = if (ofd) OFD_PID else reportedPid(t);
         const write = l_type == F_WRLCK;
         const flags = fl_lock.acquire();
 
@@ -270,7 +287,7 @@ pub fn setLock(fd: u64, cmd: u64, flock_ptr: u64) i64 {
 
         const hit = table.conflict(key, .posix, owner, write, range.start, range.end) orelse {
             if (cur_idx < waits.len) waits[cur_idx] = .{};
-            const ok = table.setPosix(key, owner, reportedPid(t), write, range.start, range.end);
+            const ok = table.setPosix(key, owner, pid, write, range.start, range.end);
             fl_lock.release(flags);
             fdt.releaseTransferFd(fd_u);
             // Turning a write lock into a read lock can let readers in.
@@ -282,7 +299,14 @@ pub fn setLock(fd: u64, cmd: u64, flock_ptr: u64) i64 {
             fdt.releaseTransferFd(fd_u);
             return EAGAIN;
         }
-        // Waiting for `hit`'s owner, who may itself be waiting (in a chain) for us: report that instead of sleeping forever.
+        // Waiting for `hit`'s owner, who may itself be waiting (in a chain) for us: report that instead of sleeping forever. An
+        // OFD lock belongs to no process, so its waits are neither checked nor recorded (Linux posix_locks_deadlock).
+        if (ofd) {
+            fl_lock.release(flags);
+            fdt.releaseTransferFd(fd_u);
+            if (waitOrInterrupt(t, cur_idx)) |r| return r;
+            continue;
+        }
         if (lt.wouldDeadlock(owner, hit.owner, &waits)) {
             if (cur_idx < waits.len) waits[cur_idx] = .{};
             fl_lock.release(flags);

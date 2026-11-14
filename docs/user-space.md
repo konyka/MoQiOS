@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello312`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello313`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -307,6 +307,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello310 | `flock` 属于打开文件描述、`fcntl` 锁属于进程，两类互不影响：别的进程打开再关闭同一文件不会释放别人的锁（A/B）；同一进程第二次 `open` 拿不到已持有的 `flock`，`dup` 出来的描述符共享它（C/D）；关闭该文件的任一描述符释放本进程的 `fcntl` 区间锁（E）；`flock` 与 `fcntl` 锁互不阻塞，`F_GETLK` 不报告 `flock`（F/G）；`fork` 子进程退出不带走共享的 `flock`（H）；`F_GETLK` 报告写锁/读锁类型和持有者 pid（I）；同一进程的第二段区间锁不覆盖第一段（J）；解锁中段会拆分区间（L）；两个新建的空 FAT32 文件各自加锁（K）（宿主机 Linux 实测同结果） |
 | hello311 | `F_SETLKW` 在等待会构成锁属主环时返回 `EDEADLK`，而不是永远等下去：两个进程各持一个字节、交叉等待对方，后发起的那个立刻得到 `EDEADLK`，先等的那个在对方放弃后拿到锁（A）；等一个自己没在等待的持有者不算死锁，持有者解锁后返回 0（B）；经过三个进程的环也能发现（C）（宿主机 Linux 实测同结果） |
 | hello312 | CPU 时钟（`CLOCK_PROCESS_CPUTIME_ID`、`CLOCK_THREAD_CPUTIME_ID`）上的 POSIX 定时器带 `TIMER_ABSTIME` 时，`it_value` 是 CPU 时钟的读数：截止时间在 20 ms CPU 之后时剩余不超过 20 ms，烧够后触发（A、B）；已过去的截止时间不再烧 CPU 也会触发（C）；10 s 之后的截止时间剩余 9～10 s，睡眠时不触发（D）；线程时钟同样（E、F）（宿主机 Linux 实测同结果） |
+| hello313 | OFD 锁（`F_OFD_GETLK`/`F_OFD_SETLK`/`F_OFD_SETLKW`）属于打开文件描述：同一进程两次 `open` 互相冲突（A），和普通 `fcntl` 锁互相冲突（B），关闭别的描述符不释放（C），`dup` 共享、最后一次关闭释放（D），`GETLK` 报告 `l_pid` -1（E），`l_pid` 非 0 是 `EINVAL`（F），`F_OFD_SETLKW` 等到解锁（G），`fork` 的子进程共享且退出不释放（H），中段解锁保留两端（I）（宿主机 Linux 实测同结果） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

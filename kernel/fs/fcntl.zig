@@ -16,6 +16,9 @@ pub const F_SETFL: u64 = 4;
 pub const F_GETLK: u64 = 5;
 pub const F_SETLK: u64 = 6;
 pub const F_SETLKW: u64 = 7;
+pub const F_OFD_GETLK: u64 = 36;
+pub const F_OFD_SETLK: u64 = 37;
+pub const F_OFD_SETLKW: u64 = 38;
 pub const F_GETLEASE: u64 = 1025;
 pub const F_DUPFD_CLOEXEC: u64 = 1030;
 pub const F_SETPIPE_SZ: u64 = 1031;
@@ -89,7 +92,7 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
             const maps = @import("../proc/task.zig").countSharedWritableTmpfsMaps(idx, tmpfs.tmpfsGetCtime(idx));
             return tmpfs.tmpfsAddSeals(idx, @truncate(arg), maps);
         },
-        F_GETLK, F_SETLK, F_SETLKW => {
+        F_GETLK, F_SETLK, F_SETLKW, F_OFD_GETLK, F_OFD_SETLK, F_OFD_SETLKW => {
             const file_lock = @import("file_lock.zig");
             return file_lock.setLock(fd_num, cmd, arg);
         },
