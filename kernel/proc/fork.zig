@@ -81,7 +81,6 @@ pub fn fork(frame: *SyscallFrame) i64 {
     // the same charged usage.
 
     parent.fd_table.inheritFdTable(child.fd_table);
-    @import("../ipc/posix_mq.zig").inheritRefs(parent_idx, child_idx);
 
     for (0..64) |i| {
         child.sigact().handlers[i] = parent.sigact().handlers[i];

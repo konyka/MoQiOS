@@ -213,7 +213,6 @@ pub fn prepareExecName(name: []const u8, argv_ptr: u64, envp_ptr: u64) Prepared 
 
     // Switch to new address space
     if (sched.currentTaskIndex()) |task_idx| {
-        @import("../ipc/posix_mq.zig").closeCloexecForTask(task_idx);
         // Linux execve runs exit_itimers() and drops the process's mq_notify registration: anything the old image armed must not
         // fire into the new one (a 100 ms timer armed before exec sent its signal straight into the new image, and the old
         // registration made the new image's mq_notify fail with EBUSY).

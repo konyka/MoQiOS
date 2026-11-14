@@ -70,6 +70,9 @@ pub const FdType = enum(u8) {
     /// the mount, rofs_gen is the mount generation it was opened under, and
     /// rofs_ref the inode / MFT record number.
     rofs_file = 22,
+    /// POSIX message queue descriptor (ipc/posix_mq.zig): mq_desc_idx / mq_desc_gen name the open description, which dup, fork and
+    /// SCM_RIGHTS copies share (one reference per descriptor).
+    mqueue = 23,
 };
 
 pub const PIPE_BUF_SIZE: u32 = 4096;
@@ -1185,6 +1188,9 @@ pub const FileDescriptor = struct {
     timerfd_idx: u32 = 0,
     inotify_idx: u32 = 0,
     tmpfs_idx: u32 = 0,
+    /// posix_mq description slot and its generation for .mqueue fds.
+    mq_desc_idx: u32 = 0,
+    mq_desc_gen: u64 = 0,
     /// devfs node slot (fs/devfs.zig); devfs.DIR_IDX = the /dev directory.
     devfs_idx: u32 = 0,
     /// devfs proxy node slot (fs/devfs_proxy.zig) for .devfs_ctrl fds.
@@ -2161,6 +2167,12 @@ pub const FdTable = struct {
             },
             .pidfd => return -1,
             .inotify => return -1, // inotify uses read via special syscall path
+            .mqueue => {
+                // Linux mqueue_read_file: the queue's status line, from this descriptor's offset.
+                const n = @import("../ipc/posix_mq.zig").statusRead(desc.mq_desc_idx, desc.mq_desc_gen, desc.offset, buf, count);
+                if (n > 0) desc.offset += @intCast(n);
+                return n;
+            },
             .raw_socket => {
                 // Raw socket: receive raw ethernet frame
                 const nic = @import("../net/nic.zig");
@@ -2362,6 +2374,7 @@ pub const FdTable = struct {
             .proc_file => return -1, // proc files are read-only
             .pidfd => return -1,
             .inotify => return -1, // inotify is read-only via special path
+            .mqueue => return -22, // EINVAL: an mq descriptor has no write (Linux mqueue_file_operations)
             .raw_socket => {
                 // Raw socket: send raw ethernet frame
                 const nic = @import("../net/nic.zig");
@@ -2427,6 +2440,8 @@ pub const FdTable = struct {
             .tcp_socket, .udp_socket, .unix_socket, .raw_socket => return -29, // ESPIPE
             .epoll, .eventfd, .timerfd, .inotify, .pidfd => return -29, // ESPIPE
             .devfs_ctrl => return -29, // ESPIPE — ctrl fds are sequential streams
+            // pread of an mq descriptor reads the status line at that offset (Linux mqueue_read_file through simple_read_from_buffer).
+            .mqueue => return @import("../ipc/posix_mq.zig").statusRead(desc.mq_desc_idx, desc.mq_desc_gen, offset, buf, count),
             .ramdisk_file => {
                 if (offset >= desc.file_size) return 0;
                 const remaining = desc.file_size - offset;
@@ -2508,6 +2523,7 @@ pub const FdTable = struct {
             .tcp_socket, .udp_socket, .unix_socket, .raw_socket => return -29, // ESPIPE
             .epoll, .eventfd, .timerfd, .inotify => return -29, // ESPIPE
             .devfs_ctrl => return -29, // ESPIPE
+            .mqueue => return -22, // EINVAL: no write operation
             .ramdisk_file => return -1, // ramdisk is read-only
             .devfs => {
                 // Char devices are streams: explicit-offset writes are
@@ -2644,10 +2660,7 @@ pub const FdTable = struct {
     /// the documented close-vs-use weakness. Callers must not rely on
     /// close blocking a concurrent user of the descriptor.
     pub fn close(self: *FdTable, fd: u32) i64 {
-        if (fd >= MAX_FDS) {
-            // POSIX mq descriptors live outside the per-task table (300+).
-            return @import("../ipc/posix_mq.zig").mqClose(fd);
-        }
+        if (fd >= MAX_FDS) return -9; // EBADF
         if (fd <= FD_STDERR and self.fds[fd].fd_type == .special) {
             // The standard descriptors stay open; one that O_ASYNC moved to a shared description gives its share back (the last
             // holder drops the registration) and goes back to a private copy without O_ASYNC.
@@ -2759,6 +2772,9 @@ pub const FdTable = struct {
         if (desc.fd_type == .tmpfs_file) {
             const tmpfs = @import("tmpfs.zig");
             tmpfs.tmpfsClose(@intCast(desc.tmpfs_idx));
+        }
+        if (desc.fd_type == .mqueue) {
+            @import("../ipc/posix_mq.zig").closeDescription(desc.mq_desc_idx, desc.mq_desc_gen);
         }
         if (desc.fd_type == .devfs_ctrl) {
             // Owner death: pending requests complete with -EIO and the
@@ -2874,6 +2890,9 @@ pub const FdTable = struct {
         }
         if (source.fd_type == .tmpfs_file) {
             @import("tmpfs.zig").tmpfsRetain(@intCast(source.tmpfs_idx));
+        }
+        if (source.fd_type == .mqueue) {
+            _ = @import("../ipc/posix_mq.zig").retainDescription(source.mq_desc_idx, source.mq_desc_gen);
         }
         var copy = source;
         copy.fd_flags = @import("namespace_policy.zig").dupFdFlags(source.fd_flags, false);
@@ -2992,6 +3011,9 @@ pub const FdTable = struct {
         if (self.fds[slot].fd_type == .tmpfs_file) {
             @import("tmpfs.zig").tmpfsRetain(@intCast(self.fds[slot].tmpfs_idx));
         }
+        if (self.fds[slot].fd_type == .mqueue) {
+            _ = @import("../ipc/posix_mq.zig").retainDescription(self.fds[slot].mq_desc_idx, self.fds[slot].mq_desc_gen);
+        }
         self.publishFd(slot);
         return @intCast(slot);
     }
@@ -3024,12 +3046,6 @@ var fd_table_pins: [MAX_FD_TABLES]u32 = @splat(0);
 
 fn tableSlot(table: *const FdTable) usize {
     return (@intFromPtr(table) - @intFromPtr(&fd_table_pool)) / @sizeOf(FdTable);
-}
-
-/// The pool slot of `table`: the index side tables keyed by descriptor table use (posix_mq's descriptor handles). A slot is reused
-/// only after freeFdTable, so a side table must be emptied in the last-reference close loop, before that call.
-pub fn tableIndex(table: *const FdTable) u32 {
-    return @intCast(tableSlot(table));
 }
 
 /// Allocation generation of a live table (stable for its whole lifetime).
@@ -3114,7 +3130,7 @@ pub fn freeFdTable(table: *FdTable) void {
 /// Kinds whose reference is held per descriptor (every dup'd fd owns one);
 /// all others hold one reference per distinct resource per table.
 fn refIsPerFd(t: FdType) bool {
-    return t == .pipe_read or t == .pipe_write or t == .fat32_file or t == .tmpfs_file;
+    return t == .pipe_read or t == .pipe_write or t == .fat32_file or t == .tmpfs_file or t == .mqueue;
 }
 
 /// Take one more reference to the resource behind `desc`. False for kinds that
@@ -3131,6 +3147,7 @@ fn retainResource(desc: *const FileDescriptor) bool {
         .unix_socket => @import("../net/unix_socket.zig").unixRetain(desc.unix_sock_idx),
         .timerfd => @import("../ipc/timerfd.zig").timerfdRetain(desc.timerfd_idx),
         .eventfd => @import("eventfd.zig").eventfdRetain(desc.eventfd_idx),
+        .mqueue => return @import("../ipc/posix_mq.zig").retainDescription(desc.mq_desc_idx, desc.mq_desc_gen),
         .ramdisk_file, .special, .devfs, .proc_file, .pidfd, .rofs_file => {},
         else => return false,
     }
@@ -3150,6 +3167,7 @@ fn releaseResource(desc: *const FileDescriptor) void {
         .unix_socket => @import("../net/unix_socket.zig").unixCloseAndReap(desc.unix_sock_idx),
         .timerfd => @import("../ipc/timerfd.zig").timerfdClose(desc.timerfd_idx),
         .eventfd => @import("eventfd.zig").eventfdClose(desc.eventfd_idx),
+        .mqueue => @import("../ipc/posix_mq.zig").closeDescription(desc.mq_desc_idx, desc.mq_desc_gen),
         else => {},
     }
 }
@@ -3208,6 +3226,11 @@ pub fn retainSharedResources(table: *FdTable) void {
         // one, so a table with two descriptors of one file needs two retains for its copy, not one.
         if (desc.fd_type == .fat32_file) {
             @import("fat32.zig").retainFile(desc.fat32_file_idx);
+            continue;
+        }
+        // An mq descriptor holds one reference to its description, so the copy takes its own.
+        if (desc.fd_type == .mqueue) {
+            _ = @import("../ipc/posix_mq.zig").retainDescription(desc.mq_desc_idx, desc.mq_desc_gen);
             continue;
         }
         var seen = false;

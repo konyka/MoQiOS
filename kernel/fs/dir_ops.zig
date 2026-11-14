@@ -54,6 +54,7 @@ pub fn descriptorIno(d: *const vfs_mod.FileDescriptor, fd: u64) u64 {
         .inotify => d.inotify_idx,
         .devfs => d.devfs_idx,
         .devfs_ctrl => d.devfs_ctrl_idx,
+        .mqueue => d.mq_desc_idx,
         else => fd,
     };
     return @import("fd_stat_policy.zig").syntheticIno(@intFromEnum(d.fd_type), res);
@@ -108,6 +109,15 @@ pub fn fstat(fd: u64, stat_ptr: u64) i64 {
                 bo.writeU64Le(stat_buf[88..96], o.stat.mtime);
                 bo.writeU64Le(stat_buf[104..112], o.stat.ctime);
             },
+        }
+    }
+    if (fdesc.fd_type == .mqueue) {
+        // Linux mqueue inode: a regular file with the queue's permission bits and owner, sized FILENT_SIZE.
+        if (@import("../ipc/posix_mq.zig").statInfo(fdesc.mq_desc_idx, fdesc.mq_desc_gen)) |m| {
+            bo.writeU64Le(stat_buf[16..24], 1);
+            bo.writeU32Le(stat_buf[24..28], 0o100000 | (m.mode & 0o7777));
+            bo.writeU32Le(stat_buf[28..32], m.uid);
+            bo.writeU32Le(stat_buf[32..36], m.gid);
         }
     }
     if (fdesc.fd_type == .tmpfs_file) {

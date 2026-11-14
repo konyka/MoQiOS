@@ -73,10 +73,13 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
         },
         F_GETFL => {
             const d = &t.fd_table.fds[fd];
+            // An mq descriptor's flags live in its description (mq_setattr changes the same O_NONBLOCK).
+            if (d.fd_type == .mqueue) return @intCast(@import("../ipc/posix_mq.zig").statusFlagsOf(d.mq_desc_idx, d.mq_desc_gen) orelse return -9);
             return @intCast(policy.reportedFlags(@tagName(d.fd_type), vfs.statusFlagsOf(d)));
         },
         F_SETFL => {
             const d = &t.fd_table.fds[fd];
+            if (d.fd_type == .mqueue) return if (@import("../ipc/posix_mq.zig").setStatusFlags(d.mq_desc_idx, d.mq_desc_gen, @truncate(arg))) 0 else -9;
             const cur_flags = vfs.statusFlagsOf(d);
             var next = policy.applySetfl(cur_flags & ~policy.O_ASYNC, arg);
             // O_ASYNC is kept only where the file can act on it (Linux setfl → f_op->fasync); elsewhere F_SETFL still succeeds.

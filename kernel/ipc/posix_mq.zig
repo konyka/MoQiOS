@@ -23,7 +23,6 @@ const MAX_MSGS: u32 = 8;
 const MAX_MSG_SIZE: u32 = 512;
 const MAX_NAME_LEN: u32 = 64;
 const MAX_OPEN_DESCRIPTIONS: u32 = 256;
-const MAX_TASK_MQ_DESCRIPTORS: u32 = descriptor_policy.MAX_DESCRIPTORS;
 
 /// POSIX message buffer
 const MsgEntry = struct {
@@ -85,27 +84,16 @@ const OpenDescription = struct {
     description_generation: u64 = 0,
     access: u32 = descriptor_policy.O_RDONLY,
     status_flags: u32 = 0,
+    /// O_CLOEXEC given at open: F_GETFL reports it (Linux keeps it in f_flags); close-on-exec itself is the fd's FD_CLOEXEC.
     cloexec: bool = false,
+    /// One per file descriptor naming this description (open, dup, dup2, fork, SCM_RIGHTS); the last close drops it.
     refs: u32 = 0,
-};
-
-const TaskHandle = struct {
-    desc_idx: u32 = 0,
-    desc_generation: u64 = 0,
-    open: bool = false,
 };
 
 var descriptions: [MAX_OPEN_DESCRIPTIONS]OpenDescription = @splat(.{});
 var description_generations: [MAX_OPEN_DESCRIPTIONS]u64 = @splat(0);
-/// mq descriptors per descriptor table (vfs.tableIndex), not per task: CLONE_FILES threads share one table and so one set of mq
-/// descriptors (Linux: an mqd_t is a file descriptor in files_struct). A forked child gets its own table and a copy.
-var table_handles: [vfs.MAX_FD_TABLES][MAX_TASK_MQ_DESCRIPTORS]TaskHandle = @splat(@splat(.{}));
-
-/// The descriptor table of task `task_idx`, as an index into table_handles.
-fn tableOf(task_idx: u32) ?u32 {
-    const t = task.getTask(task_idx) orelse return null;
-    return vfs.tableIndex(t.fd_table);
-}
+// An mqd_t is an ordinary file descriptor (Linux do_mq_open): a vfs .mqueue descriptor naming descriptions[mq_desc_idx] at
+// generation mq_desc_gen. dup, fork and SCM_RIGHTS copies share the description; the fd table owns numbering and close-on-exec.
 
 // ── O_* flags ──
 const O_RDONLY = descriptor_policy.O_RDONLY;
@@ -412,7 +400,6 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
     const name_len: u32 = @intCast(readUserString(name_ptr, &name_buf));
     if (name_len == 0) return EINVAL;
     if (!descriptor_policy.flagsValid(oflag)) return EINVAL;
-    const owner_idx = sched.currentTaskIndex() orelse return EBADF;
 
     var maxmsg: i64 = 0;
     var msgsize: i64 = 0;
@@ -428,17 +415,44 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
         return EINVAL;
     }
 
+    // Linux do_mq_open takes the descriptor first (lowest free number), so a full table is EMFILE before any queue is made.
+    const cur = sched.currentTask() orelse return EBADF;
+    const fd_slot = cur.fd_table.allocFd() orelse return EMFILE;
     const flags = mq_lock.acquire();
-    defer mq_lock.release(flags);
+    const opened = openLocked(name_buf[0..name_len], oflag, mode, umask_val, creds, create_requested and attr_ptr != 0, maxmsg, msgsize);
+    const di: u32 = if (opened >= 0) @intCast(opened) else 0;
+    const gen: u64 = if (opened >= 0) description_generations[di] else 0;
+    mq_lock.release(flags);
+    if (opened < 0) {
+        cur.fd_table.freeFd(fd_slot);
+        return opened;
+    }
+    const access = oflag & descriptor_policy.O_ACCMODE;
+    cur.fd_table.fds[fd_slot] = .{
+        .fd_type = .mqueue,
+        .mq_desc_idx = di,
+        .mq_desc_gen = gen,
+        // Every mq descriptor is close-on-exec (Linux FD_ADD(O_CLOEXEC, ...)), whatever oflag says.
+        .fd_flags = 1,
+        .status_flags = access,
+        .writable = access != O_RDONLY,
+        .file_size = descriptor_policy.FILENT_SIZE,
+    };
+    cur.fd_table.publishFd(fd_slot);
+    return @intCast(fd_slot);
+}
 
+/// Find or create queue `name` and open a description of it: its index, or -errno. Caller holds mq_lock.
+fn openLocked(name: []const u8, oflag: u32, mode: u32, umask_val: u32, creds: dac.Credentials, apply_attr: bool, maxmsg: i64, msgsize: i64) i64 {
+    const name_len: u32 = @intCast(name.len);
     // Search for existing queue with this name
     for (&queues, 0..) |*q, queue_idx| {
-        if (q.active and !q.marked_removed and str.eql(q.name[0..q.name_len], name_buf[0..name_len])) {
+        if (q.active and !q.marked_removed and str.eql(q.name[0..q.name_len], name)) {
             if (oflag & O_CREAT != 0 and oflag & O_EXCL != 0) {
                 return EEXIST;
             }
             if (!dac.allows(.{ .mode = q.mode, .uid = q.uid, .gid = q.gid }, creds, accessFor(oflag))) return -13; // EACCES
-            return openDescription(@intCast(queue_idx), q, owner_idx, oflag);
+            return openDescription(@intCast(queue_idx), q, oflag);
         }
     }
 
@@ -463,7 +477,7 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
     if (queue_generations[idx] == 0) queue_generations[idx] = 1;
 
     @memset(&q.name, 0);
-    for (0..name_len) |j| q.name[j] = name_buf[j];
+    for (0..name_len) |j| q.name[j] = name[j];
     q.name_len = name_len;
     q.active = true;
     q.head = 0;
@@ -480,7 +494,7 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
     q.notify_kind = 0;
 
     // Apply optional attributes (only honored at creation)
-    if (create_requested and attr_ptr != 0) {
+    if (apply_attr) {
         q.max_msg = @intCast(maxmsg);
         q.msg_size = @intCast(msgsize);
     }
@@ -489,7 +503,7 @@ pub fn mqOpen(name_ptr: u64, oflag: u32, mode: u32, attr_ptr: u64) i64 {
     serial.writeString(q.name[0..q.name_len]);
     serial.writeString("\n");
 
-    const opened = openDescription(idx, q, owner_idx, oflag);
+    const opened = openDescription(idx, q, oflag);
     if (opened < 0) {
         var wakes = WakeBatch{};
         freeQueue(q, &wakes);
@@ -542,7 +556,7 @@ pub fn mqUnlink(name_ptr: u64) i64 {
 /// mq_timedsend(mqd, msg_ptr, msg_len, msg_prio, abs_timeout) -> 0 or -errno
 /// rdi=mqd, rsi=msg_ptr, rdx=msg_len, r10=msg_prio, r8=abs_timeout
 pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_ptr: u64) i64 {
-    const owner_idx = sched.currentTaskIndex() orelse return EBADF;
+    const ref = fdDescription(mqd) orelse return EBADF;
     // Read timeout before acquiring lock
     const abs_timeout_ns = readAbsTimeout(timeout_ptr) catch |err| return switch (err) {
         error.Fault => EFAULT,
@@ -553,7 +567,7 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
     while (true) {
         const flags = mq_lock.acquire();
 
-        const desc = findDescription(owner_idx, mqd) orelse {
+        const desc = liveDescription(ref) orelse {
             mq_lock.release(flags);
             return EBADF;
         };
@@ -644,7 +658,7 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
         const copied = copy.copyFromUser(payload[0..copy_len], @ptrFromInt(msg_ptr), copy_len);
 
         const commit_flags = mq_lock.acquire();
-        const commit_q = findQueueForDescription(owner_idx, mqd);
+        const commit_q = findQueueForDescription(ref);
         if (commit_q == null or !commit_q.?.msgs[send_idx].reserved) {
             mq_lock.release(commit_flags);
             return EAGAIN;
@@ -678,8 +692,10 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
         // Wake a receiver blocked on the empty queue
         const wake = wakeHead(commit_q.?, 1);
 
+        const commit_qi = queueIndex(commit_q.?);
         mq_lock.release(commit_flags);
         if (wake) |token| wakeTask(token);
+        wakePollers(commit_qi);
         if (notice) |n| {
             // Linux __do_notify: SI_MESGQ, the sender's pid and uid, and the registered sigev_value, sent to the process
             // (PIDTYPE_TGID): a thread that does not block it takes it. An ignored, unblocked signal is still dropped
@@ -697,7 +713,7 @@ pub fn mqTimedSend(mqd: u32, msg_ptr: u64, msg_len: u64, msg_prio: u32, timeout_
 /// mq_timedreceive(mqd, msg_ptr, msg_len, msg_prio, abs_timeout) -> bytes or -errno
 /// rdi=mqd, rsi=msg_ptr, rdx=msg_len, r10=msg_prio, r8=abs_timeout
 pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeout_ptr: u64) i64 {
-    const owner_idx = sched.currentTaskIndex() orelse return EBADF;
+    const ref = fdDescription(mqd) orelse return EBADF;
     if (prio_ptr != 0 and !copy.validateUserBufferWritable(prio_ptr, 4)) return EFAULT;
     // Read timeout before acquiring lock
     const abs_timeout_ns = readAbsTimeout(timeout_ptr) catch |err| return switch (err) {
@@ -709,7 +725,7 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
     while (true) {
         const flags = mq_lock.acquire();
 
-        const desc = findDescription(owner_idx, mqd) orelse {
+        const desc = liveDescription(ref) orelse {
             mq_lock.release(flags);
             return EBADF;
         };
@@ -807,7 +823,7 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
             prio_written = copy.copyToUser(@ptrFromInt(prio_ptr), &prio_buf, 4);
         }
         const commit_flags = mq_lock.acquire();
-        const commit_q = findQueueForDescription(owner_idx, mqd);
+        const commit_q = findQueueForDescription(ref);
         if (commit_q == null or !commit_q.?.msgs[selected_idx].reserved) {
             mq_lock.release(commit_flags);
             return EAGAIN;
@@ -831,6 +847,7 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
 
         // Wake a sender blocked on the full queue
         const wake = wakeHead(commit_q.?, 0);
+        const commit_qi = queueIndex(commit_q.?);
 
         // If queue was marked for removal and now empty and fully closed,
         // free it
@@ -845,6 +862,7 @@ pub fn mqTimedReceive(mqd: u32, msg_ptr: u64, msg_len: u64, prio_ptr: u64, timeo
 
         mq_lock.release(commit_flags);
         if (wake) |token| wakeTask(token);
+        wakePollers(commit_qi);
         return result_len;
     }
 }
@@ -872,12 +890,12 @@ pub fn mqNotify(mqd: u32, notif_ptr: u64) i64 {
         if (!descriptor_policy.sigevNotifyValid(notify_kind)) return EINVAL;
         if (notify_kind == descriptor_policy.SIGEV_SIGNAL and (signo < 0 or signo > 64)) return EINVAL;
     }
+    const ref = fdDescription(mqd) orelse return EBADF;
 
     const flags = mq_lock.acquire();
     defer mq_lock.release(flags);
 
-    _ = descriptorHandle(owner_idx, mqd) orelse return EBADF;
-    const q = findQueueForDescription(owner_idx, mqd) orelse return EBADF;
+    const q = findQueueForDescription(ref) orelse return EBADF;
 
     if (notif_ptr == 0) {
         // Linux do_mq_notify: NULL removes the registration only when the caller owns it, and succeeds either way.
@@ -941,72 +959,12 @@ pub fn clearNotifyForExec(task_idx: u32) void {
     clearNotifyForProcess(groupId(t));
 }
 
-/// mq_close(mqd) -> 0 or -errno.
-/// mq descriptors live outside the per-task fd table (300+), so FdTable.close
-/// routes fds >= MAX_FDS here. Drops the queue's open refcount; a
-/// fully-closed, unlinked, drained queue frees its slot.
-pub fn mqClose(mqd: u32) i64 {
-    const flags = mq_lock.acquire();
-
-    const owner_idx = sched.currentTaskIndex() orelse {
-        mq_lock.release(flags);
-        return EBADF;
-    };
-    const handle = descriptorHandle(owner_idx, mqd) orelse {
-        mq_lock.release(flags);
-        return EBADF;
-    };
-    const desc = &descriptions[handle.desc_idx];
-    if (!desc.active or description_generations[handle.desc_idx] != handle.desc_generation) {
-        mq_lock.release(flags);
-        return EBADF;
-    }
-    var wakes = WakeBatch{};
-    closeHandleLocked(tableOf(owner_idx).?, owner_idx, handle.handle_idx, &wakes);
-    mq_lock.release(flags);
-    wakes.wake();
-    return 0;
-}
-
-/// The last reference to descriptor table `table` is going away (task `task_idx` is the last user, exiting): close its mq
-/// descriptors, as the fd close loop does for the others. Must run before vfs.freeFdTable lets the slot be reused.
-pub fn closeTable(table: *const vfs.FdTable, task_idx: u32) void {
-    const ti = vfs.tableIndex(table);
-    var wakes = WakeBatch{};
-    const flags = mq_lock.acquire();
-    for (0..MAX_TASK_MQ_DESCRIPTORS) |handle_idx| {
-        if (table_handles[ti][handle_idx].open) closeHandleLocked(ti, task_idx, @intCast(handle_idx), &wakes);
-    }
-    mq_lock.release(flags);
-    wakes.wake();
-}
-
-/// Fork copies every mq descriptor of the parent's table into the child's. A CLONE_FILES child shares the table: nothing to copy.
-pub fn inheritRefs(parent_idx: u32, child_idx: u32) void {
-    const pt = tableOf(parent_idx) orelse return;
-    const ct = tableOf(child_idx) orelse return;
-    if (pt == ct) return;
-    const flags = mq_lock.acquire();
-    defer mq_lock.release(flags);
-    for (0..MAX_TASK_MQ_DESCRIPTORS) |handle_idx| {
-        const parent_handle = table_handles[pt][handle_idx];
-        if (!parent_handle.open) continue;
-        const child_handle = &table_handles[ct][handle_idx];
-        if (child_handle.open) continue;
-        const desc = &descriptions[parent_handle.desc_idx];
-        if (!desc.active or description_generations[parent_handle.desc_idx] != parent_handle.desc_generation) continue;
-        child_handle.* = parent_handle;
-        desc.refs += 1;
-        queues[desc.queue_idx].open_count += 1;
-    }
-}
-
 /// mq_getsetattr(mqd, newattr, oldattr) -> 0 or -errno
 /// rdi=mqd, rsi=newattr, rdx=oldattr
 /// Linux struct mq_attr is four 8-byte longs (32 bytes):
 /// mq_flags@0, mq_maxmsg@8, mq_msgsize@16, mq_curmsgs@24.
 pub fn mqGetSetAttr(mqd: u32, newattr_ptr: u64, oldattr_ptr: u64) i64 {
-    const owner_idx = sched.currentTaskIndex() orelse return EBADF;
+    const ref = fdDescription(mqd) orelse return EBADF;
     if (oldattr_ptr != 0 and !copy.validateUserBufferWritable(oldattr_ptr, 32)) return EFAULT;
     if (newattr_ptr != 0 and newattr_ptr >= 0x0000_8000_0000_0000) return EFAULT;
     var requested_flags: ?u32 = null;
@@ -1016,11 +974,10 @@ pub fn mqGetSetAttr(mqd: u32, newattr_ptr: u64, oldattr_ptr: u64) i64 {
         requested_flags = @truncate(@as(u64, @bitCast(bo.readI64Le(new_buf[0..8]))));
     }
     const flags = mq_lock.acquire();
-    const handle = descriptorHandle(owner_idx, mqd) orelse {
+    const desc = liveDescription(ref) orelse {
         mq_lock.release(flags);
         return EBADF;
     };
-    const desc = &descriptions[handle.desc_idx];
     const q = &queues[desc.queue_idx];
 
     var old_buf: [32]u8 = undefined;
@@ -1040,47 +997,41 @@ pub fn mqGetSetAttr(mqd: u32, newattr_ptr: u64, oldattr_ptr: u64) i64 {
 
 // ── Internal descriptor helpers ──
 
-const HandleRef = struct { handle_idx: u32, desc_idx: u32, desc_generation: u64 };
-const Resolved = struct { queue: *MqQueue, description: *OpenDescription };
+/// The description an mq file descriptor names (index and generation, as stored in the fd); checked under mq_lock before use.
+const DescRef = struct { idx: u32, gen: u64 };
 
-fn descriptorHandle(task_idx: u32, mqd: u32) ?HandleRef {
-    const handle_idx = descriptor_policy.decodeToken(mqd) orelse return null;
-    if (handle_idx >= MAX_TASK_MQ_DESCRIPTORS) return null;
-    const ti = tableOf(task_idx) orelse return null;
-    const handle = table_handles[ti][handle_idx];
-    if (!handle.open or handle.desc_idx >= MAX_OPEN_DESCRIPTIONS) return null;
-    const desc = descriptions[handle.desc_idx];
-    if (!desc.active or description_generations[handle.desc_idx] != handle.desc_generation) return null;
-    return .{ .handle_idx = handle_idx, .desc_idx = handle.desc_idx, .desc_generation = handle.desc_generation };
+/// File descriptor `mqd` of the caller when it is an mq descriptor; anything else (another kind, a closed number) is EBADF.
+/// Read without mq_lock: the generation is checked under the lock before the description is used.
+fn fdDescription(mqd: u32) ?DescRef {
+    if (mqd >= vfs.MAX_FDS) return null;
+    const cur = sched.currentTask() orelse return null;
+    const d = &cur.fd_table.fds[mqd];
+    if (d.fd_type != .mqueue) return null;
+    return .{ .idx = d.mq_desc_idx, .gen = d.mq_desc_gen };
 }
 
-fn findDescription(task_idx: u32, mqd: u32) ?*OpenDescription {
-    const ref = descriptorHandle(task_idx, mqd) orelse return null;
-    return &descriptions[ref.desc_idx];
+fn liveDescription(ref: DescRef) ?*OpenDescription {
+    if (ref.idx >= MAX_OPEN_DESCRIPTIONS) return null;
+    const desc = &descriptions[ref.idx];
+    if (!desc.active or description_generations[ref.idx] != ref.gen) return null;
+    return desc;
 }
 
-fn findQueueForDescription(task_idx: u32, mqd: u32) ?*MqQueue {
-    const desc = findDescription(task_idx, mqd) orelse return null;
+fn findQueueForDescription(ref: DescRef) ?*MqQueue {
+    const desc = liveDescription(ref) orelse return null;
     if (desc.queue_idx >= MAX_QUEUES) return null;
     const q = &queues[desc.queue_idx];
     if (!q.active or queue_generations[desc.queue_idx] != desc.queue_generation) return null;
     return q;
 }
 
-fn openDescription(queue_idx: u32, q: *MqQueue, owner_idx: u32, oflag: u32) i64 {
-    const ti = tableOf(owner_idx) orelse return EMFILE;
-    var handle_idx: ?u32 = null;
-    for (0..MAX_TASK_MQ_DESCRIPTORS) |i| {
-        if (!table_handles[ti][i].open) {
-            handle_idx = @intCast(i);
-            break;
-        }
-    }
+/// Open a new description of queue `queue_idx` with one reference (the descriptor mq_open installs): its index, or EMFILE when
+/// the description pool is full. Caller holds mq_lock.
+fn openDescription(queue_idx: u32, q: *MqQueue, oflag: u32) i64 {
     const desc_idx = for (0..MAX_OPEN_DESCRIPTIONS) |i| {
         if (!descriptions[i].active) break @as(?u32, @intCast(i));
     } else null;
-    if (handle_idx == null or desc_idx == null) return EMFILE;
-    const di = desc_idx.?;
+    const di = desc_idx orelse return EMFILE;
     description_generations[di] +%= 1;
     if (description_generations[di] == 0) description_generations[di] = 1;
     descriptions[di] = .{
@@ -1093,46 +1044,137 @@ fn openDescription(queue_idx: u32, q: *MqQueue, owner_idx: u32, oflag: u32) i64 
         .cloexec = oflag & O_CLOEXEC != 0,
         .refs = 1,
     };
-    table_handles[ti][handle_idx.?] = .{ .desc_idx = di, .desc_generation = description_generations[di], .open = true };
     q.open_count += 1;
-    return @intCast(descriptor_policy.tokenValue(handle_idx.?));
+    return @intCast(di);
 }
 
-/// Close mq descriptor `handle_idx` of descriptor table `ti`; task `task_idx` is the closer (close, exec's close-on-exec, the last
-/// user's exit).
-fn closeHandleLocked(ti: u32, task_idx: u32, handle_idx: u32, wakes: *WakeBatch) void {
-    const handle = &table_handles[ti][handle_idx];
-    if (!handle.open) return;
-    const desc_idx = handle.desc_idx;
-    const desc = &descriptions[desc_idx];
-    handle.* = .{};
-    // Linux mqueue_flush_file: any close of a descriptor of the queue by the process that owns the registration removes it,
-    // whichever descriptor it was made through (a dup, another open). A forked child is another process and leaves it.
-    if (desc.queue_idx < MAX_QUEUES) {
-        const fq = &queues[desc.queue_idx];
-        const closer = task.getTask(task_idx);
-        if (fq.active and closer != null and descriptor_policy.notifyOwner(fq.notify_tgid, groupId(closer.?))) clearNotify(fq);
-    }
-    if (desc.refs > 0) desc.refs -= 1;
-    if (desc.refs == 0) {
-        const q = &queues[desc.queue_idx];
-        q.open_count -|= 1;
-        if (q.marked_removed and q.open_count == 0) freeQueue(q, wakes);
-        desc.* = .{};
-    }
+/// One more file descriptor names description `idx` (dup, dup2, fork, SCM_RIGHTS). False when the description is gone.
+pub fn retainDescription(idx: u32, gen: u64) bool {
+    const flags = mq_lock.acquire();
+    defer mq_lock.release(flags);
+    const desc = liveDescription(.{ .idx = idx, .gen = gen }) orelse return false;
+    desc.refs += 1;
+    return true;
 }
 
-/// Close current-task MQ descriptions marked O_CLOEXEC before a new image runs.
-pub fn closeCloexecForTask(task_idx: u32) void {
-    const ti = tableOf(task_idx) orelse return;
+/// A file descriptor naming description `idx` is closing (close, dup2 over it, exec's close-on-exec, the table's last close).
+/// The closer is the current task; the last reference closes the description.
+pub fn closeDescription(idx: u32, gen: u64) void {
     var wakes = WakeBatch{};
     const flags = mq_lock.acquire();
-    for (0..MAX_TASK_MQ_DESCRIPTORS) |i| {
-        const h = table_handles[ti][i];
-        if (h.open and descriptions[h.desc_idx].cloexec) closeHandleLocked(ti, task_idx, @intCast(i), &wakes);
+    if (liveDescription(.{ .idx = idx, .gen = gen })) |desc| {
+        // Linux mqueue_flush_file: any close of a descriptor of the queue by the process that owns the registration removes it,
+        // whichever descriptor it was made through (a dup, another open). A forked child is another process and leaves it.
+        if (desc.queue_idx < MAX_QUEUES) {
+            const fq = &queues[desc.queue_idx];
+            const closer = if (sched.currentTaskIndex()) |ci| task.getTask(ci) else null;
+            if (fq.active and closer != null and descriptor_policy.notifyOwner(fq.notify_tgid, groupId(closer.?))) clearNotify(fq);
+        }
+        if (desc.refs > 0) desc.refs -= 1;
+        if (desc.refs == 0) {
+            const q = &queues[desc.queue_idx];
+            q.open_count -|= 1;
+            if (q.marked_removed and q.open_count == 0) freeQueue(q, &wakes);
+            desc.* = .{};
+        }
     }
     mq_lock.release(flags);
     wakes.wake();
+}
+
+/// read() of an mq descriptor at `offset`: the queue's status line from there (Linux mqueue_read_file), 0 past its end, EBADF for
+/// a description that is gone. `buf` is filled after mq_lock is released.
+pub fn statusRead(idx: u32, gen: u64, offset: u64, buf: [*]u8, count: usize) i64 {
+    var line: [descriptor_policy.FILENT_SIZE]u8 = undefined;
+    var len: usize = 0;
+    {
+        const flags = mq_lock.acquire();
+        defer mq_lock.release(flags);
+        const q = findQueueForDescription(.{ .idx = idx, .gen = gen }) orelse return EBADF;
+        var qsize: u64 = 0;
+        for (&q.msgs) |*m| {
+            if (m.used) qsize += m.len;
+        }
+        const signo: u32 = if (q.notify_signo > 0) @intCast(q.notify_signo) else 0;
+        len = descriptor_policy.statusLine(&line, qsize, q.notify_tgid != 0, q.notify_kind, signo, q.notify_tgid).len;
+    }
+    if (offset >= len) return 0;
+    const start: usize = @intCast(offset);
+    const n = @min(count, len - start);
+    @memcpy(buf[0..n], line[start..][0..n]);
+    return @intCast(n);
+}
+
+/// poll/epoll readiness of description `idx` (Linux mqueue_poll_file); POLLERR once it is gone.
+pub fn pollEvents(idx: u32) u32 {
+    if (idx >= MAX_OPEN_DESCRIPTIONS) return 0x8;
+    const flags = mq_lock.acquire();
+    defer mq_lock.release(flags);
+    const desc = &descriptions[idx];
+    if (!desc.active) return 0x8;
+    const q = findQueueForDescription(.{ .idx = idx, .gen = description_generations[idx] }) orelse return 0x8;
+    return descriptor_policy.pollEvents(q.count, q.max_msg);
+}
+
+/// A send or receive changed queue `queue_idx`: wake poll/select sleepers and tell epoll about every description of the queue.
+/// Runs after mq_lock is released (epollNotify takes the epoll pool lock).
+fn wakePollers(queue_idx: u32) void {
+    var hits: [MAX_OPEN_DESCRIPTIONS / 64]u64 = @splat(0);
+    var events: u32 = 0;
+    const flags = mq_lock.acquire();
+    if (queue_idx < MAX_QUEUES and queues[queue_idx].active) {
+        events = descriptor_policy.pollEvents(queues[queue_idx].count, queues[queue_idx].max_msg);
+        for (&descriptions, 0..) |*d, i| {
+            if (d.active and d.queue_idx == queue_idx) hits[i / 64] |= @as(u64, 1) << @intCast(i % 64);
+        }
+    }
+    mq_lock.release(flags);
+    @import("../fs/poll_wake.zig").notify();
+    if (events == 0) return;
+    const epoll = @import("../net/epoll.zig");
+    for (hits, 0..) |word, w| {
+        var bits = word;
+        while (bits != 0) {
+            const b: u32 = @ctz(bits);
+            bits &= bits - 1;
+            epoll.epollNotify(.mqueue, @intCast(w * 64 + b), events);
+        }
+    }
+}
+
+/// F_GETFL of description `idx`: access mode, O_NONBLOCK and the O_CLOEXEC given at open (null: gone).
+pub fn statusFlagsOf(idx: u32, gen: u64) ?u32 {
+    const flags = mq_lock.acquire();
+    defer mq_lock.release(flags);
+    const desc = liveDescription(.{ .idx = idx, .gen = gen }) orelse return null;
+    return descriptor_policy.reportedFlags(desc.access, desc.status_flags, desc.cloexec);
+}
+
+/// F_SETFL of description `idx`: only O_NONBLOCK changes (the bit mq_setattr changes). False when it is gone.
+pub fn setStatusFlags(idx: u32, gen: u64, requested: u32) bool {
+    const flags = mq_lock.acquire();
+    defer mq_lock.release(flags);
+    const desc = liveDescription(.{ .idx = idx, .gen = gen }) orelse return false;
+    desc.status_flags = (desc.status_flags & ~@as(u32, O_NONBLOCK)) | (requested & O_NONBLOCK);
+    return true;
+}
+
+pub const StatInfo = struct { mode: u32, uid: u32, gid: u32 };
+
+/// fstat of description `idx`: the queue's permission bits and owner (null: gone).
+pub fn statInfo(idx: u32, gen: u64) ?StatInfo {
+    const flags = mq_lock.acquire();
+    defer mq_lock.release(flags);
+    const q = findQueueForDescription(.{ .idx = idx, .gen = gen }) orelse return null;
+    return .{ .mode = q.mode, .uid = q.uid, .gid = q.gid };
+}
+
+/// /proc/self/fd/N of description `idx`: "/name" into `out`, its length, or null (gone, or too long).
+pub fn nameOf(idx: u32, gen: u64, out: []u8) ?usize {
+    const flags = mq_lock.acquire();
+    defer mq_lock.release(flags);
+    const q = findQueueForDescription(.{ .idx = idx, .gen = gen }) orelse return null;
+    return descriptor_policy.linkName(q.name[0..q.name_len], out);
 }
 
 fn readUserString(user_ptr: u64, buf: []u8) usize {

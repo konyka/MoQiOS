@@ -633,6 +633,7 @@ fn resourceKeyFromDesc(desc: *const vfs.FileDescriptor) ?u64 {
         .devfs_ctrl => desc.devfs_ctrl_idx,
         .eventfd => desc.eventfd_idx,
         .ramdisk_file => desc.file_data,
+        .mqueue => desc.mq_desc_idx,
         else => null,
     };
 }
@@ -854,6 +855,7 @@ fn resourceIdxFromDesc(desc: *const vfs.FileDescriptor) u32 {
         .unix_socket => desc.unix_sock_idx,
         .devfs => desc.devfs_idx,
         .devfs_ctrl => desc.devfs_ctrl_idx,
+        .mqueue => desc.mq_desc_idx,
         else => 0,
     };
 }
@@ -964,6 +966,8 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32, kmsg_cursor: u64
         .raw_socket => {
             revents |= EPOLLOUT; // no per-socket RX queue to test
         },
+        // Linux mqueue_poll_file: POLLIN while a message is queued, POLLOUT while there is room.
+        .mqueue => revents |= @import("../ipc/posix_mq.zig").pollEvents(resource_idx),
         .devfs_ctrl => {
             // Owner end of a userspace node: readable when a request is
             // queued, always writable (responses are matched by seq).

@@ -928,16 +928,44 @@ test "POSIX MQ descriptor policy validates access and flags" {
     try std.testing.expect(!posix_mq_descriptor_policy.sigevNotifyValid(posix_mq_descriptor_policy.SIGEV_THREAD));
 }
 
-test "MQ descriptors live per descriptor table: CLONE_FILES threads share them, fork copies them" {
+test "MQ descriptors are ordinary file descriptors: the fd table numbers, copies and closes them" {
     const src = kt.posix_mq_source;
-    try std.testing.expect(std.mem.indexOf(u8, src, "var table_handles: [vfs.MAX_FD_TABLES]") != null);
+    // No side table of mq handles: an mqd_t is a vfs .mqueue descriptor naming a shared description.
+    try std.testing.expect(std.mem.indexOf(u8, src, "table_handles") == null);
     try std.testing.expect(std.mem.indexOf(u8, src, "task_handles") == null);
-    try std.testing.expect(std.mem.indexOf(u8, src, "if (pt == ct) return;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "inheritRefs(") != null);
-    // The table's descriptors close with its last reference (exit and the unpublished-child abort), not per task.
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.task_source, "closeTable(t.fd_table, "));
-    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "closeRefsForTask") == null);
-    try std.testing.expect(std.mem.indexOf(u8, src, "closeRefsForTask") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "pub fn closeTable") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "pub fn inheritRefs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "closeCloexecForTask") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, ".fd_type = .mqueue,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "cur.fd_table.allocFd() orelse return EMFILE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "inheritRefs(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.fork_source, "inheritRefs(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "closeTable(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "closeCloexecForTask") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "pub fn tableIndex") == null);
+}
+
+test "an mq descriptor is reference counted per fd and supports fcntl, poll, read, fstat and readlink" {
+    const v = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, v, "mqueue = 23,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "t == .tmpfs_file or t == .mqueue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "posix_mq.zig\").closeDescription(desc.mq_desc_idx, desc.mq_desc_gen);") != null);
+    try std.testing.expect(std.mem.count(u8, v, "retainDescription(") >= 4);
+    try std.testing.expect(std.mem.indexOf(u8, v, "if (fd >= MAX_FDS) return mqClose") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.fcntl_source, "if (d.fd_type == .mqueue) return @intCast(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.fcntl_source, "setStatusFlags(d.mq_desc_idx, d.mq_desc_gen") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.epoll_source, ".mqueue => revents |= ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.dir_ops_source, "fdesc.fd_type == .mqueue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.fd_target_source, ".mqueue => return") != null);
+    // epoll is told after mq_lock is released (epollNotify takes the pool lock).
+    try std.testing.expect(std.mem.indexOf(u8, kt.posix_mq_source, "wakePollers(commit_qi);") != null);
+    const p = posix_mq_descriptor_policy;
+    try std.testing.expectEqual(@as(u32, 0x802), p.reportedFlags(p.O_RDWR, p.O_NONBLOCK, false));
+    try std.testing.expectEqual(@as(u32, 0x80000), p.reportedFlags(p.O_RDONLY, 0, true));
+    try std.testing.expectEqual(p.POLLOUT, p.pollEvents(0, 8));
+    try std.testing.expectEqual(p.POLLIN, p.pollEvents(8, 8));
+    var line: [p.FILENT_SIZE]u8 = undefined;
+    try std.testing.expectEqualStrings("QSIZE:3          NOTIFY:0     SIGNO:0     NOTIFY_PID:0     \n", p.statusLine(&line, 3, false, 0, 0, 0));
 }
 
 test "parent TID copyout aborts an unpublished child before publication" {
@@ -1122,19 +1150,8 @@ test "an mq_notify registration belongs to the process: closes by the owner flus
 
 test "POSIX MQ getsetattr invalid descriptor releases the lock" {
     const source = kt.posix_mq_source;
-    try std.testing.expect(std.mem.indexOf(u8, source, "descriptorHandle(owner_idx, mqd) orelse {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "const desc = liveDescription(ref) orelse {") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "mq_lock.release(flags);") != null);
-}
-
-test "POSIX MQ descriptor tokens round-trip only inside the descriptor window" {
-    const p = posix_mq_descriptor_policy;
-    try std.testing.expectEqual(@as(u32, p.DESCRIPTOR_BASE), p.tokenValue(0));
-    try std.testing.expectEqual(@as(?u32, 0), p.decodeToken(p.tokenValue(0)));
-    try std.testing.expectEqual(@as(?u32, p.MAX_DESCRIPTORS - 1), p.decodeToken(p.tokenValue(p.MAX_DESCRIPTORS - 1)));
-    try std.testing.expect(p.decodeToken(p.DESCRIPTOR_BASE - 1) == null);
-    try std.testing.expect(p.decodeToken(p.DESCRIPTOR_BASE + p.MAX_DESCRIPTORS) == null);
-    try std.testing.expect(p.decodeToken(0) == null);
-    try std.testing.expect(p.decodeToken(std.math.maxInt(u32)) == null);
 }
 
 test "production task slot reset preserves its incarnation" {
@@ -3272,11 +3289,11 @@ test "new task creation restores NOFILE defaults after zeroSlot" {
 test "POSIX MQ uses per-open descriptions and validates descriptor semantics" {
     const source = kt.posix_mq_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "var descriptions:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "var table_handles:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "table_handles") == null);
     try std.testing.expect(std.mem.indexOf(u8, source, "q.fd") == null);
     try std.testing.expect(std.mem.indexOf(u8, source, "q.flags") == null);
     try std.testing.expect(std.mem.indexOf(u8, source, "return EMSGSIZE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "closeCloexecForTask") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, ".fd_flags = 1,") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "newattr_ptr >= 0x0000_8000_0000_0000") != null);
 }
 

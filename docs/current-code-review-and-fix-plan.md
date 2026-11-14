@@ -9132,5 +9132,61 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份，hello333 通过；同样定向跑 hello332、hello294、hello293、hello288，SMP=2、SMP=4 都通过；`zig build test` 通过。
 - 完整 smoke：四份（SMP=1、4、4、2）全部 EXIT=0，无 FAIL，hello333 在每份里都通过，`corrupted canaries=0`；riscv64、aarch64 smoke 通过。
 - 局限：
-  1. mq 描述符仍用独立的号码空间（从 300 起），不和普通 fd 共用号码。Linux 上它就是普通 fd 号（宿主机拿到 4、5），`dup`、`fcntl`、`poll` 对它的行为这里没有覆盖。
+  1. mq 描述符仍用独立的号码空间（从 300 起），不和普通 fd 共用号码。Linux 上它就是普通 fd 号（宿主机拿到 4、5），`dup`、`fcntl`、`poll` 对它的行为这里没有覆盖。（hello334 一节已改）
   2. 每张表最多 32 个 mq 描述符（`descriptor_policy.MAX_DESCRIPTORS`），表池共 64 张（`vfs.MAX_FD_TABLES`）。
+
+### POSIX mq 描述符是普通 fd（hello334，已修）
+
+- 问题：mq 描述符用独立的号码空间（从 300 起，`DESCRIPTOR_BASE + slot`），存放在 posix_mq 自己的 `table_handles` 里，不在 `FdTable` 中。
+  - `mq_open` 拿到 300 而不是最低的空闲号码（A）。
+  - `dup`、`dup2`、`fcntl`、`poll`、`read`、`lseek`、`fstat`、`/proc/self/fd` 对它都不起作用（B–F、H、I）。
+  - `fcntl(F_SETFL)` 和 `mq_setattr` 改的不是同一个 O_NONBLOCK（H）。
+  - Linux 上 mqd_t 就是普通 fd（hello333 局限 1）。
+- Linux 依据（`3rd/linux-7.0.6/ipc/mqueue.c`）：
+  - 第 924 行 `do_mq_open` 用 `FD_ADD(O_CLOEXEC, ...)` 装入最低的空闲号码，所以每个 mq 描述符都带 FD_CLOEXEC，与 oflag 无关。
+  - 第 639 行 `mqueue_read_file` 返回状态行 `"QSIZE:%-10lu NOTIFY:%-5d SIGNO:%-5d NOTIFY_PID:%-6d\n"`，QSIZE 是队列里所有消息的字节数之和。
+  - 第 670 行 `mqueue_poll_file`：有消息就 POLLIN，`count < maxmsg` 就 POLLOUT，与访问模式无关。
+  - 没有 write 操作，write 返回 EINVAL；inode 大小是 `FILENT_SIZE`（80）。
+- 宿主机实测（`gcc -DHOST -O1 -Wall -pthread user/hello334.c -lrt`，连续 3 次 A–J 全过）：
+  - A：空闲号码是 3，`mq_open` 拿到 3。
+  - B：`dup` 得到 4，通过副本发送返回 0、接收返回 2，关闭原描述符后副本仍可用。
+  - C：F_GETFD 总是 1；F_GETFL：O_RDWR|O_NONBLOCK 打开的是 0x802，O_RDONLY|O_CLOEXEC 打开的是 0x80000。
+  - D：poll 空队列 0x4，一条消息 0x5，满队列 0x1，通过 O_RDONLY 描述符看满队列也是 0x1。
+  - E：`dup2` 到 40 返回 40，发送 0，接收 1。
+  - F：read 第一次 60 字节（`QSIZE:3`），第二次 0；write -22；lseek 到 0 返回 0，再 read 又是 60。
+  - G：对管道 `mq_send`、`mq_getattr` 返回 -9，对已关闭的号码也是 -9。
+  - H：F_SETFL 0 之后 `mq_flags` 为 0；`mq_setattr` 设 O_NONBLOCK 之后 F_GETFL 为 0x802。
+  - I：fstat 返回 0，mode 0100600，size 80；readlink `/proc/self/fd/N` 返回 6，内容 `/mq334`。
+  - J：fork 的子进程通过继承的描述符发送，退出状态 0x0，父进程接收返回 2。
+- 红灯：内核未改，定向 SMP=2：
+  - A 拿到 300；B dup 返回 -1，发送 -9，接收 -11；C F_GETFD 和 F_GETFL 都是 -1；D 四种情况都是 0x20（POLLNVAL）；E dup2 返回 -9。
+  - F read -38，write -9，lseek -9；H `mq_flags` 0x800，F_GETFL -1；I fstat -1，readlink -1。
+  - G、J 通过。
+- 修复：
+  - `kernel/fs/vfs.zig`：
+    - 新增 `FdType.mqueue = 23`，`FileDescriptor` 新增 `mq_desc_idx`、`mq_desc_gen`。
+    - 引用按 fd 计（`refIsPerFd`）：`dup`、`dup2`、fork 复制（`retainSharedResources`）、SCM_RIGHTS（`retainResource`）各取一个，`finishClose` 和 `releaseResource` 调用 `posix_mq.closeDescription`。
+    - `readInner` 和 `readAtOffset` 返回状态行，`writeInner` 和 `writeAtOffsetMode` 返回 EINVAL。
+    - 删除 `close` 里 `fd >= MAX_FDS` 转给 `mqClose` 的分流和 `tableIndex`。
+  - `kernel/ipc/posix_mq.zig`：
+    - `mq_open` 先 `allocFd`（满了返回 EMFILE），在 `mq_lock` 内找到或创建队列并打开 description，释放锁后填入 fd（`fd_flags = 1`，`status_flags` 是访问模式，`file_size = 80`）并 `publishFd`；失败时 `freeFd`。
+    - send、receive、notify、getsetattr 在锁外读调用者 `fd_table.fds[mqd]`，不是 `.mqueue` 就 EBADF；在锁内用 `description_generations` 校验。
+    - 新增 `retainDescription`、`closeDescription`（属主进程关闭时移除 mq_notify 注册的规则不变，关闭者取当前任务）、`statusRead`、`pollEvents`、`statusFlagsOf`、`setStatusFlags`、`statInfo`、`nameOf`。
+    - 发送或接收提交后，释放 `mq_lock` 再调用 `wakePollers`：唤醒 poll/select，并对这个队列的每个 description 调用 `epollNotify(.mqueue, ...)`。
+    - 删除 `table_handles`、`TaskHandle`、`tableOf`、`mqClose`、`closeTable`、`inheritRefs`、`closeCloexecForTask`。
+  - `kernel/ipc/posix_mq_descriptor_policy.zig`：删除 `DESCRIPTOR_BASE`、`MAX_DESCRIPTORS`、`tokenValue`、`decodeToken`、`survivesExec`；新增 `FILENT_SIZE`、`reportedFlags`、`pollEvents`、`statusLine`、`linkName` 及其测试。
+  - `kernel/fs/fcntl.zig`：F_GETFL 对 `.mqueue` 报访问模式、当前 O_NONBLOCK 和打开时的 O_CLOEXEC；F_SETFL 只改 description 的 O_NONBLOCK。
+  - `kernel/net/epoll.zig`：`computeCurrentEvents`、`resourceIdxFromDesc`、`resourceKeyFromDesc` 加 `.mqueue`。
+  - `kernel/fs/dir_ops.zig`：fstat 报 `0100000 | 队列 mode`、队列的 uid/gid、size 80；inode 号用 description 下标。
+  - `kernel/fs/fd_target.zig`：readlink 输出队列名，没有 `/` 开头就补一个。
+  - `kernel/proc/task.zig`、`fork.zig`、`execve.zig`、`kernel/arch/x86_64/clone.zig`：删除 `closeTable`、`inheritRefs`、`closeCloexecForTask` 的调用；exec 的 FD_CLOEXEC 循环会关闭 mq 描述符，表的最后一个引用释放时的 close 循环也会。
+  - `user/hello334.c`：目标机上 read/write 改用 libc 的 `read`/`write`（本内核的 read 是 10 号系统调用）。
+  - `tests/main.zig`：hello333 那条改为检查 `table_handles` 等不存在、`.mqueue` 存在；新增引用计数和 fcntl/poll/read/fstat/readlink 的源码单测；删除 token round-trip 那条。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份，hello334 通过；同样定向跑 hello333、hello332、hello309、hello300、hello294、hello293、hello288，SMP=2、SMP=4 都通过；`zig build test` 通过。
+  - 同一次定向里 hello80 失败，原因是定向时它排在 init 创建 `/h80-root`、`/h80-open` 夹具之前，与本修复无关，完整 smoke 按正式顺序运行。hello235 G（向 SLIRP 网关的阻塞 connect 被信号打断）在这次定向里失败，完整 smoke 按正式顺序运行时，hello80 与 hello235 G 在四份中都通过，定向失败只与运行顺序和网络时序有关。
+- 完整 smoke：四份（SMP=1、4、4、2）全部 EXIT=0，`:   FAIL` 计数为 0，`hello334: PASS` 每份 1 次，hello80、hello235 均 PASS，hello228 `corrupted canaries=0`。riscv64、aarch64 smoke 通过。
+- 局限：
+  1. read 的偏移在 fd 上：`dup` 的副本不共享偏移（mq 不在 `usesSharedOffset` 里）。Linux 上副本共享 `f_pos`。
+  2. epoll 唤醒是每次发送或接收后对这个队列的所有 description 各通知一次，不区分 POLLIN、POLLOUT 是否真的变化。
+  3. `SIGEV_THREAD` 仍不支持（需要 AF_NETLINK）。
+  4. description 池共 256 个（`MAX_OPEN_DESCRIPTIONS`），每张表 `MAX_FDS`（x86_64 上 128）个描述符。

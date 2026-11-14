@@ -1157,7 +1157,6 @@ pub fn exitTask(requested_code: i32) void {
                     _ = t.fd_table.close(fd);
                 }
             }
-            @import("../ipc/posix_mq.zig").closeTable(t.fd_table, idx);
             vfs.freeFdTable(t.fd_table);
         }
     }
@@ -1638,7 +1637,6 @@ pub fn abortUnpublishedChild(slot: u32) bool {
             while (fd < vfs.MAX_FDS) : (fd += 1) {
                 if (t.fd_table.fds[fd].fd_type != .none) _ = t.fd_table.close(fd);
             }
-            @import("../ipc/posix_mq.zig").closeTable(t.fd_table, slot);
             vfs.freeFdTable(t.fd_table);
         }
     }

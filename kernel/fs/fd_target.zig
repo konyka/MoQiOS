@@ -60,6 +60,8 @@ pub fn describe(t: *task_mod.Task, fd_val: u32, text: *[256]u8) Result {
         .timerfd => return wrap(readlink_policy.anonLink("anon_inode:[timerfd]", text)),
         .inotify => return wrap(readlink_policy.anonLink("anon_inode:[inotify]", text)),
         .pidfd => return wrap(readlink_policy.anonLink("anon_inode:[pidfd]", text)),
+        // The queue name with its leading '/', as Linux shows an mqueue file (its dentry in the mqueue mount).
+        .mqueue => return if (@import("../ipc/posix_mq.zig").nameOf(d.mq_desc_idx, d.mq_desc_gen, text)) |n| .{ .ok = n } else .{ .err = -2 },
         .devfs => {
             const dev = @import("devfs.zig");
             const prefix = "/dev";

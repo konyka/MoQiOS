@@ -370,13 +370,12 @@ pub fn clone(
         // v53.50: Copy free_bm bitmap — child inherits parent's fd occupancy state.
         parent.fd_table.inheritFdTable(child.fd_table);
     }
-    // MQ descriptors live per descriptor table: a CLONE_FILES child shares them with the parent, and inheritRefs
-    // copies them only when the child got its own table (fork).
+    // MQ descriptors are ordinary fds: inheritFdTable copied them (each copy retains its description) or the child shares the table.
     const current_idx = sched.currentTaskIndex() orelse {
         _ = task_mod.abortUnpublishedChild(child_idx);
         return -1;
     };
-    @import("../../ipc/posix_mq.zig").inheritRefs(current_idx, child_idx);
+    _ = current_idx;
 
     // Signal dispositions belong to the thread group (Mm.sig): a CLONE_VM thread shares them, a copied address space
     // gets a copy. Then mask, environment, cwd, pgid, sid.

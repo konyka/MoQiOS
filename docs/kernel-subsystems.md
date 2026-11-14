@@ -1188,7 +1188,7 @@ const SchedStats = struct {
   CAP_FOWNER（EPERM，只有写权限不够），仅“现在”还接受写权限（否则 EACCES）；设置后 ctime 记为现在，并同步所有指向该 inode 的打开槽。
   只有 ext2 保存时间戳：tmpfs/FAT32 路径返回 EPERM（文件无法记录），只读卷 EROFS。路径经 `at_path.resolve`，所以 cwd 与任意目录 fd 都可用。
 - execve/execveat（hello122）：两者共用 `execve.prepareExecAt` → `prepareExecName`（此前 execveat 有一份复制的实现，
-  漏掉了 `posix_mq.closeCloexecForTask`，带 O_CLOEXEC 的消息队列描述符会穿过 execveat 留下来）。名字经 `dirfd_name.resolve`
+  漏掉了 `posix_mq.closeCloexecForTask`，带 O_CLOEXEC 的消息队列描述符会穿过 execveat 留下来；hello334 起 mq 描述符是普通 fd，由 exec 的 FD_CLOEXEC 循环关闭）。名字经 `dirfd_name.resolve`
   按 cwd 或 dirfd 解析（任意文件系统的目录 fd；空闲 fd EBADF，非目录 ENOTDIR），再由 `proc/exec_policy.programName` 映射到
   ramdisk：程序只存在于平坦的 ramdisk，解析结果是根下的单段名（带不带前导斜杠）才可执行，更深的路径 ENOENT。
   失败返回 Linux 错误码而不是一律 EPERM：找不到 ENOENT、不是 ELF ENOEXEC、地址空间分配失败 ENOMEM、路径指针坏 EFAULT、
@@ -2102,10 +2102,10 @@ The native `Message` ABI is an exactly 256-byte extern struct: `sender:u64`, `re
   接收缓冲区小于消息长度时返回 `EMSGSIZE` 并保留消息，不会静默截断后出队。
   发送和接收阶段都在 IRQ 自旋锁外执行用户空间拷贝；锁内只完成槽位 reservation，用户拷贝失败时取消 reservation 并保留队列状态。
 - mq_unlink: 只删除名字空间查找项；已有 token 继续访问原 queue generation，直到所有 open descriptions 关闭且队列排空。之后 slot 才回收；同名 reopen 创建新的 queue generation，旧 token 不会通过 ABA 复用访问新队列。
-- MQ descriptor 按 task handle 解析到带 queue slot、单调 queue generation、访问模式、`O_NONBLOCK`、`O_CLOEXEC` 的 open description；因此同一名字的两次 `mq_open` 有独立 mqd、访问权限和非阻塞状态。send/receive 分别检查 `O_WRONLY`/`O_RDONLY`，发送超过 `mq_msgsize` 返回 `EMSGSIZE`。
-- 只有持有该 task handle 的 task 才能执行 MQ 操作或 `mq_close`。fork/clone 复制 handle 并共享同一个 open description（关闭任一引用只减少该 description 的引用计数）；这保持现有 inheritRefs 行为，但不声称实现 VFS `CLONE_FILES` 的完整跨表语义。task 退出时自动释放其 handles。
-- `mq_getsetattr` 报告调用者自己的 `mq_flags`，坏的 newattr 指针返回 `EFAULT`，只允许改变 `O_NONBLOCK`。`O_CLOEXEC` 在 exec 地址空间切换前关闭当前 task 标记的 MQ handles；未标记的 handles 跨 exec 保留。
-- mq_notify: 注册/注销通知。队列从空变为非空、且没有接收者正在等待时，给注册者发一次信号，之后必须重新注册。信号是 `SI_MESGQ`（-3），`si_pid`/`si_uid` 是发送者的，`si_value` 是注册时的 `sigev_value`（hello293）。被忽略且未阻塞的信号仍在发送时丢弃。`SIGEV_NONE` 和信号 0 都会注册成功，但不发信号，第一条到达空队列的消息同样消耗这次注册（hello294）。`mq_notify(NULL)` 只在调用者属于注册者所在进程时才注销，别的进程返回 0 且不能替换（`EBUSY`）。注册属于进程（`notify_tgid`，Linux `task_tgid`）：属主进程关闭这个队列的任何描述符都会移除注册，fork 的子进程关闭不算；线程做出的注册在线程退出后仍在；信号是进程级的，做出注册的线程阻塞时由别的线程接（hello332）。mq 描述符按描述符表存放（`table_handles`，按 `fd_table` 在表池里的下标），CLONE_FILES 的线程共享同一组，fork 复制一份，表的最后一个引用释放时全部关闭（hello333）。
+- MQ descriptor 是 fd 表里的 `.mqueue` 描述符，按 `mq_desc_idx`/`mq_desc_gen` 解析到带 queue slot、单调 queue generation、访问模式、`O_NONBLOCK`、打开时 `O_CLOEXEC` 的 open description；因此同一名字的两次 `mq_open` 有独立 mqd、访问权限和非阻塞状态。send/receive 分别检查 `O_WRONLY`/`O_RDONLY`，发送超过 `mq_msgsize` 返回 `EMSGSIZE`。
+- mq 系统调用只接受调用者 fd 表里的 `.mqueue` 描述符，其他 fd 和已关闭的号码返回 `EBADF`。`dup`、`dup2`、fork、SCM_RIGHTS 的每个副本各持有 description 的一个引用，每次关闭释放一个，最后一个关闭释放 description（hello334）。
+- `mq_getsetattr` 报告调用者自己的 `mq_flags`，坏的 newattr 指针返回 `EFAULT`，只允许改变 `O_NONBLOCK`。每个 mq 描述符都带 FD_CLOEXEC（Linux `FD_ADD(O_CLOEXEC, ...)`），exec 时关闭；`F_SETFD` 清掉后跨 exec 保留。
+- mq_notify: 注册/注销通知。队列从空变为非空、且没有接收者正在等待时，给注册者发一次信号，之后必须重新注册。信号是 `SI_MESGQ`（-3），`si_pid`/`si_uid` 是发送者的，`si_value` 是注册时的 `sigev_value`（hello293）。被忽略且未阻塞的信号仍在发送时丢弃。`SIGEV_NONE` 和信号 0 都会注册成功，但不发信号，第一条到达空队列的消息同样消耗这次注册（hello294）。`mq_notify(NULL)` 只在调用者属于注册者所在进程时才注销，别的进程返回 0 且不能替换（`EBUSY`）。注册属于进程（`notify_tgid`，Linux `task_tgid`）：属主进程关闭这个队列的任何描述符都会移除注册，fork 的子进程关闭不算；线程做出的注册在线程退出后仍在；信号是进程级的，做出注册的线程阻塞时由别的线程接（hello332）。mq 描述符就是普通 fd（`FdType.mqueue`）：号码取最低空闲，CLONE_FILES 的线程共享，dup、fork 共享 description，总是带 FD_CLOEXEC；F_GETFL/F_SETFL 与 `mq_getsetattr` 用同一个 O_NONBLOCK，poll/epoll 按消息数报 POLLIN/POLLOUT，read 返回 Linux 的 `QSIZE:` 状态行，write 是 EINVAL，fstat 报队列的 mode/owner 和大小 80，`/proc/self/fd` 显示 `/队列名`（hello333、hello334）。
 - mq_getsetattr: 获取/设置队列属性
 - 系统调用: #186-191（与 x86_64 dispatcher 一致）
 
