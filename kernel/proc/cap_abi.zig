@@ -1,5 +1,5 @@
 //! The capget/capset/status view of a task's capabilities. The kernel keeps them as the packed `SysCap` flags; user space (libcap, /proc/<pid>/status)
-//! speaks Linux's numbering: CAP_CHOWN 0, CAP_DAC_OVERRIDE 1, CAP_FOWNER 3, CAP_KILL 5, CAP_SETGID 6, CAP_SETUID 7, ... CAP_SYS_TIME 25, CAP_MKNOD 27.
+//! speaks Linux's numbering: CAP_CHOWN 0, CAP_DAC_OVERRIDE 1, CAP_FOWNER 3, CAP_KILL 5, CAP_SETGID 6, CAP_SETUID 7, ... CAP_SYS_TIME 25, CAP_MKNOD 27, CAP_LEASE 28.
 //! Capabilities the kernel does not model (CAP_SETPCAP, CAP_FSETID, ...) are never reported and can never be requested.
 //!
 //! `cap_sys_mount` is the kernel's own split of CAP_SYS_ADMIN (Linux mount needs CAP_SYS_ADMIN), so both are reported as bit 21. Asking for bit 21
@@ -38,6 +38,7 @@ const table = [_]Entry{
     .{ .field = "cap_sys_resource", .number = 24 },
     .{ .field = "cap_sys_time", .number = 25 },
     .{ .field = "cap_mknod", .number = 27 },
+    .{ .field = "cap_lease", .number = 28 },
 };
 
 /// The flags as a Linux capability bitmask.

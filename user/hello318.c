@@ -72,7 +72,7 @@ static void handle(int sig) {
     sigaction(sig, &sa, (struct ksigaction *)0);
 }
 static long my_pgrp(void) { return getpgid(0); }
-static const char *F = "h318a.txt";
+static const char *F = "/tmp/h318a";
 #endif
 
 #define C_SETOWN 8

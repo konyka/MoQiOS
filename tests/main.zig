@@ -12360,6 +12360,20 @@ test "cpu_time_policy: the CPU counter sequence count makes readers retry across
     try std.testing.expect(std.mem.indexOf(u8, kt.time_syscall_source, "const m = task_mod.cpuSnapshot(t);") != null);
 }
 
+test "lease policy: F_SETLEASE needs the file's owner or CAP_LEASE (Linux vfs_setlease)" {
+    const lp = kt.lease_policy;
+    // the caller owns the file, or holds CAP_LEASE (F_UNLCK too; an unknown type is EINVAL before this check)
+    try std.testing.expectEqual(@as(i64, 0), lp.mayLease(1000, 1000, false));
+    try std.testing.expectEqual(@as(i64, -13), lp.mayLease(0, 1000, false));
+    try std.testing.expectEqual(@as(i64, 0), lp.mayLease(0, 1000, true));
+    try std.testing.expectEqual(@as(i64, -13), lp.mayLease(1000, 0, false));
+    // CAP_LEASE is Linux capability 28
+    const ca = kt.cap_abi;
+    try std.testing.expectEqual(@as(u64, 1) << 28, ca.encode(.{ .cap_lease = true }));
+    try std.testing.expect(ca.decode(@as(u64, 1) << 28, kt.capability_profile.ALL_CAPS).cap_lease);
+    try std.testing.expect(kt.capability_profile.ALL_CAPS.cap_lease);
+}
+
 test "lease policy: taking a lease checks the opens of the file and the other leases" {
     const lp = kt.lease_policy;
     var t = lp.Table(4){};

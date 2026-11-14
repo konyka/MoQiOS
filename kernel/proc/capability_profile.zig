@@ -19,7 +19,9 @@ pub const SysCap = packed struct(u32) {
     cap_sys_time: bool = false,
     /// Raise scheduling priority / renice another user's process.
     cap_sys_nice: bool = false,
-    _pad: u13 = 0,
+    /// Take a file lease on a file the caller does not own (Linux CAP_LEASE, 28).
+    cap_lease: bool = false,
+    _pad: u12 = 0,
 };
 
 pub const ALL_CAPS: SysCap = .{
@@ -42,6 +44,7 @@ pub const ALL_CAPS: SysCap = .{
     .cap_sys_rawio = true,
     .cap_sys_time = true,
     .cap_sys_nice = true,
+    .cap_lease = true,
 };
 
 pub const NO_CAPS: SysCap = .{};
@@ -121,6 +124,10 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // adjtimex test: CAP_SYS_TIME for the TAI offset and ADJ_SETOFFSET, CAP_SETUID so a child's setuid() leaves it
         // unprivileged and the EPERM refusals are observable.
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_sys_time = true, .cap_setuid = true }, .initial_init = false };
+    }
+    if (std.mem.eql(u8, name, "hello319")) {
+        // Lease permission test: uid 1000 holding only CAP_LEASE, dropped with capset to see the EACCES refusals.
+        return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_lease = true }, .initial_init = false };
     }
     if (std.mem.eql(u8, name, "hello183")) {
         // Starts as root with CAP_SETUID only (no CAP_NET_BIND) so the child's setuid() leaves it unprivileged,

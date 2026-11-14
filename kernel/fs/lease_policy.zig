@@ -19,6 +19,13 @@ const EAGAIN: i64 = -11;
 const EINVAL: i64 = -22;
 const ENOLCK: i64 = -37;
 
+const EACCES: i64 = -13;
+
+/// Linux vfs_setlease: a lease (or F_UNLCK) on a file the caller does not own needs CAP_LEASE.
+pub fn mayLease(file_uid: u32, fsuid: u32, cap_lease: bool) i64 {
+    return if (file_uid == fsuid or cap_lease) 0 else EACCES;
+}
+
 /// /proc/sys/fs/lease-break-time: how long a holder has to give a lease up.
 pub const BREAK_NS: u64 = 45 * 1_000_000_000;
 

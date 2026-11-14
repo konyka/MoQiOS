@@ -52,7 +52,7 @@ static long do_fcntl(long fd, long cmd, long a) { return syscall3(142, fd, cmd, 
 static long op(const char *p, long fl) { return open(p, fl, 0600); }
 static long trunc0(const char *p) { return truncate(p, 0); }
 static long mkd(const char *p) { return mkdir(p, 0700); }
-static const char *F = "h316a.txt";
+static const char *F = "/tmp/h316a";
 static const char *D = "/tmp/h316d";
 static long now_ms(void) { long ts[2] = { 0, 0 }; syscall2(SYS_clock_gettime, 1, (long)ts); return ts[0] * 1000 + ts[1] / 1000000; }
 #endif

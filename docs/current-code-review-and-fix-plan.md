@@ -8642,7 +8642,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello316 A–J 全过（E 的阻塞打开约 100 ms 后成功）。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello316 PASS 和 `hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
 - 如实的局限：
-  1. 没有 `F_SETSIG`，通知固定是 `SIGIO`；没有属主和 `CAP_LEASE` 检查（Linux 对非属主返回 `EACCES`）。（`F_SETSIG`/`F_SETOWN` 已实现，见下文 hello318 一节；属主和 `CAP_LEASE` 检查仍未做）
+  1. 没有 `F_SETSIG`，通知固定是 `SIGIO`；没有属主和 `CAP_LEASE` 检查（Linux 对非属主返回 `EACCES`）。（`F_SETSIG`/`F_SETOWN` 已实现，见下文 hello318 一节；属主和 `CAP_LEASE` 检查已实现，见下文 hello319 一节）
   2. `ftruncate` 不打破租约（没有在宿主机上实测 Linux 的行为）；45 s 的强制解除只有宿主机单测，目标机没有测。（`ftruncate` 一项已实测核对，与 Linux 一致，见下文「`ftruncate` 与租约（hello316 K）」）
   3. 撤回因租约失败的新 fd 用的是普通 `close`，会同时删掉本进程在该文件上的 fcntl 记录锁；Linux 的失败 open 不会这样。
   4. 租约表 32 项，满了返回 `ENOLCK`；一次打破最多通知 8 个进程。
@@ -8711,4 +8711,24 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. owner 和 sig 只用于租约打破。没有 `O_ASYNC`/`FASYNC`，socket、pipe、tty 的 I/O 就绪不发 `SIGIO`。
   2. 没有 `F_SETOWN_EX`/`F_GETOWN_EX`，也没有 `sigio_perm` 的 uid 权限检查。
   3. pipe 等不走共享 offset 槽的描述符，dup 后 owner/sig 是各自的副本，不共享。
-  4. pgid 是 u16；只做了 x86_64 的 fcntl 分派；`CAP_LEASE` 和属主检查仍未做。
+  4. pgid 是 u16；只做了 x86_64 的 fcntl 分派。（`CAP_LEASE` 和属主检查已在 hello319 一节实现）
+
+### 租约的属主与 `CAP_LEASE` 检查（hello319，已修）
+
+- 问题：任何进程都能在任何文件上拿租约（包括 root 的文件），也能对别人的文件 `F_UNLCK`；Linux 对非属主且没有 `CAP_LEASE` 的调用者返回 `EACCES`。内核的 `SysCap` 里也没有 `CAP_LEASE`。
+- Linux 依据：`fs/locks.c` 的 `vfs_setlease`：`if (!vfsuid_eq_kuid(vfsuid, current_fsuid()) && !capable(CAP_LEASE)) return -EACCES;`。在它之前，`fcntl_setlease` 拒绝目录，`lease_alloc` 拒绝未知类型（都是 `EINVAL`）；在它之后，`generic_setlease` 拒绝非普通文件（`EINVAL`）。管道和套接字的 `f_op->setlease` 是 `no_setlease`，所以给出 `EINVAL`。
+- 宿主机实测（uid 1000、无能力，`/tmp/lcap*.c`，再以 `gcc -DHOST` 跑 hello319，A、D、E、F 全过）：root 的 `/etc/passwd` 上 `F_RDLCK`/`F_WRLCK`/`F_UNLCK` 都是 `EACCES`，类型 7 和 -1 是 `EINVAL`，`F_GETLEASE` 是 2；`/dev/null`、`/dev/zero`、eventfd、timerfd、`/proc/meminfo` 是 `EACCES`；管道、套接字、`/proc/self/status`、目录（包括 root 的 `/tmp`）是 `EINVAL`；自己建的文件和 memfd 可以拿读租约。
+- 红灯：在未修改的 `file_lock.zig`、`cap_abi.zig` 上定向 SMP=2，hello319 C（`capget` 读不到第 28 位，eff 0）、D（root 的文件上三个命令都返回 0）、E（`/dev/null`、eventfd 都是 `EINVAL`）失败。宿主机单测「lease policy: F_SETLEASE needs the file's owner or CAP_LEASE」先编译失败（缺 `mayLease`）。
+- 修复：
+  - `kernel/fs/lease_policy.zig`：`mayLease(file_uid, fsuid, cap_lease)`。
+  - `kernel/proc/capability_profile.zig`：`SysCap.cap_lease`（占用 `_pad` 的一位，已有位不变），`ALL_CAPS` 包含它；hello319 以 uid 1000、只带 `cap_lease` 启动。
+  - `kernel/proc/cap_abi.zig`：`cap_lease` 对应 Linux 第 28 位。
+  - `kernel/fs/file_lock.zig`：`setLease` 按 Linux 的顺序检查目录、类型、属主、文件类型；新增 `leaseIsDir`、`leaseOwnerUid`。
+  - hello316、hello318 的测试文件从 FAT32 根目录（`h31Xa.txt`，FAT32 没有属主，视为 root）改到 `/tmp`（tmpfs，属主是创建者），否则以 uid 1000 运行时会被新的检查拒绝。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello319 A–F 全过（C：`eff 0x10000000`）；hello316、hello318 定向 SMP=2、SMP=4 都 PASS。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello319、hello318、hello316 PASS 和 `hello228: corrupted canaries=0`。
+- 局限：
+  1. 内核没有 fsuid，比较用的是 euid。
+  2. FAT32 和 ramdisk 文件没有属主，一律按 root 处理，所以普通用户不能在 FAT32 文件上拿租约（Linux 上 FAT 卷的属主由挂载参数 `uid=` 决定）。
+  3. 管道、套接字之外，procfs 文件也一律 `EINVAL`；Linux 对 `/proc/meminfo` 这类 root 文件先报 `EACCES`。
+  4. memfd 在这里是 tmpfs 文件，属主是创建者，与 Linux 一致；rofs（ext4/NTFS 只读卷）仍然不支持租约（`EINVAL`）。

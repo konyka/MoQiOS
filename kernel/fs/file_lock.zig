@@ -371,6 +371,29 @@ fn leaseable(desc: *const vfs.FileDescriptor) bool {
     };
 }
 
+fn leaseIsDir(desc: *const vfs.FileDescriptor) bool {
+    return switch (desc.fd_type) {
+        .tmpfs_file => if (@import("tmpfs.zig").tmpfsGetMetadata(@intCast(desc.tmpfs_idx))) |m| m.is_dir else false,
+        .fat32_file => @import("fat32.zig").openIsDir(desc.fat32_file_idx),
+        .ext2_file => @import("ext2.zig").openFileIsDir(desc.ext2_file_idx) orelse false,
+        else => false,
+    };
+}
+
+/// The uid vfs_setlease compares with the caller's: the owner fstat reports. Ramdisk and FAT32 files, devices and anonymous
+/// inodes (eventfd, timerfd, epoll, ...) belong to root. Pipes, sockets and procfs have no owner modeled here and stay EINVAL.
+fn leaseOwnerUid(desc: *const vfs.FileDescriptor) ?u32 {
+    return switch (desc.fd_type) {
+        .tmpfs_file => if (@import("tmpfs.zig").tmpfsGetMetadata(@intCast(desc.tmpfs_idx))) |m| m.uid else null,
+        .ext2_file => blk: {
+            var info: @import("stat_info.zig").StatInfo = .{};
+            break :blk if (@import("ext2.zig").statInode(desc.ext2_file_idx, &info)) info.uid else null;
+        },
+        .ramdisk_file, .fat32_file, .special, .devfs, .devfs_ctrl, .eventfd, .timerfd, .epoll, .inotify, .pidfd => 0,
+        else => null,
+    };
+}
+
 fn isBreaker(owner: u64) bool {
     for (&breakers) |*b| if (@atomicLoad(u64, b, .acquire) == owner) return true;
     return false;
@@ -416,7 +439,12 @@ pub fn setLease(fd: u64, arg: u64) i64 {
     if (!fdt.acquireTransferFd(fd_u)) return EBADF;
     defer fdt.releaseTransferFd(fd_u);
     const desc = &fdt.fds[fd_u];
+    // Linux order: fcntl_setlease's S_ISDIR, lease_alloc's type check, vfs_setlease's owner check, then the filesystem's support.
+    if (@import("dir_ops.zig").descriptorKind(desc) == .directory or leaseIsDir(desc)) return EINVAL;
     if (arg != lp.RDLCK and arg != lp.WRLCK and arg != lp.UNLCK) return EINVAL;
+    const file_uid = leaseOwnerUid(desc) orelse return EINVAL;
+    const may = lp.mayLease(file_uid, t.euid, t.effective_caps.cap_lease);
+    if (may != 0) return may;
     if (!leaseable(desc)) return EINVAL;
     const key = lockKey(desc) orelse return EINVAL;
     var rc: i64 = undefined;
