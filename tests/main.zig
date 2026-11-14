@@ -10192,10 +10192,27 @@ test "TCP delivery-rate samples: only bulk, recent acknowledgements measure the 
     try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "if (tcp_util.deliverySampleUsable(delivered, mssForTcb(tcb), elapsed)) {") != null);
 }
 
+test "the standard descriptors keep O_ASYNC as the console terminal, sharing a description only once O_ASYNC is on" {
+    const vfs = kt.vfs_source;
+    const fc = kt.fcntl_source;
+    // fd 0-2 are the terminal: keepsAsync knows them as "tty", and they register on the tty fasync list.
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "return isConsoleTty(desc) or desc.fd_type == .special;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "return if (isTerminal(desc)) \"tty\" else @tagName(desc.fd_type);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, ".special => .{ .kind = .tty, .idx = 0 },") != null);
+    // Shared only after setAsync promoted them, so an untouched fd 0 is still copied privately on fork.
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "if (desc.fd_type == .special) return desc.offset_slot != 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "_ = promoteDescription(desc) orelse return false;") != null);
+    // close(0..2) gives the shared description back and clears O_ASYNC on the private copy left behind.
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "const flags = statusFlagsOf(desc) & ~@as(u32, 0x2000);\n                releaseOpenFile(self, fd, desc);") != null);
+    // The default owner a terminal gives is applied to the standard descriptors too.
+    try std.testing.expect(std.mem.indexOf(u8, fc, "if (turning_on and vfs.isTerminal(d)) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fc, "vfs.isConsoleTty(d)") == null);
+}
+
 test "a pipe dup2'd onto stdin/stdout/stderr is released by close() and at exit, so its reader sees EOF" {
     const vfs = kt.vfs_source;
     // close(0..2) is a no-op only while the slot still holds the console; once dup2 put something else there it is a real close.
-    try std.testing.expect(std.mem.indexOf(u8, vfs, "if (fd <= FD_STDERR and self.fds[fd].fd_type == .special) return 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "if (fd <= FD_STDERR and self.fds[fd].fd_type == .special) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, vfs, "        if (fd <= FD_STDERR) return 0;\n") == null);
     // Both exit paths walk the whole table, not just fd 3 and up.
     const ts = kt.task_source;

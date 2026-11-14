@@ -85,7 +85,7 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
                 const turning_on = want != 0 and cur_flags & policy.O_ASYNC == 0;
                 if (want != cur_flags & policy.O_ASYNC and !vfs.setAsync(t.fd_table, @intCast(fd), want != 0)) return -12; // ENOMEM
                 // A terminal gives an unowned description an owner (Linux __tty_fasync): its foreground group, else the caller.
-                if (turning_on and vfs.isConsoleTty(d)) {
+                if (turning_on and vfs.isTerminal(d)) {
                     const pid: i32 = @intCast(if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid);
                     vfs.setFownOf(d, policy.ttyAsyncOwner(@import("../proc/jobctl.zig").foreground_pgid, pid), null, true);
                 }

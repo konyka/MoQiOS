@@ -8921,7 +8921,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份，hello326 A–J 全过；`zig build test` 通过。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），SMP=1、SMP=4 两份、SMP=2 全部 `EXIT=0`，没有失败项，四份都有 hello326 PASS 和 `hello228: corrupted canaries=0`；riscv64、aarch64 smoke 通过。完整 smoke 之后，`isConsoleTty` 又加了一个检查：tty 节点没有注册时（`ttyNodeIdx` 返回 `DIR_IDX`），`/dev` 目录的描述不会被误认成 tty。加上这个检查后重新构建，`zig build test` 通过，hello326 在 SMP=2、SMP=4 定向各一份 PASS。
 - 局限：
-  1. 只有 `/dev/tty` 保留 `O_ASYNC`。fd 0、1、2 是 `.special` 类型，没有描述对象和共享槽，仍然不保留（Linux 上它们就是同一个终端）。
+  1. 只有 `/dev/tty` 保留 `O_ASYNC`。fd 0、1、2 是 `.special` 类型，没有描述对象和共享槽，仍然不保留（Linux 上它们就是同一个终端）。（hello331 一节已改）
   2. 没有 pty，也没有输出队列：控制台写入同步发到串口，永远不会 EAGAIN，所以 tty 不发 POLL_OUT。
   3. 没有 canonical 行规程：每个字符都单独发 POLL_IN，Linux 的 canonical 模式要等到换行才发。
   4. 控制台输入只有 x86_64 的 PS/2 键盘环。riscv64、aarch64 上 TIOCSTI 返回 EIO，也不会有 tty 的 POLL_IN。
@@ -9044,3 +9044,32 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 证实：把写满后的等待加长到 10 次 `quiet()`，SMP=2、SMP=4 定向都稳定失败，`hits 0`，和完整 smoke 里的失败一样。
 - 修正：`user/hello325.c` 把 `reset()` 移到写满之前，检查条件不变：至少一次 POLL_OUT，code 2，fd 是发送方。原来的等待时间和加长到 10 次 `quiet()` 两种情况，SMP=2、SMP=4 定向都通过；宿主机 Linux 上也通过。内核没有改动。
 - 完整 smoke：SMP=1、SMP=4 两份、SMP=2 共四份，全部 EXIT=0、0 FAIL，hello325 和 hello330 都通过，`corrupted canaries=0`。
+
+### fd 0 作为控制台终端保留 O_ASYNC（hello331，已修）
+
+- 问题：hello326 只让 `/dev/tty` 保留 `O_ASYNC`。fd 0、1、2 是 `.special` 类型，没有共享槽，`F_SETFL` 把 `O_ASYNC` 丢掉，读回 0，终端输入不发 SIGIO。Linux 上标准描述符就是终端，`O_ASYNC` 照常生效，dup 和 fork 的副本共享同一个描述。
+- Linux 依据：`fs/fcntl.c` 的 `setfl` 在 `f_op->fasync` 存在时调用它；`drivers/tty/tty_io.c` 的 `tty_fasync`/`__tty_fasync` 登记并设默认 owner（前台组，否则调用者）；`n_tty_receive_buf` 收到输入后 `kill_fasync(…, POLL_IN)`；`fork` 的 `dup_fd` 共享 `struct file`。
+- 宿主机实测（`gcc -DHOST` 跑 `user/hello331.c`，把 raw pty 从端 dup 到 fd 0，连续 3 次 A–G 全过）：
+  - A 读回值是原值加 0x2000。
+  - B 默认 owner 是调用者或前台组。
+  - C 输入一个字符发 POLL_IN，band 0x41，si_fd 0。
+  - D dup 共享 `O_ASYNC`，关掉 dup 后 fd 0 仍然生效。
+  - E fork 的子进程看到 `O_ASYNC`，子进程退出后父进程仍收到信号。
+  - F 子进程清除 `O_ASYNC`，父进程这边也清除，不再收到信号。
+  - G 清除后不再发信号。
+- 目标机版本用 `/dev/tty` 的描述做 TIOCSTI 注入，所有检查都在 fd 0 上做。
+- 红灯：内核未改，定向 SMP=2，hello331 A–E 失败：读回 0x0，没有信号，子进程退出码 256。
+- 修复：
+  - `kernel/fs/vfs.zig`：
+    - 新增 `isTerminal`（`/dev/tty` 或 `.special`），`asyncTag` 用它，把 fd 0–2 叫作 "tty"；`fasyncTarget` 让 `.special` 登记到 `FasyncKind.tty`。
+    - `usesSharedSlot` 对 `.special` 只在已有共享槽时返回真；`setAsync` 对 `.special` 调用新函数 `promoteDescription` 先给它一个槽位（从 `flockOwner` 里拆出来）。flock 和 OFD 锁仍走 `flockOwner`，不会给 fd 0 分槽。
+    - `close()` 对 fd 0–2 的 `.special` 仍然不真正关闭；如果它有共享槽，先 `releaseOpenFile` 交回份额（最后一个持有者撤销登记），再回到私有拷贝并去掉 `O_ASYNC`。进程退出时也走这条路径。
+  - `kernel/fs/fcntl.zig`：默认 owner 的条件从 `isConsoleTty` 改为 `isTerminal`。
+  - `tests/main.zig`：新增源码单测，覆盖上面的分支；标准描述符 close 的源码单测按新写法更新。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份，hello331 通过；`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都有 hello331 PASS 和 `hello228: corrupted canaries=0`。SMP=1、SMP=2 和一份 SMP=4 `EXIT=0`、0 FAIL；另一份 SMP=4 `EXIT=1`，只有已记录的偶发项 hello286 J（19/60 次组停止被报告）失败。hello286 不碰 fd 0 也不用 `O_ASYNC`。对照：改过的内核上 hello286 在 SMP=4 定向跑两次，一次 J 41/60 失败、一次 PASS；把内核改动 stash 掉后定向跑两次都 PASS，样本太少，不能据此区分。随后在改过的内核上单独重跑一份 SMP=4 完整 smoke，`EXIT=0`、0 FAIL，hello286、hello331 都 PASS。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
+- 局限：
+  1. fd 0、1、2 是三个各自独立的描述，Linux 上通常是同一个 `struct file`。在 fd 0 上开 `O_ASYNC`，fd 1 读不到。
+  2. 在 fd 0 上调用 `close()` 仍然不会真正关闭它，只是交回共享的描述，`O_ASYNC` 随之清除。
+  3. 只有开过 `O_ASYNC` 的标准描述符才在 fork 时共享描述；没开过的仍是私有拷贝，在一个进程里改 `O_NONBLOCK` 不影响另一个进程。
+  4. hello326 的其余局限（没有 POLL_OUT、没有 canonical 行规程、只有 x86_64 有控制台输入）不变。

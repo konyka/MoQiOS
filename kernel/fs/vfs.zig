@@ -778,6 +778,7 @@ fn fasyncTarget(desc: *const FileDescriptor) ?struct { kind: FasyncKind, idx: u3
         .udp_socket => .{ .kind = .udp_socket, .idx = desc.udpKey() },
         .tcp_socket => .{ .kind = .tcp_socket, .idx = desc.tcb_idx },
         .devfs => if (isConsoleTty(desc)) .{ .kind = .tty, .idx = 0 } else null,
+        .special => .{ .kind = .tty, .idx = 0 },
         else => null,
     };
 }
@@ -788,7 +789,10 @@ fn fasyncTarget(desc: *const FileDescriptor) ?struct { kind: FasyncKind, idx: u3
 pub fn setAsync(table: *FdTable, fd: u32, on: bool) bool {
     const desc = &table.fds[fd];
     const target = fasyncTarget(desc) orelse return false;
-    _ = flockOwner(table, fd) orelse return false;
+    // A standard descriptor (.special) takes its slot here, so it is shared by dup()/fork() from now on (usesSharedSlot).
+    if (desc.fd_type == .special) {
+        _ = promoteDescription(desc) orelse return false;
+    } else _ = flockOwner(table, fd) orelse return false;
     const slot = desc.offset_slot;
     const f = fasync_lock.acquire();
     defer fasync_lock.release(f);
@@ -878,9 +882,14 @@ pub fn isConsoleTty(desc: *const FileDescriptor) bool {
     return desc.fd_type == .devfs and tty != @import("devfs.zig").DIR_IDX and desc.devfs_idx == tty;
 }
 
+/// The console terminal as a descriptor: /dev/tty, or one of the standard descriptors 0-2 every task starts with (.special).
+pub fn isTerminal(desc: *const FileDescriptor) bool {
+    return isConsoleTty(desc) or desc.fd_type == .special;
+}
+
 /// The name fcntl_policy.keepsAsync knows a descriptor by: its FdType, or "tty" for the console terminal.
 pub fn asyncTag(desc: *const FileDescriptor) []const u8 {
-    return if (isConsoleTty(desc)) "tty" else @tagName(desc.fd_type);
+    return if (isTerminal(desc)) "tty" else @tagName(desc.fd_type);
 }
 
 /// bind() moved a UDP socket from key `old` to key `new`: its O_ASYNC registrations follow it.
@@ -910,8 +919,10 @@ fn usesSharedOffset(t: FdType) bool {
 }
 
 /// Does `desc` keep its open file description in a shared slot? The kinds above, and /dev/tty (its status flags, owner, signal and
-/// O_ASYNC registration; other devfs nodes keep per-descriptor state).
+/// O_ASYNC registration; other devfs nodes keep per-descriptor state). A standard descriptor (.special) shares one only once
+/// O_ASYNC gave it a slot (flockOwner from setAsync); until then dup()/fork() copy it privately.
 fn usesSharedSlot(desc: *const FileDescriptor) bool {
+    if (desc.fd_type == .special) return desc.offset_slot != 0;
     return usesSharedOffset(desc.fd_type) or isConsoleTty(desc);
 }
 
@@ -1091,6 +1102,12 @@ pub fn posixLockOwner(table: *const FdTable) u64 {
 pub fn flockOwner(table: *FdTable, fd: u32) ?u64 {
     const desc = &table.fds[fd];
     if (!usesSharedSlot(desc)) return privateFlockOwner(table, fd);
+    return 0x4000_0000_0000_0000 | @as(u64, promoteDescription(desc) orelse return null);
+}
+
+/// Give `desc` a shared slot of its own (one holder) if it has none yet, carrying its status flags, owner and signal over.
+/// Null when the pool is full.
+fn promoteDescription(desc: *FileDescriptor) ?u16 {
     const f = shared_offsets_lock.acquire();
     defer shared_offsets_lock.release(f);
     if (desc.offset_slot == 0) {
@@ -1102,7 +1119,7 @@ pub fn flockOwner(table: *FdTable, fd: u32) ?u64 {
         shared_offsets.setSetter(slot, desc.fown_uid, desc.fown_euid);
         desc.offset_slot = slot;
     }
-    return 0x4000_0000_0000_0000 | @as(u64, desc.offset_slot);
+    return desc.offset_slot;
 }
 
 /// The owner flockOwner gives `desc` (descriptor `fd` of `table`), without moving it to a shared offset slot: a description that
@@ -2631,7 +2648,18 @@ pub const FdTable = struct {
             // POSIX mq descriptors live outside the per-task table (300+).
             return @import("../ipc/posix_mq.zig").mqClose(fd);
         }
-        if (fd <= FD_STDERR and self.fds[fd].fd_type == .special) return 0;
+        if (fd <= FD_STDERR and self.fds[fd].fd_type == .special) {
+            // The standard descriptors stay open; one that O_ASYNC moved to a shared description gives its share back (the last
+            // holder drops the registration) and goes back to a private copy without O_ASYNC.
+            const desc = &self.fds[fd];
+            if (desc.offset_slot != 0) {
+                const flags = statusFlagsOf(desc) & ~@as(u32, 0x2000);
+                releaseOpenFile(self, fd, desc);
+                desc.offset_slot = 0;
+                desc.status_flags = flags;
+            }
+            return 0;
+        }
         const flags = self.slot_locks[fd].acquire();
         const state = @atomicLoad(u32, &self.transfer_state[fd], .acquire);
         if (slotLifecycle(state) != SLOT_LIVE) {
