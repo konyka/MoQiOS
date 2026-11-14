@@ -33,13 +33,14 @@ pub fn sourceOf(clockid: u64) ?Source {
 
 /// What clock_nanosleep says about a clock id (measured on Linux): REALTIME, MONOTONIC and BOOTTIME sleep;
 /// MONOTONIC_RAW, REALTIME_COARSE, MONOTONIC_COARSE and THREAD_CPUTIME are EOPNOTSUPP; unknown ids are EINVAL.
-/// PROCESS_CPUTIME_ID really sleeps on Linux (until that much CPU time passes, which a sleeping process never
-/// accumulates); that cannot be modelled here, so it stays EINVAL, a documented difference.
-pub const SleepVerdict = enum { ok, not_supported, invalid };
+/// PROCESS_CPUTIME_ID sleeps until the process's CPU clock reaches the deadline (Linux posix_cpu_nsleep): CPU time the
+/// other threads of the process use counts, the sleeper's own does not move.
+pub const SleepVerdict = enum { ok, process_cpu, not_supported, invalid };
 
 pub fn sleepVerdict(clockid: u64) SleepVerdict {
     return switch (clockid) {
         CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME, CLOCK_TAI => .ok,
+        CLOCK_PROCESS_CPUTIME_ID => .process_cpu,
         CLOCK_MONOTONIC_RAW, CLOCK_REALTIME_COARSE, CLOCK_MONOTONIC_COARSE, CLOCK_THREAD_CPUTIME_ID => .not_supported,
         else => .invalid,
     };
@@ -47,7 +48,7 @@ pub fn sleepVerdict(clockid: u64) SleepVerdict {
 
 pub fn sleepErrno(v: SleepVerdict) i64 {
     return switch (v) {
-        .ok => 0,
+        .ok, .process_cpu => 0,
         .not_supported => -95,
         .invalid => -22,
     };

@@ -6278,7 +6278,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：`test_time_abi.c` 先写（`time.h` 不存在，编译失败=红）。变异 11 个，其中 3 个第一轮没被抓住并补了测试：去掉 `errno != EINTR` 的判断（补了"非信号失败时返回全部秒数"）、去掉 `sleep(0)` 的提前返回（补了"不进内核"）、错误窗口改成 `< 0`（补了 -4095/-4096 边界）。一个变异（把 `gettimeofday` 的 `tz` 改成 0）因参数未使用在 `-Werror` 下编译失败，不算有效变异。
 - 经由测量发现的内核差异（已修）：Linux 的 `clock_nanosleep` 对 `CLOCK_MONOTONIC_RAW`、`CLOCK_REALTIME_COARSE`、`CLOCK_MONOTONIC_COARSE`、`CLOCK_THREAD_CPUTIME_ID` 返回 `EOPNOTSUPP`(95)，这里原来把前三个当成可睡的、把后一个当 `EINVAL`。host 测试先写（`sleepVerdict`/`sleepErrno` 不存在，编译失败），再实现；`syscall_entry.zig` 里用判决值而不是布尔。`hello132`/`hello102` 只用 MONOTONIC 和未知时钟，不受影响。
 - 目标上验证：`hello201`（29 项）全部通过：时钟读数单调、各时钟 id 都能读、`gettimeofday`/`time`/`CLOCK_REALTIME` 互相一致、`nanosleep`/`usleep`/`sleep(1)`/`clock_nanosleep`（相对和 `TIMER_ABSTIME`，含已过去的绝对时间）都真的睡够了时间、错误形态正确、四个 `EOPNOTSUPP` 时钟。
-- 如实说明：①`CLOCK_PROCESS_CPUTIME_ID` 的 `clock_nanosleep` 这里仍是 `EINVAL`（Linux 会睡）；②没有 `localtime`/`gmtime`/`strftime`/`mktime`；③没有 `timer_create`、`setitimer` 封装；④`sleep` 被信号中断的路径只在宿主机用桩测了，目标探针没有触发 `EINTR`（`hello102` 在内核层测过 `alarm` 打断 `clock_nanosleep`）。
+- 如实说明：①`CLOCK_PROCESS_CPUTIME_ID` 的 `clock_nanosleep` 当时仍是 `EINVAL`（Linux 会睡；hello315 已修）；②没有 `localtime`/`gmtime`/`strftime`/`mktime`；③没有 `timer_create`、`setitimer` 封装；④`sleep` 被信号中断的路径只在宿主机用桩测了，目标探针没有触发 `EINTR`（`hello102` 在内核层测过 `alarm` 打断 `clock_nanosleep`）。
 
 ## libc 的日历与 strftime（hello202）
 
@@ -8570,7 +8570,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒）全部 `EXIT=0`、0 FAIL，四份都有 hello312 PASS，`hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
 - 如实的局限：
   1. 已过去的截止时间在下一个 tick（约 10 ms）触发，Linux 在 `timer_settime` 返回前就触发。hello312 C 的等待窗口是 300 ms，不受影响。
-  2. `clock_nanosleep` 在 CPU 时钟上的行为没有改：`CLOCK_PROCESS_CPUTIME_ID` 仍是 `EINVAL`（Linux 会真的去睡），`CLOCK_THREAD_CPUTIME_ID` 是 `EOPNOTSUPP`（与 Linux 相同），见 `kernel/proc/clock_ids.zig` 的说明。
+  2. `clock_nanosleep` 在 CPU 时钟上的行为没有改：`CLOCK_PROCESS_CPUTIME_ID` 当时仍是 `EINVAL`（Linux 会真的去睡；hello315 已修），`CLOCK_THREAD_CPUTIME_ID` 是 `EOPNOTSUPP`（与 Linux 相同），见 `kernel/proc/clock_ids.zig` 的说明。
 
 ## 没有 OFD 锁（`F_OFD_GETLK`/`F_OFD_SETLK`/`F_OFD_SETLKW`）（hello313，已修）
 
@@ -8608,3 +8608,21 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. hello308 F 的 CI 失败没有在本地复现过。根因是从代码推出来的：被唤醒、已认领但还没切入的线程，读数会带上从旧 `sched_in_tsc` 到现在的整段时间。hello314 直接测出了这个窗口造成的倒退。
   2. 切出时 `utime_us` 按整微秒累加，每次切换会丢掉不到 1 us 的余数，和改动前一样。
 - CI 记录：OFD 锁的提交 `f4af14c` 在 CI 的 SMP=2 上失败，唯一的失败是 hello267「with the sibling's queue full, every connection of the closing listener is still accepted, none reset」。hello267 不用文件锁，这次改动也没有碰 TCP。它和前面记过的 hello267「to m3 00」不是同一项，是新的偶发项，根因没有查。
+
+## `CLOCK_PROCESS_CPUTIME_ID` 上的 `clock_nanosleep`（hello315，已修）
+
+- 问题：`clock_nanosleep(CLOCK_PROCESS_CPUTIME_ID, ...)` 一律返回 `EINVAL`。Linux 会让调用者睡到进程（整个线程组）的 CPU 时间到达截止值为止，相对睡眠被信号打断时在 `rem` 里写回还差的 CPU 时间。
+- 新测试 hello315：一个 burner 线程持续烧 CPU，主线程在进程 CPU 时钟上睡。A 相对 50 ms 返回 0，且这段时间进程 CPU 时间至少走了 50 ms；B `TIMER_ABSTIME` 截止在当前 CPU 时间之后 30 ms，返回时已到达；C 已过去的截止时间立刻返回 0；D 没有线程烧 CPU 时，`alarm(1)` 让 10 s 的睡眠以 `EINTR` 结束，handler 运行，`rem` 约为 9.9 s；E 原始 syscall 在 `CLOCK_THREAD_CPUTIME_ID` 上仍是 `-EOPNOTSUPP`(-95)。
+- 宿主机实测：hello315（`gcc -DHOST -pthread`）A–E 全过，`taskset -c 0` 下也全过（D 的 `rem` 为 9995/9996 ms）。另外实测：glibc 的 `clock_nanosleep` 在线程时钟上返回 22（glibc 自己拦下），原始 syscall 返回 `-95`。
+- 红灯：未修改的内核上定向 SMP=2：A–D 全 FAIL（每次调用都返回 22），E 通过。
+- 修复：
+  - `kernel/proc/clock_ids.zig`：`SleepVerdict` 新增 `.process_cpu`，`sleepVerdict(2)` 返回它，`sleepErrno(.process_cpu)` 为 0。
+  - `kernel/arch/x86_64/syscall_entry.zig`：`syscallClockNanosleep` 对 `.process_cpu` 读入 timespec（非法的 `EINVAL`），截止值在 `TIMER_ABSTIME` 下就是该值，否则为当前进程 CPU 时间加上该值，交给新函数 `sleepUntilProcessCpu`。它每 10 ms 用 `sleep_bm`/`sleep_deadline_ns` 睡一次，醒来后用 `processCpuNs()`（`task.processCpuTimes`，含正在跑的片）重查：到达则返回 0；致命信号走 `exitTask`；可处理的信号返回 `EINTR`，相对睡眠写回 `rem = 截止值 - 当前 CPU 时间`。247 号本来就不在自动重启表里（`syscall_restart_policy`），所以 `EINTR` 会交给用户。
+  - 宿主机单测：`tests/main.zig` 里时钟 ID 的测试改为 `sleepVerdict(2) == .process_cpu`、`sleepErrno` 为 0，并检查 syscall 里的新条件。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello315 A–E 全过（A：CPU 72/60 ms；D：1025/1030 ms 后 `EINTR`，`rem` 9980/9892 ms）；同一次运行里 hello102（`clock_nanosleep` 的其它时钟和 flags）、hello201 也通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都有 hello315 PASS，`hello228: corrupted canaries=0`。SMP=1、SMP=2 `EXIT=0`、0 FAIL；两份 SMP=4 `EXIT=1`，各只有一项失败，都是 hello286（一份 J「60 group stops while threads come and go」50/60，一份 M「a SIGSTOP right after fork」19/20），是文档里已记录的 hello286 J/M 偶发项；hello286 不用 `clock_nanosleep`，这次改动只走时钟 2 的分支。hello286 单独定向重跑两份（SMP=4）都 PASS（J 60/60，M 20/20）。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
+- 如实的局限：
+  1. CPU 时钟的推进按 10 ms 轮询检查，返回可能比截止时间晚最多约一个轮询周期（加上调度延迟）；Linux 由 CPU 定时器在 tick 上唤醒，精度相近。
+  2. `TIMER_ABSTIME` 被信号打断时不写 `rem`，与 Linux 一致；被打断后不会自动重启。
+  3. 未知的 flags 位仍是 `EINVAL`；Linux 对 MONOTONIC 等时钟忽略未知位、返回 0。hello102 断言了 `EINVAL`，这里没有改。
+  4. 只做了 x86_64：riscv64、aarch64 没有自己的 `clock_nanosleep` 分派。

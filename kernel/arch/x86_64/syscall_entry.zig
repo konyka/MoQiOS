@@ -3816,6 +3816,56 @@ pub fn sleepUntil(deadline: u64, rem_ptr: u64) i64 {
     return 0;
 }
 
+/// CPU nanoseconds the calling process (its whole thread group) has used, including the slices running right now.
+fn processCpuNs() ?u64 {
+    const tsc = @import("../../arch/x86_64/tsc.zig");
+    const idx = @import("../../proc/sched.zig").currentTaskIndex() orelse return null;
+    return @import("../../proc/task.zig").processCpuTimes(idx, tsc.read(), tsc.tsc_freq_mhz).selfUs() *| 1000;
+}
+
+/// clock_nanosleep on CLOCK_PROCESS_CPUTIME_ID: sleep until the process's CPU clock reaches `target_ns`. The clock moves only
+/// while other threads of the process run, so the sleeper looks again once per scheduler tick (Linux arms a CPU timer and is
+/// woken by it; the tick is this kernel's CPU-timer resolution, as for posix_timer). A handled signal ends the sleep with EINTR
+/// and, for a relative sleep, the CPU time still to go in `rem_ptr`.
+fn sleepUntilProcessCpu(target_ns: u64, rem_ptr: u64) i64 {
+    const sleep_policy = @import("../../proc/sleep_policy.zig");
+    const tsc = @import("../../arch/x86_64/tsc.zig");
+    const sched = @import("../../proc/sched.zig");
+    const tm = @import("../../proc/task.zig");
+    const sig_mod = @import("../../proc/signal.zig");
+    const POLL_NS: u64 = 10_000_000;
+
+    const cur_idx = sched.currentTaskIndex() orelse return -14;
+    const cur = tm.getTask(cur_idx) orelse return -14;
+    const bit = @as(u64, 1) << @intCast(cur_idx);
+
+    while (true) {
+        if (sig_mod.pendingFatal(cur)) |s| {
+            cur.sleep_deadline_ns = 0;
+            _ = @atomicRmw(u64, &sched.sleep_bm, .And, ~bit, .seq_cst);
+            tm.exitTask(128 + @as(i32, @intCast(s)));
+        }
+        const now_cpu = processCpuNs() orelse target_ns;
+        if (now_cpu >= target_ns) break;
+        if (sig_mod.pendingActionable(cur)) {
+            cur.sleep_deadline_ns = 0;
+            _ = @atomicRmw(u64, &sched.sleep_bm, .And, ~bit, .seq_cst);
+            if (rem_ptr != 0 and !writeUserTimespec(rem_ptr, sleep_policy.remaining(target_ns, now_cpu))) return -14;
+            return -4; // EINTR
+        }
+        @atomicStore(u64, &cur.sleep_deadline_ns, tsc.nanos() +| POLL_NS, .release);
+        _ = @atomicRmw(u64, &sched.sleep_bm, .Or, bit, .seq_cst);
+        tm.blockTask(cur_idx);
+        sched.forceReschedule();
+        sched.repairCurrentAfterBlock();
+    }
+
+    cur.sleep_deadline_ns = 0;
+    _ = @atomicRmw(u64, &sched.sleep_bm, .And, ~bit, .seq_cst);
+    if (rem_ptr != 0 and !writeUserTimespec(rem_ptr, .{ .sec = 0, .nsec = 0 })) return -14;
+    return 0;
+}
+
 // ── v31.6: Process group management ─────────────────────────────
 
 /// setsid() — create a new session.
@@ -4419,9 +4469,15 @@ fn syscallClockNanosleep(clockid: u32, flags: u32, req_ptr: u64, rem_ptr: u64) i
     const tsc = @import("../../arch/x86_64/tsc.zig");
     const clock_ids = @import("../../proc/clock_ids.zig");
     const sleep_verdict = clock_ids.sleepVerdict(clockid);
-    if (sleep_verdict != .ok) return clock_ids.sleepErrno(sleep_verdict);
+    if (sleep_verdict != .ok and sleep_verdict != .process_cpu) return clock_ids.sleepErrno(sleep_verdict);
     if (flags & ~time_policy.TIMER_ABSTIME != 0) return -22;
     const ts = readUserTimespec(req_ptr) orelse return -14;
+    if (sleep_verdict == .process_cpu) {
+        const value_ns = time_policy.timespecToNs(ts.sec, ts.nsec) orelse return -22;
+        const now_cpu = processCpuNs() orelse return -14;
+        const abs = (flags & time_policy.TIMER_ABSTIME) != 0;
+        return sleepUntilProcessCpu(if (abs) value_ns else now_cpu +| value_ns, if (abs) 0 else rem_ptr);
+    }
     // The whole realtime family waits against the wall clock, the rest against the monotonic one.
     const base_clock: u32 = if (clock_ids.sourceOf(clockid).? == .realtime) time_policy.CLOCK_REALTIME else time_policy.CLOCK_MONOTONIC;
     const plan = sleep_policy.planClock(

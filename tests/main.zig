@@ -8776,16 +8776,16 @@ test "clock ids: which clock reads which time source, and which ones sleep/timer
     try std.testing.expectEqual(V.not_supported, ts.sleepVerdict(5));
     try std.testing.expectEqual(V.not_supported, ts.sleepVerdict(6));
     try std.testing.expectEqual(V.not_supported, ts.sleepVerdict(3));
-    try std.testing.expectEqual(V.invalid, ts.sleepVerdict(2));
+    try std.testing.expectEqual(V.process_cpu, ts.sleepVerdict(2));
     try std.testing.expectEqual(V.invalid, ts.sleepVerdict(8));
     try std.testing.expectEqual(V.invalid, ts.sleepVerdict(99));
     try std.testing.expectEqual(V.invalid, ts.sleepVerdict(@bitCast(@as(i64, -1))));
     try std.testing.expectEqual(@as(i64, -95), ts.sleepErrno(ts.sleepVerdict(4)));
-    try std.testing.expectEqual(@as(i64, -22), ts.sleepErrno(ts.sleepVerdict(2)));
+    try std.testing.expectEqual(@as(i64, 0), ts.sleepErrno(ts.sleepVerdict(2)));
     try std.testing.expectEqual(@as(i64, 0), ts.sleepErrno(ts.sleepVerdict(1)));
     // The syscall asks for the verdict, not a bare boolean.
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "const sleep_verdict = clock_ids.sleepVerdict(clockid);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "if (sleep_verdict != .ok) return clock_ids.sleepErrno(sleep_verdict);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "if (sleep_verdict != .ok and sleep_verdict != .process_cpu) return clock_ids.sleepErrno(sleep_verdict);") != null);
     // coarse clocks report a coarser resolution than the precise ones
     try std.testing.expectEqual(@as(u64, 1), ts.resolutionNs(1));
     try std.testing.expectEqual(@as(u64, 1_000_000), ts.resolutionNs(6));

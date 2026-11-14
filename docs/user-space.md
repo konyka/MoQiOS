@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello314`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello315`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -309,6 +309,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello312 | CPU 时钟（`CLOCK_PROCESS_CPUTIME_ID`、`CLOCK_THREAD_CPUTIME_ID`）上的 POSIX 定时器带 `TIMER_ABSTIME` 时，`it_value` 是 CPU 时钟的读数：截止时间在 20 ms CPU 之后时剩余不超过 20 ms，烧够后触发（A、B）；已过去的截止时间不再烧 CPU 也会触发（C）；10 s 之后的截止时间剩余 9～10 s，睡眠时不触发（D）；线程时钟同样（E、F）（宿主机 Linux 实测同结果） |
 | hello313 | OFD 锁（`F_OFD_GETLK`/`F_OFD_SETLK`/`F_OFD_SETLKW`）属于打开文件描述：同一进程两次 `open` 互相冲突（A），和普通 `fcntl` 锁互相冲突（B），关闭别的描述符不释放（C），`dup` 共享、最后一次关闭释放（D），`GETLK` 报告 `l_pid` -1（E），`l_pid` 非 0 是 `EINVAL`（F），`F_OFD_SETLKW` 等到解锁（G），`fork` 的子进程共享且退出不释放（H），中段解锁保留两端（I）（宿主机 Linux 实测同结果） |
 | hello314 | 3 个线程反复睡眠、唤醒时，主线程连续 1.5 秒读 `CLOCK_PROCESS_CPUTIME_ID` 和自己的 `CLOCK_THREAD_CPUTIME_ID`：进程时钟不倒退（A），线程时钟不倒退（B），进程时钟走得不比墙钟乘以线程数快（C）（宿主机 Linux 实测同结果） |
+| hello315 | 一个线程烧 CPU 时在 `CLOCK_PROCESS_CPUTIME_ID` 上 `clock_nanosleep`：相对 50 ms 返回 0 且进程 CPU 时间走够（A），`TIMER_ABSTIME` 截止时间到达（B），已过去的截止时间立刻返回（C），没有线程烧 CPU 时 `SIGALRM` 让 10 s 的睡眠以 `EINTR` 结束并写回 `rem`（D），线程时钟上原始 syscall 是 `-EOPNOTSUPP`（E）（宿主机 Linux 实测同结果） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
