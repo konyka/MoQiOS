@@ -72,8 +72,16 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
             return @intCast(policy.reportedFlags(@tagName(d.fd_type), vfs.statusFlagsOf(d)));
         },
         F_SETFL => {
-            const cur_flags = vfs.statusFlagsOf(&t.fd_table.fds[fd]);
-            vfs.setStatusFlags(&t.fd_table.fds[fd], policy.applySetfl(cur_flags, arg));
+            const d = &t.fd_table.fds[fd];
+            const cur_flags = vfs.statusFlagsOf(d);
+            var next = policy.applySetfl(cur_flags & ~policy.O_ASYNC, arg);
+            // O_ASYNC is kept only where the file can act on it (Linux setfl → f_op->fasync); elsewhere F_SETFL still succeeds.
+            if (policy.keepsAsync(@tagName(d.fd_type))) {
+                const want = @as(u32, @truncate(arg)) & policy.O_ASYNC;
+                if (want != cur_flags & policy.O_ASYNC and !vfs.setPipeAsync(t.fd_table, @intCast(fd), want != 0)) return -12; // ENOMEM
+                next |= want;
+            }
+            vfs.setStatusFlags(d, next);
             return 0;
         },
         F_GETOWN => return vfs.fownOf(&t.fd_table.fds[fd]).owner,

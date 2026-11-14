@@ -525,6 +525,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         11 => {
             syscallClose(frame);
+            checkSignalsOnSyscallReturn(frame); // the last end of a pipe going away signals O_ASYNC owners, maybe the closer (hello320 E/F)
         },
         12 => {
             syscallMunmap(frame);
@@ -1249,6 +1250,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         230 => { // closefrom(lowfd)
             frame.rax = @bitCast(misc_mod.closefrom(@truncate(frame.rdi)));
+            checkSignalsOnSyscallReturn(frame);
         },
         231 => { // move_pages(pid, count, pages, nodes, status, flags)
             frame.rax = @bitCast(misc_mod.movePages(@truncate(frame.rdi), frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
@@ -1640,6 +1642,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         314 => { // close_range(first, last, flags) — bulk close fd range
             frame.rax = @bitCast(syscallCloseRange(@truncate(frame.rdi), @truncate(frame.rsi), @truncate(frame.rdx)));
+            checkSignalsOnSyscallReturn(frame);
         },
         315 => { // pidfd_open(pid, flags) — open pid file descriptor
             frame.rax = @bitCast(syscallPidfdOpen(@truncate(frame.rdi), @truncate(frame.rsi)));
@@ -2227,6 +2230,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         436 => { // close_range(first, last, flags) — alias of #314
             frame.rax = @bitCast(syscallCloseRange(@truncate(frame.rdi), @truncate(frame.rsi), @truncate(frame.rdx)));
+            checkSignalsOnSyscallReturn(frame);
         },
         437 => { // openat2(dirfd, pathname, how, size) — alias of #320
             frame.rax = @bitCast(syscallOpenat2(frame.rdi, frame.rsi, frame.rdx, frame.r10));

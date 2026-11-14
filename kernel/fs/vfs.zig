@@ -222,9 +222,17 @@ pub fn allocPipe() ?u32 {
     return null;
 }
 
+/// Read from a pipe; any read that gets as far as the buffer (data, EAGAIN or EOF) tells the O_ASYNC write ends (Linux pipe_read's
+/// closing kill_fasync POLL_OUT). An interrupted wait returns without it, as Linux's -ERESTARTSYS does.
 pub fn pipeRead(pipe_idx: u32, buf: [*]u8, count: usize, status_flags: u32) i64 {
     if (pipe_idx >= MAX_PIPES) return -1;
     if (count == 0) return 0;
+    const r = pipeReadInner(pipe_idx, buf, count, status_flags);
+    if (r != -4) pipeFasyncNotify(pipe_idx, true);
+    return r;
+}
+
+fn pipeReadInner(pipe_idx: u32, buf: [*]u8, count: usize, status_flags: u32) i64 {
     const sched = @import("../proc/sched.zig");
     const task_mod = @import("../proc/task.zig");
     const nonblocking = (status_flags & @as(u32, 0x800)) != 0;
@@ -424,6 +432,7 @@ pub fn pipeCommitRead(token: PipeReadToken, count: usize) i64 {
     if (n > 0) {
         const epoll_r = @import("../net/epoll.zig");
         epoll_r.epollNotify(.pipe_write, token.pipe_idx, epoll_r.EPOLLOUT);
+        pipeFasyncNotify(token.pipe_idx, true);
     }
     return @intCast(n);
 }
@@ -484,6 +493,8 @@ pub fn pipeTransfer(src_idx: u32, dst_idx: u32, count: usize) i64 {
         const epoll_r = @import("../net/epoll.zig");
         epoll_r.epollNotify(.pipe_write, src_idx, epoll_r.EPOLLOUT);
         epoll_r.epollNotify(.pipe_read, dst_idx, epoll_r.EPOLLIN);
+        pipeFasyncNotify(src_idx, true);
+        pipeFasyncNotify(dst_idx, false);
     }
     return @intCast(n);
 }
@@ -616,9 +627,17 @@ pub fn pipeWaitWritable(pipe_idx: u32, nonblocking: bool) i64 {
     }
 }
 
+/// Write to a pipe; every write that reaches the buffer tells the O_ASYNC read ends (Linux pipe_write: kill_fasync POLL_IN on the
+/// way out and before each wait for room).
 pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u32) i64 {
     if (pipe_idx >= MAX_PIPES) return -1;
     if (count == 0) return 0;
+    const r = pipeWriteInner(pipe_idx, buf, count, status_flags);
+    pipeFasyncNotify(pipe_idx, false);
+    return r;
+}
+
+fn pipeWriteInner(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u32) i64 {
     const sched = @import("../proc/sched.zig");
     const task_mod = @import("../proc/task.zig");
     const sig_mod = @import("../proc/signal.zig");
@@ -697,6 +716,7 @@ pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u3
             const epoll_w = @import("../net/epoll.zig");
             epoll_w.epollNotify(.pipe_read, pipe_idx, epoll_w.EPOLLIN);
         }
+        pipeFasyncNotify(pipe_idx, false);
         if (!(stop_now and sig_mod.stopWhileWaiting(cur))) sched.rescheduleAfterBlock();
         const cleanup = pipe_lock.acquire();
         unlinkPipeWriteWaiterLocked(pipe_idx, node);
@@ -710,6 +730,7 @@ pub fn pipeClose(pipe_idx: u32, write_end: bool) void {
     if (pipe_idx >= MAX_PIPES) return;
     const flags = pipe_lock.acquire();
     const pipe = &pipes[pipe_idx];
+    var one_side_gone = false;
     if (pipe.ref_count > 0) {
         pipe.ref_count -= 1;
         if (write_end) {
@@ -717,6 +738,8 @@ pub fn pipeClose(pipe_idx: u32, write_end: bool) void {
         } else {
             pipe.read_refs -|= 1;
         }
+        // Linux pipe_release: the last reader or writer gone while the other side remains tells both sides' O_ASYNC owners.
+        one_side_gone = (pipe.read_refs == 0) != (pipe.write_refs == 0);
         if (pipe.ref_count == 0) {
             const generation = pipe.generation;
             pipe.* = .{ .buf = @splat(0), .head = 0, .tail = 0, .ref_count = 0, .generation = generation };
@@ -730,6 +753,83 @@ pub fn pipeClose(pipe_idx: u32, write_end: bool) void {
     const epoll_c = @import("../net/epoll.zig");
     epoll_c.epollNotify(.pipe_read, pipe_idx, epoll_c.EPOLLHUP);
     epoll_c.epollNotify(.pipe_write, pipe_idx, epoll_c.EPOLLERR);
+    if (one_side_gone) {
+        pipeFasyncNotify(pipe_idx, false);
+        pipeFasyncNotify(pipe_idx, true);
+    }
+}
+
+// ── O_ASYNC on pipes (Linux pipe_fasync / kill_fasync) ─────────────────────
+/// One open file description of a pipe end with O_ASYNC set: its shared slot (the owner and signal live there) and the
+/// descriptor F_SETFL went through, which becomes si_fd (Linux fasync_struct.fa_fd).
+const PipeFasync = struct { used: bool = false, pipe_idx: u8 = 0, write_end: bool = false, slot: u16 = 0, fd: u32 = 0 };
+const PIPE_FASYNC_MAX = 128;
+var pipe_fasync: [PIPE_FASYNC_MAX]PipeFasync = @splat(.{});
+var pipe_fasync_lock: IrqSpinlock = .{};
+
+/// F_SETFL changing O_ASYNC on pipe descriptor `fd` of `table`: (un)register its open file description. The description is
+/// given a shared slot first (as flockOwner does) so dup()/fork() copies share the registration. False when the slot pool or the
+/// registry is full (ENOMEM, as fasync_helper's allocation failing).
+pub fn setPipeAsync(table: *FdTable, fd: u32, on: bool) bool {
+    const desc = &table.fds[fd];
+    if (desc.fd_type != .pipe_read and desc.fd_type != .pipe_write) return false;
+    _ = flockOwner(table, fd) orelse return false;
+    const slot = desc.offset_slot;
+    const f = pipe_fasync_lock.acquire();
+    defer pipe_fasync_lock.release(f);
+    var free: ?usize = null;
+    for (&pipe_fasync, 0..) |*e, i| {
+        if (e.used and e.slot == slot) {
+            if (on) {
+                e.fd = fd;
+            } else e.* = .{};
+            return true;
+        }
+        if (!e.used and free == null) free = i;
+    }
+    if (!on) return true;
+    const i = free orelse return false;
+    pipe_fasync[i] = .{ .used = true, .pipe_idx = @intCast(desc.pipe_idx), .write_end = desc.fd_type == .pipe_write, .slot = slot, .fd = fd };
+    return true;
+}
+
+/// The open file description in `slot` is gone: drop its O_ASYNC registration (Linux __fput → fasync(-1)).
+fn dropPipeFasync(slot: u16) void {
+    const f = pipe_fasync_lock.acquire();
+    defer pipe_fasync_lock.release(f);
+    for (&pipe_fasync) |*e| {
+        if (e.used and e.slot == slot) e.* = .{};
+    }
+}
+
+/// kill_fasync for one end of a pipe: signal the owner of every O_ASYNC description of that end (POLL_OUT for the write end,
+/// POLL_IN for the read end). Collected under the registry lock, sent outside it; a description with no owner signals nobody.
+fn pipeFasyncNotify(pipe_idx: u32, write_end: bool) void {
+    var hits: [PIPE_FASYNC_MAX]PipeFasync = undefined;
+    var n: usize = 0;
+    {
+        const f = pipe_fasync_lock.acquire();
+        defer pipe_fasync_lock.release(f);
+        for (pipe_fasync) |e| {
+            if (e.used and e.pipe_idx == pipe_idx and e.write_end == write_end) {
+                hits[n] = e;
+                n += 1;
+            }
+        }
+    }
+    if (n == 0) return;
+    const fp = @import("fcntl_policy.zig");
+    const sig_mod = @import("../proc/signal.zig");
+    for (hits[0..n]) |e| {
+        const fo = fownOfDescription(0x4000_0000_0000_0000 | @as(u64, e.slot)) orelse continue;
+        if (fo.owner == 0) continue;
+        const s = fp.sigioSignal(fo.sig, e.fd, if (write_end) fp.POLL_OUT else fp.POLL_IN);
+        if (fo.owner > 0) {
+            _ = sig_mod.sendSignalInfo(@intCast(fo.owner), s.signo, s.info);
+        } else if (-fo.owner <= 0xffff) {
+            _ = sig_mod.sendSignalToPgrpInfo(@intCast(-fo.owner), s.signo, null, s.info);
+        }
+    }
 }
 
 
@@ -738,10 +838,13 @@ const shared_offset = @import("shared_offset.zig");
 var shared_offsets: shared_offset.Pool(512) = .{};
 var shared_offsets_lock: IrqSpinlock = .{};
 
-/// Descriptor kinds whose position is a byte offset into a regular object.
+/// Descriptor kinds whose open file description is shared through a slot: those with a byte offset into a regular object, and
+/// pipe ends (shared status flags, owner, signal and O_ASYNC registration).
 fn usesSharedOffset(t: FdType) bool {
     return switch (t) {
         .ramdisk_file, .fat32_file, .ext2_file, .tmpfs_file, .rofs_file, .proc_file => true,
+        // No offset, but the status flags (O_NONBLOCK, O_ASYNC), owner and signal belong to the description all the same.
+        .pipe_read, .pipe_write => true,
         else => false,
     };
 }
@@ -900,9 +1003,13 @@ fn releaseOpenFile(table: ?*FdTable, fd: u32, desc: *const FileDescriptor) void 
 /// holder, so the open file description itself is gone.
 fn releaseOffsetSlot(slot: u16) bool {
     if (slot == 0) return true;
-    const f = shared_offsets_lock.acquire();
-    defer shared_offsets_lock.release(f);
-    return shared_offsets.release(slot);
+    const last = blk: {
+        const f = shared_offsets_lock.acquire();
+        defer shared_offsets_lock.release(f);
+        break :blk shared_offsets.release(slot);
+    };
+    if (last) dropPipeFasync(slot);
+    return last;
 }
 
 /// Open file descriptor.

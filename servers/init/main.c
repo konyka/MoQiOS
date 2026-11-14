@@ -436,6 +436,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello317"); /* adjtimex / clock_adjtime: NTP variables, TAI offset, ADJ_SETOFFSET */
     run_test("hello318"); /* F_SETOWN/F_GETOWN/F_SETSIG/F_GETSIG and the signal a lease break sends */
     run_test("hello319"); /* F_SETLEASE needs the file's owner or CAP_LEASE */
+    run_test("hello320"); /* O_ASYNC on a pipe: SIGIO with POLL_IN / POLL_OUT to the owner */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

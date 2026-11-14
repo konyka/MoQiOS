@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello319`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello320`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -314,6 +314,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello317 | `adjtimex`(502)/`clock_adjtime`(503)：只读调用返回时钟状态（开机 5、`STA_UNSYNC`），tick 10000、precision 1、tolerance 32768000、constant 2（A）；`ADJ_TAI` 37 后 TAI − REALTIME = 37 s（B）；`clock_nanosleep(CLOCK_TAI, TIMER_ABSTIME)` 按 TAI 截止（C）；越界的 TAI 偏移被忽略（D）；非特权子进程的修改为 `EPERM`、`0x8000` 为 `EINVAL`、读取可用（E）；`clock_adjtime` 各时钟的错误码和 NULL 为 `EFAULT`（F）；`adjtimex(NULL)` 为 `EFAULT`（G）；`ADJ_SETOFFSET` 让 REALTIME 前进再退回（H） |
 | hello318 | `F_SETOWN`(8)/`F_GETOWN`(9)/`F_SETSIG`(10)/`F_GETSIG`(11)：默认 0（A）；`F_SETSIG` 接受 0..64，越界 `EINVAL` 不改原值，参数按 int 截断（B）；`F_SETOWN` 读回 pid 和 -pgrp，不存在的目标 `ESRCH`，`INT_MIN` `EINVAL`，0 清除（C）；属于打开文件描述，dup 和 fork 可见、另一次 open 不可见（D）；`F_SETLEASE` 无 owner 时设为调用者（E）；打破租约发出设置的信号，`si_code` `POLL_MSG`、`si_band` 0x441、`si_fd` 为租约 fd，sig 0 时发 `SIGIO`/`SI_KERNEL`（F–H）；`F_UNLCK` 清除 owner/sig（I）；owner 0 时不发信号但打开者仍 `EAGAIN`（J）；持租约期间改信号生效（K）；pipe 可设置、坏 fd `EBADF`（L） |
 | hello319 | `F_SETLEASE` 要求是文件属主或持有 `CAP_LEASE`（以 uid 1000、只带 `CAP_LEASE` 启动）：自己建的文件可拿租约（A）；持 `CAP_LEASE` 时 root 的文件可拿（B）；`capget` 把 `CAP_LEASE` 报为第 28 位，`capset` 能放弃它（C）；放弃后 root 的文件 `F_RDLCK`/`F_WRLCK`/`F_UNLCK` 都是 `EACCES`，类型 7、-1 仍是 `EINVAL`（D）；`/dev/null`、eventfd 是 `EACCES`，管道、目录是 `EINVAL`（E）；自己的文件仍可拿（F） |
+| hello320 | 管道上的 `O_ASYNC`：`F_SETFL O_ASYNC` 成功，`F_GETFL` 读回 0x2000/0x2001，没有 owner 不发信号（A）；sig 0 时每次写入发 `SIGIO`/`SI_KERNEL`（B）；`F_SETSIG 40` 时写入发 `POLL_IN`、band 0x41、读端 fd（C）；读出数据给写端发 `POLL_OUT`、band 0x304、写端 fd（D）；关闭写端给读端发 `POLL_IN`，读到 EOF 不发（E）；关闭读端给写端发 `POLL_OUT`，之后 `EPIPE` 不发（F）；清除后不发（G）；dup、fork 共享这一位（H）；子进程写入发给父进程（I）；-pgrp owner（J）；`/dev/null`、普通文件接受但不保留（K）；关闭两个描述符之一后照常发（L） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

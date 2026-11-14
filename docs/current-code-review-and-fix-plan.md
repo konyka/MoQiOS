@@ -8708,9 +8708,9 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello318 A–L 全过（F：`sig 35 code 3 band 0x441 fd 3/3`；G：`sig 29 code 128 fd 0`）；回归 hello316 定向 SMP=2、SMP=4 都 PASS。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello318 PASS、hello316 PASS 和 `hello228: corrupted canaries=0`。
 - 局限：
-  1. owner 和 sig 只用于租约打破。没有 `O_ASYNC`/`FASYNC`，socket、pipe、tty 的 I/O 就绪不发 `SIGIO`。
+  1. owner 和 sig 只用于租约打破。没有 `O_ASYNC`/`FASYNC`，socket、pipe、tty 的 I/O 就绪不发 `SIGIO`。（pipe 已在 hello320 一节实现；socket、tty 仍未做）
   2. 没有 `F_SETOWN_EX`/`F_GETOWN_EX`，也没有 `sigio_perm` 的 uid 权限检查。
-  3. pipe 等不走共享 offset 槽的描述符，dup 后 owner/sig 是各自的副本，不共享。
+  3. pipe 等不走共享 offset 槽的描述符，dup 后 owner/sig 是各自的副本，不共享。（pipe 已在 hello320 一节修复：管道两端也用共享槽；eventfd、socket 等仍是副本）
   4. pgid 是 u16；只做了 x86_64 的 fcntl 分派。（`CAP_LEASE` 和属主检查已在 hello319 一节实现）
 
 ### 租约的属主与 `CAP_LEASE` 检查（hello319，已修）
@@ -8732,3 +8732,22 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   2. FAT32 和 ramdisk 文件没有属主，一律按 root 处理，所以普通用户不能在 FAT32 文件上拿租约（Linux 上 FAT 卷的属主由挂载参数 `uid=` 决定）。
   3. 管道、套接字之外，procfs 文件也一律 `EINVAL`；Linux 对 `/proc/meminfo` 这类 root 文件先报 `EACCES`。
   4. memfd 在这里是 tmpfs 文件，属主是创建者，与 Linux 一致；rofs（ext4/NTFS 只读卷）仍然不支持租约（`EINVAL`）。
+
+### 管道上的 `O_ASYNC`（hello320，已修）
+
+- 问题：`F_SETFL O_ASYNC` 返回 0 但什么都不做，`F_GETFL` 读不回这一位，管道读写和关闭都不给 owner 发 `SIGIO`。另外管道不走共享槽，dup、fork 后状态标志、owner、sig 是各自的副本（hello318 局限 3）。
+- Linux 依据：`fs/fcntl.c` 的 `setfl` 只在 `FASYNC` 变化且有 `f_op->fasync` 时调用它，由 `fasync_helper` 设置这一位；`fs/pipe.c` 的 `pipe_read` 结尾 `kill_fasync(fasync_writers, POLL_OUT)`，`pipe_write` 在返回和等待空间前 `kill_fasync(fasync_readers, POLL_IN)`，`pipe_release` 在一侧全部关闭而另一侧还在时两边都通知；`fs/splice.c` 也通知；`send_sigio_to_task` 在 sig 非 0 时用 reason 作 `si_code`、按 band_table 填 `si_band`、用 `fa_fd` 填 `si_fd`。
+- 宿主机实测（`/tmp/async*.c`，再以 `gcc -DHOST` 跑 `user/hello320.c`，A–L 全过）：读回 0x2000/0x2001；没有 owner 不发；sig 0 时每次写入都发 `SIGIO`（code 128、band 0、fd 0），管道里已有数据也发；sig 40 时写入发 `POLL_IN`(1)、0x41、读端 fd，读出发给写端 `POLL_OUT`(2)、0x304、写端 fd，写入不给写端发；关闭写端读端收到 `POLL_IN`，关闭读端写端收到 `POLL_OUT`；读到 EOF、`EPIPE` 写入、零长度读写不发；非阻塞读得到 `EAGAIN` 也给写端发、非阻塞写得到 `EAGAIN` 也给读端发；清除后不发；dup、fork 共享这一位；子进程写入发给父进程；-pgrp owner 能收到；`/dev/null`、普通文件 `F_SETFL O_ASYNC` 返回 0 但读不回（`open(O_ASYNC)` 打开的普通文件读回 0xa002）。
+- 红灯：在未修改的内核上定向 SMP=2，hello320 A（读回 0x0/0x1）、B–F、H–J、L 失败，G、K 只检查“不发信号”所以通过。宿主机单测「fcntl policy: O_ASYNC is kept by pipes only…」先编译失败（缺 `O_ASYNC`）。
+- 修复：
+  - `kernel/fs/fcntl_policy.zig`：`O_ASYNC`、`keepsAsync`、`POLL_IN`/`POLL_OUT`/`POLL_MSG`，`sigioSignal(sig, fd, reason)` 按 band_table 填 band；`leaseBreakSignal` 改为它的 `POLL_MSG` 包装。
+  - `kernel/fs/fcntl.zig`：`F_SETFL` 先去掉旧的 `O_ASYNC`，只在管道上按参数设置并调用 `vfs.setPipeAsync`（失败 `ENOMEM`）。
+  - `kernel/fs/vfs.zig`：管道两端加入 `usesSharedOffset`；`pipe_fasync[128]` 登记表与 `setPipeAsync`、`dropPipeFasync`（描述最后一次关闭时由 `releaseOffsetSlot` 调用）、`pipeFasyncNotify`（锁内收集、锁外发送）；`pipeRead`、`pipeWrite` 拆成外层通知加 `Inner`，`pipeWrite` 等待空间前也通知；`pipeClose`、`pipeCommitRead`、`pipeTransfer` 通知。
+  - `kernel/arch/x86_64/syscall_entry.zig`：`close`、`closefrom`、`close_range` 返回前检查信号（关闭者自己是 owner 时 E、F 立即收到，否则要等下一次系统调用）。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello320 A–L 全过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello320、hello319、hello318、hello316、hello87、hello273 PASS 和 `hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过（已有的 fcntl 源码检查单测改为匹配新的 `F_SETFL` 代码）。
+- 局限：
+  1. 只做了管道；socket、tty、eventfd 等的 `O_ASYNC` 仍然不保留、不发信号。
+  2. `open(O_ASYNC)` 不保留这一位（`OPEN_STATUS_MASK` 不含它）；Linux 在普通文件上保留但不起作用，管道不能用 `open` 打开（FIFO 除外，这里没有 FIFO 的 `O_ASYNC`）。
+  3. 登记表 128 项、共享槽池 512 槽；管道描述现在也占共享槽，池满时 dup、fork 退化为私有副本，`F_SETFL O_ASYNC` 返回 `ENOMEM`。
+  4. 没有 `sigio_perm` 的 uid 检查，也没有 `F_SETOWN_EX`；只做了 x86_64 的 close 系列信号检查。

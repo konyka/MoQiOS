@@ -2154,7 +2154,8 @@ test "fcntl flags: FD_CLOEXEC is one bit, F_SETFL touches only APPEND/NONBLOCK/D
     // The entry points use the policy.
     const fc = kt.fcntl_source;
     try std.testing.expect(std.mem.indexOf(u8, fc, "t.fd_table.fds[fd].fd_flags = policy.fdFlagsFromSetfd(arg);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fc, "vfs.setStatusFlags(&t.fd_table.fds[fd], policy.applySetfl(cur_flags, arg));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fc, "var next = policy.applySetfl(cur_flags & ~policy.O_ASYNC, arg);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fc, "vfs.setStatusFlags(d, next);") != null);
     try std.testing.expect(std.mem.indexOf(u8, fc, "policy.reportedFlags(@tagName(d.fd_type), vfs.statusFlagsOf(d))") != null);
     try std.testing.expect(std.mem.indexOf(u8, fc, "F_SETLEASE => return @import(\"file_lock.zig\").setLease(fd_num, arg),") != null);
     try std.testing.expect(std.mem.indexOf(u8, fc, "F_GETLEASE => return @import(\"file_lock.zig\").getLease(fd_num),") != null);
@@ -12469,6 +12470,35 @@ test "fcntl policy: F_SETOWN and F_SETSIG arguments, and the siginfo a lease bre
     try std.testing.expectEqual(@as(i32, 3), fp.leaseBreakSignal(29, 5).info.code);
     // signals with their own si_codes get SI_SIGIO instead (Linux send_sigio_to_task)
     for ([_]u8{ 4, 5, 7, 8, 11, 17, 31 }) |sig| try std.testing.expectEqual(@as(i32, -5), fp.leaseBreakSignal(sig, 5).info.code);
+}
+
+test "fcntl policy: O_ASYNC is kept by pipes only, and SIGIO carries POLL_IN / POLL_OUT with their bands" {
+    const fp = kt.fcntl_policy;
+    try std.testing.expectEqual(@as(u32, 0x2000), fp.O_ASYNC);
+    // F_SETFL's own mask does not carry it: the pipe path adds the bit when it registers the description
+    try std.testing.expectEqual(@as(u32, 2), fp.applySetfl(2, 0x2000));
+    try std.testing.expect(fp.keepsAsync("pipe_read"));
+    try std.testing.expect(fp.keepsAsync("pipe_write"));
+    try std.testing.expect(!fp.keepsAsync("ramdisk"));
+    try std.testing.expect(!fp.keepsAsync("devnull"));
+    // signal 0: plain SIGIO, SI_KERNEL, band 0, fd 0, whatever the reason
+    const s0 = fp.sigioSignal(0, 3, fp.POLL_IN);
+    try std.testing.expectEqual(@as(u32, 29), s0.signo);
+    try std.testing.expectEqual(@as(i32, 0x80), s0.info.code);
+    try std.testing.expectEqual(@as(u64, 0), s0.info.a);
+    try std.testing.expectEqual(@as(u64, 0), s0.info.b);
+    const in40 = fp.sigioSignal(40, 3, fp.POLL_IN);
+    try std.testing.expectEqual(@as(u32, 40), in40.signo);
+    try std.testing.expectEqual(@as(i32, 1), in40.info.code);
+    try std.testing.expectEqual(@as(u64, 0x41), in40.info.a);
+    try std.testing.expectEqual(@as(u64, 3), in40.info.b);
+    const out40 = fp.sigioSignal(40, 4, fp.POLL_OUT);
+    try std.testing.expectEqual(@as(i32, 2), out40.info.code);
+    try std.testing.expectEqual(@as(u64, 0x304), out40.info.a);
+    try std.testing.expectEqual(@as(u64, 4), out40.info.b);
+    try std.testing.expectEqual(@as(i32, -5), fp.sigioSignal(17, 4, fp.POLL_OUT).info.code);
+    // a lease break is the POLL_MSG case
+    try std.testing.expectEqual(@as(u64, 0x441), fp.sigioSignal(35, 3, fp.POLL_MSG).info.a);
 }
 
 test "lease policy: a read open downgrades a write lease, and deadlines force the outcome" {

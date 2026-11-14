@@ -8,6 +8,8 @@ pub const O_ACCMODE: u32 = 0x3;
 pub const O_APPEND: u32 = 0x400;
 pub const O_NONBLOCK: u32 = 0x800;
 pub const O_DSYNC: u32 = 0x1000;
+/// O_ASYNC (FASYNC): signal the description's owner when I/O becomes possible.
+pub const O_ASYNC: u32 = 0x2000;
 pub const O_DIRECT: u32 = 0x4000;
 pub const O_DIRECTORY: u32 = 0x10000;
 pub const O_NOFOLLOW: u32 = 0x20000;
@@ -50,6 +52,12 @@ pub fn reportedFlags(tag: []const u8, stored: u32) u32 {
     return stored;
 }
 
+/// Descriptor kinds whose O_ASYNC is kept and acted on (Linux keeps FASYNC only where f_op->fasync exists; elsewhere F_SETFL
+/// succeeds and the bit reads back clear, measured on /dev/null and a regular file).
+pub fn keepsAsync(tag: []const u8) bool {
+    return eql(tag, "pipe_read") or eql(tag, "pipe_write");
+}
+
 fn eql(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| {
@@ -83,19 +91,36 @@ pub fn setownArg(arg: u64) ?i32 {
 
 const siginfo = @import("../proc/siginfo_policy.zig");
 const SIGIO: u32 = 29;
-const POLL_MSG: i32 = 3;
+/// The reasons kill_fasync passes, which become si_code when F_SETSIG chose a signal.
+pub const POLL_IN: i32 = 1;
+pub const POLL_OUT: i32 = 2;
+pub const POLL_MSG: i32 = 3;
 const SI_SIGIO: i32 = -5;
-/// POLLIN | POLLRDNORM | POLLMSG: the si_band of a POLL_MSG (Linux band_table).
-const POLL_MSG_BAND: u64 = 0x441;
 
-/// The signal a lease break sends through a description whose F_SETSIG is `sig`, taken through descriptor `fd` (Linux
-/// lease_break_callback → send_sigio_to_task): signal 0 is a plain SIGIO (SI_KERNEL); any other carries POLL_MSG, the band and the
-/// fd (si_band at offset 16, si_fd at 24), with SI_SIGIO in place of POLL_MSG for the signals that have their own si_codes.
-pub fn leaseBreakSignal(sig: u8, fd: u32) struct { signo: u32, info: siginfo.Info } {
+/// Linux band_table: POLL_IN → POLLIN|POLLRDNORM, POLL_OUT → POLLOUT|POLLWRNORM|POLLWRBAND, POLL_MSG → POLLIN|POLLRDNORM|POLLMSG.
+fn band(reason: i32) u64 {
+    return switch (reason) {
+        POLL_IN => 0x41,
+        POLL_OUT => 0x304,
+        POLL_MSG => 0x441,
+        else => 0,
+    };
+}
+
+/// The signal kill_fasync sends to the owner of a description whose F_SETSIG is `sig`, registered through descriptor `fd`, for
+/// `reason` (Linux send_sigio_to_task): signal 0 is a plain SIGIO (SI_KERNEL, no band, no fd); any other carries the reason as
+/// si_code, the band (si_band at offset 16) and the fd (si_fd at 24), with SI_SIGIO in place of the reason for the signals that
+/// have their own si_codes.
+pub fn sigioSignal(sig: u8, fd: u32, reason: i32) struct { signo: u32, info: siginfo.Info } {
     if (sig == 0) return .{ .signo = SIGIO, .info = .{ .code = siginfo.SI_KERNEL } };
     const own_codes = switch (sig) {
         4, 5, 7, 8, 11, 17, 31 => true, // SIGILL SIGTRAP SIGBUS SIGFPE SIGSEGV SIGCHLD SIGSYS
         else => false,
     };
-    return .{ .signo = sig, .info = .{ .code = if (own_codes) SI_SIGIO else POLL_MSG, .a = POLL_MSG_BAND, .b = fd } };
+    return .{ .signo = sig, .info = .{ .code = if (own_codes) SI_SIGIO else reason, .a = band(reason), .b = fd } };
+}
+
+/// The signal a lease break sends (Linux lease_break_callback): the POLL_MSG case of sigioSignal.
+pub fn leaseBreakSignal(sig: u8, fd: u32) @TypeOf(sigioSignal(0, 0, 0)) {
+    return sigioSignal(sig, fd, POLL_MSG);
 }
