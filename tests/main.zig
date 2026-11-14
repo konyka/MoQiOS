@@ -12222,3 +12222,94 @@ test "NOFILE allocation over several bitmap words: descriptors past 64 are hande
     // The one-word form is unchanged.
     try std.testing.expectEqual(@as(?u32, 3), P.allocationCandidate(~@as(u64, 0b111), 0, 64, 64));
 }
+
+test "lock table: flock and fcntl kinds are independent, owners do not conflict with themselves" {
+    const lt = kt.lock_table;
+    var t = lt.Table(8){};
+    try std.testing.expect(t.setFlock(1, 10, 100, true));
+    // another description of the same file conflicts; the same one converts in place
+    try std.testing.expect(t.conflict(1, .flock, 11, false, 0, lt.OFFSET_MAX) != null);
+    try std.testing.expect(t.conflict(1, .flock, 10, true, 0, lt.OFFSET_MAX) == null);
+    // a flock never blocks a POSIX lock, nor is it reported by one
+    try std.testing.expect(t.conflict(1, .posix, 11, true, 0, lt.OFFSET_MAX) == null);
+    try std.testing.expect(t.setPosix(1, 20, 200, true, 0, lt.OFFSET_MAX));
+    try std.testing.expect(t.conflict(1, .flock, 11, true, 0, lt.OFFSET_MAX) != null); // still the flock of owner 10
+    try std.testing.expect(t.dropFlock(1, 10));
+    try std.testing.expect(t.conflict(1, .flock, 11, true, 0, lt.OFFSET_MAX) == null);
+    try std.testing.expect(t.conflict(1, .posix, 21, false, 5, 5).?.pid == 200);
+    // other files are untouched
+    try std.testing.expect(t.conflict(2, .posix, 21, true, 0, lt.OFFSET_MAX) == null);
+}
+
+test "lock table: POSIX ranges merge, split, and convert per owner" {
+    const lt = kt.lock_table;
+    var t = lt.Table(8){};
+    try std.testing.expect(t.setPosix(1, 20, 200, true, 0, 99));
+    var changed = false;
+    try std.testing.expect(t.unlockPosix(1, 20, 40, 59, &changed));
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(usize, 2), t.count);
+    try std.testing.expect(t.conflict(1, .posix, 21, true, 40, 59) == null);
+    try std.testing.expect(t.conflict(1, .posix, 21, true, 39, 39) != null);
+    try std.testing.expect(t.conflict(1, .posix, 21, true, 60, 60) != null);
+    // relocking the hole merges the three pieces back into one lock
+    try std.testing.expect(t.setPosix(1, 20, 200, true, 40, 59));
+    try std.testing.expectEqual(@as(usize, 1), t.count);
+    try std.testing.expectEqual(@as(u64, 0), t.locks[0].start);
+    try std.testing.expectEqual(@as(u64, 99), t.locks[0].end);
+    // a read lock in the middle splits the write lock; readers then share only that part
+    try std.testing.expect(t.setPosix(1, 20, 200, false, 10, 19));
+    try std.testing.expectEqual(@as(usize, 3), t.count);
+    try std.testing.expect(t.conflict(1, .posix, 21, false, 10, 19) == null);
+    try std.testing.expect(t.conflict(1, .posix, 21, false, 9, 9) != null);
+    try std.testing.expect(t.conflict(1, .posix, 21, true, 15, 15).?.write == false);
+    // a second, separate range of the same owner keeps the first
+    try std.testing.expect(t.setPosix(1, 20, 200, true, 200, 209));
+    try std.testing.expect(t.conflict(1, .posix, 21, true, 0, 0) != null);
+    try std.testing.expect(t.dropOwner(1, .posix, 20));
+    try std.testing.expectEqual(@as(usize, 0), t.count);
+}
+
+test "lock table: a full table refuses without changing anything" {
+    const lt = kt.lock_table;
+    var t = lt.Table(3){};
+    try std.testing.expect(t.setPosix(1, 20, 200, true, 0, 99));
+    // the worst case needs two entries; one is left after this
+    try std.testing.expect(!t.setPosix(2, 20, 200, true, 0, 9) or t.count <= 3);
+    var u = lt.Table(1){};
+    try std.testing.expect(!u.setPosix(1, 20, 200, true, 0, 99));
+    var v = lt.Table(2){};
+    try std.testing.expect(v.setFlock(1, 1, 1, true));
+    try std.testing.expect(v.setPosix(1, 20, 200, true, 0, 99) == false);
+    try std.testing.expect(v.setFlock(2, 1, 1, true));
+    var changed = false;
+    // splitting needs one free entry; there is none
+    var w = lt.Table(1){};
+    w.locks[0] = .{ .inode = 1, .owner = 20, .pid = 200, .kind = .posix, .write = true, .start = 0, .end = 99 };
+    w.count = 1;
+    try std.testing.expect(!w.unlockPosix(1, 20, 40, 59, &changed));
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(@as(u64, 99), w.locks[0].end);
+}
+
+test "lock table: struct flock ranges" {
+    const lt = kt.lock_table;
+    try std.testing.expectEqual(lt.Range{ .start = 5, .end = lt.OFFSET_MAX }, try lt.rangeOf(0, 5, 0));
+    try std.testing.expectEqual(lt.Range{ .start = 5, .end = 14 }, try lt.rangeOf(0, 5, 10));
+    try std.testing.expectEqual(lt.Range{ .start = 0, .end = 4 }, try lt.rangeOf(0, 5, -5));
+    // SEEK_CUR / SEEK_END: the start is relative to the base
+    try std.testing.expectEqual(lt.Range{ .start = 95, .end = 99 }, try lt.rangeOf(100, -5, 5));
+    try std.testing.expectError(error.Invalid, lt.rangeOf(0, 5, -6));
+    try std.testing.expectError(error.Invalid, lt.rangeOf(0, -1, 3));
+    try std.testing.expectError(error.Invalid, lt.rangeOf(10, -11, 1));
+    // the last byte of a positive length must not pass OFFSET_MAX (Linux: EOVERFLOW)
+    try std.testing.expectEqual(lt.Range{ .start = 0, .end = lt.OFFSET_MAX - 1 }, try lt.rangeOf(0, 0, std.math.maxInt(i64)));
+    try std.testing.expectEqual(lt.Range{ .start = 1, .end = lt.OFFSET_MAX }, try lt.rangeOf(0, 1, std.math.maxInt(i64)));
+    try std.testing.expectError(error.Overflow, lt.rangeOf(0, 2, std.math.maxInt(i64)));
+    try std.testing.expectError(error.Overflow, lt.rangeOf(10, std.math.maxInt(i64) - 5, 0));
+    const l = lt.Lock{ .inode = 1, .owner = 1, .pid = 1, .kind = .posix, .write = true, .start = 20, .end = 29 };
+    try std.testing.expectEqual(@as(i64, 10), lt.lengthOf(&l));
+    const m = lt.Lock{ .inode = 1, .owner = 1, .pid = 1, .kind = .posix, .write = true, .start = 20 };
+    try std.testing.expectEqual(@as(i64, 0), lt.lengthOf(&m));
+}
+

@@ -139,6 +139,7 @@ pub const namespace_policy = @import("fs/namespace_policy.zig");
 pub const fd_seek_policy = @import("fs/fd_seek_policy.zig");
 pub const writeback_overlap = @import("fs/writeback_overlap.zig");
 pub const shared_offset = @import("fs/shared_offset.zig");
+pub const lock_table = @import("fs/lock_table.zig");
 pub const sched_claim = @import("proc/sched_claim.zig");
 pub const sched_queue_policy = @import("proc/sched_queue_policy.zig");
 pub const sched_getaffinity_policy = @import("proc/sched_getaffinity_policy.zig");

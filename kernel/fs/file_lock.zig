@@ -1,14 +1,18 @@
-/// File locking — flock() and fcntl() byte-range locks.
+/// File locking — flock() and fcntl() record locks.
 ///
-/// Implementation:
-///   - Static table of 64 active locks
-///   - A blocked flock/F_SETLKW parks the task (sleep_bm) and is woken when a
-///     conflicting lock is released, or by the scheduler tick within 10 ms
-///   - inode_id identifies the underlying file across different fds
+/// The table itself is lock_table.zig. Here each lock gets its file and its owner:
+///   - the file is lockKey(), the same for every open of one file;
+///   - a flock is owned by the open file description: its shared-offset slot (a descriptor is moved to a shared slot when it
+///     takes a flock, so a later dup/fork keeps the owner), or the descriptor itself for kinds without a byte offset;
+///   - an fcntl lock is owned by the descriptor table (Linux: current->files), so every thread sharing the table shares it.
+/// Releasing (vfs.releaseOpenFile): any close drops the table's fcntl locks on that file; the last close of an open file
+/// description drops its flock. A blocked flock/F_SETLKW parks the task (sleep_bm) and is woken when a lock is released, or by
+/// the scheduler tick within 10 ms.
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const vfs = @import("vfs.zig");
 const task_mod = @import("../proc/task.zig");
 const bo = @import("../lib/byte_order.zig");
+const lt = @import("lock_table.zig");
 
 // flock() operation bits
 pub const LOCK_SH = 1; // shared lock
@@ -21,17 +25,14 @@ pub const F_RDLCK = 0;
 pub const F_WRLCK = 1;
 pub const F_UNLCK = 2;
 
-const FileLock = struct {
-    active: bool,
-    inode: u64, // file identifier
-    lock_type: u8, // LOCK_SH or LOCK_EX
-    owner_pid: u16,
-    start: u64,
-    len: u64,
-};
+const EBADF: i64 = -9;
+const EAGAIN: i64 = -11;
+const EFAULT: i64 = -14;
+const EINVAL: i64 = -22;
+const ENOLCK: i64 = -37;
+const EOVERFLOW: i64 = -75;
 
-var locks: [64]FileLock = undefined;
-var lock_count: u32 = 0;
+var table: lt.Table(128) = .{};
 var fl_lock: IrqSpinlock = .{};
 /// Tasks parked in a blocking flock/F_SETLKW, by task index. Releasing a lock
 /// unblocks them; the scheduler tick does too, so a missed wake still ends.
@@ -40,30 +41,22 @@ var lock_waiter_bm: u64 = 0;
 /// How long a blocked lock sleeps before it looks again: one scheduler tick.
 const LOCK_POLL_NS: u64 = 10_000_000;
 
-/// The file a lock is keyed by: the same identity O_APPEND uses, so two opens
-/// of one file share a key and two files never do. tmpfs descriptors carry no
-/// inode_id (every one would be 0), and every new empty FAT32 file has first
-/// cluster 0, so neither can be told apart by inode_id. Null for a descriptor
-/// that cannot be locked.
+/// The file a lock is keyed by: two opens of one file share a key and two files never do. tmpfs descriptors carry no inode_id,
+/// and a FAT32 file is keyed by its open slot rather than its first cluster: a file that is empty on disk has no cluster (every
+/// such file would share key 0) and gets one on its first write (the key would change under a held lock). The slot is stable
+/// while any descriptor of the file is open, and a lock only lives that long. Null for a descriptor that cannot be locked.
 pub fn lockKey(desc: *const vfs.FileDescriptor) ?u64 {
-    if (desc.fd_type == .none) return null;
     return switch (desc.fd_type) {
+        .none => null,
         .tmpfs_file => 0x1000_0000_0000_0000 + @as(u64, desc.tmpfs_idx),
-        .fat32_file => 0x2000_0000_0000_0000 + @as(u64, @import("fat32.zig").getFirstCluster(desc.fat32_file_idx)),
+        .fat32_file => 0x2800_0000_0000_0000 + @as(u64, desc.fat32_file_idx),
         else => if (desc.inode_id == 0) null else desc.inode_id,
     };
 }
 
-fn getInodeForFd(fd_table: *vfs.FdTable, fd: u32) ?u64 {
-    if (fd >= vfs.MAX_FDS) return null;
-    return lockKey(&fd_table.fds[fd]);
-}
-
-/// The process a lock belongs to: flock and fcntl locks are per process, so
-/// every thread of one process shares them (getpid()'s id).
-fn lockOwner(t: *task_mod.Task) u16 {
-    const pid: u32 = if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid;
-    return @truncate(pid);
+/// The process id a lock reports through F_GETLK (getpid()'s id: the thread group leader).
+fn reportedPid(t: *task_mod.Task) u32 {
+    return if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid;
 }
 
 /// Park until a conflicting lock is released, or a signal arrives. A bare
@@ -87,7 +80,7 @@ fn sleepForLock(t: *task_mod.Task, cur_idx: u32) void {
 }
 
 /// Wake every task parked in a blocking lock. Called after a lock is released.
-fn wakeLockWaiters() void {
+pub fn wakeLockWaiters() void {
     var bm = @atomicLoad(u64, &lock_waiter_bm, .acquire);
     while (bm != 0) {
         const i: u6 = @intCast(@ctz(bm));
@@ -96,71 +89,29 @@ fn wakeLockWaiters() void {
     }
 }
 
-/// Drop every lock this process holds on `inode` (fl_lock held).
-fn dropOwned(inode: u64, owner: u16) void {
-    var i: u32 = 0;
-    while (i < lock_count) {
-        if (locks[i].active and locks[i].inode == inode and locks[i].owner_pid == owner) {
-            locks[i].active = false;
-            var j = i;
-            while (j + 1 < lock_count) : (j += 1) {
-                locks[j] = locks[j + 1];
-            }
-            lock_count -= 1;
-            continue;
-        }
-        i += 1;
-    }
+/// A conflict was found and the caller may wait: die on a fatal signal, report EINTR for a caught one, else sleep. Null means
+/// "look again".
+fn waitOrInterrupt(t: *task_mod.Task, cur_idx: u32) ?i64 {
+    const sig_mod = @import("../proc/signal.zig");
+    if (sig_mod.pendingFatal(t)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+    if (sig_mod.pendingActionable(t)) return -4; // EINTR
+    sleepForLock(t, cur_idx);
+    return null;
 }
 
-/// Drop every flock() lock on `inode`, whoever holds it. flock is tied to the
-/// open file description, so the last close of it releases the lock even while
-/// the process is still alive. fcntl locks stay: they belong to the process
-/// and are released when it exits (releaseProcess).
-pub fn releaseFlock(inode: u64) void {
+/// A descriptor of file `key` is closing (vfs.releaseOpenFile): drop the fcntl locks of `posix_owner` on the file, give back
+/// the descriptor's share of offset slot `slot` with `release_slot`, and when that was the last share drop the flock of
+/// `ofd_owner`. The slot is released under fl_lock: the slot number is the flock owner, and a new description that got the
+/// freed slot first could otherwise lose its own flock here.
+pub fn releaseOnClose(key: ?u64, posix_owner: ?u64, ofd_owner: ?u64, slot: u16, release_slot: *const fn (u16) bool) void {
     const flags = fl_lock.acquire();
-    var i: u32 = 0;
+    const last = release_slot(slot);
     var dropped = false;
-    while (i < lock_count) {
-        if (locks[i].active and locks[i].inode == inode and locks[i].len == 0 and locks[i].start == 0 and locks[i].lock_type != 0) {
-            // flock locks cover the whole file (start 0, len 0), and so does an
-            // fcntl lock of the whole file — those two are not told apart here,
-            // so a whole-file fcntl lock is released by the last close too.
-            locks[i].active = false;
-            var j = i;
-            while (j + 1 < lock_count) : (j += 1) {
-                locks[j] = locks[j + 1];
-            }
-            lock_count -= 1;
-            dropped = true;
-            continue;
-        }
-        i += 1;
-    }
-    fl_lock.release(flags);
-    if (dropped) wakeLockWaiters();
-}
-
-/// Drop every fcntl lock held by a process that has just exited. flock locks
-/// already went with the last close of their open file description, which the
-/// exit path runs before this.
-pub fn releaseProcess(pid: u32) void {
-    const owner: u16 = @truncate(pid);
-    const flags = fl_lock.acquire();
-    var i: u32 = 0;
-    var dropped = false;
-    while (i < lock_count) {
-        if (locks[i].active and locks[i].owner_pid == owner) {
-            locks[i].active = false;
-            var j = i;
-            while (j + 1 < lock_count) : (j += 1) {
-                locks[j] = locks[j + 1];
-            }
-            lock_count -= 1;
-            dropped = true;
-            continue;
-        }
-        i += 1;
+    if (key) |k| {
+        if (posix_owner) |po| dropped = table.dropOwner(k, .posix, po) or dropped;
+        if (last) if (ofd_owner) |o| {
+            dropped = table.dropFlock(k, o) or dropped;
+        };
     }
     fl_lock.release(flags);
     if (dropped) wakeLockWaiters();
@@ -171,91 +122,70 @@ pub fn sysFlock(fd: u64, operation: u64) i64 {
     const sched_mod = @import("../proc/sched.zig");
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
-    const fd_u: u32 = @truncate(fd);
-    const op: u8 = @truncate(operation);
-
-    const inode = getInodeForFd(t.fd_table, fd_u) orelse return -9; // EBADF
+    if (fd >= vfs.MAX_FDS) return EBADF;
+    const fd_u: u32 = @intCast(fd);
+    const op: u32 = @truncate(operation);
     const is_nb = (op & LOCK_NB) != 0;
-    const lock_type = op & (LOCK_SH | LOCK_EX | LOCK_UN);
-    const owner = lockOwner(t);
-
-    // LOCK_UN: release all locks held by this process on this inode
-    if (lock_type == LOCK_UN) {
-        const flags = fl_lock.acquire();
-        dropOwned(inode, owner);
-        fl_lock.release(flags);
-        wakeLockWaiters();
-        return 0;
-    }
+    const what = op & ~@as(u32, LOCK_NB);
+    if (what != LOCK_SH and what != LOCK_EX and what != LOCK_UN) return EINVAL;
+    const fdt = t.fd_table;
 
     while (true) {
+        // The hold keeps the descriptor (and so its open file description) from being torn down while the lock is set: a close
+        // that races in finishes when the hold goes, and drops the lock taken here.
+        if (!fdt.acquireTransferFd(fd_u)) return EBADF;
+        const key = lockKey(&fdt.fds[fd_u]) orelse {
+            fdt.releaseTransferFd(fd_u);
+            return EBADF;
+        };
+        const owner = vfs.flockOwner(fdt, fd_u) orelse {
+            fdt.releaseTransferFd(fd_u);
+            return ENOLCK;
+        };
         const flags = fl_lock.acquire();
-
-        // Check for conflicts with other owners
-        var has_conflict = false;
-        for (0..lock_count) |i| {
-            if (!locks[i].active) continue;
-            if (locks[i].inode != inode) continue;
-            if (locks[i].owner_pid == owner) continue;
-
-            if (lock_type == LOCK_EX) {
-                has_conflict = true;
-                break;
-            } else if (lock_type == LOCK_SH) {
-                if (locks[i].lock_type == LOCK_EX) {
-                    has_conflict = true;
-                    break;
-                }
-            }
-        }
-
-        if (has_conflict) {
+        if (what == LOCK_UN) {
+            const dropped = table.dropFlock(key, owner);
             fl_lock.release(flags);
-            if (is_nb) return -11; // EAGAIN for non-blocking
-            // Signal kick (sendSignal unblocks/yields us): die on a fatal
-            // signal via the same exit-by-signal path the timer tick uses,
-            // or report EINTR so the handler can run on return. This wait
-            // links no wait node, so there is nothing to unlink.
-            const sig_mod = @import("../proc/signal.zig");
-            if (sig_mod.pendingFatal(t)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
-            if (sig_mod.pendingActionable(t)) return -4; // -EINTR
-            sleepForLock(t, cur_idx);
-            continue;
-        }
-
-        // Upgrade/downgrade or add new lock for this owner
-        var found_existing = false;
-        for (0..lock_count) |i| {
-            if (locks[i].active and locks[i].inode == inode and locks[i].owner_pid == owner) {
-                locks[i].lock_type = lock_type;
-                locks[i].start = 0;
-                locks[i].len = 0;
-                found_existing = true;
-                break;
-            }
-        }
-        if (found_existing) {
-            fl_lock.release(flags);
+            fdt.releaseTransferFd(fd_u);
+            if (dropped) wakeLockWaiters();
             return 0;
         }
-
-        // Add new lock
-        if (lock_count >= locks.len) {
+        const write = what == LOCK_EX;
+        if (table.conflict(key, .flock, owner, write, 0, lt.OFFSET_MAX) == null) {
+            const ok = table.setFlock(key, owner, reportedPid(t), write);
             fl_lock.release(flags);
-            return -11; // EAGAIN
+            fdt.releaseTransferFd(fd_u);
+            return if (ok) 0 else ENOLCK;
         }
-        locks[lock_count] = .{
-            .active = true,
-            .inode = inode,
-            .lock_type = lock_type,
-            .owner_pid = owner,
-            .start = 0,
-            .len = 0,
-        };
-        lock_count += 1;
         fl_lock.release(flags);
-        return 0;
+        fdt.releaseTransferFd(fd_u);
+        if (is_nb) return EAGAIN;
+        if (waitOrInterrupt(t, cur_idx)) |r| return r;
     }
+}
+
+/// struct flock (x86_64, 32 bytes): l_type@0 l_whence@2 l_start@8 l_len@16 l_pid@24.
+fn writeBack(flock_ptr: u64, kbuf: *[32]u8, l_type: u8, l: ?lt.Lock) i64 {
+    var out: [32]u8 = kbuf.*;
+    bo.writeU16Le(out[0..2], l_type);
+    if (l) |lk| {
+        bo.writeU16Le(out[2..4], 0); // SEEK_SET
+        bo.writeU64Le(out[8..16], lk.start);
+        bo.writeU64Le(out[16..24], @bitCast(lt.lengthOf(&lk)));
+        bo.writeU32Le(out[24..28], lk.pid);
+    }
+    const copy = @import("../mm/copy_from_user.zig");
+    return if (copy.copyToUser(@ptrFromInt(flock_ptr), out[0..32], 32) == 32) 0 else EFAULT;
+}
+
+/// The size SEEK_END of an fcntl lock is relative to.
+fn fileSize(desc: *vfs.FileDescriptor) u64 {
+    return switch (desc.fd_type) {
+        .tmpfs_file => @import("tmpfs.zig").tmpfsGetSize(@intCast(desc.tmpfs_idx)),
+        .fat32_file => @import("fat32.zig").currentSize(desc.fat32_file_idx),
+        .ext2_file => @import("ext2.zig").currentSize(desc.ext2_file_idx),
+        else => desc.file_size,
+    };
 }
 
 /// fcntl F_SETLK / F_SETLKW / F_GETLK (byte-range locks)
@@ -266,134 +196,73 @@ pub fn setLock(fd: u64, cmd: u64, flock_ptr: u64) i64 {
     const sched_mod = @import("../proc/sched.zig");
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
-    const fd_u: u32 = @truncate(fd);
 
     // A bad pointer is EFAULT even for a descriptor that cannot be locked (a pipe, for instance): Linux checks the struct before it looks at the file.
-    if (flock_ptr == 0 or flock_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT
+    if (flock_ptr == 0 or flock_ptr >= 0x0000_8000_0000_0000) return EFAULT;
     const copy = @import("../mm/copy_from_user.zig");
     var kbuf: [32]u8 = undefined;
     const copied = copy.copyFromUser(kbuf[0..], @ptrFromInt(flock_ptr), 32);
-    if (copied < 28) return -14;
+    if (copied < 28) return EFAULT;
 
-    const inode = getInodeForFd(t.fd_table, fd_u) orelse return -9; // EBADF
-
+    if (fd >= vfs.MAX_FDS) return EBADF;
+    const fd_u: u32 = @intCast(fd);
     const l_type: i16 = @bitCast(bo.readU16Le(kbuf[0..2]));
-    _ = @as(i16, @bitCast(bo.readU16Le(kbuf[2..4]))); // l_whence
-    const l_start: u64 = bo.readU64At(&kbuf, 8);
-    const l_len: u64 = bo.readU64At(&kbuf, 16);
-
-    const is_nb = (cmd != 7); // F_SETLKW = 7 is blocking
-    const owner = lockOwner(t);
-
-    // F_GETLK: check for conflicting lock (no retry needed)
-    if (cmd == 5) {
-        const flags = fl_lock.acquire();
-        defer fl_lock.release(flags);
-        for (0..lock_count) |i| {
-            if (!locks[i].active) continue;
-            if (locks[i].inode != inode) continue;
-            if (locks[i].owner_pid == owner) continue;
-
-            const range_overlap = (l_len == 0 or locks[i].len == 0 or
-                (locks[i].start < l_start + l_len and locks[i].start + locks[i].len > l_start));
-            if (!range_overlap) continue;
-
-            var outbuf: [32]u8 = undefined;
-            @memcpy(outbuf[0..32], kbuf[0..32]);
-            outbuf[0] = locks[i].lock_type;
-            outbuf[1] = 0;
-            const pid_u16 = locks[i].owner_pid;
-            outbuf[24] = @truncate(pid_u16);
-            outbuf[25] = @truncate(pid_u16 >> 8);
-            outbuf[26] = 0;
-            outbuf[27] = 0;
-            const copy_to = @import("../mm/copy_from_user.zig");
-            return if (copy_to.copyToUser(@ptrFromInt(flock_ptr), outbuf[0..32], 32) == 32) 0 else -14;
-        }
-        var outbuf: [32]u8 = undefined;
-        @memcpy(outbuf[0..32], kbuf[0..32]);
-        outbuf[0] = F_UNLCK;
-        outbuf[1] = 0;
-        const copy_to = @import("../mm/copy_from_user.zig");
-        return if (copy_to.copyToUser(@ptrFromInt(flock_ptr), outbuf[0..32], 32) == 32) 0 else -14;
-    }
-
-    // F_SETLK / F_SETLKW: set or clear a byte-range lock
-    // F_UNLCK: release (no retry needed)
-    if (l_type == F_UNLCK) {
-        const flags = fl_lock.acquire();
-        dropOwned(inode, owner);
-        fl_lock.release(flags);
-        wakeLockWaiters();
-        return 0;
-    }
-
-    const req_lock_type: u8 = if (l_type == F_WRLCK) LOCK_EX else LOCK_SH;
+    const l_whence: i16 = @bitCast(bo.readU16Le(kbuf[2..4]));
+    const l_start: i64 = @bitCast(bo.readU64At(&kbuf, 8));
+    const l_len: i64 = @bitCast(bo.readU64At(&kbuf, 16));
+    if (l_type != F_RDLCK and l_type != F_WRLCK and l_type != F_UNLCK) return EINVAL;
+    if (l_whence < 0 or l_whence > 2) return EINVAL;
+    const fdt = t.fd_table;
+    const owner = vfs.posixLockOwner(fdt);
 
     while (true) {
+        if (!fdt.acquireTransferFd(fd_u)) return EBADF;
+        const desc = &fdt.fds[fd_u];
+        const key = lockKey(desc) orelse {
+            fdt.releaseTransferFd(fd_u);
+            return EBADF;
+        };
+        const base: i64 = switch (l_whence) {
+            1 => @bitCast(vfs.offsetOf(desc)),
+            2 => @bitCast(fileSize(desc)),
+            else => 0,
+        };
+        const range = lt.rangeOf(base, l_start, l_len) catch |e| {
+            fdt.releaseTransferFd(fd_u);
+            return if (e == error.Overflow) EOVERFLOW else EINVAL;
+        };
+        const write = l_type == F_WRLCK;
         const flags = fl_lock.acquire();
 
-        // Check for conflicts with other owners
-        var has_conflict = false;
-        for (0..lock_count) |i| {
-            if (!locks[i].active) continue;
-            if (locks[i].inode != inode) continue;
-            if (locks[i].owner_pid == owner) continue;
-
-            const range_overlap = (l_len == 0 or locks[i].len == 0 or
-                (locks[i].start < l_start + l_len and locks[i].start + locks[i].len > l_start));
-            if (!range_overlap) continue;
-
-            if (req_lock_type == LOCK_EX or locks[i].lock_type == LOCK_EX) {
-                has_conflict = true;
-                break;
-            }
-        }
-
-        if (has_conflict) {
+        if (cmd == 5) { // F_GETLK
+            const hit = if (l_type == F_UNLCK) null else table.conflict(key, .posix, owner, write, range.start, range.end);
             fl_lock.release(flags);
-            if (is_nb) return -11; // EAGAIN for non-blocking
-            // Signal kick (sendSignal unblocks/yields us): die on a fatal
-            // signal via the same exit-by-signal path the timer tick uses,
-            // or report EINTR so the handler can run on return. This wait
-            // links no wait node, so there is nothing to unlink.
-            const sig_mod = @import("../proc/signal.zig");
-            if (sig_mod.pendingFatal(t)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
-            if (sig_mod.pendingActionable(t)) return -4; // -EINTR
-            sleepForLock(t, cur_idx);
-            continue;
+            fdt.releaseTransferFd(fd_u);
+            if (l_type == F_UNLCK) return EINVAL;
+            if (hit) |h| return writeBack(flock_ptr, &kbuf, if (h.write) F_WRLCK else F_RDLCK, h);
+            return writeBack(flock_ptr, &kbuf, F_UNLCK, null);
         }
 
-        // Update existing lock or add new one for this owner
-        var found = false;
-        for (0..lock_count) |i| {
-            if (locks[i].active and locks[i].inode == inode and locks[i].owner_pid == owner) {
-                locks[i].lock_type = req_lock_type;
-                locks[i].start = l_start;
-                locks[i].len = l_len;
-                found = true;
-                break;
-            }
-        }
-        if (found) {
+        if (l_type == F_UNLCK) {
+            var changed = false;
+            const ok = table.unlockPosix(key, owner, range.start, range.end, &changed);
             fl_lock.release(flags);
-            return 0;
+            fdt.releaseTransferFd(fd_u);
+            if (changed) wakeLockWaiters();
+            return if (ok) 0 else ENOLCK;
         }
 
-        if (lock_count >= locks.len) {
+        if (table.conflict(key, .posix, owner, write, range.start, range.end) == null) {
+            const ok = table.setPosix(key, owner, reportedPid(t), write, range.start, range.end);
             fl_lock.release(flags);
-            return -11;
+            fdt.releaseTransferFd(fd_u);
+            // Turning a write lock into a read lock can let readers in.
+            if (ok) wakeLockWaiters();
+            return if (ok) 0 else ENOLCK;
         }
-        locks[lock_count] = .{
-            .active = true,
-            .inode = inode,
-            .lock_type = req_lock_type,
-            .owner_pid = owner,
-            .start = l_start,
-            .len = l_len,
-        };
-        lock_count += 1;
         fl_lock.release(flags);
-        return 0;
+        fdt.releaseTransferFd(fd_u);
+        if (cmd != 7) return EAGAIN;
+        if (waitOrInterrupt(t, cur_idx)) |r| return r;
     }
 }

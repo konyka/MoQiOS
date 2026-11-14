@@ -808,6 +808,45 @@ pub fn setOffsetOf(desc: *FileDescriptor, v: u64) void {
     syncOffsetOut(desc);
 }
 
+/// The owner of fcntl record locks taken through `table`: Linux ties them to current->files, so threads sharing a table share
+/// them and a forked child (a new table) does not inherit them. The allocation generation keeps a reused pool slot distinct.
+pub fn posixLockOwner(table: *const FdTable) u64 {
+    return (tableGeneration(table) << 8) | @as(u64, @intCast(tableSlot(table)));
+}
+
+/// The owner of a flock taken through `fd`: its open file description. A descriptor with a byte offset is given a shared offset
+/// slot (one holder) so the dup()/fork() copies made later carry the same owner; the slot lives as long as the description.
+/// Other kinds have no description object here and own the lock per descriptor. Null when the offset pool is full.
+pub fn flockOwner(table: *FdTable, fd: u32) ?u64 {
+    const desc = &table.fds[fd];
+    if (!usesSharedOffset(desc.fd_type)) return privateFlockOwner(table, fd);
+    const f = shared_offsets_lock.acquire();
+    defer shared_offsets_lock.release(f);
+    if (desc.offset_slot == 0) {
+        const slot = shared_offsets.promote(desc.offset) orelse return null;
+        shared_offsets.setFlags(slot, desc.status_flags);
+        desc.offset_slot = slot;
+    }
+    return 0x4000_0000_0000_0000 | @as(u64, desc.offset_slot);
+}
+
+fn privateFlockOwner(table: *const FdTable, fd: u32) u64 {
+    return 0x2000_0000_0000_0000 | (posixLockOwner(table) << 16) | fd;
+}
+
+/// A descriptor of `table` (null: one that was never installed) is going away: drop the table's fcntl locks on its file, give
+/// back its share of the open file description, and drop the description's flock when that was the last share. One step under
+/// the lock table's lock, so a freed offset slot cannot be handed to a new description before its old flock is gone.
+fn releaseOpenFile(table: ?*FdTable, fd: u32, desc: *const FileDescriptor) void {
+    const fl = @import("file_lock.zig");
+    const key = fl.lockKey(desc);
+    const posix_owner: ?u64 = if (table) |t| posixLockOwner(t) else null;
+    const ofd_owner: ?u64 = if (desc.offset_slot != 0)
+        0x4000_0000_0000_0000 | @as(u64, desc.offset_slot)
+    else if (table) |t| privateFlockOwner(t, fd) else null;
+    fl.releaseOnClose(key, posix_owner, ofd_owner, desc.offset_slot, releaseOffsetSlot);
+}
+
 /// Drop one holder of a shared open-file offset. True when that was the last
 /// holder, so the open file description itself is gone.
 fn releaseOffsetSlot(slot: u16) bool {
@@ -2304,12 +2343,9 @@ pub const FdTable = struct {
         const flags = self.slot_locks[fd].acquire();
         var desc = self.fds[fd];
         const fd_generation = self.fd_generations[fd];
-        // This descriptor stops holding its shared offset (the slot is reusable
-        // once every holder is gone). A private offset, or the last holder of a
-        // shared one, is the end of that open file description, so its flock
-        // goes with it; fcntl locks are released by the process instead.
-        const last_ofd = releaseOffsetSlot(desc.offset_slot);
-        if (last_ofd) if (@import("file_lock.zig").lockKey(&desc)) |key| @import("file_lock.zig").releaseFlock(key);
+        // Any close drops this table's fcntl locks on the file; the last holder
+        // of the open file description also takes its flock with it.
+        releaseOpenFile(self, fd, &desc);
         // Elect the owner while this slot is still CLOSING. CLEANING is an
         // owner marker, not another live reference: a peer that closes after
         // this decision must drop its slot rather than skip teardown too.
@@ -2776,7 +2812,7 @@ fn releaseResource(desc: *const FileDescriptor) void {
 /// socket closed, or the receiver had no room): give back everything it held.
 pub fn releaseDescriptor(desc: *const FileDescriptor) void {
     releaseResource(desc);
-    if (releaseOffsetSlot(desc.offset_slot)) if (@import("file_lock.zig").lockKey(desc)) |key| @import("file_lock.zig").releaseFlock(key);
+    releaseOpenFile(null, 0, desc);
 }
 
 /// Copy of `table.fds[fd]` for passing to another process, holding its own

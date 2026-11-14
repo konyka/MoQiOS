@@ -8075,8 +8075,8 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - `flock` 随打开文件描述走：`finishClose` 和 `releaseDescriptor` 在释放共享偏移时，如果这是最后一个持有者，就调 `releaseFlock`。`fcntl` 锁随进程走：`exitTask` 在进程向父进程报告退出时调 `releaseProcess`，`abortUnpublishedChild` 也按 pid 释放（未运行的子进程没有锁，是空操作）。
 - 绿灯：目标机定向 SMP=2 一份 hello290 六项全部通过（日志开头 `spawned hello2`、`spawned hello290`）：阻塞的 `flock` 等了 311 ms、CPU 时间 4 ms，`F_SETLKW` 等了 310 ms、CPU 时间 5 ms；退出、关闭、被 `SIGKILL` 后锁都消失；两个 `/tmp` 文件互不干扰。
 - 如实的局限：
-  1. `flock` 锁和覆盖整个文件的 `fcntl` 锁在表里长得一样（`start` 0、`len` 0），`releaseFlock` 分不出两者，所以整文件的 `fcntl` 锁也会在最后一次 `close` 时释放。部分范围的 `fcntl` 锁不受影响。
-  2. 空的 FAT32 文件首簇都是 0，它们的锁标识相同，会互相冲突；文件写过之后首簇才不同。tmpfs 不受影响。
+  1. `flock` 锁和覆盖整个文件的 `fcntl` 锁在表里长得一样（`start` 0、`len` 0），`releaseFlock` 分不出两者，所以整文件的 `fcntl` 锁也会在最后一次 `close` 时释放。部分范围的 `fcntl` 锁不受影响。（hello310 已修：两类锁分属不同属主，互不影响）
+  2. 空的 FAT32 文件首簇都是 0，它们的锁标识相同，会互相冲突；文件写过之后首簇才不同。tmpfs 不受影响。（hello310 已修：FAT32 改用打开槽位作锁键）
   3. 等待仍是每 10 ms 醒来重查一次，不是纯事件驱动；释放方会主动唤醒，所以通常不用等满这 10 ms。
   4. `devfs_nodes.mouseRead` 仍是最多 100 次的忙让出，没有改。
   5. 共享打开文件描述的判定用的是共享偏移槽：描述符还没被 `dup`/`fork` 过时偏移是私有的，关闭它就算最后一次，符合 `flock` 的语义；偏移池满了退回私有偏移时，两个描述符会被当成各自独立的打开文件描述。
@@ -8511,3 +8511,34 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 这不是 Linux 的 `self_exec_id` 本身（那个计数还用于判断父进程 exec 后 `SIGCHLD`/`pdeath_signal` 是否还该发）；只覆盖了定时器和 `mq_notify` 这两个开放项。
   2. `timerfd`、`alarm`/`setitimer(ITIMER_REAL)` 在 Linux 上 exec 后保留（前者是描述符，后者按 POSIX 继承），本节没有改动它们。
 - CI 记录（如实）：上一个纯文档提交 `4991801` 的 CI 在 SMP=2 冒烟里 1500 秒超时。失败步骤打印的串口尾部显示最后启动的是 hello21（ext2 写入测试，init 里倒数第一个），停在 `hello21: create=3` 之后，`write=` 没有出现，没有 panic；完成的探针数是 468（本地完整 smoke 是 469）。同样代码的 `0365e24` CI 两个冒烟都通过，本地这次四份 smoke 的 hello21 都通过。CI 没有保留完整串口日志和寄存器转储，卡在哪个块设备、哪一行无法确认；文档前面记录过停在下一次落盘处的 NVMe 中断等待竞态（已修），这次是否同类没有证据。记为新的偶发项：hello21 在 CI SMP=2 上写盘时卡住，根因未查清。
+
+
+## `flock` 与 `fcntl` 记录锁不分属主，别的进程关闭文件会释放别人的锁（hello310，已修）
+
+- 起因：hello290 一节的局限 1、2。重读 `file_lock.zig` 后发现问题比那两条更大：
+  1. 锁的属主只是 pid，`releaseFlock` 在任何一个打开文件描述最后关闭时，删掉这个文件上所有人的整文件锁。所以别的进程打开再关闭同一个文件，就会释放别人持有的 `flock` 和整文件 `fcntl` 锁。
+  2. 同一进程两次 `open` 得到的两个描述也算同一属主，第二次 `flock` 不冲突。
+  3. `flock` 和 `fcntl` 锁在同一张表里互相冲突。
+  4. 每个进程每个文件只有一条记录，第二段区间锁覆盖第一段，解锁不能拆分区间。
+  5. `F_GETLK` 把内部的 `LOCK_SH`/`LOCK_EX`（1/2）当作 `l_type` 写回，写锁被报告成 `F_UNLCK`，`l_start`/`l_len` 不写回。
+  6. 关闭同一文件的其他描述符不释放本进程的部分区间 `fcntl` 锁。
+  7. `l_whence` 被忽略。
+- Linux 依据：`3rd/linux-7.0.6/fs/locks.c`。`flock_lock_inode` 按 `flc_file`（打开文件描述）判属主；`posix_lock_inode` 按 `flc_owner = current->files` 判属主，合并相邻同类区间并拆分异类区间；`locks_remove_posix` 在每次 `close` 时运行；`flock64_to_posix_lock`（510 行）处理 `l_whence`，越过 `OFFSET_MAX` 返回 `EOVERFLOW`，起点为负返回 `EINVAL`；两类锁在不同链表上，互不冲突。
+- 宿主机实测：hello310（`gcc -DHOST`）A–L 十二项全过，`taskset -c 0` 下同样通过。I 段：写锁报告为 `F_WRLCK`，读锁报告为 `F_RDLCK`，pid 是持有者。
+- 红灯：未修改的内核上定向 SMP=2（日志开头 `spawned hello2`、`spawned hello310`）：A、B 探测进程拿到了锁（0，应为 -11）；C 第二次 `open` 拿到了 `flock`；E 关闭另一个描述符后区间锁还在；F `flock` 挡住了 `fcntl`；I 报告类型 2、pid 0；J 第二段覆盖了第一段；L 解锁中段后整段都没了。D、G、H、K 通过（K 在这个镜像上恰好没撞首簇 0，见局限）。
+- 实现：
+  - 新增 `kernel/fs/lock_table.zig`（纯模块，`tests/main.zig` 四个宿主机单测）：两类锁同表、按 `kind` 分开判冲突；POSIX 区间合并、拆分、读写转换；表满时整体拒绝不做半截修改（`ENOLCK`）；`rangeOf` 按 Linux 的换算规则。
+  - `kernel/fs/file_lock.zig` 改为用这个表。`flock` 的属主是打开文件描述：带字节偏移的描述符第一次加锁时提升到共享偏移槽（`vfs.flockOwner`），之后 `dup`/`fork` 的副本带同一个槽；没有偏移的类型按描述符本身。`fcntl` 锁的属主是描述符表（`vfs.posixLockOwner`，槽位加分配代数，表被复用时不会继承旧锁）。加锁期间用 `acquireTransferFd` 持住描述符，并发的 `close` 要等这次加锁结束，再把锁释放掉。
+  - `vfs.releaseOpenFile`：关闭时释放本表在该文件上的 `fcntl` 锁；如果是打开文件描述的最后一个持有者，再释放它的 `flock`。共享偏移槽在锁表锁内释放，避免槽位刚空出来就被新描述拿去、新描述的 `flock` 被这里误删。
+  - 退出路径不再单独调 `releaseProcess`：进程退出时关闭全部描述符，锁随之释放。
+  - FAT32 的锁键改为打开槽位 `fat32_file_idx`，不再用首簇：空文件首簇为 0 会互相冲突，首次写入分配首簇后锁键还会变。槽位在有描述符打开期间不变，锁也只活这么久。
+- 绿灯：目标机定向 SMP=2 两份、SMP=4 一份 hello310 十二项全过；后两份同时跑了 hello290，也 PASS（日志开头 `spawned hello2`、`spawned hello310`、`spawned hello290`）。`zig build`、`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒）全部 `EXIT=0`、0 FAIL，hello228 corrupted canaries 都是 0；四份里 hello310、hello290 都 PASS，hello187（`fcntl` 锁的 EFAULT 检查）也通过。`zig build -Darch=riscv64 smoke-riscv`、`zig build -Darch=aarch64 smoke-aarch64` 通过。
+- 如实的局限：
+  1. 没有死锁检测：两个进程交叉 `F_SETLKW` 时 Linux 返回 `EDEADLK`，这里两个都会一直等，直到被信号打断。
+  2. 锁表固定 128 项，满了返回 `ENOLCK`。
+  3. 偏移池（512 槽）满时 `flock` 返回 `ENOLCK`，Linux 不会。
+  4. 等待仍是每 10 ms 重查一次，释放方会主动唤醒；没有 Linux 的阻塞者链表和公平性。
+  5. K 段在红灯上通过，所以 FAT32 首簇 0 冲突这条只有代码层面的论证，没有目标机红灯证据：本内核的 `createFile` 会先分配首簇，只有从磁盘读到的空文件首簇才是 0。
+  6. 没做 OFD 锁（`F_OFD_SETLK`）和 `F_SETLK64` 之外的变体，也没做租约（`F_SETLEASE`）。
+
