@@ -386,9 +386,14 @@ pub fn sendSignalToPgrp(pgid: u16, signum: u32) u32 {
 /// Group broadcast; with a `sender`, members the sender may not signal
 /// (POSIX kill permission) are skipped.
 pub fn sendSignalToPgrpFiltered(pgid: u16, signum: u32, sender: ?*task.Task) u32 {
+    const info: siginfo.Info = if (sender != null) senderInfo() else .{ .code = siginfo.SI_KERNEL };
+    return sendSignalToPgrpInfo(pgid, signum, sender, info);
+}
+
+/// Group broadcast carrying `info` (a lease break's POLL_MSG, see file_lock.breakLease).
+pub fn sendSignalToPgrpInfo(pgid: u16, signum: u32, sender: ?*task.Task, info: siginfo.Info) u32 {
     if (signum == 0 or signum > MAX_SIGNAL) return 0;
     const action = defaultAction(signum);
-    const info: siginfo.Info = if (sender != null) senderInfo() else .{ .code = siginfo.SI_KERNEL };
     var sent: u32 = 0;
     for (0..task.MAX_TASKS) |i| {
         const t = task.getTask(@intCast(i)) orelse continue;

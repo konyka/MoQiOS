@@ -331,7 +331,30 @@ pub fn setLock(fd: u64, cmd_in: u64, flock_ptr: u64) i64 {
     }
 }
 
-const SIGIO: u32 = 29;
+/// Signal the owners of the broken leases (Linux lease_break_callback → kill_fasync → send_sigio): each lease's description
+/// names the owner (F_SETOWN: a pid, -pgrp, or 0 for nobody) and the signal (F_SETSIG; 0 is a plain SIGIO). A standard signal
+/// goes to an owner once (it would coalesce anyway); a real-time one is queued per lease, each with its own si_fd.
+fn signalBreak(notify: *const lp.Notify) void {
+    const sig_mod = @import("../proc/signal.zig");
+    const fp = @import("fcntl_policy.zig");
+    var done: [8]struct { owner: i32, signo: u32 } = undefined;
+    var nd: usize = 0;
+    outer: for (notify.entries[0..notify.n]) |e| {
+        const fo: vfs.Fown = vfs.fownOfDescription(e.owner) orelse .{ .owner = @intCast(e.tgid), .sig = 0 };
+        if (fo.owner == 0) continue;
+        const s = fp.leaseBreakSignal(fo.sig, e.fd);
+        if (s.signo < 32) {
+            for (done[0..nd]) |d| if (d.owner == fo.owner and d.signo == s.signo) continue :outer;
+            done[nd] = .{ .owner = fo.owner, .signo = s.signo };
+            nd += 1;
+        }
+        if (fo.owner > 0) {
+            _ = sig_mod.sendSignalInfo(@intCast(fo.owner), s.signo, s.info);
+        } else if (-fo.owner <= 0xffff) {
+            _ = sig_mod.sendSignalToPgrpInfo(@intCast(-fo.owner), s.signo, null, s.info);
+        }
+    }
+}
 
 fn nowNs() u64 {
     return @import("../arch/arch.zig").tsc.nanos();
@@ -402,13 +425,18 @@ pub fn setLease(fd: u64, arg: u64) i64 {
         const flags = fl_lock.acquire();
         rc = leases.unlock(key, owner, nowNs());
         fl_lock.release(flags);
+        // Linux lease_modify(F_UNLCK): f_delown and signum = 0.
+        if (rc == 0) vfs.setFownOf(desc, 0, 0, false);
     } else {
         const owner = vfs.flockOwner(fdt, fd_u) orelse return ENOLCK;
         const opens = countOpens(key, desc.writable);
         const flags = fl_lock.acquire();
         @atomicStore(bool, &leases_used, true, .release);
         rc = leases.set(key, owner, reportedPid(t), arg, opens, nowNs());
+        if (rc == 0) leases.noteFd(key, owner, fd_u);
         fl_lock.release(flags);
+        // Linux lease_setup: the caller becomes the owner unless the description already has one.
+        if (rc == 0) vfs.setFownOf(desc, @intCast(reportedPid(t)), null, true);
     }
     // Giving a lease up or downgrading it lets a blocked opener go on.
     wakeLockWaiters();
@@ -453,8 +481,7 @@ pub fn breakLease(fdt: *vfs.FdTable, fd: u32, write: bool, nonblock: bool) i64 {
     const any = leases.breakFor(key, write, nowNs(), &notify);
     fl_lock.release(flags);
     if (!any) return 0;
-    const sig_mod = @import("../proc/signal.zig");
-    for (notify.tgids[0..notify.n]) |g| _ = sig_mod.sendSignal(g, SIGIO);
+    signalBreak(&notify);
     if (nonblock) return EAGAIN;
     while (true) {
         flags = fl_lock.acquire();

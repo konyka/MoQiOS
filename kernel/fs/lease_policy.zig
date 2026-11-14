@@ -27,6 +27,8 @@ pub const Lease = struct {
     key: u64 = 0,
     owner: u64 = 0,
     tgid: u32 = 0,
+    /// The descriptor the lease was last set through: the si_fd of the signal a break sends (Linux fasync_insert_entry).
+    fd: u32 = 0,
     write: bool = false,
     unlock_pending: bool = false,
     downgrade_pending: bool = false,
@@ -37,15 +39,16 @@ pub const Lease = struct {
 /// The open file descriptions of the file: those open for writing, those open read-only, and whether the caller's is writable.
 pub const Opens = struct { writers: u32, readers: u32, self_writable: bool };
 
-/// The processes a break must signal, each once.
+/// The leases a break must signal: each lease's description (whose F_SETOWN / F_SETSIG decide who gets which signal), the fd
+/// it was taken through, and the process that took it.
 pub const Notify = struct {
-    tgids: [8]u32 = @splat(0),
+    pub const Entry = struct { owner: u64, fd: u32, tgid: u32 };
+    entries: [8]Entry = undefined,
     n: usize = 0,
 
-    fn add(self: *Notify, tgid: u32) void {
-        for (self.tgids[0..self.n]) |g| if (g == tgid) return;
-        if (self.n < self.tgids.len) {
-            self.tgids[self.n] = tgid;
+    fn add(self: *Notify, l: *const Lease) void {
+        if (self.n < self.entries.len) {
+            self.entries[self.n] = .{ .owner = l.owner, .fd = l.fd, .tgid = l.tgid };
             self.n += 1;
         }
     }
@@ -116,6 +119,11 @@ pub fn Table(comptime N: usize) type {
             return ENOLCK;
         }
 
+        /// The lease of `owner` on `key` was (re)set through descriptor `fd`.
+        pub fn noteFd(self: *Self, key: u64, owner: u64, fd: u32) void {
+            if (self.find(key, owner)) |l| l.fd = fd;
+        }
+
         /// F_SETLEASE F_UNLCK: EAGAIN when the description holds no lease.
         pub fn unlock(self: *Self, key: u64, owner: u64, now: u64) i64 {
             self.expire(now);
@@ -148,7 +156,7 @@ pub fn Table(comptime N: usize) type {
                     l.downgrade_pending = true;
                     l.downgrade_deadline = now +| BREAK_NS;
                 }
-                notify.add(l.tgid);
+                notify.add(l);
             }
             return any;
         }

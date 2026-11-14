@@ -756,6 +756,8 @@ fn shareOffsetFor(desc: *FileDescriptor) u16 {
     if (desc.offset_slot == 0) {
         const slot = shared_offsets.promote(desc.offset) orelse return 0;
         shared_offsets.setFlags(slot, desc.status_flags);
+        shared_offsets.setOwner(slot, desc.fown);
+        shared_offsets.setSignal(slot, desc.fsig);
         desc.offset_slot = slot; // the original is the first holder
     }
     shared_offsets.retain(desc.offset_slot); // the copy is the next
@@ -786,6 +788,44 @@ pub fn statusFlagsOf(desc: *FileDescriptor) u32 {
     const f = shared_offsets_lock.acquire();
     defer shared_offsets_lock.release(f);
     return shared_offsets.flags(desc.offset_slot);
+}
+
+/// F_GETOWN / F_GETSIG: the owner (pid, -pgrp or 0) and signal (0: SIGIO) of the whole open file description.
+pub const Fown = struct { owner: i32, sig: u8 };
+
+pub fn fownOf(desc: *FileDescriptor) Fown {
+    if (desc.offset_slot == 0) return .{ .owner = desc.fown, .sig = desc.fsig };
+    const f = shared_offsets_lock.acquire();
+    defer shared_offsets_lock.release(f);
+    return .{ .owner = shared_offsets.owner(desc.offset_slot), .sig = shared_offsets.signal(desc.offset_slot) };
+}
+
+/// F_SETOWN (`owner`), F_SETSIG (`sig`); `only_if_unowned`: set the owner only when there is none (Linux lease_setup).
+pub fn setFownOf(desc: *FileDescriptor, owner: ?i32, sig: ?u8, only_if_unowned: bool) void {
+    const f = shared_offsets_lock.acquire();
+    defer shared_offsets_lock.release(f);
+    const slot = desc.offset_slot;
+    if (owner) |o| {
+        const cur = if (slot == 0) desc.fown else shared_offsets.owner(slot);
+        if (!only_if_unowned or cur == 0) {
+            desc.fown = o;
+            if (slot != 0) shared_offsets.setOwner(slot, o);
+        }
+    }
+    if (sig) |s| {
+        desc.fsig = s;
+        if (slot != 0) shared_offsets.setSignal(slot, s);
+    }
+}
+
+/// The owner and signal of the shared description a lock/lease owner id names (flockOwner's 0x4000... | slot); null for any
+/// other id.
+pub fn fownOfDescription(owner_id: u64) ?Fown {
+    if (owner_id & 0x4000_0000_0000_0000 == 0) return null;
+    const slot: u16 = @truncate(owner_id);
+    const f = shared_offsets_lock.acquire();
+    defer shared_offsets_lock.release(f);
+    return .{ .owner = shared_offsets.owner(slot), .sig = shared_offsets.signal(slot) };
 }
 
 /// Publish the descriptor's offset to everyone who shares it.
@@ -825,6 +865,8 @@ pub fn flockOwner(table: *FdTable, fd: u32) ?u64 {
     if (desc.offset_slot == 0) {
         const slot = shared_offsets.promote(desc.offset) orelse return null;
         shared_offsets.setFlags(slot, desc.status_flags);
+        shared_offsets.setOwner(slot, desc.fown);
+        shared_offsets.setSignal(slot, desc.fsig);
         desc.offset_slot = slot;
     }
     return 0x4000_0000_0000_0000 | @as(u64, desc.offset_slot);
@@ -909,6 +951,9 @@ pub const FileDescriptor = struct {
     writable: bool = false,
     fd_flags: u32 = 0,
     status_flags: u32 = 0,
+    /// F_SETOWN / F_SETSIG while the description has no shared slot (afterwards the slot holds them).
+    fown: i32 = 0,
+    fsig: u8 = 0,
     readahead_state: readahead.ReadaheadState = .{},
     // inode identifier for file locking (unique per underlying file)
     inode_id: u64 = 0,

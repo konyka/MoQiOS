@@ -3,6 +3,7 @@
 //! Linux splits a descriptor's flags in two: FD_CLOEXEC lives on the descriptor, everything else
 //! (the "status flags" F_GETFL reports) on the open file description.
 
+const std = @import("std");
 pub const O_ACCMODE: u32 = 0x3;
 pub const O_APPEND: u32 = 0x400;
 pub const O_NONBLOCK: u32 = 0x800;
@@ -66,4 +67,35 @@ pub const F_UNLCK: i64 = 2;
 pub fn setPipeSize(requested: u64) i64 {
     if (requested > PIPE_SIZE) return -12; // ENOMEM
     return PIPE_SIZE;
+}
+
+/// F_SETSIG's argument is an int naming a signal 0..64 (0: SIGIO); anything else is EINVAL (null). Linux f_owner_sig, measured.
+pub fn setsigArg(arg: u64) ?i64 {
+    const v: i32 = @bitCast(@as(u32, @truncate(arg)));
+    return if (v >= 0 and v <= 64) v else null;
+}
+
+/// F_SETOWN's argument is an int: a pid (> 0), -pgrp (< 0) or 0; INT_MIN is EINVAL (null). Linux f_setown, measured.
+pub fn setownArg(arg: u64) ?i32 {
+    const v: i32 = @bitCast(@as(u32, @truncate(arg)));
+    return if (v == std.math.minInt(i32)) null else v;
+}
+
+const siginfo = @import("../proc/siginfo_policy.zig");
+const SIGIO: u32 = 29;
+const POLL_MSG: i32 = 3;
+const SI_SIGIO: i32 = -5;
+/// POLLIN | POLLRDNORM | POLLMSG: the si_band of a POLL_MSG (Linux band_table).
+const POLL_MSG_BAND: u64 = 0x441;
+
+/// The signal a lease break sends through a description whose F_SETSIG is `sig`, taken through descriptor `fd` (Linux
+/// lease_break_callback → send_sigio_to_task): signal 0 is a plain SIGIO (SI_KERNEL); any other carries POLL_MSG, the band and the
+/// fd (si_band at offset 16, si_fd at 24), with SI_SIGIO in place of POLL_MSG for the signals that have their own si_codes.
+pub fn leaseBreakSignal(sig: u8, fd: u32) struct { signo: u32, info: siginfo.Info } {
+    if (sig == 0) return .{ .signo = SIGIO, .info = .{ .code = siginfo.SI_KERNEL } };
+    const own_codes = switch (sig) {
+        4, 5, 7, 8, 11, 17, 31 => true, // SIGILL SIGTRAP SIGBUS SIGFPE SIGSEGV SIGCHLD SIGSYS
+        else => false,
+    };
+    return .{ .signo = sig, .info = .{ .code = if (own_codes) SI_SIGIO else POLL_MSG, .a = POLL_MSG_BAND, .b = fd } };
 }

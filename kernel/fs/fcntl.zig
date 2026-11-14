@@ -6,6 +6,7 @@
 ///   - F_GETFL / F_SETFL: get/set file status flags (O_NONBLOCK, O_APPEND)
 ///   - F_DUPFD_CLOEXEC: duplicate fd with FD_CLOEXEC set
 ///   - F_SETLEASE / F_GETLEASE: file leases (file_lock.zig, lease_policy.zig)
+///   - F_SETOWN / F_GETOWN / F_SETSIG / F_GETSIG: who a lease break signals, and with which signal (per open file description)
 const vfs = @import("vfs.zig");
 const policy = @import("fcntl_policy.zig");
 
@@ -17,6 +18,10 @@ pub const F_SETFL: u64 = 4;
 pub const F_GETLK: u64 = 5;
 pub const F_SETLK: u64 = 6;
 pub const F_SETLKW: u64 = 7;
+pub const F_SETOWN: u64 = 8;
+pub const F_GETOWN: u64 = 9;
+pub const F_SETSIG: u64 = 10;
+pub const F_GETSIG: u64 = 11;
 pub const F_OFD_GETLK: u64 = 36;
 pub const F_OFD_SETLK: u64 = 37;
 pub const F_OFD_SETLKW: u64 = 38;
@@ -71,6 +76,19 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
             vfs.setStatusFlags(&t.fd_table.fds[fd], policy.applySetfl(cur_flags, arg));
             return 0;
         },
+        F_GETOWN => return vfs.fownOf(&t.fd_table.fds[fd]).owner,
+        F_GETSIG => return vfs.fownOf(&t.fd_table.fds[fd]).sig,
+        F_SETOWN => {
+            const who = policy.setownArg(arg) orelse return -22;
+            if (who != 0 and !ownerExists(who)) return -3; // ESRCH
+            vfs.setFownOf(&t.fd_table.fds[fd], who, null, false);
+            return 0;
+        },
+        F_SETSIG => {
+            const s = policy.setsigArg(arg) orelse return -22;
+            vfs.setFownOf(&t.fd_table.fds[fd], null, @intCast(s), false);
+            return 0;
+        },
         F_SETLEASE => return @import("file_lock.zig").setLease(fd_num, arg),
         F_GETLEASE => return @import("file_lock.zig").getLease(fd_num),
         F_GETPIPE_SZ, F_SETPIPE_SZ => {
@@ -101,4 +119,16 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
         },
         else => return -22, // EINVAL
     }
+}
+
+/// F_SETOWN's target exists: a live task with that pid (> 0), or a live member of process group -who (< 0).
+fn ownerExists(who: i32) bool {
+    const task_mod = @import("../proc/task.zig");
+    for (0..task_mod.MAX_TASKS) |i| {
+        const t = task_mod.getTask(@intCast(i)) orelse continue;
+        if (t.state == .zombie) continue;
+        if (who > 0 and t.tid == @as(u32, @intCast(who))) return true;
+        if (who < 0 and @as(i64, t.pgid) == -@as(i64, who)) return true;
+    }
+    return false;
 }

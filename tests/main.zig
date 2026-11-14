@@ -12401,11 +12401,18 @@ test "lease policy: breaking marks each conflicting lease once and signals each 
     var n0 = lp.Notify{};
     try std.testing.expect(!t.breakFor(1, false, 0, &n0));
     try std.testing.expectEqual(@as(usize, 0), n0.n);
-    // a write open conflicts with both; one process holds them, so one notification
+    // a write open conflicts with both: one entry per lease, naming its description and the fd it was taken through
+    // (file_lock sends one signal per owner and signal number, so one process holding both still gets one SIGIO)
+    t.noteFd(1, 10, 3);
+    t.noteFd(1, 11, 4);
     var n1 = lp.Notify{};
     try std.testing.expect(t.breakFor(1, true, 0, &n1));
-    try std.testing.expectEqual(@as(usize, 1), n1.n);
-    try std.testing.expectEqual(@as(u32, 100), n1.tgids[0]);
+    try std.testing.expectEqual(@as(usize, 2), n1.n);
+    try std.testing.expectEqual(@as(u64, 10), n1.entries[0].owner);
+    try std.testing.expectEqual(@as(u32, 3), n1.entries[0].fd);
+    try std.testing.expectEqual(@as(u32, 100), n1.entries[0].tgid);
+    try std.testing.expectEqual(@as(u64, 11), n1.entries[1].owner);
+    try std.testing.expectEqual(@as(u32, 4), n1.entries[1].fd);
     try std.testing.expectEqual(lp.UNLCK, t.get(1, 10, 0));
     // marked once: a second opener still waits but sends nothing new
     var n2 = lp.Notify{};
@@ -12417,6 +12424,37 @@ test "lease policy: breaking marks each conflicting lease once and signals each 
     try std.testing.expect(t.conflicts(1, true, 0));
     try std.testing.expectEqual(@as(i64, 0), t.unlock(1, 11, 0));
     try std.testing.expect(!t.conflicts(1, true, 0));
+}
+
+test "fcntl policy: F_SETOWN and F_SETSIG arguments, and the siginfo a lease break sends (Linux measured)" {
+    const fp = kt.fcntl_policy;
+    // F_SETSIG: an int, 0..64
+    try std.testing.expectEqual(@as(i64, 0), fp.setsigArg(0).?);
+    try std.testing.expectEqual(@as(i64, 64), fp.setsigArg(64).?);
+    try std.testing.expectEqual(@as(i64, 5), fp.setsigArg(0x1_0000_0005).?);
+    try std.testing.expect(fp.setsigArg(65) == null);
+    try std.testing.expect(fp.setsigArg(@bitCast(@as(i64, -1))) == null);
+    try std.testing.expect(fp.setsigArg(1000) == null);
+    // F_SETOWN: an int; INT_MIN is EINVAL
+    try std.testing.expectEqual(@as(i32, 42), fp.setownArg(42).?);
+    try std.testing.expectEqual(@as(i32, -7), fp.setownArg(@bitCast(@as(i64, -7))).?);
+    try std.testing.expectEqual(@as(i32, 42), fp.setownArg(0x1_0000_002a).?);
+    try std.testing.expect(fp.setownArg(0x8000_0000) == null);
+    // signal 0: plain SIGIO, SI_KERNEL, no fd
+    const s0 = fp.leaseBreakSignal(0, 3);
+    try std.testing.expectEqual(@as(u32, 29), s0.signo);
+    try std.testing.expectEqual(@as(i32, 0x80), s0.info.code);
+    try std.testing.expectEqual(@as(u64, 0), s0.info.b);
+    // a chosen signal: POLL_MSG, band POLLIN|POLLRDNORM|POLLMSG at si_band, the fd at si_fd
+    const s35 = fp.leaseBreakSignal(35, 3);
+    try std.testing.expectEqual(@as(u32, 35), s35.signo);
+    try std.testing.expectEqual(@as(i32, 3), s35.info.code);
+    try std.testing.expectEqual(@as(u64, 0x441), s35.info.a);
+    try std.testing.expectEqual(@as(u64, 3), s35.info.b);
+    try std.testing.expectEqual(@as(i32, 3), fp.leaseBreakSignal(10, 5).info.code);
+    try std.testing.expectEqual(@as(i32, 3), fp.leaseBreakSignal(29, 5).info.code);
+    // signals with their own si_codes get SI_SIGIO instead (Linux send_sigio_to_task)
+    for ([_]u8{ 4, 5, 7, 8, 11, 17, 31 }) |sig| try std.testing.expectEqual(@as(i32, -5), fp.leaseBreakSignal(sig, 5).info.code);
 }
 
 test "lease policy: a read open downgrades a write lease, and deadlines force the outcome" {

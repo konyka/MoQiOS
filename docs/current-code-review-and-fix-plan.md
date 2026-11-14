@@ -5972,7 +5972,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 问题：见 `docs/kernel-subsystems.md` 的 hello187 条。最严重的是 `open(O_CLOEXEC)` 完全没有生效（`execve` 后该描述符仍然开着，会泄漏给被执行的程序）；其余是 `F_SETFD`/`F_GETFL`/`F_SETFL` 的位处理和几个没有实现的命令。
 - 方法：宿主机取 77 项真实 Linux 返回值（对 `O_LARGEFILE`——libc 在 64 位上自动加的 0x8000——在对照程序里屏蔽，因为裸系统调用看不到它），生成 hello187 逐项对照；旧内核 21 项 FAIL。
 - 修复：规则抽到 `fs/fcntl_policy.zig`（`fdFlagsFromSetfd`、`applySetfl`、`reportedFlags`、`OPEN_STATUS_MASK`、`setPipeSize`），`fcntl.zig`、`vfs.zig`（open 的状态位掩码）、`file_io.zig`（`O_CLOEXEC`）使用。
-- 已知差异：`F_SETPIPE_SZ` 无法放大管道（内核管道缓冲区固定 4096 字节；Linux 允许到 1 MiB）；`F_GETFL` 不报 `O_LARGEFILE`（Linux 内核对 64 位程序会报 0x8000，对照程序屏蔽了它，生成的程序也没有该位）；`F_SETLEASE`（hello316 已实现）、`F_NOTIFY`、`F_SETOWN/GETOWN`、`F_SETSIG/GETSIG`、`F_GET_RW_HINT` 等没有对照也没有实现（落到 `EINVAL`）；`O_PATH`、`O_TMPFILE` 的打开语义没有对照；`O_NOATIME` 的存在性检查（非属主返回 `EPERM`）没有对照。
+- 已知差异：`F_SETPIPE_SZ` 无法放大管道（内核管道缓冲区固定 4096 字节；Linux 允许到 1 MiB）；`F_GETFL` 不报 `O_LARGEFILE`（Linux 内核对 64 位程序会报 0x8000，对照程序屏蔽了它，生成的程序也没有该位）；`F_SETLEASE`（hello316 已实现）、`F_NOTIFY`、`F_SETOWN/GETOWN`、`F_SETSIG/GETSIG`（hello318 已实现）、`F_GET_RW_HINT` 等没有对照也没有实现（落到 `EINVAL`）；`O_PATH`、`O_TMPFILE` 的打开语义没有对照；`O_NOATIME` 的存在性检查（非属主返回 `EPERM`）没有对照。
 - TDD：host 新增 1 个测试（各规则函数的穷举与边界、各入口的接线形状）；hello187（77 项）在旧内核上 21 项 FAIL，新内核 PASS。
 
 - 变异（具名测试核对）：`F_SETFD` 不掩码（两种）、`SETFL_MASK` 少/多位（4 种）、`applySetfl` 丢掉当前位、`OPEN_STATUS_MASK` 少 `O_SYNC`/`O_DIRECT`/`O_DIRECTORY`/`O_NOFOLLOW`/`O_NOATIME` 各一位以及多出 `O_CLOEXEC`、`alwaysReadWrite` 的 7 个类型各去掉一个、`reportedFlags` 不补 `O_RDWR`/不替换原访问模式、`PIPE_SIZE`/`setPipeSize` 的边界、`F_UNLCK` 值、`fcntl.zig` 与 `vfs.zig` 与 `file_io.zig` 的接线，共 34 个，全部被 `fcntl flags: …` 抓住。第一轮有 3 个存活（`reportedFlags` 只检查了存储为 0 的情形、`F_UNLCK` 的值、`O_CLOEXEC` 条件取反——最后一个是因为断言只查了 `fd_flags = FD_CLOEXEC` 这一行，没有带上前一行条件），已补强断言（存储为 1 的套接字、`F_UNLCK == 2`、带上完整条件行）后重跑全部抓住；1 个因编译失败（未使用变量）改成可编译形式后抓住；恢复后 `grep -c MUTATION` 为 0。
@@ -8642,7 +8642,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello316 A–J 全过（E 的阻塞打开约 100 ms 后成功）。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello316 PASS 和 `hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
 - 如实的局限：
-  1. 没有 `F_SETSIG`，通知固定是 `SIGIO`；没有属主和 `CAP_LEASE` 检查（Linux 对非属主返回 `EACCES`）。
+  1. 没有 `F_SETSIG`，通知固定是 `SIGIO`；没有属主和 `CAP_LEASE` 检查（Linux 对非属主返回 `EACCES`）。（`F_SETSIG`/`F_SETOWN` 已实现，见下文 hello318 一节；属主和 `CAP_LEASE` 检查仍未做）
   2. `ftruncate` 不打破租约（没有在宿主机上实测 Linux 的行为）；45 s 的强制解除只有宿主机单测，目标机没有测。（`ftruncate` 一项已实测核对，与 Linux 一致，见下文「`ftruncate` 与租约（hello316 K）」）
   3. 撤回因租约失败的新 fd 用的是普通 `close`，会同时删掉本进程在该文件上的 fcntl 记录锁；Linux 的失败 open 不会这样。
   4. 租约表 32 项，满了返回 `ENOLCK`；一次打破最多通知 8 个进程。
@@ -8689,3 +8689,26 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 新增 hello316 K 断言上述行为。没有红灯：在未修改的内核上定向 SMP=2、SMP=4 各一份 hello316 A–K 全过（K：`0 0 child 0 lease 1 sigio 0`），说明本内核的 `ftruncate` 已与 Linux 一致，原来的局限是没核对，不是实现缺陷。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都有 hello316 PASS（K 都 ok）和 `hello228: corrupted canaries=0`。一份 SMP=4 `EXIT=0`；其余三份 `EXIT=1`，都是 hello108「RT task lost the CPU to reaping」（文档里已记的偶发项），其中一份 SMP=4 另有 hello286 M 19/20（同样是已记的偶发项）。这次只改了测试和文档，内核没有变。对照：hello108 单独定向在当前内核上跑六次（SMP 1/2/4 各两次）全部失败；在上一个提交 `67681b1`（本节之前，也在 adjtimex 之前）的 worktree 里定向跑三次（SMP 1/2/4）也全部失败，形状相同（窗口内被占用 5.4–8.4 ms，阈值 4 ms；最长单次中断 2.8–4.4 ms）。当时宿主机上另有一个项目在跑 cmake 构建，负载 2–38，CPU 调速策略是 powersave，所以 hello108 的失败与本节无关，仍按宿主机负载引起的偶发项记录。riscv64、aarch64 smoke 在上一节已通过，本节内核未变；`zig build`、`zig build test` 通过。
 - 局限：45 s 的强制解除仍然只有宿主机单测。
+
+### `F_SETOWN`/`F_GETOWN`/`F_SETSIG`/`F_GETSIG` 与租约打破信号（hello318，已修）
+
+- 问题：四个命令都落到 `EINVAL`；打破租约时固定给持有者的 tgid 发 `SIGIO`，`si_code` 是 `SI_USER`(0)，没有 `si_band`、`si_fd`，也不能用 `F_SETSIG` 换信号或用 `F_SETOWN` 改接收者。
+- Linux 依据：`fs/fcntl.c` 的 `f_setown`/`f_getown`/`do_fcntl`（`F_SETSIG` 用 `valid_signal`），`fs/locks.c` 的 `lease_break_callback` → `kill_fasync`，`fs/fcntl.c` 的 `send_sigio_to_task`（sig 非 0 时 `si_code` 用 `band` 对应的 `POLL_MSG`，标准信号中 SIGILL 等用 `SI_SIGIO`；sig 0 时发 `SIGIO` 且 `SEND_SIG_PRIV`）。
+- 宿主机实测（`gcc -DHOST` 跑 `user/hello318.c`，A–L 全过）：默认 owner 和 sig 都是 0；`F_SETSIG` 接受 0..64，65、-1、1000 返回 `EINVAL` 且原值不变，参数按 int 截断（2^32+5 等于 5）；`F_SETOWN` 读回 pid 和 -pgrp，不存在的 pid 或进程组 `ESRCH` 且原值不变，`INT_MIN` `EINVAL`，0 清除，参数按 int 截断；owner 和 sig 属于打开文件描述（dup、fork 子进程可见，另一次 open 不可见）；`F_SETLEASE` 没有 owner 时把调用者设为 owner，已有时保留；打破时 sig 为 35 或 `SIGUSR1` 得到 `si_code=POLL_MSG`(3)、`si_band=0x441`、`si_fd`=拿租约的 fd，sig 为 0 得到 `SIGIO`、`SI_KERNEL`(0x80)、`si_fd` 0；`F_UNLCK` 成功时清除 owner 和 sig，没有租约时 `EAGAIN` 且 sig 不变；持租约期间 owner 设为 0 则打破时不发信号，但打开者仍得到 `EAGAIN`；持租约期间改 `F_SETSIG` 用新信号；pipe 上可以设置和读回；坏 fd 四个命令都 `EBADF`。
+- 红灯：未修改的内核上定向 SMP=2，四个命令都返回 -22，A–L 全部 FAIL，打破时收到的是 `SIGIO`、code 0。宿主机单测「fcntl policy: F_SETOWN and F_SETSIG arguments...」先编译失败（缺 `setsigArg`）。
+- 修复：
+  - `kernel/fs/fcntl_policy.zig`：`setsigArg`、`setownArg`、`leaseBreakSignal`。
+  - `kernel/fs/vfs.zig`：`FileDescriptor.fown/fsig`；两处 promote 把它们复制进共享槽；`fownOf`、`setFownOf`、`fownOfDescription`。
+  - `kernel/fs/shared_offset.zig`：每槽的 `owners`、`signals`，promote 时清零。
+  - `kernel/fs/fcntl.zig`：四个命令的分派，`ownerExists` 检查 tid 或 pgid。
+  - `kernel/fs/lease_policy.zig`：租约记下 fd（`noteFd`），`Notify` 每个租约一项（owner、fd、tgid），不再按 tgid 去重。
+  - `kernel/fs/file_lock.zig`：`signalBreak` 按描述的 owner 和信号发送，标准信号对同一 owner 只发一次；拿租约时 `setFownOf(desc, pid, null, true)`，`F_UNLCK` 时清除。
+  - `kernel/proc/signal.zig`：`sendSignalToPgrpInfo`，`sendSignalToPgrpFiltered` 改为调用它。
+  - `tests/main.zig`：新增参数检查单测；租约打破单测改为检查每项的 owner/fd/tgid。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello318 A–L 全过（F：`sig 35 code 3 band 0x441 fd 3/3`；G：`sig 29 code 128 fd 0`）；回归 hello316 定向 SMP=2、SMP=4 都 PASS。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello318 PASS、hello316 PASS 和 `hello228: corrupted canaries=0`。
+- 局限：
+  1. owner 和 sig 只用于租约打破。没有 `O_ASYNC`/`FASYNC`，socket、pipe、tty 的 I/O 就绪不发 `SIGIO`。
+  2. 没有 `F_SETOWN_EX`/`F_GETOWN_EX`，也没有 `sigio_perm` 的 uid 权限检查。
+  3. pipe 等不走共享 offset 槽的描述符，dup 后 owner/sig 是各自的副本，不共享。
+  4. pgid 是 u16；只做了 x86_64 的 fcntl 分派；`CAP_LEASE` 和属主检查仍未做。
