@@ -5972,7 +5972,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 问题：见 `docs/kernel-subsystems.md` 的 hello187 条。最严重的是 `open(O_CLOEXEC)` 完全没有生效（`execve` 后该描述符仍然开着，会泄漏给被执行的程序）；其余是 `F_SETFD`/`F_GETFL`/`F_SETFL` 的位处理和几个没有实现的命令。
 - 方法：宿主机取 77 项真实 Linux 返回值（对 `O_LARGEFILE`——libc 在 64 位上自动加的 0x8000——在对照程序里屏蔽，因为裸系统调用看不到它），生成 hello187 逐项对照；旧内核 21 项 FAIL。
 - 修复：规则抽到 `fs/fcntl_policy.zig`（`fdFlagsFromSetfd`、`applySetfl`、`reportedFlags`、`OPEN_STATUS_MASK`、`setPipeSize`），`fcntl.zig`、`vfs.zig`（open 的状态位掩码）、`file_io.zig`（`O_CLOEXEC`）使用。
-- 已知差异：`F_SETPIPE_SZ` 无法放大管道（内核管道缓冲区固定 4096 字节；Linux 允许到 1 MiB）；`F_GETFL` 不报 `O_LARGEFILE`（Linux 内核对 64 位程序会报 0x8000，对照程序屏蔽了它，生成的程序也没有该位）；`F_SETLEASE`、`F_NOTIFY`、`F_SETOWN/GETOWN`、`F_SETSIG/GETSIG`、`F_GET_RW_HINT` 等没有对照也没有实现（落到 `EINVAL`）；`O_PATH`、`O_TMPFILE` 的打开语义没有对照；`O_NOATIME` 的存在性检查（非属主返回 `EPERM`）没有对照。
+- 已知差异：`F_SETPIPE_SZ` 无法放大管道（内核管道缓冲区固定 4096 字节；Linux 允许到 1 MiB）；`F_GETFL` 不报 `O_LARGEFILE`（Linux 内核对 64 位程序会报 0x8000，对照程序屏蔽了它，生成的程序也没有该位）；`F_SETLEASE`（hello316 已实现）、`F_NOTIFY`、`F_SETOWN/GETOWN`、`F_SETSIG/GETSIG`、`F_GET_RW_HINT` 等没有对照也没有实现（落到 `EINVAL`）；`O_PATH`、`O_TMPFILE` 的打开语义没有对照；`O_NOATIME` 的存在性检查（非属主返回 `EPERM`）没有对照。
 - TDD：host 新增 1 个测试（各规则函数的穷举与边界、各入口的接线形状）；hello187（77 项）在旧内核上 21 项 FAIL，新内核 PASS。
 
 - 变异（具名测试核对）：`F_SETFD` 不掩码（两种）、`SETFL_MASK` 少/多位（4 种）、`applySetfl` 丢掉当前位、`OPEN_STATUS_MASK` 少 `O_SYNC`/`O_DIRECT`/`O_DIRECTORY`/`O_NOFOLLOW`/`O_NOATIME` 各一位以及多出 `O_CLOEXEC`、`alwaysReadWrite` 的 7 个类型各去掉一个、`reportedFlags` 不补 `O_RDWR`/不替换原访问模式、`PIPE_SIZE`/`setPipeSize` 的边界、`F_UNLCK` 值、`fcntl.zig` 与 `vfs.zig` 与 `file_io.zig` 的接线，共 34 个，全部被 `fcntl flags: …` 抓住。第一轮有 3 个存活（`reportedFlags` 只检查了存储为 0 的情形、`F_UNLCK` 的值、`O_CLOEXEC` 条件取反——最后一个是因为断言只查了 `fd_flags = FD_CLOEXEC` 这一行，没有带上前一行条件），已补强断言（存储为 1 的套接字、`F_UNLCK == 2`、带上完整条件行）后重跑全部抓住；1 个因编译失败（未使用变量）改成可编译形式后抓住；恢复后 `grep -c MUTATION` 为 0。
@@ -8540,7 +8540,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   3. 偏移池（512 槽）满时 `flock` 返回 `ENOLCK`，Linux 不会。
   4. 等待仍是每 10 ms 重查一次，释放方会主动唤醒；没有 Linux 的阻塞者链表和公平性。
   5. K 段在红灯上通过，所以 FAT32 首簇 0 冲突这条只有代码层面的论证，没有目标机红灯证据：本内核的 `createFile` 会先分配首簇，只有从磁盘读到的空文件首簇才是 0。
-  6. 没做 OFD 锁（`F_OFD_SETLK`）和 `F_SETLK64` 之外的变体，也没做租约（`F_SETLEASE`）。（OFD 锁 hello313 已做；租约仍没有）
+  6. 没做 OFD 锁（`F_OFD_SETLK`）和 `F_SETLK64` 之外的变体，也没做租约（`F_SETLEASE`）。（OFD 锁 hello313 已做；租约 hello316 已做）
 
 
 ## 交叉的 `F_SETLKW` 永远互相等待，没有 `EDEADLK`（hello311，已修）
@@ -8626,3 +8626,26 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   2. `TIMER_ABSTIME` 被信号打断时不写 `rem`，与 Linux 一致；被打断后不会自动重启。
   3. 未知的 flags 位仍是 `EINVAL`；Linux 对 MONOTONIC 等时钟忽略未知位、返回 0。hello102 断言了 `EINVAL`，这里没有改。
   4. 只做了 x86_64：riscv64、aarch64 没有自己的 `clock_nanosleep` 分派。
+
+## 文件租约 `F_SETLEASE`/`F_GETLEASE`（hello316，已修）
+
+- 问题：`F_SETLEASE`(1024) 没有定义，落到 `else => EINVAL`；`F_GETLEASE`(1025) 恒返回 `F_UNLCK`(2)。依赖租约的程序（Samba、文件服务器的缓存一致性）拿不到租约，冲突的打开也不会通知持有者。
+- 宿主机实测（`gcc -DHOST`，hello316 A–J 全过）：只读打开可拿读租约或写租约；文件有任何写打开（含自己的 `O_RDWR`）时读租约为 `EAGAIN`；写租约要求除自己外没有别的打开；两个打开文件描述可各持读租约，此时写租约为 `EAGAIN`；未知类型、pipe、目录为 `EINVAL`，pipe 上 `F_GETLEASE` 为 2；写打开或 `truncate` 与任何租约冲突，读打开只与写租约冲突；冲突时持有者收到 `SIGIO`，写打开使 `F_GETLEASE` 报 2（解除待定），读打开报 0（降级待定）；非阻塞打开为 `EAGAIN`（持有者自己的打开也一样，返回时 handler 已运行）；阻塞打开等到冲突消失；租约随打开文件描述走，dup 共享，最后一次关闭删除；同一进程两个冲突租约只收到一次 `SIGIO`。
+- 红灯：未修改的内核定向 SMP=2：A、B、D–J 全 FAIL（`F_SETLEASE` 为 -22，`F_GETLEASE` 恒 2，没有 `SIGIO`，I 的非阻塞写打开拿到 fd 4）；C 碰巧通过（-22 正是默认分支）。
+- 修复：
+  - 新增纯策略模块 `kernel/fs/lease_policy.zig`（`Table(N)`：`set`/`unlock`/`get`/`breakFor`/`conflicts`/`expire`/`dropOwner`，`targetType`，45 s 的 `BREAK_NS`），在 `kernel/host_test.zig` 注册，`tests/main.zig` 加三项单测（拿租约的条件、打破时只标记一次且每个进程只通知一次、降级与截止时间）。
+  - `kernel/fs/file_lock.zig`：在 `fl_lock` 下放 32 项租约表；`setLease`（只接受 ramdisk、tmpfs、FAT32、ext2 的普通文件，`countOpens` 遍历所有描述符表按打开文件描述去重统计写打开和只读打开，跳过正在打破租约的打开）、`getLease`、`breakLease`（向持有者 tgid 发 `SIGIO`，非阻塞返回 `EAGAIN`，阻塞时用已有的 10 ms 轮询等待，信号打断为 `EINTR`）；`releaseOnClose` 在最后一次关闭时删除该打开文件描述的租约。新增 `fat32.openIsDir`、`vfs.descriptionOwner`（不提升 offset slot 的打开文件描述 ID）。
+  - `kernel/fs/fcntl.zig`：`F_SETLEASE`/`F_GETLEASE` 分派到 `file_lock`。
+  - `kernel/fs/file_io.zig` 的 `openAt`：打开成功后调用 `breakLease`（`O_WRONLY`/`O_RDWR`/`O_TRUNC` 按写打开；`O_PATH` 不打破），失败时 `close` 掉新 fd 并返回错误。`truncate` syscall 在 `truncateDesc` 前以阻塞写方式打破租约。
+  - `kernel/arch/x86_64/syscall_entry.zig`：open(9)、openat(255) 返回前调用 `checkSignalsOnSyscallReturn`，否则持有者自己打开时 `SIGIO` 要等到下一个会投递信号的 syscall（第一次绿灯跑时 I 失败，sigio 0）。
+  - `tests/main.zig` 里 fcntl 的源码检查从「`F_GETLEASE => return policy.F_UNLCK`」改为检查新的两条分派。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello316 A–J 全过（E 的阻塞打开约 100 ms 后成功）。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello316 PASS 和 `hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
+- 如实的局限：
+  1. 没有 `F_SETSIG`，通知固定是 `SIGIO`；没有属主和 `CAP_LEASE` 检查（Linux 对非属主返回 `EACCES`）。
+  2. `ftruncate` 不打破租约（没有在宿主机上实测 Linux 的行为）；45 s 的强制解除只有宿主机单测，目标机没有测。
+  3. 撤回因租约失败的新 fd 用的是普通 `close`，会同时删掉本进程在该文件上的 fcntl 记录锁；Linux 的失败 open 不会这样。
+  4. 租约表 32 项，满了返回 `ENOLCK`；一次打破最多通知 8 个进程。
+  5. rofs（ext4/NTFS 只读卷）、procfs 不支持租约（`EINVAL`）；只做了 x86_64 的 fcntl 分派。
+  6. 拿租约时的打开数统计在 `fl_lock` 之外进行，与并发的 open 之间有一个窄窗口；Linux 在插入后会重新检查一次。
+

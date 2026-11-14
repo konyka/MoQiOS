@@ -8,13 +8,14 @@
 ///   - an OFD lock (F_OFD_GETLK/SETLK/SETLKW) is a byte-range lock like an fcntl lock, in the same range space, but owned by the
 ///     open file description (the flock owner), and reports l_pid -1.
 /// Releasing (vfs.releaseOpenFile): any close drops the table's fcntl locks on that file; the last close of an open file
-/// description drops its flock and its OFD locks. A blocked flock/F_SETLKW parks the task (sleep_bm) and is woken when a lock is released, or by
+/// description drops its flock, its OFD locks and its lease. A blocked flock/F_SETLKW parks the task (sleep_bm) and is woken when a lock is released, or by
 /// the scheduler tick within 10 ms.
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const vfs = @import("vfs.zig");
 const task_mod = @import("../proc/task.zig");
 const bo = @import("../lib/byte_order.zig");
 const lt = @import("lock_table.zig");
+const lp = @import("lease_policy.zig");
 
 // flock() operation bits
 pub const LOCK_SH = 1; // shared lock
@@ -37,6 +38,10 @@ const EDEADLK: i64 = -35;
 
 var table: lt.Table(128) = .{};
 var fl_lock: IrqSpinlock = .{};
+/// File leases (F_SETLEASE), under fl_lock.
+var leases: lp.Table(32) = .{};
+/// Set once any lease has been taken, so an open of a system that never used leases does not take fl_lock.
+var leases_used: bool = false;
 /// Tasks parked in a blocking flock/F_SETLKW, by task index. Releasing a lock
 /// unblocks them; the scheduler tick does too, so a missed wake still ends.
 var lock_waiter_bm: u64 = 0;
@@ -49,7 +54,12 @@ fn clearWait(cur_idx: u32) void {
     const flags = fl_lock.acquire();
     waits[cur_idx] = .{};
     fl_lock.release(flags);
+    @atomicStore(u64, &breakers[cur_idx], 0, .release);
 }
+
+/// The open file description each task index is breaking leases for (0: none). Linux breaks leases before the open takes its
+/// share of the file's open counts, so such an open is not yet one that refuses a lease (countOpens skips it).
+var breakers: [64]u64 = @splat(0);
 
 /// How long a blocked lock sleeps before it looks again: one scheduler tick.
 const LOCK_POLL_NS: u64 = 10_000_000;
@@ -128,6 +138,7 @@ pub fn releaseOnClose(key: ?u64, posix_owner: ?u64, ofd_owner: ?u64, slot: u16, 
         if (last) if (ofd_owner) |o| {
             dropped = table.dropFlock(k, o) or dropped;
             dropped = table.dropOwner(k, .posix, o) or dropped;
+            dropped = leases.dropOwner(o) or dropped;
         };
     }
     fl_lock.release(flags);
@@ -316,6 +327,140 @@ pub fn setLock(fd: u64, cmd_in: u64, flock_ptr: u64) i64 {
         if (cur_idx < waits.len) waits[cur_idx] = .{ .owner = owner, .waits_for = hit.owner };
         fl_lock.release(flags);
         fdt.releaseTransferFd(fd_u);
+        if (waitOrInterrupt(t, cur_idx)) |r| return r;
+    }
+}
+
+const SIGIO: u32 = 29;
+
+fn nowNs() u64 {
+    return @import("../arch/arch.zig").tsc.nanos();
+}
+
+/// Leases are taken on regular files of the writable filesystems only (Linux generic_setlease: S_ISREG).
+fn leaseable(desc: *const vfs.FileDescriptor) bool {
+    return switch (desc.fd_type) {
+        .ramdisk_file => true,
+        .tmpfs_file => if (@import("tmpfs.zig").tmpfsGetMetadata(@intCast(desc.tmpfs_idx))) |m| !m.is_dir else false,
+        .fat32_file => !@import("fat32.zig").openIsDir(desc.fat32_file_idx),
+        .ext2_file => @import("ext2.zig").openFileIsDir(desc.ext2_file_idx) == false,
+        else => false,
+    };
+}
+
+fn isBreaker(owner: u64) bool {
+    for (&breakers) |*b| if (@atomicLoad(u64, b, .acquire) == owner) return true;
+    return false;
+}
+
+/// The open file descriptions of file `key` across every descriptor table, split into those open for writing and those open
+/// read-only (Linux i_writecount / i_readcount), skipping opens still breaking a lease. Scanned outside fl_lock: the slot locks
+/// are taken under it nowhere else.
+fn countOpens(key: u64, self_writable: bool) lp.Opens {
+    var owners: [64]u64 = undefined;
+    var n: usize = 0;
+    var opens: lp.Opens = .{ .writers = 0, .readers = 0, .self_writable = self_writable };
+    for (0..vfs.MAX_FD_TABLES) |slot| {
+        const pinned = vfs.pinLiveTableSlot(@intCast(slot)) orelse continue;
+        defer vfs.unpinFdTable(pinned.table);
+        for (0..vfs.MAX_FDS) |i| {
+            const id = pinned.table.snapshotFdIdentity(@intCast(i)) orelse continue;
+            if (!leaseable(&id.desc) or (lockKey(&id.desc) orelse continue) != key) continue;
+            const owner = vfs.descriptionOwner(pinned.table, @intCast(i), &id.desc);
+            if (isBreaker(owner)) continue;
+            const seen = for (owners[0..n]) |o| {
+                if (o == owner) break true;
+            } else false;
+            if (seen) continue;
+            if (n < owners.len) {
+                owners[n] = owner;
+                n += 1;
+            }
+            if (id.desc.writable) opens.writers += 1 else opens.readers += 1;
+        }
+    }
+    return opens;
+}
+
+/// fcntl(fd, F_SETLEASE, arg): F_RDLCK / F_WRLCK / F_UNLCK on the open file description of `fd`.
+pub fn setLease(fd: u64, arg: u64) i64 {
+    const sched_mod = @import("../proc/sched.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
+    const t = task_mod.getTask(cur_idx) orelse return -1;
+    if (fd >= vfs.MAX_FDS) return EBADF;
+    const fd_u: u32 = @intCast(fd);
+    const fdt = t.fd_table;
+    if (!fdt.acquireTransferFd(fd_u)) return EBADF;
+    defer fdt.releaseTransferFd(fd_u);
+    const desc = &fdt.fds[fd_u];
+    if (arg != lp.RDLCK and arg != lp.WRLCK and arg != lp.UNLCK) return EINVAL;
+    if (!leaseable(desc)) return EINVAL;
+    const key = lockKey(desc) orelse return EINVAL;
+    var rc: i64 = undefined;
+    if (arg == lp.UNLCK) {
+        const owner = vfs.descriptionOwner(fdt, fd_u, desc);
+        const flags = fl_lock.acquire();
+        rc = leases.unlock(key, owner, nowNs());
+        fl_lock.release(flags);
+    } else {
+        const owner = vfs.flockOwner(fdt, fd_u) orelse return ENOLCK;
+        const opens = countOpens(key, desc.writable);
+        const flags = fl_lock.acquire();
+        @atomicStore(bool, &leases_used, true, .release);
+        rc = leases.set(key, owner, reportedPid(t), arg, opens, nowNs());
+        fl_lock.release(flags);
+    }
+    // Giving a lease up or downgrading it lets a blocked opener go on.
+    wakeLockWaiters();
+    return rc;
+}
+
+/// fcntl(fd, F_GETLEASE): the type the description's lease is (or is on its way to), F_UNLCK for none.
+pub fn getLease(fd: u64) i64 {
+    const sched_mod = @import("../proc/sched.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
+    const t = task_mod.getTask(cur_idx) orelse return -1;
+    if (fd >= vfs.MAX_FDS) return EBADF;
+    const fd_u: u32 = @intCast(fd);
+    const fdt = t.fd_table;
+    if (!fdt.acquireTransferFd(fd_u)) return EBADF;
+    defer fdt.releaseTransferFd(fd_u);
+    const desc = &fdt.fds[fd_u];
+    if (!@atomicLoad(bool, &leases_used, .acquire) or !leaseable(desc)) return @intCast(lp.UNLCK);
+    const key = lockKey(desc) orelse return @intCast(lp.UNLCK);
+    const owner = vfs.descriptionOwner(fdt, fd_u, desc);
+    const flags = fl_lock.acquire();
+    const r = leases.get(key, owner, nowNs());
+    fl_lock.release(flags);
+    return @intCast(r);
+}
+
+/// Descriptor `fd` of `fdt` was just opened (`write`: for writing, or for a truncate): break the leases it conflicts with
+/// (Linux __break_lease). Each holder gets SIGIO; a non-blocking open is then EAGAIN, a blocking one waits until no conflicting
+/// lease is left (the holder gives it up or downgrades it, or its break time runs out) and is EINTR on a caught signal.
+pub fn breakLease(fdt: *vfs.FdTable, fd: u32, write: bool, nonblock: bool) i64 {
+    if (!@atomicLoad(bool, &leases_used, .acquire)) return 0;
+    const sched_mod = @import("../proc/sched.zig");
+    const cur_idx = sched_mod.currentTaskIndex() orelse return 0;
+    const t = task_mod.getTask(cur_idx) orelse return 0;
+    const id = fdt.snapshotFdIdentity(fd) orelse return 0;
+    if (!leaseable(&id.desc)) return 0;
+    const key = lockKey(&id.desc) orelse return 0;
+    if (cur_idx < breakers.len) @atomicStore(u64, &breakers[cur_idx], vfs.descriptionOwner(fdt, fd, &id.desc), .release);
+    defer clearWait(cur_idx);
+    var notify = lp.Notify{};
+    var flags = fl_lock.acquire();
+    const any = leases.breakFor(key, write, nowNs(), &notify);
+    fl_lock.release(flags);
+    if (!any) return 0;
+    const sig_mod = @import("../proc/signal.zig");
+    for (notify.tgids[0..notify.n]) |g| _ = sig_mod.sendSignal(g, SIGIO);
+    if (nonblock) return EAGAIN;
+    while (true) {
+        flags = fl_lock.acquire();
+        const c = leases.conflicts(key, write, nowNs());
+        fl_lock.release(flags);
+        if (!c) return 0;
         if (waitOrInterrupt(t, cur_idx)) |r| return r;
     }
 }

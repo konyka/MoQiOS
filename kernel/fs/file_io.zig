@@ -141,6 +141,15 @@ pub fn openAt(dirfd: i64, name_ptr: u64, flags: u32, requested_mode: ?u32) i64 {
         },
         .err => |e| e,
     };
+    // An open that conflicts with a lease breaks it (Linux do_dentry_open -> break_lease); one that gives up (EAGAIN, EINTR) is undone.
+    if (result >= 0 and result < vfs_mod.MAX_FDS and (flags & 0x200000) == 0) {
+        const for_write = (flags & 3) != 0 or (flags & 0x200) != 0; // O_WRONLY/O_RDWR, or O_TRUNC
+        const rc = @import("file_lock.zig").breakLease(cur.fd_table, @intCast(result), for_write, (flags & 0x800) != 0);
+        if (rc < 0) {
+            _ = cur.fd_table.close(@intCast(result));
+            return rc;
+        }
+    }
     if (result >= 0 and (flags & @import("fcntl_policy.zig").O_CLOEXEC) != 0 and result < vfs_mod.MAX_FDS) {
         cur.fd_table.fds[@intCast(result)].fd_flags = @import("fcntl_policy.zig").FD_CLOEXEC;
     }

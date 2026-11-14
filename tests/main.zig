@@ -2156,7 +2156,8 @@ test "fcntl flags: FD_CLOEXEC is one bit, F_SETFL touches only APPEND/NONBLOCK/D
     try std.testing.expect(std.mem.indexOf(u8, fc, "t.fd_table.fds[fd].fd_flags = policy.fdFlagsFromSetfd(arg);") != null);
     try std.testing.expect(std.mem.indexOf(u8, fc, "vfs.setStatusFlags(&t.fd_table.fds[fd], policy.applySetfl(cur_flags, arg));") != null);
     try std.testing.expect(std.mem.indexOf(u8, fc, "policy.reportedFlags(@tagName(d.fd_type), vfs.statusFlagsOf(d))") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fc, "F_GETLEASE => return policy.F_UNLCK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fc, "F_SETLEASE => return @import(\"file_lock.zig\").setLease(fd_num, arg),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fc, "F_GETLEASE => return @import(\"file_lock.zig\").getLease(fd_num),") != null);
     try std.testing.expect(std.mem.indexOf(u8, fc, "else => return -9, // EBADF: not a pipe") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "const status = flags & @import(\"fcntl_policy.zig\").OPEN_STATUS_MASK;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.file_io_source, "if (result >= 0 and (flags & @import(\"fcntl_policy.zig\").O_CLOEXEC) != 0 and result < vfs_mod.MAX_FDS) {\n        cur.fd_table.fds[@intCast(result)].fd_flags = @import(\"fcntl_policy.zig\").FD_CLOEXEC;") != null);
@@ -12357,4 +12358,90 @@ test "cpu_time_policy: the CPU counter sequence count makes readers retry across
     try std.testing.expect(std.mem.indexOf(u8, task_src, "total = cpu_time_policy.addMember(total, cpuSnapshot(m), now_tsc, tsc_mhz);") != null);
     try std.testing.expect(std.mem.indexOf(u8, task_src, ".running = @atomicLoad(u64, &m.sched_in_tsc, .monotonic) != 0,") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.time_syscall_source, "const m = task_mod.cpuSnapshot(t);") != null);
+}
+
+test "lease policy: taking a lease checks the opens of the file and the other leases" {
+    const lp = kt.lease_policy;
+    var t = lp.Table(4){};
+    const ro: lp.Opens = .{ .writers = 0, .readers = 1, .self_writable = false };
+    // a read lease, upgraded on the only open, then given up; F_UNLCK with none is EAGAIN
+    try std.testing.expectEqual(@as(i64, 0), t.set(1, 10, 100, lp.RDLCK, ro, 0));
+    try std.testing.expectEqual(lp.RDLCK, t.get(1, 10, 0));
+    try std.testing.expectEqual(@as(i64, 0), t.set(1, 10, 100, lp.WRLCK, ro, 0));
+    try std.testing.expectEqual(lp.WRLCK, t.get(1, 10, 0));
+    try std.testing.expectEqual(@as(i64, 0), t.unlock(1, 10, 0));
+    try std.testing.expectEqual(lp.UNLCK, t.get(1, 10, 0));
+    try std.testing.expectEqual(@as(i64, -11), t.unlock(1, 10, 0));
+    // a writer anywhere (the caller's own O_RDWR too) refuses a read lease
+    try std.testing.expectEqual(@as(i64, -11), t.set(1, 10, 100, lp.RDLCK, .{ .writers = 1, .readers = 0, .self_writable = true }, 0));
+    // a write lease on the only O_RDWR open is allowed, with another open it is not
+    try std.testing.expectEqual(@as(i64, 0), t.set(1, 10, 100, lp.WRLCK, .{ .writers = 1, .readers = 0, .self_writable = true }, 0));
+    try std.testing.expectEqual(@as(i64, 0), t.unlock(1, 10, 0));
+    try std.testing.expectEqual(@as(i64, -11), t.set(1, 10, 100, lp.WRLCK, .{ .writers = 1, .readers = 1, .self_writable = true }, 0));
+    // two descriptions may each hold a read lease; then a write lease on either is EAGAIN
+    const two: lp.Opens = .{ .writers = 0, .readers = 2, .self_writable = false };
+    try std.testing.expectEqual(@as(i64, 0), t.set(1, 10, 100, lp.RDLCK, two, 0));
+    try std.testing.expectEqual(@as(i64, 0), t.set(1, 11, 100, lp.RDLCK, two, 0));
+    try std.testing.expectEqual(@as(i64, -11), t.set(1, 10, 100, lp.WRLCK, two, 0));
+    try std.testing.expectEqual(@as(i64, -22), t.set(1, 10, 100, 7, two, 0));
+    // the lease is per description: another one reports none
+    try std.testing.expectEqual(lp.UNLCK, t.get(1, 12, 0));
+    try std.testing.expect(t.dropOwner(10));
+    try std.testing.expect(!t.dropOwner(10));
+    try std.testing.expectEqual(lp.RDLCK, t.get(1, 11, 0));
+}
+
+test "lease policy: breaking marks each conflicting lease once and signals each holder once" {
+    const lp = kt.lease_policy;
+    var t = lp.Table(4){};
+    const two: lp.Opens = .{ .writers = 0, .readers = 2, .self_writable = false };
+    try std.testing.expectEqual(@as(i64, 0), t.set(1, 10, 100, lp.RDLCK, two, 0));
+    try std.testing.expectEqual(@as(i64, 0), t.set(1, 11, 100, lp.RDLCK, two, 0));
+    // a read open does not conflict with read leases
+    var n0 = lp.Notify{};
+    try std.testing.expect(!t.breakFor(1, false, 0, &n0));
+    try std.testing.expectEqual(@as(usize, 0), n0.n);
+    // a write open conflicts with both; one process holds them, so one notification
+    var n1 = lp.Notify{};
+    try std.testing.expect(t.breakFor(1, true, 0, &n1));
+    try std.testing.expectEqual(@as(usize, 1), n1.n);
+    try std.testing.expectEqual(@as(u32, 100), n1.tgids[0]);
+    try std.testing.expectEqual(lp.UNLCK, t.get(1, 10, 0));
+    // marked once: a second opener still waits but sends nothing new
+    var n2 = lp.Notify{};
+    try std.testing.expect(t.breakFor(1, true, 0, &n2));
+    try std.testing.expectEqual(@as(usize, 0), n2.n);
+    // no new lease while one waits to be given up; the pending holder may still change its own
+    try std.testing.expectEqual(@as(i64, -11), t.set(1, 12, 200, lp.RDLCK, .{ .writers = 0, .readers = 3, .self_writable = false }, 0));
+    try std.testing.expectEqual(@as(i64, 0), t.unlock(1, 10, 0));
+    try std.testing.expect(t.conflicts(1, true, 0));
+    try std.testing.expectEqual(@as(i64, 0), t.unlock(1, 11, 0));
+    try std.testing.expect(!t.conflicts(1, true, 0));
+}
+
+test "lease policy: a read open downgrades a write lease, and deadlines force the outcome" {
+    const lp = kt.lease_policy;
+    var t = lp.Table(4){};
+    const ro: lp.Opens = .{ .writers = 0, .readers = 1, .self_writable = false };
+    try std.testing.expectEqual(@as(i64, 0), t.set(1, 10, 100, lp.WRLCK, ro, 0));
+    var n = lp.Notify{};
+    try std.testing.expect(t.breakFor(1, false, 0, &n));
+    try std.testing.expectEqual(@as(usize, 1), n.n);
+    try std.testing.expectEqual(lp.RDLCK, t.get(1, 10, 0)); // downgrade pending reports F_RDLCK
+    try std.testing.expect(t.conflicts(1, false, 0));
+    try std.testing.expectEqual(@as(i64, 0), t.set(1, 10, 100, lp.RDLCK, ro, 0));
+    try std.testing.expect(!t.conflicts(1, false, 0));
+    // a write lease left in place past the deadline becomes a read lease
+    try std.testing.expectEqual(@as(i64, 0), t.set(1, 10, 100, lp.WRLCK, ro, 0));
+    var n2 = lp.Notify{};
+    try std.testing.expect(t.breakFor(1, false, 1, &n2));
+    try std.testing.expect(t.conflicts(1, false, lp.BREAK_NS));
+    try std.testing.expect(!t.conflicts(1, false, lp.BREAK_NS + 1));
+    try std.testing.expectEqual(lp.RDLCK, t.get(1, 10, lp.BREAK_NS + 1));
+    // an unlock left pending past the deadline removes the lease
+    var n3 = lp.Notify{};
+    try std.testing.expect(t.breakFor(1, true, 2 * lp.BREAK_NS, &n3));
+    try std.testing.expect(!t.conflicts(1, true, 3 * lp.BREAK_NS + 1));
+    try std.testing.expectEqual(lp.UNLCK, t.get(1, 10, 3 * lp.BREAK_NS + 1));
+    try std.testing.expectEqual(@as(i64, -11), t.unlock(1, 10, 3 * lp.BREAK_NS + 1));
 }

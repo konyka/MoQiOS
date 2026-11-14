@@ -830,6 +830,13 @@ pub fn flockOwner(table: *FdTable, fd: u32) ?u64 {
     return 0x4000_0000_0000_0000 | @as(u64, desc.offset_slot);
 }
 
+/// The owner flockOwner gives `desc` (descriptor `fd` of `table`), without moving it to a shared offset slot: a description that
+/// was never given one has no flock, OFD lock or lease, so its private owner is only compared, never found in a table.
+pub fn descriptionOwner(table: *const FdTable, fd: u32, desc: *const FileDescriptor) u64 {
+    if (desc.offset_slot != 0) return 0x4000_0000_0000_0000 | @as(u64, desc.offset_slot);
+    return privateFlockOwner(table, fd);
+}
+
 fn privateFlockOwner(table: *const FdTable, fd: u32) u64 {
     return 0x2000_0000_0000_0000 | (posixLockOwner(table) << 16) | fd;
 }

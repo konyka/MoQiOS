@@ -5,6 +5,7 @@
 ///   - F_GETFD / F_SETFD: get/set close-on-exec flag
 ///   - F_GETFL / F_SETFL: get/set file status flags (O_NONBLOCK, O_APPEND)
 ///   - F_DUPFD_CLOEXEC: duplicate fd with FD_CLOEXEC set
+///   - F_SETLEASE / F_GETLEASE: file leases (file_lock.zig, lease_policy.zig)
 const vfs = @import("vfs.zig");
 const policy = @import("fcntl_policy.zig");
 
@@ -19,6 +20,7 @@ pub const F_SETLKW: u64 = 7;
 pub const F_OFD_GETLK: u64 = 36;
 pub const F_OFD_SETLK: u64 = 37;
 pub const F_OFD_SETLKW: u64 = 38;
+pub const F_SETLEASE: u64 = 1024;
 pub const F_GETLEASE: u64 = 1025;
 pub const F_DUPFD_CLOEXEC: u64 = 1030;
 pub const F_SETPIPE_SZ: u64 = 1031;
@@ -69,7 +71,8 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
             vfs.setStatusFlags(&t.fd_table.fds[fd], policy.applySetfl(cur_flags, arg));
             return 0;
         },
-        F_GETLEASE => return policy.F_UNLCK, // leases are not supported: none is ever held
+        F_SETLEASE => return @import("file_lock.zig").setLease(fd_num, arg),
+        F_GETLEASE => return @import("file_lock.zig").getLease(fd_num),
         F_GETPIPE_SZ, F_SETPIPE_SZ => {
             switch (t.fd_table.fds[fd].fd_type) {
                 .pipe_read, .pipe_write => {},

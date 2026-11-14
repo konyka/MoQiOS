@@ -517,6 +517,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         9 => {
             syscallOpen(frame);
+            checkSignalsOnSyscallReturn(frame); // a lease break signals the holder, who may be the opener (hello316 I)
         },
         10 => {
             syscallRead(frame);
@@ -1355,6 +1356,7 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         // ── v33.5: *at() variants ────────────────────────────────────
         255 => { // openat(dirfd, pathname, flags, mode)
             frame.rax = @bitCast(file_io_mod.openAt(dirfdArg(frame.rdi), frame.rsi, @truncate(frame.rdx), @truncate(frame.r10)));
+            checkSignalsOnSyscallReturn(frame);
         },
         256 => { // unlinkat(dirfd, pathname, flags)
             // A volume dirfd was already answered by rofsGuard; other dirfds keep
@@ -3915,6 +3917,12 @@ fn syscallTruncate(path_ptr: u64, length: u64) i64 {
     const fd_result = cur.fd_table.openWithCredentials(use_name, 1, cur.euid, cur.egid, cur.effective_caps);
     if (fd_result < 0) return fd_result;
     const fd: u32 = @intCast(fd_result);
+    // truncate breaks leases like an open for writing, and waits for them (Linux do_truncate -> break_lease).
+    const brk = @import("../../fs/file_lock.zig").breakLease(cur.fd_table, fd, true, false);
+    if (brk < 0) {
+        _ = cur.fd_table.close(fd);
+        return brk;
+    }
     const result = truncateDesc(&cur.fd_table.fds[fd], length);
     _ = cur.fd_table.close(fd);
     return result;

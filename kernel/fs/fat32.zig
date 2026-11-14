@@ -554,6 +554,13 @@ pub fn getFileSize(idx: u32) u64 {
 /// still staged in the writeback buffer. Callers assign it to the descriptor's cached size outright (not `max` with the cache): after a
 /// truncate through another descriptor the file is SHORTER than the cache says, and a `max` would keep reporting the old length. Writes are staged per file (shared by all descriptors) and reach `files[idx].size` only when
 /// flushed, so a descriptor that did not do the write would otherwise report a stale size, read EOF too early and show 0 bytes.
+/// Is open slot `idx` a directory? False for a free slot.
+pub fn openIsDir(idx: u32) bool {
+    const flags = fs_lock.acquire();
+    defer fs_lock.release(flags);
+    return idx < file_count and files[idx].active and files[idx].is_dir;
+}
+
 pub fn currentSize(idx: u32) u64 {
     const flags = fs_lock.acquire();
     if (idx >= file_count or !files[idx].active) {
