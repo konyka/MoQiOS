@@ -9031,8 +9031,16 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - `kernel/proc/capability_profile.zig`：hello330 以 root 启动，只持有 SETUID。
   - `tests/main.zig`：hello183 J 对应的源码单测按新字段改写，并检查 `bound_uid` 已经不存在；UDP rebind 的签名单测同步。
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份，hello330 通过；`zig build test` 通过。
-- 完整 smoke：跑了两轮，每轮 SMP=1、SMP=4 两份、SMP=2 共四份。第一轮 SMP=1、SMP=2 是 EXIT=0、0 FAIL；两份 SMP=4 都只有 hello325 G 失败（`hits 0`：发送方填满缓冲区后，对端读空时没有收到 POLL_OUT），hello330 在四份里都通过。随后 hello325 单独在 SMP=4 跑两份都通过，第二轮四份全部 EXIT=0、0 FAIL，hello325 G 和 hello330 都通过，`corrupted canaries=0`。hello325 不用 SO_REUSEPORT，本次改动只动了属主字段，没有找到和它的联系；原因没有确认，记为偶发项。一个可能的方向是 tcp `fasync_queue` 只有 32 项、满了就丢通知，并行负载下 POLL_OUT 可能被丢掉，这一点未验证。riscv64、aarch64 smoke 通过。
+- 完整 smoke：跑了两轮，每轮 SMP=1、SMP=4 两份、SMP=2 共四份。第一轮 SMP=1、SMP=2 是 EXIT=0、0 FAIL；两份 SMP=4 都只有 hello325 G 失败（`hits 0`：发送方填满缓冲区后，对端读空时没有收到 POLL_OUT），hello330 在四份里都通过。随后 hello325 单独在 SMP=4 跑两份都通过，第二轮四份全部 EXIT=0、0 FAIL，hello325 G 和 hello330 都通过，`corrupted canaries=0`。hello325 不用 SO_REUSEPORT，本次改动只动了属主字段，没有找到和它的联系；原因见下一节"hello325 G 的计数清零时机"：是测试本身的时序问题，不是 `fasync_queue` 丢通知。riscv64、aarch64 smoke 通过。
 - 局限：
   1. SO_PEERCRED 和 SCM_CREDENTIALS 继续用 euid/egid，和 Linux 的 `cred_to_ucred` 一致，不属于这次改动。
   2. raw 套接字和 AF_UNIX 套接字没有端口共享，所以没有属主字段。
   3. 内核自己开的 UDP 端口（DHCP、DNS）属主是 0。
+
+### hello325 G 的计数清零时机（测试修正）
+
+- 现象：hello330 一节的第一轮完整 smoke 里，两份 SMP=4 的 hello325 G 失败，`hits 0`：发送方写满缓冲区（EAGAIN）后，对端读空时没有收到 POLL_OUT。单独跑能通过。
+- 原因：G 先写满，再 `quiet()`（约 40 ms），然后 `reset()` 清零计数，再让对端读空。对端缓冲区里已有数据的 ACK（延迟 ACK 100 ms）一到，发送环就腾出了空间，`noteWriteSpace` 在这时发 POLL_OUT，和 Linux `sk_stream_write_space` 在 ACK 释放空间时唤醒一致。负载重时这个 ACK 赶在 `reset()` 之前到达，信号被清掉了，之后对端读空也不会再发第二次。
+- 证实：把写满后的等待加长到 10 次 `quiet()`，SMP=2、SMP=4 定向都稳定失败，`hits 0`，和完整 smoke 里的失败一样。
+- 修正：`user/hello325.c` 把 `reset()` 移到写满之前，检查条件不变：至少一次 POLL_OUT，code 2，fd 是发送方。原来的等待时间和加长到 10 次 `quiet()` 两种情况，SMP=2、SMP=4 定向都通过；宿主机 Linux 上也通过。内核没有改动。
+- 完整 smoke：SMP=1、SMP=4 两份、SMP=2 共四份，全部 EXIT=0、0 FAIL，hello325 和 hello330 都通过，`corrupted canaries=0`。

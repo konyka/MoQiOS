@@ -8,7 +8,8 @@
  *   D. every segment of data that arrives sends POLL_IN to the receiver, also while earlier data is unread;
  *   E. the socket's own reads and writes signal nothing;
  *   F. clearing O_ASYNC stops the signals;
- *   G. a sender that filled its buffer (EAGAIN) gets POLL_OUT (2) once the peer drains it;
+ *   G. a sender that filled its buffer (EAGAIN) gets POLL_OUT (2) once space frees: by the ACK of data the peer has buffered, or when
+ *      the peer drains it;
  *   H. the peer's SHUT_WR (FIN) sends POLL_IN;
  *   I. O_ASYNC belongs to the description: a dup reads it back;
  *   J. a peer that closes with unread data resets the connection: POLL_ERR (4), band 0x8;
@@ -212,7 +213,10 @@ int main(void) {
     drain(s);
     fc(s, C_SETFL, fl(s) | A_SYNC);
 
+    /* The counters are cleared before filling, not after: an ACK for data already in the peer's buffer can free space and send the
+     * POLL_OUT before the peer reads anything (sk_stream_write_space), and clearing afterwards would erase it. */
     long g0 = 0, g1 = 0;
+    reset();
     for (int i = 0; i < 4000; i++) {
         g1 = sndnb(c, big, sizeof big);
         if (g1 < 0) break;
@@ -220,7 +224,6 @@ int main(void) {
         if (i % 8 == 7) pump();
     }
     quiet();
-    reset();
     drain(s);
     await(S_CLI, 1);
     snprintf(msg, sizeof msg, "G: a full sender gets POLL_OUT once the peer drains (queued %ld then %ld; hits %ld code %ld fd %ld/%d)", g0, g1, cnt[S_CLI], code[S_CLI],
