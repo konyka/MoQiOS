@@ -392,6 +392,16 @@ pub fn sendSignalToPgrpFiltered(pgid: u16, signum: u32, sender: ?*task.Task) u32
 
 /// Group broadcast carrying `info` (a lease break's POLL_MSG, see file_lock.breakLease).
 pub fn sendSignalToPgrpInfo(pgid: u16, signum: u32, sender: ?*task.Task, info: siginfo.Info) u32 {
+    return pgrpSend(pgid, signum, sender, null, info);
+}
+
+/// Group broadcast of a SIGIO-style signal to a -pgrp owner set by (`owner_uid`, `owner_euid`): members that credential may not
+/// signal are skipped (Linux send_sigio → sigio_perm for each member).
+pub fn sendSignalToPgrpSigio(pgid: u16, signum: u32, owner_uid: u32, owner_euid: u32, info: siginfo.Info) u32 {
+    return pgrpSend(pgid, signum, null, .{ owner_uid, owner_euid }, info);
+}
+
+fn pgrpSend(pgid: u16, signum: u32, sender: ?*task.Task, sigio_owner: ?[2]u32, info: siginfo.Info) u32 {
     if (signum == 0 or signum > MAX_SIGNAL) return 0;
     const action = defaultAction(signum);
     var sent: u32 = 0;
@@ -400,6 +410,9 @@ pub fn sendSignalToPgrpInfo(pgid: u16, signum: u32, sender: ?*task.Task, info: s
         if (t.pgid != pgid or t.state == .zombie) continue;
         if (sender) |snd| {
             if (!@import("signal_syscall.zig").maySignal(snd, t)) continue;
+        }
+        if (sigio_owner) |o| {
+            if (!@import("signal_perm_policy.zig").sigioAllowed(o[0], o[1], .{ .uid = t.uid, .euid = t.euid, .suid = t.suid })) continue;
         }
         sent += 1;
         _ = recordSendInfo(t, signum, info);

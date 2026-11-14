@@ -12472,6 +12472,20 @@ test "fcntl policy: F_SETOWN and F_SETSIG arguments, and the siginfo a lease bre
     for ([_]u8{ 4, 5, 7, 8, 11, 17, 31 }) |sig| try std.testing.expectEqual(@as(i32, -5), fp.leaseBreakSignal(sig, 5).info.code);
 }
 
+test "signal permission: SIGIO reaches a target when the owner setter's euid is root or its uid/euid matches the target's uid/suid" {
+    const sp = kt.signal_perm_policy;
+    const t1: sp.Creds = .{ .uid = 1, .euid = 1, .suid = 1 };
+    const root: sp.Creds = .{ .uid = 0, .euid = 0, .suid = 0 };
+    try std.testing.expect(!sp.sigioAllowed(1, 1, root)); // A
+    try std.testing.expect(sp.sigioAllowed(0, 1, root)); // B: setter uid 0
+    try std.testing.expect(sp.sigioAllowed(1, 0, root)); // C: setter euid 0
+    try std.testing.expect(sp.sigioAllowed(0, 0, t1)); // E: root reaches anyone
+    try std.testing.expect(sp.sigioAllowed(1, 1, .{ .uid = 2, .euid = 2, .suid = 1 })); // F: target suid
+    try std.testing.expect(sp.sigioAllowed(1, 1, .{ .uid = 1, .euid = 2, .suid = 2 })); // G: target uid
+    try std.testing.expect(!sp.sigioAllowed(1, 1, .{ .uid = 2, .euid = 1, .suid = 2 })); // H: the target's euid does not count
+    try std.testing.expect(sp.sigioAllowed(1, 3, .{ .uid = 2, .euid = 2, .suid = 3 })); // setter euid vs target suid
+}
+
 test "fcntl policy: F_SETOWN_EX owner types TID/PID/PGRP and what F_GETOWN_EX and F_GETOWN report" {
     const fp = kt.fcntl_policy;
     try std.testing.expectEqual(@as(u8, 0), fp.F_OWNER_TID);

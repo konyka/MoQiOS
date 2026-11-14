@@ -8709,7 +8709,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello318 PASS、hello316 PASS 和 `hello228: corrupted canaries=0`。
 - 局限：
   1. owner 和 sig 只用于租约打破。没有 `O_ASYNC`/`FASYNC`，socket、pipe、tty 的 I/O 就绪不发 `SIGIO`。（pipe 已在 hello320 一节实现；socket、tty 仍未做）
-  2. 没有 `F_SETOWN_EX`/`F_GETOWN_EX`，也没有 `sigio_perm` 的 uid 权限检查。（`F_SETOWN_EX`/`F_GETOWN_EX` 已在 hello321 一节实现；`sigio_perm` 仍未做）
+  2. 没有 `F_SETOWN_EX`/`F_GETOWN_EX`，也没有 `sigio_perm` 的 uid 权限检查。（`F_SETOWN_EX`/`F_GETOWN_EX` 已在 hello321 一节实现；`sigio_perm` 已在 hello322 一节实现）
   3. pipe 等不走共享 offset 槽的描述符，dup 后 owner/sig 是各自的副本，不共享。（pipe 已在 hello320 一节修复：管道两端也用共享槽；eventfd、socket 等仍是副本）
   4. pgid 是 u16；只做了 x86_64 的 fcntl 分派。（`CAP_LEASE` 和属主检查已在 hello319 一节实现）
 
@@ -8767,6 +8767,23 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello321 A–K 全过。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello321、hello320、hello319、hello318、hello316 PASS 和 `hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
 - 局限：
-  1. 仍然没有 `sigio_perm` 的 uid 检查（Linux 要求发送时 owner 的凭据允许给目标发信号）。
+  1. 仍然没有 `sigio_perm` 的 uid 检查（Linux 要求发送时 owner 的凭据允许给目标发信号）。（已在 hello322 一节实现）
   2. TID owner 的线程退出后，Linux 的 pid 引用会让信号落空；这里按 tid 查找，tid 被重用时可能发给新任务。
   3. pgid 仍是 u16；只做了 x86_64 的 fcntl 分派。
+
+### SIGIO 的发送权限 `sigio_perm`（hello322，已修）
+
+- 问题：设置 owner 时不记录设置者的凭据，发 `SIGIO`（`O_ASYNC`、租约打破）时也不检查权限，所以 uid 1 的进程可以把 root 的进程设为 owner，让它收到信号。
+- Linux 依据：`fs/fcntl.c` 的 `__f_setown` 在设置 owner 时记下 `cred->uid`、`cred->euid`；`send_sigio_to_task` 先调用 `sigio_perm`：owner 的 euid 是初始命名空间的 root，或者 owner 的 euid、uid 等于目标的 suid 或 uid，才发送。目标的 euid 和设置者的 suid 都不参与比较。-pgrp owner 对每个组员单独检查。
+- 宿主机实测（无 sudo，在 `unshare --map-auto --map-root-user` 的用户命名空间里跑 `/tmp/sperm.c`，再以 `gcc -DHOST` 跑 `user/hello322.c`，A–K 全过）：uid 1 设置的 owner 收不到（A）；设置者 uid 0 或 euid 0 时收到（B、C）；只有 suid 是 0 时收不到（D）；目标 suid 或 uid 等于设置者的 uid 时收到，只有目标 euid 相等时收不到（F–H）；凭据在设置 owner 时记录，之后设置者降权不影响（I）；`F_SETOWN_EX` 同样记录（J）；-pgrp owner 只发给允许的组员（K）。E（root 设置者能发给任何目标）在命名空间里不成立，因为命名空间的 root 不是 `GLOBAL_ROOT_UID`，测试在宿主机上按 `/proc/self/uid_map` 判断，目标机上要求成立。
+- 红灯：在未修改的内核上定向 SMP=2，hello322 A、D、F–H、J、K 失败（都收到了信号）。宿主机单测「signal permission: SIGIO reaches a target…」先编译失败（缺 `sigioAllowed`）。第一次红灯跑时 hello322 没有 `CAP_SETUID`，子进程 `setresuid` 失败；已在 `capability_profile.zig` 让它和 hello183 一样以 root、只带 `cap_setuid` 启动。
+- 修复：
+  - `kernel/proc/signal_perm_policy.zig`：`sigioAllowed(owner_uid, owner_euid, target)`。
+  - `kernel/fs/shared_offset.zig`：每个槽新增 `setter_uids`/`setter_euids`；`kernel/fs/vfs.zig`：`FileDescriptor.fown_uid`/`fown_euid`，promote 时一起搬进槽；`Fown.uid`/`euid`；`setFownOf`、`setOwnerEx` 用 `setterCreds()` 记录当前任务的 uid、euid（租约的 `F_SETLEASE` 设置 owner 时也会记录）。
+  - `vfs.sendToOwner`：pid owner 先查目标任务并检查 `sigioAllowed`；-pgrp owner 走新的 `signal.sendSignalToPgrpSigio`，逐个组员检查。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello322 A–K 全过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒）：三份 `EXIT=0`、0 FAIL；一份 SMP=4 只有已记录的偶发项 hello286 J（55/60 次组停止被报告）失败，hello286 单独在 SMP=4 定向重跑两次都 PASS。四份都有 hello322、hello321、hello320、hello319、hello318、hello316、hello183 PASS 和 `hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
+- 局限：
+  1. 没有用户命名空间，euid 0 一律视为 `GLOBAL_ROOT_UID`。
+  2. 没有 LSM 的 `security_file_send_sigiotask`。
+  3. `F_SETOWN 0` 清除 owner 时也会更新记录的凭据（Linux 只在 pid 非空时更新）；清除后不发信号，所以没有可见差别。

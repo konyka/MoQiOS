@@ -24,6 +24,14 @@ pub fn mayKill(sender_tid: u32, pid: i64, has_cap_kill: bool) bool {
 /// Credentials relevant to signal permission (POSIX kill(2)).
 pub const Creds = struct { uid: u32, euid: u32, suid: u32 };
 
+/// Linux sigio_perm: a SIGIO-style signal (O_ASYNC, a lease break) reaches `target` when the credentials recorded with the
+/// owner (the uid and euid of whoever set it, __f_setown) have euid root, or that euid or uid equals the target's uid or saved
+/// uid. The target's euid does not count, and neither does the setter's saved uid.
+pub fn sigioAllowed(owner_uid: u32, owner_euid: u32, target: Creds) bool {
+    return owner_euid == 0 or owner_euid == target.suid or owner_euid == target.uid or
+        owner_uid == target.suid or owner_uid == target.uid;
+}
+
 /// POSIX: an unprivileged sender may signal a target when the sender's real
 /// or effective uid equals the target's real or saved uid. Privileged
 /// (cap_kill) senders may signal anyone; signalling oneself is always fine.

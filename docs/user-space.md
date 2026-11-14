@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello321`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello322`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -316,6 +316,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello319 | `F_SETLEASE` 要求是文件属主或持有 `CAP_LEASE`（以 uid 1000、只带 `CAP_LEASE` 启动）：自己建的文件可拿租约（A）；持 `CAP_LEASE` 时 root 的文件可拿（B）；`capget` 把 `CAP_LEASE` 报为第 28 位，`capset` 能放弃它（C）；放弃后 root 的文件 `F_RDLCK`/`F_WRLCK`/`F_UNLCK` 都是 `EACCES`，类型 7、-1 仍是 `EINVAL`（D）；`/dev/null`、eventfd 是 `EACCES`，管道、目录是 `EINVAL`（E）；自己的文件仍可拿（F） |
 | hello320 | 管道上的 `O_ASYNC`：`F_SETFL O_ASYNC` 成功，`F_GETFL` 读回 0x2000/0x2001，没有 owner 不发信号（A）；sig 0 时每次写入发 `SIGIO`/`SI_KERNEL`（B）；`F_SETSIG 40` 时写入发 `POLL_IN`、band 0x41、读端 fd（C）；读出数据给写端发 `POLL_OUT`、band 0x304、写端 fd（D）；关闭写端给读端发 `POLL_IN`，读到 EOF 不发（E）；关闭读端给写端发 `POLL_OUT`，之后 `EPIPE` 不发（F）；清除后不发（G）；dup、fork 共享这一位（H）；子进程写入发给父进程（I）；-pgrp owner（J）；`/dev/null`、普通文件接受但不保留（K）；关闭两个描述符之一后照常发（L） |
 | hello321 | `F_SETOWN_EX`/`F_GETOWN_EX`：新打开是 TID 0（A）；`F_SETOWN` 的 pid 读回 PID，-pgrp 读回 PGRP（B）；三种类型设置并读回（C）；坏类型 `EINVAL`（D）；不存在或负的 id `ESRCH`（E）；id 0 保留类型（F）；`EFAULT`/`EBADF`（G）；dup、fork 共享（H）；`F_SETLEASE` 设 PID owner、保留 TID owner（I）；O_ASYNC 管道的 TID owner 只由那个线程收到（J）；PID owner 收到进程定向信号，主线程屏蔽时转给其他线程（K） |
+| hello322 | SIGIO 的发送权限（以 root、只带 `CAP_SETUID` 启动，子进程用 `setresuid` 换身份）：uid 1 设置的 owner 收不到（A）；设置者 uid 0、euid 0 时收到（B、C）；只有 suid 0 不算（D）；root 设置者能发给 uid 1（E）；目标 suid、uid 匹配时收到，只有 euid 匹配时收不到（F–H）；凭据在设置时记录（I）；`F_SETOWN_EX` 同样（J）；-pgrp owner 只发给允许的组员（K） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

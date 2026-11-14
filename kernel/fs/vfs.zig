@@ -857,6 +857,7 @@ fn shareOffsetFor(desc: *FileDescriptor) u16 {
         shared_offsets.setOwner(slot, desc.fown);
         shared_offsets.setSignal(slot, desc.fsig);
         shared_offsets.setKind(slot, desc.fown_kind);
+        shared_offsets.setSetter(slot, desc.fown_uid, desc.fown_euid);
         desc.offset_slot = slot; // the original is the first holder
     }
     shared_offsets.retain(desc.offset_slot); // the copy is the next
@@ -891,46 +892,68 @@ pub fn statusFlagsOf(desc: *FileDescriptor) u32 {
 
 /// F_GETOWN / F_GETSIG: the owner (pid, -pgrp or 0) and signal (0: SIGIO) of the whole open file description.
 /// `kind` is the F_SETOWN_EX type (fcntl_policy.F_OWNER_*): a TID owner is signalled as that thread, a PID owner as its process.
-pub const Fown = struct { owner: i32, sig: u8, kind: u8 = 1 };
+/// `uid`/`euid` are the credentials of whoever set the owner (Linux sigio_perm checks them against each target).
+pub const Fown = struct { owner: i32, sig: u8, kind: u8 = 1, uid: u32 = 0, euid: u32 = 0 };
+
+/// The caller's uid and euid, recorded when it sets an owner (no current task: a kernel caller, recorded as root).
+fn setterCreds() [2]u32 {
+    const t = @import("../proc/sched.zig").currentTask() orelse return .{ 0, 0 };
+    return .{ t.uid, t.euid };
+}
 
 pub fn fownOf(desc: *FileDescriptor) Fown {
-    if (desc.offset_slot == 0) return .{ .owner = desc.fown, .sig = desc.fsig, .kind = desc.fown_kind };
+    if (desc.offset_slot == 0) return .{ .owner = desc.fown, .sig = desc.fsig, .kind = desc.fown_kind, .uid = desc.fown_uid, .euid = desc.fown_euid };
     const f = shared_offsets_lock.acquire();
     defer shared_offsets_lock.release(f);
-    const slot = desc.offset_slot;
-    return .{ .owner = shared_offsets.owner(slot), .sig = shared_offsets.signal(slot), .kind = shared_offsets.kind(slot) };
+    return slotFown(desc.offset_slot);
+}
+
+/// The owner kept in shared slot `slot`. Caller holds shared_offsets_lock.
+fn slotFown(slot: u16) Fown {
+    const who = shared_offsets.setter(slot);
+    return .{ .owner = shared_offsets.owner(slot), .sig = shared_offsets.signal(slot), .kind = shared_offsets.kind(slot), .uid = who[0], .euid = who[1] };
 }
 
 /// F_SETOWN_EX: set the owner and its type together (the id was checked by the caller).
 pub fn setOwnerEx(desc: *FileDescriptor, owner: i32, kind: u8) void {
+    const who = setterCreds();
     const f = shared_offsets_lock.acquire();
     defer shared_offsets_lock.release(f);
     desc.fown = owner;
     desc.fown_kind = kind;
+    desc.fown_uid = who[0];
+    desc.fown_euid = who[1];
     if (desc.offset_slot != 0) {
         shared_offsets.setOwner(desc.offset_slot, owner);
         shared_offsets.setKind(desc.offset_slot, kind);
+        shared_offsets.setSetter(desc.offset_slot, who[0], who[1]);
     }
 }
 
 /// Send a SIGIO-style signal to a description's owner (Linux send_sigio): a TID owner gets it as that thread, a PID owner as a
-/// process-directed signal (any thread that does not block it), -pgrp every member of the group; owner 0 nobody.
+/// process-directed signal (any thread that does not block it), -pgrp every member of the group; owner 0 nobody. A target the
+/// owner's setter may not signal (signal_perm_policy.sigioAllowed) is skipped.
 pub fn sendToOwner(fo: Fown, signo: u32, info: @import("../proc/siginfo_policy.zig").Info) void {
     const sig_mod = @import("../proc/signal.zig");
     if (fo.owner > 0) {
         const tid: u32 = @intCast(fo.owner);
+        const task_mod = @import("../proc/task.zig");
+        const idx = task_mod.findTaskByTid(tid) orelse return;
+        const target = task_mod.getTask(idx) orelse return;
+        if (!@import("../proc/signal_perm_policy.zig").sigioAllowed(fo.uid, fo.euid, .{ .uid = target.uid, .euid = target.euid, .suid = target.suid })) return;
         if (fo.kind == @import("fcntl_policy.zig").F_OWNER_TID) {
             _ = sig_mod.sendSignalInfo(tid, signo, info);
         } else {
             _ = @import("../proc/signal_syscall.zig").sendToProcessInfo(tid, signo, info);
         }
     } else if (fo.owner < 0 and -fo.owner <= 0xffff) {
-        _ = sig_mod.sendSignalToPgrpInfo(@intCast(-fo.owner), signo, null, info);
+        _ = sig_mod.sendSignalToPgrpSigio(@intCast(-fo.owner), signo, fo.uid, fo.euid, info);
     }
 }
 
 /// F_SETOWN (`owner`), F_SETSIG (`sig`); `only_if_unowned`: set the owner only when there is none (Linux lease_setup).
 pub fn setFownOf(desc: *FileDescriptor, owner: ?i32, sig: ?u8, only_if_unowned: bool) void {
+    const who = setterCreds();
     const f = shared_offsets_lock.acquire();
     defer shared_offsets_lock.release(f);
     const slot = desc.offset_slot;
@@ -940,9 +963,12 @@ pub fn setFownOf(desc: *FileDescriptor, owner: ?i32, sig: ?u8, only_if_unowned: 
             const kind = @import("fcntl_policy.zig").setownKind(o);
             desc.fown = o;
             desc.fown_kind = kind;
+            desc.fown_uid = who[0];
+            desc.fown_euid = who[1];
             if (slot != 0) {
                 shared_offsets.setOwner(slot, o);
                 shared_offsets.setKind(slot, kind);
+                shared_offsets.setSetter(slot, who[0], who[1]);
             }
         }
     }
@@ -959,7 +985,7 @@ pub fn fownOfDescription(owner_id: u64) ?Fown {
     const slot: u16 = @truncate(owner_id);
     const f = shared_offsets_lock.acquire();
     defer shared_offsets_lock.release(f);
-    return .{ .owner = shared_offsets.owner(slot), .sig = shared_offsets.signal(slot), .kind = shared_offsets.kind(slot) };
+    return slotFown(slot);
 }
 
 /// Publish the descriptor's offset to everyone who shares it.
@@ -1002,6 +1028,7 @@ pub fn flockOwner(table: *FdTable, fd: u32) ?u64 {
         shared_offsets.setOwner(slot, desc.fown);
         shared_offsets.setSignal(slot, desc.fsig);
         shared_offsets.setKind(slot, desc.fown_kind);
+        shared_offsets.setSetter(slot, desc.fown_uid, desc.fown_euid);
         desc.offset_slot = slot;
     }
     return 0x4000_0000_0000_0000 | @as(u64, desc.offset_slot);
@@ -1095,6 +1122,9 @@ pub const FileDescriptor = struct {
     fsig: u8 = 0,
     /// F_SETOWN_EX type of `fown` (fcntl_policy.F_OWNER_*); a fresh open reads back TID with id 0, as on Linux.
     fown_kind: u8 = 0,
+    /// uid and euid of whoever set `fown` (Linux __f_setown), for the SIGIO permission check.
+    fown_uid: u32 = 0,
+    fown_euid: u32 = 0,
     readahead_state: readahead.ReadaheadState = .{},
     // inode identifier for file locking (unique per underlying file)
     inode_id: u64 = 0,

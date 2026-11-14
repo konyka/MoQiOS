@@ -129,9 +129,10 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // Lease permission test: uid 1000 holding only CAP_LEASE, dropped with capset to see the EACCES refusals.
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_lease = true }, .initial_init = false };
     }
-    if (std.mem.eql(u8, name, "hello183")) {
+    if (std.mem.eql(u8, name, "hello183") or std.mem.eql(u8, name, "hello322")) {
         // Starts as root with CAP_SETUID only (no CAP_NET_BIND) so the child's setuid() leaves it unprivileged,
         // while the parent's own privileged-port expectations do not apply (it binds only high ports).
+        // hello322 (SIGIO permission) has children take uid/euid/suid combinations with setresuid.
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_setuid = true }, .initial_init = false };
     }
     if (std.mem.eql(u8, name, "hello179")) {

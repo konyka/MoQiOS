@@ -18,6 +18,9 @@ pub fn Pool(comptime N: usize) type {
         signals: [N + 1]u8 = @splat(0),
         /// F_SETOWN_EX type of the owner: 0 TID, 1 PID, 2 PGRP.
         kinds: [N + 1]u8 = @splat(0),
+        /// uid and euid of whoever set the owner (Linux fown_struct.uid/euid), checked when a SIGIO is sent.
+        setter_uids: [N + 1]u32 = @splat(0),
+        setter_euids: [N + 1]u32 = @splat(0),
 
         /// Move `offset` into a fresh slot with one holder. Null when the pool is full.
         pub fn promote(self: *Self, offset: u64) ?u16 {
@@ -30,6 +33,8 @@ pub fn Pool(comptime N: usize) type {
                     self.owners[i] = 0;
                     self.signals[i] = 0;
                     self.kinds[i] = 0;
+                    self.setter_uids[i] = 0;
+                    self.setter_euids[i] = 0;
                     return @intCast(i);
                 }
             }
@@ -87,6 +92,15 @@ pub fn Pool(comptime N: usize) type {
 
         pub fn setKind(self: *Self, slot: u16, v: u8) void {
             self.kinds[slot] = v;
+        }
+
+        pub fn setter(self: *const Self, slot: u16) [2]u32 {
+            return .{ self.setter_uids[slot], self.setter_euids[slot] };
+        }
+
+        pub fn setSetter(self: *Self, slot: u16, uid: u32, euid: u32) void {
+            self.setter_uids[slot] = uid;
+            self.setter_euids[slot] = euid;
         }
     };
 }
