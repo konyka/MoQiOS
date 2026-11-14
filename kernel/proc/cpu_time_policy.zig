@@ -3,6 +3,7 @@
 //! child that was waited for flows up to the waiter (getrusage(RUSAGE_CHILDREN),
 //! wait4's rusage).
 
+const std = @import("std");
 const rusage_policy = @import("rusage_policy.zig");
 
 pub const Times = struct {
@@ -15,6 +16,32 @@ pub const Times = struct {
         return a.user_us +| a.sys_us;
     }
 };
+
+/// A task's CPU counters (utime_us, stime_us, sched_in_tsc) change together at a context switch. A reader on another CPU that
+/// saw half of such a change would count a slice twice or not at all, and the CPU clocks would step backwards. The writer makes
+/// the sequence odd for the change and even again after it; a reader retries until it read the counters under one even value.
+/// The writer must not be interrupted by another writer of the same task (it runs with interrupts off).
+pub fn writeBegin(seq: *u32) void {
+    _ = @atomicRmw(u32, seq, .Add, 1, .acq_rel);
+}
+
+pub fn writeEnd(seq: *u32) void {
+    _ = @atomicRmw(u32, seq, .Add, 1, .release);
+}
+
+/// The even sequence value to read under (waits out a write in progress).
+pub fn readBegin(seq: *const u32) u32 {
+    while (true) {
+        const s = @atomicLoad(u32, seq, .acquire);
+        if (s & 1 == 0) return s;
+        std.atomic.spinLoopHint();
+    }
+}
+
+/// True when a write happened since `start`: the counters read must be thrown away.
+pub fn readRetry(seq: *const u32, start: u32) bool {
+    return @atomicLoad(u32, seq, .acquire) != start;
+}
 
 /// One task slot of a thread group, as the scan sees it.
 pub const Member = struct {

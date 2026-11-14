@@ -98,6 +98,7 @@ fn cpuTimeNs(thread: bool) u64 {
     const idx = sched.currentTaskIndex() orelse return 0;
     const t = task_mod.getTask(idx) orelse return 0;
     if (!thread) return task_mod.processCpuTimes(idx, tsc.read(), tsc.tsc_freq_mhz).selfUs() *| 1000;
-    const in_flight = rusage_policy.runtimeUs(0, t.sched_in_tsc, tsc.read(), tsc.tsc_freq_mhz);
-    return (t.utime_us +| t.stime_us +| in_flight) *| 1000;
+    const m = task_mod.cpuSnapshot(t);
+    const in_flight = rusage_policy.runtimeUs(0, m.sched_in_tsc, tsc.read(), tsc.tsc_freq_mhz);
+    return (m.user_us +| m.sys_us +| in_flight) *| 1000;
 }

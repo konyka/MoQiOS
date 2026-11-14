@@ -20,6 +20,7 @@ const sched_pass_policy = @import("sched_pass_policy.zig");
 const wake_preempt_policy = @import("wake_preempt_policy.zig");
 const rt_bandwidth_policy = @import("rt_bandwidth_policy.zig");
 const ipi_kick_policy = @import("ipi_kick_policy.zig");
+const cpu_time_policy = @import("cpu_time_policy.zig");
 const sched_claim = @import("sched_claim.zig");
 const sched_queue_policy = @import("sched_queue_policy.zig");
 const per_cpu = @import("per_cpu.zig");
@@ -563,8 +564,11 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
     // CPU time accounting: accumulate time spent in this task
     const tsc_mod = @import("../arch/arch.zig").tsc;
     const now_tsc = tsc_mod.read();
+    // The slice is folded and sched_in_tsc cleared in one sequence-counted step: a reader on another CPU (a CPU clock, a CPU
+    // timer tick) must never see the slice both folded and still in flight, nor a stale start once the task is off the CPU.
+    cpu_time_policy.writeBegin(&old_task.cpu_seq);
     if (old_task.sched_in_tsc != 0 and tsc_mod.tsc_freq_mhz != 0) {
-        const elapsed_tsc = now_tsc - old_task.sched_in_tsc;
+        const elapsed_tsc = now_tsc -| old_task.sched_in_tsc;
         const elapsed_us = elapsed_tsc / tsc_mod.tsc_freq_mhz;
         if (old_task.is_user) {
             old_task.utime_us += elapsed_us;
@@ -576,7 +580,11 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
             .voluntary => old_task.nvcsw += 1,
         }
     }
+    old_task.sched_in_tsc = 0;
+    cpu_time_policy.writeEnd(&old_task.cpu_seq);
+    cpu_time_policy.writeBegin(&new_task.cpu_seq);
     new_task.sched_in_tsc = now_tsc;
+    cpu_time_policy.writeEnd(&new_task.cpu_seq);
 
     if (old_task.state == .running) {
         old_task.state = .ready;
@@ -937,8 +945,11 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
     // CPU time accounting: accumulate time spent in this task
     const tsc_mod = @import("../arch/arch.zig").tsc;
     const now_tsc = tsc_mod.read();
+    // The slice is folded and sched_in_tsc cleared in one sequence-counted step: a reader on another CPU (a CPU clock, a CPU
+    // timer tick) must never see the slice both folded and still in flight, nor a stale start once the task is off the CPU.
+    cpu_time_policy.writeBegin(&old_task.cpu_seq);
     if (old_task.sched_in_tsc != 0 and tsc_mod.tsc_freq_mhz != 0) {
-        const elapsed_tsc = now_tsc - old_task.sched_in_tsc;
+        const elapsed_tsc = now_tsc -| old_task.sched_in_tsc;
         const elapsed_us = elapsed_tsc / tsc_mod.tsc_freq_mhz;
         if (old_task.is_user) {
             old_task.utime_us += elapsed_us;
@@ -950,7 +961,11 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
             .voluntary => old_task.nvcsw += 1,
         }
     }
+    old_task.sched_in_tsc = 0;
+    cpu_time_policy.writeEnd(&old_task.cpu_seq);
+    cpu_time_policy.writeBegin(&new_task.cpu_seq);
     new_task.sched_in_tsc = now_tsc;
+    cpu_time_policy.writeEnd(&new_task.cpu_seq);
 
     if (!new_task.started) {
         setupInitialFrame(new_task);

@@ -6264,9 +6264,10 @@ fn syscallGetrusage(who_raw: u64, usage_ptr: u64) i64 {
 
     // Context-switch accounting folds each slice into utime/stime by
     // privilege class; add the slice this task is running right now.
-    const in_flight = rusage_policy.runtimeUs(0, cur.sched_in_tsc, tsc.read(), tsc.tsc_freq_mhz);
-    var user_us: u64 = if (cur.is_user) cur.utime_us +| in_flight else cur.utime_us;
-    var sys_us: u64 = if (cur.is_user) cur.stime_us else cur.stime_us +| in_flight;
+    const snap = tm.cpuSnapshot(cur);
+    const in_flight = rusage_policy.runtimeUs(0, snap.sched_in_tsc, tsc.read(), tsc.tsc_freq_mhz);
+    var user_us: u64 = if (cur.is_user) snap.user_us +| in_flight else snap.user_us;
+    var sys_us: u64 = if (cur.is_user) snap.sys_us else snap.sys_us +| in_flight;
     if (who != .thread) {
         // RUSAGE_SELF / RUSAGE_CHILDREN are process-wide: every thread, and
         // the children this process has waited for.

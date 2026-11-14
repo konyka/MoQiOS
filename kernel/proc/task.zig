@@ -27,6 +27,7 @@ const task_slot_lifetime = @import("task_slot_lifetime.zig");
 const reap_policy = @import("reap_policy.zig");
 const reaper = @import("reaper.zig");
 const cpu_time_policy = @import("cpu_time_policy.zig");
+const arch_irq_ctl = @import("../arch/arch.zig").irq;
 
 const PAGE_SIZE: u64 = 4096;
 const KERNEL_STACK_PAGES: u64 = 32;
@@ -274,8 +275,12 @@ pub const Task = struct {
     dead_stime_us: u64 = 0,
     child_utime_us: u64 = 0,
     child_stime_us: u64 = 0,
-    /// Last TSC value when this task was scheduled in (for CPU time accounting).
+    /// TSC value when this task was scheduled in, while it is on a CPU; 0 once its slice has been folded into utime_us/stime_us
+    /// (switch-out, exit). Readers count a slice in flight only when this is nonzero.
     sched_in_tsc: u64 = 0,
+    /// Sequence count over utime_us/stime_us/sched_in_tsc (cpu_time_policy.writeBegin/readBegin): odd while a context switch or
+    /// exit is changing them.
+    cpu_seq: u32 = 0,
     /// Number of voluntary context switches.
     nvcsw: u64 = 0,
     /// Number of involuntary context switches.
@@ -1185,9 +1190,14 @@ pub fn exitTask(requested_code: i32) void {
     // (the switch-out accounting skips a task whose sched_in_tsc is 0).
     {
         const tsc_mod = @import("../arch/arch.zig").tsc;
+        // Interrupts off: a context switch of this task inside the write would nest a second writer in the sequence count.
+        const irq_flags = arch_irq_ctl.saveAndDisable();
+        cpu_time_policy.writeBegin(&t.cpu_seq);
         const slice = @import("rusage_policy.zig").runtimeUs(0, t.sched_in_tsc, tsc_mod.read(), tsc_mod.tsc_freq_mhz);
         if (t.is_user) t.utime_us +|= slice else t.stime_us +|= slice;
         t.sched_in_tsc = 0;
+        cpu_time_policy.writeEnd(&t.cpu_seq);
+        arch_irq_ctl.restore(irq_flags);
     }
     const flags = task_lock.acquire();
     t.exit_code = exit_code;
@@ -1506,6 +1516,23 @@ fn groupLeaderLocked(gid: u32, skip: u32) ?u32 {
     return null;
 }
 
+/// A consistent read of a task's CPU counters (see Task.cpu_seq). The slice in flight counts while sched_in_tsc is set, that is
+/// from switch-in until the switch-out (or exit) folds it; the task state is not consulted, since a task can be .running before
+/// its switch-in or .blocked before its switch-out.
+pub fn cpuSnapshot(m: *const Task) cpu_time_policy.Member {
+    while (true) {
+        const seq = cpu_time_policy.readBegin(&m.cpu_seq);
+        const snap: cpu_time_policy.Member = .{
+            .user_us = @atomicLoad(u64, &m.utime_us, .monotonic),
+            .sys_us = @atomicLoad(u64, &m.stime_us, .monotonic),
+            .running = @atomicLoad(u64, &m.sched_in_tsc, .monotonic) != 0,
+            .is_user = m.is_user,
+            .sched_in_tsc = @atomicLoad(u64, &m.sched_in_tsc, .monotonic),
+        };
+        if (!cpu_time_policy.readRetry(&m.cpu_seq, seq)) return snap;
+    }
+}
+
 /// CPU time of the thread group `gid` (task_lock held): every live member,
 /// the time of reclaimed threads, and the children the leader waited for.
 fn groupTimesLocked(gid: u32, now_tsc: u64, tsc_mhz: u64) cpu_time_policy.Times {
@@ -1517,13 +1544,7 @@ fn groupTimesLocked(gid: u32, now_tsc: u64, tsc_mhz: u64) cpu_time_policy.Times 
         const m = &tasks[j];
         const in_group = if (m.is_thread) m.parent_tid == gid else m.tid == gid;
         if (!in_group) continue;
-        total = cpu_time_policy.addMember(total, .{
-            .user_us = m.utime_us,
-            .sys_us = m.stime_us,
-            .running = sched_claim.load(&m.state) == .running,
-            .is_user = m.is_user,
-            .sched_in_tsc = m.sched_in_tsc,
-        }, now_tsc, tsc_mhz);
+        total = cpu_time_policy.addMember(total, cpuSnapshot(m), now_tsc, tsc_mhz);
         if (!m.is_thread) {
             total.user_us +|= m.dead_utime_us;
             total.sys_us +|= m.dead_stime_us;
@@ -1553,9 +1574,9 @@ pub fn cpuClockNs(idx: u32, tid: u32, thread: bool, now_tsc: u64, tsc_mhz: u64) 
     const t = getTask(idx) orelse return null;
     if (t.tid != tid or t.state == .zombie) return null;
     if (thread) {
-        const running = sched_claim.load(&t.state) == .running;
-        const slice = if (running) @import("rusage_policy.zig").runtimeUs(0, t.sched_in_tsc, now_tsc, tsc_mhz) else 0;
-        return (t.utime_us +| t.stime_us +| slice) *| 1000;
+        const m = cpuSnapshot(t);
+        const slice = if (m.running) @import("rusage_policy.zig").runtimeUs(0, m.sched_in_tsc, now_tsc, tsc_mhz) else 0;
+        return (m.user_us +| m.sys_us +| slice) *| 1000;
     }
     const gid = if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid;
     return groupTimesLocked(gid, now_tsc, tsc_mhz).selfUs() *| 1000;

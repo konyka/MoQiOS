@@ -12332,3 +12332,29 @@ test "lock table: EDEADLK when a wait would close a cycle of owners" {
     try std.testing.expect(!lt.wouldDeadlock(1, 5, &c));
 }
 
+
+test "cpu_time_policy: the CPU counter sequence count makes readers retry across a switch (hello314)" {
+    const ct = kt.cpu_time_policy;
+    var seq: u32 = 0;
+    const s0 = ct.readBegin(&seq);
+    try std.testing.expect(!ct.readRetry(&seq, s0));
+    ct.writeBegin(&seq);
+    try std.testing.expect(seq & 1 == 1);
+    try std.testing.expect(ct.readRetry(&seq, s0));
+    ct.writeEnd(&seq);
+    try std.testing.expect(ct.readRetry(&seq, s0));
+    const s1 = ct.readBegin(&seq);
+    try std.testing.expect(s1 & 1 == 0 and s1 != s0);
+    try std.testing.expect(!ct.readRetry(&seq, s1));
+
+    // Both switch paths fold the slice and clear sched_in_tsc inside one write; readers go through cpuSnapshot.
+    const sched_src = kt.sched_source;
+    var n: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, sched_src, from, "    old_task.sched_in_tsc = 0;\n    cpu_time_policy.writeEnd(&old_task.cpu_seq);")) |at| : (from = at + 1) n += 1;
+    try std.testing.expectEqual(@as(usize, 2), n);
+    const task_src = kt.task_source;
+    try std.testing.expect(std.mem.indexOf(u8, task_src, "total = cpu_time_policy.addMember(total, cpuSnapshot(m), now_tsc, tsc_mhz);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, task_src, ".running = @atomicLoad(u64, &m.sched_in_tsc, .monotonic) != 0,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.time_syscall_source, "const m = task_mod.cpuSnapshot(t);") != null);
+}

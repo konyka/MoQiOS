@@ -8588,3 +8588,23 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 不使用共享偏移的描述符类型（`vfs.usesSharedOffset` 为假），`flockOwner` 给的是逐描述符的属主（`privateFlockOwner`），所以在这类描述符上，`dup` 出来的副本不共享 OFD 锁。普通文件（tmpfs、FAT32、ext2）使用共享偏移，不受影响。
   2. 打开文件描述的属主取自共享偏移池（512 槽），池满时 OFD 命令返回 `ENOLCK`，与 `flock` 相同。
   3. 和普通 `fcntl` 锁一样，等待仍是每 10 ms 重查一次。
+
+## CPU 时间时钟在多核上会倒退，线程时钟定时器在线程睡眠时误触发（hello314，已修）
+
+- 起因：`497ba27` 的 CI 在 SMP=2 上失败，hello308 F「the thread timer does not fire while this thread sleeps」：线程自己的 CPU 时间是 0 ms，20 ms 的线程时钟定时器却在它睡眠时触发了。
+- 根因：读 CPU 时间的地方（`task.cpuClockNs`、`groupTimesLocked`、`time_syscall.cpuTimeNs`、`getrusage`）用「任务状态是 `.running`」来决定要不要加上正在跑的这一片 `now - sched_in_tsc`。但状态在调度器认领任务（`tryClaim`）时就变成 `.running`，比切入时更新 `sched_in_tsc` 早；而 `sched_in_tsc` 在切出时并不清零。于是另一个 CPU 在这段窗口里读到的是「`.running`、上一次切入的旧 `sched_in_tsc`」，把从那以后的整段时间（包括睡眠）当成正在跑的一片，切入后这一片又消失，时钟先跳前再倒退。切出时也有同样的问题：任务已经 `.blocked`，但切出还没把这一片折进 `utime_us`，这段时间被漏掉，切出后又一次补上。读者和切换路径之间也没有同步，可能读到折了一半的值。
+- 新测试 hello314：主线程连续 1.5 秒交替读 `CLOCK_PROCESS_CPUTIME_ID` 和自己的 `CLOCK_THREAD_CPUTIME_ID`，同时 3 个线程每 0.5 ms 睡一次、醒一次。A 进程时钟每次读数不小于上一次；B 线程时钟同样；C 进程时钟走得不比墙钟乘以线程数快。
+- 宿主机实测：hello314（`gcc -DHOST -pthread`）A–C 全过，`taskset -c 0` 下同样通过（约 440 万次读数，0 次倒退）。
+- 红灯：未修改的内核（`f4af14c`）上定向 SMP=2、SMP=4 各一份：A 都 FAIL，进程时钟 9759 次读数里倒退 2654 次（最多倒退 25833 us）、11023 次里倒退 2972 次（最多 24197 us）；B、C 通过。
+- 修复：
+  - `kernel/proc/cpu_time_policy.zig`：新增顺序计数 `writeBegin`/`writeEnd`/`readBegin`/`readRetry`（写时为奇数，读者读到同一个偶数值才算数）。
+  - `kernel/proc/task.zig`：`Task` 增加 `cpu_seq`。新增 `cpuSnapshot`，在顺序计数下读 `utime_us`/`stime_us`/`sched_in_tsc`，「这一片是否在跑」改看 `sched_in_tsc != 0`，不再看任务状态。`groupTimesLocked` 和 `cpuClockNs` 的线程分支都改用它。`exitTask` 折入最后一片时关中断并加顺序计数。
+  - `kernel/proc/sched.zig`：两条切换路径都在顺序计数内把切出任务的这一片折进 `utime_us`/`stime_us`，并把它的 `sched_in_tsc` 清零；切入任务的 `sched_in_tsc` 也在顺序计数内写入。
+  - `kernel/proc/time_syscall.zig` 的 `cpuTimeNs`、`kernel/arch/x86_64/syscall_entry.zig` 的 `getrusage` 改用 `cpuSnapshot`。
+  - 宿主机单测：`tests/main.zig` 新增顺序计数的行为测试，并检查两条切换路径和读者的接线。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello314 A–C 全过（0 次倒退）；另跑三份（SMP 2/4/2），hello308、hello312、hello314 依次全过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒）全部 `EXIT=0`、0 FAIL，四份都有 hello314 PASS（hello308、hello312 也都通过），`hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
+- 如实的局限：
+  1. hello308 F 的 CI 失败没有在本地复现过。根因是从代码推出来的：被唤醒、已认领但还没切入的线程，读数会带上从旧 `sched_in_tsc` 到现在的整段时间。hello314 直接测出了这个窗口造成的倒退。
+  2. 切出时 `utime_us` 按整微秒累加，每次切换会丢掉不到 1 us 的余数，和改动前一样。
+- CI 记录：OFD 锁的提交 `f4af14c` 在 CI 的 SMP=2 上失败，唯一的失败是 hello267「with the sibling's queue full, every connection of the closing listener is still accepted, none reset」。hello267 不用文件锁，这次改动也没有碰 TCP。它和前面记过的 hello267「to m3 00」不是同一项，是新的偶发项，根因没有查。
