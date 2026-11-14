@@ -84,6 +84,8 @@
 #define SYS_pwritev2    499
 #define SYS_waitid      500
 #define SYS_exit_group  501
+#define SYS_adjtimex    502
+#define SYS_clock_adjtime 503
 
 /* Processes, identity and terminals */
 #define SYS_pause       34

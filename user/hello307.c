@@ -1,6 +1,6 @@
 /* hello307: CLOCK_TAI (11) is a clock: clock_gettime, clock_getres, clock_nanosleep (relative and TIMER_ABSTIME) and timer_create
  * accept it; clock_settime refuses it (EINVAL) and timerfd_create too (EINVAL), as on Linux. TAI is REALTIME plus the kernel's TAI
- * offset, which is 0 until adjtimex(ADJ_TAI) sets it (this kernel has no adjtimex, so it stays 0). Measured on the host (build with
+ * offset, which is 0 until adjtimex(ADJ_TAI) sets it (hello317 tests that). Measured on the host (build with
  * -DHOST): all of the above, with TAI - REALTIME equal to the offset adjtimex reports (37 s on an NTP-synchronised host). */
 #ifdef HOST
 #define _GNU_SOURCE
@@ -33,7 +33,7 @@ static long csleep(long clk, long flags, long *ts) { return syscall4(SYS_clock_n
 static long tcreate(long clk, void *sev, int *id) { return syscall3(192, clk, (long)sev, (long)id); }
 static void tdelete(int id) { syscall1(196, id); }
 static long tfd_create(long clk) { return syscall2(170, clk, 0); }
-static long tai_offset_s(void) { return 0; }
+static long tai_offset_s(void) { long tx[26]; memset(tx, 0, sizeof tx); syscall1(SYS_adjtimex, (long)tx); return (int)tx[20]; }
 #endif
 
 #define TAI 11

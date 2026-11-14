@@ -267,7 +267,7 @@ pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr:
         const now_ns = tsc.nanos();
         // An absolute deadline becomes a delay from now on the monotonic clock; one already past fires at the next tick.
         const delay_ns = if ((flags & TIMER_ABSTIME) != 0)
-            time_policy.absoluteDeltaNs(t.clock_id, value_ns, now_ns, @import("../proc/time_syscall.zig").wallClockOffset()) orelse {
+            time_policy.absoluteDeltaNs(t.clock_id, value_ns, now_ns, realtimeOffsetFor(t.clock_id)) orelse {
                 lock.release(saved);
                 return EINVAL;
             }
@@ -473,10 +473,18 @@ pub fn takeSignal(idx: u32, generation: u32) u64 {
     return ov;
 }
 
+/// The offset from the monotonic clock to `clock_id`'s realtime-family time: REALTIME's wall-clock offset, plus the TAI offset
+/// for CLOCK_TAI.
+fn realtimeOffsetFor(clock_id: u32) i64 {
+    const ts = @import("../proc/time_syscall.zig");
+    return ts.wallClockOffset() +| (if (clock_id == time_policy.CLOCK_TAI) ts.taiOffsetNs() else 0);
+}
+
 /// Get current time in nanoseconds for a given clock ID.
 fn getClockNs(clock_id: u32) u64 {
     return switch (clock_id) {
-        time_policy.CLOCK_REALTIME, time_policy.CLOCK_TAI => @import("../proc/time_syscall.zig").wallClockNanos(),
+        time_policy.CLOCK_REALTIME => @import("../proc/time_syscall.zig").wallClockNanos(),
+        time_policy.CLOCK_TAI => @import("../proc/time_syscall.zig").wallClockNanos() +| @as(u64, @intCast(@max(@import("../proc/time_syscall.zig").taiOffsetNs(), 0))),
         // CLOCK_BOOTTIME shares the monotonic base (time_policy.timerClockBase).
         time_policy.CLOCK_MONOTONIC, time_policy.CLOCK_BOOTTIME => tsc.nanos(),
         else => 0,

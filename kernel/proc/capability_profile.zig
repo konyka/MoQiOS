@@ -117,6 +117,11 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
     }
     // Socket-option acceptance test: holds CAP_NET_ADMIN (SO_MARK, SO_PRIORITY > 6) as uid 0 so that
     // setuid() in a child drops it and the unprivileged refusals are observable.
+    if (std.mem.eql(u8, name, "hello317")) {
+        // adjtimex test: CAP_SYS_TIME for the TAI offset and ADJ_SETOFFSET, CAP_SETUID so a child's setuid() leaves it
+        // unprivileged and the EPERM refusals are observable.
+        return .{ .uid = 0, .gid = 0, .caps = .{ .cap_sys_time = true, .cap_setuid = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello183")) {
         // Starts as root with CAP_SETUID only (no CAP_NET_BIND) so the child's setuid() leaves it unprivileged,
         // while the parent's own privileged-port expectations do not apply (it binds only high ports).

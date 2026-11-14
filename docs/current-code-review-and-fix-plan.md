@@ -8465,7 +8465,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份，A–G 全部通过（偏移 0，差值 0～1 ms）。`zig build`、`zig build test` 通过。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒，宿主机 load 约 0.8）全部 `EXIT=0`、0 FAIL，`corrupted canaries` 都是 0；四份里 hello307 都是 PASS，hello286、hello288、hello290–hello306 都通过。
 - 如实的局限：
-  1. TAI 偏移恒为 0：本内核没有 `adjtimex`，也不处理闰秒，所以 `CLOCK_TAI` 读数和 `CLOCK_REALTIME` 相同。Linux 上通常差 37 秒（由 NTP 设定）。
+  1. TAI 偏移恒为 0：本内核没有 `adjtimex`，也不处理闰秒，所以 `CLOCK_TAI` 读数和 `CLOCK_REALTIME` 相同。Linux 上通常差 37 秒（由 NTP 设定）。（已修，见下文「`adjtimex` / `clock_adjtime` 与 TAI 偏移」；闰秒仍不处理）
   2. `CLOCK_PROCESS_CPUTIME_ID`、`CLOCK_THREAD_CPUTIME_ID` 的定时器仍未实现（要按 CPU 时间调度）。
   3. `clock_settime` 的检查顺序改成「先时钟、后权限」；现有测试没有依赖旧顺序（`hello270` 等只设 REALTIME）。
 
@@ -8659,3 +8659,24 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：第一次四份都只因 hello132 D（同一个旧断言）FAIL；改完后重跑四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，都有 hello102、hello132、hello316 PASS 和 `hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
 - 如实的局限：只改了 x86_64 的分派；`timerfd_settime`、`timer_settime` 等的 flags 检查没有动（各自另有实测依据）。
 
+
+## `adjtimex` / `clock_adjtime` 与 TAI 偏移（hello317，已修）
+
+- 问题：内核没有 `adjtimex` 和 `clock_adjtime`，调用返回 `ENOSYS`；TAI 偏移恒为 0，`CLOCK_TAI` 与 `CLOCK_REALTIME` 读数相同（hello307 的局限 1）。chrony、ntpd、PTP 工具读不到时钟状态，也设不了 TAI 偏移。
+- 宿主机实测（非特权用户；`sudo` 要密码，特权路径按 `3rd/linux-7.0.6` 的 `kernel/time/ntp.c`、`timekeeping.c`、`posix-timers.c` 源码实现）：`struct timex` 208 字节（modes 0、offset 8、freq 16、maxerror 24、esterror 32、status 40、constant 48、precision 56、tolerance 64、time 72/80、tick 88、tai 160）。只读调用返回时钟状态（宿主机已同步为 0），tick 10000、precision 1、tolerance 32768000、constant 2；TAI − REALTIME = 37 s。非特权调用者：modes 0x80、0x2000、0x1、0x4000000、0x80000000 为 `EPERM`；0xa001（`ADJ_OFFSET_SS_READ`）返回时钟状态、offset 0；0x8000 为 `EINVAL`；0x8001 为 `EPERM`；`ADJ_TICK` 配越界的 tick 8999 仍是 `EPERM`（权限先于范围检查）。指针为 NULL 或 1 为 `EFAULT`。`clock_adjtime`：时钟 0 返回状态；1–9、11 为 `EOPNOTSUPP`；10、12–15、24、99 为 `EINVAL`；16–23 为 `ENODEV`；负数时钟低 3 位为 3（CLOCKFD，-5、-13、-21）为 `EINVAL`，其它负数为 `EOPNOTSUPP`；先拷贝结构再查时钟，所以坏指针对任何时钟都是 `EFAULT`。以 `gcc -DHOST` 跑 hello317 的非特权部分（A、E、F、G）全过。
+- 红灯：hello317 登记好、内核尚未接线时定向 SMP=2（日志开头 `spawned hello2`）：所有调用返回 -38（`ENOSYS`），A–H 全 FAIL。宿主机单测里 `otherClockErrno` 对负数时钟的断言先红（当时返回 `EINVAL`），补上负数处理后变绿。
+- 修复：
+  - 新增纯策略模块 `kernel/proc/ntp_policy.zig`：`Timex`、`State`（开机 status `STA_UNSYNC`、constant 2、tick 10000、maxerror/esterror 16000000、tai 0），`validate`（与 `timekeeping_validate_timex` 同序），`adjtimex`（`process_adjtimex_modes`：status、NANO/MICRO、freq、maxerror、esterror、timeconst、TAI 0–100000、tick；`ADJ_ADJTIME` 记下 adjtime 偏移并返回旧值；`is_error_status` 时返回 `TIME_ERROR`(5)），`otherClockErrno`，`decode`/`encode`（208 字节，PPS 字段清零）。在 `kernel/host_test.zig` 注册，`tests/main.zig` 加三项单测。
+  - `kernel/proc/time_syscall.zig`：在 IrqSpinlock 下持有 `ntp_state`；`adjtimex`、`clockAdjtime`（指针检查 → 拷入 → 非 REALTIME 时钟返回 `otherClockErrno` → `validate`（`CAP_SYS_TIME`）→ `ADJ_SETOFFSET` 调整墙钟偏移 → 加锁更新 → 拷出）；`taiOffsetNs`；`clock_gettime(CLOCK_TAI)` 返回 REALTIME 加 TAI 偏移。
+  - `kernel/arch/x86_64/syscall_entry.zig`：native 502 = `adjtimex(buf)`，503 = `clock_adjtime(clk, buf)`；`clock_nanosleep(CLOCK_TAI, TIMER_ABSTIME)` 的墙钟偏移加上 TAI 偏移。
+  - `kernel/ipc/posix_timer.zig`：`CLOCK_TAI` 的读数和绝对定时器都加上 TAI 偏移（`realtimeOffsetFor`）。
+  - `lib/moqi_libc/include/moqi_syscalls.h` 加 `SYS_adjtimex`、`SYS_clock_adjtime`；`kernel/proc/capability_profile.zig` 给 hello317 `CAP_SYS_TIME` 和 `CAP_SETUID`（子进程 `setuid(1000)` 后测 `EPERM`）。
+  - hello307 目标机侧的 `tai_offset_s()` 改为用 502 读 tai；`clock_ids.zig`、`time_policy.zig` 的注释同步。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello317 A–H 全过（B：TAI − REALTIME − 37 s 约 1 ms；C：约 20–32 ms 后醒；H：REALTIME 跳 1999 ms 再退回）。第一次定向跑时 E 的 `ADJ_OFFSET_SS_READ` 返回 5：这一调用和只读调用一样返回时钟状态，内核开机时未同步所以是 5，测试原来只接受 0，改为接受 0 或 5。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都有 hello317 PASS、hello307 PASS 和 `hello228: corrupted canaries=0`。SMP=1、SMP=2 和一份 SMP=4 `EXIT=0`、0 FAIL；另一份 SMP=4 `EXIT=1`，只有 hello286 失败（J 40/60，M 19/20），是文档里已记录的 hello286 J/M 偶发项，hello286 不用 `adjtimex` 或 TAI。hello286 单独定向重跑两份（SMP=4）都 PASS。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
+- 如实的局限：
+  1. 只记录和报告 NTP 变量，不用它们校准时钟：没有 PLL/FLL，`freq`、`tick` 不改变时钟速率，adjtime 的偏移只记下不 slew，`offset` 恒报 0，不插入闰秒，`STA_INS`/`STA_DEL` 无效果。
+  2. 没有 PPS（相关字段恒为 0）。
+  3. 特权路径（B、C、D、H）没有在宿主机上实测，按 Linux 源码实现。
+  4. 只做了 x86_64；Linux 编号 159（adjtimex）和 305（clock_adjtime）在 native 表里分别是 msgctl 和 kcmp，没有为 Linux personality 加别名。
+  5. `ADJ_SETOFFSET` 只改墙钟偏移，与 `clock_settime` 一样不通知已有的 REALTIME 定时器（timerfd 的 `TFD_TIMER_CANCEL_ON_SET` 不触发）。

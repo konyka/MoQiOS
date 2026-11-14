@@ -28,6 +28,50 @@ pub fn wallClockOffset() i64 {
     return wall_clock_offset;
 }
 
+const ntp_policy = @import("ntp_policy.zig");
+const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+var ntp_state: ntp_policy.State = .{};
+var ntp_lock: IrqSpinlock = .{};
+
+/// The TAI offset adjtimex(ADJ_TAI) set, in nanoseconds: CLOCK_TAI = CLOCK_REALTIME + this.
+pub fn taiOffsetNs() i64 {
+    const flags = ntp_lock.acquire();
+    defer ntp_lock.release(flags);
+    return @as(i64, ntp_state.tai) * 1_000_000_000;
+}
+
+fn taiNanos() u64 {
+    return wallClockNanos() +| @as(u64, @intCast(@max(taiOffsetNs(), 0)));
+}
+
+/// adjtimex(buf): clock_adjtime(CLOCK_REALTIME, buf).
+pub fn adjtimex(buf_ptr: u64, cap_sys_time: bool) i64 {
+    return clockAdjtime(CLOCK_REALTIME, buf_ptr, cap_sys_time);
+}
+
+/// clock_adjtime(clockid, buf) (Linux do_clock_adjtime / do_adjtimex): the struct is copied in before the clock id is looked
+/// at; only CLOCK_REALTIME adjusts. Returns the clock state (TIME_OK / TIME_ERROR) or a negative errno.
+pub fn clockAdjtime(clockid: u64, buf_ptr: u64, cap_sys_time: bool) i64 {
+    if (buf_ptr == 0 or buf_ptr >= 0x0000_8000_0000_0000 - ntp_policy.TIMEX_SIZE) return -14;
+    var buf: [ntp_policy.TIMEX_SIZE]u8 = undefined;
+    if (copy.copyFromUser(buf[0..], @ptrFromInt(buf_ptr), buf.len) != buf.len) return -14;
+    const clk: u32 = @truncate(clockid);
+    if (clk != CLOCK_REALTIME) return ntp_policy.otherClockErrno(@as(i32, @bitCast(clk)));
+    var tx = ntp_policy.decode(&buf);
+    const v = ntp_policy.validate(&tx, cap_sys_time);
+    if (v != 0) return v;
+    if (tx.modes & ntp_policy.ADJ_SETOFFSET != 0) setWallClockOffset(wallClockOffset() +| ntp_policy.setOffsetNs(&tx));
+    const now = wallClockNanos();
+    const result = blk: {
+        const flags = ntp_lock.acquire();
+        defer ntp_lock.release(flags);
+        break :blk ntp_policy.adjtimex(&ntp_state, &tx, @intCast(now / 1_000_000_000), @intCast(now % 1_000_000_000));
+    };
+    ntp_policy.encode(&tx, &buf);
+    if (copy.copyToUser(@ptrFromInt(buf_ptr), buf[0..], buf.len) != buf.len) return -14;
+    return result;
+}
+
 /// Get current wall-clock nanoseconds (boot time + offset).
 pub fn wallClockNanos() u64 {
     const boot_ns: i64 = @intCast(tsc.nanos());
@@ -70,7 +114,7 @@ pub fn clock_gettime(clockid: u64, tp_ptr: u64) i64 {
     if (!clockIdValid(clockid)) return -22;
     if (tp_ptr == 0 or tp_ptr >= 0x0000_8000_0000_0000) return -14;
 
-    const ns: u64 = switch (clock_ids.sourceOf(clockid).?) {
+    const ns: u64 = if (clockid == clock_ids.CLOCK_TAI) taiNanos() else switch (clock_ids.sourceOf(clockid).?) {
         .realtime => wallClockNanos(),
         .monotonic => tsc.nanos(),
         .process_cpu => cpuTimeNs(false),

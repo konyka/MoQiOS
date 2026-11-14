@@ -17,7 +17,7 @@ pub const CLOCK_MONOTONIC_RAW: u64 = 4;
 pub const CLOCK_REALTIME_COARSE: u64 = 5;
 pub const CLOCK_MONOTONIC_COARSE: u64 = 6;
 pub const CLOCK_BOOTTIME: u64 = 7;
-/// TAI: REALTIME plus the kernel's TAI offset (0 here — the kernel has no adjtimex and never applies a leap-second table).
+/// TAI: REALTIME plus the TAI offset adjtimex(ADJ_TAI) sets (0 at boot; the kernel never applies a leap-second table).
 pub const CLOCK_TAI: u64 = 11;
 
 pub fn sourceOf(clockid: u64) ?Source {

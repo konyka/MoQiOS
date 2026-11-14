@@ -433,6 +433,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello314"); /* the CPU-time clocks never step backwards while sibling threads switch in and out */
     run_test("hello315"); /* clock_nanosleep on CLOCK_PROCESS_CPUTIME_ID waits for process CPU time */
     run_test("hello316"); /* file leases: F_SETLEASE/F_GETLEASE, SIGIO on a conflicting open or truncate */
+    run_test("hello317"); /* adjtimex / clock_adjtime: NTP variables, TAI offset, ADJ_SETOFFSET */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

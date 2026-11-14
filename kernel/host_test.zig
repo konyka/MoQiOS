@@ -269,6 +269,7 @@ pub const time_syscall_source = @embedFile("proc/time_syscall.zig");
 pub const clock_ids = @import("proc/clock_ids.zig");
 pub const sigreturn_policy = @import("proc/sigreturn_policy.zig");
 pub const sleep_policy = @import("proc/sleep_policy.zig");
+pub const ntp_policy = @import("proc/ntp_policy.zig");
 pub const rusage_policy = @import("proc/rusage_policy.zig");
 pub const cpu_time_policy = @import("proc/cpu_time_policy.zig");
 pub const waitpid_source = @embedFile("proc/waitpid.zig");

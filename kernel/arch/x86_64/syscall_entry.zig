@@ -2575,6 +2575,14 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         501 => { // exit_group(status) — every thread of the process ends with status
             lifecycle_mod.exitGroup(frame.rdi);
         },
+        502 => { // adjtimex(buf) — NTP variables, TAI offset, ADJ_SETOFFSET
+            const ts_mod = @import("../../proc/time_syscall.zig");
+            frame.rax = @bitCast(ts_mod.adjtimex(frame.rdi, checkCapForCurrent("cap_sys_time")));
+        },
+        503 => { // clock_adjtime(clockid, buf)
+            const ts_mod = @import("../../proc/time_syscall.zig");
+            frame.rax = @bitCast(ts_mod.clockAdjtime(frame.rdi, frame.rsi, checkCapForCurrent("cap_sys_time")));
+        },
         500 => { // waitid(idtype, id, infop, options, rusage)
             frame.rax = @bitCast(waitpid_mod.waitid(@truncate(frame.rdi), frame.rsi, frame.rdx, @truncate(frame.r10), frame.r8));
             checkSignalsOnSyscallReturn(frame);
@@ -4494,7 +4502,8 @@ fn syscallClockNanosleep(clockid: u32, flags: u32, req_ptr: u64, rem_ptr: u64) i
         ts.sec,
         ts.nsec,
         tsc.nanos(),
-        @import("../../proc/time_syscall.zig").wallClockOffset(),
+        @import("../../proc/time_syscall.zig").wallClockOffset() +|
+            (if (clockid == clock_ids.CLOCK_TAI) @import("../../proc/time_syscall.zig").taiOffsetNs() else 0),
     );
     return switch (plan) {
         .invalid => -22,

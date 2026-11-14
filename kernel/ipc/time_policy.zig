@@ -18,7 +18,7 @@ pub const CLOCK_MONOTONIC_RAW: u32 = 4;
 pub const CLOCK_REALTIME_COARSE: u32 = 5;
 pub const CLOCK_MONOTONIC_COARSE: u32 = 6;
 pub const CLOCK_BOOTTIME: u32 = 7;
-/// TAI counts on the realtime base: this kernel's TAI offset is 0 (no adjtimex, no leap-second table).
+/// TAI counts on the realtime base plus the TAI offset adjtimex(ADJ_TAI) sets (0 at boot; no leap-second table).
 pub const CLOCK_TAI: u32 = 11;
 /// CPU-time clocks: a timer on them counts the process's (or the calling thread's) CPU time, not wall time. `timerClockBase` has no
 /// base for them; posix_timer accounts their expiries from the scheduler tick.

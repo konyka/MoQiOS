@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello316`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello317`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -311,6 +311,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello314 | 3 个线程反复睡眠、唤醒时，主线程连续 1.5 秒读 `CLOCK_PROCESS_CPUTIME_ID` 和自己的 `CLOCK_THREAD_CPUTIME_ID`：进程时钟不倒退（A），线程时钟不倒退（B），进程时钟走得不比墙钟乘以线程数快（C）（宿主机 Linux 实测同结果） |
 | hello315 | 一个线程烧 CPU 时在 `CLOCK_PROCESS_CPUTIME_ID` 上 `clock_nanosleep`：相对 50 ms 返回 0 且进程 CPU 时间走够（A），`TIMER_ABSTIME` 截止时间到达（B），已过去的截止时间立刻返回（C），没有线程烧 CPU 时 `SIGALRM` 让 10 s 的睡眠以 `EINTR` 结束并写回 `rem`（D），线程时钟上原始 syscall 是 `-EOPNOTSUPP`（E）（宿主机 Linux 实测同结果） |
 | hello316 | 文件租约 `F_SETLEASE`(1024)/`F_GETLEASE`(1025)：读租约、升级为写租约、解除，没有租约时 `F_UNLCK` 为 `EAGAIN`（A）；已有写打开或其它打开时拿租约为 `EAGAIN`（B）；未知类型、pipe、目录为 `EINVAL`（C）；子进程的非阻塞写打开打破读租约，持有者收到一次 `SIGIO`（D）；阻塞写打开等持有者在 handler 里解除（E）；读打开把写租约降级（F）；`truncate` 打破读租约（G）；租约跟着打开文件描述走，dup 共享、最后一次关闭时删除（H）；持有者自己的非阻塞写打开为 `EAGAIN` 且返回时 handler 已运行（I）；同一进程两个租约只收到一次 `SIGIO`（J） |
+| hello317 | `adjtimex`(502)/`clock_adjtime`(503)：只读调用返回时钟状态（开机 5、`STA_UNSYNC`），tick 10000、precision 1、tolerance 32768000、constant 2（A）；`ADJ_TAI` 37 后 TAI − REALTIME = 37 s（B）；`clock_nanosleep(CLOCK_TAI, TIMER_ABSTIME)` 按 TAI 截止（C）；越界的 TAI 偏移被忽略（D）；非特权子进程的修改为 `EPERM`、`0x8000` 为 `EINVAL`、读取可用（E）；`clock_adjtime` 各时钟的错误码和 NULL 为 `EFAULT`（F）；`adjtimex(NULL)` 为 `EFAULT`（G）；`ADJ_SETOFFSET` 让 REALTIME 前进再退回（H） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

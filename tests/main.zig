@@ -12460,3 +12460,104 @@ test "sleep policy: clock_nanosleep ignores flag bits other than TIMER_ABSTIME (
     // the syscall no longer rejects the bits itself
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "if (flags & ~time_policy.TIMER_ABSTIME != 0) return -22;") == null);
 }
+
+test "ntp policy: an unprivileged read reports the boot state, any change needs CAP_SYS_TIME (Linux measured)" {
+    const np = kt.ntp_policy;
+    var s = np.State{};
+    var tx = np.Timex{};
+    try std.testing.expectEqual(@as(i64, 0), np.validate(&tx, false));
+    try std.testing.expectEqual(np.TIME_ERROR, np.adjtimex(&s, &tx, 100, 5_000_000));
+    try std.testing.expectEqual(np.STA_UNSYNC, tx.status);
+    try std.testing.expectEqual(@as(i64, 2), tx.constant);
+    try std.testing.expectEqual(@as(i64, 10_000), tx.tick);
+    try std.testing.expectEqual(@as(i64, 1), tx.precision);
+    try std.testing.expectEqual(@as(i64, 32_768_000), tx.tolerance);
+    try std.testing.expectEqual(@as(i64, 16_000_000), tx.maxerror);
+    try std.testing.expectEqual(@as(i32, 0), tx.tai);
+    try std.testing.expectEqual(@as(i64, 100), tx.time_sec);
+    try std.testing.expectEqual(@as(i64, 5_000), tx.time_usec); // microseconds until STA_NANO
+    // every mode bit asks for a change: EPERM without the capability; the adjtime read form is allowed
+    for ([_]u32{ 0x80, 0x2000, 0x1, 0x4000000, 0x80000000 }) |m| {
+        try std.testing.expectEqual(@as(i64, -1), np.validate(&.{ .modes = m }, false));
+    }
+    try std.testing.expectEqual(@as(i64, 0), np.validate(&.{ .modes = 0xa001 }, false));
+    try std.testing.expectEqual(@as(i64, -22), np.validate(&.{ .modes = 0x8000 }, false));
+    try std.testing.expectEqual(@as(i64, -1), np.validate(&.{ .modes = 0x8001 }, false));
+}
+
+test "ntp policy: a privileged caller sets the TAI offset, status and limits, with Linux's range checks" {
+    const np = kt.ntp_policy;
+    var s = np.State{};
+    var tx = np.Timex{ .modes = np.ADJ_TAI, .constant = 37 };
+    try std.testing.expectEqual(@as(i64, 0), np.validate(&tx, true));
+    _ = np.adjtimex(&s, &tx, 0, 0);
+    try std.testing.expectEqual(@as(i32, 37), s.tai);
+    try std.testing.expectEqual(@as(i32, 37), tx.tai);
+    // out of range TAI values are ignored, not refused
+    tx = .{ .modes = np.ADJ_TAI, .constant = -1 };
+    _ = np.adjtimex(&s, &tx, 0, 0);
+    tx = .{ .modes = np.ADJ_TAI, .constant = np.MAX_TAI_OFFSET + 1 };
+    _ = np.adjtimex(&s, &tx, 0, 0);
+    try std.testing.expectEqual(@as(i32, 37), s.tai);
+    // clearing STA_UNSYNC makes the state TIME_OK; read-only status bits stay
+    tx = .{ .modes = np.ADJ_STATUS, .status = 0x0100 };
+    try std.testing.expectEqual(np.TIME_OK, np.adjtimex(&s, &tx, 0, 0));
+    try std.testing.expectEqual(@as(i32, 0), tx.status);
+    // ADJ_NANO switches time to nanoseconds; ADJ_TIMECONST adds 4 only in microsecond mode
+    tx = .{ .modes = np.ADJ_NANO | np.ADJ_TIMECONST, .constant = 3 };
+    _ = np.adjtimex(&s, &tx, 1, 123_456_789);
+    try std.testing.expectEqual(@as(i64, 123_456_789), tx.time_usec);
+    try std.testing.expectEqual(@as(i64, 3), tx.constant);
+    tx = .{ .modes = np.ADJ_MICRO | np.ADJ_TIMECONST, .constant = 9 };
+    _ = np.adjtimex(&s, &tx, 0, 0);
+    try std.testing.expectEqual(@as(i64, 10), tx.constant);
+    // maxerror is clamped, the tick must stay within 10 % of 10000 us
+    tx = .{ .modes = np.ADJ_MAXERROR, .maxerror = -5 };
+    _ = np.adjtimex(&s, &tx, 0, 0);
+    try std.testing.expectEqual(@as(i64, 0), tx.maxerror);
+    try std.testing.expectEqual(@as(i64, -22), np.validate(&.{ .modes = np.ADJ_TICK, .tick = 8999 }, true));
+    try std.testing.expectEqual(@as(i64, -22), np.validate(&.{ .modes = np.ADJ_TICK, .tick = 11001 }, true));
+    try std.testing.expectEqual(@as(i64, 0), np.validate(&.{ .modes = np.ADJ_TICK, .tick = 9000 }, true));
+    // a frequency round-trips to within one unit and is clamped at 500 ppm
+    tx = .{ .modes = np.ADJ_FREQUENCY, .freq = 65536 };
+    _ = np.adjtimex(&s, &tx, 0, 0);
+    try std.testing.expect(tx.freq >= 65535 and tx.freq <= 65536);
+    tx = .{ .modes = np.ADJ_FREQUENCY, .freq = 1000 * 65536 };
+    _ = np.adjtimex(&s, &tx, 0, 0);
+    try std.testing.expect(tx.freq >= 500 * 65536 - 1 and tx.freq <= 500 * 65536);
+    try std.testing.expectEqual(@as(i64, -22), np.validate(&.{ .modes = np.ADJ_FREQUENCY, .freq = 200_000_000_000 }, true));
+    // ADJ_SETOFFSET: EPERM unprivileged, the sub-second part is checked, the step is in ns
+    try std.testing.expectEqual(@as(i64, -1), np.validate(&.{ .modes = np.ADJ_SETOFFSET }, false));
+    try std.testing.expectEqual(@as(i64, -22), np.validate(&.{ .modes = np.ADJ_SETOFFSET, .time_usec = 1_000_000 }, true));
+    try std.testing.expectEqual(@as(i64, -22), np.validate(&.{ .modes = np.ADJ_SETOFFSET, .time_usec = -1 }, true));
+    try std.testing.expectEqual(@as(i64, -22), np.validate(&.{ .modes = np.ADJ_SETOFFSET | np.ADJ_NANO, .time_usec = 1_000_000_000 }, true));
+    try std.testing.expectEqual(@as(i64, -1_999_000_000), np.setOffsetNs(&.{ .modes = np.ADJ_SETOFFSET, .time_sec = -2, .time_usec = 1000 }));
+    // adjtime keeps its offset and hands back the previous one
+    tx = .{ .modes = 0x8001, .offset = 250 };
+    _ = np.adjtimex(&s, &tx, 0, 0);
+    try std.testing.expectEqual(@as(i64, 0), tx.offset);
+    tx = .{ .modes = 0xa001 };
+    _ = np.adjtimex(&s, &tx, 0, 0);
+    try std.testing.expectEqual(@as(i64, 250), tx.offset);
+}
+
+test "ntp policy: clock_adjtime on other clocks and the struct timex layout (Linux measured)" {
+    const np = kt.ntp_policy;
+    for ([_]i64{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 11 }) |c| try std.testing.expectEqual(@as(i64, -95), np.otherClockErrno(c));
+    for ([_]i64{ 10, 12, 15, 24, 99 }) |c| try std.testing.expectEqual(@as(i64, -22), np.otherClockErrno(c));
+    for ([_]i64{ -1, -2, -3, -4, -6, -7, -8, -11, -1000, 0x80000000 }) |c| try std.testing.expectEqual(@as(i64, -95), np.otherClockErrno(c));
+    for ([_]i64{ -5, -13, -21, 0x7fffffff }) |c| try std.testing.expectEqual(@as(i64, -22), np.otherClockErrno(c));
+    for ([_]i64{ 16, 23 }) |c| try std.testing.expectEqual(@as(i64, -19), np.otherClockErrno(c));
+    var buf: [np.TIMEX_SIZE]u8 = @splat(0xaa);
+    std.mem.writeInt(u32, buf[0..4], np.ADJ_TAI, .little);
+    std.mem.writeInt(i64, buf[48..56], 37, .little);
+    const tx = np.decode(&buf);
+    try std.testing.expectEqual(np.ADJ_TAI, tx.modes);
+    try std.testing.expectEqual(@as(i64, 37), tx.constant);
+    np.encode(&.{ .tai = 37, .tick = 10_000, .status = np.STA_UNSYNC }, &buf);
+    try std.testing.expectEqual(@as(i32, 37), std.mem.readInt(i32, buf[160..164], .little));
+    try std.testing.expectEqual(@as(i64, 10_000), std.mem.readInt(i64, buf[88..96], .little));
+    try std.testing.expectEqual(@as(i32, 0x40), std.mem.readInt(i32, buf[40..44], .little));
+    try std.testing.expectEqual(@as(u32, np.ADJ_TAI), std.mem.readInt(u32, buf[0..4], .little)); // modes untouched
+    try std.testing.expectEqual(@as(u8, 0), buf[100]); // PPS fields zeroed
+}
