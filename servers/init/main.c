@@ -428,6 +428,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello309"); /* exec drops the old image's timers and mq_notify */
     run_test("hello310"); /* flock is per open file description, fcntl per process; independent kinds */
     run_test("hello311"); /* F_SETLKW that would close a cycle of lock owners is EDEADLK */
+    run_test("hello312"); /* TIMER_ABSTIME on a CPU-time clock is a reading of that clock */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

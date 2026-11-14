@@ -249,14 +249,15 @@ pub fn timerSettime(timerid: u32, flags: u32, new_value_ptr: u64, old_value_ptr:
         t.cpu_due_ns = 0;
     } else {
         if (time_policy.isCpuClock(t.clock_id)) {
-            // A CPU-time timer counts CPU time from now: `value_ns` is how much of it must pass (TIMER_ABSTIME is meaningless for a
-            // clock that only moves while the process runs, and Linux treats it the same way). No wall deadline is set.
+            // A CPU-time timer fires when its CPU clock reaches `cpu_due_ns`. Without TIMER_ABSTIME `value_ns` is how much CPU time
+            // must pass from now; with it `value_ns` is a reading of the CPU clock, and one already passed fires at the next tick
+            // (Linux posix_cpu_timer_set). No wall deadline is set.
             const now_cpu = cpuClockOf(t) orelse {
                 lock.release(saved);
                 return EINVAL;
             };
             t.cpu_base_ns = now_cpu;
-            t.cpu_due_ns = now_cpu +| value_ns;
+            t.cpu_due_ns = if ((flags & TIMER_ABSTIME) != 0) value_ns else now_cpu +| value_ns;
             t.expiry_ns = 0;
             t.active = true;
             cpu_armed = true;

@@ -8485,7 +8485,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - `kernel/proc/task.zig`：新增 `cpuClockNs(idx, tid, thread, now_tsc, tsc_mhz)`——线程时钟取该任务自己（含正在运行的这一片），
     进程时钟取整个线程组的 CPU 时间；槽位的 tid 不符或已是僵尸时返回 null。
   - `kernel/ipc/posix_timer.zig`：`PosixTimer` 增加 `cpu_base_ns`/`cpu_due_ns`；`timerSettime` 对 CPU 时钟按 CPU 纳秒武装
-    （`TIMER_ABSTIME` 对它们没有意义，Linux 同样按相对处理）；`timerGettime`/旧值报剩余 CPU 时间；`timerTick` 在
+    （当时把 `TIMER_ABSTIME` 也按相对处理，这一说法是错的，见 hello312 一节）；`timerGettime`/旧值报剩余 CPU 时间；`timerTick` 在
     `cpu_armed` 为真时每个 tick 都扫，按 `cpuClockNs` 判到期，周期定时器保留相位并计 overrun；所有者消失则停止定时器。
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份，A–G 全部通过（D 触发、G 剩余 49→47 ms）。`zig build`、`zig build test` 通过。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒，宿主机 load 约 1）：SMP=1、一份 SMP=4、SMP=2 `EXIT=0`、0 FAIL；另一份 SMP=4 `EXIT=1`，唯一的失败是 hello99「not enough free RAM」——它在 `sysinfo` 里读到的空闲页低于 3×16384 的前置条件就放弃了，紧接在 hello98（4 个工作者的 swap 压力测试）之后；那份日志里 hello98 本身通过，两者之间没有回收记录。另外三份 hello98 设置回收下限时的空闲页是 67687～86159，都够。与本节改动无关（CPU 定时器只在有 CPU 时钟定时器时才扫），记为新的偶发项（那份 smoke 因此缺 `hello99: PASS` 标记，按 1400 秒超时退出）。**根因已查明**：hello98 退出后由 reaper 线程异步拆除地址空间，`waitpid` 返回时它刚释放的 4 个工作者区域还没全部回到空闲池，hello99 只读一次就判了内存不足。hello99 现在最多等 3 秒（每 100 ms 重读）再判；连续三次 hello96→hello99 定向全过。四份里 hello308 都是 PASS，`corrupted canaries` 都是 0。
@@ -8493,8 +8493,8 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 如实的局限：
   1. 到期靠调度 tick（约 10 ms 一次）检查，所以短间隔的 CPU 定时器最多晚一个 tick 才发出；Linux 用高精度 CPU 时钟事件，
      精度更高。hello308 用 20 ms 间隔，在 10 ms tick 下不受影响。
-  2. `TIMER_ABSTIME` 对 CPU 时钟按相对处理（Linux 对 CPU 时钟的 `clock_nanosleep` 是 `EOPNOTSUPP`，定时器这边没有绝对的
-     CPU 时刻可等）。
+  2. `TIMER_ABSTIME` 对 CPU 时钟按相对处理。这条当时的理由不成立：Linux `posix_cpu_timer_set` 带 `TIMER_ABSTIME` 时把
+     `it_value` 当作 CPU 时钟的读数。（hello312 已修）
   3. 进程时钟的到期在「组内任何一个线程用掉 CPU」时都可能触发；只有 tick 运行在 BSP，所以组在别的 CPU 上跑满一个 tick
      的时长才必然被看到——与第 1 条同一个精度上限。
 
@@ -8559,3 +8559,15 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   2. 记录的是「在等哪个属主」，不是哪一把锁。持有者释放后，等待者到下一次重查（最多 10 ms）才更新记录，这期间的检查可能用到过期的边。Linux 用阻塞者链表，每次释放都会重新挂接。
   3. 记录按任务槽位存（64 个），线程共享描述符表时，多个线程会各自记录同一个属主；查链时取第一条匹配的。
 
+## CPU 时钟上的 POSIX 定时器忽略 `TIMER_ABSTIME`（hello312，已修）
+
+- 问题：`posix_timer.timerSettime` 的 CPU 时钟分支总是 `cpu_due_ns = now_cpu + value_ns`，不看 `TIMER_ABSTIME`，注释还写着 Linux 也这样处理。Linux 7.0.6 的 `posix_cpu_timer_set`（`kernel/time/posix-cpu-timers.c`）只在没有 `TIMER_ABSTIME` 时才加上 `now`；带它时 `it_value` 是 CPU 时钟的绝对读数，已经过去的截止时间立刻触发。结果是：用 `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` 加上一段时间去武装的定时器，实际要等「当前 CPU 时间 + 读数」那么久，截止时间已过的定时器也不会触发。
+- 新测试 hello312：A 绝对截止时间在 20 ms CPU 之后，`timer_gettime` 剩余不超过 20 ms；B 烧过这 20 ms 后触发；C 截止时间已过（当前 CPU 时间减 1 ms），不再烧 CPU 也在 300 ms 内触发；D 截止时间在 10 s CPU 之后，剩余在 9～10 s 之间，睡 300 ms 不触发；E、F 在 `CLOCK_THREAD_CPUTIME_ID` 上重复 A、C。
+- 宿主机实测：hello312（`gcc -DHOST`）A–F 全过，`taskset -c 0` 下同样通过（A 剩余 19999 us，D 剩余 10000 ms）。
+- 红灯：未修改的内核（`721b3f8`）上定向 SMP=2（日志开头 `spawned hello2`、`spawned hello312`）：A–F 全部 FAIL。A 剩余 62173 us，D 剩余 10099 ms（读数被当成相对量又加上了当前 CPU 时间），B、C、F 的 `sigtimedwait` 都是 `-11`。
+- 修复：`kernel/ipc/posix_timer.zig` 的 CPU 分支改为 `cpu_due_ns = if (TIMER_ABSTIME) value_ns else now_cpu +| value_ns`，并改正注释。已经过去的截止时间满足 `timerTick` 里的 `now_cpu >= cpu_due_ns`，在下一个 tick 触发；周期定时器按原有逻辑从这个截止时间补算次数和相位。
+- 绿灯：目标机定向 SMP=2、SMP=4 各一份，A–F 全部通过（D 剩余 9999 ms）。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒）全部 `EXIT=0`、0 FAIL，四份都有 hello312 PASS，`hello228: corrupted canaries=0`。riscv64、aarch64 smoke 通过；`zig build`、`zig build test` 通过。
+- 如实的局限：
+  1. 已过去的截止时间在下一个 tick（约 10 ms）触发，Linux 在 `timer_settime` 返回前就触发。hello312 C 的等待窗口是 300 ms，不受影响。
+  2. `clock_nanosleep` 在 CPU 时钟上的行为没有改：`CLOCK_PROCESS_CPUTIME_ID` 仍是 `EINVAL`（Linux 会真的去睡），`CLOCK_THREAD_CPUTIME_ID` 是 `EOPNOTSUPP`（与 Linux 相同），见 `kernel/proc/clock_ids.zig` 的说明。
