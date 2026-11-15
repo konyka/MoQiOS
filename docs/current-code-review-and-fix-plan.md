@@ -9274,4 +9274,21 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. hello269 的 CI 失败只是推测由旧规则引起，没有在本地复现；本地 smoke 里 hello269 一直通过。如果 CI 上还出现 5/8，要先让 hello269 打印每轮失败在 b、rc、ac 还是 n。
   2. 端口冲突扫描不区分 IPv4 和 IPv6（和改动之前一样），也不区分绑定的本地地址：TCB 没有记录绑定地址，`127.0.0.1:p` 和 `0.0.0.0:p` 视为同一个端口。
   3. connect 释放同一 4 元组上的 TIME_WAIT 残留，相当于在回环上总是做 `tcp_tw_reuse`；Linux 只在时间戳允许时才这样做，否则返回 `EADDRNOTAVAIL`。
-  4. 新发现、未修：调整顺序跑定向测试时（hello183、267、269、272、143、39 之后跑 hello340），有一次客户端 connect 返回 -1，第二次同样顺序通过。`tcpConnectSocket` 在 SYN 发不出去时把状态改回 CLOSED 并返回 -1（改动前就是这样），最可能的原因是回环队列（`lo.QUEUE_DEPTH` 16 帧）被前一个程序退出时的报文占满。Linux 发送 SYN 失败不会让 connect 出错，重传定时器会再发。
+  4. 新发现、未修：调整顺序跑定向测试时（hello183、267、269、272、143、39 之后跑 hello340），有一次客户端 connect 返回 -1，第二次同样顺序通过。`tcpConnectSocket` 在 SYN 发不出去时把状态改回 CLOSED 并返回 -1（改动前就是这样），最可能的原因是回环队列（`lo.QUEUE_DEPTH` 16 帧）被前一个程序退出时的报文占满。Linux 发送 SYN 失败不会让 connect 出错，重传定时器会再发。（hello341 已补：回环队列满时 SYN 算作丢失，连接留在 SYN_SENT 等重传；UDP `sendto` 也不再因此失败）
+
+## 补充：回环队列满时发送不再失败（hello341）
+
+- 问题：hello340 局限 4。回环设备 `lo` 只有 16 帧的队列（`lo.QUEUE_DEPTH`），满了 `lo.sendPacket` 返回 false。UDP `sendTo`/`sendToV6` 把它当成发送失败，`sendto` 返回 -1（用户态看到 `EPERM`）；TCP `connect` 在 SYN 进不了队列时把状态改回 CLOSED，也返回 -1。Linux 的回环投递不会让发送方失败：接收方放不下的数据报在接收方丢弃，`sendto` 照常返回长度；丢掉的 SYN 由重传定时器再发。
+- Linux 实测（`gcc -DHOST user/hello341.c`）：A 向自己绑定的 UDP 套接字连发 40 个 1 字节数据报、一个都不读，40 次 `sendto` 都返回 1；B 再连发 16 个之后，非阻塞 TCP `connect` 返回 `EINPROGRESS`；C 这个连接随后完成并被 accept；D UDP 套接字仍能收到数据报。
+- 红灯：旧内核上 A 只成功 16 次，第一个错误是 -1；B 的 `connect` 返回 -1。C、D 通过。
+- 修复：
+  - `kernel/net/lo.zig`：新增 `dropIsLoss(len)`。真实大小的帧因为队列满被拒绝，算作丢帧；空帧和超长帧仍然算错误。附带测试。
+  - `kernel/net/udp.zig`：`sendTo`、`sendToV6` 的回环分支改为 `lo.sendPacket(...) or lo.dropIsLoss(frame_len)`。丢弃照样记入 `/proc/lostats` 的 `dropped`。
+  - `kernel/net/tcp.zig`：`tcpConnectSocket`、`tcpConnectSocketV6` 在 SYN 发不出去时调用 `synLostOnLoopback`。如果是回环连接，就把 SYN 计入 `snd_nxt`，连接留在 SYN_SENT，由重传定时器再发；其他原因的发送失败仍然让 `connect` 返回 -1。
+- 测试：hello341（QEMU，4 项）；新增 host 测试 `a frame the full loopback queue refuses is a loss, not a failed send (hello341)`。变异：把 `len != 0 and len <= MAX_FRAME` 改成 `len <= MAX_FRAME`，这条测试失败，文件已恢复。
+- 绿灯：定向 SMP=2、SMP=4 各一份，hello341 通过；`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，各 303 个 PASS，hello341、hello340、hello224、hello174 都通过，hello228 `corrupted canaries=0`。riscv64、aarch64 smoke 通过。
+- 局限：
+  1. SYN 丢在回环队列里以后，要等第一次重传超时（初始 RTO 2000 ms）才会再发，所以这种情况下 `connect` 最多多等约 2 秒。Linux 的回环几乎不会丢 SYN，所以没有这个延迟。
+  2. 回环队列仍然只有 16 帧，满了照样丢帧。这次只改了发送方看到的返回值，没有扩大队列，也没有在满的时候先排空队列。
+  3. 已建立连接上的数据段和 FIN 发不出去时，本来就由重传定时器处理，这次没有改。

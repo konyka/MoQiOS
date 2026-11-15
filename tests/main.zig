@@ -4298,6 +4298,21 @@ test "MSI-X message address/data compose fixed LAPIC delivery" {
 // ─── loopback (F2) ───
 const lo = kt.lo;
 
+test "a frame the full loopback queue refuses is a loss, not a failed send (hello341)" {
+    // A real frame the queue had no room for is a lost frame; empty and oversized frames are still errors.
+    try std.testing.expect(lo.dropIsLoss(60));
+    try std.testing.expect(lo.dropIsLoss(lo.MAX_FRAME));
+    try std.testing.expect(!lo.dropIsLoss(0));
+    try std.testing.expect(!lo.dropIsLoss(lo.MAX_FRAME + 1));
+    // Both UDP loopback send paths report such a drop as sent (Linux sendto on lo never fails for a full receiver).
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.udp_source, "lo.sendPacket(&send_pkt, frame_len) or lo.dropIsLoss(frame_len)"));
+    // Both TCP connect paths keep a loopback connection whose SYN was dropped: the retransmit timer resends it.
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!synLostOnLoopback(tcb, netif.isLoopback(remote_ip))) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!synLostOnLoopback(tcb, netif.isLoopbackV6(remote_ip6))) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "    if (!loopback) return false;\n    advanceSndNxt(tcb, SYN, 0);\n    return true;") != null);
+}
+
 test "lo queue enqueue/dequeue preserves FIFO order" {
     var q = lo.LoopbackQueue.init();
     try std.testing.expectEqual(@as(u32, 0), q.pending());

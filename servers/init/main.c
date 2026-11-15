@@ -457,6 +457,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello338"); /* TCFLSH discards console input for TCIFLUSH/TCIOFLUSH, TCSBRK succeeds */
     run_test("hello339"); /* TCXONC (tcflow) on the console tty: valid selectors succeed, others EINVAL */
     run_test("hello340"); /* TCP bind with SO_REUSEADDR: shareable only when both set it and the holder is not listening */
+    run_test("hello341"); /* a full loopback queue does not make sendto or connect fail */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

@@ -3127,6 +3127,15 @@ pub fn tcpConnect(remote_ip: [4]u8, remote_port: u16, owner_task: u32) i64 {
     return @intCast(tcbIdx(tcb));
 }
 
+/// A connect whose SYN the full loopback queue refused (lo.dropIsLoss) goes on as if the SYN was lost: the sequence number counts
+/// it, so the retransmit timer resends it, and connect() reports EINPROGRESS or waits like any other. Returns false when the send
+/// failed for another reason, which still fails the connect. Caller holds tcp_lock.
+fn synLostOnLoopback(tcb: *TcpTcb, loopback: bool) bool {
+    if (!loopback) return false;
+    advanceSndNxt(tcb, SYN, 0);
+    return true;
+}
+
 /// Whether another connection already uses the 4-tuple TCB `tcb_idx` would connect with (its local port to `remote_port` at
 /// `remote_ip`, or `remote_ip6` when that is given). A live holder makes it taken (tcp_port_policy.tupleTakenBy); an unreferenced
 /// TIME_WAIT leftover on the tuple is freed so the new connection is the only TCB that matches it. Caller holds tcp_lock.
@@ -3180,8 +3189,10 @@ pub fn tcpConnectSocket(tcb_idx: u32, remote_ip: [4]u8, remote_port: u16) i64 {
     tcb.state = .syn_sent;
 
     if (!sendSegment(tcb, probeEcnSynFlags(true), undefined, 0)) {
-        tcb.state = .closed;
-        return -1;
+        if (!synLostOnLoopback(tcb, netif.isLoopback(remote_ip))) {
+            tcb.state = .closed;
+            return -1;
+        }
     }
 
     tcpLog("[tcp] connect: SYN sent\n");
@@ -3219,8 +3230,10 @@ pub fn tcpConnectSocketV6(tcb_idx: u32, remote_ip6: [16]u8, remote_port: u16) i6
     tcb.state = .syn_sent;
 
     if (!sendSegment(tcb, probeEcnSynFlags(true), undefined, 0)) {
-        tcb.state = .closed;
-        return -1;
+        if (!synLostOnLoopback(tcb, netif.isLoopbackV6(remote_ip6))) {
+            tcb.state = .closed;
+            return -1;
+        }
     }
 
     tcpLog("[tcp] connect v6: SYN sent\n");

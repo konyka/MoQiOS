@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello340`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello341`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -335,6 +335,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello338 | 控制台 tty 的 TCFLSH、TCSBRK：TCOFLUSH 保留输入（A），TCIFLUSH、TCIOFLUSH 丢掉未读输入（B、C），其他选择子 EINVAL（D），TCSBRK 0/1 成功（E），管道上 ENOTTY（F） |
 | hello339 | 控制台 tty 的 TCXONC（tcflow）：TCOOFF/TCOON/TCIOFF/TCION 成功（A），其他选择子 EINVAL（B），管道上 ENOTTY（C），TCOON 后写入照常（D） |
 | hello340 | TCP bind 的 SO_REUSEADDR 冲突规则（Linux inet_csk_bind_conflict）：两边都设且占用者不在 LISTEN 才可共享（A、C），只有一边设或占用者在监听则 EADDRINUSE（B、D、E），共享者中只能一个 listen（G），同一 4 元组 connect 是 EADDRNOTAVAIL（H），accept 出来的连接继承 SO_REUSEADDR（F） |
+| hello341 | 回环队列满时发送不失败：40 个不读的 UDP 数据报 `sendto` 都成功（A），队列满之后非阻塞 TCP `connect` 返回 EINPROGRESS（B），连接随后完成并被 accept（C），UDP 仍能收到数据报（D） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

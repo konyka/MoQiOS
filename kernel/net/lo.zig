@@ -166,6 +166,13 @@ pub fn init() void {
 /// TX entry used by udp/tcp when the destination is 127.0.0.0/8: queue the
 /// finished L2 frame for loopback delivery. Mirrors nic.sendPacket's
 /// contract — false means the frame was not accepted (queue full).
+/// A frame the loopback queue refused only because it was full is a lost frame, not a failed send: Linux loopback delivery never
+/// fails the sender (a datagram is dropped at the receiver, a lost TCP segment is resent by the retransmit timer). Empty and
+/// oversized frames are still errors.
+pub fn dropIsLoss(len: u32) bool {
+    return len != 0 and len <= MAX_FRAME;
+}
+
 pub fn sendPacket(data: [*]const u8, len: u32) bool {
     const saved = lo_lock.acquire();
     defer lo_lock.release(saved);
