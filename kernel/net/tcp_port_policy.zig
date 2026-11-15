@@ -89,6 +89,20 @@ pub fn sourceAddr(bound: [4]u8, remote: [4]u8, our: [4]u8) [4]u8 {
     return if (isWildcard4(bound) or bound[0] == 127) our else bound;
 }
 
+/// Whether a segment to `dst` belongs to a connection bound to `bound` with peer `remote` (the local half of Linux
+/// __inet_lookup_established's 4-tuple). A loopback connection's local address is the one its segments carry (sourceAddr); any other
+/// connection is matched by a specific non-loopback bound address only, as the interface address is all it can be reached at.
+pub fn localAddrMatches(bound: [4]u8, remote: [4]u8, our: [4]u8, dst: [4]u8) bool {
+    if (remote[0] == 127) return @as(u32, @bitCast(sourceAddr(bound, remote, our))) == @as(u32, @bitCast(dst));
+    return isWildcard4(bound) or bound[0] == 127 or @as(u32, @bitCast(bound)) == @as(u32, @bitCast(dst));
+}
+
+/// Whether two IPv4 connections to the same peer and ports also share a local address, so connect() must refuse the second
+/// (Linux __inet_check_established): their segments would carry the same source address.
+pub fn sameLocalAddr(a_bound: [4]u8, b_bound: [4]u8, remote: [4]u8, our: [4]u8) bool {
+    return @as(u32, @bitCast(sourceAddr(a_bound, remote, our))) == @as(u32, @bitCast(sourceAddr(b_bound, remote, our)));
+}
+
 /// getsockname's IPv4 address: the bound one; for an unbound socket with a peer, the source address its segments carry; otherwise
 /// the wildcard (Linux reports 0.0.0.0 for an unbound, unconnected socket).
 pub fn nameAddr(bound: [4]u8, has_peer: bool, remote: [4]u8, our: [4]u8) [4]u8 {

@@ -9363,6 +9363,20 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：四份（SMP=1、4、4、2）里三份 EXIT=0、307 PASS；一份 SMP=4 只有 hello286 M（19/20，已记录的偶发项）失败，306 PASS；hello345 四份都通过，corrupted canaries 均为 0。riscv64、aarch64 smoke 都是 EXIT=0。
 - 这次修复带来的局限：
   1. 只做了 IPv4。IPv6 TCB 仍不记录本地地址，`[::1]:p` 和 `[::]:p` 仍算同一个端口，getsockname 仍按对端选源地址。
-  2. 已建立连接的查找（`findTcbByTuple`）和 connect 的 4 元组检查（`connectTupleTaken`）仍只看本地端口和对端，不看本地地址；两个本地地址不同、端口相同的连接如果连向同一对端会被当作同一个 4 元组。
+  2. ~~已建立连接的查找（`findTcbByTuple`）和 connect 的 4 元组检查（`connectTupleTaken`）仍只看本地端口和对端，不看本地地址；两个本地地址不同、端口相同的连接如果连向同一对端会被当作同一个 4 元组。~~（hello346 已补上 IPv4。）
   3. 绑定网卡地址、对端在回环上（或反过来）的组合按 `sourceAddr` 选源地址，没有做 Linux 那样的路由检查和 `EINVAL`。
   4. UDP 的 getsockname 仍报告网卡地址，UDP 端口冲突也不区分本地地址。
+
+## 补充：只有本地地址不同的 TCP 连接是两个连接（hello346）
+
+- 背景：hello345 一节局限 2。已建立连接的查找（`findTcbByTuple`）和 connect 的 4 元组检查（`connectTupleTaken`）只看本地端口和对端，不看本地地址。
+- Linux 实测（`gcc -DHOST user/hello346.c`，端口 18898、18899）：A 在 127.0.0.1 和 127.0.0.2 的 18898 上各一个监听者；B 两个都绑 `127.0.0.5:18899`（SO_REUSEADDR）的客户端分别连 127.0.0.1、127.0.0.2，都被对应监听者 accept，各自的数据到各自的服务端套接字；C 绑 `127.0.0.6:18899` 的客户端连 127.0.0.1（端口对和对端都与 B 的第一个相同，只是本地地址不同）成功，数据到达，B 的第一个连接仍然能用；D 再用 B 第一个客户端的完整 4 元组 connect 返回 `EADDRNOTAVAIL`。
+- 红灯（未改的内核，SMP=2）：B 的第二个 connect 返回 -110（它的 SYN-ACK 被当成第一个连接的段），发送返回 -32；C 的 connect 返回 -99（4 元组被误判为占用）。D 通过。第一次跑红灯时测试没有忽略 SIGPIPE，进程在 B 里被 SIGPIPE 杀掉（code 141），什么也没打印；测试改为 `signal(SIGPIPE, SIG_IGN)` 后失败能以 FAIL 行报告。
+- 修复（`kernel/net/tcp.zig`、`kernel/net/tcp_port_policy.zig`）：
+  1. 新增 `tcp_port_policy.localAddrMatches(bound, remote, our, dst)`：回环连接的本地地址就是它的段携带的源地址（`sourceAddr`），按它比较段的目的地址；其他连接只有绑定了非回环的具体地址才比较。`findTcbByTuple` 新增 `local_ip` 参数并用它过滤；TIME_WAIT 复用的扫描也加了同样的条件。
+  2. 新增 `sameLocalAddr(a_bound, b_bound, remote, our)`：两个连向同一对端的 IPv4 连接源地址相同才算同一个 4 元组；`connectTupleTaken` 对 IPv4 跳过源地址不同的连接（Linux `__inet_check_established`）。
+- 测试：hello346（QEMU，4 项），定向 SMP=2、SMP=4 各一份通过；host 测试「TCP connections that differ only in a local address are different connections (hello346)」检查两个纯函数和接线。变异验证：让 `localAddrMatches` 对回环连接不再比较地址，这条 host 测试失败，文件已恢复。（第一次写的变异有未使用参数，编译不过，不算数，换成能编译的写法重做。）
+- 完整 smoke：四份（SMP=1、4、4、2）都是 EXIT=0，每份 308 PASS、0 FAIL，corrupted canaries 均为 0；riscv64、aarch64 smoke 都是 EXIT=0。
+- 这次修复带来的局限：
+  1. 仍只做了 IPv4，IPv6 连接查找不看本地地址。
+  2. 非回环连接里，未绑定或绑定回环地址的连接接受发往任何本地地址的段；本机只有一个网卡地址，这不会混淆，但多地址时需要记录实际源地址。

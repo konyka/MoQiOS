@@ -4358,6 +4358,31 @@ test "an IPv4 and an IPv6 TCP socket do not conflict on one port (hello344)" {
     try std.testing.expect(std.mem.indexOf(u8, ts, "        if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict\n        if (!tcp_port_policy.familiesConflict(tcb.is_v6, tcbs[i].is_v6)) continue;\n") != null);
 }
 
+test "TCP connections that differ only in a local address are different connections (hello346)" {
+    const p = kt.tcp_port_policy;
+    const any = [4]u8{ 0, 0, 0, 0 };
+    const l1 = [4]u8{ 127, 0, 0, 1 };
+    const l5 = [4]u8{ 127, 0, 0, 5 };
+    const l6 = [4]u8{ 127, 0, 0, 6 };
+    const nic = [4]u8{ 10, 0, 2, 15 };
+    const peer = [4]u8{ 10, 0, 2, 2 };
+    try std.testing.expect(p.localAddrMatches(l5, l1, nic, l5));
+    try std.testing.expect(!p.localAddrMatches(l5, l1, nic, l6));
+    try std.testing.expect(p.localAddrMatches(any, l1, nic, l1));
+    try std.testing.expect(!p.localAddrMatches(any, l1, nic, l5));
+    try std.testing.expect(p.localAddrMatches(any, peer, nic, nic));
+    try std.testing.expect(p.localAddrMatches(nic, peer, nic, nic));
+    try std.testing.expect(!p.localAddrMatches([4]u8{ 10, 0, 2, 16 }, peer, nic, nic));
+    try std.testing.expect(p.sameLocalAddr(l5, l5, l1, nic));
+    try std.testing.expect(!p.sameLocalAddr(l5, l6, l1, nic));
+    try std.testing.expect(p.sameLocalAddr(any, l1, l1, nic));
+    try std.testing.expect(p.sameLocalAddr(any, any, peer, nic));
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "            tcp_port_policy.localAddrMatches(tcbs[i].local_ip, tcbs[i].remote_ip, our, local_ip))\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const found = findTcbByTuple(dst_ip, dst_port, src_port, src_ip);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (remote_ip6 == null and !tcp_port_policy.sameLocalAddr(o.local_ip, tcb.local_ip, remote_ip, netif.getOurIp())) continue;") != null);
+}
+
 test "a TCP socket keeps its bound IPv4 address: per-address conflicts, SYN dispatch, source and name (hello345)" {
     const p = kt.tcp_port_policy;
     const any = [4]u8{ 0, 0, 0, 0 };

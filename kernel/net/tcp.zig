@@ -1011,13 +1011,17 @@ pub fn tcpRetain(tcb_idx: u32) void {
     tcbs[tcb_idx].ref_count += 1;
 }
 
-fn findTcbByTuple(local_port: u16, remote_port: u16, remote_ip: [4]u8) ?*TcpTcb {
+/// The IPv4 connection a segment to `local_ip`:`local_port` from `remote_ip`:`remote_port` belongs to: two connections that differ
+/// only in their local address are told apart (tcp_port_policy.localAddrMatches).
+fn findTcbByTuple(local_ip: [4]u8, local_port: u16, remote_port: u16, remote_ip: [4]u8) ?*TcpTcb {
+    const our = netif.getOurIp();
     var bm = tcb_active_bitmap.snapshot();
     while (bm.next()) |i| {
         if (!tcbs[i].is_v6 and
             tcbs[i].local_port == local_port and
             tcbs[i].remote_port == remote_port and
-            @as(u32, @bitCast(tcbs[i].remote_ip)) == @as(u32, @bitCast(remote_ip)))
+            @as(u32, @bitCast(tcbs[i].remote_ip)) == @as(u32, @bitCast(remote_ip)) and
+            tcp_port_policy.localAddrMatches(tcbs[i].local_ip, tcbs[i].remote_ip, our, local_ip))
         {
             return &tcbs[i];
         }
@@ -2136,6 +2140,7 @@ fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16,
         if (tcbs[i].state == .time_wait and
             !tcbs[i].is_v6 and
             tcp_util.tupleMatchV4(dst_port, src_port, src_ip, tcbs[i].local_port, tcbs[i].remote_port, tcbs[i].remote_ip) and
+            tcp_port_policy.localAddrMatches(tcbs[i].local_ip, tcbs[i].remote_ip, netif.getOurIp(), dst_ip) and
             tcp_util.seqGt(seq_num, tcbs[i].irs))
         {
             if (ls.pending_tail -% ls.pending_head >= LISTEN_BACKLOG) return;
@@ -2972,7 +2977,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, e
 
     // Find matching TCB. A new SYN for a 4-tuple still in TIME_WAIT starts a new connection when its sequence number is newer (RFC 1122 4.2.2.13,
     // Linux tcp_timewait_state_process): it goes to the listener like a fresh SYN, which takes over the TIME_WAIT slot.
-    const found = findTcbByTuple(dst_port, src_port, src_ip);
+    const found = findTcbByTuple(dst_ip, dst_port, src_port, src_ip);
     const tw_reopen = if (found) |t| t.state == .time_wait and flags & SYN != 0 and flags & ACK == 0 and tcp_util.seqGt(seq_num, t.irs) else false;
     const tcb = (if (tw_reopen) null else found) orelse {
         // No matching connection — check if any socket is listening on this port
@@ -3175,6 +3180,8 @@ fn connectTupleTaken(tcb_idx: u32, remote_port: u16, remote_ip: [4]u8, remote_ip
         if (o.local_port != tcb.local_port or o.remote_port != remote_port) continue;
         const same_peer = if (remote_ip6) |ip6| o.is_v6 and ipv6.addrEq(o.remote_ip6, ip6) else !o.is_v6 and @as(u32, @bitCast(o.remote_ip)) == @as(u32, @bitCast(remote_ip));
         if (!same_peer) continue;
+        // IPv4: a connection from another local address to the same peer is a different 4-tuple.
+        if (remote_ip6 == null and !tcp_port_policy.sameLocalAddr(o.local_ip, tcb.local_ip, remote_ip, netif.getOurIp())) continue;
         if (tcp_port_policy.tupleTakenBy(o.state == .closed, o.state == .time_wait)) return true;
         if (o.state == .time_wait) {
             if (o.ref_count != 0) return true;
