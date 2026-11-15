@@ -9212,3 +9212,19 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 本节只新增回归测试 hello336（QEMU，4 项）和文档，没有改内核代码，所以这一项不是按 TDD 先红后绿做的。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都有 hello336、hello335 PASS。SMP=1、SMP=2 和一份 SMP=4 `EXIT=0`、0 FAIL；另一份 SMP=4 `EXIT=1`，只有已记录的偶发项 hello286 J（57/60 次组停止被报告）失败。随后单独重跑一份 SMP=4，`EXIT=0`、0 FAIL。riscv64、aarch64 smoke 通过。
 - CI 记录：hello335 的提交 `bf24425` 在 CI（运行 43655065865）的 SMP=2 上失败，唯一的失败是 hello267「all 12 connections queued on the closed listener are accepted by a survivor」。hello335 只改了 mq 描述符的偏移，没有碰 TCP；本地这一轮五份完整 smoke（SMP 1/4/4/2 和重跑的 SMP=4）里 hello267 都通过。归入已记录的 hello267 偶发项，根因没有查。CI 重跑因为 token 权限不足（`Resource not accessible by personal access token`）没能执行，hello336 的提交 `0a90c82` 的 CI 运行作为同一代码加上回归测试后的再次验证。
+
+## 补充：控制台 tty 的 TCSETSW、TCSETSF（hello337）
+
+- 问题：`ioctl_policy` 把 `TCSETSW`（0x5403）、`TCSETSF`（0x5404）算作终端请求，但 `ioctl.zig` 的 switch 里没有这两个分支，在控制台上落到 `else`，返回 `ENOTTY`。`tcsetattr(fd, TCSADRAIN/TCSAFLUSH, ...)` 因此失败，termios 不变。
+- Linux 实测（`gcc -DHOST user/hello337.c`，pty 从端代替 `/dev/tty`）：A `TCSETSW` 成功，`TCGETS` 读回新的 VMIN；B `TCSETSW` 保留已排队的输入，之前的两个字符仍能读到；C `TCSETSF` 成功、设好 VMIN，并丢掉未读输入，之后只读到后来注入的字符；D 管道上 `TCSETSW` 是 `ENOTTY`，`TCSETSF` 参数为 NULL 是 `EFAULT`。
+- 红灯：旧内核上 A–D 全部失败（`TCSETSW -25`，`TCSETSF with NULL -25`，C 读到 `3 'c'`）。
+- 修复：
+  - `kernel/fs/ioctl.zig`：`TCSETS`、`TCSETSW`、`TCSETSF` 共用一个分支。控制台输出同步写串口，没有要等的输出队列，所以 `TCSETSW` 和 `TCSETS` 相同；`TCSETSF` 在 x86_64 上先调用 `keyboard.flushInput()`（Linux `set_termios` 的 `TERMIOS_FLUSH` → `tty_ldisc_flush`）。
+  - `kernel/drivers/keyboard.zig`：新增 `flushInput`，在 `push_lock` 内把 `ring_tail` 移到 `ring_head`。
+- 测试：hello337（QEMU，4 项）；host 测试 `TCSETSW and TCSETSF set the console termios, and TCSETSF discards unread input`。变异：把清空条件改成 `TCSETSW`，该测试失败，文件已恢复。
+- 绿灯：定向 SMP=2、SMP=4 各一份，hello337 通过；`zig build test` 通过。
+- 完整 smoke：四份（SMP=1、4、4、2）全部 EXIT=0，`:   FAIL` 计数为 0，`hello337: PASS` 每份 1 次，同样用 TIOCSTI 的 hello326、hello331 也都通过，hello228 `corrupted canaries=0`。riscv64、aarch64 smoke 通过。
+- 局限：
+  1. termios 仍只是保存的值：没有 canonical 行规程、回显、ISIG 由 termios 控制，VMIN/VTIME 不影响 read（hello326 局限 3 不变）。
+  2. riscv64、aarch64 没有控制台输入队列，`TCSETSF` 在那里只设 termios，没有可丢的输入。
+  3. 没有 `TCFLSH`、`TCSBRK`、`TCXONC`。

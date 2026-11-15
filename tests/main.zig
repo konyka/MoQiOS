@@ -975,6 +975,14 @@ test "an mq descriptor's read offset lives in its open description, shared by du
     try std.testing.expect(std.mem.indexOf(u8, kt.posix_mq_source, "    offset: u64 = 0,\n};") != null);
 }
 
+test "TCSETSW and TCSETSF set the console termios, and TCSETSF discards unread input" {
+    const v = kt.ioctl_source;
+    try std.testing.expect(std.mem.indexOf(u8, v, "TCSETS, ip.TCSETSW, ip.TCSETSF => {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "if (cmd == ip.TCSETSF and comptime @import(\"builtin\").cpu.arch == .x86_64) @import(\"../drivers/keyboard.zig\").flushInput();") != null);
+    try std.testing.expect(kt.ioctl_policy.isTerminalRequest(kt.ioctl_policy.TCSETSW));
+    try std.testing.expect(kt.ioctl_policy.isTerminalRequest(kt.ioctl_policy.TCSETSF));
+}
+
 test "parent TID copyout aborts an unpublished child before publication" {
     const source = kt.clone_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "abortUnpublishedChild(child_idx)") != null);

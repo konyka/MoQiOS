@@ -201,6 +201,13 @@ pub fn inject(ch: u8) bool {
     return push(ch);
 }
 
+/// TCSETSF / TCFLSH(TCIFLUSH): drop every character not yet read (Linux tty_ldisc_flush → n_tty_flush_buffer).
+pub fn flushInput() void {
+    const f = push_lock.acquire();
+    defer push_lock.release(f);
+    @atomicStore(u32, &ring_tail, @atomicLoad(u32, &ring_head, .acquire), .release);
+}
+
 /// Read a character from the keyboard buffer. Returns 0 if empty.
 pub fn readChar() u8 {
     if (ring_tail == ring_head) return 0;

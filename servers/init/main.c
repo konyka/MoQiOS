@@ -453,6 +453,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello334"); /* a POSIX mq descriptor is an ordinary file descriptor: lowest number, dup, fcntl, poll, read, fstat */
     run_test("hello335"); /* an mq descriptor's read offset belongs to its open description: dup and fork share it */
     run_test("hello336"); /* edge-triggered epoll on an mq descriptor reports again after every send and receive */
+    run_test("hello337"); /* TCSETSW keeps queued console input, TCSETSF discards it */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

@@ -188,12 +188,15 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
             if (copy.copyToUser(@ptrFromInt(arg), t_bytes[0..@sizeOf(Termios)], @sizeOf(Termios)) != @sizeOf(Termios)) return -14;
             return 0;
         },
-        TCSETS => {
+        // TCSETSW waits for queued output first and TCSETSF also discards unread input (Linux set_termios TERMIOS_WAIT,
+        // TERMIOS_FLUSH). Console output is written to the serial port synchronously, so there is never output to wait for.
+        TCSETS, ip.TCSETSW, ip.TCSETSF => {
             if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;
             var t: Termios = undefined;
             const t_bytes: [*]u8 = @ptrCast(&t);
             const copied = copy.copyFromUser(t_bytes[0..@sizeOf(Termios)], @ptrFromInt(arg), @sizeOf(Termios));
             if (copied < @sizeOf(Termios)) return -14;
+            if (cmd == ip.TCSETSF and comptime @import("builtin").cpu.arch == .x86_64) @import("../drivers/keyboard.zig").flushInput();
             default_termios = t;
             return 0;
         },
