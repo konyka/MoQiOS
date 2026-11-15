@@ -4322,13 +4322,15 @@ fn creatorFsuid(task_idx: u32) u32 {
     return t.fsuid;
 }
 
-/// Whether another TCB holding `port` keeps TCB `tcb_idx` from binding or listening on it: SO_REUSEADDR on both with a holder that is
-/// not listening (tcp_port_policy.reuseMayShare), or SO_REUSEPORT on both with one owner, lets them share. Caller holds tcp_lock.
+/// Whether another TCB holding `port` keeps TCB `tcb_idx` from binding or listening on it. Only sockets of the same family count
+/// (tcp_port_policy.familiesConflict); SO_REUSEADDR on both with a holder that is not listening (tcp_port_policy.reuseMayShare), or
+/// SO_REUSEPORT on both with one owner, lets them share. Caller holds tcp_lock.
 fn portConflict(tcb_idx: u32, port: u16) bool {
     const tcb = &tcbs[tcb_idx];
     var bm = tcb_active_bitmap.snapshot();
     while (bm.next()) |i| {
         if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict
+        if (!tcp_port_policy.familiesConflict(tcb.is_v6, tcbs[i].is_v6)) continue;
         if (tcbs[i].local_port == port) {
             if (tcp_port_policy.reuseMayShare(tcb.options.reuse_addr, tcbs[i].options.reuse_addr, tcbs[i].state == .listen)) continue;
             if (tcp_port_policy.reusePortMayShare(tcb.options.extra_flags, tcbs[i].options.extra_flags, tcb.sock_uid, tcbs[i].sock_uid)) continue;

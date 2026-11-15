@@ -56,6 +56,12 @@ pub fn reuseMayShare(new_has_reuseaddr: bool, holder_has_reuseaddr: bool, holder
     return new_has_reuseaddr and holder_has_reuseaddr and !holder_is_listening;
 }
 
+/// Two sockets on one port only conflict when they are of the same family: every AF_INET6 socket here is IPV6_V6ONLY (no IPv4-mapped
+/// dual stack), and Linux inet_bind_conflict lets a v6-only socket and an IPv4 one share a port.
+pub fn familiesConflict(new_is_v6: bool, holder_is_v6: bool) bool {
+    return new_is_v6 == holder_is_v6;
+}
+
 /// connect() from a port another connection shares: the 4-tuple is taken (EADDRNOTAVAIL, Linux __inet_check_established) while that
 /// connection is live. A CLOSED slot is no connection, and a TIME_WAIT one is taken over the way a loopback tcp_tw_reuse does.
 pub const CONNECT_EADDRNOTAVAIL: i64 = -99;

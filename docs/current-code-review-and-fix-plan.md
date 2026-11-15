@@ -9272,7 +9272,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：补上 `SO_REUSEPORT` 继承后四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，各 302 个 PASS，hello340、hello267、hello269、hello183 都通过，hello228 `corrupted canaries=0`。riscv64、aarch64 smoke 通过。
 - 局限：
   1. hello269 的 CI 失败只是推测由旧规则引起，没有在本地复现；本地 smoke 里 hello269 一直通过。如果 CI 上还出现 5/8，要先让 hello269 打印每轮失败在 b、rc、ac 还是 n。
-  2. 端口冲突扫描不区分 IPv4 和 IPv6（和改动之前一样），也不区分绑定的本地地址：TCB 没有记录绑定地址，`127.0.0.1:p` 和 `0.0.0.0:p` 视为同一个端口。
+  2. 端口冲突扫描不区分 IPv4 和 IPv6（和改动之前一样），也不区分绑定的本地地址：TCB 没有记录绑定地址，`127.0.0.1:p` 和 `0.0.0.0:p` 视为同一个端口。（hello344 已补地址族：不同族不再冲突；本地地址仍不区分。）
   3. connect 释放同一 4 元组上的 TIME_WAIT 残留，相当于在回环上总是做 `tcp_tw_reuse`；Linux 只在时间戳允许时才这样做，否则返回 `EADDRNOTAVAIL`。
   4. 新发现、未修：调整顺序跑定向测试时（hello183、267、269、272、143、39 之后跑 hello340），有一次客户端 connect 返回 -1，第二次同样顺序通过。`tcpConnectSocket` 在 SYN 发不出去时把状态改回 CLOSED 并返回 -1（改动前就是这样），最可能的原因是回环队列（`lo.QUEUE_DEPTH` 16 帧）被前一个程序退出时的报文占满。Linux 发送 SYN 失败不会让 connect 出错，重传定时器会再发。（hello341 已补：回环队列满时 SYN 算作丢失，连接留在 SYN_SENT 等重传；UDP `sendto` 也不再因此失败）
 
@@ -9324,3 +9324,17 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 服务端 SYN-ACK 重发和挑战 ACK 没有专门的确定性测试：用户态没法指定丢哪一帧，非 x86 的 SK 探针在 SK-19 之后不运行。只有 hello272 的偶发失败间接覆盖它们。
   3. 挑战 ACK 没有做 RFC 5961 的速率限制（Linux `tcp_challenge_ack_limit`）。
   2. SYN_RECEIVED 子连接重发 5 次 SYN-ACK 后由 `closeTcbRemote` 释放（backlog 条目置为无效）。RTO 从 2 秒起翻倍、上限 60 秒，所以放弃前大约 122 秒；Linux 默认 `tcp_synack_retries`=5、初始 1 秒，大约 63 秒。期间子连接一直占着 backlog 位置。
+
+## 补充：IPv4 和 IPv6 的 TCP 套接字可以绑定同一个端口（hello344）
+
+- 背景：hello340 一节局限 2 记录过，`portConflict` 不区分地址族，所以一个 IPv4 套接字占着端口时，同一端口上的 IPv6 套接字 `bind` 返回 `EADDRINUSE`。这个内核没有 IPv4 映射的双栈，每个 AF_INET6 套接字都是 IPV6_V6ONLY（`ip_opt_policy` 拒绝把它设为 0）。Linux 的 `inet_bind_conflict` 允许 v6-only 套接字和 IPv4 套接字共用端口。
+- Linux 实测（`gcc -DHOST user/hello344.c`）：A IPv6 套接字设 IPV6_V6ONLY=1 成功；B `bind 0.0.0.0:18896` 和 `bind [::]:18896` 都返回 0；C 两个都能 listen；D 同族的第二个 bind 都是 `EADDRINUSE`；E 连 127.0.0.1 的连接被 IPv4 监听者 accept，连 ::1 的被 IPv6 监听者 accept，各一个。
+- 红灯（未改的内核，SMP=2）：B 里 IPv6 bind 返回 -98，C 的 IPv6 listen 返回 -1，E 里 IPv6 监听者 accept 返回 -22。
+- 修复：新增 `tcp_port_policy.familiesConflict(new_is_v6, holder_is_v6)`，只有同族才算冲突；`portConflict`（bind 和 listen 都用它）跳过不同族的占用者。SYN 分派本来就按 `is_v6` 选监听槽（`pickListenSlot`），不用改。
+- 测试：hello344（QEMU，5 项），定向 SMP=2、SMP=4 各一份通过；host 测试「an IPv4 and an IPv6 TCP socket do not conflict on one port (hello344)」检查纯函数和源码。变异验证：让 `familiesConflict` 恒返回 true，这条测试失败。
+- 第一次完整 smoke 暴露的测试问题：四份里两份（SMP=4、SMP=2）第二轮的 hello344 E 失败，要么 IPv4 监听者 3 秒内没 accept 到（之后又 accept 到了，"then 8"），要么 IPv4 那条连接到得晚。紧跟 hello343 运行时 `/proc/lostats` 显示回环队列已丢过 46–48 帧，E 期间又多丢了约 26 帧：40 个 TIME_WAIT 残留和握手报文挤满 16 帧的队列，丢了一个握手帧的连接要等 2 秒的重传超时。原来的 E 先在 IPv4 监听者上等 3 秒再等 IPv6，时间不够。改成两个监听者轮流 accept、总共最多等 10 秒，再多等 200 ms 确认各自没有第二个连接。失败时打印 `/proc/lostats` 和 `/proc/tcpstats`。改后紧跟 hello343 的 SMP=4 定向运行 3/3 通过（改前 3 次里 2 次失败）。内核没有因此改动。
+- 完整 smoke：四份（SMP=1、4、4、2）里三份 EXIT=0，PASS 均为 306；一份 SMP=4 的 hello229 E「without SA_RESTART a blocked wait4 returns -EINTR」失败一次（305 PASS），与本改动无关，记为偶发项（子进程发信号 30 ms 后就退出，负载下父进程醒来时子进程已是僵尸，先回收而不返回 EINTR）；hello344 四份都通过，corrupted canaries 均为 0。
+- 局限：
+  1. 绑定的本地地址还是不区分：TCB 不记录绑定地址，`127.0.0.1:p` 和 `0.0.0.0:p` 仍视为同一个端口。
+  2. connect 选临时端口（`allocEphemeralPort`）时仍然把另一族的占用算进去，只是少用了一些端口，不会出错。
+  3. 回环队列只有 16 帧，前一个程序留下的报文多时握手帧会被丢，靠 2 秒的重传超时恢复；这是已有的开放项（固定容量的回环队列）。

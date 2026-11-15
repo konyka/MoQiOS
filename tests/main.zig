@@ -4348,6 +4348,16 @@ test "a SYN on a finished handshake gets an ACK; a resent SYN gets the SYN-ACK a
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (flags & (SYN | ACK) == SYN and seq_num == tcb.irs) {\n                tcb.snd_nxt = tcb.snd_una;\n                sendSynAck(tcb, tcb.ecn_ok);") != null);
 }
 
+test "an IPv4 and an IPv6 TCP socket do not conflict on one port (hello344)" {
+    const p = kt.tcp_port_policy;
+    try std.testing.expect(p.familiesConflict(false, false));
+    try std.testing.expect(p.familiesConflict(true, true));
+    try std.testing.expect(!p.familiesConflict(true, false));
+    try std.testing.expect(!p.familiesConflict(false, true));
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "        if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict\n        if (!tcp_port_policy.familiesConflict(tcb.is_v6, tcbs[i].is_v6)) continue;\n") != null);
+}
+
 test "lo queue enqueue/dequeue preserves FIFO order" {
     var q = lo.LoopbackQueue.init();
     try std.testing.expectEqual(@as(u32, 0), q.pending());
