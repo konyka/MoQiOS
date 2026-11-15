@@ -49,10 +49,19 @@ pub fn bindNeedsPrivilege(port: u16) bool {
     return port != 0 and port < PRIVILEGED_PORT_LIMIT;
 }
 
-/// A bound port held by another socket can still be taken when the new socket
-/// asked for SO_REUSEADDR and the holder is only a TIME_WAIT leftover.
-pub fn reuseMayShare(new_has_reuseaddr: bool, holder_is_time_wait: bool) bool {
-    return new_has_reuseaddr and holder_is_time_wait;
+/// A port another socket holds can still be bound (or listened on) when both sockets set SO_REUSEADDR and the holder is not listening
+/// (Linux inet_csk_bind_conflict: sk->sk_reuse && sk2->sk_reuse && sk2->sk_state != TCP_LISTEN). A TIME_WAIT holder is no exception:
+/// without SO_REUSEADDR on it the port stays taken.
+pub fn reuseMayShare(new_has_reuseaddr: bool, holder_has_reuseaddr: bool, holder_is_listening: bool) bool {
+    return new_has_reuseaddr and holder_has_reuseaddr and !holder_is_listening;
+}
+
+/// connect() from a port another connection shares: the 4-tuple is taken (EADDRNOTAVAIL, Linux __inet_check_established) while that
+/// connection is live. A CLOSED slot is no connection, and a TIME_WAIT one is taken over the way a loopback tcp_tw_reuse does.
+pub const CONNECT_EADDRNOTAVAIL: i64 = -99;
+
+pub fn tupleTakenBy(holder_is_closed: bool, holder_is_time_wait: bool) bool {
+    return !holder_is_closed and !holder_is_time_wait;
 }
 
 /// SO_REUSEPORT (socket_opt flag bit 8): two sockets may bind the same port only when BOTH set it before binding and have the same owner uid

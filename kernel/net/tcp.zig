@@ -2176,6 +2176,8 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
     new_tcb.remote_ip = src_ip;
     new_tcb.owner_task = ls.owner_task;
     new_tcb.sock_uid = listenerSockUid(ls);
+    new_tcb.options.reuse_addr = listenerReuseAddr(ls);
+    new_tcb.options.extra_flags |= listenerReusePortFlag(ls);
     new_tcb.iss = generateIss();
     new_tcb.snd_una = new_tcb.iss;
     new_tcb.snd_nxt = new_tcb.iss;
@@ -2275,6 +2277,8 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
     new_tcb.remote_ip6 = src_ip;
     new_tcb.owner_task = ls.owner_task;
     new_tcb.sock_uid = listenerSockUid(ls);
+    new_tcb.options.reuse_addr = listenerReuseAddr(ls);
+    new_tcb.options.extra_flags |= listenerReusePortFlag(ls);
     new_tcb.iss = generateIss();
     new_tcb.snd_una = new_tcb.iss;
     new_tcb.snd_nxt = new_tcb.iss;
@@ -3123,6 +3127,27 @@ pub fn tcpConnect(remote_ip: [4]u8, remote_port: u16, owner_task: u32) i64 {
     return @intCast(tcbIdx(tcb));
 }
 
+/// Whether another connection already uses the 4-tuple TCB `tcb_idx` would connect with (its local port to `remote_port` at
+/// `remote_ip`, or `remote_ip6` when that is given). A live holder makes it taken (tcp_port_policy.tupleTakenBy); an unreferenced
+/// TIME_WAIT leftover on the tuple is freed so the new connection is the only TCB that matches it. Caller holds tcp_lock.
+fn connectTupleTaken(tcb_idx: u32, remote_port: u16, remote_ip: [4]u8, remote_ip6: ?[16]u8) bool {
+    const tcb = &tcbs[tcb_idx];
+    var bm = tcb_active_bitmap.snapshot();
+    while (bm.next()) |i| {
+        if (i == tcb_idx) continue;
+        const o = &tcbs[i];
+        if (o.local_port != tcb.local_port or o.remote_port != remote_port) continue;
+        const same_peer = if (remote_ip6) |ip6| o.is_v6 and ipv6.addrEq(o.remote_ip6, ip6) else !o.is_v6 and @as(u32, @bitCast(o.remote_ip)) == @as(u32, @bitCast(remote_ip));
+        if (!same_peer) continue;
+        if (tcp_port_policy.tupleTakenBy(o.state == .closed, o.state == .time_wait)) return true;
+        if (o.state == .time_wait) {
+            if (o.ref_count != 0) return true;
+            deactivateTcb(o);
+        }
+    }
+    return false;
+}
+
 // Connect an existing socket TCB to a remote address.
 // Returns 0 on success (SYN sent), -1 on failure.
 pub fn tcpConnectSocket(tcb_idx: u32, remote_ip: [4]u8, remote_port: u16) i64 {
@@ -3140,6 +3165,8 @@ pub fn tcpConnectSocket(tcb_idx: u32, remote_ip: [4]u8, remote_port: u16) i64 {
         tcb.local_port = allocEphemeralPort(tcb);
         if (tcb.local_port == 0) return -1;
     }
+
+    if (connectTupleTaken(tcb_idx, remote_port, remote_ip, null)) return tcp_port_policy.CONNECT_EADDRNOTAVAIL;
 
     tcb.remote_port = remote_port;
     tcb.remote_ip = remote_ip;
@@ -3177,6 +3204,8 @@ pub fn tcpConnectSocketV6(tcb_idx: u32, remote_ip6: [16]u8, remote_port: u16) i6
         tcb.local_port = allocEphemeralPort(tcb);
         if (tcb.local_port == 0) return -1;
     }
+
+    if (connectTupleTaken(tcb_idx, remote_port, undefined, remote_ip6)) return tcp_port_policy.CONNECT_EADDRNOTAVAIL;
 
     tcb.remote_port = remote_port;
     tcb.remote_ip6 = remote_ip6;
@@ -4237,12 +4266,41 @@ fn listenerSockUid(slot: *const ListenSlot) u32 {
     return tcbs[slot.tcb_idx].sock_uid;
 }
 
+/// SO_REUSEADDR of the listener behind `slot`: an accepted connection starts with it (Linux sk_clone_lock copies sk_reuse).
+fn listenerReuseAddr(slot: *const ListenSlot) bool {
+    if (slot.tcb_idx >= MAX_CONNECTIONS) return false;
+    return tcbs[slot.tcb_idx].options.reuse_addr;
+}
+
+/// The SO_REUSEPORT bit of the listener behind `slot`, which an accepted connection inherits too (sk_clone_lock copies sk_reuseport):
+/// otherwise the connections a reuseport listener accepted would keep its siblings from listening on the shared port.
+fn listenerReusePortFlag(slot: *const ListenSlot) u16 {
+    if (slot.tcb_idx >= MAX_CONNECTIONS) return 0;
+    return tcbs[slot.tcb_idx].options.extra_flags & tcp_port_policy.REUSEPORT_FLAG;
+}
+
 /// The fsuid of the task in slot `task_idx` (0 when there is none): the owner a socket it creates gets (Linux sock_alloc,
 /// current_fsuid()).
 fn creatorFsuid(task_idx: u32) u32 {
     const task_mod = @import("../proc/task.zig");
     const t = task_mod.getTask(task_idx) orelse return 0;
     return t.fsuid;
+}
+
+/// Whether another TCB holding `port` keeps TCB `tcb_idx` from binding or listening on it: SO_REUSEADDR on both with a holder that is
+/// not listening (tcp_port_policy.reuseMayShare), or SO_REUSEPORT on both with one owner, lets them share. Caller holds tcp_lock.
+fn portConflict(tcb_idx: u32, port: u16) bool {
+    const tcb = &tcbs[tcb_idx];
+    var bm = tcb_active_bitmap.snapshot();
+    while (bm.next()) |i| {
+        if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict
+        if (tcbs[i].local_port == port) {
+            if (tcp_port_policy.reuseMayShare(tcb.options.reuse_addr, tcbs[i].options.reuse_addr, tcbs[i].state == .listen)) continue;
+            if (tcp_port_policy.reusePortMayShare(tcb.options.extra_flags, tcbs[i].options.extra_flags, tcb.sock_uid, tcbs[i].sock_uid)) continue;
+            return true;
+        }
+    }
+    return false;
 }
 
 /// Bind a TCB to a local port.
@@ -4256,21 +4314,7 @@ pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
     // bind() on a socket that already has an address, or is past CLOSED, is EINVAL.
     if (tcb.state != .closed or tcb.bound_explicitly) return tcp_port_policy.BIND_EINVAL;
 
-    // Check if port is already in use (bitmap-driven scan)
-    // SO_REUSEADDR allows binding to a port in TIME_WAIT state
-    var bm = tcb_active_bitmap.snapshot();
-    while (bm.next()) |i| {
-        if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict
-        if (tcbs[i].local_port == port and port != 0) {
-            if (tcp_port_policy.reuseMayShare(tcb.options.reuse_addr, @intFromEnum(tcbs[i].state) == @intFromEnum(TcpState.time_wait))) {
-                continue;
-            }
-            if (tcp_port_policy.reusePortMayShare(tcb.options.extra_flags, tcbs[i].options.extra_flags, tcb.sock_uid, tcbs[i].sock_uid)) {
-                continue;
-            }
-            return tcp_port_policy.BIND_EADDRINUSE;
-        }
-    }
+    if (port != 0 and portConflict(tcb_idx, port)) return tcp_port_policy.BIND_EADDRINUSE;
 
     tcb.local_port = port;
     tcb.bound_explicitly = port != 0;
@@ -4290,6 +4334,8 @@ pub fn tcpListen(tcb_idx: u32) i64 {
     // re-bind the port's backlog to the wrong owner (EISCONN).
     const lis_rc = tcp_recv_policy.listenErrno(tcb.state);
     if (lis_rc != 0) return lis_rc;
+    // Two SO_REUSEADDR sockets may share a bound port, but only one of them may listen on it (Linux inet_csk_get_port on listen).
+    if (tcb.state != .listen and portConflict(tcb_idx, tcb.local_port)) return tcp_port_policy.BIND_EADDRINUSE;
 
     tcb.state = .listen;
 

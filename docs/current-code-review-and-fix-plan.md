@@ -9258,3 +9258,20 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 局限：
   1. `TCOOFF` 不会真的暂停输出：控制台同步写串口，没有输出队列可以挂起，之后的 write 照常输出。Linux 上 `TCOOFF` 后写入会阻塞（或非阻塞时 EAGAIN）直到 `TCOON`。
   2. `TCIOFF`、`TCION` 不发送 STOP/START 字符：串口没有对端流控。
+
+## 补充：TCP bind 的 SO_REUSEADDR 冲突规则跟随 Linux（hello340）
+
+- 问题：`d3818bb` 的 CI 运行 43664246469 在 SMP=1 上只挂了 hello269「a client that binds the same port every round reconnects each time after the server closed first」（同端口重连 5/8）。核对规则后发现 `tcpBind` 的 `SO_REUSEADDR` 判断和 Linux 不一致：旧规则只在「新套接字设了 `SO_REUSEADDR` 且占用者处于 TIME_WAIT」时允许共享。hello269 里服务端先关，客户端端口在下一轮 bind 时可能还在 LAST_ACK（最后的 ACK 还没到），旧规则判为冲突返回 `EADDRINUSE`，Linux 在这种情况下允许 bind。CI 日志只打印了 5/8，没法确认每一轮失败在哪一步，所以这只是推测的原因。另外发现两个差距：accept 出来的连接不继承监听者的 `SO_REUSEADDR`（`allocTcb` 把 `options` 清零），connect 不检查 4 元组是否已被别的连接占用。
+- Linux 实测（`gcc -DHOST user/hello340.c`）：A 两边都设 reuse、占用者 ESTABLISHED，bind 0；B 只有占用者设 reuse，`EADDRINUSE`；C 两边都设 reuse、占用者只 bind 过，bind 0，之后占用者还能 listen；D 占用者在 LISTEN，`EADDRINUSE`；G 两个 reuse 套接字共享一个端口，其中一个 listen 之后，另一个 listen 是 `EADDRINUSE`；H 从共享端口 connect 到已建立连接正在用的同一个对端，`EADDRNOTAVAIL`（-99）；E 占用者没设 reuse，`EADDRINUSE`（另测：占用者没设 reuse 时，即使它在 TIME_WAIT，也是 `EADDRINUSE`）；F accept 出来的连接 `SO_REUSEADDR` 读回 1，监听者关闭后 reuse 套接字可以绑定那个端口，而那条连接仍是 ESTABLISHED。这是 `inet_csk_bind_conflict` 的规则：两边都有 `sk_reuse`，且占用者不在 LISTEN，才不算冲突。
+- 红灯：旧内核上 A、C、F 失败（-98 / 读回 0），其余通过。
+- 修复：
+  - `kernel/net/tcp_port_policy.zig`：`reuseMayShare(new, holder, holder_is_listening)` 改为 `new and holder and !holder_is_listening`；新增 `CONNECT_EADDRNOTAVAIL`（-99）和 `tupleTakenBy(closed, time_wait)`（存活的连接才算占用）。附带测试。
+  - `kernel/net/tcp.zig`：冲突扫描抽成 `portConflict`，`tcpBind` 使用它；`tcpListen` 在套接字不是已监听时再检查一次端口（只有一个共享者可以 listen）；IPv4、IPv6 两条 SYN 路径让新连接继承监听者的 `SO_REUSEADDR`（`listenerReuseAddr`，对应 Linux `sk_clone_lock` 复制 `sk_reuse`），同时继承 `SO_REUSEPORT` 位（`listenerReusePortFlag`，对应复制 `sk_reuseport`）。第一版只继承了 `SO_REUSEADDR`，完整 smoke 四份里 hello267 全部失败：reuseport 监听者 accept 出来的连接不带 `SO_REUSEPORT`，新加的 listen 复查把它们算成冲突，同端口的兄弟监听者 listen 返回 `EADDRINUSE`。补上继承后 hello267 通过；`tcpConnectSocket`、`tcpConnectSocketV6` 调用 `connectTupleTaken`：4 元组被存活的连接占用就返回 `EADDRNOTAVAIL`，没有引用的 TIME_WAIT 残留会被释放，让新连接成为唯一匹配这个 4 元组的 TCB。
+- 测试：hello340（QEMU，9 项，含 setup）；host 测试 `TCP bind errors and SO_REUSEADDR sharing` 改为新规则，并检查 listen 的复查、两处继承、两处 connect 检查。变异：把 `holder_has_reuseaddr` 换成 `(holder_has_reuseaddr or true)`，这条测试失败，文件已恢复。
+- 绿灯：定向 SMP=2、SMP=4 各一份，hello340 通过；`zig build test` 通过。
+- 完整 smoke：补上 `SO_REUSEPORT` 继承后四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，各 302 个 PASS，hello340、hello267、hello269、hello183 都通过，hello228 `corrupted canaries=0`。riscv64、aarch64 smoke 通过。
+- 局限：
+  1. hello269 的 CI 失败只是推测由旧规则引起，没有在本地复现；本地 smoke 里 hello269 一直通过。如果 CI 上还出现 5/8，要先让 hello269 打印每轮失败在 b、rc、ac 还是 n。
+  2. 端口冲突扫描不区分 IPv4 和 IPv6（和改动之前一样），也不区分绑定的本地地址：TCB 没有记录绑定地址，`127.0.0.1:p` 和 `0.0.0.0:p` 视为同一个端口。
+  3. connect 释放同一 4 元组上的 TIME_WAIT 残留，相当于在回环上总是做 `tcp_tw_reuse`；Linux 只在时间戳允许时才这样做，否则返回 `EADDRNOTAVAIL`。
+  4. 新发现、未修：调整顺序跑定向测试时（hello183、267、269、272、143、39 之后跑 hello340），有一次客户端 connect 返回 -1，第二次同样顺序通过。`tcpConnectSocket` 在 SYN 发不出去时把状态改回 CLOSED 并返回 -1（改动前就是这样），最可能的原因是回环队列（`lo.QUEUE_DEPTH` 16 帧）被前一个程序退出时的报文占满。Linux 发送 SYN 失败不会让 connect 出错，重传定时器会再发。

@@ -10943,11 +10943,17 @@ test "TCP bind errors and SO_REUSEADDR sharing" {
     // Ports below 1024 need the capability; 0 (ephemeral) and 1024 do not.
     try std.testing.expect(p.bindNeedsPrivilege(1) and p.bindNeedsPrivilege(80) and p.bindNeedsPrivilege(1023));
     try std.testing.expect(!p.bindNeedsPrivilege(0) and !p.bindNeedsPrivilege(1024) and !p.bindNeedsPrivilege(49152));
-    // A held port is shareable only with SO_REUSEADDR on the new socket AND a TIME_WAIT holder.
-    try std.testing.expect(p.reuseMayShare(true, true));
-    try std.testing.expect(!p.reuseMayShare(false, true));
-    try std.testing.expect(!p.reuseMayShare(true, false));
-    try std.testing.expect(!p.reuseMayShare(false, false));
+    // A held port is shareable only with SO_REUSEADDR on both sockets and a holder that is not listening (Linux inet_csk_bind_conflict).
+    try std.testing.expect(p.reuseMayShare(true, true, false));
+    try std.testing.expect(!p.reuseMayShare(true, true, true));
+    try std.testing.expect(!p.reuseMayShare(true, false, false));
+    try std.testing.expect(!p.reuseMayShare(false, true, false));
+    try std.testing.expect(!p.reuseMayShare(false, false, false));
+    // connect(): a live connection on the 4-tuple takes it (EADDRNOTAVAIL); a CLOSED or TIME_WAIT one does not.
+    try std.testing.expectEqual(@as(i64, -99), p.CONNECT_EADDRNOTAVAIL);
+    try std.testing.expect(p.tupleTakenBy(false, false));
+    try std.testing.expect(!p.tupleTakenBy(true, false));
+    try std.testing.expect(!p.tupleTakenBy(false, true));
 
     const ts = kt.tcp_source;
     // A socket that already has an address, or is not CLOSED, is EINVAL; a plain conflict is EADDRINUSE.
@@ -10955,8 +10961,14 @@ test "TCP bind errors and SO_REUSEADDR sharing" {
     try std.testing.expect(std.mem.indexOf(u8, ts, "return tcp_port_policy.BIND_EADDRINUSE;") != null);
     // Port 0 (let the kernel choose) never conflicts, and the socket's own slot is skipped.
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (i == tcb_idx) continue;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcbs[i].local_port == port and port != 0) {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ts, "tcp_port_policy.reuseMayShare(tcb.options.reuse_addr, @intFromEnum(tcbs[i].state) == @intFromEnum(TcpState.time_wait))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (port != 0 and portConflict(tcb_idx, port)) return tcp_port_policy.BIND_EADDRINUSE;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "tcp_port_policy.reuseMayShare(tcb.options.reuse_addr, tcbs[i].options.reuse_addr, tcbs[i].state == .listen)") != null);
+    // listen() checks the port again (only one SO_REUSEADDR sharer may listen); accepted connections inherit SO_REUSEADDR (both families).
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.state != .listen and portConflict(tcb_idx, tcb.local_port)) return tcp_port_policy.BIND_EADDRINUSE;") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ts, "new_tcb.options.reuse_addr = listenerReuseAddr(ls);"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ts, "new_tcb.options.extra_flags |= listenerReusePortFlag(ls);"));
+    // Both connect paths refuse a 4-tuple a live connection already uses.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ts, "return tcp_port_policy.CONNECT_EADDRNOTAVAIL;"));
     // Both bind paths (IPv4 and IPv6) refuse a privileged port without the capability with EACCES.
     const ss = kt.socket_syscall_source;
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n        return net_mod.tcp.tcpBind(tcb_idx, parsed.port);"));
