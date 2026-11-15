@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello335`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello336`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -330,6 +330,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello333 | POSIX mq 描述符由 CLONE_FILES 线程共享：线程打开的描述符在线程退出后主线程能用（A）；线程关闭后主线程得到 EBADF，号码被重用（B）；线程用过再退出不关闭描述符（C）；fork 的子进程有自己的一份（D） |
 | hello334 | POSIX mq 描述符是普通 fd：拿最低的空闲号码（A）；dup/dup2 共享 description（B、E）；总是 FD_CLOEXEC，F_GETFL 报访问模式、O_NONBLOCK 和打开时的 O_CLOEXEC（C）；poll 按消息数报 POLLIN/POLLOUT（D）；read 返回状态行，write 是 EINVAL，可 lseek（F）；非 mq 的 fd 是 EBADF（G）；F_SETFL 与 mq_setattr 改同一个 O_NONBLOCK（H）；fstat 和 /proc/self/fd（I）；fork 继承（J） |
 | hello335 | mq 描述符的 read 偏移属于 open description：dup 副本接着原 fd 的位置读（A），通过副本 lseek 移动原 fd（B），另一次 mq_open 从 0 开始（C），fork 子进程的 read 移动父进程的偏移（D），SEEK_END 为 80、负位置失败（E），pread 不动偏移（F） |
+| hello336 | mq 描述符上的边沿触发 epoll 每次收发都重新报告（Linux 每次唤醒 wait_q）：IN\|OUT\|ET 加入时报 OUT（A）；发送、满、接收、清空依次报 IN\|OUT、IN、IN\|OUT、OUT（B）；只关注 IN 时清空后不报（C）；只关注 OUT 时每次接收都报 OUT（D） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

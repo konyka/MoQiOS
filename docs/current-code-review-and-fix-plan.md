@@ -9187,7 +9187,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：四份（SMP=1、4、4、2）全部 EXIT=0，`:   FAIL` 计数为 0，`hello334: PASS` 每份 1 次，hello80、hello235 均 PASS，hello228 `corrupted canaries=0`。riscv64、aarch64 smoke 通过。
 - 局限：
   1. read 的偏移在 fd 上：`dup` 的副本不共享偏移（mq 不在 `usesSharedOffset` 里）。Linux 上副本共享 `f_pos`。（hello335 已修）
-  2. epoll 唤醒是每次发送或接收后对这个队列的所有 description 各通知一次，不区分 POLLIN、POLLOUT 是否真的变化。
+  2. epoll 唤醒是每次发送或接收后对这个队列的所有 description 各通知一次，不区分 POLLIN、POLLOUT 是否真的变化。（hello336 核对：Linux 也是每次收发都唤醒，这不是差异）
   3. `SIGEV_THREAD` 仍不支持（需要 AF_NETLINK）。
   4. description 池共 256 个（`MAX_OPEN_DESCRIPTIONS`），每张表 `MAX_FDS`（x86_64 上 128）个描述符。
 
@@ -9202,4 +9202,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：四份（SMP=1、4、4、2）全部 EXIT=0，`:   FAIL` 计数为 0，`hello335: PASS`、`hello334: PASS` 每份各 1 次，hello228 `corrupted canaries=0`。riscv64、aarch64 smoke 通过。
 - 局限：
   1. 偏移的读改写不是原子的：两个进程同时 read 同一个 description 时更新可能交错，和这个内核其他共享偏移一样（vfs.read 的注释已写明）。Linux 用 `f_pos_lock` 串行化。
-  2. hello334 局限 2（epoll 唤醒粒度粗）、3（`SIGEV_THREAD`）、4（固定容量）不变。
+  2. hello334 局限 3（`SIGEV_THREAD`）、4（固定容量）不变；局限 2 经 hello336 核对与 Linux 一致。
+
+## 补充：mq 描述符上的边沿触发 epoll（hello336，核对结论，无内核改动）
+
+- 起因：hello334 局限 2 写的是「epoll 唤醒是每次发送或接收后对这个队列的所有 description 各通知一次，不区分 POLLIN、POLLOUT 是否真的变化」，当作和 Linux 的差异列出。
+- Linux 实测（`gcc -DHOST user/hello336.c`）：Linux 的 `mq_timedsend`/`mq_timedreceive` 每次都唤醒 `info->wait_q`，EPOLLET 因此每次收发都重新报告，即使就绪状态没变。A 空队列加 IN|OUT|ET：加入时报 OUT 一次，之后没有；B 发送报 IN|OUT，再发送（满）报 IN，接收报 IN|OUT，再接收（空）报 OUT（OUT 本来就就绪，仍然再报一次）；C 只关注 IN|ET：加入时不报，发送后报 IN，接收清空后不报；D 满队列只关注 OUT|ET：加入时不报，接收后报 OUT，再接收又报 OUT。
+- 结果：hello336 在未改动的内核上 SMP=2、SMP=4 都通过，没有红灯。这个内核的 `wakePollers` 在每次提交后按当前消息数算出 POLLIN/POLLOUT 并通知该队列的所有 description，和 Linux 的可观察行为一致。hello334 局限 2 不是缺陷，已在那一节注明。
+- 本节只新增回归测试 hello336（QEMU，4 项）和文档，没有改内核代码，所以这一项不是按 TDD 先红后绿做的。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都有 hello336、hello335 PASS。SMP=1、SMP=2 和一份 SMP=4 `EXIT=0`、0 FAIL；另一份 SMP=4 `EXIT=1`，只有已记录的偶发项 hello286 J（57/60 次组停止被报告）失败。随后单独重跑一份 SMP=4，`EXIT=0`、0 FAIL。riscv64、aarch64 smoke 通过。
