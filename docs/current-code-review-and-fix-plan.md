@@ -9439,5 +9439,20 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 测试：hello350（QEMU，5 项），定向 SMP=2、SMP=4 各一份通过。新增 host 测试「read, write and lseek hold the shared description's offset lock across the offset read-modify-write (hello350)」，检查锁数组、三处接线和适用的类型。「descriptor errnos」测试里 lseek 的源码片段按新的加锁行更新。变异验证：去掉 `FdTable.read` 的加锁，这条 host 测试失败，文件已恢复。
 - 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、312 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。另有两份 SMP=4 各出现一次已知偶发失败（hello269 的端口重连 2 项、hello325 G），这两个测试不经过 open/read/write/lseek，同一份里 hello350 都通过。
 - 这次修复带来的局限：
-  1. 锁的粒度是一次 `FdTable.read`/`write`，也就是 syscall 层切出的一个 4 KiB 块。超过 4 KiB 的 read/write 和 readv/writev 的各段之间可能插入另一个进程的操作；Linux 对整个系统调用持锁。
+  1. 锁的粒度是一次 `FdTable.read`/`write`，也就是 syscall 层切出的一个 4 KiB 块。超过 4 KiB 的 read/write 和 readv/writev 的各段之间可能插入另一个进程的操作；Linux 对整个系统调用持锁。（hello351 已补上。）
   2. mq 描述符的偏移（`posix_mq` description）、`getdents` 的目录游标，以及 `aio`、`splice`、`copy_file_range` 通过 `offsetOf`/`setOffsetOf` 做的读改写都没有加这把锁。
+
+## 补充：大于 4 KiB 的 read、write、readv、writev 整个调用持偏移锁（hello351）
+
+- 背景：hello350 一节局限 1。偏移锁只在一次 `FdTable.read`/`write` 期间持有，而 syscall 层把 read、write 切成 4 KiB 一块，readv、writev 按 iovec 再切块。两个进程共享一个 description 做大读写时，另一方的块可能插进来，一次调用读到或写出的就不是连续的一段。Linux 的 `fdget_pos` 对整个系统调用持 `f_pos_lock`。
+- Linux 实测（`gcc -DHOST user/hello351.c`，tmpfs `/tmp/hello351.dat`，8 轮，父子进程通过两根管道同时起跑）：A 两个写者各写 24 个 16 KiB 块，结果里每个 16 KiB 块都是某一方完整的一块；B 同样的写法换成 4 段 4 KiB 的 writev；C 两个读者从 768 KiB 的编号文件里每次读 16 KiB，每次读到的字都连续，合起来每个字恰好读一次；D 同样的读法换成 4 段 4 KiB 的 readv。全部通过。
+- 红灯（未改的内核，带 hello350 的偏移锁）：SMP=4 上 C 8 轮错 1 轮、D 错 2 轮；A、B 通过。SMP=2 上全部通过（两个进程很少在同一时刻处于块边界）。没有起跑同步的第一版在 SMP=2、SMP=4 上都复现不出，所以加了管道同步和更多轮数。
+- 修复（`kernel/fs/vfs.zig`、`kernel/fs/file_io.zig`、`kernel/fs/readv.zig`）：
+  1. 新增 `FdTable.readHeld`/`writeHeld(fd, buf, count, held)`：调用方已经持有 `lockOffset` 返回的槽号时，只做 `syncOffsetIn`、操作、`syncOffsetOut`，不再加锁（`SleepLock` 不可重入）；`held` 为 0 时退回普通的 `read`/`write`。
+  2. `file_io.read`、`file_io.write`、`readv`、`writev` 在切块循环之前调 `lockOffset`，循环里改用 `readHeld`/`writeHeld`，返回时解锁。write、writev 的加锁顺序是先 `lockAppendCall`，再偏移锁，最后才是每块里的 append 分条锁。
+  3. 中途有 dup 给描述符分到槽时，`held` 仍是 0，后面的块退回逐块加锁，不会持锁不放或解错锁。
+- 测试：hello351（QEMU，5 项），定向 SMP=2、SMP=4 各一份通过。新增 host 测试「read, write, readv and writev hold the shared description's offset lock across the whole call, not each 4 KiB piece (hello351)」。原有的「write() and writev() on an O_APPEND file hold one lock across all their pieces」按新调用更新，并检查 append 锁在偏移锁之前。变异验证：readv 改回逐块的 `read`，这条 host 测试失败，文件已恢复。
+- 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、313 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。另有一份 SMP=4 出现一次已知偶发失败 hello325 G（EXIT=1），同一份里 hello351 通过。
+- 这次修复带来的局限：
+  1. 读到用户缓冲区时持着偏移锁做 `copyToUser`；如果缺页处理要读同一个 description（这个内核里没有这样的路径），会自锁。
+  2. hello350 局限 2 不变：mq 偏移、`getdents` 游标和 `offsetOf`/`setOffsetOf` 的调用者仍不加锁。

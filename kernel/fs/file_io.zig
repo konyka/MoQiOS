@@ -55,13 +55,16 @@ pub fn write(fd: u64, buf: u64, count: u64) i64 {
             const append_call = cur.fd_table.isAppendFile(fdIndex(fd));
             if (append_call) cur.fd_table.lockAppendCall(fdIndex(fd));
             defer if (append_call) cur.fd_table.unlockAppendCall(fdIndex(fd));
+            // One write() covers one contiguous range of a shared description: its offset lock is held across every piece.
+            const held = if (fdIndex(fd) < vfs_mod.MAX_FDS) vfs_mod.lockOffset(&cur.fd_table.fds[fdIndex(fd)]) else 0;
+            defer vfs_mod.unlockOffset(held);
             var pos: usize = 0;
             while (pos < n) {
                 const chunk = @min(n - pos, 4096);
                 var kbuf: [4096]u8 = undefined;
                 const copied = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(buf + pos), chunk);
                 if (copied == 0) break;
-                const result = cur.fd_table.write(fdIndex(fd), &kbuf, copied);
+                const result = cur.fd_table.writeHeld(fdIndex(fd), &kbuf, copied, held);
                 // Propagate a first-chunk error (e.g. -28 ENOSPC from the
                 // writeback cache) instead of reporting a 0-byte write that
                 // callers would retry forever — mirrors pwrite below.
@@ -165,6 +168,9 @@ pub fn read(fd: u32, buf_ptr: u64, count: u64) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
+    // One read() covers one contiguous range of a shared description: its offset lock is held across every piece.
+    const held = if (fd < vfs_mod.MAX_FDS) vfs_mod.lockOffset(&cur.fd_table.fds[fd]) else 0;
+    defer vfs_mod.unlockOffset(held);
     var pos: usize = 0;
     var faulted = false;
     var first_err: i64 = 0;
@@ -180,7 +186,7 @@ pub fn read(fd: u32, buf_ptr: u64, count: u64) i64 {
             break;
         }
 
-        const result = cur.fd_table.read(fd, &kbuf, chunk);
+        const result = cur.fd_table.readHeld(fd, &kbuf, chunk, held);
         if (result < 0) {
             if (pos == 0) first_err = result;
             break;
@@ -214,7 +220,7 @@ pub fn read(fd: u32, buf_ptr: u64, count: u64) i64 {
     if (pos == 0 and n > 0) {
         // v53.45: Fix 1-byte read not being copied to user space
         var tmp: [1]u8 = undefined;
-        const r = cur.fd_table.read(fd, &tmp, 1);
+        const r = cur.fd_table.readHeld(fd, &tmp, 1, held);
         if (r > 0) {
             if (copy.copyToUser(@ptrFromInt(buf_ptr), &tmp, 1) == 0) return -EFAULT;
         }

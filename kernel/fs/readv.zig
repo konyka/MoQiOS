@@ -16,6 +16,9 @@ pub fn readv(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
+    // One readv() covers one contiguous range of a shared description: its offset lock is held across every iovec.
+    const held = if (fd < vfs_mod.MAX_FDS) vfs_mod.lockOffset(&cur.fd_table.fds[fd]) else 0;
+    defer vfs_mod.unlockOffset(held);
     var total: usize = 0;
     for (0..iovcnt) |i| {
         var iov_buf: [16]u8 = undefined;
@@ -39,7 +42,7 @@ pub fn readv(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
                 if (total == 0 and pos == 0) return -EFAULT;
                 break;
             }
-            const result = cur.fd_table.read(fd, &kbuf, chunk);
+            const result = cur.fd_table.readHeld(fd, &kbuf, chunk, held);
             if (result <= 0) {
                 if (total == 0 and pos == 0) return @bitCast(result);
                 break;
@@ -65,6 +68,9 @@ pub fn writev(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
     const append_call = cur.fd_table.isAppendFile(fd);
     if (append_call) cur.fd_table.lockAppendCall(fd);
     defer if (append_call) cur.fd_table.unlockAppendCall(fd);
+    // One writev() covers one contiguous range of a shared description: its offset lock is held across every iovec.
+    const held = if (fd < vfs_mod.MAX_FDS) vfs_mod.lockOffset(&cur.fd_table.fds[fd]) else 0;
+    defer vfs_mod.unlockOffset(held);
     var total: usize = 0;
     for (0..iovcnt) |i| {
         var iov_buf: [16]u8 = undefined;
@@ -84,7 +90,7 @@ pub fn writev(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
             var kbuf: [4096]u8 = undefined;
             const from_user = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(iov_base + pos), chunk);
             if (from_user == 0) break;
-            const result = cur.fd_table.write(fd, &kbuf, from_user);
+            const result = cur.fd_table.writeHeld(fd, &kbuf, from_user, held);
             if (result <= 0) {
                 if (total == 0 and pos == 0) return @bitCast(result);
                 break;

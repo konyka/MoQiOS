@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello350`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello351`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -345,6 +345,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello348 | 同一端口上的 UDP 套接字按绑定的 IPv4 地址区分：`127.0.0.1:p` 和 `127.0.0.2:p` 可以同时绑定，再绑通配或重复地址返回 `EADDRINUSE`（A），数据报只交给绑定其目的地址的套接字（B），发往没人绑定的地址回 ICMP 端口不可达、已 connect 的发送者 recv 得到 `ECONNREFUSED`（C），`SO_REUSEADDR` 下具体地址优先于通配地址（D） |
 | hello349 | IPv6 UDP 套接字记住绑定的地址：绑 `[::1]:18905` 的 getsockname 报告 `::1`（A），绑 `[::]:18906` 的报告 `::`（B），未绑定、未发送的套接字报告 `::`（C），从 `[::1]:18905` 发出的数据报源地址是 `[::1]:18905`（D） |
 | hello350 | 共享打开文件描述的偏移读改写是原子的：父子进程共享一个 tmpfs 描述并发 4 字节读，6 轮里每条记录恰好读一次（A），第一轮后 SEEK_CUR 是文件大小（C），并发各写 1024 条记录不互相覆盖（B） |
+| hello351 | 大于 4 KiB 的调用在共享描述上覆盖连续的一段：父子进程同时起跑，各写 24 个 16 KiB 块，每块都完整（A），换成 4 段 writev 也一样（B）；每次读 16 KiB 得到连续的字、合起来每个字读一次（C），换成 4 段 readv 也一样（D） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

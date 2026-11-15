@@ -4358,6 +4358,21 @@ test "an IPv4 and an IPv6 TCP socket do not conflict on one port (hello344)" {
     try std.testing.expect(std.mem.indexOf(u8, ts, "        if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict\n        if (!tcp_port_policy.familiesConflict(tcb.is_v6, tcbs[i].is_v6)) continue;\n") != null);
 }
 
+test "read, write, readv and writev hold the shared description's offset lock across the whole call, not each 4 KiB piece (hello351)" {
+    const f = kt.file_io_source;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, f, "vfs_mod.lockOffset(&cur.fd_table.fds["));
+    try std.testing.expect(std.mem.indexOf(u8, f, "const result = cur.fd_table.writeHeld(fdIndex(fd), &kbuf, copied, held);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f, "const result = cur.fd_table.readHeld(fd, &kbuf, chunk, held);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f, "const r = cur.fd_table.readHeld(fd, &tmp, 1, held);") != null);
+    const rv = kt.readv_source;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, rv, "    const held = if (fd < vfs_mod.MAX_FDS) vfs_mod.lockOffset(&cur.fd_table.fds[fd]) else 0;\n    defer vfs_mod.unlockOffset(held);\n"));
+    try std.testing.expect(std.mem.indexOf(u8, rv, "const result = cur.fd_table.readHeld(fd, &kbuf, chunk, held);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rv, "const result = cur.fd_table.writeHeld(fd, &kbuf, from_user, held);") != null);
+    const v = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, v, "        if (held == 0) return self.read(fd, buf, count);\n        const d = &self.fds[fd];\n        syncOffsetIn(d);\n        const r = self.readInner(fd, buf, count);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "        if (held == 0) return self.write(fd, buf, count);\n        const d = &self.fds[fd];\n        syncOffsetIn(d);\n        const r = self.writeInner(fd, buf, count);\n") != null);
+}
+
 test "read, write and lseek hold the shared description's offset lock across the offset read-modify-write (hello350)" {
     const vfs = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, vfs, "var offset_locks: [513]@import(\"../sync/task_sleep_lock.zig\").SleepLock = @splat(.{});") != null);
@@ -12115,14 +12130,16 @@ test "write() and writev() on an O_APPEND file hold one lock across all their pi
     // write(): the lock covers the 4 KiB piece loop; writev(): it covers every iovec.
     const w = kt.file_io_source;
     const wl = std.mem.indexOf(u8, w, "if (append_call) cur.fd_table.lockAppendCall(fdIndex(fd));") orelse return error.TestUnexpectedResult;
-    const wp = std.mem.indexOf(u8, w, "const result = cur.fd_table.write(fdIndex(fd), &kbuf, copied);") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(wl < wp);
+    const wo = std.mem.indexOf(u8, w, "vfs_mod.lockOffset(&cur.fd_table.fds[fdIndex(fd)])") orelse return error.TestUnexpectedResult;
+    const wp = std.mem.indexOf(u8, w, "const result = cur.fd_table.writeHeld(fdIndex(fd), &kbuf, copied, held);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(wl < wo and wo < wp);
     const r = kt.readv_source;
     const rs = std.mem.indexOf(u8, r, "pub fn writev(") orelse return error.TestUnexpectedResult;
     const rl = std.mem.indexOf(u8, r[rs..], "cur.fd_table.lockAppendCall(fd)") orelse return error.TestUnexpectedResult;
-    const rp = std.mem.indexOf(u8, r[rs..], "cur.fd_table.write(fd, &kbuf, from_user)") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(rl < rp);
-    // Order: the call lock is the outer one, taken before the same file's per-piece append lock stripe.
+    const ro = std.mem.indexOf(u8, r[rs..], "vfs_mod.lockOffset(&cur.fd_table.fds[fd])") orelse return error.TestUnexpectedResult;
+    const rp = std.mem.indexOf(u8, r[rs..], "cur.fd_table.writeHeld(fd, &kbuf, from_user, held)") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rl < ro and ro < rp);
+    // Order: the call lock is the outer one, taken before the description's offset lock and the same file's per-piece append lock stripe.
     try std.testing.expect(std.mem.indexOf(u8, v, "Outer lock of an O_APPEND write()/writev() as a whole") != null);
 }
 

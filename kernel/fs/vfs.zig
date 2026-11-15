@@ -2071,6 +2071,17 @@ pub const FdTable = struct {
         return r;
     }
 
+    /// read() for a caller that already holds the description's offset lock (`held`, from lockOffset) across a whole system call
+    /// made of several pieces; with `held` 0 (nothing was locked) it is plain read().
+    pub fn readHeld(self: *FdTable, fd: u32, buf: [*]u8, count: usize, held: u16) i64 {
+        if (held == 0) return self.read(fd, buf, count);
+        const d = &self.fds[fd];
+        syncOffsetIn(d);
+        const r = self.readInner(fd, buf, count);
+        syncOffsetOut(d);
+        return r;
+    }
+
     fn readInner(self: *FdTable, fd: u32, buf: [*]u8, count: usize) i64 {
         if (fd >= MAX_FDS) return -9; // EBADF
         const desc = &self.fds[fd];
@@ -2306,6 +2317,16 @@ pub const FdTable = struct {
         const d = &self.fds[fd];
         const locked = lockOffset(d);
         defer unlockOffset(locked);
+        syncOffsetIn(d);
+        const r = self.writeInner(fd, buf, count);
+        syncOffsetOut(d);
+        return r;
+    }
+
+    /// write() for a caller already holding the description's offset lock (`held`, from lockOffset); see readHeld.
+    pub fn writeHeld(self: *FdTable, fd: u32, buf: [*]const u8, count: usize, held: u16) i64 {
+        if (held == 0) return self.write(fd, buf, count);
+        const d = &self.fds[fd];
         syncOffsetIn(d);
         const r = self.writeInner(fd, buf, count);
         syncOffsetOut(d);
