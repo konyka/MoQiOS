@@ -9567,3 +9567,26 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 发往本机非回环地址走 lo 只看 NDP 记录的本地地址；链路本地地址（不在 `local_addrs` 里）发往自己仍走网卡。
   2. 绑定的组播地址按通配处理，`scope_id` 不参与比较。
   3. 监听槽数和 TCB 数仍是固定的 128。
+
+## 补充：链路范围的 IPv6 地址需要接口（hello360）
+
+- 背景：hello359 局限 1、2。`bind` 不看 `sin6_scope_id`，绑定 `fe80::/10` 或 `ff02::/16` 时 scope 0 也成功；getsockname、recvfrom、recvmsg 报告的 scope 恒为 0；发往本机链路本地地址的段和数据报走网卡，因为该地址不在 NDP 的 `local_addrs` 里。Linux `inet6_bind` 对 `__ipv6_addr_needs_scope_id` 为真的地址要求 `sin6_scope_id`：0 是 EINVAL，不存在的接口是 ENODEV，接口上没有这个地址是 EADDRNOTAVAIL。
+- 测试设计（`user/hello360.c` 文件头记录了 host 上 `unshare -rn` 加 dummy 网卡的对照方法，MoQiOS 里 eth0 是接口 2）：
+  - L 连到 `[fe80::2%2]:9` 的 UDP 套接字报告链路本地地址 L、scope 2；
+  - A 绑定 `[L]:19001`，scope 0 是 EINVAL，99 是 ENODEV，1（lo）是 EADDRNOTAVAIL，2 成功，getsockname 报告 scope 2；
+  - B 绑定 `[ff02::1]:19002`，scope 0 是 EINVAL，scope 2 成功；
+  - C TCP 套接字绑定 `[L]:19003` scope 0 是 EINVAL；
+  - D 未绑定的 UDP 套接字发往 `[L%2]:19001`，数据报到达，源是 L、scope 2。
+- 修复：
+  1. `kernel/net/bind_addr_policy.zig` 新增 `needsScope6`（fe80::/10 或 ff02::/16）和 `inet6ScopeErrno`（scope 0 → EINVAL；不是 lo 也不是活动网卡 → ENODEV；lo 上的链路本地单播 → EADDRNOTAVAIL），以及 `LO_IFINDEX = 1`、`NIC_IFINDEX = 2`。
+  2. `kernel/net/socket_syscall.zig` 的 IPv6 UDP 和 TCP bind 在地址检查之前调用 `inet6ScopeErrno`。
+  3. `kernel/net/sockaddr_util.zig` 新增 `nameScope6`，链路范围地址报告 `NIC_IFINDEX`；`encodeInetName`、recvfrom、recvmsg 的源地址用它。
+  4. `kernel/net/ndp.zig` 新增 `isOwnAddress`（配置的地址或由 MAC 生成的链路本地地址）；`tcp.sendSegmentV6Seq` 和 `udp.sendToV6From` 用它判断是否走 lo。
+  5. 未绑定的 IPv6 UDP 套接字 getsockname 改用 `ndp.selectSourceAddress(对端)`，连链路本地对端时报告链路本地地址。
+- 测试：hello360（QEMU，5 项）；新增 host 测试「a link-scoped IPv6 address names its interface: bind checks sin6_scope_id, names carry it, own link-local goes through lo (hello360)」。`zig build test` 全部通过。
+- 完整 smoke：SMP=1 一份，EXIT=0，`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=1)`，串口日志 0 个 FAIL。本轮没有跑 SMP=2/4 和 riscv64、aarch64 smoke。
+- 变异验证：把 `inet6ScopeErrno` 里 scope 0 的 EINVAL 改成返回 0，hello360 这条 host 测试失败（1255/1256），文件已恢复。
+- 这次修复带来的局限：
+  1. 接口只有 lo（1）和 eth0（2）两个固定编号，没有接口表。
+  2. 绑定冲突和收包者选择仍不比较 `scope_id`；只有一个网卡时结果与 Linux 相同。
+  3. 组播地址绑定仍按通配处理（hello359 局限 2 的这一半不变）。
