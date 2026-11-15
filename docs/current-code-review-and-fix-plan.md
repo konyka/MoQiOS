@@ -9201,7 +9201,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：定向 SMP=2、SMP=4 各一份，hello335 通过；`zig build test` 通过。
 - 完整 smoke：四份（SMP=1、4、4、2）全部 EXIT=0，`:   FAIL` 计数为 0，`hello335: PASS`、`hello334: PASS` 每份各 1 次，hello228 `corrupted canaries=0`。riscv64、aarch64 smoke 通过。
 - 局限：
-  1. 偏移的读改写不是原子的：两个进程同时 read 同一个 description 时更新可能交错，和这个内核其他共享偏移一样（vfs.read 的注释已写明）。Linux 用 `f_pos_lock` 串行化。
+  1. 偏移的读改写不是原子的：两个进程同时 read 同一个 description 时更新可能交错，和这个内核其他共享偏移一样（vfs.read 的注释已写明）。Linux 用 `f_pos_lock` 串行化。（hello350 已对普通文件补上；mq 偏移仍不加锁。）
   2. hello334 局限 3（`SIGEV_THREAD`）、4（固定容量）不变；局限 2 经 hello336 核对与 Linux 一致。
 
 ## 补充：mq 描述符上的边沿触发 epoll（hello336，核对结论，无内核改动）
@@ -9426,3 +9426,18 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 这次修复带来的局限：
   1. IPv6 UDP 的端口冲突和收包分派仍只按端口区分，没有用 `udp_local_ip6`。
   2. IPv6 发送的源地址仍由 `sendToV6` 决定（回环用 `::1`，其他用 `ndp.selectSourceAddress`），不看绑定地址。
+
+## 补充：共享打开文件描述的偏移读改写改为原子（hello350）
+
+- 背景：hello335 一节局限 1，以及 `kernel-subsystems.md` 共享偏移一条的限制。`FdTable.read`/`write` 和 `lseek` 先 `syncOffsetIn` 读出共享偏移，做完操作再 `syncOffsetOut` 写回，中间不持锁。两个进程同时读写同一个 description 时会从同一位置开始，一方的更新覆盖另一方。Linux 的 `fdget_pos` 对共享的普通文件持 `f_pos_lock`。
+- Linux 实测（`gcc -DHOST user/hello350.c`，tmpfs `/tmp/hello350.dat`）：A 父子进程共享一个 description，各自 4 字节一次读 2048 条记录，6 轮里每条恰好读一次；C 第一轮后 SEEK_CUR 是 8192；B 父子进程各写 1024 条带标记的 4 字节记录，6 轮里文件都是 8192 字节，两种标记各 1024 条，没有覆盖。
+- 红灯（未改的内核）：SMP=2 上 A 6 轮错 2 轮（743 条读了两次），B 错 3 轮；SMP=4 上 A 错 5 轮（2523 条重复），B 错 5 轮（文件只有 7812 字节）。C 通过。
+- 修复（`kernel/fs/vfs.zig`、`kernel/arch/x86_64/syscall_entry.zig`）：
+  1. 新增 `offset_locks`：513 把睡眠锁（`task_sleep_lock.SleepLock`），按共享偏移槽 `offset_slot` 索引，和 `Pool(512)` 一一对应，不同 description 互不阻塞。用睡眠锁是因为 FAT32、ext2 的读写可能等磁盘。
+  2. `lockOffset(desc)` 只对持有共享槽的 ramdisk、FAT32、ext2、tmpfs、只读卷、procfs 文件加锁，返回锁住的槽号；`unlockOffset(slot)` 按这个槽号解锁，所以中途 dup 给描述符分到槽也不会解错锁。管道和套接字没有偏移，不加锁，阻塞读不会挡住别的读者。
+  3. `FdTable.read`、`FdTable.write`、`syscallLseek` 在 `syncOffsetIn` 之前加锁，在 `syncOffsetOut` 之后解锁。vfs.read 上「可能交错」的旧注释改为说明这把锁。
+- 测试：hello350（QEMU，5 项），定向 SMP=2、SMP=4 各一份通过。新增 host 测试「read, write and lseek hold the shared description's offset lock across the offset read-modify-write (hello350)」，检查锁数组、三处接线和适用的类型。「descriptor errnos」测试里 lseek 的源码片段按新的加锁行更新。变异验证：去掉 `FdTable.read` 的加锁，这条 host 测试失败，文件已恢复。
+- 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、312 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。另有两份 SMP=4 各出现一次已知偶发失败（hello269 的端口重连 2 项、hello325 G），这两个测试不经过 open/read/write/lseek，同一份里 hello350 都通过。
+- 这次修复带来的局限：
+  1. 锁的粒度是一次 `FdTable.read`/`write`，也就是 syscall 层切出的一个 4 KiB 块。超过 4 KiB 的 read/write 和 readv/writev 的各段之间可能插入另一个进程的操作；Linux 对整个系统调用持锁。
+  2. mq 描述符的偏移（`posix_mq` description）、`getdents` 的目录游标，以及 `aio`、`splice`、`copy_file_range` 通过 `offsetOf`/`setOffsetOf` 做的读改写都没有加这把锁。

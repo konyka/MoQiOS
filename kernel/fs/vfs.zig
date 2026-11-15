@@ -1090,6 +1090,33 @@ pub fn syncOffsetOut(desc: *FileDescriptor) void {
     shared_offsets.store(desc.offset_slot, desc.offset);
 }
 
+/// One sleeping lock per shared description slot, held across the read-modify-write of its offset (read, write, lseek): Linux
+/// takes f_pos_lock for a regular file whose description is shared. A sleeping lock because a FAT32 or ext2 read can wait on the disk.
+var offset_locks: [513]@import("../sync/task_sleep_lock.zig").SleepLock = @splat(.{});
+
+/// Take the offset lock of `desc` when its byte offset is shared with another descriptor (a regular file kind holding a slot).
+/// Pipes and sockets have no offset and are never locked: a blocking read must not hold up the other readers. Returns
+/// the slot it locked (0 = none); unlockOffset takes that slot back, so a dup that gives the descriptor a slot meanwhile
+/// cannot unbalance the lock.
+pub fn lockOffset(desc: *const FileDescriptor) u16 {
+    const slot = desc.offset_slot;
+    if (!offsetLockApplies(desc.fd_type, slot)) return 0;
+    offset_locks[slot].lock();
+    return slot;
+}
+
+pub fn unlockOffset(slot: u16) void {
+    if (slot != 0) offset_locks[slot].unlock();
+}
+
+fn offsetLockApplies(t: FdType, slot: u16) bool {
+    if (slot == 0 or slot >= offset_locks.len) return false;
+    return switch (t) {
+        .ramdisk_file, .fat32_file, .ext2_file, .tmpfs_file, .rofs_file, .proc_file => true,
+        else => false,
+    };
+}
+
 /// The current position of `desc`, shared or private.
 pub fn offsetOf(desc: *FileDescriptor) u64 {
     syncOffsetIn(desc);
@@ -2034,9 +2061,10 @@ pub const FdTable = struct {
     pub fn read(self: *FdTable, fd: u32, buf: [*]u8, count: usize) i64 {
         if (fd >= MAX_FDS) return -9; // EBADF
         const d = &self.fds[fd];
-        // A shared offset is read-modify-written around the operation. Two
-        // processes reading one description at once could still interleave
-        // their updates; that matches this kernel's other descriptor state.
+        // A shared offset is read-modify-written around the operation under the description's offset lock, so two processes
+        // reading one description never start at the same position (Linux fdget_pos / f_pos_lock).
+        const locked = lockOffset(d);
+        defer unlockOffset(locked);
         syncOffsetIn(d);
         const r = self.readInner(fd, buf, count);
         syncOffsetOut(d);
@@ -2276,6 +2304,8 @@ pub const FdTable = struct {
     pub fn write(self: *FdTable, fd: u32, buf: [*]const u8, count: usize) i64 {
         if (fd >= MAX_FDS) return -9;
         const d = &self.fds[fd];
+        const locked = lockOffset(d);
+        defer unlockOffset(locked);
         syncOffsetIn(d);
         const r = self.writeInner(fd, buf, count);
         syncOffsetOut(d);

@@ -1147,7 +1147,7 @@ const SchedStats = struct {
   **dup/fork 共享打开文件描述的偏移（已补）**：`dup`、`dup2/3`、`fcntl(F_DUPFD)` 与 `fork`/`clone`（复制 fd 表）之后，两端读写同一个位置。实现为 `fs/shared_offset.zig` 的带引用计数的偏移池（512 项，
   池满时退回各自私有偏移）：描述符第一次被复制时，它的 `offset` 被“升格”进池，原件与副本都带上同一个 `offset_slot`；`read`/`write`/`lseek`/`getdents` 在操作前后用 `syncOffsetIn/Out`
   与池同步，`close` 释放持有；`aio`、`splice`、`copy_file_range` 通过 `offsetOf/setOffsetOf` 读写。适用的描述符种类：ramdisk、FAT32、ext2、tmpfs、只读卷、procfs 文件；管道/套接字没有偏移。
-  同时 `ftruncate` 不再把文件偏移截到新长度内（POSIX 不改偏移）。限制：同一个描述被两个进程在两个 CPU 上同时读写时，读-改-写不是原子的（与本内核其它描述符状态一致）。
+  同时 `ftruncate` 不再把文件偏移截到新长度内（POSIX 不改偏移）。`read`/`write`/`lseek` 的读-改-写在描述的偏移锁 `offset_locks[offset_slot]`（睡眠锁，只对上述有偏移的种类）内完成，两个进程同时读写同一个描述不会从同一位置开始（Linux `f_pos_lock`，hello350）。限制：锁按 syscall 层的 4 KiB 块持有，不覆盖整个大读写；mq 偏移、`getdents` 游标和 `offsetOf/setOffsetOf` 的调用者不加锁。
 - **read/write/rename/readlink 与超长路径的错误码（hello128）**：`write()`/`pwrite()` 对不可写描述符（含只读打开的目录）现在是 EBADF（原先裸 `-1`=EPERM），`FdTable.write`
   入口统一经 `namespace_policy.writeGate`；`read()` 目录是 EISDIR（ext2 之前会返回 8 字节目录内容，tmpfs 返回 0）；`readlink` 对存在但不是符号链接的名字是 EINVAL
   （`ext2.readlinkPath` 区分 `not_symlink`/`missing`，tmpfs 存在的条目也是 EINVAL）；`rename` 源不存在是 ENOENT（原先被改写成 EXDEV，现在只有 FAT32 根下的名字才保留 EXDEV），

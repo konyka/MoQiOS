@@ -4358,6 +4358,17 @@ test "an IPv4 and an IPv6 TCP socket do not conflict on one port (hello344)" {
     try std.testing.expect(std.mem.indexOf(u8, ts, "        if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict\n        if (!tcp_port_policy.familiesConflict(tcb.is_v6, tcbs[i].is_v6)) continue;\n") != null);
 }
 
+test "read, write and lseek hold the shared description's offset lock across the offset read-modify-write (hello350)" {
+    const vfs = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "var offset_locks: [513]@import(\"../sync/task_sleep_lock.zig\").SleepLock = @splat(.{});") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, vfs, "        const locked = lockOffset(d);\n        defer unlockOffset(locked);\n        syncOffsetIn(d);\n"));
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "    const slot = desc.offset_slot;\n    if (!offsetLockApplies(desc.fd_type, slot)) return 0;\n    offset_locks[slot].lock();\n    return slot;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "    if (slot == 0 or slot >= offset_locks.len) return false;\n    return switch (t) {\n        .ramdisk_file, .fat32_file, .ext2_file, .tmpfs_file, .rofs_file, .proc_file => true,\n        else => false,\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vfs, "shared_offset.Pool(512)") != null);
+    const se = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, se, "    const locked = vfs_mod.lockOffset(desc);\n    defer vfs_mod.unlockOffset(locked);\n    vfs_mod.syncOffsetIn(desc);\n") != null);
+}
+
 test "an IPv6 UDP socket keeps the address it was bound to: getsockname reports it, :: when unbound (hello349)" {
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "    d.udp_local_ip = addr;\n    d.udp_local_ip6 = addr6;\n") != null);
@@ -11229,7 +11240,7 @@ test "descriptor errnos: EBADF for closed/out-of-range fds, ESPIPE for unseekabl
 
     // lseek on an unseekable descriptor is ESPIPE, decided before the offset is touched.
     const s = kt.syscall_entry_source;
-    try std.testing.expect(std.mem.indexOf(u8, s, "    if (!vfs_mod.fdTypeSeekable(desc.fd_type)) return -29;\n    vfs_mod.syncOffsetIn(desc);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "    if (!vfs_mod.fdTypeSeekable(desc.fd_type)) return -29;\n    const locked = vfs_mod.lockOffset(desc);\n    defer vfs_mod.unlockOffset(locked);\n    vfs_mod.syncOffsetIn(desc);") != null);
 }
 
 test "the program break belongs to the address space: CLONE_VM threads share it, every other path sets it on the new Mm" {

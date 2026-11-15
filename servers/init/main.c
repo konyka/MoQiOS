@@ -466,6 +466,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello347"); /* a UDP socket keeps the IPv4 address it was bound to: getsockname and the datagram source */
     run_test("hello348"); /* UDP sockets on one port are told apart by their bound IPv4 address: bind conflicts and receive dispatch */
     run_test("hello349"); /* an IPv6 UDP socket keeps the address it was bound to: getsockname and the datagram source */
+    run_test("hello350"); /* read and write move a shared open file offset atomically between processes */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */
