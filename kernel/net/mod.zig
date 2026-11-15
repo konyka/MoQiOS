@@ -28,6 +28,11 @@ pub fn init() void {
 }
 
 pub fn handleRxPacket(data: [*]const u8, len: u32) void {
+    handleRxPacketOn(data, len, @intCast(@import("bind_addr_policy.zig").NIC_IFINDEX));
+}
+
+/// handleRxPacket for a frame that arrived on interface `ifindex` (1 lo, 2 the NIC); IPv4 group delivery depends on it.
+pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
     if (len < 14) return;
 
     const ethertype = eth.parseEthertype(data);
@@ -50,7 +55,7 @@ pub fn handleRxPacket(data: [*]const u8, len: u32) void {
                     tcp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, info.ecn_ce);
                 },
                 ipv4.PROTO_UDP => {
-                    udp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len);
+                    udp.handlePacketOn(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, ifindex);
                 },
                 else => {},
             }

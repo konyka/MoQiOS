@@ -169,9 +169,10 @@ pub fn drop4(m: *Membership4, group: [4]u8, addr: [4]u8, index: u32, nic_active:
     return EADDRNOTAVAIL;
 }
 
-pub fn joined4(m: *const Membership4, group: [4]u8) bool {
+/// Whether the socket joined `group` on interface `ifindex` (any interface when null).
+pub fn joined4(m: *const Membership4, group: [4]u8, ifindex: ?u8) bool {
     for (0..m.n) |i| {
-        if (eql4(m.group[i], group)) return true;
+        if (eql4(m.group[i], group) and (ifindex == null or m.ifindex[i] == ifindex.?)) return true;
     }
     return false;
 }
@@ -181,10 +182,15 @@ pub fn alwaysJoined4(group: [4]u8) bool {
     return eql4(group, .{ 224, 0, 0, 1 });
 }
 
-/// Whether a socket takes an IPv4 datagram to `group` (ip_mc_sf_allow without source filters): it joined the group, or
-/// IP_MULTICAST_ALL is on.
-pub fn socketAccepts4(m: *const Membership4, mc_all: bool, group: [4]u8) bool {
-    return joined4(m, group) or mc_all;
+/// Whether a socket takes an IPv4 datagram to `group` that arrived on interface `ifindex` (ip_mc_sf_allow without source filters:
+/// the membership must be on that interface): it joined the group there, or IP_MULTICAST_ALL is on.
+pub fn socketAccepts4(m: *const Membership4, mc_all: bool, group: [4]u8, ifindex: u8) bool {
+    return joined4(m, group, ifindex) or mc_all;
+}
+
+/// An IPv6 datagram to a group cannot leave through lo: there is no multicast route on it (ENETUNREACH from ip6_dst_lookup).
+pub fn sendUnreachable6(mc_if: u8, dst: [16]u8) bool {
+    return isMulticast(dst) and mc_if == bap.LO_IFINDEX;
 }
 
 /// __udp_is_mcast_sock for IPv4: bound to 0.0.0.0 or the group, and not connected to another peer (the peer address is in the first
@@ -193,6 +199,13 @@ pub fn socketMatches4(bound: [4]u8, group: [4]u8, peer_port: u16, peer_ip: [16]u
     if (@as(u32, @bitCast(bound)) != 0 and !eql4(bound, group)) return false;
     if (peer_port != 0 and (peer_port != src_port or !eql4(peer_ip[0..4].*, src_ip))) return false;
     return true;
+}
+
+/// The source address of an IPv4 datagram to a group from a socket bound to `bound`: the IP_MULTICAST_IF address `mc_addr` when the
+/// socket is unbound and one was given; null leaves the choice to tcp_port_policy.sourceAddr.
+pub fn multicastSource4(group: bool, bound: [4]u8, mc_addr: [4]u8) ?[4]u8 {
+    if (!group or @as(u32, @bitCast(bound)) != 0 or @as(u32, @bitCast(mc_addr)) == 0) return null;
+    return mc_addr;
 }
 
 /// The Ethernet address of an IPv4 group (RFC 1112 §6.4): 01:00:5e and the low 23 bits of the group.

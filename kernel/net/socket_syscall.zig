@@ -440,7 +440,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
     } else if (t.fd_table.fds[fd].fd_type == .udp_socket) {
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         const is_v6 = t.fd_table.fds[fd].udp_is_v6;
-        const src_port = t.fd_table.fds[fd].udp_port;
+        const src_key = t.fd_table.fds[fd].udpKey();
         // A pending ICMP error (port unreachable) fails this send, once.
         const pending_send_err = udp.takePendingError(t.fd_table.fds[fd].udpKey());
         if (pending_send_err != 0) return -@as(i64, pending_send_err);
@@ -465,7 +465,9 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
             } else {
                 return -89; // EDESTADDRREQ
             }
-            if (udp.sendToV6From(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_port, &tmp6, @intCast(n6))) {
+            const unreach6 = udp.sendErrno6(src_key, dst6);
+            if (unreach6 != 0) return unreach6;
+            if (udp.sendToV6From(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, &tmp6, @intCast(n6))) {
                 return @intCast(n6);
             } else {
                 return -1;
@@ -490,7 +492,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         } else {
             return -89; // EDESTADDRREQ — unconnected UDP socket, no destination given
         }
-        if (udp.sendToFrom(t.fd_table.fds[fd].udp_local_ip, dst_ip, dst_port, src_port, &tmp_buf2, @intCast(n2))) {
+        if (udp.sendToFrom(t.fd_table.fds[fd].udp_local_ip, dst_ip, dst_port, src_key, &tmp_buf2, @intCast(n2))) {
             return @intCast(n2);
         } else {
             return -1;
@@ -1230,7 +1232,7 @@ fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32) i64 
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
     const d = &t.fd_table.fds[fd];
-    const src_port = d.udp_port;
+    const src_key = d.udpKey();
     if (d.udp_is_v6) {
         var dst6: [16]u8 = @splat(0);
         var dst_port6: u16 = 0;
@@ -1246,7 +1248,9 @@ fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32) i64 
             dst_port6 = d.udp_dst_port;
         } else return -89;
         const n6 = @min(payload.len, 1232);
-        return if (udp.sendToV6From(d.udp_local_ip6, dst6, dst_port6, src_port, payload.ptr, @intCast(n6))) @intCast(n6) else -1;
+        const unreach6 = udp.sendErrno6(src_key, dst6);
+        if (unreach6 != 0) return unreach6;
+        return if (udp.sendToV6From(d.udp_local_ip6, dst6, dst_port6, src_key, payload.ptr, @intCast(n6))) @intCast(n6) else -1;
     }
     var dst_ip: [4]u8 = .{ 0, 0, 0, 0 };
     var dst_port: u16 = 0;
@@ -1261,7 +1265,7 @@ fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32) i64 
         dst_port = d.udp_dst_port;
     } else return -89;
     const n = @min(payload.len, 1472);
-    return if (udp.sendToFrom(d.udp_local_ip, dst_ip, dst_port, src_port, payload.ptr, @intCast(n))) @intCast(n) else -1;
+    return if (udp.sendToFrom(d.udp_local_ip, dst_ip, dst_port, src_key, payload.ptr, @intCast(n))) @intCast(n) else -1;
 }
 
 /// recvmsg on a UDP socket: wait like recvfrom, scatter the datagram over the

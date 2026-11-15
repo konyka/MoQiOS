@@ -2,7 +2,7 @@
 //!
 //! Frames destined to 127.0.0.0/8 never reach the hardware NIC and never
 //! trigger ARP: the TX paths (udp.sendTo, tcp sendSegment) queue the finished
-//! L2 frame here, and the next drain feeds it back into net.handleRxPacket,
+//! L2 frame here, and the next drain feeds it back into net.handleRxPacketOn with the interface it arrives on,
 //! giving local TCP/UDP traffic a full stack round trip.
 //!
 //! The queue state is a plain struct with an explicit init — no arch deps —
@@ -17,8 +17,13 @@ pub const QUEUE_DEPTH: u32 = 16;
 /// Room for a full 1500-byte-MTU Ethernet frame with slack.
 pub const MAX_FRAME: u32 = 2048;
 
+/// The interface a frame on lo arrives on: lo itself, except a copy of a group datagram sent out the NIC (IP_MULTICAST_LOOP), which
+/// arrives on the NIC as Linux dev_loopback_xmit does.
+pub const IFINDEX: u8 = 1;
+
 const FrameSlot = struct {
     len: u32,
+    ifindex: u8,
     data: [MAX_FRAME]u8,
 };
 
@@ -86,7 +91,7 @@ pub const LoopbackQueue = struct {
 
     pub fn init() LoopbackQueue {
         return .{
-            .slots = @splat(.{ .len = 0, .data = @splat(0) }),
+            .slots = @splat(.{ .len = 0, .ifindex = 0, .data = @splat(0) }),
             .head = 0,
             .tail = 0,
             .len = 0,
@@ -108,6 +113,11 @@ pub const LoopbackQueue = struct {
     /// Queue one frame. Returns false — counting a drop only when the ring is
     /// full — for empty or oversized frames as well.
     pub fn enqueue(self: *LoopbackQueue, frame: []const u8) bool {
+        return self.enqueueOn(frame, IFINDEX);
+    }
+
+    /// enqueue, recording the interface the frame arrives on.
+    pub fn enqueueOn(self: *LoopbackQueue, frame: []const u8, ifindex: u8) bool {
         if (frame.len == 0 or frame.len > MAX_FRAME) return false;
         if (self.len == QUEUE_DEPTH) {
             self.dropped += 1;
@@ -115,6 +125,7 @@ pub const LoopbackQueue = struct {
         }
         const slot = &self.slots[self.tail];
         slot.len = @intCast(frame.len);
+        slot.ifindex = ifindex;
         @memcpy(slot.data[0..frame.len], frame);
         self.tail = (self.tail + 1) % QUEUE_DEPTH;
         self.len += 1;
@@ -125,8 +136,15 @@ pub const LoopbackQueue = struct {
 
     /// Pop the oldest frame into `out`; returns its length (0 when empty).
     pub fn dequeue(self: *LoopbackQueue, out: []u8) u32 {
+        var ifindex: u8 = 0;
+        return self.dequeueFrom(out, &ifindex);
+    }
+
+    /// dequeue, also reporting the interface the frame arrives on.
+    pub fn dequeueFrom(self: *LoopbackQueue, out: []u8, ifindex: *u8) u32 {
         if (self.len == 0) return 0;
         const slot = &self.slots[self.head];
+        ifindex.* = slot.ifindex;
         const n: u32 = @intCast(@min(slot.len, out.len));
         @memcpy(out[0..n], slot.data[0..n]);
         slot.len = 0;
@@ -174,9 +192,14 @@ pub fn dropIsLoss(len: u32) bool {
 }
 
 pub fn sendPacket(data: [*]const u8, len: u32) bool {
+    return sendPacketOn(data, len, IFINDEX);
+}
+
+/// sendPacket for a frame that arrives on interface `ifindex` rather than on lo.
+pub fn sendPacketOn(data: [*]const u8, len: u32, ifindex: u8) bool {
     const saved = lo_lock.acquire();
     defer lo_lock.release(saved);
-    return rx_queue.enqueue(data[0..len]);
+    return rx_queue.enqueueOn(data[0..len], ifindex);
 }
 
 /// Deliver queued frames to the RX demux; returns how many were delivered.
@@ -193,11 +216,12 @@ pub fn drain() u32 {
     // Bound one drain so a TX/RX ping-pong cannot starve the caller;
     // anything left is picked up by the next pump.
     while (count < QUEUE_DEPTH * 4) {
+        var ifindex: u8 = IFINDEX;
         const saved = lo_lock.acquire();
-        const n = rx_queue.dequeue(&buf);
+        const n = rx_queue.dequeueFrom(&buf, &ifindex);
         lo_lock.release(saved);
         if (n == 0) break;
-        net_mod.handleRxPacket(&buf, n);
+        net_mod.handleRxPacketOn(&buf, n, ifindex);
         count += 1;
     }
     return count;

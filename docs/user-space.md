@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello362`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello363`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -357,6 +357,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello360 | 链路范围的 IPv6 地址需要接口：连到 `[fe80::2%2]` 的 UDP 套接字报告链路本地地址 L、scope 2（L）；绑定 `[L]` 时 scope 0 是 EINVAL、99 是 ENODEV、1（lo）是 EADDRNOTAVAIL、2 成功且 getsockname 报告 scope 2（A）；`[ff02::1]` 同样要求 scope（B）；TCP 绑定 `[L]` scope 0 是 EINVAL（C）；发往 `[L%2]` 的数据报到达时源是 L、scope 2（D） |
 | hello361 | IPv6 UDP 组播：`IPV6_MULTICAST_HOPS/LOOP/IF/ALL` 的默认值、取值范围和错误码（O）；`IPV6_ADD/DROP_MEMBERSHIP` 的 EINVAL、ENODEV、EADDRINUSE、EADDRNOTAVAIL（J）；TCP 套接字加组是 EPROTO、设置 `MULTICAST_HOPS` 是 ENOPROTOOPT（T）；发往已加入组 `ff0e::101` 的数据报每个绑定 `::` 或该组且加组（或开着 `MULTICAST_ALL`）的套接字各收一份（D1、D2），没人加入的组谁都收不到（D3），发送方 `MULTICAST_LOOP 0` 时本机不收（D4），组里没有成员后谁都收不到（D5） |
 | hello362 | IPv4 UDP 组播：`IP_MULTICAST_TTL/LOOP/IF/ALL` 的默认值、取值范围和错误码（O，含单字节值、`IP_MULTICAST_IF` 的 EADDRNOTAVAIL）；`IP_ADD/DROP_MEMBERSHIP` 的 EINVAL、ENODEV、EADDRINUSE、EADDRNOTAVAIL，`ip_mreq` 和 `ip_mreqn` 两种格式（J）；TCP 加组 EPROTO、设置 `MULTICAST_TTL` EINVAL（T）；发往已加入组 `239.1.1.1` 的数据报每个匹配并加组（或开着 `MULTICAST_ALL`）的套接字各收一份（D1、D2），没人加入的组收不到（D3），`224.0.0.1` 不用加组（D4），`MULTICAST_LOOP 0` 时本机不收（D5），没有成员后收不到（D6）；绑定组播地址的套接字发往 127.0.0.1 时源是 127.0.0.1（S） |
+| hello363 | 组播出接口和共享端口上各套接字自己的发送选项：`IP_MULTICAST_IF` 指向 lo（127.0.0.1 或 ip_mreqn 编号 1）时数据报只经 lo 发出，lo 上的成员不论 LOOP、TTL 都收到一份，源地址是 IF 地址（F1、F2）；在网卡上加入的组收不到经 lo 发出的数据报（F3）；224.0.0.1 经 lo 也收到（F4）；只在 lo 上加入的组收不到从网卡回送的副本（F5、F6，按到达接口检查成员）；两个 SO_REUSEADDR 套接字共用端口时各用自己的 `IP_MULTICAST_LOOP`/`IPV6_MULTICAST_LOOP`（K4、K6）；`IPV6_MULTICAST_IF` 为 1 时发往组播地址是 ENETUNREACH，发往 ::1 照常（N6） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

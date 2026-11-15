@@ -4582,10 +4582,10 @@ test "IPv4 UDP multicast: IP_MULTICAST_* options, group membership, member-only 
     try std.testing.expectEqual(m.EADDRNOTAVAIL, m.drop4(&mem, g2, any, 0, true, our));
     try std.testing.expectEqual(m.EADDRNOTAVAIL, m.drop4(&mem, .{ 10, 0, 0, 1 }, any, 0, true, our));
     try std.testing.expectEqual(@as(i64, 0), m.drop4(&mem, g1, any, 0, true, our));
-    try std.testing.expect(m.joined4(&mem, g1));
+    try std.testing.expect(m.joined4(&mem, g1, null));
     try std.testing.expectEqual(m.EADDRNOTAVAIL, m.drop4(&mem, g1, any, 0, true, our));
     try std.testing.expectEqual(@as(i64, 0), m.drop4(&mem, g1, any, 1, true, our));
-    try std.testing.expect(!m.joined4(&mem, g1));
+    try std.testing.expect(!m.joined4(&mem, g1, null));
     try std.testing.expectEqual(m.ENODEV, m.drop4(&mem, g1, any, 0, false, our));
     var full: m.Membership4 = .{};
     for (0..m.MAX_GROUPS4) |i| try std.testing.expectEqual(@as(i64, 0), m.join4(&full, .{ 239, 2, 0, @intCast(i + 1) }, any, 0, true, our));
@@ -4599,7 +4599,7 @@ test "IPv4 UDP multicast: IP_MULTICAST_* options, group membership, member-only 
     try std.testing.expect(!m.socketMatches4(g2, g1, 0, @splat(0), src, 5));
     try std.testing.expect(!m.socketMatches4(any, g1, 6, src16, src, 5));
     try std.testing.expect(m.socketMatches4(any, g1, 5, src16, src, 5));
-    try std.testing.expect(m.socketAccepts4(&mem, true, g1) and !m.socketAccepts4(&mem, false, g1));
+    try std.testing.expect(m.socketAccepts4(&mem, true, g1, 2) and !m.socketAccepts4(&mem, false, g1, 2));
     try std.testing.expect(m.alwaysJoined4(.{ 224, 0, 0, 1 }) and !m.alwaysJoined4(g1));
     try std.testing.expect(m.isMulticast4(.{ 224, 0, 0, 0 }) and m.isMulticast4(.{ 239, 255, 255, 255 }) and !m.isMulticast4(.{ 240, 0, 0, 0 }));
     try std.testing.expectEqual([6]u8{ 0x01, 0x00, 0x5e, 0x01, 0x01, 0x01 }, m.multicastMac4(.{ 239, 129, 1, 1 }));
@@ -4609,17 +4609,70 @@ test "IPv4 UDP multicast: IP_MULTICAST_* options, group membership, member-only 
     try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, tp.sourceAddr(g1, .{ 127, 0, 0, 1 }, our));
 
     const us = kt.udp_source;
-    try std.testing.expect(std.mem.indexOf(u8, us, "    if (mcast.isMulticast4(dst_ip)) {\n        enqueueMcast4(hdr.dst_port, ip16, hdr.src_port, dst_ip, data[8..][0..actual_payload]);\n        return;\n    }\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "        if (!mcast.alwaysJoined4(group) and !hostJoined4Locked(group, null)) return;\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "            if (!mcast.socketAccepts4(&port_mc4[i], port_opts[i].ip.mc4_all, group)) continue;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    if (mcast.isMulticast4(dst_ip)) {\n        enqueueMcast4(hdr.dst_port, ip16, hdr.src_port, dst_ip, data[8..][0..actual_payload], ifindex);\n        return;\n    }\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "        if (!mcast.alwaysJoined4(group) and !hostJoined4Locked(group, ifindex)) return;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "            if (!mcast.socketAccepts4(&port_mc4[i], port_opts[i].ip.mc4_all, group, ifindex)) continue;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    if (group) ip_opt_policy.setTtl4(send_pkt[14..][0..20], opts4.mc4_ttl, ipv4.checksum);\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "    if (group and opts4.mc4_loop and (mcast.alwaysJoined4(dst_ip) or hostJoined4(dst_ip, out_if))) _ = lo.sendPacket(&send_pkt, frame_len);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    if (group and !via_lo and opts4.mc4_loop and (mcast.alwaysJoined4(dst_ip) or hostJoined4(dst_ip, out_if))) _ = lo.sendPacketOn(&send_pkt, frame_len, out_if);\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    else if (group)\n        mcast.multicastMac4(dst_ip)\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    port_mc4[ni] = port_mc4[oi];\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "            port_mc4[i] = port_mc4[num_ports];\n") != null);
     const so = kt.socket_opt_source;
     try std.testing.expect(std.mem.indexOf(u8, so, "(optname == ipo.IP_ADD_MEMBERSHIP or optname == ipo.IP_DROP_MEMBERSHIP)) return setMembership4(ref, optname, optval_ptr, optlen);") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, "    if (ref == .tcp) return -71;\n    if (ref != .udp) return -92;\n    if (optlen < 8) return -22;\n") != null);
+}
+
+test "multicast outgoing interface: IP_MULTICAST_IF lo sends out lo only, IPV6_MULTICAST_IF lo is ENETUNREACH, IPv4 group delivery checks the arrival interface, each sharing socket sends with its own options (hello363)" {
+    const m = kt.mcast_policy;
+    const g1 = [4]u8{ 239, 1, 3, 1 };
+    const any = [4]u8{ 0, 0, 0, 0 };
+    const our = [4]u8{ 10, 0, 2, 15 };
+    // A membership counts only on the interface it was joined on (ip_mc_sf_allow), unless MULTICAST_ALL.
+    var mem: m.Membership4 = .{};
+    try std.testing.expectEqual(@as(i64, 0), m.join4(&mem, g1, any, 1, true, our));
+    try std.testing.expect(m.joined4(&mem, g1, 1) and !m.joined4(&mem, g1, 2) and m.joined4(&mem, g1, null));
+    try std.testing.expect(m.socketAccepts4(&mem, false, g1, 1));
+    try std.testing.expect(!m.socketAccepts4(&mem, false, g1, 2));
+    try std.testing.expect(m.socketAccepts4(&mem, true, g1, 2));
+    // The IP_MULTICAST_IF address is the source of a group datagram from an unbound socket.
+    try std.testing.expectEqual(@as(?[4]u8, .{ 127, 0, 0, 1 }), m.multicastSource4(true, any, .{ 127, 0, 0, 1 }));
+    try std.testing.expectEqual(@as(?[4]u8, null), m.multicastSource4(false, any, .{ 127, 0, 0, 1 }));
+    try std.testing.expectEqual(@as(?[4]u8, null), m.multicastSource4(true, our, .{ 127, 0, 0, 1 }));
+    try std.testing.expectEqual(@as(?[4]u8, null), m.multicastSource4(true, any, any));
+    // IPv6 has no multicast route on lo.
+    var g6: [16]u8 = @splat(0);
+    g6[0] = 0xff;
+    g6[1] = 0x0e;
+    g6[15] = 0x31;
+    var lo6: [16]u8 = @splat(0);
+    lo6[15] = 1;
+    try std.testing.expect(m.sendUnreachable6(1, g6));
+    try std.testing.expect(!m.sendUnreachable6(0, g6) and !m.sendUnreachable6(2, g6));
+    try std.testing.expect(!m.sendUnreachable6(1, lo6));
+    // A loopback frame remembers the interface it arrives on.
+    var q = lo.LoopbackQueue.init();
+    try std.testing.expect(q.enqueueOn(&.{ 1, 2, 3 }, 2));
+    try std.testing.expect(q.enqueue(&.{ 4, 5 }));
+    var out: [8]u8 = undefined;
+    var ifx: u8 = 0;
+    try std.testing.expectEqual(@as(u32, 3), q.dequeueFrom(&out, &ifx));
+    try std.testing.expectEqual(@as(u8, 2), ifx);
+    try std.testing.expectEqual(@as(u32, 2), q.dequeueFrom(&out, &ifx));
+    try std.testing.expectEqual(lo.IFINDEX, ifx);
+
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "    const via_lo = loopback or (group and out_if == lo.IFINDEX);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    const ok = if (via_lo) lo.sendPacket(&send_pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    const our_ip = if (mcast.multicastSource4(group, bound, opts4.mc4_addr)) |a| a else ") != null);
+    // Options come from the sending socket's own registry key, not from whichever socket first holds the port.
+    try std.testing.expect(std.mem.indexOf(u8, us, "    const opts4: ip_opt_policy.IpOpts = if (getPortOpts(src_key)) |po| po.ip else .{};\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    const opts: ip_opt_policy.IpOpts = if (getPortOpts(src_key)) |po| po.ip else .{};\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "getPortOpts(src_port)") == null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "const src_key = "));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "const unreach6 = udp.sendErrno6(src_key, dst6);\n"));
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketOn(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, ifindex);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.lo_source, "net_mod.handleRxPacketOn(&buf, n, ifindex);") != null);
 }
 
 test "an IPv6 TCP socket's bound address takes part in conflicts, listener choice, lookup, source address and naming (hello359)" {
@@ -4667,8 +4720,8 @@ test "an IPv6 UDP datagram leaves from its socket's bound address; NDP is sent a
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "    const our_ip = @import(\"tcp_port_policy.zig\").sourceAddr6(bound, dst_ip, if (is_loop) dst_ip else ndp.selectSourceAddress(dst_ip, our_mac));\n") != null);
     const ss = kt.socket_syscall_source;
-    try std.testing.expect(std.mem.indexOf(u8, ss, "if (udp.sendToV6From(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_port, &tmp6, @intCast(n6))) {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ss, "return if (udp.sendToV6From(d.udp_local_ip6, dst6, dst_port6, src_port, payload.ptr, @intCast(n6))) @intCast(n6) else -1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (udp.sendToV6From(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, &tmp6, @intCast(n6))) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "return if (udp.sendToV6From(d.udp_local_ip6, dst6, dst_port6, src_key, payload.ptr, @intCast(n6))) @intCast(n6) else -1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "udp.sendToV6(dst6") == null);
     const iv = kt.icmpv6_source;
     try std.testing.expect(std.mem.indexOf(u8, iv, "pub const NDP_HOP_LIMIT: u8 = 255;\n") != null);
@@ -4830,7 +4883,7 @@ test "UDP sockets on one port are told apart by their bound IPv4 address: bind c
 
 test "a UDP socket keeps its bound IPv4 address: getsockname and the datagram source (hello347)" {
     const us = kt.udp_source;
-    try std.testing.expect(std.mem.indexOf(u8, us, "    const our_ip = @import(\"tcp_port_policy.zig\").sourceAddr(bound, dst_ip, netif.getOurIp());\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    const our_ip = if (mcast.multicastSource4(group, bound, opts4.mc4_addr)) |a| a else @import(\"tcp_port_policy.zig\").sourceAddr(bound, dst_ip, netif.getOurIp());\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    return sendToFrom(.{ 0, 0, 0, 0 }, dst_ip, dst_port, src_port, data, data_len);\n") != null);
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "        return udpRebind(t, fd, new_port, .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] }, @splat(0));") != null);

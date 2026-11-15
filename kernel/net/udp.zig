@@ -520,19 +520,20 @@ fn enqueueMcast(port: u16, src_ip: [16]u8, src_port: u16, group: [16]u8, payload
 }
 
 /// The IPv4 counterpart of enqueueMcast (Linux __udp4_lib_mcast_deliver, ip_check_mc_rcu): a copy to every IPv4 socket on the port
-/// that socketMatches4 and socketAccepts4, while this host is a member of the group or it is 224.0.0.1.
-fn enqueueMcast4(port: u16, src_ip: [16]u8, src_port: u16, group: [4]u8, payload: []const u8) void {
+/// that socketMatches4 and socketAccepts4, while this host is a member of the group on `ifindex`, the interface the datagram arrived
+/// on, or it is 224.0.0.1.
+fn enqueueMcast4(port: u16, src_ip: [16]u8, src_port: u16, group: [4]u8, payload: []const u8, ifindex: u8) void {
     var keys: [MAX_PORTS]u32 = undefined;
     var n: usize = 0;
     {
         const saved = udp_lock.acquire();
         defer udp_lock.release(saved);
-        if (!mcast.alwaysJoined4(group) and !hostJoined4Locked(group, null)) return;
+        if (!mcast.alwaysJoined4(group) and !hostJoined4Locked(group, ifindex)) return;
         const actual = @min(payload.len, MAX_UDP_PAYLOAD);
         for (0..num_ports) |i| {
             if (portNumber(ports[i]) != port or port_v6[i]) continue;
             if (!mcast.socketMatches4(port_local_ip[i], group, port_peer[i], port_peer_ip[i], src_ip[0..4].*, src_port)) continue;
-            if (!mcast.socketAccepts4(&port_mc4[i], port_opts[i].ip.mc4_all, group)) continue;
+            if (!mcast.socketAccepts4(&port_mc4[i], port_opts[i].ip.mc4_all, group, ifindex)) continue;
             for (0..QUEUE_DEPTH) |j| {
                 const e = &queues[i][j];
                 if (e.valid) continue;
@@ -556,6 +557,11 @@ fn enqueueMcast4(port: u16, src_ip: [16]u8, src_port: u16, group: [4]u8, payload
 }
 
 pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) void {
+    handlePacketOn(src_ip, dst_ip, data, len, @intCast(@import("bind_addr_policy.zig").NIC_IFINDEX));
+}
+
+/// handlePacket for a datagram that arrived on interface `ifindex` (1 lo, 2 the NIC).
+pub fn handlePacketOn(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, ifindex: u8) void {
     const hdr = udp_util.parseHeader(data, len) orelse return;
 
     // RFC 768: checksum 0 means "no checksum" for IPv4 UDP; verify when present.
@@ -571,7 +577,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
     var ip16: [16]u8 = @splat(0);
     @memcpy(ip16[0..4], &src_ip);
     if (mcast.isMulticast4(dst_ip)) {
-        enqueueMcast4(hdr.dst_port, ip16, hdr.src_port, dst_ip, data[8..][0..actual_payload]);
+        enqueueMcast4(hdr.dst_port, ip16, hdr.src_port, dst_ip, data[8..][0..actual_payload], ifindex);
         return;
     }
     const bound = enqueue(hdr.dst_port, ip16, hdr.src_port, hdr.dst_port, dst_ip, @splat(0), data[8..][0..actual_payload], false);
@@ -704,14 +710,24 @@ pub fn recvFromV6Ex(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[16]u8
     return 0;
 }
 
+/// The errno an IPv6 send by the socket with key `key` to `dst` fails with before anything is built, 0 when it may go ahead: a group
+/// datagram with IPV6_MULTICAST_IF naming lo has no route (ENETUNREACH).
+pub fn sendErrno6(key: u32, dst: [16]u8) i64 {
+    const opts: ip_opt_policy.IpOpts = if (getPortOpts(key)) |po| po.ip else .{};
+    return if (mcast.sendUnreachable6(opts.mc_if, dst)) -101 else 0;
+}
+
 pub fn sendTo(dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, data_len: u16) bool {
     return sendToFrom(.{ 0, 0, 0, 0 }, dst_ip, dst_port, src_port, data, data_len);
 }
 
-/// sendTo from a socket bound to the IPv4 address `bound` (0.0.0.0 when unbound): the source address follows
-/// tcp_port_policy.sourceAddr, so a loopback datagram leaves from the bound loopback address or else 127.0.0.1.
-pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, data_len: u16) bool {
+/// sendTo from the socket with registry key `src_key` (its port in the low 16 bits, see `ports`), bound to the IPv4 address `bound`
+/// (0.0.0.0 when unbound): the source address follows tcp_port_policy.sourceAddr, so a loopback datagram leaves from the bound
+/// loopback address or else 127.0.0.1. The IP options are that socket's own, also when other sockets share its port.
+pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, data: [*]const u8, data_len: u16) bool {
     if (data_len > MAX_UDP_PAYLOAD) return false;
+    const src_port = portNumber(src_key);
+    const opts4: ip_opt_policy.IpOpts = if (getPortOpts(src_key)) |po| po.ip else .{};
 
     const our_mac = netif.getMac();
     // F2: 127.0.0.0/8 goes to the loopback device — no ARP, no hardware NIC.
@@ -720,7 +736,11 @@ pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_port: u16, dat
     // would ever be transmitted) — use the broadcast MAC directly. DHCP
     // DISCOVER/REQUEST depend on this.
     const group = mcast.isMulticast4(dst_ip);
-    const dst_mac = if (loopback)
+    // IP_MULTICAST_IF naming lo: the datagram goes out lo alone (Linux ip_mc_output on the loopback device), whatever
+    // IP_MULTICAST_LOOP and IP_MULTICAST_TTL say.
+    const out_if: u8 = if (opts4.mc4_index != 0) opts4.mc4_index else @intCast(@import("bind_addr_policy.zig").NIC_IFINDEX);
+    const via_lo = loopback or (group and out_if == lo.IFINDEX);
+    const dst_mac = if (via_lo)
         our_mac
     else if (dst_ip[0] == 255 and dst_ip[1] == 255 and dst_ip[2] == 255 and dst_ip[3] == 255)
         [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }
@@ -734,7 +754,9 @@ pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_port: u16, dat
 
     // A 127/8 destination is reached from the bound loopback address, else from 127.0.0.1 (Linux's local route), so the
     // peer's replies stay on lo.
-    const our_ip = @import("tcp_port_policy.zig").sourceAddr(bound, dst_ip, netif.getOurIp());
+    // A group datagram from an unbound socket leaves from the IP_MULTICAST_IF address when one was given (Linux takes the source from
+    // inet->mc_addr).
+    const our_ip = if (mcast.multicastSource4(group, bound, opts4.mc4_addr)) |a| a else @import("tcp_port_policy.zig").sourceAddr(bound, dst_ip, netif.getOurIp());
     const udp_total: u16 = 8 + data_len;
     // SK-101/105: honor Path MTU (or armed oversized raise probe).
     if (ipv4.HEADER_LEN + udp_total > ipv4.getSendMtu(dst_ip)) return false;
@@ -754,19 +776,17 @@ pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_port: u16, dat
 
     // Build IPv4 header at offset 14 (after ethernet header)
     ipv4.buildHeader(send_pkt[14..].ptr, our_ip, dst_ip, ipv4.PROTO_UDP, udp_total);
-    const opts4: ip_opt_policy.IpOpts = if (getPortOpts(src_port)) |po| po.ip else .{};
     if (ip_opt_policy.ipv4NeedsPatch(opts4)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], opts4, ipv4.checksum);
     // A datagram to a group carries IP_MULTICAST_TTL (default 1), not the unicast TTL.
     if (group) ip_opt_policy.setTtl4(send_pkt[14..][0..20], opts4.mc4_ttl, ipv4.checksum);
 
     // Build ethernet frame
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, 20 + udp_total);
-    // IP_MULTICAST_LOOP: a member of the group on the outgoing interface (IP_MULTICAST_IF, default the NIC) gets a copy too (Linux
-    // ip_mc_output, ip_check_mc_rcu).
-    const out_if: u8 = if (opts4.mc4_index != 0) opts4.mc4_index else 2;
-    if (group and opts4.mc4_loop and (mcast.alwaysJoined4(dst_ip) or hostJoined4(dst_ip, out_if))) _ = lo.sendPacket(&send_pkt, frame_len);
+    // IP_MULTICAST_LOOP: when this host is a member of the group on the outgoing interface (the NIC here) a copy is delivered locally
+    // too, arriving on that interface (Linux ip_mc_output, ip_check_mc_rcu, dev_loopback_xmit).
+    if (group and !via_lo and opts4.mc4_loop and (mcast.alwaysJoined4(dst_ip) or hostJoined4(dst_ip, out_if))) _ = lo.sendPacketOn(&send_pkt, frame_len, out_if);
 
-    const ok = if (loopback) lo.sendPacket(&send_pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);
+    const ok = if (via_lo) lo.sendPacket(&send_pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.
     if (ok) ipv4.noteFullSizeSend(dst_ip, ipv4.HEADER_LEN + udp_total);
     return ok;
@@ -777,10 +797,12 @@ pub fn sendToV6(dst_ip: [16]u8, dst_port: u16, src_port: u16, data: [*]const u8,
     return sendToV6From(@splat(0), dst_ip, dst_port, src_port, data, data_len);
 }
 
-/// sendToV6 from a socket bound to the IPv6 address `bound` (:: when unbound): the source address follows
-/// tcp_port_policy.sourceAddr6, so a datagram leaves from the bound unicast address, also when it goes to ::1.
-pub fn sendToV6From(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_port: u16, data: [*]const u8, data_len: u16) bool {
+/// sendToV6 from the socket with registry key `src_key`, bound to the IPv6 address `bound` (:: when unbound): the source address
+/// follows tcp_port_policy.sourceAddr6, so a datagram leaves from the bound unicast address, also when it goes to ::1. The IPv6 options
+/// are that socket's own, also when other sockets share its port.
+pub fn sendToV6From(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, data: [*]const u8, data_len: u16) bool {
     if (data_len > MAX_UDP_PAYLOAD_V6) return false;
+    const src_port = portNumber(src_key);
 
     const nh = ndp.resolveNextHop(dst_ip);
     // K3: ::1 short-circuits NDP and the wire — loop back via lo.
@@ -814,7 +836,7 @@ pub fn sendToV6From(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_port: u16,
     bo.writeU16BeAt(&send_pkt, udp_off + 6, csum);
 
     ipv6.buildHeader(send_pkt[14..].ptr, our_ip, dst_ip, ipv6.PROTO_UDP, udp_total);
-    const opts: ip_opt_policy.IpOpts = if (getPortOpts(src_port)) |po| po.ip else .{};
+    const opts: ip_opt_policy.IpOpts = if (getPortOpts(src_key)) |po| po.ip else .{};
     if (ip_opt_policy.ipv6NeedsPatch(opts)) ip_opt_policy.patchIpv6(send_pkt[14..][0..40], opts);
     const group = mcast.isMulticast(dst_ip);
     // A datagram to a group carries IPV6_MULTICAST_HOPS (default 1), not the unicast hop limit.

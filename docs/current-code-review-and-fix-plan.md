@@ -9642,3 +9642,23 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异验证：删掉 `unlock` 里的 `notifyWoken` 调用，这条测试失败（1258/1259），文件已恢复。
 - 计时（SMP=2，临时让 init 先跑 hello350）：修复前 171 秒仍未跑完，修复后 10 秒 PASS。
 - 完整 smoke：与 hello362 同一个构建，SMP=2、SMP=4 各一份通过（超时上限 1400 秒），hello350 PASS（smoke 脚本检查的各程序都 PASS 且没有 FAIL）；SMP=1 一份通过，`PASS: … (SMP=1)`。本轮没有跑 riscv64、aarch64 smoke。
+
+## 补充：组播出接口为 lo、按到达接口查成员、共享端口的发送选项（hello363）
+
+- 背景：hello362 局限 2。`IP_MULTICAST_IF` 设成 lo 时，组播数据报仍从网卡发出，lo 上的成员只有在 LOOP 打开时才收到回送副本；IPv4 组播投递不区分到达接口，只在 lo 上加入的组也会收到从网卡回送的副本；`IPV6_MULTICAST_IF` 为 1 时照常发送。另外，发送路径按端口号（`src_port`）取 IP 选项，两个 SO_REUSEADDR 套接字共用端口时，第二个套接字发送用的是第一个的选项。
+- Linux 依据：`ip_mc_output`（出设备是 loopback 时直接在 lo 上发出，不看 `mc_loop`、TTL），`ip_check_mc_rcu` 和 `ip_mc_sf_allow`（按数据报到达的设备查成员），`dev_loopback_xmit`（网卡回送的副本以出设备为到达设备），源地址取 `inet->mc_addr`；IPv6 `ip6_dst_lookup` 在 lo 上没有组播路由，返回 ENETUNREACH；发送选项从发送的 sock 读取。
+- Linux 实测（`gcc -DHOST user/hello363.c`，`unshare -rn`，dummy 网卡 d0 为接口 2，配 `10.0.2.15/24` 和 `2001:db8:1::7/64`）：F1–F6、K4、K6、N6 共 9 项全部通过。探针另外测到：IF 为 lo 时 LOOP 0、TTL 0 都照样收到；只在 d0 上加入、经 lo 发送收不到；IF 用编号 1 时源地址是 10.0.2.15，用 127.0.0.1 时是 127.0.0.1。
+- 红灯（未改的内核，SMP=2，临时让 init 先跑 hello363）：F1、F4（IF lo 且 LOOP 0 时没收到）、F6（只在 lo 上加入、`MULTICAST_ALL` 为 0 的 B 也收到）、K4、K6（第二个套接字的 LOOP 0 不生效）、N6（发往组播地址返回 2 而不是 -101）失败；F2、F3、F5 通过。
+- 修复：
+  1. `kernel/net/lo.zig`：帧槽记录到达接口 `ifindex`；新增 `IFINDEX`（1）、`enqueueOn`、`dequeueFrom`、`sendPacketOn`；`drain` 调 `mod.handleRxPacketOn`。
+  2. `kernel/net/mod.zig`：`handleRxPacket` 改为调用 `handleRxPacketOn(…, 2)`，后者把接口交给 `udp.handlePacketOn`。
+  3. `kernel/net/mcast_policy.zig`：`joined4` 增加接口参数，`socketAccepts4` 按到达接口查成员；新增 `multicastSource4`、`sendUnreachable6`。
+  4. `kernel/net/udp.zig`：`enqueueMcast4` 按到达接口检查本机成员；`sendToFrom` 遇到 IF 为 lo 的组播只经 lo 发出（`via_lo`），网卡回送副本标为接口 2，未绑定时以 IF 地址为源地址；`sendToFrom`、`sendToV6From` 的参数改为发送套接字的注册键 `src_key`，选项按键查；新增 `sendErrno6`。
+  5. `kernel/net/socket_syscall.zig`：sendto 和 sendmsg 两条 UDP 路径传 `udpKey()`，IPv6 先查 `sendErrno6`。
+- 测试：hello363（QEMU，9 项）；新增 host 测试「multicast outgoing interface: IP_MULTICAST_IF lo sends out lo only, …(hello363)」。hello362、hello358、hello347 的 host 测试改为钉住新的源码行（`joined4` 多了接口参数，发送函数改传 `src_key`，`our_ip` 一行加了 `multicastSource4`），检查的行为没变。`kernel/host_test.zig` 新增 `net_mod_source`、`lo_source`。`zig build test` 全部通过（1260 个）。
+- 变异验证：`socketAccepts4` 忽略 `ifindex`（改成按任意接口查），hello363 这条 host 测试失败（1259/1260），文件已恢复。
+- 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，三份里 hello363 都 PASS。SMP=2、SMP=4 两份跑完后只改了 `lo.zig` 文件头的一行注释，SMP=1 用的是含这行注释的最终构建。本轮没有跑 riscv64、aarch64 smoke。
+- 这次修复带来的局限：
+  1. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
+  2. IPv6 组播投递仍不区分到达接口（IPv6 的成员表记了接口，但 lo 上发不出 IPv6 组播，目前只有网卡一个来源）。
+  3. 绑定冲突仍按地址完全相等判断。
