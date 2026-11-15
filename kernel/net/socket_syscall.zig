@@ -269,6 +269,8 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
             const n = copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN);
             if (n < sa.SOCKADDR_IN6_LEN) return -22; // EINVAL
             const parsed = sa.parseInet6(&sa6) orelse return -97; // EAFNOSUPPORT
+            const scope_rc = bind_addr_policy.inet6ScopeErrno(parsed.addr, parsed.scope_id, nic_mod.isActive());
+            if (scope_rc != 0) return scope_rc;
             if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;
             if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
             return udpRebind(t, fd, parsed.port, .{ 0, 0, 0, 0 }, parsed.addr);
@@ -296,6 +298,8 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN)
             return -22;
         const parsed = sa.parseInet6(&sa6) orelse return -97; // EAFNOSUPPORT
+        const scope_rc = bind_addr_policy.inet6ScopeErrno(parsed.addr, parsed.scope_id, nic_mod.isActive());
+        if (scope_rc != 0) return scope_rc;
         if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;
         if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
         return net_mod.tcp.tcpBindAddr46(tcb_idx, parsed.port, net_mod.tcp_port_policy.WILDCARD4, parsed.addr);
@@ -687,7 +691,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
                 if (copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp6))[0..to_write6], to_write6) != to_write6) return -14;
                 if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
                     var sa_out6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
-                    const alen = sa.writeInet6(&sa_out6, src_port_out6, src6, 0);
+                    const alen = sa.writeInet6(&sa_out6, src_port_out6, src6, sa.nameScope6(src6));
                     const addr_copy_len = @min(user_addr_len, alen);
                     if (addr_copy_len != 0 and copy.copyToUser(@ptrFromInt(addr_ptr), sa_out6[0..addr_copy_len], addr_copy_len) != addr_copy_len) return -14;
                     var al6: [4]u8 = .{
@@ -870,8 +874,9 @@ pub fn getsockname(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
     if (desc.fd_type == .udp_socket) {
         var sa_buf: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
         const our4 = net_mod.tcp_port_policy.nameAddr(desc.udp_local_ip, desc.udp_connected, desc.udp_dst_ip, netif.getOurIp());
-        // SK-86: an unbound socket with a non-loopback peer reports the preferred global address, else the link-local one.
-        const pref6 = ndp.getGlobalAddress() orelse ndp.generateLinkLocal(netif.getMac());
+        // An unbound socket with a non-loopback peer reports the source address chosen for that peer (SK-86: the preferred global
+        // address, or the link-local one for a link-local peer or when there is no global address).
+        const pref6 = ndp.selectSourceAddress(desc.udp_dst_ip6, netif.getMac());
         const our6 = net_mod.tcp_port_policy.nameAddr6(desc.udp_local_ip6, desc.udp_connected, desc.udp_dst_ip6, pref6);
         const alen = sa.encodeUdpName(desc.udp_is_v6, desc.udp_port, our4, our6, &sa_buf);
         if (alen == 0) return -1;
@@ -1305,7 +1310,7 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
     // msg_name / msg_namelen
     if (name_ptr != 0 and name_ptr < 0x0000_8000_0000_0000) {
         var out: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
-        const alen: u32 = if (is_v6) sa.writeInet6(&out, src_port, src6, 0) else sa.writeInet4(&out, src_port, src4);
+        const alen: u32 = if (is_v6) sa.writeInet6(&out, src_port, src6, sa.nameScope6(src6)) else sa.writeInet4(&out, src_port, src4);
         const n = @min(name_len, alen);
         if (n != 0 and copy.copyToUser(@ptrFromInt(name_ptr), out[0..n], n) != n) return -14;
         var al: [4]u8 = undefined;

@@ -4358,6 +4358,52 @@ test "an IPv4 and an IPv6 TCP socket do not conflict on one port (hello344)" {
     try std.testing.expect(std.mem.indexOf(u8, ts, "        if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict\n        if (!tcp_port_policy.familiesConflict(tcb.is_v6, tcbs[i].is_v6)) continue;\n") != null);
 }
 
+test "a link-scoped IPv6 address names its interface: bind checks sin6_scope_id, names carry it, own link-local goes through lo (hello360)" {
+    const ss = kt.socket_syscall_source;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "scope_rc = bind_addr_policy.inet6ScopeErrno(parsed.addr, parsed.scope_id, nic_mod.isActive());"));
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const alen = sa.writeInet6(&sa_out6, src_port_out6, src6, sa.nameScope6(src6));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "sa.writeInet6(&out, src_port, src6, sa.nameScope6(src6)) else") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const pref6 = ndp.selectSourceAddress(desc.udp_dst_ip6, netif.getMac());") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "ndp.isOwnAddress(tcb.remote_ip6, netif.getMac());") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "ndp.isOwnAddress(dst_ip, netif.getMac());") != null);
+    const bp = kt.bind_addr_policy;
+    const wild: [16]u8 = @splat(0);
+    var ll = wild;
+    ll[0] = 0xfe;
+    ll[1] = 0x80;
+    ll[15] = 7;
+    var mc2 = wild;
+    mc2[0] = 0xff;
+    mc2[1] = 0x02;
+    mc2[15] = 1;
+    var mc_site = mc2;
+    mc_site[1] = 0x0e;
+    var loop6 = wild;
+    loop6[15] = 1;
+    try std.testing.expect(bp.needsScope6(ll));
+    try std.testing.expect(bp.needsScope6(mc2));
+    try std.testing.expect(!bp.needsScope6(mc_site));
+    try std.testing.expect(!bp.needsScope6(loop6));
+    try std.testing.expectEqual(@as(i64, -22), bp.inet6ScopeErrno(ll, 0, true));
+    try std.testing.expectEqual(@as(i64, -19), bp.inet6ScopeErrno(ll, 99, true));
+    try std.testing.expectEqual(@as(i64, -19), bp.inet6ScopeErrno(ll, 2, false));
+    try std.testing.expectEqual(@as(i64, -99), bp.inet6ScopeErrno(ll, 1, true));
+    try std.testing.expectEqual(@as(i64, 0), bp.inet6ScopeErrno(ll, 2, true));
+    try std.testing.expectEqual(@as(i64, -22), bp.inet6ScopeErrno(mc2, 0, true));
+    try std.testing.expectEqual(@as(i64, 0), bp.inet6ScopeErrno(mc2, 2, true));
+    try std.testing.expectEqual(@as(i64, 0), bp.inet6ScopeErrno(mc2, 1, true));
+    try std.testing.expectEqual(@as(i64, 0), bp.inet6ScopeErrno(loop6, 99, true));
+    try std.testing.expectEqual(@as(i64, 0), bp.inet6ScopeErrno(wild, 99, true));
+    const sa = kt.sockaddr_util;
+    try std.testing.expectEqual(@as(u32, 2), sa.nameScope6(ll));
+    try std.testing.expectEqual(@as(u32, 0), sa.nameScope6(loop6));
+    var out: [28]u8 = undefined;
+    try std.testing.expectEqual(@as(u32, 28), sa.encodeInetName(true, 19001, .{ 0, 0, 0, 0 }, ll, &out));
+    try std.testing.expectEqual(@as(u32, 2), sa.parseInet6(&out).?.scope_id);
+    _ = sa.encodeInetName(true, 19001, .{ 0, 0, 0, 0 }, loop6, &out);
+    try std.testing.expectEqual(@as(u32, 0), sa.parseInet6(&out).?.scope_id);
+}
+
 test "an IPv6 TCP socket's bound address takes part in conflicts, listener choice, lookup, source address and naming (hello359)" {
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "        if (tcb.is_v6 and !tcp_port_policy.addrsConflict6(tcb.local_ip6, tcbs[i].local_ip6)) continue;\n") != null);
@@ -4371,8 +4417,8 @@ test "an IPv6 TCP socket's bound address takes part in conflicts, listener choic
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (!tcp_port_policy.sameLocalAddr6(o.local_ip6, tcb.local_ip6, ip6, ndp.selectSourceAddress(ip6, netif.getMac()))) continue;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "    const our_ip = tcp_port_policy.sourceAddr6(tcb.local_ip6, tcb.remote_ip6, if (is_loop) tcb.remote_ip6 else ndp.selectSourceAddress(tcb.remote_ip6, our_mac));\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "tcp_port_policy.nameAddr6(tcb.local_ip6, tcb.remote_port != 0, tcb.remote_ip6,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ts, "    const is_loop = netif.isLoopbackV6(tcb.remote_ip6) or ndp.hasLocalAddress(tcb.remote_ip6);\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "    const is_loop = netif.isLoopbackV6(dst_ip) or ndp.hasLocalAddress(dst_ip);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "    const is_loop = netif.isLoopbackV6(tcb.remote_ip6) or ndp.isOwnAddress(tcb.remote_ip6, netif.getMac());\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "    const is_loop = netif.isLoopbackV6(dst_ip) or ndp.isOwnAddress(dst_ip, netif.getMac());\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "return net_mod.tcp.tcpBindAddr46(tcb_idx, parsed.port, net_mod.tcp_port_policy.WILDCARD4, parsed.addr);") != null);
     const p = kt.tcp_port_policy;
     const wild: [16]u8 = @splat(0);

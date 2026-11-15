@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello359`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello360`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -354,6 +354,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello357 | IPv6 UDP 的绑定地址参与端口冲突和收包选择：`[::1]` 和 `[ff0e::1]` 可共用端口，`[::]` 和重复的 `[::1]` 是 EADDRINUSE（A）；SO_REUSEADDR 下发往 `::1` 的数据报不论绑定先后都给绑 `::1` 的套接字（B、C）；绑 `[ff0e::1]` 的套接字不收发往 `::1` 的数据报（D） |
 | hello358 | IPv6 UDP 数据报从套接字的绑定地址发出：连到站外地址的套接字报告 SLAAC 得到的全局地址 G（A）；绑定 `[G]:18982` 的套接字用 sendto（B）和 connect 后的 sendmsg（C）发往 `::1`，收端看到的源地址都是 G；绑定 `[::]` 的套接字发往 `::1` 时源地址是 `::1`（D） |
 | hello359 | IPv6 TCP 的绑定地址参与冲突、监听者选择、连接查找、源地址和 getsockname：`[::1]:p` 和 `[G]:p` 都能监听，`[::]:p` 是 EADDRINUSE（A）；绑定 `[G]` 的客户端连 `::1` 由 `::1` 监听者接受，服务端看到对端 G（B）；接受的套接字报告 `::1`（C）；本地地址不同的两个连接各收各的数据（D）；只有 `[G]:p` 监听时连 `[::1]:p` 是 ECONNREFUSED（E） |
+| hello360 | 链路范围的 IPv6 地址需要接口：连到 `[fe80::2%2]` 的 UDP 套接字报告链路本地地址 L、scope 2（L）；绑定 `[L]` 时 scope 0 是 EINVAL、99 是 ENODEV、1（lo）是 EADDRNOTAVAIL、2 成功且 getsockname 报告 scope 2（A）；`[ff02::1]` 同样要求 scope（B）；TCP 绑定 `[L]` scope 0 是 EINVAL（C）；发往 `[L%2]` 的数据报到达时源是 L、scope 2（D） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

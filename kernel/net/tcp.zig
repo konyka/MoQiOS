@@ -1455,7 +1455,7 @@ fn sendSegmentV6Seq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16
     const flags = decorateEcnFlags(tcb, flags_in, data_len);
     // K3: ::1 short-circuits NDP and the wire — loop back via lo.
     // An address of this host is reached through lo too (Linux routes it via the local table).
-    const is_loop = netif.isLoopbackV6(tcb.remote_ip6) or ndp.hasLocalAddress(tcb.remote_ip6);
+    const is_loop = netif.isLoopbackV6(tcb.remote_ip6) or ndp.isOwnAddress(tcb.remote_ip6, netif.getMac());
     const nh = ndp.resolveNextHop(tcb.remote_ip6);
     const dst_mac = if (is_loop) netif.getMac() else nh.mac orelse {
         if (nh.solicit) |t| icmpv6.sendNeighborSolicitation(t);

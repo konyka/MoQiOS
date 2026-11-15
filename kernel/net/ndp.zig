@@ -697,6 +697,11 @@ pub fn hasLocalAddress(addr: [16]u8) bool {
     return false;
 }
 
+/// True when `addr` is one of this host's own addresses: a configured one or the link-local address formed from `mac`.
+pub fn isOwnAddress(addr: [16]u8, mac: [6]u8) bool {
+    return hasLocalAddress(addr) or ipv6.addrEq(addr, generateLinkLocal(mac));
+}
+
 /// First *preferred* non-link-local address, if any (SK-85: DAD must pass).
 pub fn getGlobalAddress() ?[16]u8 {
     const flags = ndp_lock.acquire();

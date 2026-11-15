@@ -89,9 +89,15 @@ pub fn writeInet6(buf: []u8, port: u16, addr: [16]u8, scope_id: u32) u32 {
     return SOCKADDR_IN6_LEN;
 }
 
-/// Encode a local/peer name for UDP or TCP (SK-73/78). Same sockaddr layout.
+/// The sin6_scope_id a reported name carries: the NIC's index for a link-scoped address (lo has no link-local address), else 0.
+pub fn nameScope6(addr: [16]u8) u32 {
+    const bp = @import("bind_addr_policy.zig");
+    return if (bp.needsScope6(addr)) bp.NIC_IFINDEX else 0;
+}
+
+/// Encode a local/peer name for UDP or TCP (SK-73/78). Same sockaddr layout; a link-scoped IPv6 address names the NIC (nameScope6).
 pub fn encodeInetName(is_v6: bool, port: u16, ip4: [4]u8, ip6: [16]u8, out: []u8) u32 {
-    if (is_v6) return writeInet6(out, port, ip6, 0);
+    if (is_v6) return writeInet6(out, port, ip6, nameScope6(ip6));
     return writeInet4(out, port, ip4);
 }
 
