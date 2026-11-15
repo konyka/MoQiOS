@@ -4313,6 +4313,41 @@ test "a frame the full loopback queue refuses is a loss, not a failed send (hell
     try std.testing.expect(std.mem.indexOf(u8, ts, "    if (!loopback) return false;\n    advanceSndNxt(tcb, SYN, 0);\n    return true;") != null);
 }
 
+test "no tail loss probe before the handshake; SYN and SYN-ACK are resent at the ISS (hello343)" {
+    const S = kt.tcp_recv_policy.TcpState;
+    try std.testing.expect(!kt.tcp_recv_policy.tailLossProbeAllowed(S.syn_sent));
+    try std.testing.expect(!kt.tcp_recv_policy.tailLossProbeAllowed(S.syn_received));
+    try std.testing.expect(kt.tcp_recv_policy.tailLossProbeAllowed(S.established));
+    try std.testing.expect(kt.tcp_recv_policy.tailLossProbeAllowed(S.fin_wait_1));
+    try std.testing.expect(kt.tcp_recv_policy.tailLossProbeAllowed(S.close_wait));
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcp_recv_policy.tailLossProbeAllowed(tcb.state) and probeTlpShouldFire(") != null);
+    // The RTO resends the SYN and the SYN-ACK from the ISS; a SYN-ACK whose send failed still counts in SND.NXT so it is resent.
+    try std.testing.expect(std.mem.indexOf(u8, ts, "                tcb.snd_nxt = tcb.snd_una;\n                _ = sendSegment(tcb, probeEcnSynFlags(true)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "                tcb.snd_nxt = tcb.snd_una;\n                sendSynAck(tcb, tcb.ecn_ok);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "            } else if (tcb.state == .syn_received) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "    if (!sendSegment(tcb, probeEcnSynAckFlags(peer_ecn), undefined, 0)) advanceSndNxt(tcb, SYN, 0);") != null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ts, "_ = sendSegment(new_tcb, probeEcnSynAckFlags(peer_ecn)"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ts, "_ = sendSegment(reuse_tcb, probeEcnSynAckFlags(peer_ecn)"));
+}
+
+test "a SYN on a finished handshake gets an ACK; a resent SYN gets the SYN-ACK again (hello343)" {
+    const S = kt.tcp_recv_policy.TcpState;
+    const rp = kt.tcp_recv_policy;
+    // The client whose final ACK was lost answers the server's resent SYN-ACK, so the server child leaves SYN_RECEIVED.
+    try std.testing.expect(rp.synGetsChallengeAck(S.established));
+    try std.testing.expect(rp.synGetsChallengeAck(S.fin_wait_1));
+    try std.testing.expect(rp.synGetsChallengeAck(S.close_wait));
+    try std.testing.expect(rp.synGetsChallengeAck(S.last_ack));
+    try std.testing.expect(!rp.synGetsChallengeAck(S.syn_sent));
+    try std.testing.expect(!rp.synGetsChallengeAck(S.syn_received));
+    try std.testing.expect(!rp.synGetsChallengeAck(S.time_wait));
+    try std.testing.expect(!rp.synGetsChallengeAck(S.listen));
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (flags & SYN != 0 and flags & RST == 0 and tcp_recv_policy.synGetsChallengeAck(tcb.state)) {\n        _ = sendSegment(tcb, ACK, undefined, 0);\n        return;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (flags & (SYN | ACK) == SYN and seq_num == tcb.irs) {\n                tcb.snd_nxt = tcb.snd_una;\n                sendSynAck(tcb, tcb.ecn_ok);") != null);
+}
+
 test "lo queue enqueue/dequeue preserves FIFO order" {
     var q = lo.LoopbackQueue.init();
     try std.testing.expectEqual(@as(u32, 0), q.pending());

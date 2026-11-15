@@ -195,3 +195,19 @@ pub fn peernameErrno(state: TcpState, established_ever: bool) i64 {
     return if (hasPeer(state) or established_ever) 0 else ENOTCONN;
 }
 
+
+/// The tail loss probe runs only once the handshake is done (Linux tcp_schedule_loss_probe needs TCP_ESTABLISHED or later): before
+/// that the only thing in flight is the SYN or SYN-ACK, which the retransmit timer resends, and a probe would move SND.NXT back
+/// over it so the matching ACK (SND.NXT exactly) is refused.
+pub fn tailLossProbeAllowed(state: TcpState) bool {
+    return state != .syn_sent and state != .syn_received;
+}
+
+/// A SYN on a connection whose handshake is done gets a bare ACK and is dropped (RFC 5961 §4, Linux tcp_validate_incoming). This also
+/// answers a SYN-ACK the server retransmitted because our final ACK was lost: the ACK lets its child leave SYN_RECEIVED.
+pub fn synGetsChallengeAck(state: TcpState) bool {
+    return switch (state) {
+        .established, .fin_wait_1, .fin_wait_2, .close_wait, .closing, .last_ack => true,
+        else => false,
+    };
+}

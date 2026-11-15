@@ -2102,6 +2102,12 @@ fn applyPeerMss(tcb: *TcpTcb, opts: TcpOptions) void {
     }
 }
 
+/// Send the SYN-ACK of a SYN_RECEIVED child. A send that fails (full loopback queue, unresolved next hop) still counts the SYN in
+/// SND.NXT, as a lost SYN-ACK would, so the retransmit timer resends it instead of leaving the child silent. Caller holds tcp_lock.
+fn sendSynAck(tcb: *TcpTcb, peer_ecn: bool) void {
+    if (!sendSegment(tcb, probeEcnSynAckFlags(peer_ecn), undefined, 0)) advanceSndNxt(tcb, SYN, 0);
+}
+
 /// Called from net/mod.zig when an IPv4 packet with protocol=6 is received.
 /// Handle an incoming SYN for a listening socket.
 /// Creates a new TCB in SYN_RECEIVED state, sends SYN-ACK,
@@ -2154,7 +2160,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
 
             reuse_tcb.owner_task = ls.owner_task;
             reuse_tcb.sock_uid = listenerSockUid(ls);
-            _ = sendSegment(reuse_tcb, probeEcnSynAckFlags(peer_ecn), undefined, 0);
+            sendSynAck(reuse_tcb, peer_ecn);
             tcpLog("[tcp] TIME_WAIT reuse → SYN-ACK\n");
             // Queue it like a fresh SYN_RECEIVED child, or accept() would never see the new connection.
             ls.pending_tpbs[ls.pending_tail % LISTEN_RING] = @intCast(i);
@@ -2210,7 +2216,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
     new_tcb.accecn_ok = peer_ecn;
 
     // Send SYN-ACK
-    _ = sendSegment(new_tcb, probeEcnSynAckFlags(peer_ecn), undefined, 0);
+    sendSynAck(new_tcb, peer_ecn);
     tcpLog("[tcp] SYN-ACK sent for incoming connection\n");
 
     // Find the index of the new TCB
@@ -2260,7 +2266,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
             // SK-139: offer AccECN (AE) when peer offered ECN-setup.
             reuse_tcb.ecn_ok = peer_ecn;
             reuse_tcb.accecn_ok = peer_ecn;
-            _ = sendSegment(reuse_tcb, probeEcnSynAckFlags(peer_ecn), undefined, 0);
+            sendSynAck(reuse_tcb, peer_ecn);
             return;
         }
     }
@@ -2303,7 +2309,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
     new_tcb.ecn_ok = peer_ecn;
     new_tcb.accecn_ok = peer_ecn;
 
-    _ = sendSegment(new_tcb, probeEcnSynAckFlags(peer_ecn), undefined, 0);
+    sendSynAck(new_tcb, peer_ecn);
 
     const new_idx = tcbIdx(new_tcb);
     ls.pending_tpbs[ls.pending_tail % LISTEN_RING] = new_idx;
@@ -2382,6 +2388,11 @@ fn driveTcbStateMachine(
         }
     }
 
+    if (flags & SYN != 0 and flags & RST == 0 and tcp_recv_policy.synGetsChallengeAck(tcb.state)) {
+        _ = sendSegment(tcb, ACK, undefined, 0);
+        return;
+    }
+
     // State machine processing
     switch (tcb.state) {
         .syn_sent => {
@@ -2451,6 +2462,12 @@ fn driveTcbStateMachine(
             }
         },
         .syn_received => {
+            // The client resent its SYN, so our SYN-ACK was lost: resend it at once (Linux tcp_check_req → inet_rtx_syn_ack).
+            if (flags & (SYN | ACK) == SYN and seq_num == tcb.irs) {
+                tcb.snd_nxt = tcb.snd_una;
+                sendSynAck(tcb, tcb.ecn_ok);
+                return;
+            }
             // Third ACK of three-way handshake (from client)
             if (flags & ACK != 0) {
                 // The ACK must acknowledge our SYN-ACK exactly; an unmatched
@@ -4049,7 +4066,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
         _ = maybeRackTimerRepair(tcb, current_rto);
         // SK-117: Tail Loss Probe before RTO (no cwnd cut).
         const tlp_to = probeTlpTimeoutMs(tcb.srtt, current_rto);
-        if (probeTlpShouldFire(
+        if (tcp_recv_policy.tailLossProbeAllowed(tcb.state) and probeTlpShouldFire(
             tcb.retransmit_timer,
             tlp_to,
             current_rto,
@@ -4111,8 +4128,13 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
                 // v53.13: If all pending data has been retransmitted, also retransmit FIN
                 resendFinIfRewound(tcb);
             } else if (tcb.state == .syn_sent) {
-                // Retransmit SYN
+                // Retransmit the SYN at the ISS (snd_una until it is acknowledged): snd_nxt already counts the first one.
+                tcb.snd_nxt = tcb.snd_una;
                 _ = sendSegment(tcb, probeEcnSynFlags(true), undefined, 0);
+            } else if (tcb.state == .syn_received) {
+                // Retransmit the SYN-ACK (Linux reqsk_timer_handler), again at the ISS.
+                tcb.snd_nxt = tcb.snd_una;
+                sendSynAck(tcb, tcb.ecn_ok);
             } else if (finSent(tcb)) {
                 // v53.12: Include .closing — FIN must be retransmitted if ACK is lost.
                 // Rewind to the FIN's own seq: snd_nxt already counts it, and

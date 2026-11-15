@@ -9302,5 +9302,25 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 测试：hello342（QEMU，4 项）。定向 SMP=2、SMP=4 各一份通过。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，各 304 个 PASS，hello342 都通过，hello228 `corrupted canaries=0`。riscv64、aarch64 smoke 通过。
 - 局限：
-  1. 上面说的副作用依赖：RTO 分支没有在重发 SYN 前显式把 `snd_nxt` 设回 ISS。
-  2. 服务端 SYN_RECEIVED 的 SYN-ACK 丢失后不会重发：重传定时器不处理 SYN_RECEIVED，重复的 SYN 也不会触发重发，SYN-ACK 发送失败时 `snd_nxt` 也不前进。用户态没法让 SYN-ACK 丢失（回环队列在处理 SYN 之前已经取出了它，总有空位），非 x86 的 SK 探针在 SK-19 之后不再运行，所以这一项还没有能失败的测试，未修。
+  1. 上面说的副作用依赖：RTO 分支没有在重发 SYN 前显式把 `snd_nxt` 设回 ISS。（hello343 已补：RTO 分支显式设回，TLP 不再在握手前触发。）
+  2. 服务端 SYN_RECEIVED 的 SYN-ACK 丢失后不会重发：重传定时器不处理 SYN_RECEIVED，重复的 SYN 也不会触发重发，SYN-ACK 发送失败时 `snd_nxt` 也不前进。用户态没法让 SYN-ACK 丢失（回环队列在处理 SYN 之前已经取出了它，总有空位），非 x86 的 SK 探针在 SK-19 之后不再运行，所以这一项还没有能失败的测试，未修。（hello343 已修，只有源码检查：RTO 分支重发 SYN-ACK，发送失败的 SYN-ACK 也计入 `snd_nxt`。）
+
+## 补充：握手阶段不做尾部丢包探测，SYN/SYN-ACK 由 RTO 从 ISS 重发（hello343）
+
+- 背景：hello342 发现重传的 SYN 带 ISN 只是因为尾部丢包探测（TLP）的副作用。TLP 在 SYN_SENT 也会触发：srtt 为 0 时 PTO 是 1 秒，`sendTlpProbe` 没有数据可发，调用 `prepareRexmitFromHole` 把 `snd_nxt` 退回 `snd_una`。从这一刻到 RTO（2 秒）之间，`tcpi_unacked` 是 0，而且 SYN_SENT 分支要求 SYN-ACK 的 ack 等于 `snd_nxt`，正确的 SYN-ACK（ack=ISS+1）会被丢掉。Linux 在连接建立前不调度 TLP（`tcp_schedule_loss_probe`）。
+- Linux 实测（`gcc -DHOST user/hello343.c`）：监听者 backlog 32，40 个非阻塞 connect（A）；1.5 秒后 7 个在 SYN-SENT（B）；4 秒内每 100 ms 采样，280/280 次读数 `tcpi_unacked` 为 1（C）；40 个都在 12 秒内被 accept（D）。
+- 红灯（未改的内核，SMP=2）：C 失败，320 次读数里只有 162 次是 1，其余是 0。
+- 修复（`kernel/net/tcp.zig`、`kernel/net/tcp_recv_policy.zig`）：
+  1. 新增 `tcp_recv_policy.tailLossProbeAllowed(state)`，SYN_SENT 和 SYN_RECEIVED 返回 false；`timerTickOne` 在 `probeTlpShouldFire` 之前检查它。
+  2. RTO 分支重发 SYN 前显式 `tcb.snd_nxt = tcb.snd_una`（即 ISS）。
+  3. RTO 分支新增 SYN_RECEIVED：同样退回 `snd_una` 后用 `sendSynAck` 重发 SYN-ACK（Linux `reqsk_timer_handler`）。
+  4. 四处发送 SYN-ACK 的地方改用 `sendSynAck`：发送失败时仍 `advanceSndNxt(tcb, SYN, 0)`，让重传定时器接手，而不是让子连接一直沉默。
+  5. 握手已完成的连接（ESTABLISHED、FIN_WAIT_1/2、CLOSE_WAIT、CLOSING、LAST_ACK）收到 SYN 时回一个 ACK 并丢弃该段（`tcp_recv_policy.synGetsChallengeAck`，RFC 5961 §4，Linux `tcp_validate_incoming`）。客户端最后的 ACK 丢了以后，服务端重发的 SYN-ACK 就靠这个 ACK 让子连接离开 SYN_RECEIVED。
+  6. SYN_RECEIVED 收到对端重发的同一个 SYN（`seq_num == irs`）时立即重发 SYN-ACK（Linux `tcp_check_req` → `inet_rtx_syn_ack`）。
+- 第一次完整 smoke 暴露的问题：只做 1–4 时，一份 SMP=4 里 hello272 39/40。`/proc/tcpstats` 显示 `syn_received=1 established=79`：有一个客户端已经 ESTABLISHED，但它最后的 ACK 丢了（40 个连接同时握手时回环队列满），服务端子连接卡在 SYN_RECEIVED。修复前子连接从不重发 SYN-ACK，所以同样会卡住；加了 1–4 以后，重发的 SYN-ACK 在客户端 ESTABLISHED 分支里被忽略，还是收不到 ACK。第 5 项补上之后，重发的 SYN-ACK 换回一个 ACK，子连接完成握手。这是 docs 里记录的 hello272 偶发 39/40 的另一个来源。
+- 测试：hello343（QEMU，4 项），定向 SMP=2、SMP=4 各一份通过，hello341、hello342 同时通过；host 测试「no tail loss probe before the handshake; SYN and SYN-ACK are resent at the ISS (hello343)」和「a SYN on a finished handshake gets an ACK; a resent SYN gets the SYN-ACK again (hello343)」检查纯函数和源码。变异验证：把 `tailLossProbeAllowed` 改成只排除 SYN_SENT、把 `synGetsChallengeAck` 去掉 ESTABLISHED，对应的测试都失败。
+- 完整 smoke：四份（SMP=1、4、4、2）都是 `EXIT=0`，每份 305 个 PASS、0 FAIL，`corrupted canaries=0`；hello272 四份都是 40/40。
+- 这次修复带来的局限：
+  1. 服务端 SYN-ACK 重发和挑战 ACK 没有专门的确定性测试：用户态没法指定丢哪一帧，非 x86 的 SK 探针在 SK-19 之后不运行。只有 hello272 的偶发失败间接覆盖它们。
+  3. 挑战 ACK 没有做 RFC 5961 的速率限制（Linux `tcp_challenge_ack_limit`）。
+  2. SYN_RECEIVED 子连接重发 5 次 SYN-ACK 后由 `closeTcbRemote` 释放（backlog 条目置为无效）。RTO 从 2 秒起翻倍、上限 60 秒，所以放弃前大约 122 秒；Linux 默认 `tcp_synack_retries`=5、初始 1 秒，大约 63 秒。期间子连接一直占着 backlog 位置。
