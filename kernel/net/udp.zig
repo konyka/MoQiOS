@@ -173,6 +173,18 @@ pub fn setPeer(port: u32, peer_port: u16, peer_ip: [16]u8) void {
     port_err[i] = 0;
 }
 
+/// connect(AF_UNSPEC) on the socket with registry key `key`: drops the peer filter, any pending error and the interface the socket
+/// is tied to (Linux __udp_disconnect clears sk_bound_dev_if, also one a scoped bind set).
+pub fn disconnect(key: u32) void {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(key) orelse return;
+    port_peer[i] = 0;
+    port_peer_ip[i] = @splat(0);
+    port_err[i] = 0;
+    port_dev6[i] = 0;
+}
+
 /// The pending error (positive errno) of the socket bound to `port`, 0 if none.
 pub fn peekPendingError(port: u32) i32 {
     const saved = udp_lock.acquire();

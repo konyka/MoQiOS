@@ -34,6 +34,24 @@ pub fn unixNameEncode(path: []const u8, out: []u8) u32 {
     return @intCast(2 + path.len + 1);
 }
 
+pub const DgramConnect = enum { einval, eafnosupport, disconnect, address };
+
+/// What connect() on a datagram socket does with an address of `addr_len` bytes whose family is `family`: shorter than the family
+/// field is EINVAL; AF_UNSPEC dissolves the association (Linux inet_dgram_connect); anything else goes through the address checks.
+pub fn dgramConnectAction(addr_len: u32, family: u16) DgramConnect {
+    if (addr_len < 2) return .einval;
+    if (family == 0) return .disconnect;
+    return .address;
+}
+
+/// dgramConnectAction for an AF_INET6 socket (always V6ONLY in MoQiOS): __ip6_datagram_connect refuses AF_INET before it looks at
+/// the length, so a 16-byte sockaddr_in is EAFNOSUPPORT rather than EINVAL.
+pub fn dgramConnectAction6(addr_len: u32, family: u16) DgramConnect {
+    const a = dgramConnectAction(addr_len, family);
+    if (a == .address and family == 2) return .eafnosupport;
+    return a;
+}
+
 pub fn inet4FamilyValid(family: u16) bool {
     return family == 2;
 }

@@ -789,6 +789,23 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     // UDP connect: set default destination
     if (t.fd_table.fds[fd].fd_type == .udp_socket) {
         if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -14;
+        var fam: [2]u8 = @splat(0);
+        if (addr_len >= 2 and copy.copyFromUser(&fam, @ptrFromInt(addr_ptr), 2) != 2) return -14;
+        const sap = @import("socket_address_policy.zig");
+        const action = if (t.fd_table.fds[fd].udp_is_v6) sap.dgramConnectAction6(addr_len, bo.readU16Le(&fam)) else sap.dgramConnectAction(addr_len, bo.readU16Le(&fam));
+        switch (action) {
+            .einval => return -22,
+            .eafnosupport => return -97,
+            .disconnect => {
+                t.fd_table.fds[fd].udp_connected = false;
+                t.fd_table.fds[fd].udp_dst_ip = @splat(0);
+                t.fd_table.fds[fd].udp_dst_ip6 = @splat(0);
+                t.fd_table.fds[fd].udp_dst_port = 0;
+                udp.disconnect(t.fd_table.fds[fd].udpKey());
+                return 0;
+            },
+            .address => {},
+        }
         if (t.fd_table.fds[fd].udp_is_v6) {
             if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, true)) return -22;
             var sa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;

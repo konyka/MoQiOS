@@ -95,10 +95,11 @@ pub fn nameScope6(addr: [16]u8) u32 {
     return if (bp.needsScope6(addr)) bp.NIC_IFINDEX else 0;
 }
 
-/// The sin6_scope_id of a socket's own name: the interface it is tied to when its address needs a scope, else nameScope6.
+/// The sin6_scope_id of a UDP socket's own name (Linux inet6_getname: ipv6_iface_scope_id(addr, sk_bound_dev_if)): the interface it
+/// is tied to when its address needs a scope, 0 otherwise, also for a link-scoped address once connect(AF_UNSPEC) untied it.
 pub fn boundScope6(addr: [16]u8, bound_dev: u8) u32 {
     const bp = @import("bind_addr_policy.zig");
-    return if (bound_dev != 0 and bp.needsScope6(addr)) bound_dev else nameScope6(addr);
+    return if (bp.needsScope6(addr)) bound_dev else 0;
 }
 
 /// Encode a local/peer name for UDP or TCP (SK-73/78). Same sockaddr layout; a link-scoped IPv6 address names the NIC (nameScope6).

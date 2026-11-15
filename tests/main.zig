@@ -1273,6 +1273,23 @@ test "socket connect validates sockaddr lengths" {
     try std.testing.expect(!socket_address_policy.optionalUserAddressValid(0x8000, 0x8000));
 }
 
+test "UDP connect with AF_UNSPEC dissolves the association (hello366)" {
+    const A = socket_address_policy.DgramConnect;
+    try std.testing.expectEqual(A.einval, socket_address_policy.dgramConnectAction(0, 0));
+    try std.testing.expectEqual(A.einval, socket_address_policy.dgramConnectAction(1, 0));
+    try std.testing.expectEqual(A.disconnect, socket_address_policy.dgramConnectAction(2, 0));
+    try std.testing.expectEqual(A.disconnect, socket_address_policy.dgramConnectAction(16, 0));
+    try std.testing.expectEqual(A.disconnect, socket_address_policy.dgramConnectAction(28, 0));
+    try std.testing.expectEqual(A.address, socket_address_policy.dgramConnectAction(16, 2));
+    try std.testing.expectEqual(A.address, socket_address_policy.dgramConnectAction(2, 10));
+    // __ip6_datagram_connect looks at AF_INET before the length: a V6ONLY socket refuses it as EAFNOSUPPORT.
+    try std.testing.expectEqual(A.eafnosupport, socket_address_policy.dgramConnectAction6(16, 2));
+    try std.testing.expectEqual(A.eafnosupport, socket_address_policy.dgramConnectAction6(2, 2));
+    try std.testing.expectEqual(A.disconnect, socket_address_policy.dgramConnectAction6(2, 0));
+    try std.testing.expectEqual(A.einval, socket_address_policy.dgramConnectAction6(1, 2));
+    try std.testing.expectEqual(A.address, socket_address_policy.dgramConnectAction6(28, 10));
+}
+
 test "x86 syscall SFMASK clears direction flag" {
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "wrmsr(MSR_SFMASK, 0x40700)") != null);
 }
@@ -4726,7 +4743,8 @@ test "IPv6 bind ties a link-scoped socket to its sin6_scope_id interface: separa
     // getsockname reports the interface the socket is tied to.
     const sa = kt.sockaddr_util;
     try std.testing.expectEqual(@as(u32, 1), sa.boundScope6(ff02, 1));
-    try std.testing.expectEqual(sa.nameScope6(ff02), sa.boundScope6(ff02, 0));
+    // inet6_getname: ipv6_iface_scope_id(addr, sk_bound_dev_if), so a socket on no interface names scope 0 (hello366 U4).
+    try std.testing.expectEqual(@as(u32, 0), sa.boundScope6(ff02, 0));
     try std.testing.expectEqual(@as(u32, 0), sa.boundScope6(glob, 0));
     try std.testing.expectEqual(@as(u32, 0), sa.boundScope6(glob, 1));
 
@@ -4811,6 +4829,19 @@ test "IPv6 send interface: sendto's sin6_scope_id, the bound interface and IPV6_
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "const oif6 = udp.sendOif6(src_key, dst6, scope6);"));
     const conn_at = std.mem.indexOf(u8, ss, "const dev_rc = udp.connectDev6(t.fd_table.fds[fd].udpKey(), parsed.addr, parsed.scope_id);").?;
     try std.testing.expect(conn_at < std.mem.indexOfPos(u8, ss, conn_at, "t.fd_table.fds[fd].udp_connected = true;").?);
+}
+
+test "UDP connect(AF_UNSPEC) clears the peer, its filter and the tied interface before any address check (hello366)" {
+    const ss = kt.socket_syscall_source;
+    const act = std.mem.indexOf(u8, ss, "dgramConnectAction6(addr_len, bo.readU16Le(&fam)) else sap.dgramConnectAction(addr_len, bo.readU16Le(&fam));").?;
+    try std.testing.expect(act < std.mem.indexOfPos(u8, ss, act, "if (t.fd_table.fds[fd].udp_is_v6) {").?);
+    try std.testing.expect(std.mem.indexOfPos(u8, ss, act, "                t.fd_table.fds[fd].udp_connected = false;\n").? <
+        std.mem.indexOfPos(u8, ss, act, "                udp.disconnect(t.fd_table.fds[fd].udpKey());\n").?);
+    const us = kt.udp_source;
+    const d = std.mem.indexOf(u8, us, "pub fn disconnect(key: u32) void {").?;
+    const end = std.mem.indexOfPos(u8, us, d, "\n}\n").?;
+    for ([_][]const u8{ "port_peer[i] = 0;", "port_peer_ip[i] = @splat(0);", "port_err[i] = 0;", "port_dev6[i] = 0;" }) |line|
+        try std.testing.expect(std.mem.indexOf(u8, us[d..end], line) != null);
 }
 
 test "an IPv6 TCP socket's bound address takes part in conflicts, listener choice, lookup, source address and naming (hello359)" {

@@ -9684,6 +9684,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. sendto 不看目的地址的 sin6_scope_id。Linux 实测：从绑在 %1 上的套接字发往 scope 0 的地址，以及发往 ff02::1%1，都返回 ENETUNREACH。
   2. IPv6 TCP 不记录绑定的接口。
   3. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
+  4. hello302（SIGSTOP 打断 nanosleep）的可变延迟一项在 SMP=2 上偶发失败一次，最慢 416 ms，根因没有查。
 
 ## 补充：IPv6 sendto 和 connect 按 sin6_scope_id 选出接口（hello365）
 
@@ -9704,4 +9705,25 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. IPv6 TCP 仍不记录绑定的接口，connect 也不看 scope。
   2. IPv6 UDP 还不支持 AF_UNSPEC 断开（family 不是 AF_INET6 时返回 EAFNOSUPPORT）。Linux 实测断开后接口被清掉（绑在 ff02::1%1 上的套接字 getsockname 的 scope 变为 0，之后 connect 到 %2 成功），由 connect 写入的接口也要随之清掉。
   3. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
+  4. hello302（SIGSTOP 打断 nanosleep）的可变延迟一项在 SMP=2 上偶发失败一次，最慢 416 ms，根因没有查。
   4. hello314 A（进程 CPU 时钟不倒退）在 SMP=4 上偶发失败一次：11364 次读数里倒退 1 次，最多 67 us。hello314 修复后的完整 smoke 里没见过，根因没有查；候选是 `groupTimesLocked` 对各成员分别取快照，成员切换时一个成员的片已折入、另一个的片还按旧时间算。
+
+## 补充：UDP 的 connect(AF_UNSPEC) 断开（hello366）
+
+- 背景：hello365 的局限 2。UDP connect 先查长度再查 family，AF_UNSPEC 地址在 IPv4 套接字上返回 EAFNOSUPPORT（长度 2 时是 EINVAL），在 IPv6 套接字上是 EINVAL 或 EAFNOSUPPORT，已连接的套接字没有办法回到未连接状态。IPv6 套接字用 16 字节的 AF_INET 地址 connect 返回 EINVAL，Linux 返回 EAFNOSUPPORT。
+- Linux 依据：`inet_dgram_connect`（`net/ipv4/af_inet.c`）长度不到 sa_family 是 EINVAL，family 为 AF_UNSPEC 时调用 disconnect；`__udp_disconnect`（`net/ipv4/udp.c`）清掉对端和 sk_bound_dev_if，没有用户绑定的地址时重置源地址，没有用户绑定的端口时释放端口。`__ip6_datagram_connect`（`net/ipv6/datagram.c`）对 V6ONLY 套接字先拒绝 AF_INET（EAFNOSUPPORT），再查长度。
+- 宿主机实测（Linux，`unshare -rn` 加 dummy 网卡 d0，方法写在 `user/hello366.c` 文件头）：U1–U7 共 7 项全部通过。另外实测到：未绑定的套接字断开后 getsockname 是 0.0.0.0:0（自动选的端口被释放，别的套接字能 bind 到它），用户 bind 的端口保留。
+- 红灯（未修改的内核，SMP=2，hello366 临时放在 init 序列最前面）：U1–U7 全部失败。AF_UNSPEC 返回 -97（长度 2 时 -22），断开后 getpeername 仍是 0，send 仍成功，其他来源的数据报仍被过滤；U4 的 scope 仍是 1，connect 到 %2 是 EINVAL；U7 的 IPv6 套接字是 -22。
+- 修复：
+  1. `kernel/net/socket_address_policy.zig`：新增 `DgramConnect`、`dgramConnectAction`、`dgramConnectAction6`。
+  2. `kernel/net/udp.zig`：新增 `disconnect(key)`，在锁内清掉 `port_peer`、`port_peer_ip`、`port_err` 和 `port_dev6`。
+  3. `kernel/net/socket_syscall.zig`：UDP connect 先拷贝 2 字节 family 交给上面的策略；断开时清掉描述符的 `udp_connected`、`udp_dst_ip`、`udp_dst_ip6`、`udp_dst_port` 并调用 `udp.disconnect`。其他地址仍走原来的长度和 family 检查。
+  4. `kernel/net/sockaddr_util.zig`：`boundScope6` 改为和 Linux `ipv6_iface_scope_id(addr, sk_bound_dev_if)` 一致：地址需要 scope 时报告套接字绑定的接口，没有绑定接口时报告 0，不再退到网卡的 ifindex。第一份完整 smoke 里 U4 失败（断开后 scope 报告 2），原因就是旧的回退。红灯时 U4 的 scope 还是 1，没有暴露这一点。hello364 的 host 测试相应改为 `boundScope6(ff02, 0) == 0`。
+- 测试：hello366（QEMU，7 项）；新增 host 测试「UDP connect with AF_UNSPEC dissolves the association (hello366)」和「UDP connect(AF_UNSPEC) clears the peer, its filter and the tied interface before any address check (hello366)」。
+- 变异验证：`dgramConnectAction` 不再把 family 0 当作断开，第一条 host 测试失败；`udp.disconnect` 去掉 `port_dev6[i] = 0;`，第二条 host 测试失败。两处都已恢复。改 `boundScope6` 之前先改 hello364 的 host 测试，测试失败，改完后通过。
+- 完整 smoke：改 `boundScope6` 之前的第一份 SMP=2 里只有 U4 失败（见修复 4）。最终构建：第一份 SMP=2 里 hello366 PASS，但 hello302 的可变延迟一项失败（40 轮里 39 轮在 200 ms 内，最慢 416 ms），本次没有碰信号和睡眠，属于偶发；重跑的 SMP=2 和并行的 SMP=1、SMP=4 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`。本轮没有跑 riscv64、aarch64。
+- 这次修复带来的局限：
+  1. 断开不释放端口，地址也不回到通配。MoQiOS 在 socket() 时就分配临时端口，没有区分自动绑定和用户绑定，所以从没 bind 过的套接字断开后 getsockname 仍报告原来的端口（Linux 报告 0）。用户 bind 过的套接字和 Linux 一致。
+  2. IPv6 TCP 仍不记录绑定的接口，connect 也不看 scope。
+  3. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
+  4. hello302（SIGSTOP 打断 nanosleep）的可变延迟一项在 SMP=2 上偶发失败一次，最慢 416 ms，根因没有查。
