@@ -154,6 +154,9 @@ const TcpState = tcp_recv_policy.TcpState;
 
 const TcpTcb = struct {
     local_port: u16,
+    /// The IPv4 address bind() gave the socket, or the destination a SYN_RECEIVED child was reached at (Linux inet_rcv_saddr);
+    /// 0.0.0.0 when unbound. IPv6 sockets leave it at the wildcard.
+    local_ip: [4]u8 = tcp_port_policy.WILDCARD4,
     remote_port: u16,
     remote_ip: [4]u8,
     /// SK-75: dual-stack — when true, `remote_ip6` is the peer address.
@@ -629,22 +632,30 @@ fn stopListening(tcb: *TcpTcb) void {
 
 /// The listener a SYN for `port` goes to. With several sockets listening on the port (SO_REUSEPORT) the peer's address and port pick one, so
 /// a client always reaches the same listener; with one it is that one.
-fn pickListenSlot(port: u16, is_v6: bool, src_ip: [4]u8, src_port: u16) ?*ListenSlot {
-    var count: u32 = 0;
-    var lbm = listen_active_bitmap.snapshot();
-    while (lbm.next()) |i| {
-        if (listen_slots[i].local_port == port and listen_slots[i].is_v6 == is_v6) count += 1;
-    }
-    if (count == 0) return null;
-    var want = tcp_port_policy.pickListener(count, src_ip, src_port);
-    lbm = listen_active_bitmap.snapshot();
-    while (lbm.next()) |i| {
-        if (listen_slots[i].local_port == port and listen_slots[i].is_v6 == is_v6) {
-            if (want == 0) return &listen_slots[i];
-            want -= 1;
+/// The listener for a SYN to `dst_ip`:`port`: one bound to that address if any, else a wildcard one (tcp_port_policy.listenerTakes);
+/// within the chosen tier SO_REUSEPORT spreads by source. IPv6 passes the wildcard as `dst_ip`.
+fn pickListenSlot(port: u16, is_v6: bool, dst_ip: [4]u8, src_ip: [4]u8, src_port: u16) ?*ListenSlot {
+    for ([_]bool{ true, false }) |exact| {
+        var count: u32 = 0;
+        var lbm = listen_active_bitmap.snapshot();
+        while (lbm.next()) |i| {
+            if (listenSlotTakes(&listen_slots[i], port, is_v6, dst_ip, exact)) count += 1;
+        }
+        if (count == 0) continue;
+        var want = tcp_port_policy.pickListener(count, src_ip, src_port);
+        lbm = listen_active_bitmap.snapshot();
+        while (lbm.next()) |i| {
+            if (listenSlotTakes(&listen_slots[i], port, is_v6, dst_ip, exact)) {
+                if (want == 0) return &listen_slots[i];
+                want -= 1;
+            }
         }
     }
     return null;
+}
+
+fn listenSlotTakes(ls: *const ListenSlot, port: u16, is_v6: bool, dst_ip: [4]u8, exact: bool) bool {
+    return ls.local_port == port and ls.is_v6 == is_v6 and tcp_port_policy.listenerTakes(ls.local_ip, dst_ip, exact);
 }
 
 /// Marker for a backlog ring entry whose handshake died (never a real TCB
@@ -881,6 +892,7 @@ fn allocTcb() ?*TcpTcb {
     // The previous occupant's port must not survive: it would block bind()
     // of that port and alias a 4-tuple if connect() reused it.
     tcbs[i].local_port = 0;
+    tcbs[i].local_ip = tcp_port_policy.WILDCARD4;
     tcbs[i].remote_port = 0;
     tcbs[i].is_v6 = false;
     tcbs[i].remote_ip6 = @splat(0);
@@ -1389,9 +1401,9 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16, 
         return false;
     });
 
-    // Loopback segments also carry the 127/8 destination as source, so the
-    // peer's replies stay on lo and both pseudo-headers agree.
-    const our_ip = if (loopback) tcb.remote_ip else netif.getOurIp();
+    // A 127/8 peer is reached from the bound loopback address, else from 127.0.0.1, so the peer's replies stay on lo
+    // (tcp_port_policy.sourceAddr).
+    const our_ip = tcp_port_policy.sourceAddr(tcb.local_ip, tcb.remote_ip, netif.getOurIp());
     // SK-101/105: honor Path MTU (or armed oversized raise probe). The gate
     // runs BEFORE fillTcpSegment, which consumes SACK state
     // (sack_block_count) a PMTU bail would otherwise lose.
@@ -1583,7 +1595,7 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
             handleIncomingSynV6(src_ip, src_port, dst_port, seq_num, raw_window, opts, flags);
             // Nobody listens on the port: a ::1 peer is told at once (RFC 9293
             // §3.10.7.1) instead of retransmitting its SYN.
-            if (pendingBacklogCount() == before and !hasListener(dst_port, true)) {
+            if (pendingBacklogCount() == before and !hasListener(dst_port, true, tcp_port_policy.WILDCARD4)) {
                 sendLoopbackResetV6(src_ip, dst_ip, src_port, dst_port, flags, ack_num, seq_num, payload_len);
             }
         }
@@ -2112,11 +2124,11 @@ fn sendSynAck(tcb: *TcpTcb, peer_ecn: bool) void {
 /// Handle an incoming SYN for a listening socket.
 /// Creates a new TCB in SYN_RECEIVED state, sends SYN-ACK,
 /// and queues it in the listen backlog.
-fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions, flags: u8) void {
+fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions, flags: u8) void {
     _ = _w;
     const peer_ecn = probeEcnPeerSetup(flags);
-    // Find listen slot for this port (bitmap-driven)
-    const ls = pickListenSlot(dst_port, false, src_ip, src_port) orelse return;
+    // The listener bound to the SYN's destination address, else a wildcard one.
+    const ls = pickListenSlot(dst_port, false, dst_ip, src_ip, src_port) orelse return;
 
     // T17: Allow TCB reuse for TIME_WAIT connections (if ISN is larger)
     var tw_bm = tcb_active_bitmap.snapshot();
@@ -2158,6 +2170,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
             reuse_tcb.ecn_ok = peer_ecn;
             reuse_tcb.accecn_ok = peer_ecn;
 
+            reuse_tcb.local_ip = dst_ip;
             reuse_tcb.owner_task = ls.owner_task;
             reuse_tcb.sock_uid = listenerSockUid(ls);
             sendSynAck(reuse_tcb, peer_ecn);
@@ -2178,6 +2191,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
         return;
     };
     new_tcb.local_port = dst_port;
+    new_tcb.local_ip = dst_ip;
     new_tcb.remote_port = src_port;
     new_tcb.remote_ip = src_ip;
     new_tcb.owner_task = ls.owner_task;
@@ -2231,7 +2245,7 @@ fn handleIncomingSyn(src_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, 
 fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions, flags: u8) void {
     _ = _w;
     const peer_ecn = probeEcnPeerSetup(flags);
-    const ls = pickListenSlot(dst_port, true, .{ src_ip[12], src_ip[13], src_ip[14], src_ip[15] }, src_port) orelse return;
+    const ls = pickListenSlot(dst_port, true, tcp_port_policy.WILDCARD4, .{ src_ip[12], src_ip[13], src_ip[14], src_ip[15] }, src_port) orelse return;
 
     var tw_bm = tcb_active_bitmap.snapshot();
     while (tw_bm.next()) |i| {
@@ -2964,10 +2978,10 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, e
         // No matching connection — check if any socket is listening on this port
         if (flags & SYN != 0) {
             const before = pendingBacklogCount();
-            handleIncomingSyn(src_ip, src_port, dst_port, seq_num, raw_window, opts, flags);
+            handleIncomingSyn(src_ip, dst_ip, src_port, dst_port, seq_num, raw_window, opts, flags);
             // Nobody listens on the port: a loopback peer is told at once
             // (RFC 9293 §3.10.7.1) instead of retransmitting its SYN.
-            if (pendingBacklogCount() == before and !hasListener(dst_port, false)) {
+            if (pendingBacklogCount() == before and !hasListener(dst_port, false, dst_ip)) {
                 sendLoopbackReset(src_ip, dst_ip, src_port, dst_port, flags, ack_num, seq_num, payload_len);
             }
         }
@@ -2987,12 +3001,8 @@ fn pendingBacklogCount() u32 {
     return n;
 }
 
-fn hasListener(port: u16, is_v6: bool) bool {
-    var lbm = listen_active_bitmap.snapshot();
-    while (lbm.next()) |i| {
-        if (listen_slots[i].local_port == port and listen_slots[i].is_v6 == is_v6) return true;
-    }
-    return false;
+fn hasListener(port: u16, is_v6: bool, dst_ip: [4]u8) bool {
+    return pickListenSlot(port, is_v6, dst_ip, .{ 0, 0, 0, 0 }, 0) != null;
 }
 
 /// Answer a segment that matches no connection with a RST — loopback only: it
@@ -4249,6 +4259,8 @@ const ListenSlot = struct {
     /// The listening TCB this slot belongs to: sockets sharing a port through SO_REUSEPORT each have their own slot.
     tcb_idx: u32 = 0xFFFF_FFFF,
     local_port: u16 = 0,
+    /// The listener's bound IPv4 address (0.0.0.0 for the wildcard and for IPv6).
+    local_ip: [4]u8 = tcp_port_policy.WILDCARD4,
     owner_task: u32 = 0,
     is_v6: bool = false,
     pending_tpbs: [LISTEN_RING]u32, // TCB indices of pending connections (SYN_RECEIVED)
@@ -4261,6 +4273,7 @@ var listen_slots: [MAX_CONNECTIONS]ListenSlot = @splat(.{
     .active = false,
     .tcb_idx = 0xFFFF_FFFF,
     .local_port = 0,
+    .local_ip = tcp_port_policy.WILDCARD4,
     .owner_task = 0,
     .is_v6 = false,
     .pending_tpbs = @splat(0),
@@ -4323,7 +4336,7 @@ fn creatorFsuid(task_idx: u32) u32 {
 }
 
 /// Whether another TCB holding `port` keeps TCB `tcb_idx` from binding or listening on it. Only sockets of the same family count
-/// (tcp_port_policy.familiesConflict); SO_REUSEADDR on both with a holder that is not listening (tcp_port_policy.reuseMayShare), or
+/// (tcp_port_policy.familiesConflict), and IPv4 ones only when their bound addresses overlap (tcp_port_policy.addrsConflict); SO_REUSEADDR on both with a holder that is not listening (tcp_port_policy.reuseMayShare), or
 /// SO_REUSEPORT on both with one owner, lets them share. Caller holds tcp_lock.
 fn portConflict(tcb_idx: u32, port: u16) bool {
     const tcb = &tcbs[tcb_idx];
@@ -4331,6 +4344,7 @@ fn portConflict(tcb_idx: u32, port: u16) bool {
     while (bm.next()) |i| {
         if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict
         if (!tcp_port_policy.familiesConflict(tcb.is_v6, tcbs[i].is_v6)) continue;
+        if (!tcb.is_v6 and !tcp_port_policy.addrsConflict(tcb.local_ip, tcbs[i].local_ip)) continue;
         if (tcbs[i].local_port == port) {
             if (tcp_port_policy.reuseMayShare(tcb.options.reuse_addr, tcbs[i].options.reuse_addr, tcbs[i].state == .listen)) continue;
             if (tcp_port_policy.reusePortMayShare(tcb.options.extra_flags, tcbs[i].options.extra_flags, tcb.sock_uid, tcbs[i].sock_uid)) continue;
@@ -4343,6 +4357,11 @@ fn portConflict(tcb_idx: u32, port: u16) bool {
 /// Bind a TCB to a local port.
 /// Returns 0 on success, -1 on failure.
 pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
+    return tcpBindAddr(tcb_idx, port, tcp_port_policy.WILDCARD4);
+}
+
+/// Bind a TCB to a local IPv4 address and port (the address is the wildcard for IPv6). Returns 0 or -errno.
+pub fn tcpBindAddr(tcb_idx: u32, port: u16, addr: [4]u8) i64 {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
@@ -4351,7 +4370,12 @@ pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
     // bind() on a socket that already has an address, or is past CLOSED, is EINVAL.
     if (tcb.state != .closed or tcb.bound_explicitly) return tcp_port_policy.BIND_EINVAL;
 
-    if (port != 0 and portConflict(tcb_idx, port)) return tcp_port_policy.BIND_EADDRINUSE;
+    const saved_ip = tcb.local_ip;
+    tcb.local_ip = if (tcb.is_v6) tcp_port_policy.WILDCARD4 else addr;
+    if (port != 0 and portConflict(tcb_idx, port)) {
+        tcb.local_ip = saved_ip;
+        return tcp_port_policy.BIND_EADDRINUSE;
+    }
 
     tcb.local_port = port;
     tcb.bound_explicitly = port != 0;
@@ -4388,6 +4412,7 @@ pub fn tcpListen(tcb_idx: u32) i64 {
     listen_slots[i].active = true;
     listen_slots[i].tcb_idx = tcbIdx(tcb);
     listen_slots[i].local_port = tcb.local_port;
+    listen_slots[i].local_ip = tcb.local_ip;
     listen_slots[i].owner_task = tcb.owner_task;
     listen_slots[i].is_v6 = tcb.is_v6;
     listen_slots[i].pending_head = 0;
@@ -4679,7 +4704,7 @@ pub fn tcpGetAddrInfo(tcb_idx: u32) ?AddrInfo {
         .local_port = tcb.local_port,
         .remote_port = tcb.remote_port,
         .remote_ip = tcb.remote_ip,
-        .local_ip = netif_mod.getOurIp(),
+        .local_ip = tcp_port_policy.nameAddr(tcb.local_ip, tcb.remote_port != 0, tcb.remote_ip, netif_mod.getOurIp()),
         .is_v6 = tcb.is_v6,
         .remote_ip6 = tcb.remote_ip6,
         .local_ip6 = if (tcb.is_v6)

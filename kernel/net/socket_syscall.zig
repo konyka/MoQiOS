@@ -306,7 +306,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     const port = bo.readU16BeAt(&sock_addr, 2);
     if (bindAddrNotAvail4(.{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] })) return bind_addr_policy.EADDRNOTAVAIL;
     if (net_mod.tcp_port_policy.bindNeedsPrivilege(port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
-    return net_mod.tcp.tcpBind(tcb_idx, port);
+    return net_mod.tcp.tcpBindAddr(tcb_idx, port, .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] });
 }
 
 /// listen(fd, backlog) → 0 or -errno

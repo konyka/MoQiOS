@@ -5940,7 +5940,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 方法（如实）：这一轮没有凭记忆写预期值，而是先在宿主机上用 `gcc` 写了对照程序跑真实 Linux，取它的返回值当标准，再写 hello184；这避免了我自己记错 errno（例如我原先以为 `shutdown` 在监听者上也要 `ENOTCONN`，对照后发现 Linux 返回 0）。
 - 修复：见 `docs/kernel-subsystems.md` 的 hello184 条。
 - 排查过程（如实）：①第一次跑 hello184 的 8 项失败里，B 段“bind 非 AF_INET 地址”那一项一开始让我以为是 bind 漏检；加了 B2 段（用真实布局 `02 00` 的地址 bind/listen/connect）后，B2 的 `connect` 失败了，这才暴露字节序问题：`connect` 的地址族检查在读 `00 02` 之外一律拒绝。②改了读取字节序以后，**hello22/hello26/hello27/hello85 立刻失败**（它们的地址写成 `00 02`，一直在靠错误的字节序通过），说明这些旧测试是在固化 bug；我把它们的地址改成 `02 00`，连同 23 个把地址写成 `a[1] = 2` 的探测程序一起改。③`sendErrno` 里 `established_ever` 参数不再影响结果（现在两种情况都是 `EPIPE`），保留参数只是为了不改调用方，函数里用 `_ = established_ever;` 丢弃。
-- 已知差异：UDP `sendto` 的地址、`sendmsg` 的 `msg_name` 对 IPv4 地址族不做检查（`SOCKADDR_IN_MIN_LEN` 以上直接取端口和地址）；`connect` 到不可达地址的 errno 取决于网络栈；`getsockname` 对新套接字返回内核自己的地址表示（Linux 返回 `0.0.0.0:0`，这里返回本机 IP 和端口 0），没有改。
+- 已知差异：UDP `sendto` 的地址、`sendmsg` 的 `msg_name` 对 IPv4 地址族不做检查（`SOCKADDR_IN_MIN_LEN` 以上直接取端口和地址）；`connect` 到不可达地址的 errno 取决于网络栈；`getsockname` 对新套接字返回内核自己的地址表示（Linux 返回 `0.0.0.0:0`，这里返回本机 IP 和端口 0），没有改。（hello345 起 TCP 已改为 `0.0.0.0`；UDP 仍报告本机 IP。）
 - TDD：host 新增 1 个测试（五个状态规则对全部 11 个状态的穷举、地址族字节序、三处小端读取与零处大端读取、各入口的接线）并更新了 `sendErrno` 的旧测试（旧断言“从未连接是 `ENOTCONN`”与 Linux 不符）；hello184（A 未连接的套接字、B 地址族与短地址、B2 真实布局的地址、C 监听者、D 已建立连接、E `SHUT_WR` 之后）在旧内核上 8 项 FAIL（B2 的 connect 也失败），新内核 PASS。
 - 变异（具名测试核对）：`accept`/`listen`/`shutdown` 在任何状态都成功、监听者有对端、`shutdown` 不看状态、未连接的 `send` 又变回 `ENOTCONN`、四个入口里各自的检查被删（`accept`、`listen`、`shutdown`、`getpeername`）、`bind` 不检查地址族、UDP `connect` 按大端读地址族，共 12 个，全部被 `TCP socket-state errnos…`（一个同时被旧的 `tcp send errors…` 抓住）抓住。其中 3 个第一次因未使用参数编译失败，改成可编译形式后抓住；恢复后 `grep -c MUTATION` 为 0。
 - 验证：host 856/856；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello184 PASS，**且 hello22/26/27/85 以及其余所有 TCP/UDP 探测在新的地址族字节序下全部 PASS**、0 个 FAIL；stress（SMP=2）5/5 PASS。
@@ -9335,7 +9335,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 第一次完整 smoke 暴露的测试问题：四份里两份（SMP=4、SMP=2）第二轮的 hello344 E 失败，要么 IPv4 监听者 3 秒内没 accept 到（之后又 accept 到了，"then 8"），要么 IPv4 那条连接到得晚。紧跟 hello343 运行时 `/proc/lostats` 显示回环队列已丢过 46–48 帧，E 期间又多丢了约 26 帧：40 个 TIME_WAIT 残留和握手报文挤满 16 帧的队列，丢了一个握手帧的连接要等 2 秒的重传超时。原来的 E 先在 IPv4 监听者上等 3 秒再等 IPv6，时间不够。改成两个监听者轮流 accept、总共最多等 10 秒，再多等 200 ms 确认各自没有第二个连接。失败时打印 `/proc/lostats` 和 `/proc/tcpstats`。改后紧跟 hello343 的 SMP=4 定向运行 3/3 通过（改前 3 次里 2 次失败）。内核没有因此改动。
 - 完整 smoke：四份（SMP=1、4、4、2）里三份 EXIT=0，PASS 均为 306；一份 SMP=4 的 hello229 E「without SA_RESTART a blocked wait4 returns -EINTR」失败一次（305 PASS），与本改动无关，记为偶发项（子进程发信号 30 ms 后就退出，负载下父进程醒来时子进程已是僵尸，先回收而不返回 EINTR）；hello344 四份都通过，corrupted canaries 均为 0。
 - 局限：
-  1. 绑定的本地地址还是不区分：TCB 不记录绑定地址，`127.0.0.1:p` 和 `0.0.0.0:p` 仍视为同一个端口。
+  1. ~~绑定的本地地址还是不区分：TCB 不记录绑定地址，`127.0.0.1:p` 和 `0.0.0.0:p` 仍视为同一个端口。~~（hello345 已补上 IPv4；IPv6 仍不区分本地地址。）
   2. connect 选临时端口（`allocEphemeralPort`）时仍然把另一族的占用算进去，只是少用了一些端口，不会出错。
   3. 回环队列只有 16 帧，前一个程序留下的报文多时握手帧会被丢，靠 2 秒的重传超时恢复；这是已有的开放项（固定容量的回环队列）。
 
@@ -9346,3 +9346,23 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修改（只改测试）：`spawn_signaller` 没有数据要写时（B 和 E 的 waitpid/wait4 用例，以及 C、F、H 只需要信号的用例）发完信号等 300 ms 再退出；有数据时仍是 30 ms。hello229 没有 HOST 分支，这次没有在宿主机 Linux 上跑。
 - 验证：把 hello229 放到 init 前部单独跑，SMP=4 两份、SMP=2 一份，3/3 PASS（34 项全部 ok）。完整 smoke 四份（SMP=1、4、4、2）里 hello229 都通过；三份 EXIT=0、306 PASS，一份 SMP=4 只有 hello286 M（19/20，已记录的偶发项）失败，corrupted canaries 均为 0。
 - 局限：这只是把窗口从 30 ms 放宽到 300 ms，宿主机极端卡顿时仍可能误报。
+
+## 补充：TCP 套接字记住绑定的 IPv4 地址（hello345）
+
+- 背景：hello340、hello344 两节都把「端口冲突不区分绑定的本地地址」记为局限。TCB 没有本地地址字段，`bind` 只取端口，所以 `127.0.0.1:p` 和 `127.0.0.2:p` 不能同时绑定；端口上任何监听者都会接下发往该端口任何地址的 SYN；getsockname 总是报告网卡地址（例如 `10.0.2.15`），通配绑定和回环绑定都一样。
+- Linux 实测（`gcc -DHOST user/hello345.c`，端口 18897）：A `127.0.0.1:p`、`127.0.0.2:p` 都能 bind 和 listen；B 再绑 `0.0.0.0:p` 或 `127.0.0.2:p` 是 `EADDRINUSE`；C getsockname 给出 127.0.0.1、127.0.0.2，绑 `0.0.0.0:p+1` 的套接字给 `0.0.0.0`；D 连 127.0.0.2 的连接由 127.0.0.2 的监听者 accept，连 127.0.0.1 的由另一个 accept，accept 出的套接字以被连接的地址为名，未绑定客户端的源地址是 127.0.0.1（回环路由的 src）；E 连 `127.0.0.3:p`（没人监听）是 `ECONNREFUSED`；F 绑定 127.0.0.5 的客户端连 127.0.0.1，自己的名字和对端看到的地址都是 127.0.0.5。我原先以为 D 里未绑定客户端的源地址是 127.0.0.2，宿主机实测是 127.0.0.1，测试按实测改了。
+- 红灯（未改的内核，SMP=2）：A（第二个 bind -98、listen -1）、C（报告 10.0.2.15）、D（127.0.0.1 的监听者收到了两个连接）、E（connect 返回 0）、F 共 5 项失败，B 通过。
+- 修复（`kernel/net/tcp.zig`、`kernel/net/tcp_port_policy.zig`、`kernel/net/socket_syscall.zig`）：
+  1. TCB 和监听槽新增 `local_ip`（IPv4，默认 `0.0.0.0`；`allocTcb` 清零）；`socket_syscall.bind` 对 IPv4 调新的 `tcpBindAddr(idx, port, addr)`，冲突时恢复原地址。
+  2. `portConflict` 对 IPv4 再看 `tcp_port_policy.addrsConflict`：一方是通配或两者相同才冲突（Linux `inet_bind_conflict` 比较 `inet_rcv_saddr`）。
+  3. `pickListenSlot` 分两轮：先找绑定 SYN 目的地址的监听者，再找通配的（`listenerTakes`，Linux `compute_score` 优先精确匹配）；每轮内仍按源地址做 SO_REUSEPORT 分流。`hasListener` 改用它，所以没人监听目的地址时回环 SYN 立即得到 RST。
+  4. `handleIncomingSyn` 新增 `dst_ip` 参数，新建和复用 TIME_WAIT 的子连接都以它为 `local_ip`。
+  5. `sendSegmentSeq` 的源地址改为 `tcp_port_policy.sourceAddr`：对端在 127/8 时用绑定的回环地址，否则 127.0.0.1；其他对端用绑定地址，未绑定（或绑定回环）用网卡地址。之前回环段的源地址等于目的地址，所以未绑定客户端连 127.0.0.2 时自称 127.0.0.2。
+  6. `tcpGetAddrInfo` 的 `local_ip` 改为 `nameAddr`：有绑定地址报告它；未绑定但有对端报告 `sourceAddr`；都没有报告 `0.0.0.0`。
+- 测试：hello345（QEMU，6 项），定向 SMP=2、SMP=4 各一份通过；host 测试「a TCP socket keeps its bound IPv4 address: per-address conflicts, SYN dispatch, source and name (hello345)」检查四个纯函数和接线；两条已有 host 测试按新的 `hasListener`、`tcpBindAddr` 文本更新。变异验证：让 `addrsConflict` 恒返回 true，这条 host 测试失败，文件已恢复。
+- 完整 smoke：四份（SMP=1、4、4、2）里三份 EXIT=0、307 PASS；一份 SMP=4 只有 hello286 M（19/20，已记录的偶发项）失败，306 PASS；hello345 四份都通过，corrupted canaries 均为 0。riscv64、aarch64 smoke 都是 EXIT=0。
+- 这次修复带来的局限：
+  1. 只做了 IPv4。IPv6 TCB 仍不记录本地地址，`[::1]:p` 和 `[::]:p` 仍算同一个端口，getsockname 仍按对端选源地址。
+  2. 已建立连接的查找（`findTcbByTuple`）和 connect 的 4 元组检查（`connectTupleTaken`）仍只看本地端口和对端，不看本地地址；两个本地地址不同、端口相同的连接如果连向同一对端会被当作同一个 4 元组。
+  3. 绑定网卡地址、对端在回环上（或反过来）的组合按 `sourceAddr` 选源地址，没有做 Linux 那样的路由检查和 `EINVAL`。
+  4. UDP 的 getsockname 仍报告网卡地址，UDP 端口冲突也不区分本地地址。

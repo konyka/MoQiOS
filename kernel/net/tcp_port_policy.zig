@@ -62,6 +62,41 @@ pub fn familiesConflict(new_is_v6: bool, holder_is_v6: bool) bool {
     return new_is_v6 == holder_is_v6;
 }
 
+pub const WILDCARD4 = [4]u8{ 0, 0, 0, 0 };
+pub const LOOPBACK4 = [4]u8{ 127, 0, 0, 1 };
+
+fn isWildcard4(a: [4]u8) bool {
+    return @as(u32, @bitCast(a)) == 0;
+}
+
+/// Two IPv4 sockets on one port conflict when either is bound to the wildcard or both to the same address (Linux inet_bind_conflict
+/// compares inet_rcv_saddr). 127.0.0.1:p and 127.0.0.2:p may coexist; 0.0.0.0:p conflicts with every address on p.
+pub fn addrsConflict(a: [4]u8, b: [4]u8) bool {
+    return isWildcard4(a) or isWildcard4(b) or @as(u32, @bitCast(a)) == @as(u32, @bitCast(b));
+}
+
+/// Whether a listener bound to `bound` takes a SYN for `dst`. `exact` asks for an address match only: a listener bound to the SYN's
+/// destination is preferred over a wildcard one (Linux compute_score).
+pub fn listenerTakes(bound: [4]u8, dst: [4]u8, exact: bool) bool {
+    if (exact) return !isWildcard4(bound) and @as(u32, @bitCast(bound)) == @as(u32, @bitCast(dst));
+    return isWildcard4(bound);
+}
+
+/// The IPv4 source address of a segment to `remote`. A loopback peer is reached from the bound address when that is on loopback too,
+/// otherwise from 127.0.0.1 (the source of Linux's local route); any other peer from the bound address, else the interface's.
+pub fn sourceAddr(bound: [4]u8, remote: [4]u8, our: [4]u8) [4]u8 {
+    if (remote[0] == 127) return if (bound[0] == 127) bound else LOOPBACK4;
+    return if (isWildcard4(bound) or bound[0] == 127) our else bound;
+}
+
+/// getsockname's IPv4 address: the bound one; for an unbound socket with a peer, the source address its segments carry; otherwise
+/// the wildcard (Linux reports 0.0.0.0 for an unbound, unconnected socket).
+pub fn nameAddr(bound: [4]u8, has_peer: bool, remote: [4]u8, our: [4]u8) [4]u8 {
+    if (!isWildcard4(bound)) return bound;
+    if (!has_peer) return WILDCARD4;
+    return sourceAddr(bound, remote, our);
+}
+
 /// connect() from a port another connection shares: the 4-tuple is taken (EADDRNOTAVAIL, Linux __inet_check_established) while that
 /// connection is live. A CLOSED slot is no connection, and a TIME_WAIT one is taken over the way a loopback tcp_tw_reuse does.
 pub const CONNECT_EADDRNOTAVAIL: i64 = -99;

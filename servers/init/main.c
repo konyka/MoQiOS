@@ -461,6 +461,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello342"); /* a retransmitted SYN carries the original ISN */
     run_test("hello343"); /* a connect stuck in SYN-SENT keeps its SYN outstanding (no tail loss probe before the handshake) */
     run_test("hello344"); /* an IPv4 and an IPv6 TCP socket may bind and listen on the same port */
+    run_test("hello345"); /* a TCP socket keeps the IPv4 address it was bound to: per-address bind, SYN dispatch and getsockname */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

@@ -4358,6 +4358,40 @@ test "an IPv4 and an IPv6 TCP socket do not conflict on one port (hello344)" {
     try std.testing.expect(std.mem.indexOf(u8, ts, "        if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict\n        if (!tcp_port_policy.familiesConflict(tcb.is_v6, tcbs[i].is_v6)) continue;\n") != null);
 }
 
+test "a TCP socket keeps its bound IPv4 address: per-address conflicts, SYN dispatch, source and name (hello345)" {
+    const p = kt.tcp_port_policy;
+    const any = [4]u8{ 0, 0, 0, 0 };
+    const l1 = [4]u8{ 127, 0, 0, 1 };
+    const l2 = [4]u8{ 127, 0, 0, 2 };
+    const l5 = [4]u8{ 127, 0, 0, 5 };
+    const nic = [4]u8{ 10, 0, 2, 15 };
+    const peer = [4]u8{ 10, 0, 2, 2 };
+    try std.testing.expect(!p.addrsConflict(l1, l2));
+    try std.testing.expect(p.addrsConflict(l2, l2));
+    try std.testing.expect(p.addrsConflict(any, l2));
+    try std.testing.expect(p.addrsConflict(l1, any));
+    try std.testing.expect(p.addrsConflict(any, any));
+    try std.testing.expect(p.listenerTakes(l2, l2, true));
+    try std.testing.expect(!p.listenerTakes(l1, l2, true));
+    try std.testing.expect(!p.listenerTakes(any, l2, true));
+    try std.testing.expect(p.listenerTakes(any, l2, false));
+    try std.testing.expect(!p.listenerTakes(l1, l2, false));
+    try std.testing.expectEqual(l1, p.sourceAddr(any, l2, nic));
+    try std.testing.expectEqual(l5, p.sourceAddr(l5, l1, nic));
+    try std.testing.expectEqual(nic, p.sourceAddr(any, peer, nic));
+    try std.testing.expectEqual(nic, p.sourceAddr(l5, peer, nic));
+    try std.testing.expectEqual(l2, p.nameAddr(l2, false, any, nic));
+    try std.testing.expectEqual(any, p.nameAddr(any, false, any, nic));
+    try std.testing.expectEqual(l1, p.nameAddr(any, true, l2, nic));
+    try std.testing.expectEqual(nic, p.nameAddr(any, true, peer, nic));
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "        if (!tcb.is_v6 and !tcp_port_policy.addrsConflict(tcb.local_ip, tcbs[i].local_ip)) continue;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "    for ([_]bool{ true, false }) |exact| {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "    new_tcb.local_ip = dst_ip;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "            reuse_tcb.local_ip = dst_ip;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "    const our_ip = tcp_port_policy.sourceAddr(tcb.local_ip, tcb.remote_ip, netif.getOurIp());\n") != null);
+}
+
 test "lo queue enqueue/dequeue preserves FIFO order" {
     var q = lo.LoopbackQueue.init();
     try std.testing.expectEqual(@as(u32, 0), q.pending());
@@ -10212,9 +10246,9 @@ test "process CPU time wiring: reap folds children and threads, readers use the 
 test "TCP over IPv6 loopback: a SYN to a port nobody listens on is answered with a RST" {
     const src = kt.tcp_source;
     // The v6 receive path resets a ::1 SYN that created no connection and has no listener.
-    try std.testing.expect(std.mem.indexOf(u8, src, "if (pendingBacklogCount() == before and !hasListener(dst_port, true)) {\n                sendLoopbackResetV6(src_ip, dst_ip, src_port, dst_port, flags, ack_num, seq_num, payload_len);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (pendingBacklogCount() == before and !hasListener(dst_port, true, tcp_port_policy.WILDCARD4)) {\n                sendLoopbackResetV6(src_ip, dst_ip, src_port, dst_port, flags, ack_num, seq_num, payload_len);") != null);
     // The IPv4 rule is unchanged (v4 listeners only).
-    try std.testing.expect(std.mem.indexOf(u8, src, "if (pendingBacklogCount() == before and !hasListener(dst_port, false)) {\n                sendLoopbackReset(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (pendingBacklogCount() == before and !hasListener(dst_port, false, dst_ip)) {\n                sendLoopbackReset(") != null);
     // The reply is ::1 only, never answers a RST, goes back out through lo, and is checksummed for IPv6.
     try std.testing.expect(std.mem.indexOf(u8, src, "if (!netif.isLoopbackV6(src_ip) or !netif.isLoopbackV6(dst_ip)) return;") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "fn sendLoopbackResetV6(") != null);
@@ -11021,7 +11055,7 @@ test "TCP bind errors and SO_REUSEADDR sharing" {
     try std.testing.expect(std.mem.indexOf(u8, ts, "return tcp_port_policy.BIND_EADDRINUSE;") != null);
     // Port 0 (let the kernel choose) never conflicts, and the socket's own slot is skipped.
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (i == tcb_idx) continue;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ts, "if (port != 0 and portConflict(tcb_idx, port)) return tcp_port_policy.BIND_EADDRINUSE;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (port != 0 and portConflict(tcb_idx, port)) {\n        tcb.local_ip = saved_ip;\n        return tcp_port_policy.BIND_EADDRINUSE;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "tcp_port_policy.reuseMayShare(tcb.options.reuse_addr, tcbs[i].options.reuse_addr, tcbs[i].state == .listen)") != null);
     // listen() checks the port again (only one SO_REUSEADDR sharer may listen); accepted connections inherit SO_REUSEADDR (both families).
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.state != .listen and portConflict(tcb_idx, tcb.local_port)) return tcp_port_policy.BIND_EADDRINUSE;") != null);
@@ -11032,7 +11066,7 @@ test "TCP bind errors and SO_REUSEADDR sharing" {
     // Both bind paths (IPv4 and IPv6) refuse a privileged port without the capability with EACCES.
     const ss = kt.socket_syscall_source;
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n        return net_mod.tcp.tcpBind(tcb_idx, parsed.port);"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n    return net_mod.tcp.tcpBind(tcb_idx, port);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n    return net_mod.tcp.tcpBindAddr(tcb_idx, port, .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] });"));
     // UDP (IPv4 and IPv6) refuses a privileged port the same way; no bare -1 is left in any bind path.
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n            return udpRebind(t, fd, parsed.port);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(new_port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;") != null);
