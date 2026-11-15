@@ -111,6 +111,17 @@ pub fn nameAddr(bound: [4]u8, has_peer: bool, remote: [4]u8, our: [4]u8) [4]u8 {
     return sourceAddr(bound, remote, our);
 }
 
+/// getsockname's IPv6 address, the IPv6 counterpart of nameAddr: the bound address; for an unbound socket with a peer, ::1 when the
+/// peer is ::1 and `our` (the interface's preferred address) otherwise; else :: (Linux reports :: for an unbound, unconnected socket).
+pub fn nameAddr6(bound: [16]u8, has_peer: bool, remote: [16]u8, our: [16]u8) [16]u8 {
+    const wild: [16]u8 = @splat(0);
+    if (@as(u128, @bitCast(bound)) != 0) return bound;
+    if (!has_peer) return wild;
+    var loop6 = wild;
+    loop6[15] = 1;
+    return if (@as(u128, @bitCast(remote)) == @as(u128, @bitCast(loop6))) loop6 else our;
+}
+
 /// connect() from a port another connection shares: the 4-tuple is taken (EADDRNOTAVAIL, Linux __inet_check_established) while that
 /// connection is live. A CLOSED slot is no connection, and a TIME_WAIT one is taken over the way a loopback tcp_tw_reuse does.
 pub const CONNECT_EADDRNOTAVAIL: i64 = -99;

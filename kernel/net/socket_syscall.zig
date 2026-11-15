@@ -75,13 +75,14 @@ pub fn socket(domain: u32, type_and_flags: u32, protocol: u32) i64 {
 /// bind() of a UDP socket to `new_port`: the registration moves with its options, joining a port other sockets hold only when
 /// udp_port_policy allows it (both SO_REUSEADDR, or both SO_REUSEPORT with the same owner, the fsuid recorded when socket() created it).
 /// Sockets bound to different IPv4 addresses `addr` (0.0.0.0 for IPv6) on one port do not conflict. The ephemeral port from socket() is dropped.
-fn udpRebind(t: *task_mod.Task, fd: u32, new_port: u16, addr: [4]u8) i64 {
+fn udpRebind(t: *task_mod.Task, fd: u32, new_port: u16, addr: [4]u8, addr6: [16]u8) i64 {
     const d = &t.fd_table.fds[fd];
     var disc: u16 = 0;
     const old_key = d.udpKey();
     const rc = udp.rebind(old_key, new_port, addr, &disc);
     if (rc != 0) return rc;
     d.udp_local_ip = addr;
+    d.udp_local_ip6 = addr6;
     d.udp_port = new_port;
     d.udp_disc = disc;
     if (d.udpKey() != old_key) vfs_mod.udpFasyncRekey(old_key, d.udpKey());
@@ -270,7 +271,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
             const parsed = sa.parseInet6(&sa6) orelse return -97; // EAFNOSUPPORT
             if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;
             if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
-            return udpRebind(t, fd, parsed.port, .{ 0, 0, 0, 0 });
+            return udpRebind(t, fd, parsed.port, .{ 0, 0, 0, 0 }, parsed.addr);
         }
         if (addr_len < SOCKADDR_IN_MIN_LEN) return -22;
         var sock_addr: [sa.SOCKADDR_IN_LEN]u8 = undefined;
@@ -280,7 +281,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         const new_port = bo.readU16BeAt(&sock_addr, 2);
         if (bindAddrNotAvail4(.{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] })) return bind_addr_policy.EADDRNOTAVAIL;
         if (net_mod.tcp_port_policy.bindNeedsPrivilege(new_port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
-        return udpRebind(t, fd, new_port, .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] });
+        return udpRebind(t, fd, new_port, .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] }, @splat(0));
     }
 
     if (t.fd_table.fds[fd].fd_type != .tcp_socket) return -88; // ENOTSOCK
@@ -869,8 +870,9 @@ pub fn getsockname(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
     if (desc.fd_type == .udp_socket) {
         var sa_buf: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
         const our4 = net_mod.tcp_port_policy.nameAddr(desc.udp_local_ip, desc.udp_connected, desc.udp_dst_ip, netif.getOurIp());
-        // SK-86: prefer preferred global when reporting the local UDP name.
-        const our6 = ndp.getGlobalAddress() orelse ndp.generateLinkLocal(netif.getMac());
+        // SK-86: an unbound socket with a non-loopback peer reports the preferred global address, else the link-local one.
+        const pref6 = ndp.getGlobalAddress() orelse ndp.generateLinkLocal(netif.getMac());
+        const our6 = net_mod.tcp_port_policy.nameAddr6(desc.udp_local_ip6, desc.udp_connected, desc.udp_dst_ip6, pref6);
         const alen = sa.encodeUdpName(desc.udp_is_v6, desc.udp_port, our4, our6, &sa_buf);
         if (alen == 0) return -1;
         return copySockaddrToUser(addr_ptr, addrlen_ptr, sa_buf[0..alen], alen);

@@ -4358,6 +4358,24 @@ test "an IPv4 and an IPv6 TCP socket do not conflict on one port (hello344)" {
     try std.testing.expect(std.mem.indexOf(u8, ts, "        if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict\n        if (!tcp_port_policy.familiesConflict(tcb.is_v6, tcbs[i].is_v6)) continue;\n") != null);
 }
 
+test "an IPv6 UDP socket keeps the address it was bound to: getsockname reports it, :: when unbound (hello349)" {
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "    d.udp_local_ip = addr;\n    d.udp_local_ip6 = addr6;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const our6 = net_mod.tcp_port_policy.nameAddr6(desc.udp_local_ip6, desc.udp_connected, desc.udp_dst_ip6, pref6);") != null);
+    const p = kt.tcp_port_policy;
+    const wild: [16]u8 = @splat(0);
+    var loop6 = wild;
+    loop6[15] = 1;
+    var glob = wild;
+    glob[0] = 0x20;
+    glob[1] = 0x01;
+    glob[15] = 7;
+    try std.testing.expectEqualSlices(u8, &loop6, &p.nameAddr6(loop6, false, wild, glob));
+    try std.testing.expectEqualSlices(u8, &wild, &p.nameAddr6(wild, false, wild, glob));
+    try std.testing.expectEqualSlices(u8, &loop6, &p.nameAddr6(wild, true, loop6, glob));
+    try std.testing.expectEqualSlices(u8, &glob, &p.nameAddr6(wild, true, glob, glob));
+}
+
 test "UDP sockets on one port are told apart by their bound IPv4 address: bind conflicts and receive dispatch (hello348)" {
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "        used |= @as(u64, 1) << @intCast(ports[j] >> 16);\n        if (!port_v6[j] and !port_v6[oi] and !@import(\"tcp_port_policy.zig\").addrsConflict(addr, port_local_ip[j])) continue;\n") != null);
@@ -4379,7 +4397,7 @@ test "a UDP socket keeps its bound IPv4 address: getsockname and the datagram so
     try std.testing.expect(std.mem.indexOf(u8, us, "    const our_ip = @import(\"tcp_port_policy.zig\").sourceAddr(bound, dst_ip, netif.getOurIp());\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    return sendToFrom(.{ 0, 0, 0, 0 }, dst_ip, dst_port, src_port, data, data_len);\n") != null);
     const ss = kt.socket_syscall_source;
-    try std.testing.expect(std.mem.indexOf(u8, ss, "        return udpRebind(t, fd, new_port, .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] });") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "        return udpRebind(t, fd, new_port, .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] }, @splat(0));") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "    if (rc != 0) return rc;\n    d.udp_local_ip = addr;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "const our4 = net_mod.tcp_port_policy.nameAddr(desc.udp_local_ip, desc.udp_connected, desc.udp_dst_ip, netif.getOurIp());") != null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "udp.sendToFrom("));
@@ -11124,7 +11142,7 @@ test "TCP bind errors and SO_REUSEADDR sharing" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n        return net_mod.tcp.tcpBind(tcb_idx, parsed.port);"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n    return net_mod.tcp.tcpBindAddr(tcb_idx, port, .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] });"));
     // UDP (IPv4 and IPv6) refuses a privileged port the same way; no bare -1 is left in any bind path.
-    try std.testing.expect(std.mem.indexOf(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n            return udpRebind(t, fd, parsed.port, .{ 0, 0, 0, 0 });") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n            return udpRebind(t, fd, parsed.port, .{ 0, 0, 0, 0 }, parsed.addr);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(new_port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;") != null);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ss, "!cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return -1;"));
     // hello183 runs as uid 0 with only CAP_SETUID so the child's setuid leaves it unprivileged.

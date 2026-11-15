@@ -1218,6 +1218,8 @@ pub const FileDescriptor = struct {
     /// The IPv4 address bind() gave the socket (Linux inet_rcv_saddr), 0.0.0.0 when unbound; IPv6 sockets leave it at the wildcard.
     udp_local_ip: [4]u8 = .{ 0, 0, 0, 0 },
     udp_dst_ip6: [16]u8 = @splat(0),
+    /// The IPv6 address bind() gave the socket (Linux sk_v6_rcv_saddr), :: when unbound; IPv4 sockets leave it at the wildcard.
+    udp_local_ip6: [16]u8 = @splat(0),
     udp_dst_port: u16 = 0,
     writable: bool = false,
     fd_flags: u32 = 0,

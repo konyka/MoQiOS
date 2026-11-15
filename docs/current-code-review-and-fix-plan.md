@@ -9394,7 +9394,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：四份（SMP=1、4、4、2）里三份 EXIT=0、309 PASS；一份 SMP=4 只有 hello269「no single round stalls for seconds」失败（最慢一轮 5274 ms，已记录的偶发项，这次改动只涉及 UDP），308 PASS；hello347 四份都通过，corrupted canaries 均为 0。riscv64、aarch64 smoke 都是 EXIT=0。
 - 这次修复带来的局限：
   1. UDP 端口冲突和收包分派仍不区分本地地址：两个套接字绑 `127.0.0.1:p` 和 `127.0.0.2:p` 仍冲突，发往任何本地地址的数据报都交给端口上的套接字。（hello348 已补上 IPv4。）
-  2. 只做了 IPv4；IPv6 UDP 的 getsockname 仍报告首选全局地址或链路本地地址。
+  2. 只做了 IPv4；IPv6 UDP 的 getsockname 仍报告首选全局地址或链路本地地址。（hello349 已补上。）
   3. 已 connect 的未绑定套接字的名字按 `sourceAddr` 计算，没有做路由查找。
 
 ## 补充：同一端口上的 UDP 套接字按绑定的 IPv4 地址区分（hello348）
@@ -9411,3 +9411,18 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 这次修复带来的局限：
   1. 只做了 IPv4。IPv6 UDP 套接字不记录绑定地址，同端口的 IPv6 套接字仍全部冲突，IPv6 数据报只按通配候选分派。
   2. 分派的偏好只分“精确地址”和“通配”两档，没有实现 Linux `compute_score` 的完整打分（例如已 connect 的套接字加分、绑定设备加分）。已 connect 的套接字仍由 `pickReceiverConnected` 在选出的候选里处理。
+
+## 补充：IPv6 UDP 套接字记住绑定的地址（hello349）
+
+- 背景：hello347 一节局限 2。IPv6 UDP 的 getsockname 不管绑定到哪里，都报告首选全局地址或链路本地地址；绑 `[::1]:p`、绑 `[::]:p` 和未绑定的套接字报告的是同一个地址。
+- Linux 实测（`gcc -DHOST user/hello349.c`，端口 18905、18906）：A 绑 `[::1]:18905` 的套接字名字是 `::1`；B 绑 `[::]:18906` 的是 `::`；C 未绑定、未发送的套接字名字是 `::`；D 从 `[::1]:18905` 发往 `[::1]:18906`，收到的源地址是 `[::1]:18905`。
+- 红灯（未改的内核，SMP=2）：A、B、C 失败（报告的是链路本地地址），D 已经通过（回环发送本来就用 `::1` 作源地址）。
+- 修复（`kernel/fs/vfs.zig`、`kernel/net/tcp_port_policy.zig`、`kernel/net/socket_syscall.zig`）：
+  1. 描述符新增 `udp_local_ip6`（默认 `::`）。`udpRebind` 多带一个 IPv6 地址参数，IPv6 bind 传解析出的地址，IPv4 bind 传 `::`；udp 层成功后才写入。
+  2. 新增 `tcp_port_policy.nameAddr6(bound, has_peer, remote, our)`：有绑定地址报告它；未绑定但已 connect 时，对端是 `::1` 就报告 `::1`，否则报告首选地址；都没有报告 `::`。
+  3. getsockname 的 IPv6 地址改用 `nameAddr6`。
+- 测试：hello349（QEMU，4 项），定向 SMP=2、SMP=4 各一份通过。新增 host 测试「an IPv6 UDP socket keeps the address it was bound to: getsockname reports it, :: when unbound (hello349)」，检查接线和 `nameAddr6` 的 4 种情况。hello347、hello348 相关测试按新的 `udpRebind` 参数更新。变异验证：`nameAddr6` 忽略绑定地址，这条 host 测试失败，文件已恢复。
+- 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、311 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
+- 这次修复带来的局限：
+  1. IPv6 UDP 的端口冲突和收包分派仍只按端口区分，没有用 `udp_local_ip6`。
+  2. IPv6 发送的源地址仍由 `sendToV6` 决定（回环用 `::1`，其他用 `ndp.selectSourceAddress`），不看绑定地址。
