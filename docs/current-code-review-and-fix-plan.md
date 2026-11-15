@@ -9584,7 +9584,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   4. `kernel/net/ndp.zig` 新增 `isOwnAddress`（配置的地址或由 MAC 生成的链路本地地址）；`tcp.sendSegmentV6Seq` 和 `udp.sendToV6From` 用它判断是否走 lo。
   5. 未绑定的 IPv6 UDP 套接字 getsockname 改用 `ndp.selectSourceAddress(对端)`，连链路本地对端时报告链路本地地址。
 - 测试：hello360（QEMU，5 项）；新增 host 测试「a link-scoped IPv6 address names its interface: bind checks sin6_scope_id, names carry it, own link-local goes through lo (hello360)」。`zig build test` 全部通过。
-- 完整 smoke：SMP=1 一份，EXIT=0，`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=1)`，串口日志 0 个 FAIL。本轮没有跑 SMP=2/4 和 riscv64、aarch64 smoke。
+- 完整 smoke：SMP=1 一份，EXIT=0，`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=1)`，串口日志 0 个 FAIL；SMP=2 一份，EXIT=0，`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=2)`，结束前检查串口日志 0 个 FAIL、hello360 PASS。本轮没有跑 SMP=4 和 riscv64、aarch64 smoke。
 - 变异验证：把 `inet6ScopeErrno` 里 scope 0 的 EINVAL 改成返回 0，hello360 这条 host 测试失败（1255/1256），文件已恢复。
 - 这次修复带来的局限：
   1. 接口只有 lo（1）和 eth0（2）两个固定编号，没有接口表。
