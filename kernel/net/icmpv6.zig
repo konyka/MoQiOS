@@ -29,6 +29,10 @@ pub const NEIGHBOR_SOLICITATION: u8 = 135;
 pub const NEIGHBOR_ADVERTISEMENT: u8 = 136;
 pub const REDIRECT: u8 = 137;
 
+/// Every Neighbor Discovery message is sent with hop limit 255 (RFC 4861 §4.1-4.4), so a receiver can tell it was not forwarded;
+/// a router or neighbor drops one with any other value (Linux ndisc_rcv, QEMU slirp ndp_input).
+pub const NDP_HOP_LIMIT: u8 = 255;
+
 // NDP option types
 const OPT_SOURCE_LL_ADDR: u8 = 1;
 const OPT_TARGET_LL_ADDR: u8 = 2;
@@ -467,6 +471,7 @@ pub fn buildNeighborAdvertisement(
     @memcpy(out[icmp_off + 26 .. icmp_off + 32], &our_mac);
 
     ipv6.buildHeader(out + ip_off, target, requester_ip, ipv6.PROTO_ICMPV6, icmp_len);
+    out[ip_off + 7] = NDP_HOP_LIMIT;
 
     const csum = checksum(target, requester_ip, out + icmp_off, icmp_len);
     bo.writeU16BeAt(out, icmp_off + 2, csum);
@@ -518,6 +523,7 @@ fn buildNsFrame(
     const icmp_off: u16 = 14 + ipv6.HEADER_LEN;
     fillNeighborSolicitationBody(out, icmp_off, target, our_mac);
     ipv6.buildHeader(out + 14, our_ip, dst_ip, ipv6.PROTO_ICMPV6, icmp_len);
+    out[14 + 7] = NDP_HOP_LIMIT;
     const csum = checksum(our_ip, dst_ip, out + icmp_off, icmp_len);
     bo.writeU16BeAt(out, icmp_off + 2, csum);
     return eth.buildFrame(out, dst_mac, our_mac, eth.ETHERTYPE_IPV6, total_payload);
@@ -594,6 +600,7 @@ pub fn buildRouterSolicitation(
     @memcpy(out[icmp_off + 10 .. icmp_off + 16], &our_mac);
 
     ipv6.buildHeader(out + 14, our_ip, dst_ip, ipv6.PROTO_ICMPV6, icmp_len);
+    out[14 + 7] = NDP_HOP_LIMIT;
     const csum = checksum(our_ip, dst_ip, out + icmp_off, icmp_len);
     bo.writeU16BeAt(out, icmp_off + 2, csum);
     return eth.buildFrame(out, dst_mac, our_mac, eth.ETHERTYPE_IPV6, total_payload);
@@ -683,6 +690,7 @@ pub fn buildDadNeighborSolicitation(out: [*]u8, target: [16]u8, our_mac: [6]u8) 
     @memcpy(out[icmp_off + 8 .. icmp_off + 24], &target);
 
     ipv6.buildHeader(out + 14, src_ip, dst_ip, ipv6.PROTO_ICMPV6, icmp_len);
+    out[14 + 7] = NDP_HOP_LIMIT;
     const csum = checksum(src_ip, dst_ip, out + icmp_off, icmp_len);
     bo.writeU16BeAt(out, icmp_off + 2, csum);
     return eth.buildFrame(out, dst_mac, our_mac, eth.ETHERTYPE_IPV6, total_payload);

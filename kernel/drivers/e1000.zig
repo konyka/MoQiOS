@@ -41,6 +41,9 @@ const CTRL_SLU: u32 = 1 << 6;
 // RCTRL bits
 const RCTRL_EN: u32 = 1 << 1;
 const RCTRL_BAM: u32 = 1 << 15;
+/// Multicast promiscuous: accept every multicast frame. The MTA stays empty, so without this the IPv6 all-nodes and
+/// solicited-node frames (router advertisements, neighbor solicitations) never reach the stack.
+const RCTRL_MPE: u32 = 1 << 4;
 const RCTRL_BSIZE_2048: u32 = 0;
 const RCTRL_SECRC: u32 = 1 << 26;
 
@@ -288,8 +291,8 @@ fn initDevice(dev: *const pci.PciDevice) !void {
     try setupRX();
     try setupTX();
 
-    // Enable receive: EN | BAM | BSIZE_2048 | SECRC
-    writeReg(REG_RCTRL, readReg(REG_RCTRL) | RCTRL_EN | RCTRL_BAM | RCTRL_BSIZE_2048 | RCTRL_SECRC);
+    // Enable receive: EN | BAM | MPE | BSIZE_2048 | SECRC
+    writeReg(REG_RCTRL, readReg(REG_RCTRL) | RCTRL_EN | RCTRL_BAM | RCTRL_MPE | RCTRL_BSIZE_2048 | RCTRL_SECRC);
 
     // Enable transmit: EN | PSP
     writeReg(REG_TCTRL, readReg(REG_TCTRL) | TCTRL_EN | TCTRL_PSP);

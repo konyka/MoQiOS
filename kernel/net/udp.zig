@@ -609,6 +609,12 @@ pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_port: u16, dat
 
 /// Send a UDP datagram over IPv6 (SK-70/87). On-link via NDP; off-link via default router.
 pub fn sendToV6(dst_ip: [16]u8, dst_port: u16, src_port: u16, data: [*]const u8, data_len: u16) bool {
+    return sendToV6From(@splat(0), dst_ip, dst_port, src_port, data, data_len);
+}
+
+/// sendToV6 from a socket bound to the IPv6 address `bound` (:: when unbound): the source address follows
+/// tcp_port_policy.sourceAddr6, so a datagram leaves from the bound unicast address, also when it goes to ::1.
+pub fn sendToV6From(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_port: u16, data: [*]const u8, data_len: u16) bool {
     if (data_len > MAX_UDP_PAYLOAD_V6) return false;
 
     const nh = ndp.resolveNextHop(dst_ip);
@@ -620,9 +626,8 @@ pub fn sendToV6(dst_ip: [16]u8, dst_port: u16, src_port: u16, data: [*]const u8,
     };
 
     const our_mac = netif.getMac();
-    // Loopback: src = dst = ::1 (mirrors the IPv4 lo choice), keeping TX/RX
-    // pseudo-headers consistent on both sides.
-    const our_ip = if (is_loop) dst_ip else ndp.selectSourceAddress(dst_ip, our_mac);
+    // An unbound socket sends to ::1 from ::1 (mirrors the IPv4 lo choice), elsewhere from the selected source address.
+    const our_ip = @import("tcp_port_policy.zig").sourceAddr6(bound, dst_ip, if (is_loop) dst_ip else ndp.selectSourceAddress(dst_ip, our_mac));
     const udp_total: u16 = 8 + data_len;
     // SK-97/105: honor Path MTU (or armed oversized raise probe).
     if (ipv6.HEADER_LEN + udp_total > ipv6.getSendMtu(dst_ip)) return false;

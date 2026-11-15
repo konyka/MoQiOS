@@ -176,6 +176,7 @@ pub const icmp_echo_policy = @import("net/icmp_echo_policy.zig");
 pub const icmp_unreach_policy = @import("net/icmp_unreach_policy.zig");
 pub const udp_source = @embedFile("net/udp.zig");
 pub const icmpv6_source = @embedFile("net/icmpv6.zig");
+pub const e1000_source = @embedFile("drivers/e1000.zig");
 pub const ndp_na_policy = @import("net/ndp_na_policy.zig");
 pub const ps2_policy = @import("drivers/ps2_policy.zig");
 pub const dns_policy = @import("net/dns_policy.zig");

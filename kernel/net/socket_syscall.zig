@@ -461,7 +461,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
             } else {
                 return -89; // EDESTADDRREQ
             }
-            if (udp.sendToV6(dst6, dst_port6, src_port, &tmp6, @intCast(n6))) {
+            if (udp.sendToV6From(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_port, &tmp6, @intCast(n6))) {
                 return @intCast(n6);
             } else {
                 return -1;
@@ -1241,7 +1241,7 @@ fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32) i64 
             dst_port6 = d.udp_dst_port;
         } else return -89;
         const n6 = @min(payload.len, 1232);
-        return if (udp.sendToV6(dst6, dst_port6, src_port, payload.ptr, @intCast(n6))) @intCast(n6) else -1;
+        return if (udp.sendToV6From(d.udp_local_ip6, dst6, dst_port6, src_port, payload.ptr, @intCast(n6))) @intCast(n6) else -1;
     }
     var dst_ip: [4]u8 = .{ 0, 0, 0, 0 };
     var dst_port: u16 = 0;

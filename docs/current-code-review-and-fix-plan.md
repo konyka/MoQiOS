@@ -9425,7 +9425,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、311 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
 - 这次修复带来的局限：
   1. IPv6 UDP 的端口冲突和收包分派仍只按端口区分，没有用 `udp_local_ip6`。（hello357 已补上。）
-  2. IPv6 发送的源地址仍由 `sendToV6` 决定（回环用 `::1`，其他用 `ndp.selectSourceAddress`），不看绑定地址。
+  2. IPv6 发送的源地址仍由 `sendToV6` 决定（回环用 `::1`，其他用 `ndp.selectSourceAddress`），不看绑定地址。（已由 hello358 解决。）
 
 ## 补充：共享打开文件描述的偏移读改写改为原子（hello350）
 
@@ -9525,6 +9525,27 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 测试：hello357（QEMU，4 项），定向 SMP=2、SMP=4 各一份通过。新增 host 测试「an IPv6 UDP socket's bound address takes part in port conflicts and receiver choice (hello357)」，检查接线和两个新函数的 7 种情况。hello348 和「udp: bind moves the registration…」两条旧 host 测试改为钉住新的源码行，它们检查的 IPv4 行为没有变。变异验证：IPv6 冲突检查改成恒不跳过，这条 host 测试失败，文件已恢复。
 - 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、319 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
 - 这次修复带来的局限：
-  1. IPv6 发送的源地址仍由 `sendToV6` 决定（回环用 `::1`，其他用 `ndp.selectSourceAddress`），不看绑定地址（hello349 局限 2）。
+  1. IPv6 发送的源地址仍由 `sendToV6` 决定（回环用 `::1`，其他用 `ndp.selectSourceAddress`），不看绑定地址（hello349 局限 2）。（已由 hello358 解决。）
   2. IPv6 TCP 的绑定冲突和连接查找仍不看本地地址。
   3. 组播地址只当作普通绑定地址比较，没有组成员关系；`scope_id` 不参与比较。
+
+## 补充：IPv6 UDP 数据报从绑定地址发出；NDP 报文用跳数 255，e1000 接收组播（hello358）
+
+- 背景：hello349 局限 2、hello357 局限 1。`udp.sendToV6` 发往 `::1` 时源地址固定为 `::1`，发往别处时用 `ndp.selectSourceAddress`，不看套接字的 `udp_local_ip6`。Linux `ip6_datagram_send` 把 `sk_v6_rcv_saddr` 放进流的源地址，绑定了单播地址的套接字发往 `::1` 时源地址仍是绑定地址。
+- Linux 实测（`gcc -DHOST user/hello358.c`，在 `unshare -rn` 里给 dummy 网卡配 `2001:db8:1::7/64` 和默认路由）：A 连到 `[2001:db8:9::8]:9` 的套接字报告一个全局地址 G；B 绑定 `[G]:18982` 用 sendto 发往 `[::1]:18981`，收端看到源地址 `[G]:18982`；C 同一个套接字 connect 到 `::1` 后用不带地址的 sendmsg 发送，源地址仍是 `[G]:18982`；D 绑定 `[::]:18983` 发往 `::1`，源地址是 `[::1]:18983`。全部通过。
+- 构造红灯时发现的两个问题：QEMU 上 MoQiOS 一直拿不到全局 IPv6 地址，A 等 10 秒仍只有链路本地地址。用 `filter-dump` 抓包后看到两层原因：
+  1. NDP 报文（路由请求、邻居请求和通告、DAD）都用 `ipv6.buildHeader` 的默认跳数 64 发出。RFC 4861 §4 要求 255，QEMU slirp 的 `ndp_input` 和 Linux `ndisc_rcv` 都丢弃其他跳数的报文，所以 slirp 从不回路由通告。
+  2. e1000 的 RCTL 只开了 BAM（广播），组播表 MTA 全为 0，发往 `ff02::1` 的路由通告到不了协议栈。
+- 红灯（只修上面两个问题、不改发送源地址）：SMP=2 下 A 通过（拿到 `fec0::/64` 的 SLAAC 地址），B、C 失败（源地址是 `::1`），D 通过。最早的红灯（三处都没改）SMP=2、SMP=4 结果相同：A、B、C 失败，D 通过。
+- 修复：
+  1. `kernel/net/icmpv6.zig` 新增 `NDP_HOP_LIMIT = 255`，邻居通告、邻居请求（组播和单播共用 `buildNsFrame`）、路由请求、DAD 邻居请求四个构造函数在 `buildHeader` 之后把跳数改成 255。
+  2. `kernel/drivers/e1000.zig` 新增 `RCTRL_MPE`（组播混杂），初始化时和 BAM 一起打开。
+  3. `kernel/net/tcp_port_policy.zig` 新增纯函数 `sourceAddr6(bound, dst, our)`：绑定地址不是 `::` 也不是组播时返回它；否则 `dst` 是 `::1` 时返回 `::1`，其他返回 `our`。
+  4. `kernel/net/udp.zig` 新增 `sendToV6From(bound, …)`，`sendToV6` 改为用 `::` 调用它；`socket_syscall.zig` 的 sendto 和 sendmsg 两条 IPv6 路径传入 `udp_local_ip6`。
+- 测试：hello358（QEMU，4 项），定向 SMP=2、SMP=4 各一份通过。新增 host 测试「an IPv6 UDP datagram leaves from its socket's bound address; NDP is sent at hop limit 255 and e1000 takes multicast (hello358)」，检查接线、四处跳数、RCTL 位和 `sourceAddr6` 的 7 种情况。变异验证：`sourceAddr6` 不再返回绑定地址、DAD 改回默认跳数、RCTL 去掉 MPE，这条 host 测试各自失败，文件都已恢复。
+- 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、320 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
+- 这次修复带来的局限：
+  1. 绑定 `::1` 而发往站外地址的套接字仍以 `::1` 为源地址发出；Linux 在这种情况下照发（实测 sendto 成功），但对端无法回复。没有改成报错。
+  2. e1000 接收所有组播帧，没有按加入的组过滤 MTA；virtio-net 的接收过滤没有检查。
+  3. 绑定的组播地址按通配处理；`scope_id` 仍不参与选源地址。
+  4. IPv6 TCP 的源地址、绑定冲突和连接查找仍不看本地地址（hello357 局限 2）。

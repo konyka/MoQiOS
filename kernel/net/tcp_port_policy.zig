@@ -106,6 +106,16 @@ pub fn sourceAddr(bound: [4]u8, remote: [4]u8, our: [4]u8) [4]u8 {
     return if (isWildcard4(bound) or bound[0] == 127) our else bound;
 }
 
+/// The IPv6 source address of a datagram to `dst` from a socket bound to `bound`: the bound address when it is a unicast one (Linux
+/// ip6_datagram_send copies sk_v6_rcv_saddr into the flow, also for a ::1 destination); otherwise ::1 for a ::1 destination, else
+/// `our` (the address source selection picked).
+pub fn sourceAddr6(bound: [16]u8, dst: [16]u8, our: [16]u8) [16]u8 {
+    if (!isWildcard6(bound) and bound[0] != 0xff) return bound;
+    var loop6: [16]u8 = @splat(0);
+    loop6[15] = 1;
+    return if (@as(u128, @bitCast(dst)) == @as(u128, @bitCast(loop6))) loop6 else our;
+}
+
 /// Whether a segment to `dst` belongs to a connection bound to `bound` with peer `remote` (the local half of Linux
 /// __inet_lookup_established's 4-tuple). A loopback connection's local address is the one its segments carry (sourceAddr); any other
 /// connection is matched by a specific non-loopback bound address only, as the interface address is all it can be reached at.

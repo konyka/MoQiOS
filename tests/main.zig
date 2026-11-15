@@ -4358,6 +4358,39 @@ test "an IPv4 and an IPv6 TCP socket do not conflict on one port (hello344)" {
     try std.testing.expect(std.mem.indexOf(u8, ts, "        if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict\n        if (!tcp_port_policy.familiesConflict(tcb.is_v6, tcbs[i].is_v6)) continue;\n") != null);
 }
 
+test "an IPv6 UDP datagram leaves from its socket's bound address; NDP is sent at hop limit 255 and e1000 takes multicast (hello358)" {
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "    const our_ip = @import(\"tcp_port_policy.zig\").sourceAddr6(bound, dst_ip, if (is_loop) dst_ip else ndp.selectSourceAddress(dst_ip, our_mac));\n") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (udp.sendToV6From(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_port, &tmp6, @intCast(n6))) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "return if (udp.sendToV6From(d.udp_local_ip6, dst6, dst_port6, src_port, payload.ptr, @intCast(n6))) @intCast(n6) else -1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "udp.sendToV6(dst6") == null);
+    const iv = kt.icmpv6_source;
+    try std.testing.expect(std.mem.indexOf(u8, iv, "pub const NDP_HOP_LIMIT: u8 = 255;\n") != null);
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, iv, "7] = NDP_HOP_LIMIT;\n"));
+    try std.testing.expect(std.mem.indexOf(u8, kt.e1000_source, "RCTRL_EN | RCTRL_BAM | RCTRL_MPE | RCTRL_BSIZE_2048 | RCTRL_SECRC") != null);
+    const p = kt.tcp_port_policy;
+    const wild: [16]u8 = @splat(0);
+    var loop6 = wild;
+    loop6[15] = 1;
+    var g = wild;
+    g[0] = 0xfe;
+    g[1] = 0xc0;
+    g[15] = 7;
+    var our = g;
+    our[15] = 9;
+    var mcast = loop6;
+    mcast[0] = 0xff;
+    mcast[1] = 0x0e;
+    try std.testing.expectEqual(g, p.sourceAddr6(g, loop6, loop6));
+    try std.testing.expectEqual(g, p.sourceAddr6(g, our, our));
+    try std.testing.expectEqual(loop6, p.sourceAddr6(loop6, loop6, loop6));
+    try std.testing.expectEqual(loop6, p.sourceAddr6(wild, loop6, our));
+    try std.testing.expectEqual(our, p.sourceAddr6(wild, g, our));
+    try std.testing.expectEqual(loop6, p.sourceAddr6(mcast, loop6, our));
+    try std.testing.expectEqual(our, p.sourceAddr6(mcast, g, our));
+}
+
 test "an IPv6 UDP socket's bound address takes part in port conflicts and receiver choice (hello357)" {
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "        if (port_v6[j] and port_v6[oi] and !@import(\"tcp_port_policy.zig\").addrsConflict6(addr6, port_local_ip6[j])) continue;\n") != null);
