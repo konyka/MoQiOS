@@ -34,7 +34,8 @@ static void pause_ms(long ms) {
     while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
 }
 
-/* Child that signals its parent after 60 ms and, when data is given, writes it 60 ms later; then exits with `code`. */
+/* Child that signals its parent after 60 ms and, when data is given, writes it 60 ms later; then exits with `code`
+ * (30 ms later with data, 300 ms without). */
 static long spawn_signaller(long parent, int wfd, const char *data, int code) {
     long pid = fork();
     if (pid == 0) {
@@ -44,7 +45,9 @@ static long spawn_signaller(long parent, int wfd, const char *data, int code) {
             pause_ms(60);
             write(wfd, data, strlen(data));
         }
-        pause_ms(30);
+        /* Without data the parent is blocked in waitpid/wait4: a wakeup that lands after this exit reaps the child first
+         * (Linux do_wait does the same), so leave the parent plenty of time to see the signal alone. */
+        pause_ms(data ? 30 : 300);
         _exit(code);
     }
     return pid;

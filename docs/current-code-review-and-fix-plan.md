@@ -9338,3 +9338,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 绑定的本地地址还是不区分：TCB 不记录绑定地址，`127.0.0.1:p` 和 `0.0.0.0:p` 仍视为同一个端口。
   2. connect 选临时端口（`allocEphemeralPort`）时仍然把另一族的占用算进去，只是少用了一些端口，不会出错。
   3. 回环队列只有 16 帧，前一个程序留下的报文多时握手帧会被丢，靠 2 秒的重传超时恢复；这是已有的开放项（固定容量的回环队列）。
+
+## 补充：hello229 里 waitpid/wait4 被打断的用例留出更长的窗口
+
+- 现象：hello344 的完整 smoke 里，一份 SMP=4 的 hello229 E「without SA_RESTART a blocked wait4 returns -EINTR」失败一次。
+- 原因：`spawn_signaller` 在 60 ms 时给父进程发 SIGUSR1，再过 30 ms 就退出。父进程阻塞在 waitpid/wait4 里，被信号唤醒后 `waitpid.zig` 先回收子进程，只有没有可回收的子进程时才返回 `-EINTR`（Linux `do_wait` 的顺序相同，回收优先于信号）。宿主机负载高时父进程 30 ms 内没被调度到，醒来时子进程已是僵尸，于是 wait4 返回子进程 pid。内核行为正确，是测试窗口太窄。
+- 修改（只改测试）：`spawn_signaller` 没有数据要写时（B 和 E 的 waitpid/wait4 用例，以及 C、F、H 只需要信号的用例）发完信号等 300 ms 再退出；有数据时仍是 30 ms。hello229 没有 HOST 分支，这次没有在宿主机 Linux 上跑。
+- 验证：把 hello229 放到 init 前部单独跑，SMP=4 两份、SMP=2 一份，3/3 PASS（34 项全部 ok）。完整 smoke 四份（SMP=1、4、4、2）里 hello229 都通过；三份 EXIT=0、306 PASS，一份 SMP=4 只有 hello286 M（19/20，已记录的偶发项）失败，corrupted canaries 均为 0。
+- 局限：这只是把窗口从 30 ms 放宽到 300 ms，宿主机极端卡顿时仍可能误报。
