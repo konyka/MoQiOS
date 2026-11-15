@@ -4358,6 +4358,16 @@ test "an IPv4 and an IPv6 TCP socket do not conflict on one port (hello344)" {
     try std.testing.expect(std.mem.indexOf(u8, ts, "        if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict\n        if (!tcp_port_policy.familiesConflict(tcb.is_v6, tcbs[i].is_v6)) continue;\n") != null);
 }
 
+test "copy_file_range with offset pointers copies at its own positions and never moves the shared file offsets (hello354)" {
+    const c = kt.copy_file_range_source;
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, c, "offsetOf("));
+    try std.testing.expect(std.mem.indexOf(u8, c, "const rd = if (use_off_in) cur.fd_table.readAtOffset(fd_in, &kbuf, chunk, at_in) else cur.fd_table.read(fd_in, &kbuf, chunk);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "const wr = if (use_off_out) cur.fd_table.writeAtOffset(fd_out, &kbuf, @intCast(rd), at_out) else cur.fd_table.write(fd_out, &kbuf, @intCast(rd));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "        at_in += @intCast(wr);\n        at_out += @intCast(wr);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "var buf: [8]u8 = @bitCast(at_in);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "var buf: [8]u8 = @bitCast(at_out);") != null);
+}
+
 test "aio reads and writes use the iocb's offset like pread/pwrite and never move the shared file offset (hello353)" {
     const a = kt.aio_source;
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, a, "offsetOf("));

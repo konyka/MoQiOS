@@ -1146,7 +1146,7 @@ const SchedStats = struct {
   否则之后再扩大会把已“删除”的数据读回来。`lseek`（SEEK_SET/CUR/END、负位置/非法 whence EINVAL、坏 fd EBADF）、`O_APPEND`、`O_TRUNC`、只读描述符 `ftruncate` 失败在 ext2 与 tmpfs 上都已核对无误。
   **dup/fork 共享打开文件描述的偏移（已补）**：`dup`、`dup2/3`、`fcntl(F_DUPFD)` 与 `fork`/`clone`（复制 fd 表）之后，两端读写同一个位置。实现为 `fs/shared_offset.zig` 的带引用计数的偏移池（512 项，
   池满时退回各自私有偏移）：描述符第一次被复制时，它的 `offset` 被“升格”进池，原件与副本都带上同一个 `offset_slot`；`read`/`write`/`lseek`/`getdents` 在操作前后用 `syncOffsetIn/Out`
-  与池同步，`close` 释放持有；`splice`、`copy_file_range` 通过 `offsetOf/setOffsetOf` 读写；aio 的 PREAD/PWRITE 像 pread/pwrite 一样按 iocb 的偏移读写，不动共享偏移（hello353）。适用的描述符种类：ramdisk、FAT32、ext2、tmpfs、只读卷、procfs 文件；管道/套接字没有偏移。
+  与池同步，`close` 释放持有；`splice` 通过 `offsetOf/setOffsetOf` 读写；`copy_file_range` 给了偏移指针的一端用 `readAtOffset`/`writeAtOffset`，不动共享偏移（hello354）；aio 的 PREAD/PWRITE 像 pread/pwrite 一样按 iocb 的偏移读写，不动共享偏移（hello353）。适用的描述符种类：ramdisk、FAT32、ext2、tmpfs、只读卷、procfs 文件；管道/套接字没有偏移。
   同时 `ftruncate` 不再把文件偏移截到新长度内（POSIX 不改偏移）。`read`/`write`/`lseek` 的读-改-写在描述的偏移锁 `offset_locks[offset_slot]`（睡眠锁，只对上述有偏移的种类）内完成，两个进程同时读写同一个描述不会从同一位置开始（Linux `f_pos_lock`，hello350）。`read`、`write`、`readv`、`writev` 在 syscall 层整个调用持这把锁，切出的每块用 `readHeld`/`writeHeld`，所以一次大读写覆盖连续的一段（hello351）。`getdents64` 也在这把锁内读改写目录游标（hello352）。限制：mq 偏移和 `offsetOf/setOffsetOf` 的调用者不加锁。
 - **read/write/rename/readlink 与超长路径的错误码（hello128）**：`write()`/`pwrite()` 对不可写描述符（含只读打开的目录）现在是 EBADF（原先裸 `-1`=EPERM），`FdTable.write`
   入口统一经 `namespace_policy.writeGate`；`read()` 目录是 EISDIR（ext2 之前会返回 8 字节目录内容，tmpfs 返回 0）；`readlink` 对存在但不是符号链接的名字是 EINVAL

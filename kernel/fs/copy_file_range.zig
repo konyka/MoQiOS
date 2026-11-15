@@ -54,16 +54,11 @@ pub fn copyFileRange(fd_in: u32, off_in_ptr: u64, fd_out: u32, off_out_ptr: u64,
         use_off_out = true;
     }
 
-    // Explicit offsets temporarily replace the descriptor positions. Restore both
-    // descriptor offsets from one cleanup path, including all error returns.
-    const orig_in = vfs_mod.offsetOf(&cur.fd_table.fds[fd_in]);
-    const orig_out = vfs_mod.offsetOf(&cur.fd_table.fds[fd_out]);
-    defer {
-        if (use_off_in) vfs_mod.setOffsetOf(&cur.fd_table.fds[fd_in], orig_in);
-        if (use_off_out) vfs_mod.setOffsetOf(&cur.fd_table.fds[fd_out], orig_out);
-    }
-    if (use_off_in) vfs_mod.setOffsetOf(&cur.fd_table.fds[fd_in], off_in_val);
-    if (use_off_out) vfs_mod.setOffsetOf(&cur.fd_table.fds[fd_out], off_out_val);
+    // An explicit offset is a position of the call's own, like pread/pwrite: the descriptor's shared offset is never moved
+    // (Linux copies at &pos and leaves f_pos alone), so a process sharing the description is not disturbed. A NULL pointer
+    // uses and advances the descriptor's offset.
+    var at_in: u64 = off_in_val;
+    var at_out: u64 = off_out_val;
 
     // Copy in 8KB chunks
     const n: usize = @intCast(@min(len, 0x7FFFFFFF));
@@ -71,26 +66,26 @@ pub fn copyFileRange(fd_in: u32, off_in_ptr: u64, fd_out: u32, off_out_ptr: u64,
     while (total < n) {
         const chunk = @min(n - total, 8192);
         var kbuf: [8192]u8 = undefined;
-        const rd = cur.fd_table.read(fd_in, &kbuf, chunk);
+        const rd = if (use_off_in) cur.fd_table.readAtOffset(fd_in, &kbuf, chunk, at_in) else cur.fd_table.read(fd_in, &kbuf, chunk);
         if (rd < 0) return if (total > 0) @intCast(total) else rd;
         if (rd == 0) break;
-        const wr = cur.fd_table.write(fd_out, &kbuf, @intCast(rd));
+        const wr = if (use_off_out) cur.fd_table.writeAtOffset(fd_out, &kbuf, @intCast(rd), at_out) else cur.fd_table.write(fd_out, &kbuf, @intCast(rd));
         if (wr < 0) return if (total > 0) @intCast(total) else wr;
         if (wr == 0) break;
         total += @intCast(wr);
+        at_in += @intCast(wr);
+        at_out += @intCast(wr);
         if (wr < rd) break;
     }
 
     // Write back updated offsets if pointer was provided
     if (use_off_in) {
-        const new_off = vfs_mod.offsetOf(&cur.fd_table.fds[fd_in]);
-        var buf: [8]u8 = @bitCast(new_off);
+        var buf: [8]u8 = @bitCast(at_in);
         // Data already copied is observable, so preserve its partial-copy result.
         if (copy.copyToUser(@ptrFromInt(off_in_ptr), &buf, 8) != 8) return if (total > 0) @intCast(total) else EFAULT;
     }
     if (use_off_out) {
-        const new_off = vfs_mod.offsetOf(&cur.fd_table.fds[fd_out]);
-        var buf: [8]u8 = @bitCast(new_off);
+        var buf: [8]u8 = @bitCast(at_out);
         if (copy.copyToUser(@ptrFromInt(off_out_ptr), &buf, 8) != 8) return if (total > 0) @intCast(total) else EFAULT;
     }
 

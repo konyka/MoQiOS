@@ -9477,4 +9477,16 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   2. 新增 `hasPosition`：普通文件（ramdisk、FAT32、ext2、tmpfs、只读卷、procfs）和 mq 按偏移读写；管道、套接字、控制台、设备节点仍按流用 `read`/`write`，因为 `readAtOffset` 对它们返回 ESPIPE，而 Linux 对它们的 aio 就是普通读写。
 - 测试：hello353（QEMU，4 项），定向 SMP=2、SMP=4 各一份通过。`kernel/host_test.zig` 新增 `aio_source`，新增 host 测试「aio reads and writes use the iocb's offset like pread/pwrite and never move the shared file offset (hello353)」。变异验证：PREAD 恒走 `read`，这条 host 测试失败，文件已恢复。
 - 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、315 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
-- 这次修复带来的局限：mq 描述符的偏移、`splice` 和 `copy_file_range` 通过 `offsetOf`/`setOffsetOf` 的读改写仍不加偏移锁。
+- 这次修复带来的局限：mq 描述符的偏移、`splice` 和 `copy_file_range` 通过 `offsetOf`/`setOffsetOf` 的读改写仍不加偏移锁。（`copy_file_range` 由 hello354 改为不动共享偏移。）
+
+## 补充：带偏移指针的 copy_file_range 不动共享文件偏移（hello354）
+
+- 背景：hello353 一节的局限。`copyFileRange` 给了 `off_in`/`off_out` 指针时，先用 `offsetOf` 记下两个描述符的偏移，`setOffsetOf` 改成指针里的值，复制完再改回去。描述被另一个进程共享时，它在这段时间里会从复制的位置读，复制也可能从对方挪过的位置读写，改回去时还会盖掉对方的进度。Linux 对给了指针的一端用局部的 `pos`，不碰 `f_pos`。
+- Linux 实测（`gcc -DHOST user/hello354.c`，tmpfs `/tmp/hello354.dat` 4096 条 4 字节记录，输出到 `/tmp/hello354.out`，父子进程通过管道同时起跑）：A 父进程在共享描述上做 3000 次 64 字节、带两个偏移指针的 copy_file_range 时，子进程每次 4 字节顺序读，正好读到 4096 条、顺序不乱；B 每次复制都把 `off_in` 处的记录放到 `off_out`，两个指针各前进 64；C 结束后共享偏移是 16384；D 指针为 NULL 时使用并推进描述符自己的偏移（两端都到 64）。全部通过。
+- 红灯（未改的内核）：最初 300 次复制在 SMP=2、SMP=4 上都复现不出，改成 3000 次后两边都失败。SMP=2 上 A（子进程读到 2896 条、顺序乱）、B（1928 次复制的数据和指针都错）失败；SMP=4 上 A（2749 条）、B（2556 次）失败。C、D 通过。
+- 修复（`kernel/fs/copy_file_range.zig`）：去掉 `offsetOf`/`setOffsetOf`。给了 `off_in` 时用 `readAtOffset(fd_in, …, at_in)`，给了 `off_out` 时用 `writeAtOffset(fd_out, …, at_out)`；指针为 NULL 的一端仍走 `read`/`write`，使用并推进描述符偏移（hello350 的偏移锁覆盖每一块）。每块后 `at_in`、`at_out` 前进，最后写回指针。
+- 测试：hello354（QEMU，5 项），定向 SMP=2、SMP=4 各一份通过。新增 host 测试「copy_file_range with offset pointers copies at its own positions and never moves the shared file offsets (hello354)」。变异验证：给了 `off_in` 也走 `read`，这条 host 测试失败，文件已恢复。
+- 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、316 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
+- 这次修复带来的局限：
+  1. 指针为 NULL 时，偏移锁按 8 KiB 块持有，一次大复制的各块之间可能插入另一个进程的读写；Linux 对整个调用持锁。
+  2. mq 描述符的偏移和 `splice` 通过 `offsetOf`/`setOffsetOf` 的读改写仍不加偏移锁。
