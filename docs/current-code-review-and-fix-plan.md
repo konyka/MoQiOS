@@ -9365,7 +9365,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 只做了 IPv4。IPv6 TCB 仍不记录本地地址，`[::1]:p` 和 `[::]:p` 仍算同一个端口，getsockname 仍按对端选源地址。
   2. ~~已建立连接的查找（`findTcbByTuple`）和 connect 的 4 元组检查（`connectTupleTaken`）仍只看本地端口和对端，不看本地地址；两个本地地址不同、端口相同的连接如果连向同一对端会被当作同一个 4 元组。~~（hello346 已补上 IPv4。）
   3. 绑定网卡地址、对端在回环上（或反过来）的组合按 `sourceAddr` 选源地址，没有做 Linux 那样的路由检查和 `EINVAL`。
-  4. UDP 的 getsockname 仍报告网卡地址，UDP 端口冲突也不区分本地地址。（hello347 已补上 getsockname 和源地址；端口冲突仍不区分本地地址。）
+  4. UDP 的 getsockname 仍报告网卡地址，UDP 端口冲突也不区分本地地址。（hello347 已补上 getsockname 和源地址，hello348 补上端口冲突和收包分派。）
 
 ## 补充：只有本地地址不同的 TCP 连接是两个连接（hello346）
 
@@ -9393,6 +9393,21 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 测试：hello347（QEMU，4 项），定向 SMP=2、SMP=4 各一份通过；host 测试「a UDP socket keeps its bound IPv4 address: getsockname and the datagram source (hello347)」检查接线（两条用户发送路径都走 `sendToFrom`、没有遗漏的 `udp.sendTo(`）；已有的「udp: bind moves the registration ...」按新的 `const urc = udpRebind(...)` 更新。变异验证：getsockname 改回报告网卡地址，这条 host 测试失败，文件已恢复。
 - 完整 smoke：四份（SMP=1、4、4、2）里三份 EXIT=0、309 PASS；一份 SMP=4 只有 hello269「no single round stalls for seconds」失败（最慢一轮 5274 ms，已记录的偶发项，这次改动只涉及 UDP），308 PASS；hello347 四份都通过，corrupted canaries 均为 0。riscv64、aarch64 smoke 都是 EXIT=0。
 - 这次修复带来的局限：
-  1. UDP 端口冲突和收包分派仍不区分本地地址：两个套接字绑 `127.0.0.1:p` 和 `127.0.0.2:p` 仍冲突，发往任何本地地址的数据报都交给端口上的套接字。
+  1. UDP 端口冲突和收包分派仍不区分本地地址：两个套接字绑 `127.0.0.1:p` 和 `127.0.0.2:p` 仍冲突，发往任何本地地址的数据报都交给端口上的套接字。（hello348 已补上 IPv4。）
   2. 只做了 IPv4；IPv6 UDP 的 getsockname 仍报告首选全局地址或链路本地地址。
   3. 已 connect 的未绑定套接字的名字按 `sourceAddr` 计算，没有做路由查找。
+
+## 补充：同一端口上的 UDP 套接字按绑定的 IPv4 地址区分（hello348）
+
+- 背景：hello347 一节局限 1。UDP 端口冲突只看端口号，绑 `127.0.0.1:p` 之后再绑 `127.0.0.2:p` 返回 `EADDRINUSE`；收包时也只看目的端口，发往任何本地地址的数据报都交给端口上的套接字，发往没人绑定的地址也不回 ICMP 端口不可达。
+- Linux 实测（`gcc -DHOST user/hello348.c`，端口 18903、18904）：A 能同时绑 `127.0.0.1:18903` 和 `127.0.0.2:18903`，再绑 `0.0.0.0:18903` 或 `127.0.0.2:18903` 返回 -98；B 发往 127.0.0.2 的数据报只到绑 .2 的套接字，发往 127.0.0.1 的只到绑 .1 的；C connect 到 `127.0.0.3:18903` 后发送，下一次 recv 返回 -111（`ECONNREFUSED`），两个绑定的套接字都收不到；D 都设了 `SO_REUSEADDR` 的 `0.0.0.0:18904` 和 `127.0.0.2:18904`，发往 .2 的到绑具体地址的套接字，发往 .1 的到通配套接字。
+- 红灯（未改的内核，SMP=2）：4 项都失败（A 第二次 bind 返回 -98；B 两个数据报都到了一个套接字；C recv 返回 -11，数据报被绑定的套接字收走；D 两个数据报都到了绑具体地址的套接字）。
+- 修复（`kernel/net/udp.zig`、`kernel/net/socket_syscall.zig`）：
+  1. 新增按槽位记录的 `port_local_ip`。新槽位设为通配，swap-remove 时随槽位搬移并清空尾部。
+  2. `udp.rebind(old_key, new_port, addr, out_disc)`：两个 IPv4 套接字地址不冲突时（`tcp_port_policy.addrsConflict`）跳过共享检查，但它的区分号（discriminator）仍算作已占用，这样同端口的 key 不会重复。IPv6 套接字仍和同端口所有套接字冲突。`udpRebind` 带上地址参数（IPv6 传通配），在 udp 层成功后才设置 `udp_local_ip`，取代 hello347 的 `if (urc == 0)` 写法。
+  3. `enqueue` 增加目的地址参数，分四轮选候选：精确地址加同族、精确地址加任意族、通配加同族、通配加任意族（`listenerTakes`），找到候选的第一轮就停。返回值表示有没有套接字认领这个数据报，`handlePacket` 用它决定是否回 ICMP 端口不可达，取代原来只看端口的 `portBound`（已删除）。
+- 测试：hello348（QEMU，4 项），定向 SMP=2、SMP=4 各一份通过。新增 host 测试「UDP sockets on one port are told apart by their bound IPv4 address: bind conflicts and receive dispatch (hello348)」，检查冲突跳过、地址记录、swap-remove 搬移、分轮选择和 `enqueue` 返回值的接线。hello347 的测试和「udp: bind moves the registration ...」测试按新的 `udpRebind` 签名更新。变异验证：分轮选择改成只取精确地址（`true or r[0]`），这条 host 测试失败，文件已恢复。
+- 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、310 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
+- 这次修复带来的局限：
+  1. 只做了 IPv4。IPv6 UDP 套接字不记录绑定地址，同端口的 IPv6 套接字仍全部冲突，IPv6 数据报只按通配候选分派。
+  2. 分派的偏好只分“精确地址”和“通配”两档，没有实现 Linux `compute_score` 的完整打分（例如已 connect 的套接字加分、绑定设备加分）。已 connect 的套接字仍由 `pickReceiverConnected` 在选出的候选里处理。

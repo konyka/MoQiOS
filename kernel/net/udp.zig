@@ -62,6 +62,9 @@ var port_err: [MAX_PORTS]i32 = @splat(0);
 var port_peer: [MAX_PORTS]u16 = @splat(0);
 /// Peer address a connect() fixed (IPv4 in the first 4 bytes), meaningful when port_peer is nonzero.
 var port_peer_ip: [MAX_PORTS][16]u8 = @splat(@splat(0));
+/// IPv4 address each slot is bound to (0.0.0.0 for the wildcard and for IPv6 sockets). Sockets on one port bound to different
+/// addresses do not conflict, and a datagram goes to the socket bound to its destination before a wildcard one (Linux inet_rcv_saddr).
+var port_local_ip: [MAX_PORTS][4]u8 = @splat(.{ 0, 0, 0, 0 });
 
 /// Options of the socket bound to `port`, or null if it is not registered.
 pub fn getPortOpts(port: u32) ?@import("sockopt_policy.zig").Stored {
@@ -139,13 +142,6 @@ pub fn notifyUnreachable(local_port: u16, peer_port: u16) void {
     }
 }
 
-/// True when a socket is bound to `port`.
-pub fn portBound(port: u16) bool {
-    const saved = udp_lock.acquire();
-    defer udp_lock.release(saved);
-    return countPortLocked(port) != 0;
-}
-
 /// Lookup with the lock already held. Callers that use the returned index to
 /// touch `queues` MUST stay in the same critical section: releasePort's
 /// swap-remove reshuffles slots, so an index computed under a previous lock
@@ -182,6 +178,7 @@ fn newSlotLocked(key: u32, is_v6: bool, uid: u32) u16 {
     port_seq[idx] = next_seq;
     next_seq +%= 1;
     port_v6[idx] = is_v6;
+    port_local_ip[idx] = .{ 0, 0, 0, 0 };
     for (0..QUEUE_DEPTH) |j| queues[idx][j].valid = false;
     num_ports += 1;
     return @intCast(idx);
@@ -212,15 +209,18 @@ pub fn ensurePortExclusive(port: u16, is_v6: bool, uid: u32) u16 {
 }
 
 /// bind() on a UDP socket already registered under `old_key`: move it to `new_port`, keeping its options (SO_REUSEADDR / SO_REUSEPORT are
-/// set before bind). A port another socket holds can be joined only when the sharing policy allows it with every holder. On success returns
-/// 0 and the socket's new discriminator in `out_disc`; -98 (EADDRINUSE) when the port is taken or the table is full, -9 when `old_key` is gone.
-pub fn rebind(old_key: u32, new_port: u16, out_disc: *u16) i64 {
+/// set before bind) and recording the IPv4 address `addr` it is bound to. A port another socket holds can be joined only when the sharing
+/// policy allows it with every holder whose address conflicts (tcp_port_policy.addrsConflict; IPv6 sockets always conflict). On success
+/// returns 0 and the socket's new discriminator in `out_disc`; -98 (EADDRINUSE) when the port is taken or the table is full, -9 when
+/// `old_key` is gone.
+pub fn rebind(old_key: u32, new_port: u16, addr: [4]u8, out_disc: *u16) i64 {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
 
     const oi = findPortIdxLocked(old_key) orelse return -9;
     if (portNumber(old_key) == new_port) {
         out_disc.* = @truncate(old_key >> 16);
+        port_local_ip[oi] = addr;
         return 0;
     }
     const mine = port_opts[oi];
@@ -228,13 +228,15 @@ pub fn rebind(old_key: u32, new_port: u16, out_disc: *u16) i64 {
     var used: u64 = 0;
     for (0..num_ports) |j| {
         if (portNumber(ports[j]) != new_port) continue;
-        if (!@import("udp_port_policy.zig").mayShare(mine.flags, port_opts[j].flags, uid, port_uid[j])) return -98;
         used |= @as(u64, 1) << @intCast(ports[j] >> 16);
+        if (!port_v6[j] and !port_v6[oi] and !@import("tcp_port_policy.zig").addrsConflict(addr, port_local_ip[j])) continue;
+        if (!@import("udp_port_policy.zig").mayShare(mine.flags, port_opts[j].flags, uid, port_uid[j])) return -98;
     }
     if (num_ports >= MAX_PORTS) return -98;
     const disc: u16 = @intCast(@ctz(~used));
     const ni = newSlotLocked(new_port | (@as(u32, disc) << 16), port_v6[oi], uid);
     port_opts[ni] = mine;
+    port_local_ip[ni] = addr;
     releaseLocked(old_key);
     out_disc.* = disc;
     return 0;
@@ -278,6 +280,8 @@ fn releaseLocked(port: u32) void {
             port_uid[i] = port_uid[num_ports];
             port_seq[i] = port_seq[num_ports];
             port_v6[i] = port_v6[num_ports];
+            port_local_ip[i] = port_local_ip[num_ports];
+            port_local_ip[num_ports] = .{ 0, 0, 0, 0 };
             port_err[num_ports] = 0;
             port_peer[num_ports] = 0;
             queues[i] = queues[num_ports];
@@ -332,8 +336,11 @@ pub fn nextDatagramLen(port: u32, is_v6: bool) u32 {
 /// point the index at a different port's queue, delivering the datagram to
 /// the wrong socket (or effectively dropping it for the real owner).
 /// Sockets sharing the port (SO_REUSEADDR / SO_REUSEPORT) are told apart by udp_port_policy.pickReceiver.
-fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, payload: []const u8, is_v6: bool) void {
+/// Candidates are the sockets bound to the destination address `dst_ip` (IPv4; 0.0.0.0 for IPv6 datagrams), else the wildcard ones,
+/// each preferring the datagram's address family. Returns whether any socket claims the datagram (false: ICMP port unreachable).
+fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, dst_ip: [4]u8, payload: []const u8, is_v6: bool) bool {
     var notify_key: u32 = 0;
+    var claimed = false;
     const was_inserted = blk: {
         const saved = udp_lock.acquire();
         defer udp_lock.release(saved);
@@ -342,23 +349,19 @@ fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, payload: []c
         var cand: [MAX_PORTS]u16 = undefined;
         var info: [MAX_PORTS]policy.Candidate = undefined;
         var n: usize = 0;
-        for (0..num_ports) |i| {
-            if (portNumber(ports[i]) == port and port_v6[i] == is_v6) {
+        const rounds = [_][2]bool{ .{ true, true }, .{ true, false }, .{ false, true }, .{ false, false } };
+        for (rounds) |r| {
+            for (0..num_ports) |i| {
+                if (portNumber(ports[i]) != port or (r[1] and port_v6[i] != is_v6)) continue;
+                if (!@import("tcp_port_policy.zig").listenerTakes(port_local_ip[i], dst_ip, r[0])) continue;
                 cand[n] = @intCast(i);
                 info[n] = .{ .flags = port_opts[i].flags, .seq = port_seq[i], .peer_port = port_peer[i], .peer_ip = port_peer_ip[i] };
                 n += 1;
             }
-        }
-        if (n == 0) {
-            for (0..num_ports) |i| {
-                if (portNumber(ports[i]) == port) {
-                    cand[n] = @intCast(i);
-                    info[n] = .{ .flags = port_opts[i].flags, .seq = port_seq[i], .peer_port = port_peer[i], .peer_ip = port_peer_ip[i] };
-                    n += 1;
-                }
-            }
+            if (n != 0) break;
         }
         if (n == 0) break :blk false;
+        claimed = true;
         // A connected socket whose peer is not this sender has no claim; one connected to it wins (see pickReceiverConnected).
         const pick = policy.pickReceiverConnected(info[0..n], src_ip, src_port) orelse break :blk false;
         const port_idx = cand[pick];
@@ -379,7 +382,7 @@ fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, payload: []c
         // Queue full - packet dropped (no accounting yet)
         break :blk false;
     };
-    if (!was_inserted) return;
+    if (!was_inserted) return claimed;
     // The datagram arrival is the readiness edge: without this notify, an
     // epoll item registered EPOLLIN on an empty queue never enters the ready
     // list (readiness is only re-probed on epoll_ctl and ready-list drain),
@@ -388,6 +391,7 @@ fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, payload: []c
     @import("epoll.zig").epollNotify(.udp_socket, notify_key, @import("epoll.zig").EPOLLIN);
     // sock_def_readable: every queued datagram signals an O_ASYNC owner with POLL_IN.
     @import("../fs/vfs.zig").udpFasyncNotify(notify_key, @import("../fs/fcntl_policy.zig").POLL_IN);
+    return true;
 }
 
 pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) void {
@@ -405,8 +409,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
     if (8 + actual_payload > len) return;
     var ip16: [16]u8 = @splat(0);
     @memcpy(ip16[0..4], &src_ip);
-    const bound = portBound(hdr.dst_port);
-    enqueue(hdr.dst_port, ip16, hdr.src_port, hdr.dst_port, data[8..][0..actual_payload], false);
+    const bound = enqueue(hdr.dst_port, ip16, hdr.src_port, hdr.dst_port, dst_ip, data[8..][0..actual_payload], false);
     const unreach = @import("icmp_unreach_policy.zig");
     if (unreach.shouldReply(netif.isLoopback(src_ip) and netif.isLoopback(dst_ip), false, bound)) {
         sendPortUnreachable(src_ip, dst_ip, data, hdr.udp_len);
@@ -447,8 +450,7 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
 
     const actual_payload = @min(hdr.payload_len, @as(u16, MAX_UDP_PAYLOAD_V6));
     if (8 + actual_payload > len) return;
-    const bound = portBound(hdr.dst_port);
-    enqueue(hdr.dst_port, src_ip, hdr.src_port, hdr.dst_port, data[8..][0..actual_payload], true);
+    const bound = enqueue(hdr.dst_port, src_ip, hdr.src_port, hdr.dst_port, .{ 0, 0, 0, 0 }, data[8..][0..actual_payload], true);
     if (@import("icmp_unreach_policy.zig").shouldReplyV6(netif.isLoopbackV6(src_ip), netif.isLoopbackV6(dst_ip), bound)) {
         sendPortUnreachableV6(src_ip, dst_ip, data, hdr.udp_len);
     }
