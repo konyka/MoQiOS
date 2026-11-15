@@ -9,6 +9,8 @@ pub const TCGETS: u64 = 0x5401;
 pub const TCSETS: u64 = 0x5402;
 pub const TCSETSW: u64 = 0x5403;
 pub const TCSETSF: u64 = 0x5404;
+pub const TCSBRK: u64 = 0x5409;
+pub const TCFLSH: u64 = 0x540B;
 pub const TIOCGPGRP: u64 = 0x540F;
 pub const TIOCSPGRP: u64 = 0x5410;
 pub const TIOCGWINSZ: u64 = 0x5413;
@@ -22,9 +24,27 @@ pub const FIOCLEX: u64 = 0x5451;
 
 pub fn isTerminalRequest(cmd: u64) bool {
     return switch (cmd) {
-        TCGETS, TCSETS, TCSETSW, TCSETSF, TIOCGPGRP, TIOCSPGRP, TIOCGWINSZ, TIOCSWINSZ, TIOCSTI => true,
+        TCGETS, TCSETS, TCSETSW, TCSETSF, TCSBRK, TCFLSH, TIOCGPGRP, TIOCSPGRP, TIOCGWINSZ, TIOCSWINSZ, TIOCSTI => true,
         else => false,
     };
+}
+
+/// TCFLSH's queue selector (an int, Linux tty_perform_flush): TCIFLUSH 0 and TCIOFLUSH 2 discard unread input, TCOFLUSH 1 only
+/// output; anything else is EINVAL (null).
+pub fn flushDiscardsInput(arg: u64) ?bool {
+    return switch (@as(u32, @truncate(arg))) {
+        0, 2 => true,
+        1 => false,
+        else => null,
+    };
+}
+
+test "TCFLSH selects the queues to discard" {
+    try @import("std").testing.expectEqual(@as(?bool, true), flushDiscardsInput(0));
+    try @import("std").testing.expectEqual(@as(?bool, false), flushDiscardsInput(1));
+    try @import("std").testing.expectEqual(@as(?bool, true), flushDiscardsInput(2));
+    try @import("std").testing.expectEqual(@as(?bool, null), flushDiscardsInput(3));
+    try @import("std").testing.expectEqual(@as(?bool, null), flushDiscardsInput(0xFFFF_FFFF_FFFF_FFFF));
 }
 
 /// What a descriptor is, as far as terminal requests care.

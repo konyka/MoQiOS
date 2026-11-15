@@ -201,7 +201,7 @@ pub fn inject(ch: u8) bool {
     return push(ch);
 }
 
-/// TCSETSF / TCFLSH(TCIFLUSH): drop every character not yet read (Linux tty_ldisc_flush → n_tty_flush_buffer).
+/// TCSETSF / TCFLSH (TCIFLUSH, TCIOFLUSH): drop every character not yet read (Linux tty_ldisc_flush → n_tty_flush_buffer).
 pub fn flushInput() void {
     const f = push_lock.acquire();
     defer push_lock.release(f);

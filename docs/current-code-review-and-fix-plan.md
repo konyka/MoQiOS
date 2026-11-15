@@ -9227,4 +9227,19 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 局限：
   1. termios 仍只是保存的值：没有 canonical 行规程、回显、ISIG 由 termios 控制，VMIN/VTIME 不影响 read（hello326 局限 3 不变）。
   2. riscv64、aarch64 没有控制台输入队列，`TCSETSF` 在那里只设 termios，没有可丢的输入。
-  3. 没有 `TCFLSH`、`TCSBRK`、`TCXONC`。
+  3. 没有 `TCFLSH`、`TCSBRK`、`TCXONC`。（hello338 已补 `TCFLSH`、`TCSBRK`）
+
+## 补充：控制台 tty 的 TCFLSH、TCSBRK（hello338）
+
+- 问题：hello337 局限 3。`TCFLSH`（0x540B，`tcflush`）和 `TCSBRK`（0x5409，`tcdrain`、`tcsendbreak`）既不在 `ioctl_policy.isTerminalRequest` 里，也没有 ioctl 分支，在控制台上返回 `ENOTTY`。
+- Linux 实测（`gcc -DHOST user/hello338.c`，pty 从端代替 `/dev/tty`）：A `TCFLSH TCOFLUSH`（1）成功，保留已排队输入；B `TCFLSH TCIFLUSH`（0）成功并丢掉输入；C `TCFLSH TCIOFLUSH`（2）成功并丢掉输入，之后注入的字符能读到；D `TCFLSH 3`、`TCFLSH -1` 是 `EINVAL`；E `TCSBRK 1`、`TCSBRK 0` 成功；F 管道上两者都是 `ENOTTY`。
+- 红灯：旧内核上 A–E 失败（都是 `-25`），F 通过。
+- 修复：
+  - `kernel/fs/ioctl_policy.zig`：新增 `TCSBRK`、`TCFLSH`，加入 `isTerminalRequest`；新增 `flushDiscardsInput(arg)`：0、2 丢输入，1 不丢，其他为 null（EINVAL），并附带测试。
+  - `kernel/fs/ioctl.zig`：`TCSBRK` 直接返回 0（控制台输出同步写串口，没有要等的输出，也没有 break 的意义）；`TCFLSH` 按 `flushDiscardsInput` 判断，需要时在 x86_64 上调用 `keyboard.flushInput()`。参数是 int，不是指针。
+- 测试：hello338（QEMU，6 项）；host 测试 `TCFLSH discards console input for TCIFLUSH and TCIOFLUSH, TCSBRK succeeds` 和 `ioctl_policy` 里的 `TCFLSH selects the queues to discard`。变异：把 `0, 2 => true` 改成 `0 => true`，两条测试都失败，文件已恢复。
+- 绿灯：定向 SMP=2、SMP=4 各一份，hello338 通过；`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都有 hello338、hello337 PASS，hello228 `corrupted canaries=0`。SMP=1、SMP=2 和一份 SMP=4 `EXIT=0`、0 FAIL；另一份 SMP=4 `EXIT=1`，只有已记录的偶发项 hello286 J（3/60）和 M（19/20）失败。单独重跑 SMP=4 第一份 `EXIT=1`，只有已记录的偶发项 hello325 G（`hits 0`）失败，hello286 通过；第二份 `EXIT=0`、0 FAIL。hello338 只改了 ioctl 和键盘环的清空，不涉及信号、作业控制和 TCP。riscv64、aarch64 smoke 通过。
+- 局限：
+  1. `TCXONC`（tcflow）仍是 `ENOTTY`：没有输出队列，也没有 XON/XOFF 流控状态。
+  2. hello337 局限 1、2 不变：termios 只是保存的值，riscv64、aarch64 没有控制台输入队列。

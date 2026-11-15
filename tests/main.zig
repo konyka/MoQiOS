@@ -983,6 +983,20 @@ test "TCSETSW and TCSETSF set the console termios, and TCSETSF discards unread i
     try std.testing.expect(kt.ioctl_policy.isTerminalRequest(kt.ioctl_policy.TCSETSF));
 }
 
+test "TCFLSH discards console input for TCIFLUSH and TCIOFLUSH, TCSBRK succeeds" {
+    const v = kt.ioctl_source;
+    try std.testing.expect(std.mem.indexOf(u8, v, "ip.TCSBRK => return 0,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "const discard = ip.flushDiscardsInput(arg) orelse return -22;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "if (discard and comptime @import(\"builtin\").cpu.arch == .x86_64) @import(\"../drivers/keyboard.zig\").flushInput();") != null);
+    const ip = kt.ioctl_policy;
+    try std.testing.expect(ip.isTerminalRequest(ip.TCSBRK));
+    try std.testing.expect(ip.isTerminalRequest(ip.TCFLSH));
+    try std.testing.expectEqual(@as(?bool, true), ip.flushDiscardsInput(0));
+    try std.testing.expectEqual(@as(?bool, false), ip.flushDiscardsInput(1));
+    try std.testing.expectEqual(@as(?bool, true), ip.flushDiscardsInput(2));
+    try std.testing.expectEqual(@as(?bool, null), ip.flushDiscardsInput(3));
+}
+
 test "parent TID copyout aborts an unpublished child before publication" {
     const source = kt.clone_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "abortUnpublishedChild(child_idx)") != null);
