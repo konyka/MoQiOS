@@ -3057,7 +3057,7 @@ This is an ABI/rollback contract only, not a throughput claim.
 
 **pause() 阻塞与 gettid（hello225）**：`pause()` 此前让出一次 CPU 就无条件返回 `-EINTR`，不等信号；现在与 `sigsuspend` 共用 `signal_syscall.waitForSignal`（睡到出现可处理的信号），返回 `-EINTR` 前由分发器投递信号，默认动作为终止的信号直接结束进程。新增 `gettid()`（497），返回调用任务自己的 tid（`getpid()` 是线程组 id），多线程程序因此能对自己 `tkill`。
 
-**/proc/lostats：回环队列的计数（hello224）**：`net/lo.zig` 的 16 帧环形队列此前满了就丢帧、只在内部累加 `dropped`，没有任何地方读它，所以无从知道 TCP/UDP 的某次停滞是不是因为回环丢了帧。现在队列记录 `queued`（接受的帧）、`delivered`（交给接收路径的帧）、`dropped`（队列满而拒绝的帧）、`high_water`（同时排队的最大帧数），`/proc/lostats` 以 `queued=N delivered=N dropped=N high_water=N depth=N` 一行给出（`lo.snapshot()` 在队列锁下取一份一致的拷贝）。空帧和超长帧被拒绝但不算拥塞丢帧。队列满时丢掉的帧算作丢失，不算发送失败（`lo.dropIsLoss`）：UDP `sendto` 照常返回长度，回环 TCP `connect` 的 SYN 丢了以后连接留在 SYN_SENT，由重传定时器再发（hello341，Linux 的回环投递也不会让发送方失败）。`hello174` 在排空断言之后打印这一行，下次 CI 里它失败时能直接看到丢帧是否发生。
+**/proc/lostats：回环队列的计数（hello224）**：`net/lo.zig` 的 16 帧环形队列此前满了就丢帧、只在内部累加 `dropped`，没有任何地方读它，所以无从知道 TCP/UDP 的某次停滞是不是因为回环丢了帧。现在队列记录 `queued`（接受的帧）、`delivered`（交给接收路径的帧）、`dropped`（队列满而拒绝的帧）、`high_water`（同时排队的最大帧数），`/proc/lostats` 以 `queued=N delivered=N dropped=N high_water=N depth=N` 一行给出（`lo.snapshot()` 在队列锁下取一份一致的拷贝）。空帧和超长帧被拒绝但不算拥塞丢帧。队列满时丢掉的帧算作丢失，不算发送失败（`lo.dropIsLoss`）：UDP `sendto` 照常返回长度，回环 TCP `connect` 的 SYN 丢了以后连接留在 SYN_SENT，由重传定时器再发（hello341，Linux 的回环投递也不会让发送方失败）；重传的 SYN 带原始 ISN，对端的 RST 或 SYN-ACK 照常被接受（hello342）。`hello174` 在排空断言之后打印这一行，下次 CI 里它失败时能直接看到丢帧是否发生。
 
 **当前目录的读写在锁下（hello222）**：`FsContext`（`mm/group_state.zig`）带一把 `IrqSpinlock`，读只通过 `snapshot()`、写只通过 `set()`，两者只在拷贝期间持锁；`getcwd`、相对路径查找、`chdir`、`fchdir` 与 `fork`/`clone` 复制目录都走这两个入口。此前 `chdir` 分几步写一个 256 字节数组，同时有别的线程读它时会读到半新半旧的路径。
 

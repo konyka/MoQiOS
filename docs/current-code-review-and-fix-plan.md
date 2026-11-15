@@ -9292,3 +9292,15 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. SYN 丢在回环队列里以后，要等第一次重传超时（初始 RTO 2000 ms）才会再发，所以这种情况下 `connect` 最多多等约 2 秒。Linux 的回环几乎不会丢 SYN，所以没有这个延迟。
   2. 回环队列仍然只有 16 帧，满了照样丢帧。这次只改了发送方看到的返回值，没有扩大队列，也没有在满的时候先排空队列。
   3. 已建立连接上的数据段和 FIN 发不出去时，本来就由重传定时器处理，这次没有改。
+
+## 补充：重传的 SYN 带原始 ISN 的回归测试（hello342）
+
+- 背景：hello341 之后，回环队列满时 SYN 会被丢弃，连接留在 SYN_SENT，等重传定时器再发。这一节确认重传的 SYN 使用原始 ISN（RFC 9293 3.8.1；Linux `tcp_retransmit_skb` 原样重发队列里的 SYN），所以对端的应答仍然被接受。
+- Linux 实测（`gcc -DHOST user/hello342.c`）：A 先发 16 个 UDP 数据报，再对一个没有监听的端口做非阻塞 `connect`，返回 `EINPROGRESS`；B 8 秒内 connect 以 `ECONNREFUSED` 失败（`SO_ERROR` 111），说明应答 SYN 的 RST 被接受了；C 再发 16 个数据报后，对监听者的非阻塞 `connect` 完成并被 accept；D 客户端写的 1 字节到达 accept 出来的套接字。Linux 不会丢帧，所以应答立即到达。
+- 结果：当前内核上 A–D 都通过，B 大约 2 秒（一次重传超时），所以没有红灯，只加回归测试，内核没有改。
+- 机制（源码核对，没有单独测试）：SYN_SENT 时 `snd_nxt` 已经是 ISS+1，RTO 分支直接按 `snd_nxt` 重发 SYN。之所以重传的 SYN 还是 ISS，是因为 RTO 之前尾部丢包探测（`sendTlpProbe`）在没有数据可发时调用 `prepareRexmitFromHole`，把 `snd_nxt` 退回 `snd_una`（即 ISS）。这依赖副作用：如果以后 TLP 不在 RTO 之前触发，hello342 B、C 会失败。
+- 测试：hello342（QEMU，4 项）。定向 SMP=2、SMP=4 各一份通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都 `EXIT=0`、0 FAIL，各 304 个 PASS，hello342 都通过，hello228 `corrupted canaries=0`。riscv64、aarch64 smoke 通过。
+- 局限：
+  1. 上面说的副作用依赖：RTO 分支没有在重发 SYN 前显式把 `snd_nxt` 设回 ISS。
+  2. 服务端 SYN_RECEIVED 的 SYN-ACK 丢失后不会重发：重传定时器不处理 SYN_RECEIVED，重复的 SYN 也不会触发重发，SYN-ACK 发送失败时 `snd_nxt` 也不前进。用户态没法让 SYN-ACK 丢失（回环队列在处理 SYN 之前已经取出了它，总有空位），非 x86 的 SK 探针在 SK-19 之后不再运行，所以这一项还没有能失败的测试，未修。
