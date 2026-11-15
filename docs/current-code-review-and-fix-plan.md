@@ -9211,3 +9211,4 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 结果：hello336 在未改动的内核上 SMP=2、SMP=4 都通过，没有红灯。这个内核的 `wakePollers` 在每次提交后按当前消息数算出 POLLIN/POLLOUT 并通知该队列的所有 description，和 Linux 的可观察行为一致。hello334 局限 2 不是缺陷，已在那一节注明。
 - 本节只新增回归测试 hello336（QEMU，4 项）和文档，没有改内核代码，所以这一项不是按 TDD 先红后绿做的。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都有 hello336、hello335 PASS。SMP=1、SMP=2 和一份 SMP=4 `EXIT=0`、0 FAIL；另一份 SMP=4 `EXIT=1`，只有已记录的偶发项 hello286 J（57/60 次组停止被报告）失败。随后单独重跑一份 SMP=4，`EXIT=0`、0 FAIL。riscv64、aarch64 smoke 通过。
+- CI 记录：hello335 的提交 `bf24425` 在 CI（运行 43655065865）的 SMP=2 上失败，唯一的失败是 hello267「all 12 connections queued on the closed listener are accepted by a survivor」。hello335 只改了 mq 描述符的偏移，没有碰 TCP；本地这一轮五份完整 smoke（SMP 1/4/4/2 和重跑的 SMP=4）里 hello267 都通过。归入已记录的 hello267 偶发项，根因没有查。CI 重跑因为 token 权限不足（`Resource not accessible by personal access token`）没能执行，hello336 的提交 `0a90c82` 的 CI 运行作为同一代码加上回归测试后的再次验证。
