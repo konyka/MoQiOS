@@ -9662,3 +9662,25 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
   2. IPv6 组播投递仍不区分到达接口（IPv6 的成员表记了接口，但 lo 上发不出 IPv6 组播，目前只有网卡一个来源）。
   3. 绑定冲突仍按地址完全相等判断。
+
+## 补充：IPv6 套接字绑定 sin6_scope_id 指定的接口（hello364）
+
+- 背景：IPv6 UDP bind 只检查 sin6_scope_id 是否合法，不记录它。结果是同一端口上 ff02::1%1 和 ff02::1%2 互相冲突，getsockname 总是报告网卡的编号，绑在接口 1 上的套接字也会收到从接口 2 到达的组播。另外 ff01::/16 没有算作需要 scope 的地址，IPv6 TCP 还能 bind 组播地址。
+- Linux 依据：inet6_bind 对需要 scope 的地址把 sin6_scope_id 写入 sk_bound_dev_if；inet_bind_conflict 跳过绑定接口不同的一对套接字；__udp_v6_is_mcast_sock 拒收从其他接口到达的数据报；__inet6_bind 对 SOCK_STREAM 的组播地址返回 EINVAL；__ipv6_addr_needs_scope_id 包括接口本地组播 ff01::/16。
+- 宿主机实测（Linux，`unshare -rn` 加 dummy 网卡 d0，方法写在 `user/hello364.c` 文件头）：S、B1、B2、B3、N、D、J、J2、T 共 9 项全部通过。
+- 红灯（未修改的内核，SMP=2）：S（ff01::1 scope 0 时 bind 成功，返回 3；scope 9 返回 -98）、B1（第二个 bind 返回 -98）、N（scope 依次是 2、-88、0、0）、D（A 也收到了）、T（IPv6 TCP 绑组播地址成功）失败；B2、B3、J、J2 通过。
+- 修复：
+  1. `kernel/net/bind_addr_policy.zig`：`needsScope6` 包括 ff01::/16；新增 `boundDev6`、`boundDevsConflict`、`streamBindErrno6`。
+  2. `kernel/net/udp.zig`：新增 `port_dev6` 和 `boundDev6`，在 `newSlotLocked`、`rebind`、`releaseLocked` 中维护；`rebind` 多了 `dev6` 参数，冲突判断先查 `boundDevsConflict`；`enqueueMcast` 多了到达接口参数，按该接口查本机成员，并把套接字绑定的接口交给 `socketMatches`；新增 `handlePacketV6On`；IPv6 回送副本用 `lo.sendPacketOn` 标记出接口。
+  3. `kernel/net/mcast_policy.zig`：`socketMatches` 增加 `bound_dev`、`dif` 两个参数，绑定的接口不是到达接口时不匹配。
+  4. `kernel/net/mod.zig`：IPv6 UDP 改调 `udp.handlePacketV6On(…, ifindex)`。
+  5. `kernel/net/sockaddr_util.zig`：新增 `boundScope6`。
+  6. `kernel/net/socket_syscall.zig`：`udpRebind` 传 `boundDev6(parsed.addr, parsed.scope_id)`（IPv4 传 0）；IPv6 TCP bind 在检查 scope 之前先查 `streamBindErrno6`；UDP getsockname 的 IPv6 分支用 `boundScope6`。
+- 测试：hello364（QEMU，9 项）；新增 host 测试「IPv6 bind ties a link-scoped socket to its sin6_scope_id interface …(hello364)」。hello361、hello347、「TCP bind errors and SO_REUSEADDR sharing」和「udp: bind moves the registration …」这几条 host 测试改为钉住新的签名和源码行，检查的行为没变。`zig build test` 全部通过（1261 个）。
+- 变异验证：`boundDevsConflict` 恒返回 true，或 `socketMatches` 忽略 `bound_dev`，hello364 这条 host 测试都失败（1259/1261，另一条失败是还没更新的文档测试），文件已恢复。
+- 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，三份里 hello364 都 PASS（9 项全部 ok）。三份跑完后只改了 `udp.rebind` 文档注释里的一句（「IPv6 sockets always conflict」改为 addrsConflict6），之后 `zig build test` 和 `zig build` 重新通过，没有再跑 smoke。本轮没有跑 riscv64、aarch64 smoke。
+- 和 hello363 局限 2 的关系：IPv6 组播投递现在按到达接口检查本机成员。套接字是否接收仍只比较组，不看它在哪个接口上加入，这和 Linux 一致（inet6_mc_check，见 J 项）。
+- 这次修复带来的局限：
+  1. sendto 不看目的地址的 sin6_scope_id。Linux 实测：从绑在 %1 上的套接字发往 scope 0 的地址，以及发往 ff02::1%1，都返回 ENETUNREACH。
+  2. IPv6 TCP 不记录绑定的接口。
+  3. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。

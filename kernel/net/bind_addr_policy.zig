@@ -43,10 +43,27 @@ fn mappedV4(addr: [16]u8) ?[4]u8 {
     return .{ addr[12], addr[13], addr[14], addr[15] };
 }
 
-/// Whether `addr` means something only together with an interface: link-local unicast (fe80::/10) or link-local multicast
-/// (ff02::/16) (Linux __ipv6_addr_needs_scope_id).
+/// Whether `addr` means something only together with an interface: link-local unicast (fe80::/10), interface-local multicast
+/// (ff01::/16) or link-local multicast (ff02::/16) (Linux __ipv6_addr_needs_scope_id).
 pub fn needsScope6(addr: [16]u8) bool {
-    return (addr[0] == 0xfe and (addr[1] & 0xc0) == 0x80) or (addr[0] == 0xff and (addr[1] & 0x0f) == 2);
+    return (addr[0] == 0xfe and (addr[1] & 0xc0) == 0x80) or (addr[0] == 0xff and ((addr[1] & 0x0f) == 1 or (addr[1] & 0x0f) == 2));
+}
+
+/// The interface bind() ties an IPv6 socket to (Linux sk_bound_dev_if from sin6_scope_id): the scope of an address that needs one
+/// (checked by inet6ScopeErrno first), 0 (none) for any other address.
+pub fn boundDev6(addr: [16]u8, scope_id: u32) u8 {
+    return if (needsScope6(addr)) @truncate(scope_id) else 0;
+}
+
+/// Two sockets on one port can conflict only when one of them is not tied to an interface or both are tied to the same one (Linux
+/// inet_bind_conflict).
+pub fn boundDevsConflict(a: u8, b: u8) bool {
+    return a == 0 or b == 0 or a == b;
+}
+
+/// An IPv6 stream socket cannot bind a multicast address (Linux __inet6_bind: EINVAL before the scope checks).
+pub fn streamBindErrno6(addr: [16]u8) i64 {
+    return if (addr[0] == 0xff) EINVAL else 0;
 }
 
 /// bind()'s check of sin6_scope_id, made before the address check (Linux inet6_bind): a link-scoped address without an interface is

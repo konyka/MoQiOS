@@ -31,7 +31,7 @@ pub fn handleRxPacket(data: [*]const u8, len: u32) void {
     handleRxPacketOn(data, len, @intCast(@import("bind_addr_policy.zig").NIC_IFINDEX));
 }
 
-/// handleRxPacket for a frame that arrived on interface `ifindex` (1 lo, 2 the NIC); IPv4 group delivery depends on it.
+/// handleRxPacket for a frame that arrived on interface `ifindex` (1 lo, 2 the NIC); UDP group delivery depends on it.
 pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
     if (len < 14) return;
 
@@ -74,7 +74,7 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
                     tcp.handlePacketV6(info6.src_ip, info6.dst_ip, data + payload_start6, info6.payload_len, info6.ecn_ce);
                 },
                 ipv6.PROTO_UDP => {
-                    udp.handlePacketV6(info6.src_ip, info6.dst_ip, data + payload_start6, info6.payload_len);
+                    udp.handlePacketV6On(info6.src_ip, info6.dst_ip, data + payload_start6, info6.payload_len, ifindex);
                 },
                 else => {},
             }

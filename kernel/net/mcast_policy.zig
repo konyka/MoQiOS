@@ -89,9 +89,10 @@ pub fn socketAccepts(m: *const Membership, mc_all: bool, group: [16]u8) bool {
 }
 
 /// Whether a socket bound to `bound` (and connected to `peer_ip`:`peer_port` when that port is nonzero) is a candidate for a
-/// datagram from `src_ip`:`src_port` to `group` (__udp_v6_is_mcast_sock): bound to :: or to the group itself, and not connected
-/// to another peer.
-pub fn socketMatches(bound: [16]u8, group: [16]u8, peer_port: u16, peer_ip: [16]u8, src_ip: [16]u8, src_port: u16) bool {
+/// datagram from `src_ip`:`src_port` to `group` that arrived on interface `dif` (__udp_v6_is_mcast_sock): bound to :: or to the
+/// group itself, not connected to another peer, and not tied to another interface (`bound_dev`, 0 for none).
+pub fn socketMatches(bound: [16]u8, group: [16]u8, peer_port: u16, peer_ip: [16]u8, src_ip: [16]u8, src_port: u16, bound_dev: u8, dif: u8) bool {
+    if (bound_dev != 0 and bound_dev != dif) return false;
     if (@as(u128, @bitCast(bound)) != 0 and !eql(bound, group)) return false;
     if (peer_port != 0 and (peer_port != src_port or !eql(peer_ip, src_ip))) return false;
     return true;

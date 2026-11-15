@@ -4482,11 +4482,11 @@ test "IPv6 UDP multicast: IPV6_MULTICAST_* options, group membership, member-onl
     const wild: [16]u8 = @splat(0);
     var src: [16]u8 = @splat(0);
     src[15] = 9;
-    try std.testing.expect(m.socketMatches(wild, g1, 0, wild, src, 5));
-    try std.testing.expect(m.socketMatches(g1, g1, 0, wild, src, 5));
-    try std.testing.expect(!m.socketMatches(g2, g1, 0, wild, src, 5));
-    try std.testing.expect(!m.socketMatches(wild, g1, 7, src, src, 5));
-    try std.testing.expect(m.socketMatches(wild, g1, 5, src, src, 5));
+    try std.testing.expect(m.socketMatches(wild, g1, 0, wild, src, 5, 0, 2));
+    try std.testing.expect(m.socketMatches(g1, g1, 0, wild, src, 5, 0, 2));
+    try std.testing.expect(!m.socketMatches(g2, g1, 0, wild, src, 5, 0, 2));
+    try std.testing.expect(!m.socketMatches(wild, g1, 7, src, src, 5, 0, 2));
+    try std.testing.expect(m.socketMatches(wild, g1, 5, src, src, 5, 0, 2));
     try std.testing.expect(m.socketAccepts(&mem, true, g1));
     try std.testing.expect(!m.socketAccepts(&mem, false, g1));
     var allnodes: [16]u8 = @splat(0);
@@ -4498,11 +4498,11 @@ test "IPv6 UDP multicast: IPV6_MULTICAST_* options, group membership, member-onl
     try std.testing.expectEqual(@as(u8, 1), m.outInterface(1));
 
     const us = kt.udp_source;
-    try std.testing.expect(std.mem.indexOf(u8, us, "    if (mcast.isMulticast(dst_ip)) {\n        enqueueMcast(hdr.dst_port, src_ip, hdr.src_port, dst_ip, data[8..][0..actual_payload]);\n        return;\n    }\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "        if (!mcast.alwaysJoined(group) and !hostJoinedLocked(group, null)) return;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    if (mcast.isMulticast(dst_ip)) {\n        enqueueMcast(hdr.dst_port, src_ip, hdr.src_port, dst_ip, data[8..][0..actual_payload], ifindex);\n        return;\n    }\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "        if (!mcast.alwaysJoined(group) and !hostJoinedLocked(group, ifindex)) return;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "            if (!mcast.socketAccepts(&port_mc[i], port_opts[i].ip.mc_all, group)) continue;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    if (group) send_pkt[14 + 7] = opts.mc_hops;\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "    if (group and opts.mc_loop and (mcast.alwaysJoined(dst_ip) or hostJoined(dst_ip, mcast.outInterface(opts.mc_if)))) _ = lo.sendPacket(&send_pkt, frame_len);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    const out_if6 = mcast.outInterface(opts.mc_if);\n    if (group and opts.mc_loop and (mcast.alwaysJoined(dst_ip) or hostJoined(dst_ip, out_if6))) _ = lo.sendPacketOn(&send_pkt, frame_len, out_if6);\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    port_mc[ni] = port_mc[oi];\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "            port_mc[i] = port_mc[num_ports];\n") != null);
     const so = kt.socket_opt_source;
@@ -4673,6 +4673,73 @@ test "multicast outgoing interface: IP_MULTICAST_IF lo sends out lo only, IPV6_M
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "const unreach6 = udp.sendErrno6(src_key, dst6);\n"));
     try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketOn(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, ifindex);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.lo_source, "net_mod.handleRxPacketOn(&buf, n, ifindex);") != null);
+}
+
+test "IPv6 bind ties a link-scoped socket to its sin6_scope_id interface: separate ports per interface, receive filter, getsockname scope, no stream multicast bind (hello364)" {
+    const bp = kt.bind_addr_policy;
+    var ll: [16]u8 = @splat(0);
+    ll[0] = 0xfe;
+    ll[1] = 0x80;
+    ll[15] = 1;
+    var ff01: [16]u8 = @splat(0);
+    ff01[0] = 0xff;
+    ff01[1] = 0x01;
+    ff01[15] = 1;
+    var ff02: [16]u8 = @splat(0);
+    ff02[0] = 0xff;
+    ff02[1] = 0x02;
+    ff02[15] = 1;
+    var glob: [16]u8 = @splat(0);
+    glob[0] = 0x20;
+    glob[1] = 0x01;
+    glob[15] = 7;
+    var ff05: [16]u8 = @splat(0);
+    ff05[0] = 0xff;
+    ff05[1] = 0x05;
+    ff05[15] = 1;
+    // Interface-local multicast needs a scope too (__ipv6_addr_needs_scope_id).
+    try std.testing.expect(bp.needsScope6(ff01) and bp.needsScope6(ff02) and bp.needsScope6(ll));
+    try std.testing.expect(!bp.needsScope6(glob) and !bp.needsScope6(ff05));
+    // sk_bound_dev_if comes from sin6_scope_id only for an address that needs a scope.
+    try std.testing.expectEqual(@as(u8, 1), bp.boundDev6(ff02, 1));
+    try std.testing.expectEqual(@as(u8, 2), bp.boundDev6(ll, 2));
+    try std.testing.expectEqual(@as(u8, 0), bp.boundDev6(glob, 2));
+    try std.testing.expectEqual(@as(u8, 0), bp.boundDev6(ff05, 1));
+    // inet_bind_conflict: different interfaces never conflict; an unbound one conflicts with any.
+    try std.testing.expect(!bp.boundDevsConflict(1, 2));
+    try std.testing.expect(bp.boundDevsConflict(1, 1));
+    try std.testing.expect(bp.boundDevsConflict(0, 2) and bp.boundDevsConflict(1, 0) and bp.boundDevsConflict(0, 0));
+    // __inet6_bind: a stream socket cannot bind a multicast address.
+    try std.testing.expectEqual(bp.EINVAL, bp.streamBindErrno6(ff02));
+    try std.testing.expectEqual(bp.EINVAL, bp.streamBindErrno6(ff05));
+    try std.testing.expectEqual(@as(i64, 0), bp.streamBindErrno6(glob));
+    try std.testing.expectEqual(@as(i64, 0), bp.streamBindErrno6(ll));
+    // __udp_v6_is_mcast_sock: a socket tied to an interface takes only datagrams that arrived on it.
+    const m = kt.mcast_policy;
+    const wild: [16]u8 = @splat(0);
+    try std.testing.expect(m.socketMatches(ff02, ff02, 0, wild, glob, 5, 1, 1));
+    try std.testing.expect(!m.socketMatches(ff02, ff02, 0, wild, glob, 5, 1, 2));
+    try std.testing.expect(!m.socketMatches(ff02, ff02, 0, wild, glob, 5, 2, 1));
+    try std.testing.expect(m.socketMatches(ff02, ff02, 0, wild, glob, 5, 0, 1));
+    // getsockname reports the interface the socket is tied to.
+    const sa = kt.sockaddr_util;
+    try std.testing.expectEqual(@as(u32, 1), sa.boundScope6(ff02, 1));
+    try std.testing.expectEqual(sa.nameScope6(ff02), sa.boundScope6(ff02, 0));
+    try std.testing.expectEqual(@as(u32, 0), sa.boundScope6(glob, 0));
+    try std.testing.expectEqual(@as(u32, 0), sa.boundScope6(glob, 1));
+
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (port_v6[j] and port_v6[oi] and !@import(\"bind_addr_policy.zig\").boundDevsConflict(dev6, port_dev6[j])) continue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    port_dev6[ni] = dev6;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "            port_dev6[i] = port_dev6[num_ports];\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    port_dev6[idx] = 0;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "port_peer_ip[i], src_ip, src_port, port_dev6[i], ifindex)) continue;") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "parsed.addr, bind_addr_policy.boundDev6(parsed.addr, parsed.scope_id));") != null);
+    const stream_at = std.mem.indexOf(u8, ss, "const stream_rc = bind_addr_policy.streamBindErrno6(parsed.addr);").?;
+    try std.testing.expect(stream_at < std.mem.indexOfPos(u8, ss, stream_at, "inet6ScopeErrno(parsed.addr").?);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "sa.writeInet6(&sa_buf, desc.udp_port, our6, sa.boundScope6(our6, udp.boundDev6(desc.udpKey())))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketV6On(") != null);
 }
 
 test "an IPv6 TCP socket's bound address takes part in conflicts, listener choice, lookup, source address and naming (hello359)" {
@@ -4886,7 +4953,7 @@ test "a UDP socket keeps its bound IPv4 address: getsockname and the datagram so
     try std.testing.expect(std.mem.indexOf(u8, us, "    const our_ip = if (mcast.multicastSource4(group, bound, opts4.mc4_addr)) |a| a else @import(\"tcp_port_policy.zig\").sourceAddr(bound, dst_ip, netif.getOurIp());\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    return sendToFrom(.{ 0, 0, 0, 0 }, dst_ip, dst_port, src_port, data, data_len);\n") != null);
     const ss = kt.socket_syscall_source;
-    try std.testing.expect(std.mem.indexOf(u8, ss, "        return udpRebind(t, fd, new_port, .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] }, @splat(0));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "        return udpRebind(t, fd, new_port, .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] }, @splat(0), 0);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "    if (rc != 0) return rc;\n    d.udp_local_ip = addr;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "const our4 = net_mod.tcp_port_policy.nameAddr(desc.udp_local_ip, desc.udp_connected, desc.udp_dst_ip, netif.getOurIp());") != null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "udp.sendToFrom("));
@@ -11631,7 +11698,7 @@ test "TCP bind errors and SO_REUSEADDR sharing" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n        return net_mod.tcp.tcpBindAddr46(tcb_idx, parsed.port, net_mod.tcp_port_policy.WILDCARD4, parsed.addr);"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n    return net_mod.tcp.tcpBindAddr(tcb_idx, port, .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] });"));
     // UDP (IPv4 and IPv6) refuses a privileged port the same way; no bare -1 is left in any bind path.
-    try std.testing.expect(std.mem.indexOf(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n            return udpRebind(t, fd, parsed.port, .{ 0, 0, 0, 0 }, parsed.addr);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n            return udpRebind(t, fd, parsed.port, .{ 0, 0, 0, 0 }, parsed.addr, bind_addr_policy.boundDev6(parsed.addr, parsed.scope_id));") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(new_port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;") != null);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ss, "!cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return -1;"));
     // hello183 runs as uid 0 with only CAP_SETUID so the child's setuid leaves it unprivileged.
@@ -12739,13 +12806,13 @@ test "udp port sharing: without SO_REUSEPORT on every socket the newest bound on
 
 test "udp: bind moves the registration with its options and sharing goes through udp.rebind" {
     const us = kt.udp_source;
-    try std.testing.expect(std.mem.indexOf(u8, us, "pub fn rebind(old_key: u32, new_port: u16, addr: [4]u8, addr6: [16]u8, out_disc: *u16) i64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "pub fn rebind(old_key: u32, new_port: u16, addr: [4]u8, addr6: [16]u8, dev6: u8, out_disc: *u16) i64") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "@import(\"udp_port_policy.zig\").mayShare(mine.flags, port_opts[j].flags, uid, port_uid[j])") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "port_opts[ni] = mine;") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "policy.pickReceiverConnected(info[0..n], src_ip, src_port)") != null);
     const ss = kt.socket_syscall_source;
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "return udpRebind(t, fd,"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "const rc = udp.rebind(old_key, new_port, addr, addr6, &disc);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "const rc = udp.rebind(old_key, new_port, addr, addr6, dev6, &disc);"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ss, "udp.ensurePortExclusive(parsed.port)"));
 }
 

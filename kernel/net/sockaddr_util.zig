@@ -95,6 +95,12 @@ pub fn nameScope6(addr: [16]u8) u32 {
     return if (bp.needsScope6(addr)) bp.NIC_IFINDEX else 0;
 }
 
+/// The sin6_scope_id of a socket's own name: the interface it is tied to when its address needs a scope, else nameScope6.
+pub fn boundScope6(addr: [16]u8, bound_dev: u8) u32 {
+    const bp = @import("bind_addr_policy.zig");
+    return if (bound_dev != 0 and bp.needsScope6(addr)) bound_dev else nameScope6(addr);
+}
+
 /// Encode a local/peer name for UDP or TCP (SK-73/78). Same sockaddr layout; a link-scoped IPv6 address names the NIC (nameScope6).
 pub fn encodeInetName(is_v6: bool, port: u16, ip4: [4]u8, ip6: [16]u8, out: []u8) u32 {
     if (is_v6) return writeInet6(out, port, ip6, nameScope6(ip6));

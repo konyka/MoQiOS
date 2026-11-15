@@ -72,6 +72,16 @@ var port_local_ip6: [MAX_PORTS][16]u8 = @splat(@splat(0));
 var port_mc: [MAX_PORTS]mcast.Membership = @splat(.{});
 /// IPv4 multicast groups each slot joined (IP_ADD_MEMBERSHIP).
 var port_mc4: [MAX_PORTS]mcast.Membership4 = @splat(.{});
+/// The interface an IPv6 slot is tied to by binding a scoped address (Linux sk_bound_dev_if), 0 for none.
+var port_dev6: [MAX_PORTS]u8 = @splat(0);
+
+/// The interface the socket with registry key `port` is tied to, 0 for none (or when it is gone).
+pub fn boundDev6(port: u32) u8 {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return 0;
+    return port_dev6[i];
+}
 
 /// Options of the socket bound to `port`, or null if it is not registered.
 pub fn getPortOpts(port: u32) ?@import("sockopt_policy.zig").Stored {
@@ -252,6 +262,7 @@ fn newSlotLocked(key: u32, is_v6: bool, uid: u32) u16 {
     port_local_ip6[idx] = @splat(0);
     port_mc[idx] = .{};
     port_mc4[idx] = .{};
+    port_dev6[idx] = 0;
     for (0..QUEUE_DEPTH) |j| queues[idx][j].valid = false;
     num_ports += 1;
     return @intCast(idx);
@@ -283,10 +294,11 @@ pub fn ensurePortExclusive(port: u16, is_v6: bool, uid: u32) u16 {
 
 /// bind() on a UDP socket already registered under `old_key`: move it to `new_port`, keeping its options (SO_REUSEADDR / SO_REUSEPORT are
 /// set before bind) and recording the IPv4 address `addr` it is bound to. A port another socket holds can be joined only when the sharing
-/// policy allows it with every holder whose address conflicts (tcp_port_policy.addrsConflict; IPv6 sockets always conflict). On success
+/// policy allows it with every holder whose address conflicts (tcp_port_policy.addrsConflict, addrsConflict6 for IPv6). On success
 /// returns 0 and the socket's new discriminator in `out_disc`; -98 (EADDRINUSE) when the port is taken or the table is full, -9 when
-/// `old_key` is gone.
-pub fn rebind(old_key: u32, new_port: u16, addr: [4]u8, addr6: [16]u8, out_disc: *u16) i64 {
+/// `old_key` is gone. `dev6` is the interface a scoped IPv6 address ties the socket to (0 for none): two IPv6 sockets tied to
+/// different interfaces do not conflict (bind_addr_policy.boundDevsConflict).
+pub fn rebind(old_key: u32, new_port: u16, addr: [4]u8, addr6: [16]u8, dev6: u8, out_disc: *u16) i64 {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
 
@@ -295,6 +307,7 @@ pub fn rebind(old_key: u32, new_port: u16, addr: [4]u8, addr6: [16]u8, out_disc:
         out_disc.* = @truncate(old_key >> 16);
         port_local_ip[oi] = addr;
         port_local_ip6[oi] = addr6;
+        port_dev6[oi] = dev6;
         return 0;
     }
     const mine = port_opts[oi];
@@ -304,6 +317,7 @@ pub fn rebind(old_key: u32, new_port: u16, addr: [4]u8, addr6: [16]u8, out_disc:
         if (portNumber(ports[j]) != new_port) continue;
         used |= @as(u64, 1) << @intCast(ports[j] >> 16);
         if (!port_v6[j] and !port_v6[oi] and !@import("tcp_port_policy.zig").addrsConflict(addr, port_local_ip[j])) continue;
+        if (port_v6[j] and port_v6[oi] and !@import("bind_addr_policy.zig").boundDevsConflict(dev6, port_dev6[j])) continue;
         if (port_v6[j] and port_v6[oi] and !@import("tcp_port_policy.zig").addrsConflict6(addr6, port_local_ip6[j])) continue;
         if (!@import("udp_port_policy.zig").mayShare(mine.flags, port_opts[j].flags, uid, port_uid[j])) return -98;
     }
@@ -313,6 +327,7 @@ pub fn rebind(old_key: u32, new_port: u16, addr: [4]u8, addr6: [16]u8, out_disc:
     port_opts[ni] = mine;
     port_local_ip[ni] = addr;
     port_local_ip6[ni] = addr6;
+    port_dev6[ni] = dev6;
     port_mc[ni] = port_mc[oi];
     port_mc4[ni] = port_mc4[oi];
     releaseLocked(old_key);
@@ -366,6 +381,8 @@ fn releaseLocked(port: u32) void {
             port_mc[num_ports] = .{};
             port_mc4[i] = port_mc4[num_ports];
             port_mc4[num_ports] = .{};
+            port_dev6[i] = port_dev6[num_ports];
+            port_dev6[num_ports] = 0;
             port_err[num_ports] = 0;
             port_peer[num_ports] = 0;
             queues[i] = queues[num_ports];
@@ -483,19 +500,20 @@ fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, dst_ip: [4]u
 }
 
 /// An IPv6 datagram to a multicast group goes to every IPv6 socket on its port that mcast_policy.socketMatches and socketAccepts, a
-/// copy each (Linux __udp6_lib_mcast_deliver), and only when this host is a member of the group (ip6_mc_input) or the group is
-/// all-nodes. Nobody taking it is not an error: a group datagram never draws an ICMP port unreachable.
-fn enqueueMcast(port: u16, src_ip: [16]u8, src_port: u16, group: [16]u8, payload: []const u8) void {
+/// copy each (Linux __udp6_lib_mcast_deliver), and only when this host is a member of the group on `ifindex`, the interface it
+/// arrived on (ip6_mc_input), or the group is all-nodes. Nobody taking it is not an error: a group datagram never draws an ICMP port
+/// unreachable.
+fn enqueueMcast(port: u16, src_ip: [16]u8, src_port: u16, group: [16]u8, payload: []const u8, ifindex: u8) void {
     var keys: [MAX_PORTS]u32 = undefined;
     var n: usize = 0;
     {
         const saved = udp_lock.acquire();
         defer udp_lock.release(saved);
-        if (!mcast.alwaysJoined(group) and !hostJoinedLocked(group, null)) return;
+        if (!mcast.alwaysJoined(group) and !hostJoinedLocked(group, ifindex)) return;
         const actual = @min(payload.len, MAX_UDP_PAYLOAD);
         for (0..num_ports) |i| {
             if (portNumber(ports[i]) != port or !port_v6[i]) continue;
-            if (!mcast.socketMatches(port_local_ip6[i], group, port_peer[i], port_peer_ip[i], src_ip, src_port)) continue;
+            if (!mcast.socketMatches(port_local_ip6[i], group, port_peer[i], port_peer_ip[i], src_ip, src_port, port_dev6[i], ifindex)) continue;
             if (!mcast.socketAccepts(&port_mc[i], port_opts[i].ip.mc_all, group)) continue;
             for (0..QUEUE_DEPTH) |j| {
                 const e = &queues[i][j];
@@ -610,6 +628,11 @@ fn sendPortUnreachable(src_ip: [4]u8, dst_ip: [4]u8, udp: [*]const u8, udp_len: 
 
 /// IPv6 UDP receive (SK-70). Bound-port-only; checksum verified when non-zero.
 pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32) void {
+    handlePacketV6On(src_ip, dst_ip, data, len, @intCast(@import("bind_addr_policy.zig").NIC_IFINDEX));
+}
+
+/// handlePacketV6 for a datagram that arrived on interface `ifindex` (1 lo, 2 the NIC).
+pub fn handlePacketV6On(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32, ifindex: u8) void {
     const hdr = udp_util.parseHeader(data, len) orelse return;
     if (hdr.udp_len < udp_util.HEADER_LEN or hdr.udp_len > len) return;
 
@@ -622,7 +645,7 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
     const actual_payload = @min(hdr.payload_len, @as(u16, MAX_UDP_PAYLOAD_V6));
     if (8 + actual_payload > len) return;
     if (mcast.isMulticast(dst_ip)) {
-        enqueueMcast(hdr.dst_port, src_ip, hdr.src_port, dst_ip, data[8..][0..actual_payload]);
+        enqueueMcast(hdr.dst_port, src_ip, hdr.src_port, dst_ip, data[8..][0..actual_payload], ifindex);
         return;
     }
     const bound = enqueue(hdr.dst_port, src_ip, hdr.src_port, hdr.dst_port, .{ 0, 0, 0, 0 }, dst_ip, data[8..][0..actual_payload], true);
@@ -842,9 +865,10 @@ pub fn sendToV6From(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, 
     // A datagram to a group carries IPV6_MULTICAST_HOPS (default 1), not the unicast hop limit.
     if (group) send_pkt[14 + 7] = opts.mc_hops;
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + udp_total);
-    // IPV6_MULTICAST_LOOP: when this host is a member of the group on the outgoing interface a copy is delivered locally too
-    // (Linux ip6_finish_output2 checks ipv6_chk_mcast_addr on the device).
-    if (group and opts.mc_loop and (mcast.alwaysJoined(dst_ip) or hostJoined(dst_ip, mcast.outInterface(opts.mc_if)))) _ = lo.sendPacket(&send_pkt, frame_len);
+    // IPV6_MULTICAST_LOOP: when this host is a member of the group on the outgoing interface a copy is delivered locally too,
+    // arriving on that interface (Linux ip6_finish_output2 checks ipv6_chk_mcast_addr on the device).
+    const out_if6 = mcast.outInterface(opts.mc_if);
+    if (group and opts.mc_loop and (mcast.alwaysJoined(dst_ip) or hostJoined(dst_ip, out_if6))) _ = lo.sendPacketOn(&send_pkt, frame_len, out_if6);
     const ok = if (is_loop) lo.sendPacket(&send_pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.
     if (ok) ipv6.noteFullSizeSend(dst_ip, ipv6.HEADER_LEN + udp_total);
