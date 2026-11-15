@@ -279,7 +279,9 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         const new_port = bo.readU16BeAt(&sock_addr, 2);
         if (bindAddrNotAvail4(.{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] })) return bind_addr_policy.EADDRNOTAVAIL;
         if (net_mod.tcp_port_policy.bindNeedsPrivilege(new_port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
-        return udpRebind(t, fd, new_port);
+        const urc = udpRebind(t, fd, new_port);
+        if (urc == 0) t.fd_table.fds[fd].udp_local_ip = .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] };
+        return urc;
     }
 
     if (t.fd_table.fds[fd].fd_type != .tcp_socket) return -88; // ENOTSOCK
@@ -484,7 +486,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         } else {
             return -89; // EDESTADDRREQ — unconnected UDP socket, no destination given
         }
-        if (udp.sendTo(dst_ip, dst_port, src_port, &tmp_buf2, @intCast(n2))) {
+        if (udp.sendToFrom(t.fd_table.fds[fd].udp_local_ip, dst_ip, dst_port, src_port, &tmp_buf2, @intCast(n2))) {
             return @intCast(n2);
         } else {
             return -1;
@@ -867,7 +869,7 @@ pub fn getsockname(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
 
     if (desc.fd_type == .udp_socket) {
         var sa_buf: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
-        const our4 = netif.getOurIp();
+        const our4 = net_mod.tcp_port_policy.nameAddr(desc.udp_local_ip, desc.udp_connected, desc.udp_dst_ip, netif.getOurIp());
         // SK-86: prefer preferred global when reporting the local UDP name.
         const our6 = ndp.getGlobalAddress() orelse ndp.generateLinkLocal(netif.getMac());
         const alen = sa.encodeUdpName(desc.udp_is_v6, desc.udp_port, our4, our6, &sa_buf);
@@ -1253,7 +1255,7 @@ fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32) i64 
         dst_port = d.udp_dst_port;
     } else return -89;
     const n = @min(payload.len, 1472);
-    return if (udp.sendTo(dst_ip, dst_port, src_port, payload.ptr, @intCast(n))) @intCast(n) else -1;
+    return if (udp.sendToFrom(d.udp_local_ip, dst_ip, dst_port, src_port, payload.ptr, @intCast(n))) @intCast(n) else -1;
 }
 
 /// recvmsg on a UDP socket: wait like recvfrom, scatter the datagram over the

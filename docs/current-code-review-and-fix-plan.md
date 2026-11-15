@@ -5940,7 +5940,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 方法（如实）：这一轮没有凭记忆写预期值，而是先在宿主机上用 `gcc` 写了对照程序跑真实 Linux，取它的返回值当标准，再写 hello184；这避免了我自己记错 errno（例如我原先以为 `shutdown` 在监听者上也要 `ENOTCONN`，对照后发现 Linux 返回 0）。
 - 修复：见 `docs/kernel-subsystems.md` 的 hello184 条。
 - 排查过程（如实）：①第一次跑 hello184 的 8 项失败里，B 段“bind 非 AF_INET 地址”那一项一开始让我以为是 bind 漏检；加了 B2 段（用真实布局 `02 00` 的地址 bind/listen/connect）后，B2 的 `connect` 失败了，这才暴露字节序问题：`connect` 的地址族检查在读 `00 02` 之外一律拒绝。②改了读取字节序以后，**hello22/hello26/hello27/hello85 立刻失败**（它们的地址写成 `00 02`，一直在靠错误的字节序通过），说明这些旧测试是在固化 bug；我把它们的地址改成 `02 00`，连同 23 个把地址写成 `a[1] = 2` 的探测程序一起改。③`sendErrno` 里 `established_ever` 参数不再影响结果（现在两种情况都是 `EPIPE`），保留参数只是为了不改调用方，函数里用 `_ = established_ever;` 丢弃。
-- 已知差异：UDP `sendto` 的地址、`sendmsg` 的 `msg_name` 对 IPv4 地址族不做检查（`SOCKADDR_IN_MIN_LEN` 以上直接取端口和地址）；`connect` 到不可达地址的 errno 取决于网络栈；`getsockname` 对新套接字返回内核自己的地址表示（Linux 返回 `0.0.0.0:0`，这里返回本机 IP 和端口 0），没有改。（hello345 起 TCP 已改为 `0.0.0.0`；UDP 仍报告本机 IP。）
+- 已知差异：UDP `sendto` 的地址、`sendmsg` 的 `msg_name` 对 IPv4 地址族不做检查（`SOCKADDR_IN_MIN_LEN` 以上直接取端口和地址）；`connect` 到不可达地址的 errno 取决于网络栈；`getsockname` 对新套接字返回内核自己的地址表示（Linux 返回 `0.0.0.0:0`，这里返回本机 IP 和端口 0），没有改。（hello345 起 TCP、hello347 起 UDP 都已改为 `0.0.0.0`。）
 - TDD：host 新增 1 个测试（五个状态规则对全部 11 个状态的穷举、地址族字节序、三处小端读取与零处大端读取、各入口的接线）并更新了 `sendErrno` 的旧测试（旧断言“从未连接是 `ENOTCONN`”与 Linux 不符）；hello184（A 未连接的套接字、B 地址族与短地址、B2 真实布局的地址、C 监听者、D 已建立连接、E `SHUT_WR` 之后）在旧内核上 8 项 FAIL（B2 的 connect 也失败），新内核 PASS。
 - 变异（具名测试核对）：`accept`/`listen`/`shutdown` 在任何状态都成功、监听者有对端、`shutdown` 不看状态、未连接的 `send` 又变回 `ENOTCONN`、四个入口里各自的检查被删（`accept`、`listen`、`shutdown`、`getpeername`）、`bind` 不检查地址族、UDP `connect` 按大端读地址族，共 12 个，全部被 `TCP socket-state errnos…`（一个同时被旧的 `tcp send errors…` 抓住）抓住。其中 3 个第一次因未使用参数编译失败，改成可编译形式后抓住；恢复后 `grep -c MUTATION` 为 0。
 - 验证：host 856/856；x86_64/riscv64/aarch64 构建通过；冒烟 SMP=1、SMP=8（连续 3 次）与 GPT SMP=2 均 hello184 PASS，**且 hello22/26/27/85 以及其余所有 TCP/UDP 探测在新的地址族字节序下全部 PASS**、0 个 FAIL；stress（SMP=2）5/5 PASS。
@@ -9365,7 +9365,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 只做了 IPv4。IPv6 TCB 仍不记录本地地址，`[::1]:p` 和 `[::]:p` 仍算同一个端口，getsockname 仍按对端选源地址。
   2. ~~已建立连接的查找（`findTcbByTuple`）和 connect 的 4 元组检查（`connectTupleTaken`）仍只看本地端口和对端，不看本地地址；两个本地地址不同、端口相同的连接如果连向同一对端会被当作同一个 4 元组。~~（hello346 已补上 IPv4。）
   3. 绑定网卡地址、对端在回环上（或反过来）的组合按 `sourceAddr` 选源地址，没有做 Linux 那样的路由检查和 `EINVAL`。
-  4. UDP 的 getsockname 仍报告网卡地址，UDP 端口冲突也不区分本地地址。
+  4. UDP 的 getsockname 仍报告网卡地址，UDP 端口冲突也不区分本地地址。（hello347 已补上 getsockname 和源地址；端口冲突仍不区分本地地址。）
 
 ## 补充：只有本地地址不同的 TCP 连接是两个连接（hello346）
 
@@ -9380,3 +9380,19 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 这次修复带来的局限：
   1. 仍只做了 IPv4，IPv6 连接查找不看本地地址。
   2. 非回环连接里，未绑定或绑定回环地址的连接接受发往任何本地地址的段；本机只有一个网卡地址，这不会混淆，但多地址时需要记录实际源地址。
+
+## 补充：UDP 套接字记住绑定的 IPv4 地址（hello347）
+
+- 背景：hello345 一节局限 4。UDP 描述符不记录绑定地址：getsockname 总报告网卡地址（新套接字、通配绑定、回环绑定都是 `10.0.2.15`）；回环数据报的源地址等于目的地址，绑定 127.0.0.5 的套接字发出的数据报源地址却是 127.0.0.1（目的地址），未绑定套接字发往 127.0.0.2 的源地址是 127.0.0.2。
+- Linux 实测（`gcc -DHOST user/hello347.c`，端口 18900–18902）：A 绑 `127.0.0.2:18900` 的套接字名字是 127.0.0.2，绑 `0.0.0.0:18901` 的是 `0.0.0.0`；B 绑 `127.0.0.5:18902` 的套接字发往 127.0.0.1，收到的源地址是 `127.0.0.5:18902`；C 未绑定的套接字发往 127.0.0.2，源地址是 127.0.0.1；D 未绑定、未发送的套接字名字是 `0.0.0.0`。
+- 红灯（未改的内核，SMP=2）：4 项都失败（A、D 报告 10.0.2.15；B 源地址 127.0.0.1；C 源地址 127.0.0.2）。
+- 修复（`kernel/fs/vfs.zig`、`kernel/net/udp.zig`、`kernel/net/socket_syscall.zig`）：
+  1. 描述符新增 `udp_local_ip`（默认 `0.0.0.0`）；IPv4 bind 成功后记下地址。
+  2. `udp.sendToFrom(bound, ...)`：源地址用 hello345 的 `tcp_port_policy.sourceAddr`；`sendTo` 保留给内核自己的 DNS、DHCP，等于从通配地址发送。sendto 和 sendmsg 两条用户路径改调 `sendToFrom`。
+  3. getsockname 的 IPv4 地址改用 `tcp_port_policy.nameAddr`：有绑定地址报告它，已 connect 报告源地址，否则 `0.0.0.0`。
+- 测试：hello347（QEMU，4 项），定向 SMP=2、SMP=4 各一份通过；host 测试「a UDP socket keeps its bound IPv4 address: getsockname and the datagram source (hello347)」检查接线（两条用户发送路径都走 `sendToFrom`、没有遗漏的 `udp.sendTo(`）；已有的「udp: bind moves the registration ...」按新的 `const urc = udpRebind(...)` 更新。变异验证：getsockname 改回报告网卡地址，这条 host 测试失败，文件已恢复。
+- 完整 smoke：四份（SMP=1、4、4、2）里三份 EXIT=0、309 PASS；一份 SMP=4 只有 hello269「no single round stalls for seconds」失败（最慢一轮 5274 ms，已记录的偶发项，这次改动只涉及 UDP），308 PASS；hello347 四份都通过，corrupted canaries 均为 0。riscv64、aarch64 smoke 都是 EXIT=0。
+- 这次修复带来的局限：
+  1. UDP 端口冲突和收包分派仍不区分本地地址：两个套接字绑 `127.0.0.1:p` 和 `127.0.0.2:p` 仍冲突，发往任何本地地址的数据报都交给端口上的套接字。
+  2. 只做了 IPv4；IPv6 UDP 的 getsockname 仍报告首选全局地址或链路本地地址。
+  3. 已 connect 的未绑定套接字的名字按 `sourceAddr` 计算，没有做路由查找。

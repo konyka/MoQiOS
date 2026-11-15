@@ -4358,6 +4358,20 @@ test "an IPv4 and an IPv6 TCP socket do not conflict on one port (hello344)" {
     try std.testing.expect(std.mem.indexOf(u8, ts, "        if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict\n        if (!tcp_port_policy.familiesConflict(tcb.is_v6, tcbs[i].is_v6)) continue;\n") != null);
 }
 
+test "a UDP socket keeps its bound IPv4 address: getsockname and the datagram source (hello347)" {
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "    const our_ip = @import(\"tcp_port_policy.zig\").sourceAddr(bound, dst_ip, netif.getOurIp());\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    return sendToFrom(.{ 0, 0, 0, 0 }, dst_ip, dst_port, src_port, data, data_len);\n") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (urc == 0) t.fd_table.fds[fd].udp_local_ip = .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const our4 = net_mod.tcp_port_policy.nameAddr(desc.udp_local_ip, desc.udp_connected, desc.udp_dst_ip, netif.getOurIp());") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "udp.sendToFrom("));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ss, "udp.sendTo("));
+    const p = kt.tcp_port_policy;
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, p.nameAddr(.{ 0, 0, 0, 0 }, false, .{ 0, 0, 0, 0 }, .{ 10, 0, 2, 15 }));
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, p.sourceAddr(.{ 0, 0, 0, 0 }, .{ 127, 0, 0, 2 }, .{ 10, 0, 2, 15 }));
+}
+
 test "TCP connections that differ only in a local address are different connections (hello346)" {
     const p = kt.tcp_port_policy;
     const any = [4]u8{ 0, 0, 0, 0 };
@@ -12204,7 +12218,8 @@ test "udp: bind moves the registration with its options and sharing goes through
     try std.testing.expect(std.mem.indexOf(u8, us, "port_opts[ni] = mine;") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "policy.pickReceiverConnected(info[0..n], src_ip, src_port)") != null);
     const ss = kt.socket_syscall_source;
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "return udpRebind(t, fd,"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "return udpRebind(t, fd,"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "const urc = udpRebind(t, fd, new_port);"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ss, "udp.ensurePortExclusive(parsed.port)"));
 }
 

@@ -534,6 +534,12 @@ pub fn recvFromV6Ex(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[16]u8
 }
 
 pub fn sendTo(dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, data_len: u16) bool {
+    return sendToFrom(.{ 0, 0, 0, 0 }, dst_ip, dst_port, src_port, data, data_len);
+}
+
+/// sendTo from a socket bound to the IPv4 address `bound` (0.0.0.0 when unbound): the source address follows
+/// tcp_port_policy.sourceAddr, so a loopback datagram leaves from the bound loopback address or else 127.0.0.1.
+pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, data_len: u16) bool {
     if (data_len > MAX_UDP_PAYLOAD) return false;
 
     const our_mac = netif.getMac();
@@ -552,9 +558,9 @@ pub fn sendTo(dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, da
             return false;
         };
 
-    // Loopback datagrams also carry the 127/8 destination as source, so the
-    // peer's replies stay on lo and both directions are symmetric.
-    const our_ip = if (loopback) dst_ip else netif.getOurIp();
+    // A 127/8 destination is reached from the bound loopback address, else from 127.0.0.1 (Linux's local route), so the
+    // peer's replies stay on lo.
+    const our_ip = @import("tcp_port_policy.zig").sourceAddr(bound, dst_ip, netif.getOurIp());
     const udp_total: u16 = 8 + data_len;
     // SK-101/105: honor Path MTU (or armed oversized raise probe).
     if (ipv4.HEADER_LEN + udp_total > ipv4.getSendMtu(dst_ip)) return false;

@@ -463,6 +463,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello344"); /* an IPv4 and an IPv6 TCP socket may bind and listen on the same port */
     run_test("hello345"); /* a TCP socket keeps the IPv4 address it was bound to: per-address bind, SYN dispatch and getsockname */
     run_test("hello346"); /* TCP connections that differ only in a local address are different connections (lookup and connect 4-tuple) */
+    run_test("hello347"); /* a UDP socket keeps the IPv4 address it was bound to: getsockname and the datagram source */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */
