@@ -9489,4 +9489,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、316 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
 - 这次修复带来的局限：
   1. 指针为 NULL 时，偏移锁按 8 KiB 块持有，一次大复制的各块之间可能插入另一个进程的读写；Linux 对整个调用持锁。
-  2. mq 描述符的偏移和 `splice` 通过 `offsetOf`/`setOffsetOf` 的读改写仍不加偏移锁。
+  2. mq 描述符的偏移和 `splice` 通过 `offsetOf`/`setOffsetOf` 的读改写仍不加偏移锁。（`splice` 由 hello355 核对：给了偏移时不碰共享偏移；NULL 偏移时不加锁和 Linux 一致，不算缺陷。）
+
+## 补充：带显式偏移的 splice 和 sendfile 不动共享文件偏移（hello355，核对测试）
+
+- 背景：hello354 一节的局限 2 说 `splice` 通过 `offsetOf`/`setOffsetOf` 读改写偏移、不加偏移锁。复查 `kernel/fs/splice.zig`：给了 `off_in`/`off_out`（`sendfile` 给了 `offset`）时，偏移从用户指针读进局部变量，文件一端用 `readAtOffset`/`writeAtOffset`（ramdisk、tmpfs、只读卷直接按局部偏移读），最后写回指针，从不调用 `setOffsetOf`。只有偏移为 NULL 时才读改写描述符偏移。
+- Linux 对照：`fs/splice.c` 的 `splice` 和 `fs/read_write.c` 的 `do_sendfile` 用 `CLASS(fd, …)` 取描述符，不是 `fdget_pos`，所以 NULL 偏移时也不持 `f_pos_lock`：先读 `f_pos`，传输，再写回。MoQiOS 在 NULL 偏移时的行为和它一致，不算缺陷，这次不改。
+- Linux 实测（`gcc -DHOST user/hello355.c`，tmpfs `/tmp/hello355.dat` 4096 条 4 字节记录，父子进程通过管道同时起跑，每轮 3000 次 64 字节调用，子进程同时在共享描述上每次 4 字节顺序读）：A splice 文件→管道带 `off_in`、B splice 管道→文件带 `off_out`（写回原位已有的记录）、C sendfile 文件→管道带 `offset`，三轮里子进程都正好读到 4096 条、顺序不乱，每次调用的数据和偏移指针都对，结束后共享偏移是 16384；D 偏移为 NULL 时 splice、sendfile 都使用并推进描述符偏移（到 64）。全部通过。
+- MoQiOS：未改的内核上 SMP=2、SMP=4 各一份，hello355 全部通过。这是核对测试，没有内核改动，不是先红后绿。
+- 测试：hello355（QEMU，5 项）。新增 host 测试「splice and sendfile with an explicit offset move data at that offset and never move the shared file offset (hello355)」，钉住两处只在 NULL 偏移时才 `setOffsetOf`、`splicePipeToFile` 给了偏移时用 `writeAtOffset`、文件读用 `readAtOffset`，以及 `setOffsetOf(` 只出现 2 次。变异验证：把 `sendfile` 改成无论有没有偏移都 `setOffsetOf`，这条 host 测试失败，文件已恢复。
+- 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、317 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
+- 局限：偏移为 NULL 的并发 splice/sendfile 可能和同一描述上的 read 读到同一段数据，和 Linux 相同；mq 描述符偏移仍不加锁。

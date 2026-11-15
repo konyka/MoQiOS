@@ -4358,6 +4358,16 @@ test "an IPv4 and an IPv6 TCP socket do not conflict on one port (hello344)" {
     try std.testing.expect(std.mem.indexOf(u8, ts, "        if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict\n        if (!tcp_port_policy.familiesConflict(tcb.is_v6, tcbs[i].is_v6)) continue;\n") != null);
 }
 
+test "splice and sendfile with an explicit offset move data at that offset and never move the shared file offset (hello355)" {
+    const s = kt.splice_source;
+    try std.testing.expect(std.mem.indexOf(u8, s, "    if (!update_user_offset) vfs_mod.setOffsetOf(&fd_table.fds[in_fd], offset);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "    if (!update_user_offset) {\n        vfs_mod.setOffsetOf(&fd_table.fds[file_fd], offset);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "            const nwritten = if (explicit_offset)\n                fd_table.writeAtOffset(file_fd, &kbuf, to_write, file_offset)\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "    if (!explicit_offset) {\n        fd_table.fds[file_fd].offset = file_offset;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "            const n = fd_table.readAtOffset(fd, buf, count, offset.*);\n") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, s, "setOffsetOf("));
+}
+
 test "copy_file_range with offset pointers copies at its own positions and never moves the shared file offsets (hello354)" {
     const c = kt.copy_file_range_source;
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, c, "offsetOf("));
