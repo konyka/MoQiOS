@@ -189,11 +189,6 @@ pub fn socketAccepts4(m: *const Membership4, mc_all: bool, group: [4]u8, ifindex
     return joined4(m, group, ifindex) or mc_all;
 }
 
-/// An IPv6 datagram to a group cannot leave through lo: there is no multicast route on it (ENETUNREACH from ip6_dst_lookup).
-pub fn sendUnreachable6(mc_if: u8, dst: [16]u8) bool {
-    return isMulticast(dst) and mc_if == bap.LO_IFINDEX;
-}
-
 /// __udp_is_mcast_sock for IPv4: bound to 0.0.0.0 or the group, and not connected to another peer (the peer address is in the first
 /// 4 bytes of `peer_ip`).
 pub fn socketMatches4(bound: [4]u8, group: [4]u8, peer_port: u16, peer_ip: [16]u8, src_ip: [4]u8, src_port: u16) bool {

@@ -166,6 +166,12 @@ pub fn isMulticast(addr: [16]u8) bool {
     return addr[0] == 0xFF;
 }
 
+/// Whether a datagram to `dst` is sent from the link-local address: a link-local unicast destination or an interface- or
+/// link-local multicast group (RFC 6724 rule 2, a source of the destination's scope).
+pub fn wantsLinkLocalSource(dst: [16]u8) bool {
+    return isLinkLocal(dst) or (isMulticast(dst) and (dst[1] & 0x0f) <= 2);
+}
+
 /// Check whether an IPv6 address is the solicited-node multicast for the
 /// given target unicast address (ff02::1:ff00:0/104 + low 24 bits of target).
 pub fn isSolicitedNodeMulticast(addr: [16]u8, target: [16]u8) bool {

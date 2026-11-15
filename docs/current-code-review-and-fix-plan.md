@@ -9684,3 +9684,24 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. sendto 不看目的地址的 sin6_scope_id。Linux 实测：从绑在 %1 上的套接字发往 scope 0 的地址，以及发往 ff02::1%1，都返回 ENETUNREACH。
   2. IPv6 TCP 不记录绑定的接口。
   3. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
+
+## 补充：IPv6 sendto 和 connect 按 sin6_scope_id 选出接口（hello365）
+
+- 背景：hello364 的局限 1。IPv6 UDP 的 sendto 不看目的地址的 sin6_scope_id，也不看套接字绑定的接口，只在 `IPV6_MULTICAST_IF` 为 lo 时拒绝组播。connect 完全不检查 scope：发往 ff02::1 不带 scope 也能连上，scope 指向不存在的接口也能连上。
+- Linux 依据：udpv6_sendmsg 的 flowi6_oif 依次取 sin6_scope_id（仅对需要 scope 的地址）、sk_bound_dev_if、组播的 mcast_oif；ip6_dst_lookup 在 lo 上只有到 ::1 的路由，接口不存在时也是 ENETUNREACH。__ip6_datagram_connect 对需要 scope 的地址：scope 与已绑接口不同是 EINVAL，取 scope 写入 sk_bound_dev_if，组播无 scope 时用 mcast_oif，仍没有接口是 EINVAL；之后路由失败返回 ENETUNREACH，但 sk_bound_dev_if 已被写入。
+- 宿主机实测（Linux，`unshare -rn` 加 dummy 网卡 d0，方法写在 `user/hello365.c` 文件头）：S1、S2、S3、S4、R、C1–C7 共 12 项全部通过。其中 C6 的写法是先在宿主机上实测：IF 为 lo 时 connect ff02::1 失败后套接字已被绑到 lo，再 connect 全局单播地址也是 ENETUNREACH；connect ff0e::1 失败不绑接口，之后可以连全局地址。
+- 红灯（未修改的内核，SMP=2，hello365 临时放在 init 序列最前面）：S1、S2、S3、S4、C1、C3、C4、C5、C6 失败；R、C2、C7 通过。R、C2 在这里通过，是因为当时 SLAAC 还没有配好全局地址。第一次完整 smoke（hello365 排在 hello364 之后，全局地址已配好）里 R、C2、C6 失败：发往 ff02 组的数据报用全局地址作源地址，getsockname 也报告全局地址和 scope 0。
+- 修复：
+  1. `kernel/net/bind_addr_policy.zig`：新增 `ENETUNREACH`、`sendOif6`、`routeErrno6`、`Connect6`、`connectDev6`。
+  2. `kernel/net/udp.zig`：`sendErrno6` 换成 `sendOif6`（按注册键取 `port_dev6` 和 `IPV6_MULTICAST_IF`）；新增 `connectDev6`，在锁内写回绑定的接口；`sendToV6From` 多了 `oif` 参数，组播回送副本用它作到达接口。
+  3. `kernel/net/socket_syscall.zig`：sendto 和 sendmsg 的 IPv6 路径记下 `scope6`，用 `sendOif6` 加 `routeErrno6` 检查后把 `oif6` 传给 `sendToV6From`；IPv6 UDP connect 先调 `udp.connectDev6`，出错时直接返回，不标为已连接。
+  4. `kernel/net/mcast_policy.zig`：删去不再使用的 `sendUnreachable6`。
+  5. `kernel/net/ipv6.zig` 新增 `wantsLinkLocalSource`（链路本地单播和 ff01/ff02 范围的组播），`kernel/net/ndp.zig` 的 `selectSourceAddress` 改用它，链路范围的组播从链路本地地址发出（RFC 6724 规则 2）。`kernel/host_test.zig` 新增 `ndp_source`。
+- 测试：hello365（QEMU，12 项）；新增 host 测试「IPv6 send interface: sendto's sin6_scope_id, …(hello365)」。hello363 的 host 测试改为通过 `sendOif6`/`routeErrno6` 检查 lo 上没有组播路由，hello361、hello363、hello358 的钉住行改为新的调用形式，检查的行为没变。`zig build test` 全部通过（1262 个）。
+- 变异验证：`sendOif6` 忽略 sendto 的 scope，或 `connectDev6` 在路由失败时不保留接口，hello365 这条 host 测试都失败（1260/1262，另一条是还没更新的文档测试），文件已恢复。`wantsLinkLocalSource` 改为只看链路本地单播，hello365 这条 host 测试也失败（1261/1262），文件已恢复。
+- 完整 smoke：加上 `wantsLinkLocalSource` 之后的最终构建：SMP=2、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`。SMP=4 第一份里 hello365 PASS，但 hello314 A 失败（「the process CPU clock never goes backwards (1 of 11364 readings, worst 67 us)」），这一项和本次改动无关（本次没有碰调度和 CPU 时间）；同一构建重跑 SMP=4 通过。所有份里 hello365 都 PASS。本轮没有跑 riscv64、aarch64 smoke。
+- 这次修复带来的局限：
+  1. IPv6 TCP 仍不记录绑定的接口，connect 也不看 scope。
+  2. IPv6 UDP 还不支持 AF_UNSPEC 断开（family 不是 AF_INET6 时返回 EAFNOSUPPORT）。Linux 实测断开后接口被清掉（绑在 ff02::1%1 上的套接字 getsockname 的 scope 变为 0，之后 connect 到 %2 成功），由 connect 写入的接口也要随之清掉。
+  3. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
+  4. hello314 A（进程 CPU 时钟不倒退）在 SMP=4 上偶发失败一次：11364 次读数里倒退 1 次，最多 67 us。hello314 修复后的完整 smoke 里没见过，根因没有查；候选是 `groupTimesLocked` 对各成员分别取快照，成员切换时一个成员的片已折入、另一个的片还按旧时间算。

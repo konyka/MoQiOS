@@ -715,12 +715,12 @@ pub fn getGlobalAddress() ?[16]u8 {
 }
 
 /// Select IPv6 source address for `dst` (SK-86, RFC 6724 simplified).
-/// Link-local destinations use link-local source; otherwise prefer a
+/// Link-local destinations and link-scoped groups use link-local source; otherwise prefer a
 /// preferred global that shares a /64 with `dst`, else any preferred global,
 /// else fall back to link-local.
 pub fn selectSourceAddress(dst: [16]u8, mac: [6]u8) [16]u8 {
     const ll = generateLinkLocal(mac);
-    if (ipv6.isLinkLocal(dst)) return ll;
+    if (ipv6.wantsLinkLocalSource(dst)) return ll;
 
     const flags = ndp_lock.acquire();
     defer ndp_lock.release(flags);

@@ -61,6 +61,59 @@ pub fn boundDevsConflict(a: u8, b: u8) bool {
     return a == 0 or b == 0 or a == b;
 }
 
+pub const ENETUNREACH: i64 = -101;
+
+/// An interface index from a sin6_scope_id; one too large for any interface names none that exists.
+fn ifIndex8(scope_id: u32) u8 {
+    return if (scope_id > 255) 255 else @intCast(scope_id);
+}
+
+/// The interface an IPv6 datagram to `dst` leaves through (Linux udpv6_sendmsg's flowi6_oif): the sendto scope of an address that
+/// needs one, else the interface the socket is tied to, else IPV6_MULTICAST_IF for a group. 0 is the default route.
+pub fn sendOif6(dst: [16]u8, scope_id: u32, bound_dev: u8, mc_if: u8) u8 {
+    if (scope_id != 0 and needsScope6(dst)) return ifIndex8(scope_id);
+    if (bound_dev != 0) return bound_dev;
+    return if (dst[0] == 0xff) mc_if else 0;
+}
+
+/// Whether `dst` has a route out of interface `oif` (0 the default route): lo carries only ::1, the NIC everything, an interface
+/// that does not exist nothing (ENETUNREACH).
+pub fn routeErrno6(dst: [16]u8, oif: u8) i64 {
+    if (oif == 0 or oif == NIC_IFINDEX) return 0;
+    const loop6 = blk: {
+        var l: [16]u8 = @splat(0);
+        l[15] = 1;
+        break :blk l;
+    };
+    if (oif == LO_IFINDEX and std.mem.eql(u8, &dst, &loop6)) return 0;
+    return ENETUNREACH;
+}
+
+pub const Connect6 = struct {
+    /// The interface the socket is tied to afterwards (kept even when `err` is a route error).
+    dev: u8,
+    err: i64,
+};
+
+/// connect() of an IPv6 datagram socket tied to `bound_dev` (0 none) to `dst` with `scope_id` (Linux __ip6_datagram_connect): an
+/// address that needs a scope ties the socket to the scope's interface, which must be the one it is already tied to (EINVAL), or
+/// for a group with no scope to IPV6_MULTICAST_IF; with no interface at all it is EINVAL. The route is then checked through that
+/// interface (or IPV6_MULTICAST_IF for any group), and a failure there leaves the socket tied.
+pub fn connectDev6(dst: [16]u8, scope_id: u32, bound_dev: u8, mc_if: u8) Connect6 {
+    var dev = bound_dev;
+    const group = dst[0] == 0xff;
+    if (needsScope6(dst)) {
+        if (scope_id != 0) {
+            if (dev != 0 and dev != scope_id) return .{ .dev = dev, .err = EINVAL };
+            dev = ifIndex8(scope_id);
+        }
+        if (dev == 0 and group) dev = mc_if;
+        if (dev == 0) return .{ .dev = dev, .err = EINVAL };
+    }
+    const oif = if (dev == 0 and group) mc_if else dev;
+    return .{ .dev = dev, .err = routeErrno6(dst, oif) };
+}
+
 /// An IPv6 stream socket cannot bind a multicast address (Linux __inet6_bind: EINVAL before the scope checks).
 pub fn streamBindErrno6(addr: [16]u8) i64 {
     return if (addr[0] == 0xff) EINVAL else 0;

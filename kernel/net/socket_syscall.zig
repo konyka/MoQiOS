@@ -453,6 +453,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
             if (n6 == 0) return -1;
             var dst6: [16]u8 = @splat(0);
             var dst_port6: u16 = 0;
+            var scope6: u32 = 0;
             if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
                 if (addr_len < sa.SOCKADDR_IN6_LEN) return -22;
                 var sa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
@@ -461,15 +462,17 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
                 const parsed = sa.parseInet6(&sa6) orelse return -97; // EAFNOSUPPORT
                 dst6 = parsed.addr;
                 dst_port6 = parsed.port;
+                scope6 = parsed.scope_id;
             } else if (t.fd_table.fds[fd].udp_connected) {
                 dst6 = t.fd_table.fds[fd].udp_dst_ip6;
                 dst_port6 = t.fd_table.fds[fd].udp_dst_port;
             } else {
                 return -89; // EDESTADDRREQ
             }
-            const unreach6 = udp.sendErrno6(src_key, dst6);
+            const oif6 = udp.sendOif6(src_key, dst6, scope6);
+            const unreach6 = bind_addr_policy.routeErrno6(dst6, oif6);
             if (unreach6 != 0) return unreach6;
-            if (udp.sendToV6From(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, &tmp6, @intCast(n6))) {
+            if (udp.sendToV6From(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, oif6, &tmp6, @intCast(n6))) {
                 return @intCast(n6);
             } else {
                 return -1;
@@ -792,6 +795,9 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
             if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN)
                 return -22;
             const parsed = sa.parseInet6(&sa6) orelse return -97;
+            // A scoped peer ties the socket to its interface; the route is checked before the socket counts as connected.
+            const dev_rc = udp.connectDev6(t.fd_table.fds[fd].udpKey(), parsed.addr, parsed.scope_id);
+            if (dev_rc != 0) return dev_rc;
             t.fd_table.fds[fd].udp_connected = true;
             t.fd_table.fds[fd].udp_dst_ip6 = parsed.addr;
             t.fd_table.fds[fd].udp_dst_port = parsed.port;
@@ -1239,6 +1245,7 @@ fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32) i64 
     if (d.udp_is_v6) {
         var dst6: [16]u8 = @splat(0);
         var dst_port6: u16 = 0;
+        var scope6: u32 = 0;
         if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
             if (addr_len < sa.SOCKADDR_IN6_LEN) return -22;
             var sa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
@@ -1246,14 +1253,16 @@ fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32) i64 
             const parsed = sa.parseInet6(&sa6) orelse return -97;
             dst6 = parsed.addr;
             dst_port6 = parsed.port;
+            scope6 = parsed.scope_id;
         } else if (d.udp_connected) {
             dst6 = d.udp_dst_ip6;
             dst_port6 = d.udp_dst_port;
         } else return -89;
         const n6 = @min(payload.len, 1232);
-        const unreach6 = udp.sendErrno6(src_key, dst6);
+        const oif6 = udp.sendOif6(src_key, dst6, scope6);
+        const unreach6 = bind_addr_policy.routeErrno6(dst6, oif6);
         if (unreach6 != 0) return unreach6;
-        return if (udp.sendToV6From(d.udp_local_ip6, dst6, dst_port6, src_key, payload.ptr, @intCast(n6))) @intCast(n6) else -1;
+        return if (udp.sendToV6From(d.udp_local_ip6, dst6, dst_port6, src_key, oif6, payload.ptr, @intCast(n6))) @intCast(n6) else -1;
     }
     var dst_ip: [4]u8 = .{ 0, 0, 0, 0 };
     var dst_port: u16 = 0;

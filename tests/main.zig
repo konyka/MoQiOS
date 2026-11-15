@@ -4502,7 +4502,7 @@ test "IPv6 UDP multicast: IPV6_MULTICAST_* options, group membership, member-onl
     try std.testing.expect(std.mem.indexOf(u8, us, "        if (!mcast.alwaysJoined(group) and !hostJoinedLocked(group, ifindex)) return;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "            if (!mcast.socketAccepts(&port_mc[i], port_opts[i].ip.mc_all, group)) continue;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    if (group) send_pkt[14 + 7] = opts.mc_hops;\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "    const out_if6 = mcast.outInterface(opts.mc_if);\n    if (group and opts.mc_loop and (mcast.alwaysJoined(dst_ip) or hostJoined(dst_ip, out_if6))) _ = lo.sendPacketOn(&send_pkt, frame_len, out_if6);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    const out_if6 = mcast.outInterface(oif);\n    if (group and opts.mc_loop and (mcast.alwaysJoined(dst_ip) or hostJoined(dst_ip, out_if6))) _ = lo.sendPacketOn(&send_pkt, frame_len, out_if6);\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    port_mc[ni] = port_mc[oi];\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "            port_mc[i] = port_mc[num_ports];\n") != null);
     const so = kt.socket_opt_source;
@@ -4640,15 +4640,17 @@ test "multicast outgoing interface: IP_MULTICAST_IF lo sends out lo only, IPV6_M
     try std.testing.expectEqual(@as(?[4]u8, null), m.multicastSource4(true, our, .{ 127, 0, 0, 1 }));
     try std.testing.expectEqual(@as(?[4]u8, null), m.multicastSource4(true, any, any));
     // IPv6 has no multicast route on lo.
+    const bp = kt.bind_addr_policy;
     var g6: [16]u8 = @splat(0);
     g6[0] = 0xff;
     g6[1] = 0x0e;
     g6[15] = 0x31;
     var lo6: [16]u8 = @splat(0);
     lo6[15] = 1;
-    try std.testing.expect(m.sendUnreachable6(1, g6));
-    try std.testing.expect(!m.sendUnreachable6(0, g6) and !m.sendUnreachable6(2, g6));
-    try std.testing.expect(!m.sendUnreachable6(1, lo6));
+    try std.testing.expectEqual(bp.ENETUNREACH, bp.routeErrno6(g6, bp.sendOif6(g6, 0, 0, 1)));
+    try std.testing.expectEqual(@as(i64, 0), bp.routeErrno6(g6, bp.sendOif6(g6, 0, 0, 0)));
+    try std.testing.expectEqual(@as(i64, 0), bp.routeErrno6(g6, bp.sendOif6(g6, 0, 0, 2)));
+    try std.testing.expectEqual(@as(i64, 0), bp.routeErrno6(lo6, bp.sendOif6(lo6, 0, 0, 1)));
     // A loopback frame remembers the interface it arrives on.
     var q = lo.LoopbackQueue.init();
     try std.testing.expect(q.enqueueOn(&.{ 1, 2, 3 }, 2));
@@ -4670,7 +4672,7 @@ test "multicast outgoing interface: IP_MULTICAST_IF lo sends out lo only, IPV6_M
     try std.testing.expect(std.mem.indexOf(u8, us, "getPortOpts(src_port)") == null);
     const ss = kt.socket_syscall_source;
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "const src_key = "));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "const unreach6 = udp.sendErrno6(src_key, dst6);\n"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "const unreach6 = bind_addr_policy.routeErrno6(dst6, oif6);\n"));
     try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketOn(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, ifindex);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.lo_source, "net_mod.handleRxPacketOn(&buf, n, ifindex);") != null);
 }
@@ -4742,6 +4744,75 @@ test "IPv6 bind ties a link-scoped socket to its sin6_scope_id interface: separa
     try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketV6On(") != null);
 }
 
+test "IPv6 send interface: sendto's sin6_scope_id, the bound interface and IPV6_MULTICAST_IF pick it, lo carries only ::1; connect ties a scoped peer's interface (hello365)" {
+    const bp = kt.bind_addr_policy;
+    var ff02: [16]u8 = @splat(0);
+    ff02[0] = 0xff;
+    ff02[1] = 0x02;
+    ff02[15] = 1;
+    var ll: [16]u8 = @splat(0);
+    ll[0] = 0xfe;
+    ll[1] = 0x80;
+    ll[15] = 1;
+    var ff0e: [16]u8 = @splat(0);
+    ff0e[0] = 0xff;
+    ff0e[1] = 0x0e;
+    ff0e[15] = 1;
+    var uni: [16]u8 = @splat(0);
+    uni[0] = 0x20;
+    uni[1] = 0x01;
+    uni[15] = 9;
+    var lo6: [16]u8 = @splat(0);
+    lo6[15] = 1;
+    // udpv6_sendmsg: the scope of an address that needs one, else sk_bound_dev_if, else mcast_oif for a group.
+    try std.testing.expectEqual(@as(u8, 2), bp.sendOif6(ff02, 2, 1, 1));
+    try std.testing.expectEqual(@as(u8, 1), bp.sendOif6(ff02, 0, 1, 2));
+    try std.testing.expectEqual(@as(u8, 1), bp.sendOif6(ff0e, 9, 0, 1));
+    try std.testing.expectEqual(@as(u8, 0), bp.sendOif6(ff0e, 9, 0, 0));
+    try std.testing.expectEqual(@as(u8, 0), bp.sendOif6(uni, 9, 0, 1));
+    try std.testing.expectEqual(@as(u8, 255), bp.sendOif6(ff02, 1000, 0, 0));
+    // lo has a route only to ::1; an unknown interface none.
+    try std.testing.expectEqual(@as(i64, 0), bp.routeErrno6(ff02, 0));
+    try std.testing.expectEqual(@as(i64, 0), bp.routeErrno6(ff02, 2));
+    try std.testing.expectEqual(bp.ENETUNREACH, bp.routeErrno6(ff02, 1));
+    try std.testing.expectEqual(bp.ENETUNREACH, bp.routeErrno6(ll, 1));
+    try std.testing.expectEqual(@as(i64, 0), bp.routeErrno6(lo6, 1));
+    try std.testing.expectEqual(bp.ENETUNREACH, bp.routeErrno6(ff02, 9));
+    // __ip6_datagram_connect.
+    try std.testing.expectEqual(bp.Connect6{ .dev = 0, .err = bp.EINVAL }, bp.connectDev6(ff02, 0, 0, 0));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 0, .err = bp.EINVAL }, bp.connectDev6(ll, 0, 0, 0));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 2, .err = 0 }, bp.connectDev6(ff02, 2, 0, 0));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 9, .err = bp.ENETUNREACH }, bp.connectDev6(ff02, 9, 0, 0));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 9, .err = bp.EINVAL }, bp.connectDev6(ff02, 2, 9, 0));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 1, .err = bp.ENETUNREACH }, bp.connectDev6(ff02, 1, 1, 0));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 2, .err = 0 }, bp.connectDev6(ff02, 0, 0, 2));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 1, .err = bp.ENETUNREACH }, bp.connectDev6(ff02, 0, 0, 1));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 0, .err = bp.ENETUNREACH }, bp.connectDev6(ff0e, 0, 0, 1));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 0, .err = 0 }, bp.connectDev6(uni, 9, 0, 1));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 1, .err = bp.ENETUNREACH }, bp.connectDev6(uni, 0, 1, 0));
+
+    // A link-scoped group is sent from the link-local address even when a global one exists (the source getsockname reports too).
+    const v6 = kt.ipv6;
+    try std.testing.expect(v6.wantsLinkLocalSource(ff02) and v6.wantsLinkLocalSource(ll));
+    var ff01: [16]u8 = ff02;
+    ff01[1] = 0x01;
+    var ff05: [16]u8 = ff02;
+    ff05[1] = 0x05;
+    try std.testing.expect(v6.wantsLinkLocalSource(ff01));
+    try std.testing.expect(!v6.wantsLinkLocalSource(ff05) and !v6.wantsLinkLocalSource(ff0e) and !v6.wantsLinkLocalSource(uni));
+    try std.testing.expect(std.mem.indexOf(u8, kt.ndp_source, "    if (ipv6.wantsLinkLocalSource(dst)) return ll;\n") != null);
+
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "    port_dev6[i] = r.dev;\n    return r.err;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "return @import(\"bind_addr_policy.zig\").sendOif6(dst, scope_id, port_dev6[i], port_opts[i].ip.mc_if);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    const out_if6 = mcast.outInterface(oif);\n") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "scope6 = parsed.scope_id;"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "const oif6 = udp.sendOif6(src_key, dst6, scope6);"));
+    const conn_at = std.mem.indexOf(u8, ss, "const dev_rc = udp.connectDev6(t.fd_table.fds[fd].udpKey(), parsed.addr, parsed.scope_id);").?;
+    try std.testing.expect(conn_at < std.mem.indexOfPos(u8, ss, conn_at, "t.fd_table.fds[fd].udp_connected = true;").?);
+}
+
 test "an IPv6 TCP socket's bound address takes part in conflicts, listener choice, lookup, source address and naming (hello359)" {
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "        if (tcb.is_v6 and !tcp_port_policy.addrsConflict6(tcb.local_ip6, tcbs[i].local_ip6)) continue;\n") != null);
@@ -4787,8 +4858,8 @@ test "an IPv6 UDP datagram leaves from its socket's bound address; NDP is sent a
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "    const our_ip = @import(\"tcp_port_policy.zig\").sourceAddr6(bound, dst_ip, if (is_loop) dst_ip else ndp.selectSourceAddress(dst_ip, our_mac));\n") != null);
     const ss = kt.socket_syscall_source;
-    try std.testing.expect(std.mem.indexOf(u8, ss, "if (udp.sendToV6From(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, &tmp6, @intCast(n6))) {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ss, "return if (udp.sendToV6From(d.udp_local_ip6, dst6, dst_port6, src_key, payload.ptr, @intCast(n6))) @intCast(n6) else -1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (udp.sendToV6From(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, oif6, &tmp6, @intCast(n6))) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "return if (udp.sendToV6From(d.udp_local_ip6, dst6, dst_port6, src_key, oif6, payload.ptr, @intCast(n6))) @intCast(n6) else -1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "udp.sendToV6(dst6") == null);
     const iv = kt.icmpv6_source;
     try std.testing.expect(std.mem.indexOf(u8, iv, "pub const NDP_HOP_LIMIT: u8 = 255;\n") != null);

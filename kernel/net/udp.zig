@@ -733,11 +733,24 @@ pub fn recvFromV6Ex(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[16]u8
     return 0;
 }
 
-/// The errno an IPv6 send by the socket with key `key` to `dst` fails with before anything is built, 0 when it may go ahead: a group
-/// datagram with IPV6_MULTICAST_IF naming lo has no route (ENETUNREACH).
-pub fn sendErrno6(key: u32, dst: [16]u8) i64 {
-    const opts: ip_opt_policy.IpOpts = if (getPortOpts(key)) |po| po.ip else .{};
-    return if (mcast.sendUnreachable6(opts.mc_if, dst)) -101 else 0;
+/// The interface an IPv6 datagram from the socket with key `key` to `dst` (sendto's sin6_scope_id `scope_id`, 0 for none) leaves
+/// through, 0 for the default route (bind_addr_policy.sendOif6); bind_addr_policy.routeErrno6 says whether it has a route there.
+pub fn sendOif6(key: u32, dst: [16]u8, scope_id: u32) u8 {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(key) orelse return @import("bind_addr_policy.zig").sendOif6(dst, scope_id, 0, 0);
+    return @import("bind_addr_policy.zig").sendOif6(dst, scope_id, port_dev6[i], port_opts[i].ip.mc_if);
+}
+
+/// connect() of the IPv6 socket with key `key` to `dst`%`scope_id`: ties it to the interface bind_addr_policy.connectDev6 picks
+/// (also when the route check then fails, as Linux does) and returns that errno, 0 when the connect may go on.
+pub fn connectDev6(key: u32, dst: [16]u8, scope_id: u32) i64 {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(key) orelse return -9;
+    const r = @import("bind_addr_policy.zig").connectDev6(dst, scope_id, port_dev6[i], port_opts[i].ip.mc_if);
+    port_dev6[i] = r.dev;
+    return r.err;
 }
 
 pub fn sendTo(dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, data_len: u16) bool {
@@ -817,13 +830,14 @@ pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, data
 
 /// Send a UDP datagram over IPv6 (SK-70/87). On-link via NDP; off-link via default router.
 pub fn sendToV6(dst_ip: [16]u8, dst_port: u16, src_port: u16, data: [*]const u8, data_len: u16) bool {
-    return sendToV6From(@splat(0), dst_ip, dst_port, src_port, data, data_len);
+    return sendToV6From(@splat(0), dst_ip, dst_port, src_port, 0, data, data_len);
 }
 
 /// sendToV6 from the socket with registry key `src_key`, bound to the IPv6 address `bound` (:: when unbound): the source address
 /// follows tcp_port_policy.sourceAddr6, so a datagram leaves from the bound unicast address, also when it goes to ::1. The IPv6 options
-/// are that socket's own, also when other sockets share its port.
-pub fn sendToV6From(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, data: [*]const u8, data_len: u16) bool {
+/// are that socket's own, also when other sockets share its port. `oif` is the interface it leaves through (sendOif6, 0 for the
+/// default route); a group copy looped back to this host arrives on it.
+pub fn sendToV6From(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, oif: u8, data: [*]const u8, data_len: u16) bool {
     if (data_len > MAX_UDP_PAYLOAD_V6) return false;
     const src_port = portNumber(src_key);
 
@@ -867,7 +881,7 @@ pub fn sendToV6From(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, 
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + udp_total);
     // IPV6_MULTICAST_LOOP: when this host is a member of the group on the outgoing interface a copy is delivered locally too,
     // arriving on that interface (Linux ip6_finish_output2 checks ipv6_chk_mcast_addr on the device).
-    const out_if6 = mcast.outInterface(opts.mc_if);
+    const out_if6 = mcast.outInterface(oif);
     if (group and opts.mc_loop and (mcast.alwaysJoined(dst_ip) or hostJoined(dst_ip, out_if6))) _ = lo.sendPacketOn(&send_pkt, frame_len, out_if6);
     const ok = if (is_loop) lo.sendPacket(&send_pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.
