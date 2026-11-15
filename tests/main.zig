@@ -4358,6 +4358,17 @@ test "an IPv4 and an IPv6 TCP socket do not conflict on one port (hello344)" {
     try std.testing.expect(std.mem.indexOf(u8, ts, "        if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict\n        if (!tcp_port_policy.familiesConflict(tcb.is_v6, tcbs[i].is_v6)) continue;\n") != null);
 }
 
+test "aio reads and writes use the iocb's offset like pread/pwrite and never move the shared file offset (hello353)" {
+    const a = kt.aio_source;
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, a, "offsetOf("));
+    try std.testing.expect(std.mem.indexOf(u8, a, "const n = if (positioned) cur.fd_table.readAtOffset(fd, &kbuf, chunk, at) else cur.fd_table.read(fd, &kbuf, chunk);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a, "const n = if (positioned) cur.fd_table.writeAtOffset(fd, &kbuf, copied, at) else cur.fd_table.write(fd, &kbuf, copied);") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, a, "    const positioned = hasPosition(cur.fd_table.fds[fd].fd_type);\n    var at: u64 = @intCast(iocb.aio_offset);\n"));
+    try std.testing.expect(std.mem.indexOf(u8, a, "        at += @as(u64, @intCast(written));\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a, "        at += @as(u64, @intCast(n));\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a, "        .ramdisk_file, .fat32_file, .ext2_file, .tmpfs_file, .rofs_file, .proc_file, .mqueue => true,\n        else => false,\n") != null);
+}
+
 test "getdents64 holds the shared description's offset lock across the directory cursor read-modify-write (hello352)" {
     const g = kt.getdents_source;
     try std.testing.expect(std.mem.indexOf(u8, g, "    const locked = vfs_mod.lockOffset(desc);\n    defer vfs_mod.unlockOffset(locked);\n    vfs_mod.syncOffsetIn(desc);\n    defer vfs_mod.syncOffsetOut(desc);\n") != null);

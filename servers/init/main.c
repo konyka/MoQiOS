@@ -469,6 +469,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello350"); /* read and write move a shared open file offset atomically between processes */
     run_test("hello351"); /* a read or write larger than 4 KiB on a shared description covers one contiguous range */
     run_test("hello352"); /* getdents64 moves a shared directory cursor atomically between processes */
+    run_test("hello353"); /* aio reads and writes use their own offset and leave the shared file offset alone */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

@@ -221,9 +221,16 @@ pub fn ioCancel(ctx_id: u64, iocb: u64, result: u64) i64 {
 
 // ── I/O execution helpers ──
 
+/// Descriptor kinds an aio request reads or writes at its own offset: regular files and mq status files. The rest are streams.
+fn hasPosition(t: @import("vfs.zig").FdType) bool {
+    return switch (t) {
+        .ramdisk_file, .fat32_file, .ext2_file, .tmpfs_file, .rofs_file, .proc_file, .mqueue => true,
+        else => false,
+    };
+}
+
 fn executePread(iocb: *const IoCb) i64 {
     const sched_mod = @import("../proc/sched.zig");
-    const vfs_mod = @import("vfs.zig");
 const task_mod = @import("../proc/task.zig");
     const copy_mod = @import("../mm/copy_from_user.zig");
 
@@ -237,10 +244,11 @@ const task_mod = @import("../proc/task.zig");
     // A negative offset would trap the @intCast below; reject it up front.
     if (iocb.aio_offset < 0) return EINVAL;
 
-    // Save offset, set to requested position, read via VFS, restore
-    const saved_offset = vfs_mod.offsetOf(&cur.fd_table.fds[fd]);
-    vfs_mod.setOffsetOf(&cur.fd_table.fds[fd], @intCast(iocb.aio_offset));
-
+    // Read at the iocb's own offset, like pread: the description's shared offset is never moved (Linux sets ki_pos from
+    // aio_offset), so a process sharing the description keeps reading from where it was. A pipe, a socket, the console
+    // and a device node have no position and are read as a stream.
+    const positioned = hasPosition(cur.fd_table.fds[fd].fd_type);
+    var at: u64 = @intCast(iocb.aio_offset);
     var remaining: usize = @intCast(@min(iocb.aio_nbytes, 0x7FFFFFFF));
     var total: usize = 0;
     var dst: u64 = iocb.aio_buf;
@@ -248,7 +256,7 @@ const task_mod = @import("../proc/task.zig");
     while (remaining > 0) {
         const chunk = @min(remaining, 4096);
         var kbuf: [4096]u8 = undefined;
-        const n = cur.fd_table.read(fd, &kbuf, chunk);
+        const n = if (positioned) cur.fd_table.readAtOffset(fd, &kbuf, chunk, at) else cur.fd_table.read(fd, &kbuf, chunk);
         if (n <= 0) break;
         // Credit what copyToUser delivered, not what the file produced —
         // bytes that never reached the user buffer were never read as far
@@ -256,16 +264,15 @@ const task_mod = @import("../proc/task.zig");
         const written = copy_mod.copyToUser(@ptrFromInt(dst), kbuf[0..@intCast(n)], @intCast(n));
         total += written;
         dst += @as(u64, @intCast(written));
+        at += @as(u64, @intCast(written));
         remaining -= written;
         if (n < @as(i64, @intCast(chunk)) or written < @as(usize, @intCast(n))) break;
     }
 
-    vfs_mod.setOffsetOf(&cur.fd_table.fds[fd], saved_offset);
     return @intCast(total);
 }
 
 fn executePwrite(iocb: *const IoCb) i64 {
-    const vfs_mod = @import("vfs.zig");
     const sched_mod = @import("../proc/sched.zig");
     const task_mod = @import("../proc/task.zig");
     const copy_mod = @import("../mm/copy_from_user.zig");
@@ -280,10 +287,10 @@ fn executePwrite(iocb: *const IoCb) i64 {
     // A negative offset would trap the @intCast below; reject it up front.
     if (iocb.aio_offset < 0) return EINVAL;
 
-    // Save offset, set to requested position, write via VFS, restore
-    const saved_offset = vfs_mod.offsetOf(&cur.fd_table.fds[fd]);
-    vfs_mod.setOffsetOf(&cur.fd_table.fds[fd], @intCast(iocb.aio_offset));
-
+    // Write at the iocb's own offset, like pwrite (an O_APPEND descriptor appends); the shared offset is never moved. A pipe, a
+    // socket, the console and a device node have no position and are written as a stream.
+    const positioned = hasPosition(cur.fd_table.fds[fd].fd_type);
+    var at: u64 = @intCast(iocb.aio_offset);
     var remaining: usize = @intCast(@min(iocb.aio_nbytes, 0x7FFFFFFF));
     var total: usize = 0;
     var src: u64 = iocb.aio_buf;
@@ -293,15 +300,15 @@ fn executePwrite(iocb: *const IoCb) i64 {
         var kbuf: [4096]u8 = undefined;
         const copied = copy_mod.copyFromUser(kbuf[0..chunk], @ptrFromInt(src), chunk);
         if (copied == 0) break;
-        const n = cur.fd_table.write(fd, &kbuf, copied);
+        const n = if (positioned) cur.fd_table.writeAtOffset(fd, &kbuf, copied, at) else cur.fd_table.write(fd, &kbuf, copied);
         if (n <= 0) break;
         total += @intCast(n);
         src += @as(u64, @intCast(n));
+        at += @as(u64, @intCast(n));
         remaining -= @intCast(n);
         if (n < @as(i64, @intCast(copied))) break;
     }
 
-    vfs_mod.setOffsetOf(&cur.fd_table.fds[fd], saved_offset);
     return @intCast(total);
 }
 

@@ -326,6 +326,7 @@ pub const unsupported_policy = @import("proc/unsupported_policy.zig");
 pub const signal_syscall_source = @embedFile("proc/signal_syscall.zig");
 pub const process_mgmt_source = @embedFile("proc/process_mgmt.zig");
 pub const file_io_source = @embedFile("fs/file_io.zig");
+pub const aio_source = @embedFile("fs/aio.zig");
 pub const mmap_source = @embedFile("mm/mmap.zig");
 pub const copy_from_user_source = @embedFile("mm/copy_from_user.zig");
 pub const huge_user_impl_source = @embedFile("mm/huge_user_impl.zig");

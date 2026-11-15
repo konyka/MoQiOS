@@ -9465,4 +9465,16 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 修复（`kernel/fs/getdents.zig`）：`getdents64` 在 `syncOffsetIn` 之前调 `vfs_mod.lockOffset(desc)`，返回时解锁，覆盖 ext2、ext4/NTFS（rofs）、tmpfs 和 procfs 目录。devfs 目录描述没有共享槽，`lockOffset` 返回 0，不加锁。
 - 测试：hello352（QEMU，3 项），定向 SMP=2、SMP=4 各一份通过。新增 host 测试「getdents64 holds the shared description's offset lock across the directory cursor read-modify-write (hello352)」，检查加锁的位置在第一个分派之前。变异验证：去掉加锁，这条 host 测试失败，文件已恢复。
 - 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、314 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
-- 这次修复带来的局限：mq 偏移和 `aio`、`splice`、`copy_file_range` 通过 `offsetOf`/`setOffsetOf` 的读改写仍不加偏移锁。
+- 这次修复带来的局限：mq 偏移和 `aio`、`splice`、`copy_file_range` 通过 `offsetOf`/`setOffsetOf` 的读改写仍不加偏移锁。（aio 由 hello353 改为不动共享偏移。）
+
+## 补充：aio 读写按 iocb 自己的偏移进行，不动共享文件偏移（hello353）
+
+- 背景：hello352 一节的局限。`executePread`/`executePwrite` 先用 `offsetOf` 记下描述符偏移，`setOffsetOf` 改成 `aio_offset`，读写完再改回去。描述被另一个进程共享时，它在这段时间里会从 aio 的位置读，aio 也可能从对方移动过的位置读写，改回去时还会覆盖对方的进度。Linux 的 `aio_prep_rw` 只把 `aio_offset` 放进 `ki_pos`，从不碰 `f_pos`。
+- Linux 实测（`gcc -DHOST user/hello353.c`，tmpfs `/tmp/hello353.dat`，4096 条 4 字节记录，父子进程通过管道同时起跑）：A 父进程在同一个 description 上提交 300 个 aio 读写（每 3 个里 1 个写，写回原值）时，子进程每次 4 字节顺序读，正好读到 4096 条、顺序不乱；B 每个 aio 读都拿到自己偏移处的数据；C 结束后共享偏移是 16384（子进程读到的位置）。全部通过。
+- 红灯（未改的内核）：SMP=4 上 A 失败（子进程读到 4188 条、顺序乱），B 失败（300 个里 61 个读错），C 通过；SMP=2 上全部通过。
+- 修复（`kernel/fs/aio.zig`）：
+  1. 去掉 `offsetOf`/`setOffsetOf`。PREAD 走 `FdTable.readAtOffset(fd, buf, n, at)`，PWRITE 走 `writeAtOffset`，`at` 从 `aio_offset` 开始，每块后前进，和 pread/pwrite 一样（O_APPEND 描述符照样追加）。
+  2. 新增 `hasPosition`：普通文件（ramdisk、FAT32、ext2、tmpfs、只读卷、procfs）和 mq 按偏移读写；管道、套接字、控制台、设备节点仍按流用 `read`/`write`，因为 `readAtOffset` 对它们返回 ESPIPE，而 Linux 对它们的 aio 就是普通读写。
+- 测试：hello353（QEMU，4 项），定向 SMP=2、SMP=4 各一份通过。`kernel/host_test.zig` 新增 `aio_source`，新增 host 测试「aio reads and writes use the iocb's offset like pread/pwrite and never move the shared file offset (hello353)」。变异验证：PREAD 恒走 `read`，这条 host 测试失败，文件已恢复。
+- 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、315 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
+- 这次修复带来的局限：mq 描述符的偏移、`splice` 和 `copy_file_range` 通过 `offsetOf`/`setOffsetOf` 的读改写仍不加偏移锁。
