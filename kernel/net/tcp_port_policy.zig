@@ -103,7 +103,8 @@ pub fn listenerTakes(bound: [4]u8, dst: [4]u8, exact: bool) bool {
 /// otherwise from 127.0.0.1 (the source of Linux's local route); any other peer from the bound address, else the interface's.
 pub fn sourceAddr(bound: [4]u8, remote: [4]u8, our: [4]u8) [4]u8 {
     if (remote[0] == 127) return if (bound[0] == 127) bound else LOOPBACK4;
-    return if (isWildcard4(bound) or bound[0] == 127) our else bound;
+    // A group address is never a source: a socket bound to one sends from the interface's (Linux ip_route_connect picks saddr).
+    return if (isWildcard4(bound) or bound[0] == 127 or (bound[0] >= 224 and bound[0] <= 239)) our else bound;
 }
 
 /// The IPv6 source address of a datagram to `dst` from a socket bound to `bound`: the bound address when it is a unicast one (Linux

@@ -9610,3 +9610,35 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   2. 加组不发 MLD 报告，e1000 仍以组播混杂方式收所有组播帧，不按加入的组设 MTA。
   3. 组成员表每个套接字最多 8 个组（Linux 受 optmem 限制，实测约 2300 个）。
   4. 绑定冲突仍按地址完全相等判断，绑定组播地址的套接字之间不因 `scope_id` 区分。
+
+## 补充：IPv4 UDP 组播选项、加组和本机投递（hello362）
+
+- 背景：hello361 局限 1 的 IPv4 一半。`IPPROTO_IP` 层只认 `IP_TTL`、`IP_TOS`，`IP_MULTICAST_TTL/LOOP/IF/ALL` 和 `IP_ADD/DROP_MEMBERSHIP` 一律 ENOPROTOOPT；发往 224/4 的数据报按单播规则投递；发送时组播目的地址走 ARP 解析（解析不到就丢），TTL 用 64；绑定组播地址的套接字发往别处时把组地址当源地址。
+- Linux 依据：`do_ip_setsockopt`（`IP_MULTICAST_TTL` -1 恢复 1，0..255，TCP 是 EINVAL；`IP_MULTICAST_LOOP` 非 0 即 1；`IP_MULTICAST_ALL` 只能 0 或 1；这三个接受单字节值；`IP_MULTICAST_IF` 接受 4、8、12 字节，接口不存在 EADDRNOTAVAIL；加组先查 TCP 的 EPROTO 再查 `optlen < sizeof(ip_mreq)`），`__ip_mc_join_group`（非组播 EINVAL，接口不存在 ENODEV，同接口已加入 EADDRINUSE，超过 `igmp_max_memberships` 20 是 ENOBUFS），`ip_mc_leave_group`（没有成员 EADDRNOTAVAIL），`ip_mc_sf_allow`、`__udp4_lib_mcast_deliver`、`ip_mc_output`。
+- Linux 实测（`gcc -DHOST user/hello362.c`，`unshare -rn` 里开了 multicast 的 dummy 网卡 d0，接口 2，`10.0.2.15/24`，默认路由 10.0.2.2）：L、O、J、T、D1–D6、S 共 12 项全部通过。探针另外测到：每个套接字第 21 个组是 ENOBUFS；TCP 设置 `IP_MULTICAST_LOOP`、`IP_MULTICAST_ALL` 成功，设置 `IP_MULTICAST_IF` 是 EINVAL。
+- 红灯（未改的内核，SMP=2，临时让 init 先跑 hello362）：O、J、T 全是 -92（O 里 3 字节的 `IP_MULTICAST_IF` 是 -22）；D1、D2、D4 没有套接字收到；D5 设置 LOOP 是 -92；L、D3、D6、S 通过（D3、D6 期望都是 0；S 发往 127.0.0.1 本来就用回环源地址）。
+- 修复：
+  1. `kernel/net/ip_opt_policy.zig`：新增 `IP_MULTICAST_IF/TTL/LOOP/ALL`、`IP_ADD/DROP_MEMBERSHIP` 常量；`IpOpts` 新增 `mc4_ttl`、`mc4_loop`、`mc4_all`、`mc4_addr`、`mc4_index`；`applySet`、`getValue` 处理 TTL/LOOP/ALL；新增 `ifaceOf4`（按接口编号或本机地址找接口）、`setMulticastIf4`、`streamSetErrno4`、`setTtl4`。
+  2. `kernel/net/mcast_policy.zig`：新增 IPv4 组成员表 `Membership4`（20 个组，满了 ENOBUFS）和 `join4`、`drop4`、`joined4`、`alwaysJoined4`（224.0.0.1）、`socketAccepts4`、`socketMatches4`、`multicastMac4`（01:00:5e 加组地址低 23 位）。
+  3. `kernel/net/socket_opt.zig`：新增 `setMembership4`（读 8 字节 `ip_mreq` 或 12 字节 `ip_mreqn`）；`setIpOpt` 处理 TCP 的拒绝和 UDP 的 `IP_MULTICAST_IF`。
+  4. `kernel/net/udp.zig`：端口槽新增 `port_mc4`，随槽新建、rebind、swap-remove 一起搬；新增 `mcJoin4`、`mcDrop4`、`hostJoined4`；`handlePacket` 遇到组播目的地址走 `enqueueMcast4`；`sendToFrom` 发往组播时目的 MAC 用 `multicastMac4`（不再走 ARP），TTL 用 `mc4_ttl`，`mc4_loop` 为真且本机在出接口上是成员（或 224.0.0.1）时经 lo 回送一份。
+  5. `kernel/net/tcp_port_policy.zig` 的 `sourceAddr`：绑定地址是组播时改用接口地址（发往回环时仍是 127.0.0.1）。
+- 测试：hello362（QEMU，12 项）；新增 host 测试「IPv4 UDP multicast: IP_MULTICAST_* options, group membership, member-only local delivery and loopback copy (hello362)」。旧 host 测试「IP socket options: dispatch and send-path wiring」改为钉住新的 IPv4 发送路径行，检查的行为没变。`zig build test` 全部通过（1258 个）。
+- 变异验证：`socketAccepts4` 的 `or mc_all` 改成 `and mc_all`，hello362 这条 host 测试失败（1257/1258），文件已恢复。
+- 完整 smoke：修复前的构建上，两份 SMP=2 都在 900 秒超时（hello362 十二项都 ok 且 PASS，超时原因是 hello350 很慢，根因见下一节「SleepLock 把锁交给等待者后通知调度器」）；修复前的构建上 SMP=1 一份通过。加上睡眠锁修复后：SMP=2 一份通过，`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=2)`；SMP=4 一份通过，`PASS: … (SMP=4)`；SMP=1 一份通过，`PASS: … (SMP=1)`。本轮没有跑 riscv64、aarch64 smoke。
+- 这次修复带来的局限：
+  1. 不发 IGMP 报告，没有源过滤（`IP_ADD_SOURCE_MEMBERSHIP`、`MCAST_*`）和 `IP_MSFILTER`。
+  2. 回环之外，发出的组播帧不检查 `IP_MULTICAST_IF` 指向 lo 的情况：设成 lo 时仍从网卡发出。
+  3. 绑定冲突按地址完全相等判断，与 IPv6 一节相同。
+
+## 补充：SleepLock 把锁交给等待者后通知调度器（hello350 在 SMP=2 上变慢）
+
+- 背景：hello361 一节的第一份 SMP=2 smoke 超时，hello350 的 fork 轮次耗时约 7 分钟；hello362 的两份 SMP=2 smoke 也都在 900 秒超时，原因同样是 hello350。hello350 让多个进程争用同一把睡眠锁（rofs、挂载、追加写、文件偏移和 mq 都用 `SleepLock`）。
+- 根因：`SleepLock.unlock` 把所有权直接交给最老的等待者（`held` 保持为真），`Env.wakeOne` 只把它设为可运行，不通知调度器。新主人要等它所在 CPU 自己的时间片到期（最长 100 ms）才运行，排在它后面的等待者也一起等。每次交接都可能多等一个时间片，争用多时累积成几分钟。
+- 修复：
+  1. `kernel/sync/sleep_lock.zig`：`unlock` 在释放 guard 之后，对交接出去的任务调用 `Env.notifyWoken(idx)`；没有等待者时不调用。文件头的 Env 契约加上 `notifyWoken`。
+  2. `kernel/sync/task_sleep_lock.zig`：`notifyWoken` 调 `sched.notifyWake`，由调度器决定抢占本 CPU 还是向目标 CPU 发 IPI。
+- 测试：`tests/sleep_lock_test.zig` 的 model 记录通知次数、最后通知的任务和通知时 guard 是否还持有，新增测试「unlock tells the scheduler which sleeper now owns the lock, outside the guard; an uncontended unlock tells it nothing」。未改的代码上这条测试失败，修复后通过。`zig build test` 全部通过（1259 个）。
+- 变异验证：删掉 `unlock` 里的 `notifyWoken` 调用，这条测试失败（1258/1259），文件已恢复。
+- 计时（SMP=2，临时让 init 先跑 hello350）：修复前 171 秒仍未跑完，修复后 10 秒 PASS。
+- 完整 smoke：与 hello362 同一个构建，SMP=2、SMP=4 各一份通过（超时上限 1400 秒），hello350 PASS（smoke 脚本检查的各程序都 PASS 且没有 FAIL）；SMP=1 一份通过，`PASS: … (SMP=1)`。本轮没有跑 riscv64、aarch64 smoke。

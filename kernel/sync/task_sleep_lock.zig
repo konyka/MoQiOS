@@ -29,6 +29,9 @@ const Env = struct {
     pub fn relax() void {
         arch.cpu.pause();
     }
+    pub fn notifyWoken(idx: u32) void {
+        if (task.getTask(idx)) |t| sched.notifyWake(t);
+    }
 };
 
 pub const SleepLock = sleep_lock.SleepLock(Env);

@@ -101,3 +101,101 @@ pub fn socketMatches(bound: [16]u8, group: [16]u8, peer_port: u16, peer_ip: [16]
 pub fn outInterface(mc_if: u8) u8 {
     return if (mc_if != 0) mc_if else @intCast(bap.NIC_IFINDEX);
 }
+
+/// Groups one IPv4 socket can join at once (Linux net.ipv4.igmp_max_memberships, default 20; the join past it is ENOBUFS).
+pub const MAX_GROUPS4 = 20;
+pub const ENOBUFS: i64 = -105;
+
+pub const Membership4 = struct {
+    group: [MAX_GROUPS4][4]u8 = @splat(.{ 0, 0, 0, 0 }),
+    /// The interface address the join named (0.0.0.0 when it named none) and the interface it landed on (1 lo, 2 the NIC).
+    addr: [MAX_GROUPS4][4]u8 = @splat(.{ 0, 0, 0, 0 }),
+    ifindex: [MAX_GROUPS4]u8 = @splat(0),
+    n: u8 = 0,
+};
+
+pub fn isMulticast4(addr: [4]u8) bool {
+    return addr[0] >= 224 and addr[0] <= 239;
+}
+
+fn eql4(a: [4]u8, b: [4]u8) bool {
+    return @as(u32, @bitCast(a)) == @as(u32, @bitCast(b));
+}
+
+/// The interface an IPv4 group request lands on (Linux ip_mc_find_dev): the index when given, else the interface owning `addr`,
+/// else the one the route to the group leaves through (the NIC). Null is ENODEV.
+pub fn deviceFor4(addr: [4]u8, index: u32, nic_active: bool, our: [4]u8) ?u8 {
+    if (index != 0 or @as(u32, @bitCast(addr)) != 0) return @import("ip_opt_policy.zig").ifaceOf4(addr, index, nic_active, our);
+    return if (nic_active) @intCast(bap.NIC_IFINDEX) else null;
+}
+
+/// IP_ADD_MEMBERSHIP (ip_mc_join_group): EINVAL for a non-multicast group, ENODEV when the interface does not exist, EADDRINUSE when
+/// the socket already has the group on that interface, ENOBUFS past MAX_GROUPS4; checked in that order.
+pub fn join4(m: *Membership4, group: [4]u8, addr: [4]u8, index: u32, nic_active: bool, our: [4]u8) i64 {
+    if (!isMulticast4(group)) return EINVAL;
+    const dev = deviceFor4(addr, index, nic_active, our) orelse return ENODEV;
+    for (0..m.n) |i| {
+        if (eql4(m.group[i], group) and m.ifindex[i] == dev) return EADDRINUSE;
+    }
+    if (m.n == MAX_GROUPS4) return ENOBUFS;
+    m.group[m.n] = group;
+    m.addr[m.n] = addr;
+    m.ifindex[m.n] = dev;
+    m.n += 1;
+    return 0;
+}
+
+/// IP_DROP_MEMBERSHIP (ip_mc_leave_group): ENODEV when neither an index nor an address is given and no route leads to the group;
+/// otherwise the membership of `group` on the resolved index, or (no index found) the one joined with that interface address, is
+/// removed, and none is EADDRNOTAVAIL. A non-multicast group is simply not found.
+pub fn drop4(m: *Membership4, group: [4]u8, addr: [4]u8, index: u32, nic_active: bool, our: [4]u8) i64 {
+    const dev = deviceFor4(addr, index, nic_active, our);
+    if (index == 0 and @as(u32, @bitCast(addr)) == 0 and dev == null) return ENODEV;
+    const ifx: u32 = if (index != 0) index else if (dev) |d| d else 0;
+    for (0..m.n) |i| {
+        if (!eql4(m.group[i], group)) continue;
+        if (ifx != 0) {
+            if (m.ifindex[i] != ifx) continue;
+        } else if (@as(u32, @bitCast(addr)) != 0 and !eql4(addr, m.addr[i])) continue;
+        m.n -= 1;
+        m.group[i] = m.group[m.n];
+        m.addr[i] = m.addr[m.n];
+        m.ifindex[i] = m.ifindex[m.n];
+        m.group[m.n] = .{ 0, 0, 0, 0 };
+        m.addr[m.n] = .{ 0, 0, 0, 0 };
+        m.ifindex[m.n] = 0;
+        return 0;
+    }
+    return EADDRNOTAVAIL;
+}
+
+pub fn joined4(m: *const Membership4, group: [4]u8) bool {
+    for (0..m.n) |i| {
+        if (eql4(m.group[i], group)) return true;
+    }
+    return false;
+}
+
+/// 224.0.0.1 (all hosts): every interface is in it without a join.
+pub fn alwaysJoined4(group: [4]u8) bool {
+    return eql4(group, .{ 224, 0, 0, 1 });
+}
+
+/// Whether a socket takes an IPv4 datagram to `group` (ip_mc_sf_allow without source filters): it joined the group, or
+/// IP_MULTICAST_ALL is on.
+pub fn socketAccepts4(m: *const Membership4, mc_all: bool, group: [4]u8) bool {
+    return joined4(m, group) or mc_all;
+}
+
+/// __udp_is_mcast_sock for IPv4: bound to 0.0.0.0 or the group, and not connected to another peer (the peer address is in the first
+/// 4 bytes of `peer_ip`).
+pub fn socketMatches4(bound: [4]u8, group: [4]u8, peer_port: u16, peer_ip: [16]u8, src_ip: [4]u8, src_port: u16) bool {
+    if (@as(u32, @bitCast(bound)) != 0 and !eql4(bound, group)) return false;
+    if (peer_port != 0 and (peer_port != src_port or !eql4(peer_ip[0..4].*, src_ip))) return false;
+    return true;
+}
+
+/// The Ethernet address of an IPv4 group (RFC 1112 §6.4): 01:00:5e and the low 23 bits of the group.
+pub fn multicastMac4(group: [4]u8) [6]u8 {
+    return .{ 0x01, 0x00, 0x5e, group[1] & 0x7f, group[2], group[3] };
+}

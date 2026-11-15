@@ -463,12 +463,25 @@ fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
     const fam = socketFamily(ref, v6_hint) orelse return -92;
     if (!ipo.levelApplies(level, fam)) return -92;
     if (level == ipo.SOL_IPV6 and (optname == ipo.IPV6_ADD_MEMBERSHIP or optname == ipo.IPV6_DROP_MEMBERSHIP)) return setMembership(ref, optname, optval_ptr, optlen);
+    if (level == ipo.SOL_IP and (optname == ipo.IP_ADD_MEMBERSHIP or optname == ipo.IP_DROP_MEMBERSHIP)) return setMembership4(ref, optname, optval_ptr, optlen);
     if (ref == .tcp and level == ipo.SOL_IPV6) {
         if (ipo.streamSetErrno(optname)) |e| return e;
+    }
+    if (ref == .tcp and level == ipo.SOL_IP) {
+        if (ipo.streamSetErrno4(optname)) |e| return e;
     }
     var raw: [16]u8 = undefined;
     const n = readOptval(optval_ptr, optlen, &raw);
     if (n < 0) return n;
+    if (level == ipo.SOL_IP and optname == ipo.IP_MULTICAST_IF and ref == .udp) {
+        const udp_mod = @import("udp.zig");
+        var st = udp_mod.getPortOpts(ref.udp) orelse return -9;
+        switch (ipo.setMulticastIf4(st.ip, raw[0..@intCast(n)], @import("nic.zig").isActive(), @import("netif.zig").getOurIp())) {
+            .err => |e| return e,
+            .ok => |v| st.ip = v,
+        }
+        return if (udp_mod.setPortOpts(ref.udp, st)) 0 else -9;
+    }
     if (level == ipo.SOL_IPV6 and optname == ipo.IPV6_MULTICAST_IF and n >= 4) {
         const e = ipo.mcastIfErrno(ipo.readInt(raw[0..4]).?, @import("nic.zig").isActive());
         if (e != 0) return e;
@@ -513,6 +526,29 @@ fn setMembership(ref: SockRef, optname: u64, optval_ptr: u64, optlen: u64) i64 {
         udp_mod.mcJoin(ref.udp, group, ifindex, @import("nic.zig").isActive())
     else
         udp_mod.mcDrop(ref.udp, group, ifindex);
+}
+
+/// IP_ADD_MEMBERSHIP / IP_DROP_MEMBERSHIP: a TCP socket is EPROTO, then a value shorter than struct ip_mreq (8 bytes: group, interface
+/// address) is EINVAL; 12 bytes and more are a struct ip_mreqn with an interface index too (Linux do_ip_setsockopt).
+fn setMembership4(ref: SockRef, optname: u64, optval_ptr: u64, optlen: u64) i64 {
+    if (ref == .tcp) return -71;
+    if (ref != .udp) return -92;
+    if (optlen < 8) return -22;
+    const copy_mod = @import("../mm/copy_from_user.zig");
+    if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;
+    var mreq: [12]u8 = @splat(0);
+    const len: usize = if (optlen >= 12) 12 else 8;
+    if (copy_mod.copyFromUser(mreq[0..len], @ptrFromInt(optval_ptr), len) != len) return -14;
+    const group: [4]u8 = mreq[0..4].*;
+    const addr: [4]u8 = mreq[4..8].*;
+    const index = bo.readU32Le(mreq[8..12]);
+    const udp_mod = @import("udp.zig");
+    const nic_on = @import("nic.zig").isActive();
+    const our = @import("netif.zig").getOurIp();
+    return if (optname == ipo.IP_ADD_MEMBERSHIP)
+        udp_mod.mcJoin4(ref.udp, group, addr, index, nic_on, our)
+    else
+        udp_mod.mcDrop4(ref.udp, group, addr, index, nic_on, our);
 }
 
 fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u64, optlen_ptr: u64) i64 {

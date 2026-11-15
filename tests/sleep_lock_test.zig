@@ -17,6 +17,11 @@ const Model = struct {
     spurious: bool = false,
     /// Number of times a granted node was found still linked (must stay 0).
     stale_links: u32 = 0,
+    /// notifyWoken calls, and the last task they named.
+    notified: u32 = 0,
+    last_notified: u32 = 0xffff_ffff,
+    /// Whether the guard was held during the last notifyWoken (must stay false).
+    notified_under_guard: bool = false,
 };
 
 var model: Model = .{};
@@ -89,7 +94,17 @@ const Env = struct {
     pub fn relax() void {
         std.atomic.spinLoopHint();
     }
+    pub fn notifyWoken(tid: u32) void {
+        if (current_guard) |g| {
+            if (@atomicLoad(u32, &g.locked, .seq_cst) != 0) model.notified_under_guard = true;
+        }
+        model.last_notified = tid;
+        _ = @atomicRmw(u32, &model.notified, .Add, 1, .seq_cst);
+    }
 };
+
+/// The guard of the lock under test, so notifyWoken can check it is called with the guard released.
+var current_guard: ?*ModelGuard = null;
 
 const Lock = kt.sleep_lock.SleepLock(Env);
 
@@ -281,4 +296,32 @@ test "tryLock takes a free lock and refuses a held one" {
     lock.unlock();
     try std.testing.expect(lock.tryLock());
     lock.unlock();
+}
+
+test "unlock tells the scheduler which sleeper now owns the lock, outside the guard; an uncontended unlock tells it nothing" {
+    resetModel();
+    var lock: Lock = .{};
+    current_guard = &lock.guard;
+    defer current_guard = null;
+    my_tid = 7;
+    lock.lock();
+    lock.unlock();
+    try std.testing.expectEqual(@as(u32, 0), model.notified);
+    const Waiter = struct {
+        fn run(l: *Lock) void {
+            my_tid = 3;
+            l.lock();
+            l.unlock();
+        }
+    };
+    my_tid = 7;
+    lock.lock();
+    var t = try std.Thread.spawn(.{}, Waiter.run, .{&lock});
+    waitQueued(1);
+    lock.unlock();
+    t.join();
+    // The handoff woke task 3; the waiter's own unlock found nobody queued.
+    try std.testing.expectEqual(@as(u32, 1), model.notified);
+    try std.testing.expectEqual(@as(u32, 3), model.last_notified);
+    try std.testing.expect(!model.notified_under_guard);
 }

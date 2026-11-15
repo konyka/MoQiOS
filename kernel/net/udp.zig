@@ -70,6 +70,8 @@ var port_local_ip: [MAX_PORTS][4]u8 = @splat(.{ 0, 0, 0, 0 });
 var port_local_ip6: [MAX_PORTS][16]u8 = @splat(@splat(0));
 /// IPv6 multicast groups each slot joined (IPV6_ADD_MEMBERSHIP); travels with the slot like port_opts.
 var port_mc: [MAX_PORTS]mcast.Membership = @splat(.{});
+/// IPv4 multicast groups each slot joined (IP_ADD_MEMBERSHIP).
+var port_mc4: [MAX_PORTS]mcast.Membership4 = @splat(.{});
 
 /// Options of the socket bound to `port`, or null if it is not registered.
 pub fn getPortOpts(port: u32) ?@import("sockopt_policy.zig").Stored {
@@ -115,6 +117,39 @@ pub fn hostJoined(group: [16]u8, ifindex: ?u8) bool {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     return hostJoinedLocked(group, ifindex);
+}
+
+/// IP_ADD_MEMBERSHIP / IP_DROP_MEMBERSHIP on the socket with registry key `port` (mcast_policy.join4 / drop4); -9 when it is gone.
+pub fn mcJoin4(port: u32, group: [4]u8, addr: [4]u8, index: u32, nic_active: bool, our: [4]u8) i64 {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return -9;
+    return mcast.join4(&port_mc4[i], group, addr, index, nic_active, our);
+}
+
+pub fn mcDrop4(port: u32, group: [4]u8, addr: [4]u8, index: u32, nic_active: bool, our: [4]u8) i64 {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return -9;
+    return mcast.drop4(&port_mc4[i], group, addr, index, nic_active, our);
+}
+
+/// Whether some IPv4 socket joined `group` on interface `ifindex`.
+fn hostJoined4Locked(group: [4]u8, ifindex: ?u8) bool {
+    for (0..num_ports) |i| {
+        if (port_v6[i]) continue;
+        const m = &port_mc4[i];
+        for (0..m.n) |k| {
+            if (@as(u32, @bitCast(m.group[k])) == @as(u32, @bitCast(group)) and (ifindex == null or m.ifindex[k] == ifindex.?)) return true;
+        }
+    }
+    return false;
+}
+
+pub fn hostJoined4(group: [4]u8, ifindex: ?u8) bool {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    return hostJoined4Locked(group, ifindex);
 }
 
 /// connect() fixed the peer port of the socket bound to `port`.
@@ -216,6 +251,7 @@ fn newSlotLocked(key: u32, is_v6: bool, uid: u32) u16 {
     port_local_ip[idx] = .{ 0, 0, 0, 0 };
     port_local_ip6[idx] = @splat(0);
     port_mc[idx] = .{};
+    port_mc4[idx] = .{};
     for (0..QUEUE_DEPTH) |j| queues[idx][j].valid = false;
     num_ports += 1;
     return @intCast(idx);
@@ -278,6 +314,7 @@ pub fn rebind(old_key: u32, new_port: u16, addr: [4]u8, addr6: [16]u8, out_disc:
     port_local_ip[ni] = addr;
     port_local_ip6[ni] = addr6;
     port_mc[ni] = port_mc[oi];
+    port_mc4[ni] = port_mc4[oi];
     releaseLocked(old_key);
     out_disc.* = disc;
     return 0;
@@ -327,6 +364,8 @@ fn releaseLocked(port: u32) void {
             port_local_ip6[num_ports] = @splat(0);
             port_mc[i] = port_mc[num_ports];
             port_mc[num_ports] = .{};
+            port_mc4[i] = port_mc4[num_ports];
+            port_mc4[num_ports] = .{};
             port_err[num_ports] = 0;
             port_peer[num_ports] = 0;
             queues[i] = queues[num_ports];
@@ -480,6 +519,42 @@ fn enqueueMcast(port: u16, src_ip: [16]u8, src_port: u16, group: [16]u8, payload
     }
 }
 
+/// The IPv4 counterpart of enqueueMcast (Linux __udp4_lib_mcast_deliver, ip_check_mc_rcu): a copy to every IPv4 socket on the port
+/// that socketMatches4 and socketAccepts4, while this host is a member of the group or it is 224.0.0.1.
+fn enqueueMcast4(port: u16, src_ip: [16]u8, src_port: u16, group: [4]u8, payload: []const u8) void {
+    var keys: [MAX_PORTS]u32 = undefined;
+    var n: usize = 0;
+    {
+        const saved = udp_lock.acquire();
+        defer udp_lock.release(saved);
+        if (!mcast.alwaysJoined4(group) and !hostJoined4Locked(group, null)) return;
+        const actual = @min(payload.len, MAX_UDP_PAYLOAD);
+        for (0..num_ports) |i| {
+            if (portNumber(ports[i]) != port or port_v6[i]) continue;
+            if (!mcast.socketMatches4(port_local_ip[i], group, port_peer[i], port_peer_ip[i], src_ip[0..4].*, src_port)) continue;
+            if (!mcast.socketAccepts4(&port_mc4[i], port_opts[i].ip.mc4_all, group)) continue;
+            for (0..QUEUE_DEPTH) |j| {
+                const e = &queues[i][j];
+                if (e.valid) continue;
+                e.src_ip = src_ip;
+                e.src_port = src_port;
+                e.dst_port = port;
+                e.data_len = @intCast(actual);
+                @memcpy(e.data[0..actual], payload[0..actual]);
+                e.is_v6 = false;
+                e.valid = true;
+                keys[n] = ports[i];
+                n += 1;
+                break;
+            }
+        }
+    }
+    for (keys[0..n]) |key| {
+        @import("epoll.zig").epollNotify(.udp_socket, key, @import("epoll.zig").EPOLLIN);
+        @import("../fs/vfs.zig").udpFasyncNotify(key, @import("../fs/fcntl_policy.zig").POLL_IN);
+    }
+}
+
 pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) void {
     const hdr = udp_util.parseHeader(data, len) orelse return;
 
@@ -495,6 +570,10 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
     if (8 + actual_payload > len) return;
     var ip16: [16]u8 = @splat(0);
     @memcpy(ip16[0..4], &src_ip);
+    if (mcast.isMulticast4(dst_ip)) {
+        enqueueMcast4(hdr.dst_port, ip16, hdr.src_port, dst_ip, data[8..][0..actual_payload]);
+        return;
+    }
     const bound = enqueue(hdr.dst_port, ip16, hdr.src_port, hdr.dst_port, dst_ip, @splat(0), data[8..][0..actual_payload], false);
     const unreach = @import("icmp_unreach_policy.zig");
     if (unreach.shouldReply(netif.isLoopback(src_ip) and netif.isLoopback(dst_ip), false, bound)) {
@@ -640,10 +719,13 @@ pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_port: u16, dat
     // Limited broadcast has no ARP entry (arp.resolve would fail and nothing
     // would ever be transmitted) — use the broadcast MAC directly. DHCP
     // DISCOVER/REQUEST depend on this.
+    const group = mcast.isMulticast4(dst_ip);
     const dst_mac = if (loopback)
         our_mac
     else if (dst_ip[0] == 255 and dst_ip[1] == 255 and dst_ip[2] == 255 and dst_ip[3] == 255)
         [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }
+    else if (group)
+        mcast.multicastMac4(dst_ip)
     else
         arp.resolve(dst_ip) orelse {
             arp.sendArpRequest(dst_ip);
@@ -672,12 +754,17 @@ pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_port: u16, dat
 
     // Build IPv4 header at offset 14 (after ethernet header)
     ipv4.buildHeader(send_pkt[14..].ptr, our_ip, dst_ip, ipv4.PROTO_UDP, udp_total);
-    if (getPortOpts(src_port)) |po| {
-        if (ip_opt_policy.ipv4NeedsPatch(po.ip)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], po.ip, ipv4.checksum);
-    }
+    const opts4: ip_opt_policy.IpOpts = if (getPortOpts(src_port)) |po| po.ip else .{};
+    if (ip_opt_policy.ipv4NeedsPatch(opts4)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], opts4, ipv4.checksum);
+    // A datagram to a group carries IP_MULTICAST_TTL (default 1), not the unicast TTL.
+    if (group) ip_opt_policy.setTtl4(send_pkt[14..][0..20], opts4.mc4_ttl, ipv4.checksum);
 
     // Build ethernet frame
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, 20 + udp_total);
+    // IP_MULTICAST_LOOP: a member of the group on the outgoing interface (IP_MULTICAST_IF, default the NIC) gets a copy too (Linux
+    // ip_mc_output, ip_check_mc_rcu).
+    const out_if: u8 = if (opts4.mc4_index != 0) opts4.mc4_index else 2;
+    if (group and opts4.mc4_loop and (mcast.alwaysJoined4(dst_ip) or hostJoined4(dst_ip, out_if))) _ = lo.sendPacket(&send_pkt, frame_len);
 
     const ok = if (loopback) lo.sendPacket(&send_pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.

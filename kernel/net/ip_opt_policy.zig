@@ -8,6 +8,12 @@ pub const SOL_IPV6: u64 = 41;
 
 pub const IP_TOS: u64 = 1;
 pub const IP_TTL: u64 = 2;
+pub const IP_MULTICAST_IF: u64 = 32;
+pub const IP_MULTICAST_TTL: u64 = 33;
+pub const IP_MULTICAST_LOOP: u64 = 34;
+pub const IP_ADD_MEMBERSHIP: u64 = 35;
+pub const IP_DROP_MEMBERSHIP: u64 = 36;
+pub const IP_MULTICAST_ALL: u64 = 49;
 pub const IPV6_UNICAST_HOPS: u64 = 16;
 pub const IPV6_MULTICAST_IF: u64 = 17;
 pub const IPV6_MULTICAST_HOPS: u64 = 18;
@@ -35,6 +41,12 @@ pub const IpOpts = struct {
     mc_loop: bool = true,
     mc_if: u8 = 0,
     mc_all: bool = true,
+    /// IP_MULTICAST_TTL / _LOOP / _ALL and IP_MULTICAST_IF (Linux mc_ttl, MC_LOOP, MC_ALL, mc_addr and mc_index).
+    mc4_ttl: u8 = 1,
+    mc4_loop: bool = true,
+    mc4_all: bool = true,
+    mc4_addr: [4]u8 = .{ 0, 0, 0, 0 },
+    mc4_index: u8 = 0,
 };
 
 pub const Family = enum { v4, v6 };
@@ -73,6 +85,16 @@ pub fn applySet(cur: IpOpts, level: u64, optname: u64, val: []const u8) SetResul
             },
             // Only the low byte; the ECN bits are not the user's to set.
             IP_TOS => o.tos = @as(u8, @truncate(@as(u32, @bitCast(v)))) & ~ECN_MASK,
+            // -1 restores the default 1; 0..255 (0 keeps the datagram on this host).
+            IP_MULTICAST_TTL => {
+                if (v < -1 or v > 255) return .{ .err = -22 };
+                o.mc4_ttl = if (v == -1) 1 else @intCast(v);
+            },
+            IP_MULTICAST_LOOP => o.mc4_loop = v != 0,
+            IP_MULTICAST_ALL => {
+                if (v != 0 and v != 1) return .{ .err = -22 };
+                o.mc4_all = v == 1;
+            },
             else => return .{ .err = -92 },
         },
         SOL_IPV6 => switch (optname) {
@@ -120,6 +142,47 @@ pub fn applySet(cur: IpOpts, level: u64, optname: u64, val: []const u8) SetResul
     return .{ .ok = o };
 }
 
+/// The interface an IPv4 multicast request names (Linux ip_mc_find_dev, ip_dev_find): an index (1 lo, 2 the NIC while it is up), else
+/// an address of this host (127/8 is lo, `our` the NIC). Null: no such interface.
+pub fn ifaceOf4(addr: [4]u8, index: u32, nic_active: bool, our: [4]u8) ?u8 {
+    if (index != 0) {
+        if (index == 1) return 1;
+        if (index == 2 and nic_active) return 2;
+        return null;
+    }
+    if (addr[0] == 127) return 1;
+    if (nic_active and @as(u32, @bitCast(addr)) == @as(u32, @bitCast(our))) return 2;
+    return null;
+}
+
+/// IP_MULTICAST_IF takes an in_addr (4 bytes), a struct ip_mreq (8: the interface address is the second word) or a struct ip_mreqn
+/// (12: an address and an index); shorter is EINVAL. 0.0.0.0 without an index clears it; an interface that does not exist is
+/// EADDRNOTAVAIL. getsockopt reports the address given.
+pub fn setMulticastIf4(cur: IpOpts, val: []const u8, nic_active: bool, our: [4]u8) SetResult {
+    if (val.len < 4) return .{ .err = -22 };
+    const addr: [4]u8 = if (val.len >= 8) val[4..8].* else val[0..4].*;
+    const index: u32 = if (val.len >= 12) std.mem.readInt(u32, val[8..12], .little) else 0;
+    var o = cur;
+    if (index == 0 and @as(u32, @bitCast(addr)) == 0) {
+        o.mc4_addr = .{ 0, 0, 0, 0 };
+        o.mc4_index = 0;
+        return .{ .ok = o };
+    }
+    o.mc4_index = ifaceOf4(addr, index, nic_active, our) orelse return .{ .err = -99 };
+    o.mc4_addr = addr;
+    return .{ .ok = o };
+}
+
+/// The SOL_IP options a TCP socket refuses (do_ip_setsockopt on SOCK_STREAM): MULTICAST_TTL and MULTICAST_IF are EINVAL, group
+/// membership EPROTO. Null: handled as for any socket.
+pub fn streamSetErrno4(optname: u64) ?i64 {
+    return switch (optname) {
+        IP_MULTICAST_TTL, IP_MULTICAST_IF => -22,
+        IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP => -71,
+        else => null,
+    };
+}
+
 /// IPV6_MULTICAST_IF names an interface that must exist: 0 (none), lo (1) or the active NIC (2); anything else is ENODEV.
 pub fn mcastIfErrno(v: i32, nic_active: bool) i64 {
     if (v == 0 or v == 1 or (nic_active and v == 2)) return 0;
@@ -142,6 +205,10 @@ pub fn getValue(o: IpOpts, level: u64, optname: u64) ?i32 {
         SOL_IP => switch (optname) {
             IP_TTL => if (o.ttl == 0) DEFAULT_TTL else o.ttl,
             IP_TOS => o.tos,
+            IP_MULTICAST_TTL => o.mc4_ttl,
+            IP_MULTICAST_LOOP => @intFromBool(o.mc4_loop),
+            IP_MULTICAST_ALL => @intFromBool(o.mc4_all),
+            IP_MULTICAST_IF => @bitCast(o.mc4_addr),
             else => null,
         },
         SOL_IPV6 => switch (optname) {
@@ -182,6 +249,14 @@ pub fn ipv6NeedsPatch(o: IpOpts) bool {
 pub fn patchIpv4(hdr: *[20]u8, o: IpOpts, csum: *const fn ([*]const u8, u16) u16) void {
     hdr[8] = effectiveTtl(o);
     hdr[1] = (hdr[1] & ECN_MASK) | o.tos;
+    hdr[10] = 0;
+    hdr[11] = 0;
+    std.mem.writeInt(u16, hdr[10..12], csum(hdr, 20), .big);
+}
+
+/// Set an IPv4 header's TTL (byte 8) and recompute its checksum.
+pub fn setTtl4(hdr: *[20]u8, ttl: u8, csum: *const fn ([*]const u8, u16) u16) void {
+    hdr[8] = ttl;
     hdr[10] = 0;
     hdr[11] = 0;
     std.mem.writeInt(u16, hdr[10..12], csum(hdr, 20), .big);

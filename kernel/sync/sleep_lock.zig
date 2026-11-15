@@ -22,6 +22,10 @@
 //!                                  make it runnable
 //!   sleepAfterBlock()              give up the CPU until woken
 //!   relax()
+//!   notifyWoken(u32)               the task unlock() handed the lock to is
+//!                                  runnable: let the scheduler preempt or
+//!                                  kick its CPU (called with the guard
+//!                                  released)
 //!
 //! Ownership is handed straight to the oldest waiter on unlock (`held` stays
 //! true), so a woken waiter cannot lose the lock to a task that arrives in
@@ -85,10 +89,17 @@ pub fn SleepLock(comptime Env: type) type {
         }
 
         pub fn unlock(self: *Self) void {
-            const f = self.guard.acquire();
-            defer self.guard.release(f);
-            // A waiter inherits ownership: `held` stays true across the handoff.
-            if (Env.wakeOne(&self.waiters) == null) self.held = false;
+            const woken = blk: {
+                const f = self.guard.acquire();
+                defer self.guard.release(f);
+                // A waiter inherits ownership: `held` stays true across the handoff.
+                const w = Env.wakeOne(&self.waiters);
+                if (w == null) self.held = false;
+                break :blk w;
+            };
+            // Without the kick the new owner sits on its CPU's run queue until that CPU reschedules by itself, while everyone
+            // queued behind it waits too.
+            if (woken) |idx| Env.notifyWoken(idx);
         }
 
         /// Take the lock only if it is free right now.

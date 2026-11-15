@@ -4510,6 +4510,118 @@ test "IPv6 UDP multicast: IPV6_MULTICAST_* options, group membership, member-onl
     try std.testing.expect(std.mem.indexOf(u8, so, "    if (optlen < 20) return -22;\n    if (ref == .tcp) return -71;\n") != null);
 }
 
+test "IPv4 UDP multicast: IP_MULTICAST_* options, group membership, member-only local delivery and loopback copy (hello362)" {
+    const p = kt.ip_opt_policy;
+    const m = kt.mcast_policy;
+    try std.testing.expectEqual(@as(u64, 32), p.IP_MULTICAST_IF);
+    try std.testing.expectEqual(@as(u64, 33), p.IP_MULTICAST_TTL);
+    try std.testing.expectEqual(@as(u64, 34), p.IP_MULTICAST_LOOP);
+    try std.testing.expectEqual(@as(u64, 35), p.IP_ADD_MEMBERSHIP);
+    try std.testing.expectEqual(@as(u64, 36), p.IP_DROP_MEMBERSHIP);
+    try std.testing.expectEqual(@as(u64, 49), p.IP_MULTICAST_ALL);
+    const none: p.IpOpts = .{};
+    try std.testing.expectEqual(@as(?i32, 1), p.getValue(none, p.SOL_IP, p.IP_MULTICAST_TTL));
+    try std.testing.expectEqual(@as(?i32, 1), p.getValue(none, p.SOL_IP, p.IP_MULTICAST_LOOP));
+    try std.testing.expectEqual(@as(?i32, 1), p.getValue(none, p.SOL_IP, p.IP_MULTICAST_ALL));
+    try std.testing.expectEqual(@as(?i32, 0), p.getValue(none, p.SOL_IP, p.IP_MULTICAST_IF));
+    const set4 = struct {
+        fn f(cur: p.IpOpts, name: u64, v: i32) p.SetResult {
+            var b: [4]u8 = undefined;
+            std.mem.writeInt(i32, &b, v, .little);
+            return p.applySet(cur, p.SOL_IP, name, &b);
+        }
+    }.f;
+    try std.testing.expectEqual(@as(u8, 7), set4(none, p.IP_MULTICAST_TTL, 7).ok.mc4_ttl);
+    try std.testing.expectEqual(@as(u8, 0), set4(none, p.IP_MULTICAST_TTL, 0).ok.mc4_ttl);
+    try std.testing.expectEqual(@as(u8, 1), set4(.{ .mc4_ttl = 9 }, p.IP_MULTICAST_TTL, -1).ok.mc4_ttl);
+    try std.testing.expectEqual(@as(i64, -22), set4(none, p.IP_MULTICAST_TTL, 256).err);
+    try std.testing.expectEqual(@as(i64, -22), set4(none, p.IP_MULTICAST_TTL, -2).err);
+    // One byte is accepted for the IPv4 multicast options.
+    try std.testing.expectEqual(@as(u8, 9), p.applySet(none, p.SOL_IP, p.IP_MULTICAST_TTL, &.{9}).ok.mc4_ttl);
+    try std.testing.expect(!p.applySet(none, p.SOL_IP, p.IP_MULTICAST_LOOP, &.{0}).ok.mc4_loop);
+    try std.testing.expect(set4(.{ .mc4_loop = false }, p.IP_MULTICAST_LOOP, 5).ok.mc4_loop);
+    try std.testing.expectEqual(@as(i64, -22), set4(none, p.IP_MULTICAST_ALL, 3).err);
+    try std.testing.expect(!set4(none, p.IP_MULTICAST_ALL, 0).ok.mc4_all);
+    const our = [4]u8{ 10, 0, 2, 15 };
+    try std.testing.expectEqual(@as(?u8, 2), p.ifaceOf4(our, 0, true, our));
+    try std.testing.expectEqual(@as(?u8, null), p.ifaceOf4(our, 0, false, our));
+    try std.testing.expectEqual(@as(?u8, 1), p.ifaceOf4(.{ 127, 0, 0, 1 }, 0, true, our));
+    try std.testing.expectEqual(@as(?u8, null), p.ifaceOf4(.{ 10, 9, 9, 9 }, 0, true, our));
+    try std.testing.expectEqual(@as(?u8, 2), p.ifaceOf4(.{ 0, 0, 0, 0 }, 2, true, our));
+    try std.testing.expectEqual(@as(?u8, null), p.ifaceOf4(.{ 0, 0, 0, 0 }, 99, true, our));
+    const ifa = p.setMulticastIf4(none, &our, true, our).ok;
+    try std.testing.expectEqual(our, ifa.mc4_addr);
+    try std.testing.expectEqual(@as(?i32, @bitCast(our)), p.getValue(ifa, p.SOL_IP, p.IP_MULTICAST_IF));
+    try std.testing.expectEqual(@as(i64, -99), p.setMulticastIf4(none, &.{ 10, 9, 9, 9 }, true, our).err);
+    try std.testing.expectEqual(@as(i64, -22), p.setMulticastIf4(none, our[0..3], true, our).err);
+    try std.testing.expectEqual(@as(u8, 0), p.setMulticastIf4(ifa, &.{ 0, 0, 0, 0 }, true, our).ok.mc4_index);
+    try std.testing.expectEqual(@as(?i64, -22), p.streamSetErrno4(p.IP_MULTICAST_TTL));
+    try std.testing.expectEqual(@as(?i64, -22), p.streamSetErrno4(p.IP_MULTICAST_IF));
+    try std.testing.expectEqual(@as(?i64, -71), p.streamSetErrno4(p.IP_ADD_MEMBERSHIP));
+    try std.testing.expectEqual(@as(?i64, null), p.streamSetErrno4(p.IP_MULTICAST_LOOP));
+    var hdr: [20]u8 = @splat(0);
+    hdr[0] = 0x45;
+    hdr[8] = 64;
+    p.setTtl4(&hdr, 1, kt.ipv4.checksum);
+    try std.testing.expectEqual(@as(u8, 1), hdr[8]);
+    try std.testing.expectEqual(@as(u16, 0), kt.ipv4.checksum(&hdr, 20));
+
+    const g1 = [4]u8{ 239, 1, 1, 1 };
+    const g2 = [4]u8{ 239, 1, 1, 2 };
+    const any = [4]u8{ 0, 0, 0, 0 };
+    var mem: m.Membership4 = .{};
+    try std.testing.expectEqual(m.EINVAL, m.join4(&mem, .{ 10, 0, 0, 1 }, any, 0, true, our));
+    try std.testing.expectEqual(m.ENODEV, m.join4(&mem, g1, .{ 10, 9, 9, 9 }, 0, true, our));
+    try std.testing.expectEqual(m.ENODEV, m.join4(&mem, g1, any, 0, false, our));
+    try std.testing.expectEqual(@as(i64, 0), m.join4(&mem, g1, any, 0, true, our));
+    try std.testing.expectEqual(m.EADDRINUSE, m.join4(&mem, g1, any, 0, true, our));
+    try std.testing.expectEqual(m.EADDRINUSE, m.join4(&mem, g1, our, 0, true, our));
+    try std.testing.expectEqual(m.EADDRINUSE, m.join4(&mem, g1, any, 2, true, our));
+    try std.testing.expectEqual(m.ENODEV, m.join4(&mem, g1, any, 99, true, our));
+    try std.testing.expectEqual(@as(i64, 0), m.join4(&mem, g1, .{ 127, 0, 0, 1 }, 0, true, our));
+    try std.testing.expectEqual(m.EADDRNOTAVAIL, m.drop4(&mem, g2, any, 0, true, our));
+    try std.testing.expectEqual(m.EADDRNOTAVAIL, m.drop4(&mem, .{ 10, 0, 0, 1 }, any, 0, true, our));
+    try std.testing.expectEqual(@as(i64, 0), m.drop4(&mem, g1, any, 0, true, our));
+    try std.testing.expect(m.joined4(&mem, g1));
+    try std.testing.expectEqual(m.EADDRNOTAVAIL, m.drop4(&mem, g1, any, 0, true, our));
+    try std.testing.expectEqual(@as(i64, 0), m.drop4(&mem, g1, any, 1, true, our));
+    try std.testing.expect(!m.joined4(&mem, g1));
+    try std.testing.expectEqual(m.ENODEV, m.drop4(&mem, g1, any, 0, false, our));
+    var full: m.Membership4 = .{};
+    for (0..m.MAX_GROUPS4) |i| try std.testing.expectEqual(@as(i64, 0), m.join4(&full, .{ 239, 2, 0, @intCast(i + 1) }, any, 0, true, our));
+    try std.testing.expectEqual(m.ENOBUFS, m.join4(&full, g1, any, 0, true, our));
+    var src16: [16]u8 = @splat(0);
+    src16[0] = 10;
+    src16[3] = 7;
+    const src = [4]u8{ 10, 0, 0, 7 };
+    try std.testing.expect(m.socketMatches4(any, g1, 0, @splat(0), src, 5));
+    try std.testing.expect(m.socketMatches4(g1, g1, 0, @splat(0), src, 5));
+    try std.testing.expect(!m.socketMatches4(g2, g1, 0, @splat(0), src, 5));
+    try std.testing.expect(!m.socketMatches4(any, g1, 6, src16, src, 5));
+    try std.testing.expect(m.socketMatches4(any, g1, 5, src16, src, 5));
+    try std.testing.expect(m.socketAccepts4(&mem, true, g1) and !m.socketAccepts4(&mem, false, g1));
+    try std.testing.expect(m.alwaysJoined4(.{ 224, 0, 0, 1 }) and !m.alwaysJoined4(g1));
+    try std.testing.expect(m.isMulticast4(.{ 224, 0, 0, 0 }) and m.isMulticast4(.{ 239, 255, 255, 255 }) and !m.isMulticast4(.{ 240, 0, 0, 0 }));
+    try std.testing.expectEqual([6]u8{ 0x01, 0x00, 0x5e, 0x01, 0x01, 0x01 }, m.multicastMac4(.{ 239, 129, 1, 1 }));
+    // A socket bound to a group sends from the interface's address, or 127.0.0.1 towards loopback.
+    const tp = kt.tcp_port_policy;
+    try std.testing.expectEqual(our, tp.sourceAddr(g1, .{ 10, 0, 2, 2 }, our));
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, tp.sourceAddr(g1, .{ 127, 0, 0, 1 }, our));
+
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "    if (mcast.isMulticast4(dst_ip)) {\n        enqueueMcast4(hdr.dst_port, ip16, hdr.src_port, dst_ip, data[8..][0..actual_payload]);\n        return;\n    }\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "        if (!mcast.alwaysJoined4(group) and !hostJoined4Locked(group, null)) return;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "            if (!mcast.socketAccepts4(&port_mc4[i], port_opts[i].ip.mc4_all, group)) continue;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    if (group) ip_opt_policy.setTtl4(send_pkt[14..][0..20], opts4.mc4_ttl, ipv4.checksum);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    if (group and opts4.mc4_loop and (mcast.alwaysJoined4(dst_ip) or hostJoined4(dst_ip, out_if))) _ = lo.sendPacket(&send_pkt, frame_len);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    else if (group)\n        mcast.multicastMac4(dst_ip)\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    port_mc4[ni] = port_mc4[oi];\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "            port_mc4[i] = port_mc4[num_ports];\n") != null);
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "(optname == ipo.IP_ADD_MEMBERSHIP or optname == ipo.IP_DROP_MEMBERSHIP)) return setMembership4(ref, optname, optval_ptr, optlen);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "    if (ref == .tcp) return -71;\n    if (ref != .udp) return -92;\n    if (optlen < 8) return -22;\n") != null);
+}
+
 test "an IPv6 TCP socket's bound address takes part in conflicts, listener choice, lookup, source address and naming (hello359)" {
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "        if (tcb.is_v6 and !tcp_port_policy.addrsConflict6(tcb.local_ip6, tcbs[i].local_ip6)) continue;\n") != null);
@@ -11205,7 +11317,7 @@ test "IP socket options: dispatch and send-path wiring" {
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (ip_opt_policy.ipv4NeedsPatch(tcb.options.ip)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], tcb.options.ip, ipv4.checksum);\n    // SK-131/143: ECT(1) for AccECN/L4S, else ECT(0) for classic ECN.") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (ip_opt_policy.ipv6NeedsPatch(tcb.options.ip)) ip_opt_policy.patchIpv6(send_pkt[14..][0..40], tcb.options.ip);\n    // SK-131/143: ECT(1) for AccECN/L4S, else ECT(0) for classic ECN.") != null);
     const us = kt.udp_source;
-    try std.testing.expect(std.mem.indexOf(u8, us, "if (ip_opt_policy.ipv4NeedsPatch(po.ip)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], po.ip, ipv4.checksum);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (ip_opt_policy.ipv4NeedsPatch(opts4)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], opts4, ipv4.checksum);") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "if (ip_opt_policy.ipv6NeedsPatch(opts)) ip_opt_policy.patchIpv6(send_pkt[14..][0..40], opts);") != null);
 }
 
