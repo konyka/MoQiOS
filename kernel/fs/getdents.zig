@@ -23,7 +23,10 @@ pub fn getdents64(fd: u32, buf_ptr: u64, buf_size: u64) i64 {
     const desc = &cur.fd_table.fds[fd];
     if (desc.fd_type == .none) return -9;
 
-    // A directory cursor is part of the open file description: dup()/fork() share it.
+    // A directory cursor is part of the open file description: dup()/fork() share it, and its offset lock keeps two listers
+    // of one description from starting at the same position (Linux fdget_pos).
+    const locked = vfs_mod.lockOffset(desc);
+    defer vfs_mod.unlockOffset(locked);
     vfs_mod.syncOffsetIn(desc);
     defer vfs_mod.syncOffsetOut(desc);
 

@@ -9455,4 +9455,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、313 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。另有一份 SMP=4 出现一次已知偶发失败 hello325 G（EXIT=1），同一份里 hello351 通过。
 - 这次修复带来的局限：
   1. 读到用户缓冲区时持着偏移锁做 `copyToUser`；如果缺页处理要读同一个 description（这个内核里没有这样的路径），会自锁。
-  2. hello350 局限 2 不变：mq 偏移、`getdents` 游标和 `offsetOf`/`setOffsetOf` 的调用者仍不加锁。
+  2. hello350 局限 2 不变：mq 偏移、`getdents` 游标和 `offsetOf`/`setOffsetOf` 的调用者仍不加锁。（`getdents` 游标由 hello352 补上。）
+
+## 补充：getdents64 在共享目录描述上原子地移动游标（hello352）
+
+- 背景：hello350、hello351 一节的局限 2。`getdents64` 先 `syncOffsetIn` 读出共享的目录游标，列完一批再 `syncOffsetOut` 写回，中间不持偏移锁。两个进程共用一个目录描述同时列目录时，会从同一游标开始，同一批条目被两边各读一次。Linux 的 `getdents64` 通过 `fdget_pos` 持 `f_pos_lock`。
+- Linux 实测（`gcc -DHOST user/hello352.c`，`/tmp/hello352d` 下 120 个条目 e000–e119，8 轮，父子进程通过管道同时起跑，缓冲区 40 字节，每次大约一条）：A 两边合起来每个条目恰好看到一次；B 每轮结束后再调一次 getdents64 返回 0。全部通过。
+- 红灯（未改的内核）：SMP=4 上 A 8 轮错 2 轮，43 个条目被看到两次，B 通过；SMP=2 上全部通过。
+- 修复（`kernel/fs/getdents.zig`）：`getdents64` 在 `syncOffsetIn` 之前调 `vfs_mod.lockOffset(desc)`，返回时解锁，覆盖 ext2、ext4/NTFS（rofs）、tmpfs 和 procfs 目录。devfs 目录描述没有共享槽，`lockOffset` 返回 0，不加锁。
+- 测试：hello352（QEMU，3 项），定向 SMP=2、SMP=4 各一份通过。新增 host 测试「getdents64 holds the shared description's offset lock across the directory cursor read-modify-write (hello352)」，检查加锁的位置在第一个分派之前。变异验证：去掉加锁，这条 host 测试失败，文件已恢复。
+- 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、314 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
+- 这次修复带来的局限：mq 偏移和 `aio`、`splice`、`copy_file_range` 通过 `offsetOf`/`setOffsetOf` 的读改写仍不加偏移锁。

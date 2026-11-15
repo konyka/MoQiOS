@@ -4358,6 +4358,14 @@ test "an IPv4 and an IPv6 TCP socket do not conflict on one port (hello344)" {
     try std.testing.expect(std.mem.indexOf(u8, ts, "        if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict\n        if (!tcp_port_policy.familiesConflict(tcb.is_v6, tcbs[i].is_v6)) continue;\n") != null);
 }
 
+test "getdents64 holds the shared description's offset lock across the directory cursor read-modify-write (hello352)" {
+    const g = kt.getdents_source;
+    try std.testing.expect(std.mem.indexOf(u8, g, "    const locked = vfs_mod.lockOffset(desc);\n    defer vfs_mod.unlockOffset(locked);\n    vfs_mod.syncOffsetIn(desc);\n    defer vfs_mod.syncOffsetOut(desc);\n") != null);
+    const lk = std.mem.indexOf(u8, g, "vfs_mod.lockOffset(desc)") orelse return error.TestUnexpectedResult;
+    const first = std.mem.indexOf(u8, g, "return getdents64Ext2(desc, buf_ptr, buf_size);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(lk < first);
+}
+
 test "read, write, readv and writev hold the shared description's offset lock across the whole call, not each 4 KiB piece (hello351)" {
     const f = kt.file_io_source;
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, f, "vfs_mod.lockOffset(&cur.fd_table.fds["));
