@@ -997,6 +997,15 @@ test "TCFLSH discards console input for TCIFLUSH and TCIOFLUSH, TCSBRK succeeds"
     try std.testing.expectEqual(@as(?bool, null), ip.flushDiscardsInput(3));
 }
 
+test "TCXONC on the console checks its action and otherwise succeeds" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.ioctl_source, "ip.TCXONC => return if (ip.flowActionValid(arg)) 0 else -22,") != null);
+    const ip = kt.ioctl_policy;
+    try std.testing.expect(ip.isTerminalRequest(ip.TCXONC));
+    try std.testing.expect(ip.flowActionValid(0));
+    try std.testing.expect(ip.flowActionValid(3));
+    try std.testing.expect(!ip.flowActionValid(4));
+}
+
 test "parent TID copyout aborts an unpublished child before publication" {
     const source = kt.clone_source;
     try std.testing.expect(std.mem.indexOf(u8, source, "abortUnpublishedChild(child_idx)") != null);

@@ -203,6 +203,9 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
         // The argument is an int, not a pointer. Console output is written to the serial port synchronously, so there is no output
         // queue to drain (TCSBRK, tcdrain) or discard (TCOFLUSH); a break has no meaning on this console.
         ip.TCSBRK => return 0,
+        // tcflow: the selector is checked, but output is not suspended (the console writes to the serial port synchronously and
+        // has no output queue to hold back) and no STOP/START character is sent (there is no line to send it on).
+        ip.TCXONC => return if (ip.flowActionValid(arg)) 0 else -22,
         ip.TCFLSH => {
             const discard = ip.flushDiscardsInput(arg) orelse return -22; // EINVAL
             if (discard and comptime @import("builtin").cpu.arch == .x86_64) @import("../drivers/keyboard.zig").flushInput();

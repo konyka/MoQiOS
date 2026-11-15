@@ -10,6 +10,7 @@ pub const TCSETS: u64 = 0x5402;
 pub const TCSETSW: u64 = 0x5403;
 pub const TCSETSF: u64 = 0x5404;
 pub const TCSBRK: u64 = 0x5409;
+pub const TCXONC: u64 = 0x540A;
 pub const TCFLSH: u64 = 0x540B;
 pub const TIOCGPGRP: u64 = 0x540F;
 pub const TIOCSPGRP: u64 = 0x5410;
@@ -24,7 +25,7 @@ pub const FIOCLEX: u64 = 0x5451;
 
 pub fn isTerminalRequest(cmd: u64) bool {
     return switch (cmd) {
-        TCGETS, TCSETS, TCSETSW, TCSETSF, TCSBRK, TCFLSH, TIOCGPGRP, TIOCSPGRP, TIOCGWINSZ, TIOCSWINSZ, TIOCSTI => true,
+        TCGETS, TCSETS, TCSETSW, TCSETSF, TCSBRK, TCXONC, TCFLSH, TIOCGPGRP, TIOCSPGRP, TIOCGWINSZ, TIOCSWINSZ, TIOCSTI => true,
         else => false,
     };
 }
@@ -45,6 +46,18 @@ test "TCFLSH selects the queues to discard" {
     try @import("std").testing.expectEqual(@as(?bool, true), flushDiscardsInput(2));
     try @import("std").testing.expectEqual(@as(?bool, null), flushDiscardsInput(3));
     try @import("std").testing.expectEqual(@as(?bool, null), flushDiscardsInput(0xFFFF_FFFF_FFFF_FFFF));
+}
+
+/// TCXONC's action (an int, Linux n_tty_ioctl_helper): TCOOFF 0, TCOON 1, TCIOFF 2, TCION 3; anything else is EINVAL.
+pub fn flowActionValid(arg: u64) bool {
+    return @as(u32, @truncate(arg)) <= 3;
+}
+
+test "TCXONC accepts TCOOFF..TCION only" {
+    try @import("std").testing.expect(flowActionValid(0));
+    try @import("std").testing.expect(flowActionValid(3));
+    try @import("std").testing.expect(!flowActionValid(4));
+    try @import("std").testing.expect(!flowActionValid(0xFFFF_FFFF_FFFF_FFFF));
 }
 
 /// What a descriptor is, as far as terminal requests care.

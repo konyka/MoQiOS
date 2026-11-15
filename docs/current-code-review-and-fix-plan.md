@@ -9241,5 +9241,20 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 绿灯：定向 SMP=2、SMP=4 各一份，hello338 通过；`zig build test` 通过。
 - 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都有 hello338、hello337 PASS，hello228 `corrupted canaries=0`。SMP=1、SMP=2 和一份 SMP=4 `EXIT=0`、0 FAIL；另一份 SMP=4 `EXIT=1`，只有已记录的偶发项 hello286 J（3/60）和 M（19/20）失败。单独重跑 SMP=4 第一份 `EXIT=1`，只有已记录的偶发项 hello325 G（`hits 0`）失败，hello286 通过；第二份 `EXIT=0`、0 FAIL。hello338 只改了 ioctl 和键盘环的清空，不涉及信号、作业控制和 TCP。riscv64、aarch64 smoke 通过。
 - 局限：
-  1. `TCXONC`（tcflow）仍是 `ENOTTY`：没有输出队列，也没有 XON/XOFF 流控状态。
+  1. `TCXONC`（tcflow）仍是 `ENOTTY`：没有输出队列，也没有 XON/XOFF 流控状态。（hello339 已补：选择子校验后成功，输出不会真的挂起）
   2. hello337 局限 1、2 不变：termios 只是保存的值，riscv64、aarch64 没有控制台输入队列。
+
+## 补充：控制台 tty 的 TCXONC（hello339）
+
+- 问题：hello338 局限 1。`TCXONC`（0x540A，`tcflow`）不在 `ioctl_policy.isTerminalRequest` 里，也没有 ioctl 分支，在控制台上返回 `ENOTTY`，`tcflow` 因此失败。
+- Linux 实测（`gcc -DHOST user/hello339.c`，pty 从端代替 `/dev/tty`）：A `TCOOFF`（0）、`TCOON`（1）、`TCIOFF`（2）、`TCION`（3）都成功；B 选择子 4、-1 是 `EINVAL`；C 管道上是 `ENOTTY`；D `TCOON` 之后写终端照常成功。第一版测量程序在 `TCOOFF` 后立即对阻塞的主端 read，进程挂住；改成非阻塞、只测返回值后重测，结果如上。
+- 红灯：旧内核上 A、B 失败（都是 `-25`），C、D 通过。
+- 修复：
+  - `kernel/fs/ioctl_policy.zig`：新增 `TCXONC`，加入 `isTerminalRequest`；新增 `flowActionValid(arg)`（0–3 合法），附带测试。
+  - `kernel/fs/ioctl.zig`：`TCXONC` 校验选择子，合法返回 0，否则 `EINVAL`。
+- 测试：hello339（QEMU，4 项）；host 测试 `TCXONC on the console checks its action and otherwise succeeds` 和 `ioctl_policy` 里的 `TCXONC accepts TCOOFF..TCION only`。变异：把上限 3 改成 4，两条测试都失败，文件已恢复。
+- 绿灯：定向 SMP=2、SMP=4 各一份，hello339 通过；`zig build test` 通过。
+- 完整 smoke：四份并行（SMP 1/4/4/2，超时 1400 秒），四份都有 hello339 PASS，hello228 `corrupted canaries=0`。SMP=1、SMP=2 和一份 SMP=4 `EXIT=0`、0 FAIL；另一份 SMP=4 `EXIT=1`，只有已记录的偶发项 hello286 J（3/60）失败。单独重跑一份 SMP=4，`EXIT=0`、0 FAIL。riscv64、aarch64 smoke 通过。
+- 局限：
+  1. `TCOOFF` 不会真的暂停输出：控制台同步写串口，没有输出队列可以挂起，之后的 write 照常输出。Linux 上 `TCOOFF` 后写入会阻塞（或非阻塞时 EAGAIN）直到 `TCOON`。
+  2. `TCIOFF`、`TCION` 不发送 STOP/START 字符：串口没有对端流控。

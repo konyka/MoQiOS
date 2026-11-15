@@ -455,6 +455,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello336"); /* edge-triggered epoll on an mq descriptor reports again after every send and receive */
     run_test("hello337"); /* TCSETSW keeps queued console input, TCSETSF discards it */
     run_test("hello338"); /* TCFLSH discards console input for TCIFLUSH/TCIOFLUSH, TCSBRK succeeds */
+    run_test("hello339"); /* TCXONC (tcflow) on the console tty: valid selectors succeed, others EINVAL */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */
