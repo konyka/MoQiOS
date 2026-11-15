@@ -472,6 +472,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello353"); /* aio reads and writes use their own offset and leave the shared file offset alone */
     run_test("hello354"); /* copy_file_range with offset pointers leaves the shared file offset alone */
     run_test("hello355"); /* splice and sendfile with an explicit offset leave the shared file offset alone */
+    run_test("hello356"); /* read on a shared mq description moves its offset atomically */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

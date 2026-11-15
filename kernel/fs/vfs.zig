@@ -1095,10 +1095,16 @@ pub fn syncOffsetOut(desc: *FileDescriptor) void {
 var offset_locks: [513]@import("../sync/task_sleep_lock.zig").SleepLock = @splat(.{});
 
 /// Take the offset lock of `desc` when its byte offset is shared with another descriptor (a regular file kind holding a slot).
-/// Pipes and sockets have no offset and are never locked: a blocking read must not hold up the other readers. Returns
-/// the slot it locked (0 = none); unlockOffset takes that slot back, so a dup that gives the descriptor a slot meanwhile
-/// cannot unbalance the lock.
+/// Pipes and sockets have no offset and are never locked: a blocking read must not hold up the other readers. An mq
+/// description keeps its position in the mq table, not in a shared slot, so it has a lock of its own (Linux: an mqueue file
+/// is S_IFREG and a shared one takes f_pos_lock). Returns the slot it locked (0 = none); unlockOffset takes that slot back,
+/// so a dup that gives the descriptor a slot meanwhile cannot unbalance the lock.
 pub fn lockOffset(desc: *const FileDescriptor) u16 {
+    if (desc.fd_type == .mqueue) {
+        const token = @import("../ipc/posix_mq.zig").lockDescriptionOffset(desc.mq_desc_idx, desc.mq_desc_gen);
+        if (token == 0) return 0;
+        return mq_offset_lock_base + token;
+    }
     const slot = desc.offset_slot;
     if (!offsetLockApplies(desc.fd_type, slot)) return 0;
     offset_locks[slot].lock();
@@ -1106,8 +1112,16 @@ pub fn lockOffset(desc: *const FileDescriptor) u16 {
 }
 
 pub fn unlockOffset(slot: u16) void {
+    if (slot >= mq_offset_lock_base) {
+        @import("../ipc/posix_mq.zig").unlockDescriptionOffset(slot - mq_offset_lock_base);
+        return;
+    }
     if (slot != 0) offset_locks[slot].unlock();
 }
+
+/// Slot numbers lockOffset returns for an mq description start here, above every shared-offset slot, so unlockOffset can tell
+/// the two kinds apart.
+const mq_offset_lock_base: u16 = 0x8000;
 
 fn offsetLockApplies(t: FdType, slot: u16) bool {
     if (slot == 0 or slot >= offset_locks.len) return false;

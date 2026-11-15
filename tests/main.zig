@@ -4358,6 +4358,16 @@ test "an IPv4 and an IPv6 TCP socket do not conflict on one port (hello344)" {
     try std.testing.expect(std.mem.indexOf(u8, ts, "        if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict\n        if (!tcp_port_policy.familiesConflict(tcb.is_v6, tcbs[i].is_v6)) continue;\n") != null);
 }
 
+test "read and lseek of a shared mq description hold that description's offset lock (hello356)" {
+    const v = kt.vfs_source;
+    const m = kt.posix_mq_source;
+    try std.testing.expect(std.mem.indexOf(u8, v, "    if (desc.fd_type == .mqueue) {\n        const token = @import(\"../ipc/posix_mq.zig\").lockDescriptionOffset(desc.mq_desc_idx, desc.mq_desc_gen);\n        if (token == 0) return 0;\n        return mq_offset_lock_base + token;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "    if (slot >= mq_offset_lock_base) {\n        @import(\"../ipc/posix_mq.zig\").unlockDescriptionOffset(slot - mq_offset_lock_base);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "var description_offset_locks: [MAX_OPEN_DESCRIPTIONS]@import(\"../sync/task_sleep_lock.zig\").SleepLock = @splat(.{});") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "    description_offset_locks[idx].lock();\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "    description_offset_locks[token - 1].unlock();\n") != null);
+}
+
 test "splice and sendfile with an explicit offset move data at that offset and never move the shared file offset (hello355)" {
     const s = kt.splice_source;
     try std.testing.expect(std.mem.indexOf(u8, s, "    if (!update_user_offset) vfs_mod.setOffsetOf(&fd_table.fds[in_fd], offset);\n") != null);

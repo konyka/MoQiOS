@@ -94,6 +94,10 @@ const OpenDescription = struct {
 
 var descriptions: [MAX_OPEN_DESCRIPTIONS]OpenDescription = @splat(.{});
 var description_generations: [MAX_OPEN_DESCRIPTIONS]u64 = @splat(0);
+/// One sleeping lock per open description, held across the read-modify-write of its offset (read, lseek). A sleeping lock, not
+/// mq_lock: the read copies into a user buffer, and a page fault there must not be taken while mq_lock is held. Linux takes
+/// f_pos_lock for a shared mqueue file (it is S_IFREG).
+var description_offset_locks: [MAX_OPEN_DESCRIPTIONS]@import("../sync/task_sleep_lock.zig").SleepLock = @splat(.{});
 // An mqd_t is an ordinary file descriptor (Linux do_mq_open): a vfs .mqueue descriptor naming descriptions[mq_desc_idx] at
 // generation mq_desc_gen. dup, fork and SCM_RIGHTS copies share the description; the fd table owns numbering and close-on-exec.
 
@@ -1078,6 +1082,9 @@ pub fn closeDescription(idx: u32, gen: u64) void {
             q.open_count -|= 1;
             if (q.marked_removed and q.open_count == 0) freeQueue(q, &wakes);
             desc.* = .{};
+            // The offset lock is not dropped here. A reader of a descriptor another thread just closed still holds it, and
+            // stealing it would let that reader unlock twice. The index cannot be reused until that reader re-checks under
+            // mq_lock, finds the description gone and unlocks; a new opener of the same index waits on the lock meanwhile.
         }
     }
     mq_lock.release(flags);
@@ -1105,6 +1112,32 @@ pub fn statusRead(idx: u32, gen: u64, offset: u64, buf: [*]u8, count: usize) i64
     const n = @min(count, len - start);
     @memcpy(buf[0..n], line[start..][0..n]);
     return @intCast(n);
+}
+
+/// Take the offset lock of open description `idx` when it is still the description `gen` names, so a read or lseek of a shared mq
+/// description cannot race another one on its position (Linux f_pos_lock). Returns the token unlockDescriptionOffset takes back;
+/// 0 when the description is already gone (nothing to lock, the read then fails with EBADF).
+pub fn lockDescriptionOffset(idx: u32, gen: u64) u16 {
+    if (idx >= MAX_OPEN_DESCRIPTIONS) return 0;
+    {
+        const flags = mq_lock.acquire();
+        defer mq_lock.release(flags);
+        if (liveDescription(.{ .idx = idx, .gen = gen }) == null) return 0;
+    }
+    description_offset_locks[idx].lock();
+    const flags = mq_lock.acquire();
+    defer mq_lock.release(flags);
+    if (liveDescription(.{ .idx = idx, .gen = gen }) == null) {
+        description_offset_locks[idx].unlock();
+        return 0;
+    }
+    return @intCast(idx + 1);
+}
+
+/// Drop the offset lock lockDescriptionOffset took; `token` 0 means nothing was locked.
+pub fn unlockDescriptionOffset(token: u16) void {
+    if (token == 0 or token > MAX_OPEN_DESCRIPTIONS) return;
+    description_offset_locks[token - 1].unlock();
 }
 
 /// The read position of description `idx` (Linux f_pos of the mqueue file); null once the description is gone.

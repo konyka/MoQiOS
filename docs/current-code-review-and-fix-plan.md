@@ -9499,4 +9499,16 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - MoQiOS：未改的内核上 SMP=2、SMP=4 各一份，hello355 全部通过。这是核对测试，没有内核改动，不是先红后绿。
 - 测试：hello355（QEMU，5 项）。新增 host 测试「splice and sendfile with an explicit offset move data at that offset and never move the shared file offset (hello355)」，钉住两处只在 NULL 偏移时才 `setOffsetOf`、`splicePipeToFile` 给了偏移时用 `writeAtOffset`、文件读用 `readAtOffset`，以及 `setOffsetOf(` 只出现 2 次。变异验证：把 `sendfile` 改成无论有没有偏移都 `setOffsetOf`，这条 host 测试失败，文件已恢复。
 - 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、317 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
-- 局限：偏移为 NULL 的并发 splice/sendfile 可能和同一描述上的 read 读到同一段数据，和 Linux 相同；mq 描述符偏移仍不加锁。
+- 局限：偏移为 NULL 的并发 splice/sendfile 可能和同一描述上的 read 读到同一段数据，和 Linux 相同；mq 描述符偏移仍不加锁。（mq 由 hello356 加锁。）
+
+## 补充：共享 mq 描述的 read 和 lseek 持偏移锁（hello356）
+
+- 背景：hello355 一节的局限。mq 描述符的位置存在 `posix_mq` 的打开描述里（`descriptionOffset`/`setDescriptionOffset`），不在共享偏移池，`offsetLockApplies` 也不包含 `.mqueue`，所以 `read`、`lseek` 的读改写不加锁。Linux 的 mqueue 文件是 `S_IFREG`（`ipc/mqueue.c` 的 `mqueue_create_attr`），`fs/open.c` 对普通文件置 `FMODE_ATOMIC_POS`，共享时 `fdget_pos` 拿 `f_pos_lock`。
+- Linux 实测（`gcc -DHOST user/hello356.c -lrt`，队列 `/hello356`，状态行 60 字节，200 轮，父子进程通过管道同时起跑，各每次读 1 字节）：A 两个人合起来正好读完每个字节一次；B 每轮结束后共享偏移是 60；C 另一次 `mq_open` 的描述偏移仍是 0。全部通过。
+- 红灯（未改的内核）：SMP=2 上 200 轮全部通过；SMP=4 上 A 失败（200 轮里 11 轮两个人读到的字节数加起来不等于行长）。B、C 通过。
+- 修复：
+  1. `kernel/ipc/posix_mq.zig` 新增 `description_offset_locks`，每个打开描述一把睡眠锁。`lockDescriptionOffset` 先在 `mq_lock` 下确认描述还在，再加睡眠锁，加完再确认一次；描述已经没了就立刻解锁并返回 0。不用 `mq_lock` 本身当偏移锁：read 还要把字节拷进用户缓冲区，缺页时不能持着 `mq_lock`。
+  2. `FdTable.lockOffset` 对 `.mqueue` 走这把锁，返回的槽号从 `0x8000` 起，`unlockOffset` 据此交回 `unlockDescriptionOffset`。`read`、`readv`、`lseek` 本来就走 `lockOffset`，所以一次 read 的所有块和 lseek 的读改写都在锁内。关闭最后一个引用时不偷走这把锁：读者会在重检时发现描述没了再自己解锁，否则会解锁两次。
+- 测试：hello356（QEMU，6 项），定向 SMP=2、SMP=4 各一份通过。新增 host 测试「read and lseek of a shared mq description hold that description's offset lock (hello356)」。变异验证：`.mqueue` 分支改成恒不进入，这条 host 测试失败，文件已恢复。
+- 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、318 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
+- 局限：锁按描述索引，不看引用计数。描述只有一个持有者时也加锁，比 Linux 的 `file_needs_f_pos_lock`（单引用不加）更严，不影响结果。描述刚被关闭、索引还没被下一个打开者重用的窗口里，新的打开者会等这把锁，等读者解锁。
