@@ -4404,6 +4404,112 @@ test "a link-scoped IPv6 address names its interface: bind checks sin6_scope_id,
     try std.testing.expectEqual(@as(u32, 0), sa.parseInet6(&out).?.scope_id);
 }
 
+test "IPv6 UDP multicast: IPV6_MULTICAST_* options, group membership, member-only local delivery and loopback copy (hello361)" {
+    const p = kt.ip_opt_policy;
+    const m = kt.mcast_policy;
+    try std.testing.expectEqual(@as(u64, 17), p.IPV6_MULTICAST_IF);
+    try std.testing.expectEqual(@as(u64, 18), p.IPV6_MULTICAST_HOPS);
+    try std.testing.expectEqual(@as(u64, 19), p.IPV6_MULTICAST_LOOP);
+    try std.testing.expectEqual(@as(u64, 20), p.IPV6_ADD_MEMBERSHIP);
+    try std.testing.expectEqual(@as(u64, 21), p.IPV6_DROP_MEMBERSHIP);
+    try std.testing.expectEqual(@as(u64, 29), p.IPV6_MULTICAST_ALL);
+    const none: p.IpOpts = .{};
+    try std.testing.expectEqual(@as(?i32, 1), p.getValue(none, p.SOL_IPV6, p.IPV6_MULTICAST_HOPS));
+    try std.testing.expectEqual(@as(?i32, 1), p.getValue(none, p.SOL_IPV6, p.IPV6_MULTICAST_LOOP));
+    try std.testing.expectEqual(@as(?i32, 0), p.getValue(none, p.SOL_IPV6, p.IPV6_MULTICAST_IF));
+    try std.testing.expectEqual(@as(?i32, 1), p.getValue(none, p.SOL_IPV6, p.IPV6_MULTICAST_ALL));
+    const set6 = struct {
+        fn f(cur: p.IpOpts, name: u64, v: i32) p.SetResult {
+            var b: [4]u8 = undefined;
+            std.mem.writeInt(i32, &b, v, .little);
+            return p.applySet(cur, p.SOL_IPV6, name, &b);
+        }
+    }.f;
+    try std.testing.expectEqual(@as(u8, 7), set6(none, p.IPV6_MULTICAST_HOPS, 7).ok.mc_hops);
+    try std.testing.expectEqual(@as(u8, 0), set6(none, p.IPV6_MULTICAST_HOPS, 0).ok.mc_hops);
+    try std.testing.expectEqual(@as(u8, 1), set6(.{ .mc_hops = 9 }, p.IPV6_MULTICAST_HOPS, -1).ok.mc_hops);
+    try std.testing.expectEqual(@as(i64, -22), set6(none, p.IPV6_MULTICAST_HOPS, 256).err);
+    try std.testing.expectEqual(@as(i64, -22), set6(none, p.IPV6_MULTICAST_HOPS, -2).err);
+    try std.testing.expectEqual(@as(i64, -22), set6(none, p.IPV6_MULTICAST_LOOP, 2).err);
+    try std.testing.expect(!set6(none, p.IPV6_MULTICAST_LOOP, 0).ok.mc_loop);
+    try std.testing.expect(set6(none, p.IPV6_MULTICAST_ALL, 5).ok.mc_all);
+    try std.testing.expect(!set6(none, p.IPV6_MULTICAST_ALL, 0).ok.mc_all);
+    // The multicast options need a full int.
+    try std.testing.expectEqual(@as(i64, -22), p.applySet(none, p.SOL_IPV6, p.IPV6_MULTICAST_LOOP, &.{1}).err);
+    try std.testing.expectEqual(@as(i64, -22), p.applySet(none, p.SOL_IPV6, p.IPV6_MULTICAST_HOPS, &.{1}).err);
+    try std.testing.expectEqual(@as(i64, 0), p.mcastIfErrno(0, false));
+    try std.testing.expectEqual(@as(i64, 0), p.mcastIfErrno(1, false));
+    try std.testing.expectEqual(@as(i64, -19), p.mcastIfErrno(2, false));
+    try std.testing.expectEqual(@as(i64, 0), p.mcastIfErrno(2, true));
+    try std.testing.expectEqual(@as(i64, -19), p.mcastIfErrno(99, true));
+    try std.testing.expectEqual(@as(?i64, -92), p.streamSetErrno(p.IPV6_MULTICAST_HOPS));
+    try std.testing.expectEqual(@as(?i64, -92), p.streamSetErrno(p.IPV6_MULTICAST_IF));
+    try std.testing.expectEqual(@as(?i64, -71), p.streamSetErrno(p.IPV6_ADD_MEMBERSHIP));
+    try std.testing.expectEqual(@as(?i64, null), p.streamSetErrno(p.IPV6_MULTICAST_LOOP));
+
+    var g1: [16]u8 = @splat(0);
+    g1[0] = 0xff;
+    g1[1] = 0x0e;
+    g1[14] = 1;
+    g1[15] = 1;
+    var g2 = g1;
+    g2[15] = 2;
+    var uni: [16]u8 = @splat(0);
+    uni[0] = 0x20;
+    uni[15] = 1;
+    var mem: m.Membership = .{};
+    try std.testing.expectEqual(m.EINVAL, m.join(&mem, uni, 0, true));
+    try std.testing.expectEqual(m.ENODEV, m.join(&mem, g1, 99, true));
+    try std.testing.expectEqual(m.ENODEV, m.join(&mem, g1, 0, false));
+    try std.testing.expectEqual(@as(i64, 0), m.join(&mem, g1, 0, true));
+    try std.testing.expectEqual(m.EADDRINUSE, m.join(&mem, g1, 0, true));
+    try std.testing.expectEqual(m.EADDRINUSE, m.join(&mem, g1, 2, true));
+    try std.testing.expectEqual(@as(i64, 0), m.join(&mem, g1, 1, true));
+    try std.testing.expect(m.joinedOn(&mem, g1, 2) and m.joinedOn(&mem, g1, 1) and !m.joinedOn(&mem, g2, null));
+    try std.testing.expectEqual(m.EADDRNOTAVAIL, m.drop(&mem, g2, 0));
+    try std.testing.expectEqual(@as(i64, 0), m.drop(&mem, g1, 2));
+    try std.testing.expect(!m.joinedOn(&mem, g1, 2) and m.joinedOn(&mem, g1, 1));
+    try std.testing.expectEqual(@as(i64, 0), m.drop(&mem, g1, 0));
+    try std.testing.expectEqual(m.EADDRNOTAVAIL, m.drop(&mem, g1, 0));
+    var full: m.Membership = .{};
+    for (0..m.MAX_GROUPS) |i| {
+        var g = g1;
+        g[13] = @intCast(i + 1);
+        try std.testing.expectEqual(@as(i64, 0), m.join(&full, g, 0, true));
+    }
+    try std.testing.expectEqual(m.ENOMEM, m.join(&full, g1, 0, true));
+    // Receivers: bound to :: or the group, not connected elsewhere; joined or IPV6_MULTICAST_ALL.
+    const wild: [16]u8 = @splat(0);
+    var src: [16]u8 = @splat(0);
+    src[15] = 9;
+    try std.testing.expect(m.socketMatches(wild, g1, 0, wild, src, 5));
+    try std.testing.expect(m.socketMatches(g1, g1, 0, wild, src, 5));
+    try std.testing.expect(!m.socketMatches(g2, g1, 0, wild, src, 5));
+    try std.testing.expect(!m.socketMatches(wild, g1, 7, src, src, 5));
+    try std.testing.expect(m.socketMatches(wild, g1, 5, src, src, 5));
+    try std.testing.expect(m.socketAccepts(&mem, true, g1));
+    try std.testing.expect(!m.socketAccepts(&mem, false, g1));
+    var allnodes: [16]u8 = @splat(0);
+    allnodes[0] = 0xff;
+    allnodes[1] = 0x02;
+    allnodes[15] = 1;
+    try std.testing.expect(m.alwaysJoined(allnodes) and !m.alwaysJoined(g1));
+    try std.testing.expectEqual(@as(u8, 2), m.outInterface(0));
+    try std.testing.expectEqual(@as(u8, 1), m.outInterface(1));
+
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "    if (mcast.isMulticast(dst_ip)) {\n        enqueueMcast(hdr.dst_port, src_ip, hdr.src_port, dst_ip, data[8..][0..actual_payload]);\n        return;\n    }\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "        if (!mcast.alwaysJoined(group) and !hostJoinedLocked(group, null)) return;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "            if (!mcast.socketAccepts(&port_mc[i], port_opts[i].ip.mc_all, group)) continue;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    if (group) send_pkt[14 + 7] = opts.mc_hops;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    if (group and opts.mc_loop and (mcast.alwaysJoined(dst_ip) or hostJoined(dst_ip, mcast.outInterface(opts.mc_if)))) _ = lo.sendPacket(&send_pkt, frame_len);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    port_mc[ni] = port_mc[oi];\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "            port_mc[i] = port_mc[num_ports];\n") != null);
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "(optname == ipo.IPV6_ADD_MEMBERSHIP or optname == ipo.IPV6_DROP_MEMBERSHIP)) return setMembership(ref, optname, optval_ptr, optlen);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "    if (optlen < 20) return -22;\n    if (ref == .tcp) return -71;\n") != null);
+}
+
 test "an IPv6 TCP socket's bound address takes part in conflicts, listener choice, lookup, source address and naming (hello359)" {
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "        if (tcb.is_v6 and !tcp_port_policy.addrsConflict6(tcb.local_ip6, tcbs[i].local_ip6)) continue;\n") != null);
@@ -11100,7 +11206,7 @@ test "IP socket options: dispatch and send-path wiring" {
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (ip_opt_policy.ipv6NeedsPatch(tcb.options.ip)) ip_opt_policy.patchIpv6(send_pkt[14..][0..40], tcb.options.ip);\n    // SK-131/143: ECT(1) for AccECN/L4S, else ECT(0) for classic ECN.") != null);
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "if (ip_opt_policy.ipv4NeedsPatch(po.ip)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], po.ip, ipv4.checksum);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "if (ip_opt_policy.ipv6NeedsPatch(po.ip)) ip_opt_policy.patchIpv6(send_pkt[14..][0..40], po.ip);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (ip_opt_policy.ipv6NeedsPatch(opts)) ip_opt_policy.patchIpv6(send_pkt[14..][0..40], opts);") != null);
 }
 
 test "SOL_SOCKET priority / mark / device binding / flag rules" {

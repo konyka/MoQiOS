@@ -9,10 +9,18 @@ pub const SOL_IPV6: u64 = 41;
 pub const IP_TOS: u64 = 1;
 pub const IP_TTL: u64 = 2;
 pub const IPV6_UNICAST_HOPS: u64 = 16;
+pub const IPV6_MULTICAST_IF: u64 = 17;
+pub const IPV6_MULTICAST_HOPS: u64 = 18;
+pub const IPV6_MULTICAST_LOOP: u64 = 19;
+pub const IPV6_ADD_MEMBERSHIP: u64 = 20;
+pub const IPV6_DROP_MEMBERSHIP: u64 = 21;
 pub const IPV6_V6ONLY: u64 = 26;
+pub const IPV6_MULTICAST_ALL: u64 = 29;
 pub const IPV6_TCLASS: u64 = 67;
 
 pub const DEFAULT_TTL: u8 = 64;
+/// Hop limit of a multicast datagram when IPV6_MULTICAST_HOPS is unset or -1 (Linux IPV6_DEFAULT_MCASTHOPS).
+pub const DEFAULT_MCAST_HOPS: u8 = 1;
 /// The two low bits of TOS / traffic class belong to ECN, which TCP manages itself.
 pub const ECN_MASK: u8 = 0x03;
 
@@ -22,6 +30,11 @@ pub const IpOpts = struct {
     tos: u8 = 0,
     hops: u8 = 0,
     tclass: u8 = 0,
+    /// IPV6_MULTICAST_HOPS / _LOOP / _IF / _ALL (Linux mcast_hops, MC6_LOOP, mcast_oif, MC6_ALL); these hold the value itself.
+    mc_hops: u8 = DEFAULT_MCAST_HOPS,
+    mc_loop: bool = true,
+    mc_if: u8 = 0,
+    mc_all: bool = true,
 };
 
 pub const Family = enum { v4, v6 };
@@ -82,11 +95,45 @@ pub fn applySet(cur: IpOpts, level: u64, optname: u64, val: []const u8) SetResul
                 // This stack has no IPv4-mapped dual-stack: an AF_INET6 socket is always v6-only.
                 if (v == 0) return .{ .err = -22 };
             },
+            // The multicast options need a full int (Linux checks optlen < sizeof(int) first).
+            IPV6_MULTICAST_HOPS => {
+                if (val.len < 4 or v < -1 or v > 255) return .{ .err = -22 };
+                o.mc_hops = if (v == -1) DEFAULT_MCAST_HOPS else @intCast(v);
+            },
+            IPV6_MULTICAST_LOOP => {
+                if (val.len < 4 or (v != 0 and v != 1)) return .{ .err = -22 };
+                o.mc_loop = v == 1;
+            },
+            // The interface itself is checked by mcastIfErrno before this.
+            IPV6_MULTICAST_IF => {
+                if (val.len < 4 or v < 0 or v > 255) return .{ .err = -22 };
+                o.mc_if = @intCast(v);
+            },
+            IPV6_MULTICAST_ALL => {
+                if (val.len < 4) return .{ .err = -22 };
+                o.mc_all = v != 0;
+            },
             else => return .{ .err = -92 },
         },
         else => return .{ .err = -92 },
     }
     return .{ .ok = o };
+}
+
+/// IPV6_MULTICAST_IF names an interface that must exist: 0 (none), lo (1) or the active NIC (2); anything else is ENODEV.
+pub fn mcastIfErrno(v: i32, nic_active: bool) i64 {
+    if (v == 0 or v == 1 or (nic_active and v == 2)) return 0;
+    return -19;
+}
+
+/// The SOL_IPV6 options a TCP socket refuses (Linux do_ipv6_setsockopt on SOCK_STREAM / inet_csk sockets): MULTICAST_HOPS and
+/// MULTICAST_IF are ENOPROTOOPT, group membership EPROTO. Null: the option is handled as for any socket.
+pub fn streamSetErrno(optname: u64) ?i64 {
+    return switch (optname) {
+        IPV6_MULTICAST_HOPS, IPV6_MULTICAST_IF => -92,
+        IPV6_ADD_MEMBERSHIP, IPV6_DROP_MEMBERSHIP => -71,
+        else => null,
+    };
 }
 
 /// getsockopt value as an int, or null when the option does not exist.
@@ -101,6 +148,10 @@ pub fn getValue(o: IpOpts, level: u64, optname: u64) ?i32 {
             IPV6_UNICAST_HOPS => if (o.hops == 0) DEFAULT_TTL else o.hops,
             IPV6_TCLASS => o.tclass,
             IPV6_V6ONLY => 1,
+            IPV6_MULTICAST_HOPS => o.mc_hops,
+            IPV6_MULTICAST_LOOP => @intFromBool(o.mc_loop),
+            IPV6_MULTICAST_IF => o.mc_if,
+            IPV6_MULTICAST_ALL => @intFromBool(o.mc_all),
             else => null,
         },
         else => null,

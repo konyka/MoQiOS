@@ -9590,3 +9590,23 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 接口只有 lo（1）和 eth0（2）两个固定编号，没有接口表。
   2. 绑定冲突和收包者选择仍不比较 `scope_id`；只有一个网卡时结果与 Linux 相同。
   3. 组播地址绑定仍按通配处理（hello359 局限 2 的这一半不变）。
+
+## 补充：IPv6 UDP 组播选项、加组和本机投递（hello361）
+
+- 背景：hello360 局限 3、hello358 局限 2。`IPPROTO_IPV6` 层只认 `IPV6_UNICAST_HOPS`、`IPV6_TCLASS`、`IPV6_V6ONLY`，`IPV6_MULTICAST_HOPS/LOOP/IF/ALL` 和 `IPV6_ADD/DROP_MEMBERSHIP` 一律是 ENOPROTOOPT；没有组成员表，发往组播地址的数据报按单播规则交给端口上任一通配或地址相同的套接字；发往组播的数据报用单播跳数 64，本机加入的组收不到自己发的数据报。
+- Linux 依据：`do_ipv6_setsockopt`（MULTICAST_HOPS 取 -1..255，-1 恢复默认 1；MULTICAST_LOOP 只能 0 或 1；MULTICAST_IF 要求接口存在，TCP 是 ENOPROTOOPT；加组要求 `optlen >= sizeof(ipv6_mreq)`，TCP 是 EPROTO），`__ipv6_sock_mc_join`（非组播 EINVAL，已加入 EADDRINUSE，接口不存在 ENODEV），`ipv6_sock_mc_drop`（没加入 EADDRNOTAVAIL），`inet6_mc_check`（加了组或 `MC6_ALL` 为真才收），`__udp6_lib_mcast_deliver`（每个匹配的套接字一份），`ip6_finish_output2`（`MC6_LOOP` 且出接口是组成员时本机回送一份）。
+- Linux 实测（`gcc -DHOST user/hello361.c`，`unshare -rn` 里开了 multicast 的 dummy 网卡 d0，接口 2，配 `2001:db8:1::7/64` 和默认路由）：O、J、T、D1–D5 八项全部通过。另外实测：只有 lo 时在接口 0 上加组是 ENODEV；单字节的组播选项值是 EINVAL；`IPV6_MULTICAST_ALL` 非 0 都读成 1。
+- 红灯（未改的内核，SMP=2，临时让 init 先跑 hello361）：O、J、T 全是 -92；D1、D2 加组 -92，没有套接字收到；D4 设置 LOOP -92；D3、D5 碰巧通过（期望都是 0）。
+- 修复：
+  1. `kernel/net/ip_opt_policy.zig`：新增 `IPV6_MULTICAST_IF/HOPS/LOOP/ALL`、`IPV6_ADD/DROP_MEMBERSHIP` 常量和 `DEFAULT_MCAST_HOPS = 1`；`IpOpts` 新增 `mc_hops`、`mc_loop`、`mc_if`、`mc_all`；`applySet`、`getValue` 处理这四个选项（要求 4 字节）；新增 `mcastIfErrno`（0、lo、活动网卡之外是 ENODEV）和 `streamSetErrno`（TCP 设置 MULTICAST_HOPS/IF 是 ENOPROTOOPT，加组退组是 EPROTO）。
+  2. 新文件 `kernel/net/mcast_policy.zig`：每个套接字的组成员表 `Membership`（最多 8 个组，满了是 ENOMEM），`join`、`drop`、`joinedOn`、`alwaysJoined`（ff01::1、ff02::1）、`socketMatches`（绑定 `::` 或该组，没连到别的对端）、`socketAccepts`（加了组或 MULTICAST_ALL）、`outInterface`。
+  3. `kernel/net/socket_opt.zig`：新增 `setMembership`，读 20 字节的 `ipv6_mreq` 调 `udp.mcJoin`/`udp.mcDrop`；`setIpOpt` 先处理 TCP 的拒绝和 MULTICAST_IF 的接口检查。
+  4. `kernel/net/udp.zig`：每个端口槽新增 `port_mc`，随槽新建、rebind、swap-remove 一起搬；新增 `mcJoin`、`mcDrop`、`hostJoined`；`handlePacketV6` 遇到组播目的地址走新的 `enqueueMcast`：本机是组成员（或 all-nodes）时，给端口上每个匹配并接受的 IPv6 套接字各放一份，不回 ICMP；`sendToV6From` 发往组播时跳数用 `mc_hops`，`mc_loop` 为真且本机在出接口上是成员（或 all-nodes）时经 lo 回送一份。
+- 测试：hello361（QEMU，8 项）；新增 host 测试「IPv6 UDP multicast: IPV6_MULTICAST_* options, group membership, member-only local delivery and loopback copy (hello361)」，检查选项取值和错误码、`mcast_policy` 各函数和接线。两条旧 host 测试（hello348 的 rebind 行、IP 选项发送路径）改为钉住新的源码行，检查的行为没变。`zig build test` 全部通过（1257 个）。
+- 变异验证：`socketAccepts` 的 `or mc_all` 改成 `and mc_all`，hello361 这条 host 测试失败（1256/1257），文件已恢复。
+- 完整 smoke：第一份 SMP=2 在 900 秒超时（hello361 八项都 ok 且 PASS；hello350 的 fork 轮次耗时约 7 分钟，hello350 本身 PASS，sweep 阶段没跑完），失败日志保留在 `/tmp/moqios-smoke-last-failure-smp2.log`；重跑的 SMP=2 一份通过，`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=2)`，hello350、hello361 PASS；SMP=1 一份通过，`PASS: … (SMP=1)`，进入 sweep 时串口日志 0 个 FAIL。本轮没有跑 SMP=4 和 riscv64、aarch64 smoke。
+- 这次修复带来的局限：
+  1. 没有源过滤（`MCAST_JOIN_SOURCE_GROUP`、`MCAST_BLOCK_SOURCE` 等），也没有 IPv4 的 `IP_ADD_MEMBERSHIP`。
+  2. 加组不发 MLD 报告，e1000 仍以组播混杂方式收所有组播帧，不按加入的组设 MTA。
+  3. 组成员表每个套接字最多 8 个组（Linux 受 optmem 限制，实测约 2300 个）。
+  4. 绑定冲突仍按地址完全相等判断，绑定组播地址的套接字之间不因 `scope_id` 区分。

@@ -462,9 +462,17 @@ fn socketFamily(ref: SockRef, v6_hint: bool) ?ipo.Family {
 fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u64, optlen: u64) i64 {
     const fam = socketFamily(ref, v6_hint) orelse return -92;
     if (!ipo.levelApplies(level, fam)) return -92;
+    if (level == ipo.SOL_IPV6 and (optname == ipo.IPV6_ADD_MEMBERSHIP or optname == ipo.IPV6_DROP_MEMBERSHIP)) return setMembership(ref, optname, optval_ptr, optlen);
+    if (ref == .tcp and level == ipo.SOL_IPV6) {
+        if (ipo.streamSetErrno(optname)) |e| return e;
+    }
     var raw: [16]u8 = undefined;
     const n = readOptval(optval_ptr, optlen, &raw);
     if (n < 0) return n;
+    if (level == ipo.SOL_IPV6 and optname == ipo.IPV6_MULTICAST_IF and n >= 4) {
+        const e = ipo.mcastIfErrno(ipo.readInt(raw[0..4]).?, @import("nic.zig").isActive());
+        if (e != 0) return e;
+    }
     switch (ref) {
         .tcp => |idx| {
             const tcp_mod = @import("tcp.zig");
@@ -486,6 +494,25 @@ fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
         },
         else => return -92,
     }
+}
+
+/// IPV6_ADD_MEMBERSHIP / IPV6_DROP_MEMBERSHIP with a struct ipv6_mreq (group, then a 32-bit interface index): shorter is EINVAL,
+/// a TCP socket EPROTO (Linux checks the length first); a UDP socket joins or leaves through udp.mcJoin / udp.mcDrop.
+fn setMembership(ref: SockRef, optname: u64, optval_ptr: u64, optlen: u64) i64 {
+    if (optlen < 20) return -22;
+    if (ref == .tcp) return -71;
+    if (ref != .udp) return -92;
+    const copy_mod = @import("../mm/copy_from_user.zig");
+    if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;
+    var mreq: [20]u8 = undefined;
+    if (copy_mod.copyFromUser(&mreq, @ptrFromInt(optval_ptr), 20) != 20) return -14;
+    const group: [16]u8 = mreq[0..16].*;
+    const ifindex = bo.readU32Le(mreq[16..20]);
+    const udp_mod = @import("udp.zig");
+    return if (optname == ipo.IPV6_ADD_MEMBERSHIP)
+        udp_mod.mcJoin(ref.udp, group, ifindex, @import("nic.zig").isActive())
+    else
+        udp_mod.mcDrop(ref.udp, group, ifindex);
 }
 
 fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u64, optlen_ptr: u64) i64 {
