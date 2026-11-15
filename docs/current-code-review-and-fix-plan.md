@@ -9526,7 +9526,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、319 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
 - 这次修复带来的局限：
   1. IPv6 发送的源地址仍由 `sendToV6` 决定（回环用 `::1`，其他用 `ndp.selectSourceAddress`），不看绑定地址（hello349 局限 2）。（已由 hello358 解决。）
-  2. IPv6 TCP 的绑定冲突和连接查找仍不看本地地址。
+  2. IPv6 TCP 的绑定冲突和连接查找仍不看本地地址。（已由 hello359 解决。）
   3. 组播地址只当作普通绑定地址比较，没有组成员关系；`scope_id` 不参与比较。
 
 ## 补充：IPv6 UDP 数据报从绑定地址发出；NDP 报文用跳数 255，e1000 接收组播（hello358）
@@ -9548,4 +9548,22 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 绑定 `::1` 而发往站外地址的套接字仍以 `::1` 为源地址发出；Linux 在这种情况下照发（实测 sendto 成功），但对端无法回复。没有改成报错。
   2. e1000 接收所有组播帧，没有按加入的组过滤 MTA；virtio-net 的接收过滤没有检查。
   3. 绑定的组播地址按通配处理；`scope_id` 仍不参与选源地址。
-  4. IPv6 TCP 的源地址、绑定冲突和连接查找仍不看本地地址（hello357 局限 2）。
+  4. IPv6 TCP 的源地址、绑定冲突和连接查找仍不看本地地址（hello357 局限 2）。（已由 hello359 解决。）
+
+## 补充：IPv6 TCP 的绑定地址参与冲突、监听者选择、连接查找、源地址和 getsockname（hello359）
+
+- 背景：hello357 局限 2、hello358 局限 4。IPv6 TCP 的 `bind` 只记端口，`local_ip` 恒为 `0.0.0.0`：同端口的 IPv6 套接字不管绑到哪都冲突，SYN 不看目的地址就交给端口上的任一监听者，连接查找只比对端，段的源地址和 getsockname 都按 `ndp.selectSourceAddress` 算。Linux 在 `inet6_bind` 里设 `sk_v6_rcv_saddr`，`inet6_csk_bind_conflict`、`inet6_lookup_listener`、`__inet6_lookup_established`、`__inet6_check_established` 都比较它。
+- Linux 实测（`gcc -DHOST user/hello359.c`，`unshare -rn` 里 dummy 网卡配 `2001:db8:1::7/64` 和默认路由，所有套接字 IPV6_V6ONLY）：G 连到站外的 UDP 套接字报告全局地址 G；A `[::1]:18991` 和 `[G]:18991` 都能绑定并监听，`[::]:18991` 是 EADDRINUSE；B 绑定 `[G]:18992`（SO_REUSEADDR）的客户端连 `[::1]:18991`，`::1` 监听者接受，服务端看到对端 `[G]:18992`，客户端报告 `[G]:18992`，数据到达；C 接受的套接字报告 `[::1]:18991`，未绑定的客户端连 `::1` 后报告 `::1`；D 绑定 `[::1]:18992` 的客户端也连 `[::1]:18991`（端口对和对端与 B 相同，本地地址不同）能连上，服务端看到对端 `[::1]:18992`，两个服务端套接字各收各的数据；E 只有 `[G]:18993` 监听时连 `[::1]:18993` 是 ECONNREFUSED。全部通过。
+- 红灯（未改的内核）：SMP=2、SMP=4 结果相同。G 通过；A 失败（`[G]` 绑定 -98）；B 失败（服务端看到对端 `::1`）；C 失败（接受的套接字报告 G）；D 失败（connect 返回 -99）；E 失败（connect 成功）。
+- 第一次绿灯时 B 超时（-110）：客户端发往 `::1` 的段源地址是 G，服务端的 SYN-ACK 发往 G，`sendSegmentV6Seq` 只把 `::1` 当回环，G 走 NDP 解析失败被丢掉。Linux 经本地路由表把本机地址送到 lo。
+- 修复：
+  1. `kernel/net/tcp_port_policy.zig` 新增 `localAddrMatches6`（对端是 `::1` 时比较 `sourceAddr6` 选出的源地址，否则绑定 `::` 或绑定地址等于目的地址才匹配）和 `sameLocalAddr6`。
+  2. `kernel/net/tcp.zig`：`TcpTcb` 和 `ListenSlot` 新增 `local_ip6`；新增 `tcpBindAddr46`，`tcpBindAddr` 改为调用它；`portConflict` 对 IPv6 用 `addrsConflict6`；`listen` 把 `local_ip6` 抄进监听槽；`pickListenSlot`、`listenSlotTakes`、`hasListener` 多带 `dst_ip6`，IPv6 用 `listenerTakes6`；SO_REUSEPORT 兄弟监听者迁移只在地址相同的槽之间进行；`findTcbByTupleV6` 多带可选的本地地址，收包路径传段的目的地址，其余探针传 null；`handleIncomingSynV6` 带上目的地址，新子连接和复用 TIME_WAIT 槽都记下它，TIME_WAIT 复用也比本地地址；`connectTupleTaken` 对 IPv6 用 `sameLocalAddr6`；段的源地址用 `sourceAddr6`；`tcpGetAddrInfo` 用 `nameAddr6`。
+  3. `tcp.zig` 的 `sendSegmentV6Seq` 和 `udp.zig` 的 `sendToV6From`：目的地址是本机地址（`ndp.hasLocalAddress`）时也走 lo。
+  4. `kernel/net/socket_syscall.zig` 的 IPv6 TCP bind 调用 `tcpBindAddr46` 传入地址。
+- 测试：hello359（QEMU，6 项），定向 SMP=2、SMP=4 各一份通过。新增 host 测试「an IPv6 TCP socket's bound address takes part in conflicts, listener choice, lookup, source address and naming (hello359)」，检查接线和两个新函数的 11 种情况。三条旧 host 测试（IPv6 回环 RST、TCP bind 错误码两处）改为钉住新的源码行，检查的行为没变。变异验证：`localAddrMatches6` 恒返回 true、IPv6 冲突检查恒不跳过，这条 host 测试各自失败，文件已恢复。
+- 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、321 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
+- 这次修复带来的局限：
+  1. 发往本机非回环地址走 lo 只看 NDP 记录的本地地址；链路本地地址（不在 `local_addrs` 里）发往自己仍走网卡。
+  2. 绑定的组播地址按通配处理，`scope_id` 不参与比较。
+  3. 监听槽数和 TCB 数仍是固定的 128。

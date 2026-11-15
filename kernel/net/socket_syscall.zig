@@ -298,7 +298,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         const parsed = sa.parseInet6(&sa6) orelse return -97; // EAFNOSUPPORT
         if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;
         if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
-        return net_mod.tcp.tcpBind(tcb_idx, parsed.port);
+        return net_mod.tcp.tcpBindAddr46(tcb_idx, parsed.port, net_mod.tcp_port_policy.WILDCARD4, parsed.addr);
     }
     if (addr_len < SOCKADDR_IN_MIN_LEN) return -22;
     if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, false)) return -22;

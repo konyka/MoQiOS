@@ -124,6 +124,20 @@ pub fn localAddrMatches(bound: [4]u8, remote: [4]u8, our: [4]u8, dst: [4]u8) boo
     return isWildcard4(bound) or bound[0] == 127 or @as(u32, @bitCast(bound)) == @as(u32, @bitCast(dst));
 }
 
+/// The IPv6 counterpart of localAddrMatches: a connection to ::1 is matched by the source address its segments carry (sourceAddr6);
+/// any other one by its bound address, or by any address when it is bound to :: (Linux __inet6_lookup_established).
+pub fn localAddrMatches6(bound: [16]u8, remote: [16]u8, dst: [16]u8) bool {
+    var loop6: [16]u8 = @splat(0);
+    loop6[15] = 1;
+    if (@as(u128, @bitCast(remote)) == @as(u128, @bitCast(loop6))) return @as(u128, @bitCast(sourceAddr6(bound, remote, loop6))) == @as(u128, @bitCast(dst));
+    return isWildcard6(bound) or @as(u128, @bitCast(bound)) == @as(u128, @bitCast(dst));
+}
+
+/// The IPv6 counterpart of sameLocalAddr (Linux __inet6_check_established): `our` is the source address selection picks for `remote`.
+pub fn sameLocalAddr6(a_bound: [16]u8, b_bound: [16]u8, remote: [16]u8, our: [16]u8) bool {
+    return @as(u128, @bitCast(sourceAddr6(a_bound, remote, our))) == @as(u128, @bitCast(sourceAddr6(b_bound, remote, our)));
+}
+
 /// Whether two IPv4 connections to the same peer and ports also share a local address, so connect() must refuse the second
 /// (Linux __inet_check_established): their segments would carry the same source address.
 pub fn sameLocalAddr(a_bound: [4]u8, b_bound: [4]u8, remote: [4]u8, our: [4]u8) bool {

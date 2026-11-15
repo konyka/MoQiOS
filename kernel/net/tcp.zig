@@ -157,6 +157,9 @@ const TcpTcb = struct {
     /// The IPv4 address bind() gave the socket, or the destination a SYN_RECEIVED child was reached at (Linux inet_rcv_saddr);
     /// 0.0.0.0 when unbound. IPv6 sockets leave it at the wildcard.
     local_ip: [4]u8 = tcp_port_policy.WILDCARD4,
+    /// The IPv6 counterpart of local_ip (Linux sk_v6_rcv_saddr): the bound address, or the destination a SYN_RECEIVED child was
+    /// reached at; :: when unbound and for IPv4 sockets.
+    local_ip6: [16]u8 = @splat(0),
     remote_port: u16,
     remote_ip: [4]u8,
     /// SK-75: dual-stack — when true, `remote_ip6` is the peer address.
@@ -595,6 +598,7 @@ fn migrateToSiblingListener(from: *const ListenSlot, child_idx: u32) bool {
     while (lbm.next()) |i| {
         const sib = &listen_slots[i];
         if (sib == from or sib.local_port != from.local_port or sib.is_v6 != from.is_v6) continue;
+        if (@as(u32, @bitCast(sib.local_ip)) != @as(u32, @bitCast(from.local_ip)) or !ipv6.addrEq(sib.local_ip6, from.local_ip6)) continue;
         if (sib.pending_tail -% sib.pending_head >= LISTEN_RING) continue;
         sibs[n] = sib;
         n += 1;
@@ -633,19 +637,19 @@ fn stopListening(tcb: *TcpTcb) void {
 /// The listener a SYN for `port` goes to. With several sockets listening on the port (SO_REUSEPORT) the peer's address and port pick one, so
 /// a client always reaches the same listener; with one it is that one.
 /// The listener for a SYN to `dst_ip`:`port`: one bound to that address if any, else a wildcard one (tcp_port_policy.listenerTakes);
-/// within the chosen tier SO_REUSEPORT spreads by source. IPv6 passes the wildcard as `dst_ip`.
-fn pickListenSlot(port: u16, is_v6: bool, dst_ip: [4]u8, src_ip: [4]u8, src_port: u16) ?*ListenSlot {
+/// within the chosen tier SO_REUSEPORT spreads by source. IPv4 compares `dst_ip`, IPv6 `dst_ip6` (tcp_port_policy.listenerTakes6).
+fn pickListenSlot(port: u16, is_v6: bool, dst_ip: [4]u8, dst_ip6: [16]u8, src_ip: [4]u8, src_port: u16) ?*ListenSlot {
     for ([_]bool{ true, false }) |exact| {
         var count: u32 = 0;
         var lbm = listen_active_bitmap.snapshot();
         while (lbm.next()) |i| {
-            if (listenSlotTakes(&listen_slots[i], port, is_v6, dst_ip, exact)) count += 1;
+            if (listenSlotTakes(&listen_slots[i], port, is_v6, dst_ip, dst_ip6, exact)) count += 1;
         }
         if (count == 0) continue;
         var want = tcp_port_policy.pickListener(count, src_ip, src_port);
         lbm = listen_active_bitmap.snapshot();
         while (lbm.next()) |i| {
-            if (listenSlotTakes(&listen_slots[i], port, is_v6, dst_ip, exact)) {
+            if (listenSlotTakes(&listen_slots[i], port, is_v6, dst_ip, dst_ip6, exact)) {
                 if (want == 0) return &listen_slots[i];
                 want -= 1;
             }
@@ -654,8 +658,9 @@ fn pickListenSlot(port: u16, is_v6: bool, dst_ip: [4]u8, src_ip: [4]u8, src_port
     return null;
 }
 
-fn listenSlotTakes(ls: *const ListenSlot, port: u16, is_v6: bool, dst_ip: [4]u8, exact: bool) bool {
-    return ls.local_port == port and ls.is_v6 == is_v6 and tcp_port_policy.listenerTakes(ls.local_ip, dst_ip, exact);
+fn listenSlotTakes(ls: *const ListenSlot, port: u16, is_v6: bool, dst_ip: [4]u8, dst_ip6: [16]u8, exact: bool) bool {
+    if (ls.local_port != port or ls.is_v6 != is_v6) return false;
+    return if (is_v6) tcp_port_policy.listenerTakes6(ls.local_ip6, dst_ip6, exact) else tcp_port_policy.listenerTakes(ls.local_ip, dst_ip, exact);
 }
 
 /// Marker for a backlog ring entry whose handshake died (never a real TCB
@@ -893,6 +898,7 @@ fn allocTcb() ?*TcpTcb {
     // of that port and alias a 4-tuple if connect() reused it.
     tcbs[i].local_port = 0;
     tcbs[i].local_ip = tcp_port_policy.WILDCARD4;
+    tcbs[i].local_ip6 = @splat(0);
     tcbs[i].remote_port = 0;
     tcbs[i].is_v6 = false;
     tcbs[i].remote_ip6 = @splat(0);
@@ -1029,13 +1035,16 @@ fn findTcbByTuple(local_ip: [4]u8, local_port: u16, remote_port: u16, remote_ip:
     return null;
 }
 
-fn findTcbByTupleV6(local_port: u16, remote_port: u16, remote_ip6: [16]u8) ?*TcpTcb {
+/// The IPv6 connection a segment to `local_ip6` (null: any local address) belongs to; connections that differ only in their local
+/// address are told apart (tcp_port_policy.localAddrMatches6).
+fn findTcbByTupleV6(local_ip6: ?[16]u8, local_port: u16, remote_port: u16, remote_ip6: [16]u8) ?*TcpTcb {
     var bm = tcb_active_bitmap.snapshot();
     while (bm.next()) |i| {
         if (tcbs[i].is_v6 and
             tcbs[i].local_port == local_port and
             tcbs[i].remote_port == remote_port and
-            ipv6.addrEq(tcbs[i].remote_ip6, remote_ip6))
+            ipv6.addrEq(tcbs[i].remote_ip6, remote_ip6) and
+            (local_ip6 == null or tcp_port_policy.localAddrMatches6(tcbs[i].local_ip6, remote_ip6, local_ip6.?)))
         {
             return &tcbs[i];
         }
@@ -1445,7 +1454,8 @@ fn sendSegmentV6Seq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16
 
     const flags = decorateEcnFlags(tcb, flags_in, data_len);
     // K3: ::1 short-circuits NDP and the wire — loop back via lo.
-    const is_loop = netif.isLoopbackV6(tcb.remote_ip6);
+    // An address of this host is reached through lo too (Linux routes it via the local table).
+    const is_loop = netif.isLoopbackV6(tcb.remote_ip6) or ndp.hasLocalAddress(tcb.remote_ip6);
     const nh = ndp.resolveNextHop(tcb.remote_ip6);
     const dst_mac = if (is_loop) netif.getMac() else nh.mac orelse {
         if (nh.solicit) |t| icmpv6.sendNeighborSolicitation(t);
@@ -1454,8 +1464,8 @@ fn sendSegmentV6Seq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16
     };
 
     const our_mac = netif.getMac();
-    // Loopback: src = dst = ::1 (mirrors the IPv4 lo choice).
-    const our_ip = if (is_loop) tcb.remote_ip6 else ndp.selectSourceAddress(tcb.remote_ip6, our_mac);
+    // The bound (or SYN-reached) address; else ::1 to ::1 (mirrors the IPv4 lo choice) and the selected source elsewhere.
+    const our_ip = tcp_port_policy.sourceAddr6(tcb.local_ip6, tcb.remote_ip6, if (is_loop) tcb.remote_ip6 else ndp.selectSourceAddress(tcb.remote_ip6, our_mac));
     // Only the header region needs zeroing (see sendSegmentSeq).
     var send_pkt: [1518]u8 = undefined;
     const tcp_off: u16 = 14 + ipv6.HEADER_LEN;
@@ -1593,13 +1603,13 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
     const opts = parseTcpOptions(data, data_offset);
     const payload_len: u32 = if (tcp_len > data_offset) tcp_len - data_offset else 0;
 
-    const tcb = findTcbByTupleV6(dst_port, src_port, src_ip) orelse {
+    const tcb = findTcbByTupleV6(dst_ip, dst_port, src_port, src_ip) orelse {
         if (flags & SYN != 0) {
             const before = pendingBacklogCount();
-            handleIncomingSynV6(src_ip, src_port, dst_port, seq_num, raw_window, opts, flags);
+            handleIncomingSynV6(src_ip, dst_ip, src_port, dst_port, seq_num, raw_window, opts, flags);
             // Nobody listens on the port: a ::1 peer is told at once (RFC 9293
             // §3.10.7.1) instead of retransmitting its SYN.
-            if (pendingBacklogCount() == before and !hasListener(dst_port, true, tcp_port_policy.WILDCARD4)) {
+            if (pendingBacklogCount() == before and !hasListener(dst_port, true, tcp_port_policy.WILDCARD4, dst_ip)) {
                 sendLoopbackResetV6(src_ip, dst_ip, src_port, dst_port, flags, ack_num, seq_num, payload_len);
             }
         }
@@ -2132,7 +2142,7 @@ fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16,
     _ = _w;
     const peer_ecn = probeEcnPeerSetup(flags);
     // The listener bound to the SYN's destination address, else a wildcard one.
-    const ls = pickListenSlot(dst_port, false, dst_ip, src_ip, src_port) orelse return;
+    const ls = pickListenSlot(dst_port, false, dst_ip, @splat(0), src_ip, src_port) orelse return;
 
     // T17: Allow TCB reuse for TIME_WAIT connections (if ISN is larger)
     var tw_bm = tcb_active_bitmap.snapshot();
@@ -2247,10 +2257,11 @@ fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16,
 }
 
 /// IPv6 listen SYN (SK-75/76). Creates SYN_RECEIVED and sends SYN-ACK via NDP.
-fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions, flags: u8) void {
+fn handleIncomingSynV6(src_ip: [16]u8, dst_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions, flags: u8) void {
     _ = _w;
     const peer_ecn = probeEcnPeerSetup(flags);
-    const ls = pickListenSlot(dst_port, true, tcp_port_policy.WILDCARD4, .{ src_ip[12], src_ip[13], src_ip[14], src_ip[15] }, src_port) orelse return;
+    // The listener bound to the SYN's destination address, else one bound to ::.
+    const ls = pickListenSlot(dst_port, true, tcp_port_policy.WILDCARD4, dst_ip, .{ src_ip[12], src_ip[13], src_ip[14], src_ip[15] }, src_port) orelse return;
 
     var tw_bm = tcb_active_bitmap.snapshot();
     while (tw_bm.next()) |i| {
@@ -2259,6 +2270,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
             tcbs[i].local_port == dst_port and
             tcbs[i].remote_port == src_port and
             ipv6.addrEq(tcbs[i].remote_ip6, src_ip) and
+            tcp_port_policy.localAddrMatches6(tcbs[i].local_ip6, src_ip, dst_ip) and
             tcp_util.seqGt(seq_num, tcbs[i].irs))
         {
             const reuse_tcb = &tcbs[i];
@@ -2285,6 +2297,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
             // SK-139: offer AccECN (AE) when peer offered ECN-setup.
             reuse_tcb.ecn_ok = peer_ecn;
             reuse_tcb.accecn_ok = peer_ecn;
+            reuse_tcb.local_ip6 = dst_ip;
             sendSynAck(reuse_tcb, peer_ecn);
             return;
         }
@@ -2300,6 +2313,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u3
     new_tcb.remote_port = src_port;
     new_tcb.is_v6 = true;
     new_tcb.remote_ip6 = src_ip;
+    new_tcb.local_ip6 = dst_ip;
     new_tcb.owner_task = ls.owner_task;
     new_tcb.sock_uid = listenerSockUid(ls);
     new_tcb.options.reuse_addr = listenerReuseAddr(ls);
@@ -2986,7 +3000,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, e
             handleIncomingSyn(src_ip, dst_ip, src_port, dst_port, seq_num, raw_window, opts, flags);
             // Nobody listens on the port: a loopback peer is told at once
             // (RFC 9293 §3.10.7.1) instead of retransmitting its SYN.
-            if (pendingBacklogCount() == before and !hasListener(dst_port, false, dst_ip)) {
+            if (pendingBacklogCount() == before and !hasListener(dst_port, false, dst_ip, @splat(0))) {
                 sendLoopbackReset(src_ip, dst_ip, src_port, dst_port, flags, ack_num, seq_num, payload_len);
             }
         }
@@ -3006,8 +3020,8 @@ fn pendingBacklogCount() u32 {
     return n;
 }
 
-fn hasListener(port: u16, is_v6: bool, dst_ip: [4]u8) bool {
-    return pickListenSlot(port, is_v6, dst_ip, .{ 0, 0, 0, 0 }, 0) != null;
+fn hasListener(port: u16, is_v6: bool, dst_ip: [4]u8, dst_ip6: [16]u8) bool {
+    return pickListenSlot(port, is_v6, dst_ip, dst_ip6, .{ 0, 0, 0, 0 }, 0) != null;
 }
 
 /// Answer a segment that matches no connection with a RST — loopback only: it
@@ -3182,6 +3196,9 @@ fn connectTupleTaken(tcb_idx: u32, remote_port: u16, remote_ip: [4]u8, remote_ip
         if (!same_peer) continue;
         // IPv4: a connection from another local address to the same peer is a different 4-tuple.
         if (remote_ip6 == null and !tcp_port_policy.sameLocalAddr(o.local_ip, tcb.local_ip, remote_ip, netif.getOurIp())) continue;
+        if (remote_ip6) |ip6| {
+            if (!tcp_port_policy.sameLocalAddr6(o.local_ip6, tcb.local_ip6, ip6, ndp.selectSourceAddress(ip6, netif.getMac()))) continue;
+        }
         if (tcp_port_policy.tupleTakenBy(o.state == .closed, o.state == .time_wait)) return true;
         if (o.state == .time_wait) {
             if (o.ref_count != 0) return true;
@@ -4268,6 +4285,8 @@ const ListenSlot = struct {
     local_port: u16 = 0,
     /// The listener's bound IPv4 address (0.0.0.0 for the wildcard and for IPv6).
     local_ip: [4]u8 = tcp_port_policy.WILDCARD4,
+    /// The listener's bound IPv6 address (:: for the wildcard and for IPv4).
+    local_ip6: [16]u8 = @splat(0),
     owner_task: u32 = 0,
     is_v6: bool = false,
     pending_tpbs: [LISTEN_RING]u32, // TCB indices of pending connections (SYN_RECEIVED)
@@ -4352,6 +4371,7 @@ fn portConflict(tcb_idx: u32, port: u16) bool {
         if (i == tcb_idx) continue; // a stale port left in this very slot is not a conflict
         if (!tcp_port_policy.familiesConflict(tcb.is_v6, tcbs[i].is_v6)) continue;
         if (!tcb.is_v6 and !tcp_port_policy.addrsConflict(tcb.local_ip, tcbs[i].local_ip)) continue;
+        if (tcb.is_v6 and !tcp_port_policy.addrsConflict6(tcb.local_ip6, tcbs[i].local_ip6)) continue;
         if (tcbs[i].local_port == port) {
             if (tcp_port_policy.reuseMayShare(tcb.options.reuse_addr, tcbs[i].options.reuse_addr, tcbs[i].state == .listen)) continue;
             if (tcp_port_policy.reusePortMayShare(tcb.options.extra_flags, tcbs[i].options.extra_flags, tcb.sock_uid, tcbs[i].sock_uid)) continue;
@@ -4369,6 +4389,11 @@ pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
 
 /// Bind a TCB to a local IPv4 address and port (the address is the wildcard for IPv6). Returns 0 or -errno.
 pub fn tcpBindAddr(tcb_idx: u32, port: u16, addr: [4]u8) i64 {
+    return tcpBindAddr46(tcb_idx, port, addr, @splat(0));
+}
+
+/// Bind a TCB to a local address and port: `addr` for an IPv4 socket, `addr6` for an IPv6 one. Returns 0 or -errno.
+pub fn tcpBindAddr46(tcb_idx: u32, port: u16, addr: [4]u8, addr6: [16]u8) i64 {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
@@ -4378,9 +4403,12 @@ pub fn tcpBindAddr(tcb_idx: u32, port: u16, addr: [4]u8) i64 {
     if (tcb.state != .closed or tcb.bound_explicitly) return tcp_port_policy.BIND_EINVAL;
 
     const saved_ip = tcb.local_ip;
+    const saved_ip6 = tcb.local_ip6;
     tcb.local_ip = if (tcb.is_v6) tcp_port_policy.WILDCARD4 else addr;
+    tcb.local_ip6 = if (tcb.is_v6) addr6 else @splat(0);
     if (port != 0 and portConflict(tcb_idx, port)) {
         tcb.local_ip = saved_ip;
+        tcb.local_ip6 = saved_ip6;
         return tcp_port_policy.BIND_EADDRINUSE;
     }
 
@@ -4420,6 +4448,7 @@ pub fn tcpListen(tcb_idx: u32) i64 {
     listen_slots[i].tcb_idx = tcbIdx(tcb);
     listen_slots[i].local_port = tcb.local_port;
     listen_slots[i].local_ip = tcb.local_ip;
+    listen_slots[i].local_ip6 = tcb.local_ip6;
     listen_slots[i].owner_task = tcb.owner_task;
     listen_slots[i].is_v6 = tcb.is_v6;
     listen_slots[i].pending_head = 0;
@@ -4446,7 +4475,7 @@ pub fn tcpProbeSeedV6(local_port: u16, remote_port: u16, remote_ip6: [16]u8) i64
 pub fn tcpProbeHasV6(local_port: u16, remote_port: u16, remote_ip6: [16]u8) bool {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
-    return findTcbByTupleV6(local_port, remote_port, remote_ip6) != null;
+    return findTcbByTupleV6(null, local_port, remote_port, remote_ip6) != null;
 }
 
 /// Probe helper: idle_ms of a seeded TCB (or maxInt if missing).
@@ -4461,7 +4490,7 @@ pub fn tcpProbeIdleV6(tcb_idx: u32) u32 {
 pub fn tcpProbeSynAckAdvancedV6(local_port: u16, remote_port: u16, remote_ip6: [16]u8) bool {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
-    const tcb = findTcbByTupleV6(local_port, remote_port, remote_ip6) orelse return false;
+    const tcb = findTcbByTupleV6(null, local_port, remote_port, remote_ip6) orelse return false;
     return tcb.state == .syn_received and tcb.snd_nxt == tcb.iss +% 1;
 }
 
@@ -4469,7 +4498,7 @@ pub fn tcpProbeSynAckAdvancedV6(local_port: u16, remote_port: u16, remote_ip6: [
 pub fn tcpProbeIsEstablishedV6(local_port: u16, remote_port: u16, remote_ip6: [16]u8) bool {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
-    const tcb = findTcbByTupleV6(local_port, remote_port, remote_ip6) orelse return false;
+    const tcb = findTcbByTupleV6(null, local_port, remote_port, remote_ip6) orelse return false;
     return tcb.state == .established;
 }
 
@@ -4477,7 +4506,7 @@ pub fn tcpProbeIsEstablishedV6(local_port: u16, remote_port: u16, remote_ip6: [1
 pub fn tcpProbeConnIdxV6(local_port: u16, remote_port: u16, remote_ip6: [16]u8) i64 {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
-    const tcb = findTcbByTupleV6(local_port, remote_port, remote_ip6) orelse return -1;
+    const tcb = findTcbByTupleV6(null, local_port, remote_port, remote_ip6) orelse return -1;
     return @intCast(tcbIdx(tcb));
 }
 
@@ -4715,7 +4744,7 @@ pub fn tcpGetAddrInfo(tcb_idx: u32) ?AddrInfo {
         .is_v6 = tcb.is_v6,
         .remote_ip6 = tcb.remote_ip6,
         .local_ip6 = if (tcb.is_v6)
-            ndp_mod.selectSourceAddress(tcb.remote_ip6, netif_mod.getMac())
+            tcp_port_policy.nameAddr6(tcb.local_ip6, tcb.remote_port != 0, tcb.remote_ip6, ndp_mod.selectSourceAddress(tcb.remote_ip6, netif_mod.getMac()))
         else
             ndp_mod.generateLinkLocal(netif_mod.getMac()),
     };
@@ -4725,7 +4754,7 @@ pub fn tcpGetAddrInfo(tcb_idx: u32) ?AddrInfo {
 pub fn tcpProbeIsSynSentV6(local_port: u16, remote_port: u16, remote_ip6: [16]u8) bool {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
-    const tcb = findTcbByTupleV6(local_port, remote_port, remote_ip6) orelse return false;
+    const tcb = findTcbByTupleV6(null, local_port, remote_port, remote_ip6) orelse return false;
     return tcb.state == .syn_sent;
 }
 

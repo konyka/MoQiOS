@@ -619,7 +619,8 @@ pub fn sendToV6From(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_port: u16,
 
     const nh = ndp.resolveNextHop(dst_ip);
     // K3: ::1 short-circuits NDP and the wire — loop back via lo.
-    const is_loop = netif.isLoopbackV6(dst_ip);
+    // An address of this host is reached through lo too (Linux routes it via the local table).
+    const is_loop = netif.isLoopbackV6(dst_ip) or ndp.hasLocalAddress(dst_ip);
     const dst_mac = if (is_loop) netif.getMac() else nh.mac orelse {
         if (nh.solicit) |t| icmpv6.sendNeighborSolicitation(t);
         return false;

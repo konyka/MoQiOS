@@ -475,6 +475,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello356"); /* read on a shared mq description moves its offset atomically */
     run_test("hello357"); /* an IPv6 UDP socket's bound address takes part in port conflicts and receiver choice */
     run_test("hello358"); /* an IPv6 UDP datagram leaves from its socket's bound address */
+    run_test("hello359"); /* an IPv6 TCP socket's bound address takes part in conflicts, listener choice, lookup and naming */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */
