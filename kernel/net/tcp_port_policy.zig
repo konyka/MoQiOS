@@ -75,6 +75,23 @@ pub fn addrsConflict(a: [4]u8, b: [4]u8) bool {
     return isWildcard4(a) or isWildcard4(b) or @as(u32, @bitCast(a)) == @as(u32, @bitCast(b));
 }
 
+fn isWildcard6(a: [16]u8) bool {
+    return @as(u128, @bitCast(a)) == 0;
+}
+
+/// The IPv6 counterpart of addrsConflict (Linux udp_lib_lport_inuse compares sk_v6_rcv_saddr): [::1]:p and [ff0e::1]:p may coexist;
+/// [::]:p conflicts with every address on p.
+pub fn addrsConflict6(a: [16]u8, b: [16]u8) bool {
+    return isWildcard6(a) or isWildcard6(b) or @as(u128, @bitCast(a)) == @as(u128, @bitCast(b));
+}
+
+/// The IPv6 counterpart of listenerTakes: `exact` asks for a socket bound to `dst` itself, otherwise a wildcard one (Linux
+/// udp6_lib_lookup2 scores an exact local address above ::).
+pub fn listenerTakes6(bound: [16]u8, dst: [16]u8, exact: bool) bool {
+    if (exact) return !isWildcard6(bound) and @as(u128, @bitCast(bound)) == @as(u128, @bitCast(dst));
+    return isWildcard6(bound);
+}
+
 /// Whether a listener bound to `bound` takes a SYN for `dst`. `exact` asks for an address match only: a listener bound to the SYN's
 /// destination is preferred over a wildcard one (Linux compute_score).
 pub fn listenerTakes(bound: [4]u8, dst: [4]u8, exact: bool) bool {

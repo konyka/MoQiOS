@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello356`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello357`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -351,6 +351,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello354 | 带偏移指针的 copy_file_range 不动共享偏移：父进程在共享描述上做 3000 次复制时，子进程顺序读到全部 4096 条记录（A），每次复制放对位置、两个指针各前进 64（B），结束后共享偏移是子进程读到的位置（C），NULL 指针使用并推进描述符偏移（D） |
 | hello355 | 带显式偏移的 splice、sendfile 不动共享偏移：父进程在共享描述上做 3000 次 splice 文件→管道（A）、splice 管道→文件（B）、sendfile 文件→管道（C）时，子进程顺序读到全部 4096 条记录，每次调用的数据和偏移都对，结束后共享偏移是 16384；NULL 偏移使用并推进描述符偏移（D）。核对测试，没有内核改动 |
 | hello356 | 共享 mq 描述的 read 原子推进偏移：父子进程各读 1 字节，200 轮合起来正好读完状态行的每个字节一次（A），每轮结束后共享偏移等于行长（B），另一次打开的描述偏移仍是 0（C） |
+| hello357 | IPv6 UDP 的绑定地址参与端口冲突和收包选择：`[::1]` 和 `[ff0e::1]` 可共用端口，`[::]` 和重复的 `[::1]` 是 EADDRINUSE（A）；SO_REUSEADDR 下发往 `::1` 的数据报不论绑定先后都给绑 `::1` 的套接字（B、C）；绑 `[ff0e::1]` 的套接字不收发往 `::1` 的数据报（D） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

@@ -74,12 +74,12 @@ pub fn socket(domain: u32, type_and_flags: u32, protocol: u32) i64 {
 
 /// bind() of a UDP socket to `new_port`: the registration moves with its options, joining a port other sockets hold only when
 /// udp_port_policy allows it (both SO_REUSEADDR, or both SO_REUSEPORT with the same owner, the fsuid recorded when socket() created it).
-/// Sockets bound to different IPv4 addresses `addr` (0.0.0.0 for IPv6) on one port do not conflict. The ephemeral port from socket() is dropped.
+/// Sockets bound to different addresses on one port (IPv4 `addr`, or IPv6 `addr6` between two IPv6 sockets) do not conflict. The ephemeral port from socket() is dropped.
 fn udpRebind(t: *task_mod.Task, fd: u32, new_port: u16, addr: [4]u8, addr6: [16]u8) i64 {
     const d = &t.fd_table.fds[fd];
     var disc: u16 = 0;
     const old_key = d.udpKey();
-    const rc = udp.rebind(old_key, new_port, addr, &disc);
+    const rc = udp.rebind(old_key, new_port, addr, addr6, &disc);
     if (rc != 0) return rc;
     d.udp_local_ip = addr;
     d.udp_local_ip6 = addr6;

@@ -9424,7 +9424,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 测试：hello349（QEMU，4 项），定向 SMP=2、SMP=4 各一份通过。新增 host 测试「an IPv6 UDP socket keeps the address it was bound to: getsockname reports it, :: when unbound (hello349)」，检查接线和 `nameAddr6` 的 4 种情况。hello347、hello348 相关测试按新的 `udpRebind` 参数更新。变异验证：`nameAddr6` 忽略绑定地址，这条 host 测试失败，文件已恢复。
 - 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、311 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
 - 这次修复带来的局限：
-  1. IPv6 UDP 的端口冲突和收包分派仍只按端口区分，没有用 `udp_local_ip6`。
+  1. IPv6 UDP 的端口冲突和收包分派仍只按端口区分，没有用 `udp_local_ip6`。（hello357 已补上。）
   2. IPv6 发送的源地址仍由 `sendToV6` 决定（回环用 `::1`，其他用 `ndp.selectSourceAddress`），不看绑定地址。
 
 ## 补充：共享打开文件描述的偏移读改写改为原子（hello350）
@@ -9512,3 +9512,19 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 测试：hello356（QEMU，6 项），定向 SMP=2、SMP=4 各一份通过。新增 host 测试「read and lseek of a shared mq description hold that description's offset lock (hello356)」。变异验证：`.mqueue` 分支改成恒不进入，这条 host 测试失败，文件已恢复。
 - 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、318 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
 - 局限：锁按描述索引，不看引用计数。描述只有一个持有者时也加锁，比 Linux 的 `file_needs_f_pos_lock`（单引用不加）更严，不影响结果。描述刚被关闭、索引还没被下一个打开者重用的窗口里，新的打开者会等这把锁，等读者解锁。
+
+## 补充：IPv6 UDP 的端口冲突和收包分派看绑定地址（hello357）
+
+- 背景：hello349 一节局限 1。IPv6 UDP 套接字记录了 `udp_local_ip6`，但 `udp.rebind` 判冲突、`enqueue` 选收包者时只用 IPv4 的 `port_local_ip`，IPv6 槽位那里一直是 `0.0.0.0`。结果是同端口的 IPv6 套接字不管绑到哪个地址都算冲突，而且一个只绑了 `ff0e::1` 的套接字也会收下发往 `::1` 的数据报。Linux `udp_lib_lport_inuse` 比较 `sk_v6_rcv_saddr`，`udp6_lib_lookup2` 给精确本地地址打的分高于 `::`，绑定地址不匹配的套接字不参与。
+- Linux 实测（`gcc -DHOST user/hello357.c`，所有套接字 IPV6_V6ONLY）：A `[::1]:18971` 和 `[ff0e::1]:18971` 都能绑定，`[::]:18971` 和第二个 `[::1]:18971` 都是 EADDRINUSE；B 都设 SO_REUSEADDR，先绑 `[::1]:18972` 再绑 `[::]:18972`，发往 `[::1]:18972` 的 5 个数据报全给 `::1` 套接字；C 反过来先绑 `[::]` 再绑 `[::1]`，5 个也全给 `::1` 套接字；D 端口 18974 上只有绑 `[ff0e::1]` 的套接字，它收不到发往 `::1` 的数据报。全部通过。
+- 红灯（未改的内核）：SMP=2、SMP=4 结果相同。A 失败（`[ff0e::1]` 绑定返回 -98）；B 失败（`::1` 套接字收到 0 个、`::` 套接字收到 5 个，原来按后绑定者优先）；D 失败（收到 5 个）；C 碰巧通过。
+- 修复：
+  1. `kernel/net/tcp_port_policy.zig` 新增 `addrsConflict6`、`listenerTakes6`，和 IPv4 的两个函数规则相同。
+  2. `kernel/net/udp.zig` 新增 `port_local_ip6`，在新建槽位、`rebind`、swap-remove 时随槽位一起维护。`rebind` 多带一个 `addr6` 参数，两个 IPv6 槽位之间用 `addrsConflict6` 判冲突。`enqueue` 多带一个 `dst_ip6` 参数，IPv6 数据报对 IPv6 槽位用 `listenerTakes6`：先找绑定到目的地址的套接字，再找绑定 `::` 的。
+  3. `kernel/net/socket_syscall.zig` 的 `udpRebind` 把 `addr6` 传给 `udp.rebind`。
+- 测试：hello357（QEMU，4 项），定向 SMP=2、SMP=4 各一份通过。新增 host 测试「an IPv6 UDP socket's bound address takes part in port conflicts and receiver choice (hello357)」，检查接线和两个新函数的 7 种情况。hello348 和「udp: bind moves the registration…」两条旧 host 测试改为钉住新的源码行，它们检查的 IPv4 行为没有变。变异验证：IPv6 冲突检查改成恒不跳过，这条 host 测试失败，文件已恢复。
+- 完整 smoke：SMP=1、SMP=4（两份）、SMP=2 四份都是 EXIT=0、319 PASS、0 FAIL、`corrupted canaries=0`；riscv64、aarch64 smoke 都通过。
+- 这次修复带来的局限：
+  1. IPv6 发送的源地址仍由 `sendToV6` 决定（回环用 `::1`，其他用 `ndp.selectSourceAddress`），不看绑定地址（hello349 局限 2）。
+  2. IPv6 TCP 的绑定冲突和连接查找仍不看本地地址。
+  3. 组播地址只当作普通绑定地址比较，没有组成员关系；`scope_id` 不参与比较。
