@@ -19,9 +19,18 @@ pub const Slot = struct {
     next_probe_ns: u64 = 0,
 };
 
+/// A frame waiting for an IPv6 next hop's MAC. Neighbor Discovery itself repeats the solicitations (ndp.timerTick), so only the
+/// hold time applies.
+pub const Slot6 = struct {
+    used: bool = false,
+    hop: [16]u8 = @splat(0),
+    queued_ns: u64 = 0,
+};
+
 /// The slot a new frame takes: a free or expired one, else the oldest (__neigh_event_send drops the oldest queued frame when the
 /// queue is over its limit).
-pub fn pickSlot(slots: []const Slot, now: u64) usize {
+/// `slots` is an array or slice of Slot or Slot6.
+pub fn pickSlot(slots: anytype, now: u64) usize {
     var oldest: usize = 0;
     for (slots, 0..) |s, i| {
         if (!s.used or expired(s, now)) return i;
@@ -30,7 +39,7 @@ pub fn pickSlot(slots: []const Slot, now: u64) usize {
     return oldest;
 }
 
-pub fn expired(s: Slot, now: u64) bool {
+pub fn expired(s: anytype, now: u64) bool {
     return s.used and now -| s.queued_ns >= HOLD_NS;
 }
 

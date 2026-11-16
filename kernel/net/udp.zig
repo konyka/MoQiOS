@@ -1048,9 +1048,13 @@ pub fn sendToV6From(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, 
     // K3: ::1 short-circuits NDP and the wire — loop back via lo.
     // An address of this host is reached through lo too (Linux routes it via the local table).
     const is_loop = netif.isLoopbackV6(dst_ip) or ndp.isOwnAddress(dst_ip, netif.getMac());
-    const dst_mac = if (is_loop) netif.getMac() else nh.mac orelse {
-        if (nh.solicit) |t| icmpv6.sendNeighborSolicitation(t);
-        return false;
+    // A next hop still being solicited: the frame is built and waits for it (ndp_queue), and the send succeeds, as in Linux.
+    var wait_hop6: ?[16]u8 = null;
+    const dst_mac = if (is_loop) netif.getMac() else nh.mac orelse blk: {
+        const t = nh.solicit orelse return false;
+        icmpv6.sendNeighborSolicitation(t);
+        wait_hop6 = t;
+        break :blk [6]u8{ 0, 0, 0, 0, 0, 0 };
     };
 
     const our_mac = netif.getMac();
@@ -1086,6 +1090,10 @@ pub fn sendToV6From(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, 
     // arriving on that interface (Linux ip6_finish_output2 checks ipv6_chk_mcast_addr on the device).
     const out_if6 = mcast.outInterface(oif);
     if (group and opts.mc_loop and (mcast.alwaysJoined(dst_ip) or hostJoined(dst_ip, out_if6))) _ = lo.sendPacketOn(&send_pkt, frame_len, out_if6);
+    if (wait_hop6) |hop| {
+        @import("ndp_queue.zig").queueFrame(hop, &send_pkt, frame_len);
+        return true;
+    }
     const ok = if (is_loop) lo.sendPacket(&send_pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.
     if (ok) ipv6.noteFullSizeSend(dst_ip, ipv6.HEADER_LEN + udp_total);

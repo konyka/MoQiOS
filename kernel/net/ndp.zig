@@ -1013,7 +1013,13 @@ pub fn lookup(ipv6_addr: [16]u8) ?[6]u8 {
 
 /// Insert or refresh an entry, marking it as `reachable`.
 /// Mirrors the simple "always overwrite" cache strategy used by ARP.
+/// Learn `ipv6_addr` at `mac_addr` (reachable), then send the frames that waited for it (ndp_queue).
 pub fn update(ipv6_addr: [16]u8, mac_addr: [6]u8) void {
+    updateCache(ipv6_addr, mac_addr);
+    @import("ndp_queue.zig").flush(ipv6_addr, mac_addr);
+}
+
+fn updateCache(ipv6_addr: [16]u8, mac_addr: [6]u8) void {
     // v53.40: Acquire lock — neighbor_cache accessed from interrupt + syscall contexts
     const flags = ndp_lock.acquire();
     defer ndp_lock.release(flags);

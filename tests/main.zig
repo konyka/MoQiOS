@@ -14184,3 +14184,25 @@ test "arp: unresolved IPv4 sends queue the frame, ARP replies flush it, the time
     try std.testing.expect(std.mem.indexOf(u8, io, "if (cmd == ap.SIOCDARP) return if (arp.deleteEntry(r.ip)) 0 else ap.notFound();") != null);
     try std.testing.expect(std.mem.indexOf(u8, io, "const mac = arp.resolve(r.ip) orelse return ap.notFound();") != null);
 }
+
+test "ndp queue: unresolved IPv6 sends queue the frame and ndp.update flushes it; slots expire after the hold time (hello376)" {
+    const ap = kt.arp_policy;
+    var slots: [ap.MAX_PENDING]ap.Slot6 = @splat(.{});
+    try std.testing.expectEqual(@as(usize, 0), ap.pickSlot(&slots, 0));
+    for (&slots, 0..) |*s, i| s.* = .{ .used = true, .queued_ns = 100 + @as(u64, @intCast(i)) };
+    try std.testing.expectEqual(@as(usize, 0), ap.pickSlot(&slots, 200));
+    slots[0].queued_ns = 300;
+    try std.testing.expectEqual(@as(usize, 1), ap.pickSlot(&slots, 400));
+    try std.testing.expect(!ap.expired(slots[1], 101 + ap.HOLD_NS - 1));
+    try std.testing.expect(ap.expired(slots[1], 101 + ap.HOLD_NS));
+
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "const t = nh.solicit orelse return false;\n        icmpv6.sendNeighborSolicitation(t);\n        wait_hop6 = t;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "@import(\"ndp_queue.zig\").queueFrame(hop, &send_pkt, frame_len);\n        return true;") != null);
+    const is = kt.icmpv6_source;
+    try std.testing.expect(std.mem.indexOf(u8, is, "@import(\"ndp_queue.zig\").queueFrame(hop, &pkt, frame_len);\n        return 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.ndp_source, "updateCache(ipv6_addr, mac_addr);\n    @import(\"ndp_queue.zig\").flush(ipv6_addr, mac_addr);") != null);
+    const qs = kt.ndp_queue_source;
+    try std.testing.expect(std.mem.indexOf(u8, qs, "@memcpy(out[0..6], &mac);\n        _ = nic.sendPacket(&out, n);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, qs, "if (!pending[i].used or policy.expired(pending[i], now) or !sameAddr(pending[i].hop, ip)) continue;") != null);
+}

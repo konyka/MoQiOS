@@ -9896,7 +9896,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异验证：`pickReceiver6` 不再检查绑定地址时，hello374 这条 host 测试失败，文件已恢复。
 - 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello374 PASS。本轮没有跑 riscv64、aarch64。
 - 局限：
-  1. 下一跳未解析时 ping 发送返回 EAGAIN，Linux 会把报文挂起并返回成功。IPv4 已在 hello375 一节解决；IPv6（NDP）仍返回 EAGAIN。
+  1. 下一跳未解析时 ping 发送返回 EAGAIN，Linux 会把报文挂起并返回成功。IPv4 已在 hello375 一节解决，IPv6 已在 hello376 一节解决。
   2. 不处理发往 ping 套接字的 ICMPv6 错误，也没有 IPV6_RECVERR；不支持 IPV6_* 的辅助数据（cmsg）。
   3. 除了 ::1，IPv6 回显只能经 QEMU user 网络验证；外部主机发来的 ping 进不来。
 
@@ -9916,6 +9916,24 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异验证：`firstForHop` 恒为 true、去掉 SIOCDARP 的 CAP_NET_ADMIN 检查、`handlePacket` 不再调用 `flushPending`，三种情况下各有对应的 host 测试失败，文件已恢复。
 - 完整 smoke：SMP=2、SMP=1 各一份通过，SMP=4 跑了三份（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello375 PASS。三份 SMP=4 里 hello375 都是 PASS：第一份只有已记录的偶发项 hello286 M（19/20）失败；第二份是 hello108「RT task lost the CPU to reaping」（已记录为宿主机负载引起的偶发失败）和 hello325 G（`hits 0`，hello330 一节记录过同样的现象）失败；第三份通过。riscv64、aarch64 的 `zig build -Darch=...` 返回 0，没有在这两个架构上跑 QEMU。
 - 局限：
-  1. TCP 和 IPv6（`sendToV6From`、`icmpv6.sendFrom6`）的发送不挂起。TCP 由重传补发；IPv6 UDP 仍丢包，IPv6 ping 返回 EAGAIN。
+  1. TCP 和 IPv6（`sendToV6From`、`icmpv6.sendFrom6`）的发送不挂起。TCP 由重传补发；IPv6 已在 hello376 一节解决。
   2. 不支持 SIOCSARP（静态条目和代理条目），也没有 `/proc/net/arp`。
   3. ARP 缓存仍是 16 项、没有老化，满了不加新条目。
+
+## 补充：IPv6 帧等待邻居通告（hello376）
+
+- 问题：IPv6 UDP `sendToV6From` 在下一跳正在被请求时发出 NS 后丢掉报文，sendto 返回 -1；IPv6 ping 套接字的 `icmpv6.sendFrom6` 返回 EAGAIN。发往新邻居（包括 QEMU user 网络的路由器 fec0::2）的第一个报文总会丢。Linux 把帧挂在邻居上，发送返回字节数。
+- 宿主机实测（Linux，`unshare --map-auto --map-root-user -n` 里建一对 veth，远端持有 fec0::2 和 fec0::3，本端 fec0::15/64，默认路由经 fec0::2，地址都加 `nodad`，方法写在 `user/hello376.c` 文件头）：A、R、U、Q 共 4 项全部通过。发往不应答的 fec0::99 时，UDP sendto、connected send 和 ping 都返回 16，4 秒内什么也收不到，SO_ERROR 是 0。
+- 红灯（未修改的内核，只加了 hello376 的启动配置，SMP=2，hello376 临时放在 init 序列最前面）：A 通过；R、U、Q 失败，ping 返回 -11，UDP 返回 -1。
+- 修复：
+  1. `arp_policy` 新增 `Slot6`（128 位下一跳），`pickSlot`、`expired` 改为对 `Slot` 和 `Slot6` 通用。
+  2. 新文件 `net/ndp_queue.zig`：`queueFrame` 把帧挂起，最多 8 帧，3 秒后作废；`flush` 把等某个地址的帧补上 MAC 后发出。NS 的重发仍由 `ndp.timerTick` 负责。
+  3. `ndp.update` 拆成 `updateCache` 加 `ndp_queue.flush`，在放开 `ndp_lock` 之后发帧。
+  4. `sendToV6From` 和 `icmpv6.sendFrom6` 在下一跳正在被请求时照常组帧，交给 `ndp_queue.queueFrame`，返回成功。没有路由时 UDP 仍失败，ping 从 EAGAIN 改为 ENETUNREACH。
+  5. `capability_profile` 给 hello376 设 uid 0、gid 0，用来写 ping_group_range。
+- 测试：hello376（QEMU，4 项）。新增 host 测试「ndp queue: unresolved IPv6 sends queue the frame and ndp.update flushes it ...」。
+- 变异验证：`ndp.update` 不再调用 `ndp_queue.flush` 时，这条 host 测试失败，文件已恢复。
+- 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello376 PASS。riscv64、aarch64 的 `zig build -Darch=... --prefix` 返回 0，并重新生成了内核 ELF；没有在这两个架构上跑 QEMU。
+- 局限：
+  1. TCP 的发送不挂起，由重传补发。
+  2. IPv6 队列不按邻居失败（NDP 3 次请求无应答）立即清空，而是等 3 秒作废。

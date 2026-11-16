@@ -347,17 +347,20 @@ pub fn sendEchoReply(
 
 /// Send the ICMPv6 message `msg` (header and data; the checksum is computed here over the pseudo-header) from an IPv6 ping socket
 /// bound to `bound` (:: when unbound) to `dst`: routed like an IPv6 UDP datagram (lo for ::1 and this host's addresses, else the
-/// next hop's MAC, soliciting it when it is missing). Returns 0, or -EMSGSIZE past the path MTU, -EAGAIN while the next hop is
-/// unresolved, -ENOBUFS when the device drops it.
+/// next hop's MAC; while that is being solicited the frame waits in ndp_queue and the send succeeds, as Linux queues it on the
+/// neighbour). Returns 0, or -EMSGSIZE past the path MTU, -ENETUNREACH with no route, -ENOBUFS when the device drops it.
 pub fn sendFrom6(bound: [16]u8, dst: [16]u8, msg: []u8) i64 {
     if (msg.len + ipv6.HEADER_LEN > ipv6.getSendMtu(dst)) return -90;
     const our_mac = netif.getMac();
     const via_lo = netif.isLoopbackV6(dst) or ndp.isOwnAddress(dst, our_mac);
+    var wait_hop: ?[16]u8 = null;
     const dst_mac = if (via_lo) our_mac else resolve: {
         const nh = ndp.resolveNextHop(dst);
-        break :resolve nh.mac orelse {
-            if (nh.solicit) |t| sendNeighborSolicitation(t);
-            return -11;
+        break :resolve nh.mac orelse blk: {
+            const t = nh.solicit orelse return -101; // ENETUNREACH: no route
+            sendNeighborSolicitation(t);
+            wait_hop = t;
+            break :blk [6]u8{ 0, 0, 0, 0, 0, 0 };
         };
     };
     const src = @import("tcp_port_policy.zig").sourceAddr6(bound, dst, if (via_lo) dst else ndp.selectSourceAddress(dst, our_mac));
@@ -371,6 +374,10 @@ pub fn sendFrom6(bound: [16]u8, dst: [16]u8, msg: []u8) i64 {
     @memcpy(pkt[icmp_off..][0..msg.len], msg);
     ipv6.buildHeader(pkt[14..].ptr, src, dst, ipv6.PROTO_ICMPV6, @intCast(msg.len));
     const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, @intCast(ipv6.HEADER_LEN + msg.len));
+    if (wait_hop) |hop| {
+        @import("ndp_queue.zig").queueFrame(hop, &pkt, frame_len);
+        return 0;
+    }
     const lo = @import("lo.zig");
     const ok = if (via_lo) lo.sendPacket(&pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt, frame_len);
     return if (ok) 0 else -105;
