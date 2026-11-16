@@ -225,9 +225,9 @@ pub fn setProxy(ip: [4]u8, dev: policy.ProxyDev) i64 {
 }
 
 const devconf = @import("devconf_policy.zig");
-/// net.ipv4.conf.{all,default,lo,eth0}.proxy_arp, indexed by devconf.Dev. Kept and reported only: MoQiOS does not forward, so no
-/// proxy reply is ever due.
-var proxy_arp_conf: [4]i32 = @splat(0);
+/// net.ipv4.conf.{all,default,lo,eth0}.<param>, indexed by devconf.Param. proxy_arp is kept and reported only (MoQiOS does not
+/// forward, so no proxy reply is ever due); route_localnet decides whether a 127/8 source may leave through the NIC.
+var conf: [2]devconf.Conf = @splat(.{});
 
 /// The conf entry a proxy device names: no device is all (arp_req_set_proxy's IPV4_DEVCONF_ALL).
 pub fn confDev(d: policy.ProxyDev) devconf.Dev {
@@ -241,22 +241,33 @@ pub fn confDev(d: policy.ProxyDev) devconf.Dev {
 pub fn setProxyArp(dev: devconf.Dev, v: i32) void {
     const saved = arp_lock.acquire();
     defer arp_lock.release(saved);
-    proxy_arp_conf[@intFromEnum(dev)] = v;
+    conf[@intFromEnum(devconf.Param.proxy_arp)].set(dev, v);
 }
 
-/// A write at offset 0 to /proc/sys/net/ipv4/conf/<dev>/proxy_arp: the bytes consumed or -EINVAL (devconf.writeInt).
-pub fn proxyArpWrite(dev: devconf.Dev, text: []const u8) i64 {
+/// A write at offset 0 to /proc/sys/net/ipv4/conf/<dev>/<param>: the bytes consumed or -EINVAL (devconf.writeInt).
+pub fn confWrite(cf: devconf.ConfFile, text: []const u8) i64 {
     const w = devconf.writeInt(text);
-    if (w.value) |v| setProxyArp(dev, v);
+    if (w.value) |v| {
+        const saved = arp_lock.acquire();
+        defer arp_lock.release(saved);
+        conf[@intFromEnum(cf.param)].set(cf.dev, v);
+    }
     return w.ret;
 }
 
-/// The text of /proc/sys/net/ipv4/conf/<dev>/proxy_arp.
-pub fn proxyArpRead(dev: devconf.Dev, out: []u8) usize {
+/// The text of /proc/sys/net/ipv4/conf/<dev>/<param>.
+pub fn confRead(cf: devconf.ConfFile, out: []u8) usize {
     const saved = arp_lock.acquire();
-    const v = proxy_arp_conf[@intFromEnum(dev)];
+    const v = conf[@intFromEnum(cf.param)].get(cf.dev);
     arp_lock.release(saved);
     return devconf.formatInt(out, v);
+}
+
+/// Whether a socket bound to 127/8 may send through the NIC: route_localnet of eth0 or all (IN_DEV_ROUTE_LOCALNET).
+pub fn loopbackAllowed() bool {
+    const saved = arp_lock.acquire();
+    defer arp_lock.release(saved);
+    return conf[@intFromEnum(devconf.Param.route_localnet)].routeLocalnet(.eth);
 }
 
 /// Remove the proxy entry (`ip`, `dev`); false when there is none (pneigh_delete's ENOENT).

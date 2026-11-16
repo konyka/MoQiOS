@@ -158,7 +158,7 @@ fn pingSend(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr
         dst = d.udp_dst_ip;
     } else return -89; // EDESTADDRREQ
     // A socket bound to 127/8 reaches only what lo carries (__mkroute_output).
-    const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(d.udp_local_ip, dst, netif.getOurIp());
+    const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(d.udp_local_ip, dst, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
     if (lo_rc != 0) return lo_rc;
     var msg: [pp.MAX_MESSAGE]u8 = undefined;
     @memcpy(msg[0..payload.len], payload);
@@ -673,7 +673,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         } else {
             return -89; // EDESTADDRREQ — unconnected UDP socket, no destination given
         }
-        const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(t.fd_table.fds[fd].udp_local_ip, dst_ip, netif.getOurIp());
+        const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(t.fd_table.fds[fd].udp_local_ip, dst_ip, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
         if (lo_rc != 0) return lo_rc;
         if (udp.sendToFrom(t.fd_table.fds[fd].udp_local_ip, dst_ip, dst_port, src_key, &tmp_buf2, @intCast(n2))) {
             return @intCast(n2);
@@ -1018,7 +1018,7 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         const dst_port = bo.readU16BeAt(&sock_addr, 2);
         const dst_ip = [4]u8{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] };
         // ip4_datagram_connect routes the peer first: a 127/8-bound socket cannot connect out through the NIC, and stays unconnected.
-        const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(t.fd_table.fds[fd].udp_local_ip, dst_ip, netif.getOurIp());
+        const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(t.fd_table.fds[fd].udp_local_ip, dst_ip, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
         if (lo_rc != 0) return lo_rc;
         t.fd_table.fds[fd].udp_connected = true;
         t.fd_table.fds[fd].udp_dst_ip = dst_ip;
@@ -1058,7 +1058,7 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     const port = bo.readU16BeAt(&sock_addr, 2);
     const ip = [4]u8{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] };
     // tcp_v4_connect routes first (ip_route_connect): from a 127/8 address only lo destinations, else EINVAL with nothing sent.
-    const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(info.local_ip, ip, netif.getOurIp());
+    const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(info.local_ip, ip, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
     if (lo_rc != 0) return lo_rc;
     return finishTcpConnect(t, fd, net_mod.tcp.tcpConnectSocket(tcb_idx, ip, port));
 }
@@ -1506,7 +1506,7 @@ fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32) i64 
         dst_ip = d.udp_dst_ip;
         dst_port = d.udp_dst_port;
     } else return -89;
-    const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(d.udp_local_ip, dst_ip, netif.getOurIp());
+    const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(d.udp_local_ip, dst_ip, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
     if (lo_rc != 0) return lo_rc;
     const n = @min(payload.len, 1472);
     return if (udp.sendToFrom(d.udp_local_ip, dst_ip, dst_port, src_key, payload.ptr, @intCast(n))) @intCast(n) else -1;

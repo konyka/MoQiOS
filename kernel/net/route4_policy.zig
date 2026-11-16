@@ -21,9 +21,11 @@ pub const EINVAL: i64 = -22;
 /// A socket bound to a 127/8 address may only reach destinations routed through lo: another 127/8 address, this host's own `our`,
 /// the limited broadcast and multicast (ip_route_output_key_hash_rcu sends those from a local source address without a route, so
 /// they never reach __mkroute_output's check). Anything else leaves through the NIC, and a loopback source on a non-loopback device
-/// is EINVAL (net/ipv4/route.c __mkroute_output, route_localnet off). 0 when the destination is fine.
-pub fn loopbackSourceErrno(bound: [4]u8, dst: [4]u8, our: [4]u8) i64 {
+/// is EINVAL (net/ipv4/route.c __mkroute_output) unless `localnet` says route_localnet is on for the NIC (its value or all's). 0
+/// when the destination is fine.
+pub fn loopbackSourceErrno(bound: [4]u8, dst: [4]u8, our: [4]u8, localnet: bool) i64 {
     if (bound[0] != 127) return 0;
+    if (localnet) return 0;
     if (isLocal4(dst, our)) return 0;
     if (@as(u32, @bitCast(dst)) == 0xffff_ffff) return 0;
     if (dst[0] >= 224 and dst[0] <= 239) return 0;

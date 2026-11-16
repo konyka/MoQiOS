@@ -1,5 +1,6 @@
-//! net.ipv4.conf.<dev>.proxy_arp: the per-device proxy ARP switch (net/ipv4/devinet.c, /proc/sys/net/ipv4/conf/{all,default,lo,
-//! eth0}/proxy_arp; arp_req_set_proxy sets it from SIOCSARP / SIOCDARP with ATF_PUBL and netmask 0). Each of the four is its own int:
+//! net.ipv4.conf.<dev>.<param>: per-device IPv4 settings (net/ipv4/devinet.c, /proc/sys/net/ipv4/conf/{all,default,lo,eth0}/...).
+//! MoQiOS keeps proxy_arp (arp_req_set_proxy sets it from SIOCSARP / SIOCDARP with ATF_PUBL and netmask 0) and route_localnet (a
+//! 127/8 source may leave through a device whose value or all's is nonzero, __mkroute_output). Each of the four is its own int:
 //! lo and the NIC carry addresses, so on Linux their values no longer follow default (ipv4_devconf_setall), and all is separate too.
 //! The files read and write like proc_dointvec with one value (kernel/sysctl.c do_proc_dointvec, proc_get_long), measured in hello383.
 const std = @import("std");
@@ -8,11 +9,56 @@ pub const EINVAL: i64 = -22;
 
 pub const Dev = enum(u8) { all = 0, default = 1, lo = 2, eth = 3 };
 
-/// What a path below /proc names inside sys/net/ipv4/conf: the conf directory, a device's directory, or its proxy_arp file.
+pub const Param = enum(u8) { proxy_arp = 0, route_localnet = 1 };
+
+/// One file: a device's directory and the parameter it holds.
+pub const ConfFile = struct { dev: Dev, param: Param };
+
+/// What a path below /proc names inside sys/net/ipv4/conf: the conf directory, a device's directory, or one of its files.
 pub const Path = union(enum) {
     conf_dir,
     dev_dir: Dev,
-    proxy_arp: Dev,
+    conf_file: ConfFile,
+};
+
+/// A ConfFile packed into a descriptor's proc_pid, and back.
+pub fn encode(cf: ConfFile) u32 {
+    return @as(u32, @intFromEnum(cf.dev)) | (@as(u32, @intFromEnum(cf.param)) << 8);
+}
+
+pub fn decode(v: u32) ConfFile {
+    return .{ .dev = @enumFromInt(@as(u8, @truncate(v))), .param = @enumFromInt(@as(u8, @truncate(v >> 8))) };
+}
+
+/// One parameter's value for all, default, lo and eth0.
+pub const Conf = struct {
+    all: i32 = 0,
+    default: i32 = 0,
+    lo: i32 = 0,
+    eth: i32 = 0,
+
+    pub fn get(self: Conf, dev: Dev) i32 {
+        return switch (dev) {
+            .all => self.all,
+            .default => self.default,
+            .lo => self.lo,
+            .eth => self.eth,
+        };
+    }
+
+    pub fn set(self: *Conf, dev: Dev, v: i32) void {
+        switch (dev) {
+            .all => self.all = v,
+            .default => self.default = v,
+            .lo => self.lo = v,
+            .eth => self.eth = v,
+        }
+    }
+
+    /// IN_DEV_ORCONF for the output device `dev`: its own value or all's is nonzero (default only seeds new devices).
+    pub fn routeLocalnet(self: Conf, dev: Dev) bool {
+        return self.get(dev) != 0 or self.all != 0;
+    }
 };
 
 /// The device a conf directory name stands for; eth0 only while the NIC is up (Linux lists the devices that exist).
@@ -49,7 +95,8 @@ pub fn lookup(rest: []const u8, nic_active: bool) ?Path {
     const dev = devByName(tail[0..slash], nic_active) orelse return null;
     const file = tail[slash + 1 ..];
     if (file.len == 0) return .{ .dev_dir = dev };
-    if (std.mem.eql(u8, file, "proxy_arp")) return .{ .proxy_arp = dev };
+    if (std.mem.eql(u8, file, "proxy_arp")) return .{ .conf_file = .{ .dev = dev, .param = .proxy_arp } };
+    if (std.mem.eql(u8, file, "route_localnet")) return .{ .conf_file = .{ .dev = dev, .param = .route_localnet } };
     return null;
 }
 
@@ -91,7 +138,7 @@ pub fn writeInt(text: []const u8) IntWrite {
     return .{ .ret = @intCast(text.len - (p.len - i)), .value = value };
 }
 
-/// The text a proxy_arp file reads: the value and a newline. Returns the bytes written.
+/// The text a conf file reads: the value and a newline. Returns the bytes written.
 pub fn formatInt(out: []u8, v: i32) usize {
     const s = std.fmt.bufPrint(out, "{d}\n", .{v}) catch return 0;
     return s.len;

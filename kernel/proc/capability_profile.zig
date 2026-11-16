@@ -162,6 +162,10 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // Proxy ARP test: CAP_NET_ADMIN to set and remove proxy entries.
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_net_admin = true }, .initial_init = false };
     }
+    if (std.mem.eql(u8, name, "hello387")) {
+        // net.ipv4.conf.<dev>.route_localnet: uid 1000 with CAP_NET_ADMIN writes the sysctls (net_ctl_permissions).
+        return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_net_admin = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello386")) {
         // A 127/8-bound socket cannot reach out through the NIC: root for ping_group_range, CAP_NET_RAW for the ping socket and
         // CAP_NET_BIND_SERVICE for the low ports the test binds (40386, 40387, 80).

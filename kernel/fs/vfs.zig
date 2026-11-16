@@ -982,7 +982,7 @@ pub fn statusFlagsOf(desc: *FileDescriptor) u32 {
 
 /// F_GETOWN / F_GETSIG: the owner (pid, -pgrp or 0) and signal (0: SIGIO) of the whole open file description.
 /// `kind` is the F_SETOWN_EX type (fcntl_policy.F_OWNER_*): a TID owner is signalled as that thread, a PID owner as its process.
-/// A write to a /proc/sys file at `offset`: ping_group_range (ipv4_ping_group_range) or a device's proxy_arp (proc_dointvec). At an
+/// A write to a /proc/sys file at `offset`: ping_group_range (ipv4_ping_group_range) or a device's conf file (proc_dointvec). At an
 /// offset past 0 the write is swallowed whole and changes nothing (sysctl_writes_strict, measured in hello383); the rest of /proc is
 /// read-only.
 fn sysctlWrite(desc: *FileDescriptor, buf: [*]const u8, count: usize, offset: u64) i64 {
@@ -993,7 +993,7 @@ fn sysctlWrite(desc: *FileDescriptor, buf: [*]const u8, count: usize, offset: u6
     const text = buf[0..count];
     return switch (desc.proc_file_type) {
         .ping_group_range => @import("../net/udp.zig").pingGroupWrite(text),
-        .proxy_arp => @import("../net/arp.zig").proxyArpWrite(@enumFromInt(desc.proc_pid), text),
+        .conf_file => @import("../net/arp.zig").confWrite(@import("../net/devconf_policy.zig").decode(desc.proc_pid), text),
         else => -1,
     };
 }
@@ -1792,7 +1792,7 @@ pub const FdTable = struct {
                 }
                 pfile = .net_arp;
             } else if (@import("../net/devconf_policy.zig").lookup(rest, @import("../net/nic.zig").isActive())) |cp| {
-                // /proc/sys/net/ipv4/conf, conf/<dev> (directories, mode 0555) and conf/<dev>/proxy_arp (mode 0644 like
+                // /proc/sys/net/ipv4/conf, conf/<dev> (directories, mode 0555) and conf/<dev>/{proxy_arp,route_localnet} (mode 0644 like
                 // ping_group_range). The device rides in proc_pid.
                 switch (cp) {
                     .conf_dir => pfile = .sys_conf_dir,
@@ -1800,12 +1800,12 @@ pub const FdTable = struct {
                         pfile = .conf_dev_dir;
                         pid = @intFromEnum(d);
                     },
-                    .proxy_arp => |d| {
-                        pfile = .proxy_arp;
-                        pid = @intFromEnum(d);
+                    .conf_file => |cf| {
+                        pfile = .conf_file;
+                        pid = @import("../net/devconf_policy.zig").encode(cf);
                     },
                 }
-                if (is_writable and pfile != .proxy_arp) {
+                if (is_writable and pfile != .conf_file) {
                     self.freeFd(slot);
                     return -21; // EISDIR
                 }

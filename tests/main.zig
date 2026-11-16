@@ -14412,8 +14412,8 @@ test "devconf policy: net.ipv4.conf.<dev>.proxy_arp paths, proc_dointvec writes,
     try std.testing.expect(dp.lookup("sys/net/ipv4/conf/", true).? == .conf_dir);
     try std.testing.expectEqual(dp.Dev.eth, dp.lookup("sys/net/ipv4/conf/eth0", true).?.dev_dir);
     try std.testing.expectEqual(dp.Dev.all, dp.lookup("sys/net/ipv4/conf/all/", true).?.dev_dir);
-    try std.testing.expectEqual(dp.Dev.default, dp.lookup("sys/net/ipv4/conf/default/proxy_arp", true).?.proxy_arp);
-    try std.testing.expectEqual(dp.Dev.lo, dp.lookup("sys/net/ipv4/conf/lo/proxy_arp", false).?.proxy_arp);
+    try std.testing.expectEqual(dp.Dev.default, dp.lookup("sys/net/ipv4/conf/default/proxy_arp", true).?.conf_file.dev);
+    try std.testing.expectEqual(dp.Dev.lo, dp.lookup("sys/net/ipv4/conf/lo/proxy_arp", false).?.conf_file.dev);
     try std.testing.expect(dp.lookup("sys/net/ipv4/conf/eth0/proxy_arp", false) == null);
     try std.testing.expect(dp.lookup("sys/net/ipv4/conf/nope0/proxy_arp", true) == null);
     try std.testing.expect(dp.lookup("sys/net/ipv4/conf/eth0/nope", true) == null);
@@ -14447,14 +14447,14 @@ test "devconf policy: net.ipv4.conf.<dev>.proxy_arp paths, proc_dointvec writes,
     // CAP_NET_ADMIN may open them (and ping_group_range) for writing (net_ctl_permissions); a sysctl reads nothing past offset 0 and
     // a write there is swallowed (sysctl_writes_strict).
     const as = kt.arp_source;
-    try std.testing.expect(std.mem.indexOf(u8, as, "pub fn proxyArpWrite(dev: devconf.Dev, text: []const u8) i64 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, as, "pub fn confWrite(cf: devconf.ConfFile, text: []const u8) i64 {") != null);
     try std.testing.expect(std.mem.indexOf(u8, as, "pub fn setProxyArp(dev: devconf.Dev, v: i32) void {") != null);
     const io = kt.ioctl_source;
     try std.testing.expect(std.mem.indexOf(u8, io, ".toggle => |d| {") != null);
     try std.testing.expect(std.mem.indexOf(u8, io, "arp.setProxyArp(arp.confDev(d), if (cmd == ap.SIOCSARP) 1 else 0);") != null);
     const pf = kt.procfs_source;
     try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pf, ".proxy_arp => @intCast(@import(\"../net/arp.zig\").proxyArpRead(@enumFromInt(pid), buf[0..@min(max_len, 16)])),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".conf_file => @intCast(@import(\"../net/arp.zig\").confRead(@import(\"../net/devconf_policy.zig\").decode(pid), buf[0..@min(max_len, 16)])),") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "pub fn isSysctl(file: ProcFile) bool {") != null);
     const vs = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, vs, "@import(\"../net/devconf_policy.zig\").lookup(rest, @import(\"../net/nic.zig\").isActive())") != null);
@@ -14521,18 +14521,66 @@ test "route4 policy: a socket bound to 127/8 cannot send or connect out through 
     const rp = kt.route4_policy;
     const our = [4]u8{ 10, 0, 2, 15 };
     const lb = [4]u8{ 127, 0, 0, 1 };
-    try std.testing.expectEqual(@as(i64, -22), rp.loopbackSourceErrno(lb, .{ 10, 0, 2, 2 }, our));
-    try std.testing.expectEqual(@as(i64, -22), rp.loopbackSourceErrno(lb, .{ 8, 8, 8, 8 }, our));
-    try std.testing.expectEqual(@as(i64, -22), rp.loopbackSourceErrno(lb, .{ 10, 0, 2, 255 }, our));
-    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(lb, .{ 127, 9, 9, 9 }, our));
-    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(lb, our, our));
-    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(lb, .{ 255, 255, 255, 255 }, our));
-    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(lb, .{ 224, 0, 0, 1 }, our));
-    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(.{ 0, 0, 0, 0 }, .{ 10, 0, 2, 2 }, our));
-    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(our, lb, our));
+    try std.testing.expectEqual(@as(i64, -22), rp.loopbackSourceErrno(lb, .{ 10, 0, 2, 2 }, our, false));
+    try std.testing.expectEqual(@as(i64, -22), rp.loopbackSourceErrno(lb, .{ 8, 8, 8, 8 }, our, false));
+    try std.testing.expectEqual(@as(i64, -22), rp.loopbackSourceErrno(lb, .{ 10, 0, 2, 255 }, our, false));
+    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(lb, .{ 127, 9, 9, 9 }, our, false));
+    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(lb, our, our, false));
+    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(lb, .{ 255, 255, 255, 255 }, our, false));
+    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(lb, .{ 224, 0, 0, 1 }, our, false));
+    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(.{ 0, 0, 0, 0 }, .{ 10, 0, 2, 2 }, our, false));
+    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(our, lb, our, false));
 
     // Wired into UDP sendto / sendmsg / connect, the ping send and connect, and TCP connect, before anything is sent.
     const ss = kt.socket_syscall_source;
     // Five call sites: the ping send, sendto and sendmsg of UDP, the UDP/ping connect and the TCP connect.
     try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, ss, "route4_policy.zig\").loopbackSourceErrno("));
+}
+
+test "devconf policy: net.ipv4.conf.<dev>.route_localnet gates the loopback-source check on the output device (Linux IN_DEV_ROUTE_LOCALNET, hello387)" {
+    const dp = kt.devconf_policy;
+    // Two parameters share the same path shape: the file name picks which one.
+    try std.testing.expectEqual(dp.Param.proxy_arp, dp.lookup("sys/net/ipv4/conf/eth0/proxy_arp", true).?.conf_file.param);
+    try std.testing.expectEqual(dp.Param.route_localnet, dp.lookup("sys/net/ipv4/conf/eth0/route_localnet", true).?.conf_file.param);
+    try std.testing.expectEqual(dp.Dev.all, dp.lookup("sys/net/ipv4/conf/all/route_localnet", true).?.conf_file.dev);
+    try std.testing.expect(dp.lookup("sys/net/ipv4/conf/eth0/nope", true) == null);
+    try std.testing.expect(dp.lookup("sys/net/ipv4/conf/lo/route_localnet", false) != null);
+
+    // The conf table: the output device's value or all's lets a 127/8 source out through the NIC.
+    const Conf = dp.Conf;
+    const off: Conf = .{};
+    const eth_on: Conf = .{ .eth = 1 };
+    const all_on: Conf = .{ .all = 1 };
+    const lo_on: Conf = .{ .lo = 1 };
+    const dflt_on: Conf = .{ .default = 1 };
+    const neg: Conf = .{ .eth = -1 };
+    const seven: Conf = .{ .eth = 7 };
+    try std.testing.expect(!off.routeLocalnet(.eth));
+    try std.testing.expect(eth_on.routeLocalnet(.eth));
+    try std.testing.expect(all_on.routeLocalnet(.eth));
+    try std.testing.expect(!lo_on.routeLocalnet(.eth));
+    try std.testing.expect(!dflt_on.routeLocalnet(.eth));
+    try std.testing.expect(neg.routeLocalnet(.eth));
+    try std.testing.expect(seven.routeLocalnet(.eth));
+
+    // route4_policy takes the switch as an argument: on, the bound 127/8 address is fine; off, EINVAL.
+    const rp = kt.route4_policy;
+    const our = [4]u8{ 10, 0, 2, 15 };
+    const lb = [4]u8{ 127, 0, 0, 1 };
+    try std.testing.expectEqual(@as(i64, -22), rp.loopbackSourceErrno(lb, .{ 10, 0, 2, 2 }, our, false));
+    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(lb, .{ 10, 0, 2, 2 }, our, true));
+    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(lb, .{ 127, 9, 9, 9 }, our, false));
+
+    // Wiring: the five call sites pass the conf switch of the output device (the NIC here), procfs and vfs serve the new file.
+    const ss = kt.socket_syscall_source;
+    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, ss, "loopbackSourceErrno("));
+    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, ss, ".loopbackAllowed()"));
+    const pf = kt.procfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".conf_dev_dir => &.{ .{ .name = \"proxy_arp\", .dtype = DT_REG }, .{ .name = \"route_localnet\", .dtype = DT_REG } },") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".conf_file => @intCast(@import(\"../net/arp.zig\").confRead(@import(\"../net/devconf_policy.zig\").decode(pid), buf[0..@min(max_len, 16)])),") != null);
+    const vs = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, vs, ".conf_file => @import(\"../net/arp.zig\").confWrite(@import(\"../net/devconf_policy.zig\").decode(desc.proc_pid), text),") != null);
+    const as = kt.arp_source;
+    try std.testing.expect(std.mem.indexOf(u8, as, "pub fn confWrite(cf: devconf.ConfFile, text: []const u8) i64 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, as, "pub fn loopbackAllowed() bool {") != null);
 }

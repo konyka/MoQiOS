@@ -10128,5 +10128,26 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello386 PASS；已有测试里没有依赖回环源地址经网卡发出的。riscv64、aarch64 交叉构建通过，没有在这两个架构上跑 QEMU。
 - 局限：
   1. 只做了 IPv4。IPv6 不受影响：Linux 允许从 ::1 发往别的主机（hello358 实测 sendto 成功），MoQiOS 也照发。
-  2. 没有 `route_localnet` 开关（`/proc/sys/net/ipv4/conf/*/route_localnet`），检查总是打开的，等于 Linux 的默认值。
+  2. 没有 `route_localnet` 开关（`/proc/sys/net/ipv4/conf/*/route_localnet`），检查总是打开的，等于 Linux 的默认值。（后来在 hello387 一节解决。）
+
+## 补充：net.ipv4.conf.<dev>.route_localnet（hello387）
+
+- 背景：hello386 局限 2。hello386 把「绑定 127/8 不能经网卡发送」的检查做成总是打开，等于 Linux 的默认值。Linux 有开关：`net/ipv4/route.c` 的 `__mkroute_output` 只有在出接口（或 all）的 `route_localnet` 为 0 时才返回 EINVAL，一些把回环地址当管理地址的部署会把它打开。
+- 宿主机实测（`user/hello387.c`，root、`unshare -n`、hello375 的 veth 环境）：L、N、E、V、T、R 共 6 项通过。要点：
+  1. 四个设备各有自己的值，默认 0；写 7 或 -1 读回来一样，而且都算开（`ipv4_devconf_set` 存原值，`IN_DEV_ORCONF` 只判非零）。
+  2. 出接口是网卡，所以只有网卡的 `route_localnet` 或 all 能让回环源地址出去；把 lo 或 default 置 1 都不行（Linux 实测 sendto 仍 EINVAL）。
+  3. 打开后 TCP 从 127.0.0.1 connect 网关返回 EINPROGRESS（真的发 SYN），不再是 EINVAL。
+  4. 写入的权限和 proxy_arp 一样（root 或 CAP_NET_ADMIN，hello383）。
+- 修复：
+  1. `devconf_policy` 从「一个参数」推广成「文件 = 设备 + 参数」：新增 `Param`（proxy_arp、route_localnet）、`ConfFile`、`encode`/`decode`（打包进描述符的 proc_pid）和 `Conf`（四个 int，`get`/`set`/`routeLocalnet`）；`lookup` 返回 `conf_file`。
+  2. `arp.zig` 把 `proxy_arp_conf[4]` 换成 `conf[2]`（按参数索引），新增 `confRead`、`confWrite`、`loopbackAllowed()`；`setProxyArp` 保留给 ioctl 用。
+  3. `route4_policy.loopbackSourceErrno` 新增 `localnet` 参数：为真时直接返回 0。`socket_syscall.zig` 的五个调用点都传 `arp.loopbackAllowed()`。
+  4. `procfs.zig` 的 `proxy_arp` 改成 `conf_file`（`conf_dev_dir` 列出两个文件，读用 `confRead`）；`vfs.zig` 的写路径用 `confWrite`，open 时把 `ConfFile` 编进 proc_pid。
+  5. `capability_profile` 给 hello387 设 uid 1000 和 CAP_NET_ADMIN。
+- host 测试 "devconf policy: net.ipv4.conf.<dev>.route_localnet gates the loopback-source check on the output device (Linux IN_DEV_ROUTE_LOCALNET, hello387)"：实现前编译失败（没有 `Param`）；实现后通过。变异验证：`Conf.routeLocalnet` 恒返回 false 时测试失败，文件已恢复。hello383、hello386 的 host 测试按新 API 更新（`conf_file.dev`、第四个参数）。
+- 红灯：未修改的内核（只保留启动配置）上定向 SMP=2，L、E、V、T、R 失败：目录里没有这个文件（读 -2），写也 ENOENT。N 在旧内核上通过，因为 hello386 的检查默认就打开。绿灯：6 项全部通过。第一次绿灯前发现测试程序 L 项取不到条目，原因是宿主机目录条目多、一次 getdents 读不完，改成循环读到 0 后通过。
+- 完整 smoke：SMP=2、SMP=1 各一份通过；SMP=4 第一份只有 hello267（已记录的偶发项，本次未改 TCP）失败，重跑的 SMP=4 通过（超时上限 1400 秒），smoke 脚本要求 hello387 PASS。riscv64、aarch64 交叉构建通过，没有在这两个架构上跑 QEMU。
+- 局限：
+  1. 只有 proxy_arp 和 route_localnet 两个参数；Linux 每个设备还有几十个（forwarding、rp_filter、arp_ignore、accept_local 等）。
+  2. 没有 `default` 向新设备传播的时机（设备固定），也没有 `route_localnet` 影响校验源地址的那一半（`fib_validate_source`，MoQiOS 不做入向校验）。
 
