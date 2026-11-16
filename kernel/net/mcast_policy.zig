@@ -4,8 +4,9 @@
 const std = @import("std");
 const bap = @import("bind_addr_policy.zig");
 
-/// Groups one socket can join at once (Linux bounds this by optmem; here a fixed table, the join past it is ENOMEM).
-pub const MAX_GROUPS = 8;
+/// Groups one socket can join at once. Linux bounds this by the socket's optmem (one ipv6_mc_socklist per group; a socket joined
+/// 2340 on the host with the default optmem_max); here a fixed table per socket, the join past it is ENOMEM as in Linux.
+pub const MAX_GROUPS = 64;
 
 pub const EINVAL: i64 = -22;
 pub const EADDRINUSE: i64 = -98;

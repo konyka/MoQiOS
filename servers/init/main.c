@@ -497,6 +497,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello378"); /* /proc/net/arp */
     run_test("hello379"); /* /proc/net and /proc/sys directories */
     run_test("hello380"); /* a full ARP cache still learns a new neighbour */
+    run_test("hello381"); /* one IPv6 socket joins 64 multicast groups */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

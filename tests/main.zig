@@ -14329,3 +14329,26 @@ test "arp policy: a full cache gives a new neighbour the slot of the ordinary en
     try std.testing.expect(std.mem.indexOf(u8, src, "const i = slot orelse policy.pickCacheSlot(&cache) orelse return -105; // ENOBUFS") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "cache[i].updated_ns = nowNs();") != null);
 }
+
+test "mcast policy: one IPv6 socket can join 64 groups, the 65th is ENOMEM (Linux measured 2340 within optmem_max, hello381)" {
+    const m = kt.mcast_policy;
+    try std.testing.expectEqual(@as(usize, 64), m.MAX_GROUPS);
+    var mem: m.Membership = .{};
+    var g: [16]u8 = @splat(0);
+    g[0] = 0xff;
+    g[1] = 0x02;
+    g[11] = 1;
+    for (0..64) |i| {
+        g[15] = @intCast(i + 1);
+        try std.testing.expectEqual(@as(i64, 0), m.join(&mem, g, 1, true));
+    }
+    g[15] = 65;
+    try std.testing.expectEqual(m.ENOMEM, m.join(&mem, g, 1, true));
+    g[15] = 1;
+    try std.testing.expectEqual(m.EADDRINUSE, m.join(&mem, g, 1, true));
+    for (0..64) |i| {
+        g[15] = @intCast(i + 1);
+        try std.testing.expectEqual(@as(i64, 0), m.drop(&mem, g, 1));
+    }
+    try std.testing.expectEqual(@as(u8, 0), mem.n);
+}

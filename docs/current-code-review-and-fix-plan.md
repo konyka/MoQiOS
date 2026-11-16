@@ -9608,7 +9608,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 这次修复带来的局限：
   1. 没有源过滤（`MCAST_JOIN_SOURCE_GROUP`、`MCAST_BLOCK_SOURCE` 等），也没有 IPv4 的 `IP_ADD_MEMBERSHIP`。
   2. 加组不发 MLD 报告，e1000 仍以组播混杂方式收所有组播帧，不按加入的组设 MTA。
-  3. 组成员表每个套接字最多 8 个组（Linux 受 optmem 限制，实测约 2300 个）。
+  3. 组成员表每个套接字最多 8 个组（Linux 受 optmem 限制，实测约 2300 个）。（后来在 hello381 一节放宽到 64 个）
   4. 绑定冲突仍按地址完全相等判断，绑定组播地址的套接字之间不因 `scope_id` 区分。
 
 ## 补充：IPv4 UDP 组播选项、加组和本机投递（hello362）
@@ -10018,3 +10018,16 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 局限：
   1. 仍没有按时间老化（Linux 的 REACHABLE → STALE → 重新探测）；条目只会在表满时被挤掉、或被 SIOCDARP 删除。
   2. 表大小固定为 16 项。
+
+## 补充：一个 IPv6 套接字只能加入 8 个组播组（hello381）
+
+- 问题：`mcast_policy.MAX_GROUPS` 是 8，第 9 次 `IPV6_ADD_MEMBERSHIP` 返回 ENOMEM。Linux 每加一个组从套接字的 optmem 里分配一个 `ipv6_mc_socklist`，宿主机默认 `optmem_max`（81920）下一个套接字实测加入 2340 个组后才 ENOMEM。要监听多个组的程序（mDNS、路由守护进程）在 MoQiOS 上很快就加不进去。
+- 宿主机实测（`user/hello381.c`，`unshare -rn`，`ip link set lo up`）：J、D 都通过。
+- 修复：`kernel/net/mcast_policy.zig` 的 `MAX_GROUPS` 改为 64，超出仍是 ENOMEM。表随 UDP 端口槽静态分配，64 个端口槽 × 64 组 × 17 字节约 70 KiB。
+- host 测试 "mcast policy: one IPv6 socket can join 64 groups, the 65th is ENOMEM ..."：修复前失败；修复后通过。变异验证：改回 8 时测试失败，文件已恢复。原有测试按 `MAX_GROUPS` 填满表，不受影响。
+- 红灯：未修改的内核上定向 SMP=2，hello381 J、D 失败：64 个只加入 8 个，第 9 个 -12（ENOMEM）。绿灯：J、D 通过。
+- 启动配置：不需要。
+- 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello381 PASS。没有在 riscv64、aarch64 上跑 QEMU。
+- 局限：
+  1. 上限仍是固定的 64，不按 optmem 计算；Linux 上的上限高得多。
+  2. 仍不发 MLD 报告，没有源过滤；e1000 仍以组播混杂方式接收所有组播帧。
