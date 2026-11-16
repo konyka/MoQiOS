@@ -794,11 +794,14 @@ pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, data
         [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }
     else if (group)
         mcast.multicastMac4(dst_ip)
-    else
-        arp.resolve(dst_ip) orelse {
-            arp.sendArpRequest(dst_ip);
+    else resolve: {
+        // An off-link destination is reached through the gateway, whose MAC is the one to resolve.
+        const hop = netif.nextHop4(dst_ip);
+        break :resolve arp.resolve(hop) orelse {
+            arp.sendArpRequest(hop);
             return false;
         };
+    };
 
     // A 127/8 destination is reached from the bound loopback address, else from 127.0.0.1 (Linux's local route), so the
     // peer's replies stay on lo.

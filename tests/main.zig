@@ -4844,6 +4844,30 @@ test "UDP connect(AF_UNSPEC) clears the peer, its filter and the tied interface 
         try std.testing.expect(std.mem.indexOf(u8, us[d..end], line) != null);
 }
 
+test "IPv4 next hop: an off-link address goes through the gateway, and a SYN waiting for ARP counts as sent (hello368)" {
+    const r = kt.route4_policy;
+    const our = [4]u8{ 10, 0, 2, 15 };
+    const mask = [4]u8{ 255, 255, 255, 0 };
+    const gw = [4]u8{ 10, 0, 2, 2 };
+    try std.testing.expectEqual([4]u8{ 10, 0, 2, 99 }, r.nextHop4(.{ 10, 0, 2, 99 }, our, mask, gw));
+    try std.testing.expectEqual(gw, r.nextHop4(gw, our, mask, gw));
+    try std.testing.expectEqual(gw, r.nextHop4(.{ 192, 0, 2, 1 }, our, mask, gw));
+    try std.testing.expectEqual(gw, r.nextHop4(.{ 10, 0, 3, 1 }, our, mask, gw));
+    // No gateway: every address is tried on the link.
+    try std.testing.expectEqual([4]u8{ 192, 0, 2, 1 }, r.nextHop4(.{ 192, 0, 2, 1 }, our, mask, .{ 0, 0, 0, 0 }));
+    // A /16 subnet keeps 10.0.3.1 on the link.
+    try std.testing.expectEqual([4]u8{ 10, 0, 3, 1 }, r.nextHop4(.{ 10, 0, 3, 1 }, our, .{ 255, 255, 0, 0 }, gw));
+
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "arp.resolve(hop) orelse {\n            arp.sendArpRequest(hop);") != null);
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const hop = netif.nextHop4(tcb.remote_ip);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "arp.resolve(hop) orelse {\n        arp.sendArpRequest(hop);") != null);
+    const lost = std.mem.indexOf(u8, ts, "if (!synLostOnLoopback(tcb, netif.isLoopback(remote_ip))) {").?;
+    try std.testing.expect(std.mem.indexOfPos(u8, ts, lost, "if (!synAwaitsNeighbor(tcb, arp.resolve(netif.nextHop4(remote_ip)) == null)) {").? <
+        std.mem.indexOfPos(u8, ts, lost, "tcb.state = .closed;").?);
+}
+
 test "IPv6 TCP connect: a group is ENETUNREACH, a link-local peer needs an interface and ties the socket to it (hello367)" {
     const bp = kt.bind_addr_policy;
     var ff02: [16]u8 = @splat(0);

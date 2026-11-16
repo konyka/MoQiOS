@@ -1412,7 +1412,10 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16, 
     // F2: 127.0.0.0/8 goes to the loopback device — no ARP, no hardware NIC.
     const loopback = netif.isLoopback(tcb.remote_ip);
     const our_mac = netif.getMac();
-    const dst_mac = if (loopback) our_mac else (arp.resolve(tcb.remote_ip) orelse {
+    // An off-link peer is reached through the gateway; a missing entry asks for it, and the retransmit timer sends again.
+    const hop = netif.nextHop4(tcb.remote_ip);
+    const dst_mac = if (loopback) our_mac else (arp.resolve(hop) orelse {
+        arp.sendArpRequest(hop);
         tcpLog("[tcp] ARP resolution failed\n");
         return false;
     });
@@ -3253,8 +3256,10 @@ pub fn tcpConnectSocket(tcb_idx: u32, remote_ip: [4]u8, remote_port: u16) i64 {
 
     if (!sendSegment(tcb, probeEcnSynFlags(true), undefined, 0)) {
         if (!synLostOnLoopback(tcb, netif.isLoopback(remote_ip))) {
-            tcb.state = .closed;
-            return -1;
+            if (!synAwaitsNeighbor(tcb, arp.resolve(netif.nextHop4(remote_ip)) == null)) {
+                tcb.state = .closed;
+                return -1;
+            }
         }
     }
 

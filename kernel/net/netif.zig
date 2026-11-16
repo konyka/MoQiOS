@@ -33,6 +33,16 @@ pub fn getGateway() [4]u8 {
     return .{ 10, 0, 2, 2 };
 }
 
+/// The address ARP resolves to reach `dst` over the NIC (route4_policy.nextHop4): the DHCP router and netmask once the lease is
+/// configured, the QEMU user-net defaults otherwise.
+pub fn nextHop4(dst: [4]u8) [4]u8 {
+    const dhcp = @import("dhcp.zig");
+    const leased = dhcp.isConfigured();
+    const gw = if (leased) dhcp.getGateway() else getGateway();
+    const mask = if (leased and @as(u32, @bitCast(dhcp.getNetmask())) != 0) dhcp.getNetmask() else getNetmask();
+    return @import("route4_policy.zig").nextHop4(dst, getOurIp(), mask, gw);
+}
+
 /// Route decision for the TX paths: the whole 127.0.0.0/8 block is loopback
 /// (F2) and goes to the lo device instead of the hardware NIC.
 pub fn isLoopback(ip: [4]u8) bool {

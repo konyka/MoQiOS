@@ -9747,3 +9747,23 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   2. 已接受的 IPv6 连接 getsockname、getpeername 的 scope 仍用 `nameScope6` 报告网卡（2），和 Linux 一致；但子连接不继承 `bound_dev6`。
   3. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
   4. IPv4 TCP connect 在 ARP 解析失败时仍返回 -1（Linux 同样把 SYN 挂起等 ARP 结果），本次没有改。
+
+## 补充：IPv4 的下一跳和等 ARP 的 SYN（hello368）
+
+- 背景：hello367 的局限 4。IPv4 的 UDP 和 TCP 发送路径直接对目的地址做 ARP，不看子网：发往子网外地址的数据报要等目的地址本身应答 ARP，而路由器不会代答，所以永远发不出去，sendto 返回 -1。TCP 的发送路径缺 ARP 条目时连 ARP 请求都不发，connect 直接返回 -1。
+- Linux 依据：`fib_lookup` 对子网外的地址选默认路由，邻居是网关（`ip_finish_output2` 用 `rt_nexthop`）；没有邻居条目时报文挂在邻居条目上等解析（`neigh_resolve_output`），connect 返回 EINPROGRESS，解析失败后 SO_ERROR 是 EHOSTUNREACH。
+- 宿主机实测（Linux，`unshare -rn` 加一对 veth，对端不配地址、没人应答 ARP，方法写在 `user/hello368.c` 文件头）：A、B、C 共 3 项全部通过。另外实测到：connect 到 10.0.2.99 和 192.0.2.1 约 3 秒后 SO_ERROR 都是 113（EHOSTUNREACH）。
+- 红灯（未修改的内核，SMP=2，hello368 临时放在 init 序列最前面）：A、B、C 全部失败。发往网关的数据报重试 1 次后发出，但发往 192.0.2.1 和 198.51.100.7 返回 -1；两个非阻塞 connect 都返回 -1。
+- 修复：
+  1. 新增 `kernel/net/route4_policy.zig`：`nextHop4(dst, our, mask, gw)`，子网内的地址就是自己，子网外的是网关，没有网关时一律在链路上解析。`kernel/host_test.zig` 导出它。
+  2. `kernel/net/netif.zig`：新增 `nextHop4(dst)`，DHCP 租约生效后用租约的 router 和 netmask，否则用 QEMU user-net 的默认值（10.0.2.2，/24）。
+  3. `kernel/net/udp.zig`：`sendToFrom` 对下一跳做 ARP，缺条目时向下一跳发 ARP 请求。
+  4. `kernel/net/tcp.zig`：`sendSegmentSeq` 同样对下一跳做 ARP，缺条目时发 ARP 请求；IPv4 connect 的 SYN 因缺 ARP 条目没发出时，由 hello367 新增的 `synAwaitsNeighbor` 当作已发出，connect 返回 EINPROGRESS，由重传定时器重发。
+- 测试：hello368（QEMU，3 项）；新增 host 测试「IPv4 next hop: an off-link address goes through the gateway, and a SYN waiting for ARP counts as sent (hello368)」。
+- 变异验证：`nextHop4` 不再比较子网（总是返回目的地址），hello368 这条 host 测试失败，文件已恢复。
+- 完整 smoke：SMP=2、SMP=1、SMP=4 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello368 PASS。本轮没有跑 riscv64、aarch64。
+- 这次修复带来的局限：
+  1. 等 ARP 的 SYN 由重传定时器重发，最终超时报 ETIMEDOUT（110），Linux 在 ARP 失败后报 EHOSTUNREACH（113）。IPv6 等 NDP 的 SYN 也是这样。
+  2. ICMP 回显应答仍直接对请求的源地址做 ARP，子网外来的 ping 得不到应答。
+  3. 只有一条默认路由，没有路由表，也不处理 ICMP 重定向。
+  4. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。

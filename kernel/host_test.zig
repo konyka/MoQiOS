@@ -200,6 +200,7 @@ pub const poll_wake_policy = @import("fs/poll_wake_policy.zig");
 pub const ioctl_policy = @import("fs/ioctl_policy.zig");
 pub const ifreq_policy = @import("net/ifreq_policy.zig");
 pub const bind_addr_policy = @import("net/bind_addr_policy.zig");
+pub const route4_policy = @import("net/route4_policy.zig");
 pub const mcast_policy = @import("net/mcast_policy.zig");
 pub const sockaddr_util = @import("net/sockaddr_util.zig");
 pub const tcp_info_policy = @import("net/tcp_info_policy.zig");
