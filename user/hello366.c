@@ -14,8 +14,8 @@
  *       the socket is no longer on interface 2);
  *   U6. bound to 0.0.0.0:19603 and connected to 127.0.0.1:19600 it names 127.0.0.1:19603, after AF_UNSPEC 0.0.0.0:19603;
  *   U7. an IPv6 socket connecting to an AF_INET address and an IPv4 socket to an AF_INET6 one get EAFNOSUPPORT.
- * Linux also releases an automatically chosen port on AF_UNSPEC (getsockname then names port 0); MoQiOS gives every socket its
- * port at socket(), so this test does not look at the port of a socket that never bound. */
+ * Linux also releases an automatically chosen port on AF_UNSPEC (getsockname then names port 0); this test does not look at the
+ * port of a socket that never bound, hello385 does. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>

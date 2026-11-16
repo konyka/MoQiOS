@@ -89,3 +89,27 @@ pub fn pickReceiverConnected(cands: []const Candidate, src_ip: [16]u8, src_port:
     return map[pickReceiver(flags[0..n], seqs[0..n], src_ip, src_port)];
 }
 
+
+// ── autobind (inet_autobind, __udp_disconnect) ──
+
+pub const EPHEMERAL_LOW: u16 = 49152;
+pub const EPHEMERAL_HIGH: u16 = 65535;
+
+/// The port an unnamed socket takes when bind with port 0, connect or a send names it (inet_autobind → udp_lib_get_port(sk, 0)):
+/// the one socket() reserved for it, `current`, unless a named socket now holds that number (someone bound it while this socket had
+/// no name), else the first ephemeral port no named socket holds. `named` lists the port numbers of the named sockets. Null when
+/// every ephemeral port is held (EAGAIN).
+pub fn pickAutobindPort(current: u16, named: []const u16) ?u16 {
+    if (current != 0 and std.mem.indexOfScalar(u16, named, current) == null) return current;
+    var p: u32 = EPHEMERAL_LOW;
+    while (p <= EPHEMERAL_HIGH) : (p += 1) {
+        if (std.mem.indexOfScalar(u16, named, @intCast(p)) == null) return @intCast(p);
+    }
+    return null;
+}
+
+/// Whether connect(AF_UNSPEC) keeps the socket's port: only a port the user chose with bind (SOCK_BINDPORT_LOCK); one picked by
+/// bind with port 0, connect or a send is given up and getsockname names port 0 again. The bound address is kept either way.
+pub fn disconnectKeepsPort(user_chose_port: bool) bool {
+    return user_chose_port;
+}

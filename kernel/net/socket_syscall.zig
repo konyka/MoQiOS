@@ -80,11 +80,37 @@ fn udpRebind(t: *task_mod.Task, fd: u32, new_port: u16, addr: [4]u8, addr6: [16]
     const d = &t.fd_table.fds[fd];
     var disc: u16 = 0;
     const old_key = d.udpKey();
-    const rc = udp.rebind(old_key, new_port, addr, addr6, dev6, &disc);
+    // bind with port 0 names the socket on an ephemeral port (udp_lib_get_port(sk, 0)), keeping the one socket() reserved when it is
+    // still free; the address is recorded the same way.
+    const target = if (new_port == 0) blk: {
+        const ab = udpAutobind(d);
+        if (ab != 0) return ab;
+        break :blk d.udp_port;
+    } else new_port;
+    const rc = udp.rebind(d.udpKey(), target, addr, addr6, dev6, &disc);
     if (rc != 0) return rc;
     d.udp_local_ip = addr;
     d.udp_local_ip6 = addr6;
-    d.udp_port = new_port;
+    d.udp_port = target;
+    d.udp_disc = disc;
+    // A port the user named survives connect(AF_UNSPEC) (SOCK_BINDPORT_LOCK); one bind picked is given up like an autobound one.
+    if (new_port != 0) {
+        _ = udp.markUserPort(d.udpKey());
+    } else _ = udp.autobindDone(d.udpKey());
+    if (d.udpKey() != old_key) vfs_mod.udpFasyncRekey(old_key, d.udpKey());
+    return 0;
+}
+
+/// Name an unnamed UDP socket before it is used (inet_send_prepare, ip4_datagram_connect -> inet_autobind): it keeps the port
+/// socket() reserved unless someone bound that number meanwhile. The descriptor is rekeyed when the port moves. 0, or -EAGAIN.
+fn udpAutobind(d: *vfs_mod.FileDescriptor) i64 {
+    if (d.udp_ping) return 0;
+    const old_key = d.udpKey();
+    var port: u16 = 0;
+    var disc: u16 = 0;
+    const rc = udp.autobind(old_key, &port, &disc);
+    if (rc != 0) return rc;
+    d.udp_port = port;
     d.udp_disc = disc;
     if (d.udpKey() != old_key) vfs_mod.udpFasyncRekey(old_key, d.udpKey());
     return 0;
@@ -584,6 +610,9 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         if (len != 0 and copy.copyFromUser(pbuf[0..len], @ptrFromInt(buf), len) != len) return -14;
         return pingSend(&t.fd_table.fds[fd], pbuf[0..len], addr_ptr, addr_len);
     } else if (t.fd_table.fds[fd].fd_type == .udp_socket) {
+        // inet_send_prepare: the socket is named before anything else is checked, so even a send that fails leaves it a port.
+        const ab = udpAutobind(&t.fd_table.fds[fd]);
+        if (ab != 0) return ab;
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         const is_v6 = t.fd_table.fds[fd].udp_is_v6;
         const src_key = t.fd_table.fds[fd].udpKey();
@@ -952,6 +981,11 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
             },
             .address => {},
         }
+        // ip4_datagram_connect autobinds before it touches the address, so even a connect that fails names the socket.
+        if (!t.fd_table.fds[fd].udp_ping) {
+            const ab = udpAutobind(&t.fd_table.fds[fd]);
+            if (ab != 0) return ab;
+        }
         if (t.fd_table.fds[fd].udp_is_v6) {
             if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, true)) return -22;
             var sa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
@@ -1067,7 +1101,9 @@ pub fn getsockname(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
         const our6 = net_mod.tcp_port_policy.nameAddr6(desc.udp_local_ip6, desc.udp_connected, desc.udp_dst_ip6, pref6);
         // A socket tied to an interface by a scoped bind names that interface.
         // A ping socket names port 0 until bind or its first send gives it an ident (Linux inet_num is 0 before that).
-        const name_port: u16 = if (desc.udp_ping and !desc.udp_ping_bound) 0 else desc.udp_port;
+        // A UDP socket names port 0 until bind, connect or a send gives it one, and again after connect(AF_UNSPEC) gave up a port the
+        // user did not choose (Linux inet_sport 0).
+        const name_port: u16 = if (desc.udp_ping and !desc.udp_ping_bound) 0 else if (!desc.udp_ping and !udp.isNamed(desc.udpKey())) 0 else desc.udp_port;
         const alen = if (desc.udp_is_v6) sa.writeInet6(&sa_buf, name_port, our6, sa.boundScope6(our6, udp.boundDev6(desc.udpKey()))) else sa.encodeUdpName(false, name_port, our4, our6, &sa_buf);
         if (alen == 0) return -1;
         return copySockaddrToUser(addr_ptr, addrlen_ptr, sa_buf[0..alen], alen);
@@ -1422,6 +1458,8 @@ fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32) i64 
     const t = task_mod.getTask(cur_idx) orelse return -1;
     const d = &t.fd_table.fds[fd];
     if (d.udp_ping) return pingSend(d, payload, addr_ptr, addr_len);
+    const ab = udpAutobind(d);
+    if (ab != 0) return ab;
     const src_key = d.udpKey();
     if (d.udp_is_v6) {
         var dst6: [16]u8 = @splat(0);

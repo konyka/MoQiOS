@@ -77,6 +77,11 @@ var port_mc: [MAX_PORTS]mcast.Membership = @splat(.{});
 var port_mc4: [MAX_PORTS]mcast.Membership4 = @splat(.{});
 /// The interface an IPv6 slot is tied to by binding a scoped address (Linux sk_bound_dev_if), 0 for none.
 var port_dev6: [MAX_PORTS]u8 = @splat(0);
+/// Whether the socket has been named yet: socket() only reserves an ephemeral number for it (Linux inet_num stays 0), so it takes
+/// no datagrams and holds no port against another socket's bind until bind, connect or a send names it (inet_autobind).
+var port_named: [MAX_PORTS]bool = @splat(true);
+/// Whether the user chose the port with bind (Linux SOCK_BINDPORT_LOCK): connect(AF_UNSPEC) gives up any other port and names 0.
+var port_user_port: [MAX_PORTS]bool = @splat(false);
 
 /// The interface the socket with registry key `port` is tied to, 0 for none (or when it is gone).
 pub fn boundDev6(port: u32) u8 {
@@ -186,6 +191,10 @@ pub fn disconnect(key: u32) void {
     port_peer_ip[i] = @splat(0);
     port_err[i] = 0;
     port_dev6[i] = 0;
+    // __udp_disconnect: a port the user did not choose with bind is given up, so getsockname names 0 again (inet_sport = 0).
+    // The port keeps its number (the descriptor goes on holding the slot), it is only unnamed from now on.
+    const policy = @import("udp_port_policy.zig");
+    if (!policy.disconnectKeepsPort(port_user_port[i])) port_named[i] = false;
 }
 
 /// The pending error (positive errno) of the socket bound to `port`, 0 if none.
@@ -223,7 +232,7 @@ pub fn notifyUnreachable(local_port: u16, peer_port: u16) void {
         const saved = udp_lock.acquire();
         defer udp_lock.release(saved);
         for (0..num_ports) |i| {
-            if (port_ping[i]) continue;
+            if (port_ping[i] or !port_named[i]) continue;
             if (portNumber(ports[i]) != local_port) continue;
             if (!@import("icmp_unreach_policy.zig").matchesConnected(.{ .src_port = local_port, .dst_port = peer_port }, local_port, port_peer[i] != 0, port_peer[i])) continue;
             port_err[i] = 111; // ECONNREFUSED
@@ -263,6 +272,7 @@ fn countSpaceLocked(port: u16, ping: bool) u32 {
     var n: u32 = 0;
     for (0..num_ports) |i| {
         if (port_ping[i] != ping) continue;
+        if (!port_named[i]) continue;
         if (portNumber(ports[i]) == port) n += 1;
     }
     return n;
@@ -286,6 +296,8 @@ fn newSlotLocked(key: u32, is_v6: bool, uid: u32) u16 {
     port_mc[idx] = .{};
     port_mc4[idx] = .{};
     port_dev6[idx] = 0;
+    port_named[idx] = true;
+    port_user_port[idx] = false;
     for (0..QUEUE_DEPTH) |j| queues[idx][j].valid = false;
     num_ports += 1;
     return @intCast(idx);
@@ -475,9 +487,91 @@ pub fn ensurePortExclusive(port: u16, is_v6: bool, uid: u32) u16 {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
 
-    if (countPortLocked(port) != 0) return 0xFFFE;
+    // Every slot counts here, unnamed ones too: two sockets must never reserve one key.
+    for (0..num_ports) |i| {
+        if (!port_ping[i] and portNumber(ports[i]) == port) return 0xFFFE;
+    }
     if (num_ports >= MAX_PORTS) return 0xFFFF;
-    return newSlotLocked(port, is_v6, uid);
+    const idx = newSlotLocked(port, is_v6, uid);
+    port_named[idx] = false;
+    return idx;
+}
+
+/// Whether the socket at `key` has a local port yet (Linux inet_num).
+pub fn isNamed(key: u32) bool {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(key) orelse return false;
+    return port_named[i];
+}
+
+/// Name the socket at `key` (inet_autobind): it takes the ephemeral port socket() reserved for it (portNumber(key)) unless a named
+/// socket holds that number now, else the first ephemeral port none holds. Returns 0 and the new port and discriminator in
+/// `out_port` / `out_disc` (the key usually changes, so the caller must rekey its descriptor), or -EAGAIN when no port is free.
+pub fn autobind(key: u32, out_port: *u16, out_disc: *u16) i64 {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const oi = findPortIdxLocked(key) orelse return -9;
+    if (port_named[oi]) {
+        out_port.* = portNumber(key);
+        out_disc.* = @truncate(key >> 16);
+        return 0;
+    }
+    var named_buf: [MAX_PORTS]u16 = undefined;
+    var n: usize = 0;
+    var used: u64 = 0;
+    for (0..num_ports) |j| {
+        if (!port_named[j]) continue;
+        named_buf[n] = portNumber(ports[j]);
+        n += 1;
+    }
+    const want = @import("udp_port_policy.zig").pickAutobindPort(portNumber(key), named_buf[0..n]) orelse return -11; // EAGAIN
+    if (portNumber(key) == want) {
+        port_named[oi] = true;
+        out_port.* = want;
+        out_disc.* = @truncate(key >> 16);
+        return 0;
+    }
+    // The discriminator avoids every slot already on that number, unnamed ones included, so keys stay unique.
+    for (0..num_ports) |j| {
+        if (!port_ping[j] and portNumber(ports[j]) == want) used |= @as(u64, 1) << @intCast((ports[j] >> 16) & 0x3f);
+    }
+    if (used == ~@as(u64, 0)) return -11;
+    const disc: u16 = @intCast(@ctz(~used));
+    const ni = newSlotLocked(want | (@as(u32, disc) << 16), port_v6[oi], port_uid[oi]);
+    port_opts[ni] = port_opts[oi];
+    port_local_ip[ni] = port_local_ip[oi];
+    port_local_ip6[ni] = port_local_ip6[oi];
+    port_dev6[ni] = port_dev6[oi];
+    port_mc[ni] = port_mc[oi];
+    port_mc4[ni] = port_mc4[oi];
+    port_user_port[ni] = false;
+    releaseLocked(key);
+    out_port.* = want;
+    out_disc.* = disc;
+    return 0;
+}
+
+/// Mark the socket at `key` as named on an automatically picked port (bind with port 0, connect or a send): connect(AF_UNSPEC)
+/// gives such a port up. False when the socket is gone.
+pub fn autobindDone(key: u32) bool {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(key) orelse return false;
+    port_named[i] = true;
+    port_user_port[i] = false;
+    return true;
+}
+
+/// Mark the socket at `key` as bound by the user to the port it already has (Linux SOCK_BINDPORT_LOCK): bind names the port, and
+/// only such a port survives connect(AF_UNSPEC). False when the socket is gone.
+pub fn markUserPort(key: u32) bool {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(key) orelse return false;
+    port_named[i] = true;
+    port_user_port[i] = true;
+    return true;
 }
 
 /// bind() on a UDP socket already registered under `old_key`: move it to `new_port`, keeping its options (SO_REUSEADDR / SO_REUSEPORT are
@@ -504,7 +598,9 @@ pub fn rebind(old_key: u32, new_port: u16, addr: [4]u8, addr6: [16]u8, dev6: u8,
     for (0..num_ports) |j| {
         if (port_ping[j]) continue;
         if (portNumber(ports[j]) != new_port) continue;
+        // An unnamed socket holds no port, but its reserved key must stay unique: its discriminator is taken all the same.
         used |= @as(u64, 1) << @intCast(ports[j] >> 16);
+        if (!port_named[j]) continue;
         if (!port_v6[j] and !port_v6[oi] and !@import("tcp_port_policy.zig").addrsConflict(addr, port_local_ip[j])) continue;
         if (port_v6[j] and port_v6[oi] and !@import("bind_addr_policy.zig").boundDevsConflict(dev6, port_dev6[j])) continue;
         if (port_v6[j] and port_v6[oi] and !@import("tcp_port_policy.zig").addrsConflict6(addr6, port_local_ip6[j])) continue;
@@ -574,6 +670,8 @@ fn releaseLocked(port: u32) void {
             port_mc4[num_ports] = .{};
             port_dev6[i] = port_dev6[num_ports];
             port_dev6[num_ports] = 0;
+            port_named[i] = port_named[num_ports];
+            port_user_port[i] = port_user_port[num_ports];
             port_err[num_ports] = 0;
             port_peer[num_ports] = 0;
             queues[i] = queues[num_ports];
@@ -644,7 +742,7 @@ fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, dst_ip: [4]u
         const rounds = [_][2]bool{ .{ true, true }, .{ true, false }, .{ false, true }, .{ false, false } };
         for (rounds) |r| {
             for (0..num_ports) |i| {
-                if (port_ping[i]) continue;
+                if (port_ping[i] or !port_named[i]) continue;
                 if (portNumber(ports[i]) != port or (r[1] and port_v6[i] != is_v6)) continue;
                 const takes = if (is_v6 and port_v6[i])
                     @import("tcp_port_policy.zig").listenerTakes6(port_local_ip6[i], dst_ip6, r[0])
@@ -704,7 +802,7 @@ fn enqueueMcast(port: u16, src_ip: [16]u8, src_port: u16, group: [16]u8, payload
         if (!mcast.alwaysJoined(group) and !hostJoinedLocked(group, ifindex)) return;
         const actual = @min(payload.len, MAX_UDP_PAYLOAD);
         for (0..num_ports) |i| {
-            if (port_ping[i]) continue;
+            if (port_ping[i] or !port_named[i]) continue;
             if (portNumber(ports[i]) != port or !port_v6[i]) continue;
             if (!mcast.socketMatches(port_local_ip6[i], group, port_peer[i], port_peer_ip[i], src_ip, src_port, port_dev6[i], ifindex)) continue;
             if (!mcast.socketAccepts(&port_mc[i], port_opts[i].ip.mc_all, group)) continue;
@@ -742,7 +840,7 @@ fn enqueueMcast4(port: u16, src_ip: [16]u8, src_port: u16, group: [4]u8, payload
         if (!mcast.alwaysJoined4(group) and !hostJoined4Locked(group, ifindex)) return;
         const actual = @min(payload.len, MAX_UDP_PAYLOAD);
         for (0..num_ports) |i| {
-            if (port_ping[i]) continue;
+            if (port_ping[i] or !port_named[i]) continue;
             if (portNumber(ports[i]) != port or port_v6[i]) continue;
             if (!mcast.socketMatches4(port_local_ip[i], group, port_peer[i], port_peer_ip[i], src_ip[0..4].*, src_port)) continue;
             if (!mcast.socketAccepts4(&port_mc4[i], port_opts[i].ip.mc4_all, group, ifindex)) continue;

@@ -9723,7 +9723,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异验证：`dgramConnectAction` 不再把 family 0 当作断开，第一条 host 测试失败；`udp.disconnect` 去掉 `port_dev6[i] = 0;`，第二条 host 测试失败。两处都已恢复。改 `boundScope6` 之前先改 hello364 的 host 测试，测试失败，改完后通过。
 - 完整 smoke：改 `boundScope6` 之前的第一份 SMP=2 里只有 U4 失败（见修复 4）。最终构建：第一份 SMP=2 里 hello366 PASS，但 hello302 的可变延迟一项失败（40 轮里 39 轮在 200 ms 内，最慢 416 ms），本次没有碰信号和睡眠，属于偶发；重跑的 SMP=2 和并行的 SMP=1、SMP=4 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`。本轮没有跑 riscv64、aarch64。
 - 这次修复带来的局限：
-  1. 断开不释放端口，地址也不回到通配。MoQiOS 在 socket() 时就分配临时端口，没有区分自动绑定和用户绑定，所以从没 bind 过的套接字断开后 getsockname 仍报告原来的端口（Linux 报告 0）。用户 bind 过的套接字和 Linux 一致。
+  1. 断开不释放端口，地址也不回到通配。MoQiOS 在 socket() 时就分配临时端口，没有区分自动绑定和用户绑定，所以从没 bind 过的套接字断开后 getsockname 仍报告原来的端口（Linux 报告 0）。用户 bind 过的套接字和 Linux 一致。（后来在 hello385 一节解决：端口改成按需命名，断开时交还自动选的端口。）
   2. IPv6 TCP 仍不记录绑定的接口，connect 也不看 scope。
   3. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
   4. hello302（SIGSTOP 打断 nanosleep）的可变延迟一项在 SMP=2 上偶发失败一次，最慢 416 ms，根因没有查。
@@ -10090,4 +10090,24 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 局限：
   1. 不完整条目和普通条目一样占 16 项缓存，不会自动删除（Linux 由垃圾回收删 NUD_FAILED 条目）；缓存满时它们和普通条目一起按最久没更新的规则让位。
   2. 没有状态机：不区分 INCOMPLETE 和 FAILED，有 MAC 的条目也不区分 REACHABLE 和 STALE，不按时间老化。
+
+## 补充：未命名的 UDP 套接字按需分配端口（hello385）
+
+- 背景：hello366 局限 1。MoQiOS 在 `socket()` 时就给 UDP 套接字一个临时端口，`connect(AF_UNSPEC)` 断开后端口不释放，getsockname 仍报告它。Linux 的 `inet_num` 在命名之前一直是 0（`inet_autobind` 只在 bind 端口 0、connect 或发送时经 `udp_lib_get_port(sk, 0)` 取端口），断开时 `__udp_disconnect` 对用户没有用 bind 指定过的端口（没有 `SOCK_BINDPORT_LOCK`）调 `unhash` 并把 `inet_sport` 清 0。红灯还暴露出第二个缺陷：旧内核上 `bind(0.0.0.0:0)` 真的把端口设成了 0（getsockname 报 0，套接字因此接不到任何数据报）。
+- 宿主机实测（`user/hello385.c`，`unshare -rn`，`ip link set lo up`）：A、R、D、C、B、W、E、V 共 8 项全部通过。要点：
+  1. 未命名的套接字 getpeername/getsockname 报端口 0；`recv` 为它保留端口也不命名；第一次 sendto 才命名。
+  2. 断开后端口回 0，旧端口上的数据报收不到（EAGAIN）；旧端口可以被别的套接字 bind，原套接字下一次发送换一个端口。
+  3. connect 命名端口，断开交还；bind 端口 0 命名端口，断开也交还；用户明确 bind 的端口（40385）保留。
+  4. 绑 127.0.0.1:0 时地址保留、端口交还；`send` 因没有对端返回 EDESTADDRREQ、`sendto` 因地址长度不对返回 EINVAL，这两种失败也先给套接字端口。
+- 修复：
+  1. `udp_port_policy` 新增 `pickAutobindPort`（先取 socket() 预留的端口，被别人占走时取第一个空闲临时端口）、`disconnectKeepsPort`。
+  2. `udp.zig` 给每个端口槽加 `port_named`（`socket()` 建的槽是未命名）和 `port_user_port`（bind 指定过端口）；新增 `isNamed`、`autobind`（命名并可能换键）、`autobindDone`、`markUserPort`。`enqueue`、`enqueueMcast`、`enqueueMcast4`、`notifyUnreachable`、`countSpaceLocked` 和 `rebind` 的冲突检查都跳过未命名的槽（它们不接收、不占用端口号，但预留的键仍不重复）。`disconnect` 调用 `disconnectKeepsPort`，自动选的端口从此未命名。
+  3. `socket_syscall.zig`：新增 `udpAutobind`（改名后按需 rekey 描述符）；`sendto`、`sendmsg` 的 UDP 路径和 `connect` 在任何检查之前先命名（`inet_send_prepare`，所以失败的 send 也会留下端口）；`udpRebind` 在端口 0 时先命名再 rebind；getsockname 对未命名的 UDP 套接字报端口 0。
+  4. `hello366` 的文档注释里那段「MoQiOS 在 socket() 时就分配端口」的说明已过时，改为指向本节。
+- host 测试 "udp autobind: an unbound UDP socket has no port until bind, connect or a send names it; disconnect gives an auto-picked port up (Linux measured, hello385)"：实现前失败（断言失败）；实现后通过。变异验证：`disconnectKeepsPort` 永远返回 true 时测试失败，文件已恢复。hello371、hello348 的源码断言按新文本更新。
+- 红灯：未修改的内核（只保留启动配置）上定向 SMP=2，A、R、D、C、B、W、V 失败：新套接字报 49152、断开不退、bind 端口 0 报 0。E 在旧内核上本来就成立（它只要求失败后仍有端口）。
+- 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello385 PASS；SMP=2 那份构建时 hello366 的注释还没改（只改注释，行为不变），SMP=4、SMP=1 带着改动。riscv64、aarch64 交叉构建通过，没有在这两个架构上跑 QEMU。
+- 局限：
+  1. 端口号在 socket() 时就预留，所以未命名的套接字仍占着 `MAX_PORTS`（64）里的一个槽；Linux 的 sk 不占端口哈希表的位置。
+  2. 未命名套接字预留的编号只是「首选」：被别人 bind 走之后第一次命名会换一个端口，和 Linux 相同，但 MoQiOS 换端口时要改描述符的键，Linux 只在哈希表里移动。
 

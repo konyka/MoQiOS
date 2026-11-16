@@ -4901,9 +4901,11 @@ test "ping sockets: SOCK_DGRAM/IPPROTO_ICMP sends echo requests under the socket
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8) void {") != null);
     // notifyUnreachable, enqueue and both group paths skip ping slots; rebind only conflicts with UDP slots; the port count is per space.
-    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, us, "if (port_ping[i]) continue;"));
+    // A socket with no local port yet is skipped the same way (hello385).
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, us, "if (port_ping[i] or !port_named[i]) continue;"));
     try std.testing.expect(std.mem.indexOf(u8, us, "        if (port_ping[j]) continue;\n        if (portNumber(ports[j]) != new_port) continue;\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "        if (port_ping[i] != ping) continue;\n        if (portNumber(ports[i]) == port) n += 1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "        used |= @as(u64, 1) << @intCast(ports[j] >> 16);\n        if (!port_named[j]) continue;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "        if (port_ping[i] != ping) continue;\n        if (!port_named[i]) continue;\n        if (portNumber(ports[i]) == port) n += 1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "const key = PING_KEY | ident;") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "        port_opts[i].flags |= @import(\"udp_port_policy.zig\").REUSEADDR_FLAG;\n        return key;") != null);
     // getsockopt(SO_PROTOCOL) on a ping socket is IPPROTO_ICMP.
@@ -5405,7 +5407,7 @@ test "an IPv6 UDP socket keeps the address it was bound to: getsockname reports 
 
 test "UDP sockets on one port are told apart by their bound IPv4 address: bind conflicts and receive dispatch (hello348)" {
     const us = kt.udp_source;
-    try std.testing.expect(std.mem.indexOf(u8, us, "        used |= @as(u64, 1) << @intCast(ports[j] >> 16);\n        if (!port_v6[j] and !port_v6[oi] and !@import(\"tcp_port_policy.zig\").addrsConflict(addr, port_local_ip[j])) continue;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "        if (!port_named[j]) continue;\n        if (!port_v6[j] and !port_v6[oi] and !@import(\"tcp_port_policy.zig\").addrsConflict(addr, port_local_ip[j])) continue;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    port_opts[ni] = mine;\n    port_local_ip[ni] = addr;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "            port_local_ip[i] = port_local_ip[num_ports];\n            port_local_ip[num_ports] = .{ 0, 0, 0, 0 };\n            port_local_ip6[i] = port_local_ip6[num_ports];\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "                else\n                    @import(\"tcp_port_policy.zig\").listenerTakes(port_local_ip[i], dst_ip, r[0]);\n                if (!takes) continue;\n") != null);
@@ -13283,7 +13285,8 @@ test "udp: bind moves the registration with its options and sharing goes through
     try std.testing.expect(std.mem.indexOf(u8, us, "policy.pickReceiverConnected(info[0..n], src_ip, src_port)") != null);
     const ss = kt.socket_syscall_source;
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "return udpRebind(t, fd,"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "const rc = udp.rebind(old_key, new_port, addr, addr6, dev6, &disc);"));
+    // hello385: bind with port 0 names the socket first, so the key it rebinds is read after it.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "const rc = udp.rebind(d.udpKey(), target, addr, addr6, dev6, &disc);"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ss, "udp.ensurePortExclusive(parsed.port)"));
 }
 
@@ -14486,4 +14489,30 @@ test "arp policy: an incomplete neighbour (no MAC yet) reads flags 0 in SIOCGARP
     try std.testing.expect(std.mem.indexOf(u8, as, "            const m = mac orelse if (cache[i].has_mac) cache[i].mac else return -22; // EINVAL") != null);
     try std.testing.expect(std.mem.indexOf(u8, as, "n += policy.formatProcLine(out[n..], e.ip, e.mac, policy.entryFlags(e.has_mac, e.perm), \"eth0\");") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.ioctl_source, "ap.answerGet(&req, e.mac, ap.entryFlags(e.has_mac, e.perm));") != null);
+}
+
+test "udp autobind: an unbound UDP socket has no port until bind, connect or a send names it; disconnect gives an auto-picked port up (Linux measured, hello385)" {
+    const up = kt.udp_port_policy;
+    // The reserved port is taken unless a named socket holds it now; then the first ephemeral port nobody named holds.
+    try std.testing.expectEqual(@as(?u16, 50000), up.pickAutobindPort(50000, &.{ 40000, 50001 }));
+    try std.testing.expectEqual(@as(?u16, 49153), up.pickAutobindPort(50000, &.{ 50000, 49152 }));
+    try std.testing.expectEqual(@as(?u16, 49152), up.pickAutobindPort(0, &.{}));
+    try std.testing.expect(up.disconnectKeepsPort(true));
+    try std.testing.expect(!up.disconnectKeepsPort(false));
+
+    // udp.zig: a slot from socket() is unnamed; unnamed slots take no datagrams and hold no port against bind; naming and the
+    // disconnect go through the policy.
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "var port_named: [MAX_PORTS]bool = @splat(true);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "var port_user_port: [MAX_PORTS]bool = @splat(false);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    const idx = newSlotLocked(port, is_v6, uid);\n    port_named[idx] = false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "pub fn autobind(key: u32, out_port: *u16, out_disc: *u16) i64 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (!policy.disconnectKeepsPort(port_user_port[i])) port_named[i] = false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "pub fn isNamed(key: u32) bool {") != null);
+    try std.testing.expect(std.mem.count(u8, us, "if (port_ping[i] or !port_named[i]) continue;") >= 4);
+    // socket_syscall.zig: every UDP send names the socket first (inet_send_prepare), connect names it, getsockname reports 0 for
+    // an unnamed socket.
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.count(u8, ss, "const ab = udpAutobind(&t.fd_table.fds[fd]);") >= 2);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (desc.udp_ping and !desc.udp_ping_bound) 0 else if (!desc.udp_ping and !udp.isNamed(desc.udpKey())) 0 else desc.udp_port;") != null);
 }
