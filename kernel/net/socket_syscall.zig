@@ -128,7 +128,8 @@ fn pingSend(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr
     var msg: [pp.MAX_MESSAGE]u8 = undefined;
     @memcpy(msg[0..payload.len], payload);
     pp.finishRequest(msg[0..payload.len], d.udp_port);
-    // The first send gives the socket its ident for good (ping_v4_sendmsg autobinds through inet_autobind).
+    // The first send gives the socket its ident for good (ping_v4_sendmsg autobinds through inet_autobind) and hashes it.
+    if (!d.udp_ping_bound) udp.pingRehash(d.udpKey());
     d.udp_ping_bound = true;
     const sent = @import("icmp.zig").sendFrom(d.udp_local_ip, dst, msg[0..payload.len]);
     return if (sent < 0) sent else @intCast(payload.len);
@@ -912,6 +913,11 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         @memcpy(peer16[0..4], &dst_ip);
         // A ping socket has no remote port; its receive filter is the peer address alone (setPeer's port marks it connected).
         udp.setPeer(t.fd_table.fds[fd].udpKey(), if (t.fd_table.fds[fd].udp_ping) 1 else dst_port, peer16);
+        // connect() of a ping socket hashes it (ip4_datagram_connect autobinds), so getsockname names its ident.
+        if (t.fd_table.fds[fd].udp_ping and !t.fd_table.fds[fd].udp_ping_bound) {
+            udp.pingRehash(t.fd_table.fds[fd].udpKey());
+            t.fd_table.fds[fd].udp_ping_bound = true;
+        }
         return 0;
     }
 

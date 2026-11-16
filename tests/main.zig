@@ -4911,6 +4911,40 @@ test "ping sockets: SOCK_DGRAM/IPPROTO_ICMP sends echo requests under the socket
     try std.testing.expectEqual(@as(u32, 2), kt.sockopt_policy.identity(.ping, false).sock_type);
 }
 
+test "ping sockets sharing an ident: the reply goes to the one hashed last that takes it (hello372)" {
+    const pp = kt.ping_policy;
+    const any = [4]u8{ 0, 0, 0, 0 };
+    const lo1 = [4]u8{ 127, 0, 0, 1 };
+    const lo2 = [4]u8{ 127, 0, 0, 2 };
+    const own = [4]u8{ 10, 0, 2, 15 };
+    // ping_lookup walks the hash chain from its head, and sk_add_node_rcu puts a newly hashed socket at the head: the last one wins.
+    const two = [_]pp.Holder{ .{ .seq = 1, .bound = any }, .{ .seq = 2, .bound = any } };
+    try std.testing.expectEqual(@as(?usize, 1), pp.pickReceiver(&two, lo1, lo1));
+    // A later socket bound to another address does not take it, so the earlier one does.
+    const spec = [_]pp.Holder{ .{ .seq = 1, .bound = any }, .{ .seq = 2, .bound = own } };
+    try std.testing.expectEqual(@as(?usize, 0), pp.pickReceiver(&spec, lo1, lo1));
+    // Bound to the reply's destination: taken whatever the order.
+    const later_spec = [_]pp.Holder{ .{ .seq = 5, .bound = any }, .{ .seq = 9, .bound = lo1 } };
+    try std.testing.expectEqual(@as(?usize, 1), pp.pickReceiver(&later_spec, lo1, lo1));
+    const earlier_spec = [_]pp.Holder{ .{ .seq = 9, .bound = any }, .{ .seq = 5, .bound = lo1 } };
+    try std.testing.expectEqual(@as(?usize, 0), pp.pickReceiver(&earlier_spec, lo1, lo1));
+    // ping_lookup does not look at the peer: a connected socket hashed last takes a reply from anybody.
+    const conn = [_]pp.Holder{ .{ .seq = 1, .bound = any }, .{ .seq = 2, .bound = any, .peer = lo1 } };
+    try std.testing.expectEqual(@as(?usize, 1), pp.pickReceiver(&conn, lo2, lo1));
+    try std.testing.expectEqual(@as(?usize, null), pp.pickReceiver(&[_]pp.Holder{.{ .seq = 1, .bound = own }}, lo1, lo1));
+    try std.testing.expectEqual(@as(?usize, null), pp.pickReceiver(&[_]pp.Holder{}, lo1, lo1));
+
+    const us = kt.udp_source;
+    // deliverPing gathers every holder of the ident and lets the policy pick; pingBind and the first send rehash (a new sequence).
+    try std.testing.expect(std.mem.indexOf(u8, us, "const pick = pp.pickReceiver(holders[0..n], src_ip, dst_ip) orelse break :blk;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "pub fn pingRehash(key: u32) void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    port_seq[oi] = next_seq;\n    next_seq +%= 1;\n    port_local_ip[oi] = addr;") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "    if (!d.udp_ping_bound) udp.pingRehash(d.udpKey());\n    d.udp_ping_bound = true;") != null);
+    // connect() of a ping socket hashes it too (ip4_datagram_connect autobinds), so getsockname names its ident.
+    try std.testing.expect(std.mem.indexOf(u8, ss, "        if (t.fd_table.fds[fd].udp_ping and !t.fd_table.fds[fd].udp_ping_bound) {\n            udp.pingRehash(t.fd_table.fds[fd].udpKey());\n            t.fd_table.fds[fd].udp_ping_bound = true;\n        }") != null);
+}
+
 test "IPv4 traffic to our own address goes over lo like 127/8 (hello370)" {
     const r = kt.route4_policy;
     const our = [4]u8{ 10, 0, 2, 15 };

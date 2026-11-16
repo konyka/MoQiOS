@@ -326,6 +326,9 @@ pub fn pingBind(old_key: u32, ident: u16, addr: [4]u8) i64 {
         used |= @as(u64, 1) << @intCast((ports[j] >> 16) & 0x3f);
         if (!@import("ping_policy.zig").mayShareIdent(port_opts[oi].flags, port_opts[j].flags)) return -98;
     }
+    // Hashing the socket (ping_get_port) puts it at the head of the chain: replies prefer it to earlier holders of the ident.
+    port_seq[oi] = next_seq;
+    next_seq +%= 1;
     port_local_ip[oi] = addr;
     if (want == portNumber(old_key)) return @intCast(old_key);
     const disc: u32 = @ctz(~used);
@@ -334,20 +337,36 @@ pub fn pingBind(old_key: u32, ident: u16, addr: [4]u8) i64 {
     return @intCast(key);
 }
 
-/// An echo reply `msg` (ICMP header and data) from `src_ip` to `dst_ip` for ident `ident`: queued on the first ping socket holding
-/// that ident whose bound address takes it (ping_lookup, ping_queue_rcv_skb). Nobody holding it drops it.
+/// The ping socket `key` gets its ident for good (its first send or connect, Linux inet_autobind → ping_get_port): it is hashed now,
+/// so replies to its ident prefer it to sockets hashed earlier.
+pub fn pingRehash(key: u32) void {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(key) orelse return;
+    port_seq[i] = next_seq;
+    next_seq +%= 1;
+}
+
+/// An echo reply `msg` (ICMP header and data) from `src_ip` to `dst_ip` for ident `ident`: queued on the ping socket
+/// ping_policy.pickReceiver picks among those holding the ident (ping_lookup, ping_queue_rcv_skb). Nobody holding it drops it.
 pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8) void {
     var notify_key: u32 = 0;
-    {
+    blk: {
         const saved = udp_lock.acquire();
         defer udp_lock.release(saved);
         const pp = @import("ping_policy.zig");
-        for (0..num_ports) |i| {
-            if (!port_ping[i] or portNumber(ports[i]) != ident) continue;
-            if (!pp.takesReply(port_local_ip[i], dst_ip)) continue;
-            // A connected ping socket takes replies from its peer alone (ip4_datagram_connect sets inet_daddr; ping_lookup is by ident,
-            // and the socket's receive filter drops the rest the way UDP's does).
-            if (port_peer[i] != 0 and @as(u32, @bitCast(port_peer_ip[i][0..4].*)) != @as(u32, @bitCast(src_ip))) continue;
+        var holders: [MAX_PORTS]pp.Holder = undefined;
+        var slots: [MAX_PORTS]usize = undefined;
+        var n: usize = 0;
+        for (0..num_ports) |k| {
+            if (!port_ping[k] or portNumber(ports[k]) != ident) continue;
+            holders[n] = .{ .seq = port_seq[k], .bound = port_local_ip[k], .peer = port_peer_ip[k][0..4].* };
+            slots[n] = k;
+            n += 1;
+        }
+        const pick = pp.pickReceiver(holders[0..n], src_ip, dst_ip) orelse break :blk;
+        {
+            const i = slots[pick];
             const actual = @min(msg.len, MAX_UDP_PAYLOAD);
             for (0..QUEUE_DEPTH) |j| {
                 const e = &queues[i][j];
@@ -363,7 +382,6 @@ pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8) vo
                 notify_key = ports[i];
                 break;
             }
-            break;
         }
     }
     if (notify_key == 0) return;

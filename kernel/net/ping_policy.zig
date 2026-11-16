@@ -65,6 +65,22 @@ pub fn takesReply(bound: [4]u8, dst: [4]u8) bool {
     return @as(u32, @bitCast(bound)) == 0 or @as(u32, @bitCast(bound)) == @as(u32, @bitCast(dst));
 }
 
+/// A ping socket holding the ident of a reply: when it was hashed (later = larger), the address it is bound to and the peer it is
+/// connected to (0.0.0.0 for none; ping_lookup does not look at it).
+pub const Holder = struct { seq: u32, bound: [4]u8, peer: [4]u8 = .{ 0, 0, 0, 0 } };
+
+/// Which holder an echo reply from `src` to `dst` goes to (ping_lookup): the hash chain is walked from its head and a socket is put
+/// at the head when it is hashed, so the most recently hashed holder whose bound address takes the reply wins.
+pub fn pickReceiver(holders: []const Holder, src: [4]u8, dst: [4]u8) ?usize {
+    _ = src;
+    var best: ?usize = null;
+    for (holders, 0..) |h, i| {
+        if (!takesReply(h.bound, dst)) continue;
+        if (best == null or h.seq > holders[best.?].seq) best = i;
+    }
+    return best;
+}
+
 fn checksum(buf: []const u8) u16 {
     var acc: u32 = 0;
     var i: usize = 0;

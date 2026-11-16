@@ -488,6 +488,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello369"); /* a connect whose next hop never answers fails with EHOSTUNREACH */
     run_test("hello370"); /* datagrams and segments to our own IPv4 address go over lo */
     run_test("hello371"); /* IPv4 ping sockets */
+    run_test("hello372"); /* ping sockets that share an ident */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

@@ -9830,3 +9830,23 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   4. 两个 ping 套接字共用 ident 时应答交给注册表里的第一个，Linux 交给后绑定的那个。
   5. 不处理发往 ping 套接字的 ICMP 错误（目的不可达等），`IP_RECVERR` 也没有。
   6. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
+
+## 补充：共用 ident 的 ping 套接字由最后散列的那个接收应答（hello372）
+
+- 背景：hello371 的局限 4。两个 ping 套接字共用 ident 时，`deliverPing` 把应答交给注册表里排在前面的那个，Linux 交给后绑定的那个。另外查到：ping 套接字 connect 之后 getsockname 仍报告端口 0（Linux connect 时自动绑定，报告 ident）；`deliverPing` 对已连接套接字按对端过滤，Linux 的 `ping_lookup` 不看对端。
+- Linux 依据：`ping_get_port` 用 `sk_add_node_rcu` 把新散列的套接字插到链头，`ping_lookup` 从链头开始找第一个 ident 相同、绑定地址接受该应答的套接字，不看 inet_daddr；`ip4_datagram_connect` 对没有 ident 的套接字先 `inet_autobind`。
+- 宿主机实测（Linux，`unshare -rn` 里把 `ping_group_range` 设为 `0 0`，方法写在 `user/hello372.c` 文件头）：L、S、A、C 共 4 项全部通过。
+- 红灯（未修改的内核，SMP=2，hello372 临时放在 init 序列最前面）：4 项全部失败。L、A 里应答都给了先注册的套接字；S 的两种顺序都给了前者；C 里 connect 后名字没有 ident，来自 127.0.0.2 的应答被已连接的套接字过滤掉、给了另一个。
+- 修复：
+  1. `kernel/net/ping_policy.zig`：新增 `Holder` 和 `pickReceiver`（在绑定地址接受应答的持有者里选序号最大的，不看对端）。
+  2. `kernel/net/udp.zig`：`pingBind` 更新 `port_seq`；新增 `pingRehash`；`deliverPing` 收集该 ident 的所有持有者交给 `pickReceiver`。
+  3. `kernel/net/socket_syscall.zig`：第一次发送和 connect 时调用 `pingRehash` 并把套接字标为已有 ident，getsockname 随之报告 ident。
+- 测试：hello372（QEMU，4 项）；新增 host 测试「ping sockets sharing an ident: the reply goes to the one hashed last that takes it (hello372)」。
+- 变异验证：`pickReceiver` 改为选序号最小的，hello372 这条 host 测试失败，文件已恢复。
+- 完整 smoke：SMP=2、SMP=1、SMP=4 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello372 PASS。本轮没有跑 riscv64、aarch64。
+- 这次修复带来的局限：
+  1. 没有 `ping_group_range`，所有任务都能建 ping 套接字（Linux 默认谁都不能）。
+  2. 只有 IPv4；IPv6 的 ping 套接字仍是 EPROTONOSUPPORT。
+  3. 下一跳没解析时发送返回 EAGAIN，Linux 把报文挂在邻居条目上并返回成功。
+  4. 不处理发往 ping 套接字的 ICMP 错误，也没有 `IP_RECVERR`。
+  5. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
