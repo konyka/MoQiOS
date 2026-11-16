@@ -71,8 +71,39 @@ pub fn parseFragNeeded(data: [*]const u8, len: u32) ?FragNeededMsg {
     };
 }
 
+/// Send the ICMP message `msg` (header and data, checksum already set) from a ping socket bound to `bound` (0.0.0.0 when unbound) to
+/// `dst`: routed like a UDP datagram (lo for this host's addresses, else the next hop's MAC, asking ARP for it when it is missing).
+/// Returns 0, or a negative errno: -EMSGSIZE past the path MTU, -EAGAIN while the next hop is unresolved (Linux queues the
+/// datagram on the neighbour; this stack has no such queue, the caller retries).
+pub fn sendFrom(bound: [4]u8, dst: [4]u8, msg: []const u8) i64 {
+    if (msg.len + ipv4.HEADER_LEN > ipv4.getSendMtu(dst)) return -90;
+    const our_mac = netif.getMac();
+    const via_lo = netif.isLocal4(dst);
+    const dst_mac = if (via_lo) our_mac else resolve: {
+        const hop = netif.nextHop4(dst);
+        break :resolve arp.resolve(hop) orelse {
+            arp.sendArpRequest(hop);
+            return -11;
+        };
+    };
+    const src = @import("tcp_port_policy.zig").sourceAddr(bound, dst, netif.getOurIp());
+    var pkt: [1518]u8 = @splat(0);
+    @memcpy(pkt[34..][0..msg.len], msg);
+    ipv4.buildHeader(pkt[14..].ptr, src, dst, ipv4.PROTO_ICMP, @intCast(msg.len));
+    const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, @intCast(20 + msg.len));
+    const ok = if (via_lo) lo.sendPacket(&pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt, frame_len);
+    return if (ok) 0 else -105;
+}
+
 pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) void {
     if (len < 8) return;
+    // An echo reply is for the ping socket whose ident is its id (Linux icmp_rcv → ping_rcv); a bad checksum drops it.
+    const pp = @import("ping_policy.zig");
+    if (pp.replyIdent(data[0..len])) |ident| {
+        if (len > 0xffff or ipv4.checksum(data, @intCast(len)) != 0) return;
+        @import("udp.zig").deliverPing(ident, src_ip, dst_ip, data[0..len]);
+        return;
+    }
 
     const icmp_type = data[0];
     const icmp_code = data[1];

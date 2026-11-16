@@ -252,7 +252,8 @@ pub fn socketArgs(domain: u32, type_and_flags: u32, protocol: u32) union(enum) {
     } else if (t == 1) {
         if (protocol != 0 and protocol != 6) return .{ .err = -93 };
     } else if (t == 2) {
-        if (protocol != 0 and protocol != 17) return .{ .err = -93 };
+        // IPPROTO_ICMP on an AF_INET datagram socket is a ping socket (Linux inetsw_array: SOCK_DGRAM, IPPROTO_ICMP, ping_prot).
+        if (protocol != 0 and protocol != 17 and !(domain == 2 and protocol == 1)) return .{ .err = -93 };
     }
     return .{ .ok = .{ .sock_type = t, .cloexec = (type_and_flags & SOCK_CLOEXEC_FLAG) != 0, .nonblock = (type_and_flags & SOCK_NONBLOCK_FLAG) != 0 } };
 }

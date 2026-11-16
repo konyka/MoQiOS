@@ -673,7 +673,8 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
         },
         .udp => |port| {
             stored = @import("udp.zig").getPortOpts(port) orelse return -9;
-            facts = .{ .id = sp.identity(.udp, v6), .so_error = @import("udp.zig").peekPendingError(port) };
+            // A ping socket's key carries udp.PING_KEY: it reports IPPROTO_ICMP (Linux sk_protocol of a ping socket).
+            facts = .{ .id = if ((port & @import("udp.zig").PING_KEY) != 0) sp.identity(.ping, false) else sp.identity(.udp, v6), .so_error = @import("udp.zig").peekPendingError(port) };
             udp_clear = port;
         },
         .unix => |idx| {

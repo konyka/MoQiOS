@@ -60,7 +60,7 @@ pub fn socket(domain: u32, type_and_flags: u32, protocol: u32) i64 {
         .ok => |a| a,
         .err => |e| return e,
     };
-    const fd = socketCreate(domain, parsed.sock_type);
+    const fd = if (domain == 2 and parsed.sock_type == 2 and protocol == 1) pingCreate() else socketCreate(domain, parsed.sock_type);
     if (fd < 0) return fd;
     // SOCK_CLOEXEC / SOCK_NONBLOCK belong to the new descriptor, not to the socket type.
     const cur_idx = sched_mod.currentTaskIndex() orelse return fd;
@@ -87,6 +87,51 @@ fn udpRebind(t: *task_mod.Task, fd: u32, new_port: u16, addr: [4]u8, addr6: [16]
     d.udp_disc = disc;
     if (d.udpKey() != old_key) vfs_mod.udpFasyncRekey(old_key, d.udpKey());
     return 0;
+}
+
+/// socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP): a ping socket on the first free ICMP ident. Linux lets only the groups in
+/// net.ipv4.ping_group_range create one (none by default); this kernel has no such sysctl and lets every task.
+fn pingCreate() i64 {
+    const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
+    const t = task_mod.getTask(cur_idx) orelse return -1;
+    const key = udp.pingOpen(t.fsuid) orelse return -105; // ENOBUFS
+    const fd_slot = t.fd_table.allocFd() orelse {
+        udp.releasePort(key);
+        return -24; // EMFILE
+    };
+    t.fd_table.fds[fd_slot] = .{
+        .fd_type = .udp_socket,
+        .udp_port = @truncate(key),
+        .udp_ping = true,
+        .writable = true,
+    };
+    t.fd_table.publishFd(fd_slot);
+    return @intCast(fd_slot);
+}
+
+/// sendto/sendmsg on a ping socket: `payload` is an ICMP echo request; the ident and the checksum are filled in
+/// (ping_v4_sendmsg). The destination is `addr_ptr` (a sockaddr_in of at least 16 bytes) or the connected peer.
+fn pingSend(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr_len: u32) i64 {
+    const pp = @import("ping_policy.zig");
+    const rc = pp.sendErrno(payload.len, if (payload.len > 0) payload[0] else 0, if (payload.len > 1) payload[1] else 0);
+    if (rc != 0) return rc;
+    var dst: [4]u8 = .{ 0, 0, 0, 0 };
+    if (addr_ptr != 0) {
+        if (addr_len < SOCKADDR_IN_MIN_LEN + 8) return -22;
+        var sa_buf: [16]u8 = undefined;
+        if (copy.copyFromUser(&sa_buf, @ptrFromInt(addr_ptr), 16) != 16) return -14;
+        if (!@import("socket_address_policy.zig").inet4FamilyValid(bo.readU16Le(sa_buf[0..2]))) return -97;
+        dst = .{ sa_buf[4], sa_buf[5], sa_buf[6], sa_buf[7] };
+    } else if (d.udp_connected) {
+        dst = d.udp_dst_ip;
+    } else return -89; // EDESTADDRREQ
+    var msg: [pp.MAX_MESSAGE]u8 = undefined;
+    @memcpy(msg[0..payload.len], payload);
+    pp.finishRequest(msg[0..payload.len], d.udp_port);
+    // The first send gives the socket its ident for good (ping_v4_sendmsg autobinds through inet_autobind).
+    d.udp_ping_bound = true;
+    const sent = @import("icmp.zig").sendFrom(d.udp_local_ip, dst, msg[0..payload.len]);
+    return if (sent < 0) sent else @intCast(payload.len);
 }
 
 fn socketCreate(domain: u32, sock_type: u32) i64 {
@@ -257,6 +302,31 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         const path_len = @import("socket_address_policy.zig").unixNameLen(sock_addr_buf[2..copied]);
         const result = net_mod.unix_socket.unixBind(unix_idx, @ptrCast(sock_addr_buf[2 .. 2 + path_len].ptr), path_len);
         return @as(i64, result);
+    }
+
+    // Ping socket bind: the port is the ICMP ident (ping_bind → ping_get_port).
+    if (t.fd_table.fds[fd].fd_type == .udp_socket and t.fd_table.fds[fd].udp_ping) {
+        if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -14;
+        if (addr_len < SOCKADDR_IN_MIN_LEN + 8) return -22;
+        var pa: [16]u8 = undefined;
+        if (copy.copyFromUser(&pa, @ptrFromInt(addr_ptr), 16) != 16) return -14;
+        if (!@import("socket_address_policy.zig").inet4FamilyValid(bo.readU16Le(pa[0..2]))) return -97;
+        const addr4 = [4]u8{ pa[4], pa[5], pa[6], pa[7] };
+        const pp = @import("ping_policy.zig");
+        if (!pp.bindAddrAllowed(addr4, !bindAddrNotAvail4(addr4))) return bind_addr_policy.EADDRNOTAVAIL;
+        const d = &t.fd_table.fds[fd];
+        const bind_rc = pp.bindErrno(d.udp_ping_bound);
+        if (bind_rc != 0) return bind_rc;
+        const old_key = d.udpKey();
+        const nk = udp.pingBind(old_key, bo.readU16BeAt(&pa, 2), addr4);
+        if (nk < 0) return nk;
+        const key: u32 = @intCast(nk);
+        d.udp_port = @truncate(key);
+        d.udp_disc = @truncate((key >> 16) & 0x7fff);
+        d.udp_local_ip = addr4;
+        d.udp_ping_bound = true;
+        if (d.udpKey() != old_key) vfs_mod.udpFasyncRekey(old_key, d.udpKey());
+        return 0;
     }
 
     // UDP bind
@@ -439,6 +509,12 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         const tcb_idx = t.fd_table.fds[fd].tcb_idx;
         return @import("../fs/namespace_policy.zig").sendResult(net_mod.tcp.tcpSendBlocking(tcb_idx, buf, true, len, net_mod.tcp_recv_policy.nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), flags)), flags);
+    } else if (t.fd_table.fds[fd].fd_type == .udp_socket and t.fd_table.fds[fd].udp_ping) {
+        if (buf >= 0x0000_8000_0000_0000) return -14;
+        var pbuf: [@import("ping_policy.zig").MAX_MESSAGE]u8 = undefined;
+        if (len > pbuf.len) return -90; // EMSGSIZE
+        if (len != 0 and copy.copyFromUser(pbuf[0..len], @ptrFromInt(buf), len) != len) return -14;
+        return pingSend(&t.fd_table.fds[fd], pbuf[0..len], addr_ptr, addr_len);
     } else if (t.fd_table.fds[fd].fd_type == .udp_socket) {
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         const is_v6 = t.fd_table.fds[fd].udp_is_v6;
@@ -717,7 +793,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         const to_read2 = @min(len, 1472);
         if (!copy.validateUserBufferWritable(buf, to_read2)) return -14; // EFAULT
         if (addr_ptr != 0) {
-            const addr_copy_len = @min(user_addr_len, SOCKADDR_IN_MIN_LEN);
+            const addr_copy_len = @min(user_addr_len, sa.SOCKADDR_IN_LEN);
             if (addr_copy_len != 0 and !copy.validateUserBufferWritable(addr_ptr, addr_copy_len)) return -14;
         }
         var src_ip: [4]u8 = .{ 0, 0, 0, 0 };
@@ -728,11 +804,13 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
             const to_write = @min(@as(u32, @intCast(result2)), to_read2);
             if (copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf2))[0..to_write], to_write) != to_write) return -14;
             if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
-                var sa_out: [sa.SOCKADDR_IN_LEN]u8 = undefined;
+                // A whole sockaddr_in (16 bytes, sin_zero cleared), cut to the caller's length; the reported length is 16 (Linux
+                // udp_recvmsg / ping_recvmsg set msg_namelen to sizeof(struct sockaddr_in)).
+                var sa_out: [sa.SOCKADDR_IN_LEN]u8 = @splat(0);
                 _ = sa.writeInet4(&sa_out, src_port_out, src_ip);
-                const addr_copy_len = @min(user_addr_len, SOCKADDR_IN_MIN_LEN);
+                const addr_copy_len = @min(user_addr_len, sa.SOCKADDR_IN_LEN);
                 if (addr_copy_len != 0 and copy.copyToUser(@ptrFromInt(addr_ptr), sa_out[0..addr_copy_len], addr_copy_len) != addr_copy_len) return -14;
-                var al: [4]u8 = .{ 8, 0, 0, 0 };
+                var al: [4]u8 = .{ sa.SOCKADDR_IN_LEN, 0, 0, 0 };
                 if (copy.copyToUser(@ptrFromInt(addr_len_ptr), &al, 4) != 4) return -14;
             }
             return if (msg_trunc) @as(i64, full_len) else @intCast(to_write);
@@ -832,7 +910,8 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         t.fd_table.fds[fd].udp_dst_port = dst_port;
         var peer16: [16]u8 = @splat(0);
         @memcpy(peer16[0..4], &dst_ip);
-        udp.setPeer(t.fd_table.fds[fd].udpKey(), dst_port, peer16);
+        // A ping socket has no remote port; its receive filter is the peer address alone (setPeer's port marks it connected).
+        udp.setPeer(t.fd_table.fds[fd].udpKey(), if (t.fd_table.fds[fd].udp_ping) 1 else dst_port, peer16);
         return 0;
     }
 
@@ -909,7 +988,9 @@ pub fn getsockname(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
         const pref6 = ndp.selectSourceAddress(desc.udp_dst_ip6, netif.getMac());
         const our6 = net_mod.tcp_port_policy.nameAddr6(desc.udp_local_ip6, desc.udp_connected, desc.udp_dst_ip6, pref6);
         // A socket tied to an interface by a scoped bind names that interface.
-        const alen = if (desc.udp_is_v6) sa.writeInet6(&sa_buf, desc.udp_port, our6, sa.boundScope6(our6, udp.boundDev6(desc.udpKey()))) else sa.encodeUdpName(false, desc.udp_port, our4, our6, &sa_buf);
+        // A ping socket names port 0 until bind or its first send gives it an ident (Linux inet_num is 0 before that).
+        const name_port: u16 = if (desc.udp_ping and !desc.udp_ping_bound) 0 else desc.udp_port;
+        const alen = if (desc.udp_is_v6) sa.writeInet6(&sa_buf, name_port, our6, sa.boundScope6(our6, udp.boundDev6(desc.udpKey()))) else sa.encodeUdpName(false, name_port, our4, our6, &sa_buf);
         if (alen == 0) return -1;
         return copySockaddrToUser(addr_ptr, addrlen_ptr, sa_buf[0..alen], alen);
     }
@@ -1261,6 +1342,7 @@ fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32) i64 
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
     const d = &t.fd_table.fds[fd];
+    if (d.udp_ping) return pingSend(d, payload, addr_ptr, addr_len);
     const src_key = d.udpKey();
     if (d.udp_is_v6) {
         var dst6: [16]u8 = @splat(0);

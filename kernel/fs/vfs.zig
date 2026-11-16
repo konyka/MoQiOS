@@ -1255,6 +1255,10 @@ pub const FileDescriptor = struct {
     udp_disc: u16 = 0,
     udp_connected: bool = false,
     udp_is_v6: bool = false,
+    /// An IPv4 ping socket (SOCK_DGRAM/IPPROTO_ICMP): udp_port is its ICMP ident and udpKey() carries udp.PING_KEY.
+    udp_ping: bool = false,
+    /// The ping socket has its ident fixed (bind, or the first send): bind() again is EINVAL (ping_bind checks inet_num).
+    udp_ping_bound: bool = false,
     udp_dst_ip: [4]u8 = .{ 0, 0, 0, 0 },
     /// The IPv4 address bind() gave the socket (Linux inet_rcv_saddr), 0.0.0.0 when unbound; IPv6 sockets leave it at the wildcard.
     udp_local_ip: [4]u8 = .{ 0, 0, 0, 0 },
@@ -1287,7 +1291,7 @@ pub const FileDescriptor = struct {
 
     /// Registry key of a UDP socket in net/udp.zig: local port in the low 16 bits, discriminator above.
     pub fn udpKey(self: *const FileDescriptor) u32 {
-        return @as(u32, self.udp_port) | (@as(u32, self.udp_disc) << 16);
+        return @as(u32, self.udp_port) | (@as(u32, self.udp_disc) << 16) | (if (self.udp_ping) @as(u32, 0x8000_0000) else 0);
     }
 };
 

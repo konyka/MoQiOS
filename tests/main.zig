@@ -4758,7 +4758,7 @@ test "IPv6 bind ties a link-scoped socket to its sin6_scope_id interface: separa
     try std.testing.expect(std.mem.indexOf(u8, ss, "parsed.addr, bind_addr_policy.boundDev6(parsed.addr, parsed.scope_id));") != null);
     const stream_at = std.mem.indexOf(u8, ss, "const stream_rc = bind_addr_policy.streamBindErrno6(parsed.addr);").?;
     try std.testing.expect(stream_at < std.mem.indexOfPos(u8, ss, stream_at, "inet6ScopeErrno(parsed.addr").?);
-    try std.testing.expect(std.mem.indexOf(u8, ss, "sa.writeInet6(&sa_buf, desc.udp_port, our6, sa.boundScope6(our6, udp.boundDev6(desc.udpKey())))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "sa.writeInet6(&sa_buf, name_port, our6, sa.boundScope6(our6, udp.boundDev6(desc.udpKey())))") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketV6On(") != null);
 }
 
@@ -4842,6 +4842,73 @@ test "UDP connect(AF_UNSPEC) clears the peer, its filter and the tied interface 
     const end = std.mem.indexOfPos(u8, us, d, "\n}\n").?;
     for ([_][]const u8{ "port_peer[i] = 0;", "port_peer_ip[i] = @splat(0);", "port_err[i] = 0;", "port_dev6[i] = 0;" }) |line|
         try std.testing.expect(std.mem.indexOf(u8, us[d..end], line) != null);
+}
+
+test "ping sockets: SOCK_DGRAM/IPPROTO_ICMP sends echo requests under the socket's ident and gets the matching replies (hello371)" {
+    const pp = kt.ping_policy;
+    // ping_common_sendmsg: a full ICMP header, and only an echo request (or an extended echo request) with code 0.
+    try std.testing.expectEqual(@as(i64, 0), pp.sendErrno(8, 8, 0));
+    try std.testing.expectEqual(@as(i64, 0), pp.sendErrno(64, 8, 0));
+    try std.testing.expectEqual(@as(i64, 0), pp.sendErrno(8, 42, 0));
+    try std.testing.expectEqual(@as(i64, -22), pp.sendErrno(7, 8, 0));
+    try std.testing.expectEqual(@as(i64, -22), pp.sendErrno(16, 0, 0));
+    try std.testing.expectEqual(@as(i64, -22), pp.sendErrno(16, 8, 1));
+    try std.testing.expectEqual(@as(i64, -90), pp.sendErrno(pp.MAX_MESSAGE + 1, 8, 0));
+    // ping_v4_sendmsg puts the socket's ident in the id field and checksums the whole message.
+    var msg = [_]u8{ 8, 0, 0x12, 0x34, 0xaa, 0xbb, 0, 7, 'p', 'a', 'y', 'l', 'o', 'a', 'd', '!' };
+    pp.finishRequest(&msg, 0x1234);
+    try std.testing.expectEqual(@as(u8, 8), msg[0]);
+    try std.testing.expectEqual(@as(u8, 0x12), msg[4]);
+    try std.testing.expectEqual(@as(u8, 0x34), msg[5]);
+    try std.testing.expectEqual(@as(u8, 7), msg[7]);
+    try std.testing.expectEqual(@as(u16, 0), kt.ipv4.checksum(&msg, msg.len));
+    // Odd length too.
+    var odd = [_]u8{ 8, 0, 0, 0, 0, 0, 0, 1, 'x' };
+    pp.finishRequest(&odd, 1);
+    try std.testing.expectEqual(@as(u16, 0), kt.ipv4.checksum(&odd, odd.len));
+    // ping_rcv takes echo replies (and extended ones) for the socket whose ident is the reply's id.
+    const reply = [_]u8{ 0, 0, 0, 0, 0x12, 0x34, 0, 7 };
+    try std.testing.expectEqual(@as(?u16, 0x1234), pp.replyIdent(&reply));
+    try std.testing.expectEqual(@as(?u16, null), pp.replyIdent(&[_]u8{ 8, 0, 0, 0, 0x12, 0x34, 0, 7 }));
+    try std.testing.expectEqual(@as(?u16, null), pp.replyIdent(&[_]u8{ 0, 1, 0, 0, 0x12, 0x34, 0, 7 }));
+    try std.testing.expectEqual(@as(?u16, 0x0102), pp.replyIdent(&[_]u8{ 43, 0, 0, 0, 1, 2, 0, 0 }));
+    try std.testing.expectEqual(@as(?u16, null), pp.replyIdent(&[_]u8{ 0, 0, 0, 0, 1, 2, 0 }));
+    // A socket bound to an address takes only replies sent to it.
+    try std.testing.expect(pp.takesReply(.{ 0, 0, 0, 0 }, .{ 127, 0, 0, 1 }));
+    try std.testing.expect(pp.takesReply(.{ 127, 0, 0, 1 }, .{ 127, 0, 0, 1 }));
+    try std.testing.expect(!pp.takesReply(.{ 127, 0, 0, 1 }, .{ 10, 0, 2, 15 }));
+    // ping_check_bind_addr and ping_bind.
+    try std.testing.expect(pp.bindAddrAllowed(.{ 0, 0, 0, 0 }, false));
+    try std.testing.expect(pp.bindAddrAllowed(.{ 127, 0, 0, 1 }, true));
+    try std.testing.expect(!pp.bindAddrAllowed(.{ 10, 0, 2, 99 }, false));
+    try std.testing.expect(!pp.bindAddrAllowed(.{ 224, 0, 0, 1 }, true));
+    try std.testing.expect(!pp.bindAddrAllowed(.{ 255, 255, 255, 255 }, true));
+    try std.testing.expectEqual(@as(i64, 0), pp.bindErrno(false));
+    try std.testing.expectEqual(@as(i64, -22), pp.bindErrno(true));
+    // SO_REUSEADDR is on for a new ping socket (INET_PROTOSW_REUSE), so two default ping sockets share an ident.
+    try std.testing.expect(pp.mayShareIdent(1, 1));
+    try std.testing.expect(!pp.mayShareIdent(0, 1));
+    try std.testing.expect(!pp.mayShareIdent(1, 0));
+
+    // socket(): AF_INET datagram sockets accept IPPROTO_ICMP; a stream socket does not.
+    const np = kt.namespace_policy;
+    try std.testing.expect(np.socketArgs(2, 2, 1) == .ok);
+    try std.testing.expectEqual(@as(i64, -93), np.socketArgs(2, 1, 1).err);
+    try std.testing.expectEqual(@as(i64, -93), np.socketArgs(10, 2, 1).err);
+
+    // Wiring: echo replies are offered to ping sockets before anything else, and UDP never sees a ping slot.
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "if (pp.replyIdent(data[0..len])) |ident| {\n        if (len > 0xffff or ipv4.checksum(data, @intCast(len)) != 0) return;\n        @import(\"udp.zig\").deliverPing(ident, src_ip, dst_ip, data[0..len]);") != null);
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8) void {") != null);
+    // notifyUnreachable, enqueue and both group paths skip ping slots; rebind only conflicts with UDP slots; the port count is per space.
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, us, "if (port_ping[i]) continue;"));
+    try std.testing.expect(std.mem.indexOf(u8, us, "        if (port_ping[j]) continue;\n        if (portNumber(ports[j]) != new_port) continue;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "        if (port_ping[i] != ping) continue;\n        if (portNumber(ports[i]) == port) n += 1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "const key = PING_KEY | ident;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "        port_opts[i].flags |= @import(\"udp_port_policy.zig\").REUSEADDR_FLAG;\n        return key;") != null);
+    // getsockopt(SO_PROTOCOL) on a ping socket is IPPROTO_ICMP.
+    try std.testing.expectEqual(@as(u32, 1), kt.sockopt_policy.identity(.ping, false).protocol);
+    try std.testing.expectEqual(@as(u32, 2), kt.sockopt_policy.identity(.ping, false).sock_type);
 }
 
 test "IPv4 traffic to our own address goes over lo like 127/8 (hello370)" {
@@ -13217,7 +13284,7 @@ test "udp: connect records the peer address and enqueue chooses the receiver wit
     try std.testing.expect(std.mem.indexOf(u8, us, "port_peer_ip[i] = peer_ip;") != null);
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "udp.setPeer(t.fd_table.fds[fd].udpKey(), parsed.port, parsed.addr);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ss, "udp.setPeer(t.fd_table.fds[fd].udpKey(), dst_port, peer16);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "udp.setPeer(t.fd_table.fds[fd].udpKey(), if (t.fd_table.fds[fd].udp_ping) 1 else dst_port, peer16);") != null);
 }
 
 test "tcp: a closing SO_REUSEPORT listener spreads its queued children over the siblings by the peer hash" {

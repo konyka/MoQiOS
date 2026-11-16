@@ -41,6 +41,9 @@ var port_seq: [MAX_PORTS]u32 = @splat(0);
 var next_seq: u32 = 1;
 /// Address family of the socket that owns each slot.
 var port_v6: [MAX_PORTS]bool = @splat(false);
+/// The slot belongs to an IPv4 ping socket (SOCK_DGRAM/IPPROTO_ICMP): its port is the ICMP ident, which shares no number space with
+/// UDP ports (Linux ping_table), so no UDP path looks at it.
+var port_ping: [MAX_PORTS]bool = @splat(false);
 /// Cross-process references per registered port (fork/clone fd-table copy) —
 /// releasePort frees the slot only when the count reaches 0.
 var port_refs: [MAX_PORTS]u16 = @splat(0);
@@ -220,6 +223,7 @@ pub fn notifyUnreachable(local_port: u16, peer_port: u16) void {
         const saved = udp_lock.acquire();
         defer udp_lock.release(saved);
         for (0..num_ports) |i| {
+            if (port_ping[i]) continue;
             if (portNumber(ports[i]) != local_port) continue;
             if (!@import("icmp_unreach_policy.zig").matchesConnected(.{ .src_port = local_port, .dst_port = peer_port }, local_port, port_peer[i] != 0, port_peer[i])) continue;
             port_err[i] = 111; // ECONNREFUSED
@@ -251,8 +255,14 @@ fn portNumber(key: u32) u16 {
 
 /// Number of sockets holding local port `port` (every discriminator).
 fn countPortLocked(port: u16) u32 {
+    return countSpaceLocked(port, false);
+}
+
+/// Number of sockets holding `port` among the ping sockets (`ping`) or the UDP sockets.
+fn countSpaceLocked(port: u16, ping: bool) u32 {
     var n: u32 = 0;
     for (0..num_ports) |i| {
+        if (port_ping[i] != ping) continue;
         if (portNumber(ports[i]) == port) n += 1;
     }
     return n;
@@ -270,6 +280,7 @@ fn newSlotLocked(key: u32, is_v6: bool, uid: u32) u16 {
     port_seq[idx] = next_seq;
     next_seq +%= 1;
     port_v6[idx] = is_v6;
+    port_ping[idx] = false;
     port_local_ip[idx] = .{ 0, 0, 0, 0 };
     port_local_ip6[idx] = @splat(0);
     port_mc[idx] = .{};
@@ -278,6 +289,86 @@ fn newSlotLocked(key: u32, is_v6: bool, uid: u32) u16 {
     for (0..QUEUE_DEPTH) |j| queues[idx][j].valid = false;
     num_ports += 1;
     return @intCast(idx);
+}
+
+/// Ping socket keys carry PING_KEY in the discriminator so they never equal a UDP socket's key; the ident is the low 16 bits.
+pub const PING_KEY: u32 = 0x8000_0000;
+
+/// Register a ping socket created by `uid` on the first free ident from 1 (Linux ping_get_port with ident 0 walks a rover; any
+/// free ident does). Returns the registry key, or null when the table is full.
+pub fn pingOpen(uid: u32) ?u32 {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    if (num_ports >= MAX_PORTS) return null;
+    var ident: u32 = 1;
+    while (ident <= 0xffff) : (ident += 1) {
+        if (countSpaceLocked(@intCast(ident), true) != 0) continue;
+        const key = PING_KEY | ident;
+        const i = newSlotLocked(key, false, uid);
+        port_ping[i] = true;
+        // INET_PROTOSW_REUSE: a ping socket starts with SO_REUSEADDR on, so default ping sockets may share an ident.
+        port_opts[i].flags |= @import("udp_port_policy.zig").REUSEADDR_FLAG;
+        return key;
+    }
+    return null;
+}
+
+/// bind() of the ping socket `old_key` to ident `ident` (0 keeps an automatic one) and address `addr`: another ping socket holding
+/// the ident conflicts unless both set SO_REUSEADDR, whatever their addresses (ping_get_port). Returns the new key, or -98.
+pub fn pingBind(old_key: u32, ident: u16, addr: [4]u8) i64 {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const oi = findPortIdxLocked(old_key) orelse return -9;
+    const want: u16 = if (ident == 0) portNumber(old_key) else ident;
+    var used: u64 = 0;
+    for (0..num_ports) |j| {
+        if (!port_ping[j] or j == oi or portNumber(ports[j]) != want) continue;
+        used |= @as(u64, 1) << @intCast((ports[j] >> 16) & 0x3f);
+        if (!@import("ping_policy.zig").mayShareIdent(port_opts[oi].flags, port_opts[j].flags)) return -98;
+    }
+    port_local_ip[oi] = addr;
+    if (want == portNumber(old_key)) return @intCast(old_key);
+    const disc: u32 = @ctz(~used);
+    const key = PING_KEY | (disc << 16) | want;
+    ports[oi] = key;
+    return @intCast(key);
+}
+
+/// An echo reply `msg` (ICMP header and data) from `src_ip` to `dst_ip` for ident `ident`: queued on the first ping socket holding
+/// that ident whose bound address takes it (ping_lookup, ping_queue_rcv_skb). Nobody holding it drops it.
+pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8) void {
+    var notify_key: u32 = 0;
+    {
+        const saved = udp_lock.acquire();
+        defer udp_lock.release(saved);
+        const pp = @import("ping_policy.zig");
+        for (0..num_ports) |i| {
+            if (!port_ping[i] or portNumber(ports[i]) != ident) continue;
+            if (!pp.takesReply(port_local_ip[i], dst_ip)) continue;
+            // A connected ping socket takes replies from its peer alone (ip4_datagram_connect sets inet_daddr; ping_lookup is by ident,
+            // and the socket's receive filter drops the rest the way UDP's does).
+            if (port_peer[i] != 0 and @as(u32, @bitCast(port_peer_ip[i][0..4].*)) != @as(u32, @bitCast(src_ip))) continue;
+            const actual = @min(msg.len, MAX_UDP_PAYLOAD);
+            for (0..QUEUE_DEPTH) |j| {
+                const e = &queues[i][j];
+                if (e.valid) continue;
+                e.src_ip = @splat(0);
+                @memcpy(e.src_ip[0..4], &src_ip);
+                e.src_port = 0;
+                e.dst_port = ident;
+                e.data_len = @intCast(actual);
+                @memcpy(e.data[0..actual], msg[0..actual]);
+                e.is_v6 = false;
+                e.valid = true;
+                notify_key = ports[i];
+                break;
+            }
+            break;
+        }
+    }
+    if (notify_key == 0) return;
+    @import("epoll.zig").epollNotify(.udp_socket, notify_key, @import("epoll.zig").EPOLLIN);
+    @import("../fs/vfs.zig").udpFasyncNotify(notify_key, @import("../fs/fcntl_policy.zig").POLL_IN);
 }
 
 pub fn ensurePort(port: u16) u16 {
@@ -326,6 +417,7 @@ pub fn rebind(old_key: u32, new_port: u16, addr: [4]u8, addr6: [16]u8, dev6: u8,
     const uid = port_uid[oi];
     var used: u64 = 0;
     for (0..num_ports) |j| {
+        if (port_ping[j]) continue;
         if (portNumber(ports[j]) != new_port) continue;
         used |= @as(u64, 1) << @intCast(ports[j] >> 16);
         if (!port_v6[j] and !port_v6[oi] and !@import("tcp_port_policy.zig").addrsConflict(addr, port_local_ip[j])) continue;
@@ -385,6 +477,8 @@ fn releaseLocked(port: u32) void {
             port_uid[i] = port_uid[num_ports];
             port_seq[i] = port_seq[num_ports];
             port_v6[i] = port_v6[num_ports];
+            port_ping[i] = port_ping[num_ports];
+            port_ping[num_ports] = false;
             port_local_ip[i] = port_local_ip[num_ports];
             port_local_ip[num_ports] = .{ 0, 0, 0, 0 };
             port_local_ip6[i] = port_local_ip6[num_ports];
@@ -465,6 +559,7 @@ fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, dst_ip: [4]u
         const rounds = [_][2]bool{ .{ true, true }, .{ true, false }, .{ false, true }, .{ false, false } };
         for (rounds) |r| {
             for (0..num_ports) |i| {
+                if (port_ping[i]) continue;
                 if (portNumber(ports[i]) != port or (r[1] and port_v6[i] != is_v6)) continue;
                 const takes = if (is_v6 and port_v6[i])
                     @import("tcp_port_policy.zig").listenerTakes6(port_local_ip6[i], dst_ip6, r[0])
@@ -524,6 +619,7 @@ fn enqueueMcast(port: u16, src_ip: [16]u8, src_port: u16, group: [16]u8, payload
         if (!mcast.alwaysJoined(group) and !hostJoinedLocked(group, ifindex)) return;
         const actual = @min(payload.len, MAX_UDP_PAYLOAD);
         for (0..num_ports) |i| {
+            if (port_ping[i]) continue;
             if (portNumber(ports[i]) != port or !port_v6[i]) continue;
             if (!mcast.socketMatches(port_local_ip6[i], group, port_peer[i], port_peer_ip[i], src_ip, src_port, port_dev6[i], ifindex)) continue;
             if (!mcast.socketAccepts(&port_mc[i], port_opts[i].ip.mc_all, group)) continue;
@@ -561,6 +657,7 @@ fn enqueueMcast4(port: u16, src_ip: [16]u8, src_port: u16, group: [4]u8, payload
         if (!mcast.alwaysJoined4(group) and !hostJoined4Locked(group, ifindex)) return;
         const actual = @min(payload.len, MAX_UDP_PAYLOAD);
         for (0..num_ports) |i| {
+            if (port_ping[i]) continue;
             if (portNumber(ports[i]) != port or port_v6[i]) continue;
             if (!mcast.socketMatches4(port_local_ip[i], group, port_peer[i], port_peer_ip[i], src_ip[0..4].*, src_port)) continue;
             if (!mcast.socketAccepts4(&port_mc4[i], port_opts[i].ip.mc4_all, group, ifindex)) continue;

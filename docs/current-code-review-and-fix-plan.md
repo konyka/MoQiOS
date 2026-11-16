@@ -9805,3 +9805,28 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 没有 ping 套接字（`SOCK_DGRAM`/`IPPROTO_ICMP`），回显应答的新路径只有 host 测试的钉住检查，QEMU 里没有端到端测试：QEMU user 网络不会把外部的 ping 转给客户机。
   2. 只有一个网卡地址；DHCP 换地址后，换之前建立的、绑在旧地址上的连接不会迁移。
   3. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
+
+## 补充：IPv4 ping 套接字（hello371）
+
+- 背景：hello370 的局限 1。MoQiOS 没有 ping 套接字，`socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)` 返回 EPROTONOSUPPORT，回显应答的发送路径在 QEMU 里没法端到端验证。另外查到一个旧缺陷：IPv4 UDP 的 recvfrom 报告的地址长度是 8，只拷贝 8 字节，Linux 报告 16（完整的 sockaddr_in，sin_zero 清零）。
+- Linux 依据：`net/ipv4/ping.c`。`ping_common_sendmsg` 要求消息至少有完整的 ICMP 头，类型是回显请求（或扩展回显请求）、code 0；`ping_v4_sendmsg` 地址不到 16 字节是 EINVAL，family 不是 AF_INET 是 EAFNOSUPPORT，未连接又没地址是 EDESTADDRREQ，id 字段写入套接字的 ident（inet_sport），校验和覆盖整个消息；`ping_rcv` 按应答的 id 找套接字（`ping_lookup` 还比较绑定地址）；`ping_get_port` 只有两边都设了 SO_REUSEADDR 才共用 ident，而 ping 套接字创建时就带 SO_REUSEADDR（`inetsw_array` 的 INET_PROTOSW_REUSE）；`ping_bind` 对已有 ident 的套接字是 EINVAL；`ping_check_bind_addr` 拒绝组播和广播地址；`ping_init_sock` 只允许 `ping_group_range` 里的组。
+- 宿主机实测（Linux，`unshare -rn` 里把 `ping_group_range` 设为 `0 0`，lo 加一对 veth，方法写在 `user/hello371.c` 文件头）：P、O、E、B、C、U 共 6 项全部通过。另外实测到：两个 ping 套接字共用 ident 时，应答交给后绑定的那个；第一次发送后再 bind 是 EINVAL。
+- 红灯（未修改的内核，SMP=2，hello371 临时放在 init 序列最前面）：6 项全部失败。socket() 返回 EPROTONOSUPPORT，之后的调用都是 EBADF；U 的地址长度是 8。
+- 修复：
+  1. 新增 `kernel/net/ping_policy.zig`：`sendErrno`、`finishRequest`、`replyIdent`、`takesReply`、`mayShareIdent`、`bindAddrAllowed`、`bindErrno`。`kernel/host_test.zig` 导出它。
+  2. `kernel/fs/namespace_policy.zig`：`socketArgs` 让 AF_INET 的 SOCK_DGRAM 接受 IPPROTO_ICMP。
+  3. `kernel/fs/vfs.zig`：描述符新增 `udp_ping`、`udp_ping_bound`；ping 套接字的 `udpKey` 带 `0x8000_0000`。
+  4. `kernel/net/udp.zig`：新增 `port_ping`、`PING_KEY`、`pingOpen`（第一个空闲 ident，带 SO_REUSEADDR）、`pingBind`、`deliverPing`；`countPortLocked` 按号码空间分开；`notifyUnreachable`、`enqueue`、两条组播投递和 `rebind` 都跳过 ping 槽。
+  5. `kernel/net/icmp.zig`：新增 `sendFrom`（本机地址走 lo，否则对下一跳做 ARP，缺条目时返回 EAGAIN，超过路径 MTU 是 EMSGSIZE）；`handlePacket` 先把回显应答交给 ping 套接字，校验和不对的丢掉。
+  6. `kernel/net/socket_syscall.zig`：新增 `pingCreate`、`pingSend`；socket() 对 IPPROTO_ICMP 建 ping 套接字；sendto、sendmsg、bind、connect、getsockname 加上 ping 分支；IPv4 UDP recvfrom 报告并拷贝 16 字节的地址。
+  7. `kernel/net/sockopt_policy.zig`、`kernel/net/socket_opt.zig`：新增 `.ping`，ping 套接字的 SO_PROTOCOL 是 1。
+- 测试：hello371（QEMU，6 项）；新增 host 测试「ping sockets: SOCK_DGRAM/IPPROTO_ICMP sends echo requests under the socket's ident and gets the matching replies (hello371)」。「bind(): an address the host does not have …」「udp: connect records the peer address …」和 hello364 的 host 测试改为钉住新的 bind、connect 和 getsockname 写法，检查的行为没变。
+- 变异验证：`finishRequest` 把 ident 的高字节写错（右移 9 位），hello371 这条 host 测试失败，文件已恢复。第一次变异写成丢弃参数，只得到编译错误，没有算数，改成行为变异后重做。
+- 完整 smoke：SMP=2、SMP=1、SMP=4 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello371 PASS。hello371 的 O 项让发往本机地址的回显请求走一遍 hello370 改过的回显应答路径（本机走 lo）。本轮没有跑 riscv64、aarch64。
+- 这次修复带来的局限：
+  1. 没有 `ping_group_range`，所有任务都能建 ping 套接字（Linux 默认谁都不能）。
+  2. 只有 IPv4；IPv6 的 ping 套接字（`IPPROTO_ICMPV6`）仍是 EPROTONOSUPPORT。
+  3. 下一跳没解析时发送返回 EAGAIN，Linux 把报文挂在邻居条目上并返回成功。
+  4. 两个 ping 套接字共用 ident 时应答交给注册表里的第一个，Linux 交给后绑定的那个。
+  5. 不处理发往 ping 套接字的 ICMP 错误（目的不可达等），`IP_RECVERR` 也没有。
+  6. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
