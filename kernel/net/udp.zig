@@ -318,9 +318,10 @@ pub fn pingGroupWrite(text: []const u8) i64 {
 /// Ping socket keys carry PING_KEY in the discriminator so they never equal a UDP socket's key; the ident is the low 16 bits.
 pub const PING_KEY: u32 = 0x8000_0000;
 
-/// Register a ping socket created by `uid` on the first free ident from 1 (Linux ping_get_port with ident 0 walks a rover; any
-/// free ident does). Returns the registry key, or null when the table is full.
-pub fn pingOpen(uid: u32) ?u32 {
+/// Register a ping socket created by `uid` (an IPv6 one when `is_v6`) on the first free ident from 1 (Linux ping_get_port with ident
+/// 0 walks a rover; any free ident does). IPv4 and IPv6 ping sockets share one ident table, as in Linux's ping_table. Returns the
+/// registry key, or null when the table is full.
+pub fn pingOpen(uid: u32, is_v6: bool) ?u32 {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     if (num_ports >= MAX_PORTS) return null;
@@ -328,7 +329,7 @@ pub fn pingOpen(uid: u32) ?u32 {
     while (ident <= 0xffff) : (ident += 1) {
         if (countSpaceLocked(@intCast(ident), true) != 0) continue;
         const key = PING_KEY | ident;
-        const i = newSlotLocked(key, false, uid);
+        const i = newSlotLocked(key, is_v6, uid);
         port_ping[i] = true;
         // INET_PROTOSW_REUSE: a ping socket starts with SO_REUSEADDR on, so default ping sockets may share an ident.
         port_opts[i].flags |= @import("udp_port_policy.zig").REUSEADDR_FLAG;
@@ -337,9 +338,10 @@ pub fn pingOpen(uid: u32) ?u32 {
     return null;
 }
 
-/// bind() of the ping socket `old_key` to ident `ident` (0 keeps an automatic one) and address `addr`: another ping socket holding
-/// the ident conflicts unless both set SO_REUSEADDR, whatever their addresses (ping_get_port). Returns the new key, or -98.
-pub fn pingBind(old_key: u32, ident: u16, addr: [4]u8) i64 {
+/// bind() of the ping socket `old_key` to ident `ident` (0 keeps an automatic one) and address `addr` (`addr6` for an IPv6 one):
+/// another ping socket holding the ident, of either family, conflicts unless both set SO_REUSEADDR, whatever their addresses
+/// (ping_get_port). Returns the new key, or -98.
+pub fn pingBind(old_key: u32, ident: u16, addr: [4]u8, addr6: [16]u8) i64 {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const oi = findPortIdxLocked(old_key) orelse return -9;
@@ -354,6 +356,7 @@ pub fn pingBind(old_key: u32, ident: u16, addr: [4]u8) i64 {
     port_seq[oi] = next_seq;
     next_seq +%= 1;
     port_local_ip[oi] = addr;
+    port_local_ip6[oi] = addr6;
     if (want == portNumber(old_key)) return @intCast(old_key);
     const disc: u32 = @ctz(~used);
     const key = PING_KEY | (disc << 16) | want;
@@ -383,7 +386,8 @@ pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8) vo
         var slots: [MAX_PORTS]usize = undefined;
         var n: usize = 0;
         for (0..num_ports) |k| {
-            if (!port_ping[k] or portNumber(ports[k]) != ident) continue;
+            // An IPv4 reply only goes to an IPv4 ping socket (ping_lookup matches sk_family to the packet's protocol).
+            if (!port_ping[k] or port_v6[k] or portNumber(ports[k]) != ident) continue;
             holders[n] = .{ .seq = port_seq[k], .bound = port_local_ip[k], .peer = port_peer_ip[k][0..4].* };
             slots[n] = k;
             n += 1;
@@ -406,6 +410,45 @@ pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8) vo
                 notify_key = ports[i];
                 break;
             }
+        }
+    }
+    if (notify_key == 0) return;
+    @import("epoll.zig").epollNotify(.udp_socket, notify_key, @import("epoll.zig").EPOLLIN);
+    @import("../fs/vfs.zig").udpFasyncNotify(notify_key, @import("../fs/fcntl_policy.zig").POLL_IN);
+}
+
+/// An ICMPv6 echo reply `msg` from `src_ip` to `dst_ip` for ident `ident`: queued on the IPv6 ping socket ping_policy.pickReceiver6
+/// picks among the IPv6 ones holding the ident (ping_lookup). Nobody holding it drops it.
+pub fn deliverPing6(ident: u16, src_ip: [16]u8, dst_ip: [16]u8, msg: []const u8) void {
+    var notify_key: u32 = 0;
+    blk: {
+        const saved = udp_lock.acquire();
+        defer udp_lock.release(saved);
+        const pp = @import("ping_policy.zig");
+        var holders: [MAX_PORTS]pp.Holder6 = undefined;
+        var slots: [MAX_PORTS]usize = undefined;
+        var n: usize = 0;
+        for (0..num_ports) |k| {
+            if (!port_ping[k] or !port_v6[k] or portNumber(ports[k]) != ident) continue;
+            holders[n] = .{ .seq = port_seq[k], .bound = port_local_ip6[k] };
+            slots[n] = k;
+            n += 1;
+        }
+        const pick = pp.pickReceiver6(holders[0..n], dst_ip) orelse break :blk;
+        const i = slots[pick];
+        const actual = @min(msg.len, MAX_UDP_PAYLOAD_V6);
+        for (0..QUEUE_DEPTH) |j| {
+            const e = &queues[i][j];
+            if (e.valid) continue;
+            e.src_ip = src_ip;
+            e.src_port = 0;
+            e.dst_port = ident;
+            e.data_len = @intCast(actual);
+            @memcpy(e.data[0..actual], msg[0..actual]);
+            e.is_v6 = true;
+            e.valid = true;
+            notify_key = ports[i];
+            break;
         }
     }
     if (notify_key == 0) return;

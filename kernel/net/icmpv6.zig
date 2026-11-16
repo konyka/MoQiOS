@@ -101,6 +101,11 @@ pub fn handlePacket(
     if (len < 8) return;
     // v53.37: Verify ICMPv6 checksum (RFC 4443 §2.3). checksum() returns 0 for valid packets.
     if (checksum(src_ip, dst_ip, data, len) != 0) return;
+    // An echo reply is for the IPv6 ping socket whose ident is its id (icmpv6_rcv → ping_rcv).
+    if (@import("ping_policy.zig").replyIdent6(data[0..len])) |ident| {
+        @import("udp.zig").deliverPing6(ident, src_ip, dst_ip, data[0..len]);
+        return;
+    }
     const icmp_type = data[0];
 
     switch (icmp_type) {
@@ -312,8 +317,11 @@ pub fn sendEchoReply(
 ) void {
     if (len < 8 or len > 1280) return;
 
-    const dst_mac = ndp.lookup(requester_ip) orelse return;
     const our_mac = netif.getMac();
+    // A requester on this host (::1 or one of its own addresses) is answered over lo, like any datagram to it; elsewhere the reply
+    // needs the requester's MAC.
+    const via_lo = netif.isLoopbackV6(requester_ip) or ndp.isOwnAddress(requester_ip, our_mac);
+    const dst_mac = if (via_lo) our_mac else ndp.lookup(requester_ip) orelse return;
     const our_ip = our_ip_in; // reply from the address we received it on
 
     var pkt: [1500]u8 = undefined;
@@ -334,7 +342,38 @@ pub fn sendEchoReply(
     bo.writeU16BeAt(&pkt, icmp_off + 2, csum);
 
     const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + len);
-    _ = nic.sendPacket(&pkt, frame_len);
+    if (via_lo) _ = @import("lo.zig").sendPacket(&pkt, frame_len) else _ = nic.sendPacket(&pkt, frame_len);
+}
+
+/// Send the ICMPv6 message `msg` (header and data; the checksum is computed here over the pseudo-header) from an IPv6 ping socket
+/// bound to `bound` (:: when unbound) to `dst`: routed like an IPv6 UDP datagram (lo for ::1 and this host's addresses, else the
+/// next hop's MAC, soliciting it when it is missing). Returns 0, or -EMSGSIZE past the path MTU, -EAGAIN while the next hop is
+/// unresolved, -ENOBUFS when the device drops it.
+pub fn sendFrom6(bound: [16]u8, dst: [16]u8, msg: []u8) i64 {
+    if (msg.len + ipv6.HEADER_LEN > ipv6.getSendMtu(dst)) return -90;
+    const our_mac = netif.getMac();
+    const via_lo = netif.isLoopbackV6(dst) or ndp.isOwnAddress(dst, our_mac);
+    const dst_mac = if (via_lo) our_mac else resolve: {
+        const nh = ndp.resolveNextHop(dst);
+        break :resolve nh.mac orelse {
+            if (nh.solicit) |t| sendNeighborSolicitation(t);
+            return -11;
+        };
+    };
+    const src = @import("tcp_port_policy.zig").sourceAddr6(bound, dst, if (via_lo) dst else ndp.selectSourceAddress(dst, our_mac));
+    msg[2] = 0;
+    msg[3] = 0;
+    const csum = checksum(src, dst, msg.ptr, @intCast(msg.len));
+    msg[2] = @truncate(csum >> 8);
+    msg[3] = @truncate(csum);
+    var pkt: [1518]u8 = @splat(0);
+    const icmp_off: usize = 14 + ipv6.HEADER_LEN;
+    @memcpy(pkt[icmp_off..][0..msg.len], msg);
+    ipv6.buildHeader(pkt[14..].ptr, src, dst, ipv6.PROTO_ICMPV6, @intCast(msg.len));
+    const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, @intCast(ipv6.HEADER_LEN + msg.len));
+    const lo = @import("lo.zig");
+    const ok = if (via_lo) lo.sendPacket(&pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt, frame_len);
+    return if (ok) 0 else -105;
 }
 
 fn handleNeighborSolicitation(

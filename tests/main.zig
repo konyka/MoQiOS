@@ -4965,6 +4965,92 @@ test "net.ipv4.ping_group_range: who may create a ping socket, read and written 
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "                .writable = is_writable and pfile == .ping_group_range,\n") != null);
 }
 
+test "IPv6 ping sockets: SOCK_DGRAM/IPPROTO_ICMPV6 share the ident table but only take replies of their own family (hello374)" {
+    const pp = kt.ping_policy;
+    // ping_common_sendmsg for AF_INET6: an ICMPv6 echo request (128) or extended one (160) with code 0; the IPv4 type 8 is EINVAL.
+    try std.testing.expectEqual(@as(i64, 0), pp.sendErrno6(8, 128, 0));
+    try std.testing.expectEqual(@as(i64, 0), pp.sendErrno6(16, 160, 0));
+    try std.testing.expectEqual(@as(i64, -22), pp.sendErrno6(7, 128, 0));
+    try std.testing.expectEqual(@as(i64, -22), pp.sendErrno6(16, 8, 0));
+    try std.testing.expectEqual(@as(i64, -22), pp.sendErrno6(16, 128, 1));
+    try std.testing.expectEqual(@as(i64, -90), pp.sendErrno6(pp.MAX_MESSAGE + 1, 128, 0));
+    var m = [_]u8{ 128, 0, 0, 0, 0, 0, 0, 9 };
+    pp.setIdent(&m, 0x1374);
+    try std.testing.expectEqual(@as(u8, 0x13), m[4]);
+    try std.testing.expectEqual(@as(u8, 0x74), m[5]);
+    // Echo replies (129) and extended ones (161) with code 0 go to the socket whose ident is the id.
+    try std.testing.expectEqual(@as(?u16, 0x0102), pp.replyIdent6(&[_]u8{ 129, 0, 0, 0, 1, 2, 0, 0 }));
+    try std.testing.expectEqual(@as(?u16, 0x0102), pp.replyIdent6(&[_]u8{ 161, 0, 0, 0, 1, 2, 0, 0 }));
+    try std.testing.expectEqual(@as(?u16, null), pp.replyIdent6(&[_]u8{ 128, 0, 0, 0, 1, 2, 0, 0 }));
+    try std.testing.expectEqual(@as(?u16, null), pp.replyIdent6(&[_]u8{ 0, 0, 0, 0, 1, 2, 0, 0 }));
+    try std.testing.expectEqual(@as(?u16, null), pp.replyIdent6(&[_]u8{ 129, 1, 0, 0, 1, 2, 0, 0 }));
+    try std.testing.expectEqual(@as(?u16, null), pp.replyIdent6(&[_]u8{ 129, 0, 0, 0, 1, 2, 0 }));
+    // ping_check_bind_addr for AF_INET6.
+    const any: [16]u8 = @splat(0);
+    var lo1: [16]u8 = @splat(0);
+    lo1[15] = 1;
+    var grp: [16]u8 = @splat(0);
+    grp[0] = 0xff;
+    grp[1] = 2;
+    grp[15] = 1;
+    var ll: [16]u8 = @splat(0);
+    ll[0] = 0xfe;
+    ll[1] = 0x80;
+    ll[15] = 5;
+    try std.testing.expectEqual(@as(i64, 0), pp.bindAddrErrno6(any, false, 0, false, false));
+    try std.testing.expectEqual(@as(i64, 0), pp.bindAddrErrno6(lo1, false, 0, false, true));
+    try std.testing.expectEqual(@as(i64, -22), pp.bindAddrErrno6(grp, true, 0, false, false));
+    try std.testing.expectEqual(@as(i64, -99), pp.bindAddrErrno6(lo1, false, 0, false, false));
+    try std.testing.expectEqual(@as(i64, -22), pp.bindAddrErrno6(ll, true, 0, false, true));
+    try std.testing.expectEqual(@as(i64, -19), pp.bindAddrErrno6(ll, true, 7, false, true));
+    try std.testing.expectEqual(@as(i64, 0), pp.bindAddrErrno6(ll, true, 2, true, true));
+    try std.testing.expectEqual(@as(i64, -97), pp.family6Errno(2));
+    try std.testing.expectEqual(@as(i64, 0), pp.family6Errno(10));
+    // ping_v6_sendmsg: a link-scoped destination needs an interface; a v4-mapped one is EINVAL.
+    try std.testing.expectEqual(@as(i64, -22), pp.destErrno6(ll, true, 0));
+    try std.testing.expectEqual(@as(i64, 0), pp.destErrno6(ll, true, 2));
+    var mapped: [16]u8 = @splat(0);
+    mapped[10] = 0xff;
+    mapped[11] = 0xff;
+    mapped[12] = 127;
+    mapped[15] = 1;
+    try std.testing.expectEqual(@as(i64, -22), pp.destErrno6(mapped, false, 0));
+    try std.testing.expectEqual(@as(i64, 0), pp.destErrno6(lo1, false, 0));
+    // ping_lookup: the last hashed holder whose bound address is :: or the reply's destination.
+    const two = [_]pp.Holder6{ .{ .seq = 1, .bound = any }, .{ .seq = 2, .bound = any } };
+    try std.testing.expectEqual(@as(?usize, 1), pp.pickReceiver6(&two, lo1));
+    const spec = [_]pp.Holder6{ .{ .seq = 1, .bound = any }, .{ .seq = 2, .bound = ll } };
+    try std.testing.expectEqual(@as(?usize, 0), pp.pickReceiver6(&spec, lo1));
+    try std.testing.expectEqual(@as(?usize, 1), pp.pickReceiver6(&spec, ll));
+    try std.testing.expectEqual(@as(?usize, null), pp.pickReceiver6(&[_]pp.Holder6{.{ .seq = 1, .bound = ll }}, lo1));
+
+    // socket(): AF_INET6 datagram sockets accept IPPROTO_ICMPV6; AF_INET does not, nor does AF_INET6 take IPPROTO_ICMP.
+    const np = kt.namespace_policy;
+    try std.testing.expect(np.socketArgs(10, 2, 58) == .ok);
+    try std.testing.expectEqual(@as(i64, -93), np.socketArgs(2, 2, 58).err);
+    try std.testing.expectEqual(@as(i64, -93), np.socketArgs(10, 2, 1).err);
+    try std.testing.expectEqual(@as(i64, -93), np.socketArgs(10, 1, 58).err);
+    // SO_PROTOCOL 58 and SO_DOMAIN 10 on an IPv6 ping socket.
+    try std.testing.expectEqual(@as(u32, 58), kt.sockopt_policy.identity(.ping, true).protocol);
+    try std.testing.expectEqual(@as(u32, 10), kt.sockopt_policy.identity(.ping, true).domain);
+    try std.testing.expectEqual(@as(u32, 1), kt.sockopt_policy.identity(.ping, false).protocol);
+
+    // Wiring: echo replies reach deliverPing6 before the ICMPv6 dispatch; each family's delivery skips the other family's sockets.
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmpv6_source, "if (@import(\"ping_policy.zig\").replyIdent6(data[0..len])) |ident| {\n        @import(\"udp.zig\").deliverPing6(ident, src_ip, dst_ip, data[0..len]);") != null);
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (!port_ping[k] or port_v6[k] or portNumber(ports[k]) != ident) continue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (!port_ping[k] or !port_v6[k] or portNumber(ports[k]) != ident) continue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "const i = newSlotLocked(key, is_v6, uid);") != null);
+    // A requester on this host is answered over lo (an echo request to ::1 used to need an NDP entry and was never answered).
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmpv6_source, "const via_lo = netif.isLoopbackV6(requester_ip) or ndp.isOwnAddress(requester_ip, our_mac);") != null);
+    // getpeername on any ping socket is ENOTCONN (it has no peer port).
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (!desc.udp_connected or desc.udp_ping) return ENOTCONN;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const is_ping = parsed.sock_type == 2 and ((domain == 2 and protocol == 1) or (domain == 10 and protocol == 58));") != null);
+    const prof = kt.capability_profile.profileForLaunch("hello374", true, false);
+    try std.testing.expectEqual(@as(u32, 0), prof.uid);
+}
+
 test "ping sockets sharing an ident: the reply goes to the one hashed last that takes it (hello372)" {
     const pp = kt.ping_policy;
     const any = [4]u8{ 0, 0, 0, 0 };
@@ -13371,7 +13457,7 @@ test "udp: connect records the peer address and enqueue chooses the receiver wit
     try std.testing.expect(std.mem.indexOf(u8, us, "const pick = policy.pickReceiverConnected(info[0..n], src_ip, src_port) orelse break :blk false;") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "port_peer_ip[i] = peer_ip;") != null);
     const ss = kt.socket_syscall_source;
-    try std.testing.expect(std.mem.indexOf(u8, ss, "udp.setPeer(t.fd_table.fds[fd].udpKey(), parsed.port, parsed.addr);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "udp.setPeer(t.fd_table.fds[fd].udpKey(), if (t.fd_table.fds[fd].udp_ping) 1 else parsed.port, parsed.addr);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "udp.setPeer(t.fd_table.fds[fd].udpKey(), if (t.fd_table.fds[fd].udp_ping) 1 else dst_port, peer16);") != null);
 }
 

@@ -60,7 +60,8 @@ pub fn socket(domain: u32, type_and_flags: u32, protocol: u32) i64 {
         .ok => |a| a,
         .err => |e| return e,
     };
-    const fd = if (domain == 2 and parsed.sock_type == 2 and protocol == 1) pingCreate() else socketCreate(domain, parsed.sock_type);
+    const is_ping = parsed.sock_type == 2 and ((domain == 2 and protocol == 1) or (domain == 10 and protocol == 58));
+    const fd = if (is_ping) pingCreate(domain == 10) else socketCreate(domain, parsed.sock_type);
     if (fd < 0) return fd;
     // SOCK_CLOEXEC / SOCK_NONBLOCK belong to the new descriptor, not to the socket type.
     const cur_idx = sched_mod.currentTaskIndex() orelse return fd;
@@ -89,14 +90,15 @@ fn udpRebind(t: *task_mod.Task, fd: u32, new_port: u16, addr: [4]u8, addr6: [16]
     return 0;
 }
 
-/// socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP): a ping socket on the first free ICMP ident, for a task whose egid or a supplementary
-/// group lies in net.ipv4.ping_group_range (empty by default; root sets it through /proc/sys/net/ipv4/ping_group_range).
-fn pingCreate() i64 {
+/// socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP), or socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6) when `is_v6`: a ping socket on the
+/// first free ident, for a task whose egid or a supplementary group lies in net.ipv4.ping_group_range (empty by default; root sets
+/// it through /proc/sys/net/ipv4/ping_group_range; the IPv6 socket is gated by the same range, as in Linux ping_init_sock).
+fn pingCreate(is_v6: bool) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
     // ping_init_sock: the egid or a supplementary group must lie in net.ipv4.ping_group_range.
     if (!udp.pingGroupAllowed(t.egid, t.groups[0..t.ngroups])) return -13; // EACCES
-    const key = udp.pingOpen(t.fsuid) orelse return -105; // ENOBUFS
+    const key = udp.pingOpen(t.fsuid, is_v6) orelse return -105; // ENOBUFS
     const fd_slot = t.fd_table.allocFd() orelse {
         udp.releasePort(key);
         return -24; // EMFILE
@@ -105,6 +107,7 @@ fn pingCreate() i64 {
         .fd_type = .udp_socket,
         .udp_port = @truncate(key),
         .udp_ping = true,
+        .udp_is_v6 = is_v6,
         .writable = true,
     };
     t.fd_table.publishFd(fd_slot);
@@ -115,6 +118,7 @@ fn pingCreate() i64 {
 /// (ping_v4_sendmsg). The destination is `addr_ptr` (a sockaddr_in of at least 16 bytes) or the connected peer.
 fn pingSend(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr_len: u32) i64 {
     const pp = @import("ping_policy.zig");
+    if (d.udp_is_v6) return pingSend6(d, payload, addr_ptr, addr_len);
     const rc = pp.sendErrno(payload.len, if (payload.len > 0) payload[0] else 0, if (payload.len > 1) payload[1] else 0);
     if (rc != 0) return rc;
     var dst: [4]u8 = .{ 0, 0, 0, 0 };
@@ -134,6 +138,41 @@ fn pingSend(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr
     if (!d.udp_ping_bound) udp.pingRehash(d.udpKey());
     d.udp_ping_bound = true;
     const sent = @import("icmp.zig").sendFrom(d.udp_local_ip, dst, msg[0..payload.len]);
+    return if (sent < 0) sent else @intCast(payload.len);
+}
+
+/// sendto/sendmsg on an IPv6 ping socket: `payload` is an ICMPv6 echo request; the ident and the checksum (over the IPv6
+/// pseudo-header) are filled in (ping_v6_sendmsg). The destination is `addr_ptr` (a sockaddr_in6 of at least 28 bytes) or the
+/// connected peer; a link-scoped one needs an interface (sin6_scope_id or the socket's own).
+fn pingSend6(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr_len: u32) i64 {
+    const pp = @import("ping_policy.zig");
+    const rc = pp.sendErrno6(payload.len, if (payload.len > 0) payload[0] else 0, if (payload.len > 1) payload[1] else 0);
+    if (rc != 0) return rc;
+    var dst: [16]u8 = @splat(0);
+    var scope: u32 = 0;
+    if (addr_ptr != 0) {
+        if (addr_len < sa.SOCKADDR_IN6_LEN) return -22;
+        var sa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
+        if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) != sa.SOCKADDR_IN6_LEN) return -14;
+        const fam_rc = pp.family6Errno(bo.readU16Le(sa6[0..2]));
+        if (fam_rc != 0) return fam_rc;
+        const parsed = sa.parseInet6(&sa6) orelse return -97;
+        dst = parsed.addr;
+        scope = parsed.scope_id;
+    } else if (d.udp_connected) {
+        dst = d.udp_dst_ip6;
+    } else return -89; // EDESTADDRREQ
+    const oif = udp.sendOif6(d.udpKey(), dst, scope);
+    const dest_rc = pp.destErrno6(dst, bind_addr_policy.needsScope6(dst), oif);
+    if (dest_rc != 0) return dest_rc;
+    const unreach = bind_addr_policy.routeErrno6(dst, oif);
+    if (unreach != 0) return unreach;
+    var msg: [pp.MAX_MESSAGE]u8 = undefined;
+    @memcpy(msg[0..payload.len], payload);
+    pp.setIdent(msg[0..payload.len], d.udp_port);
+    if (!d.udp_ping_bound) udp.pingRehash(d.udpKey());
+    d.udp_ping_bound = true;
+    const sent = @import("icmpv6.zig").sendFrom6(d.udp_local_ip6, dst, msg[0..payload.len]);
     return if (sent < 0) sent else @intCast(payload.len);
 }
 
@@ -308,6 +347,32 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     }
 
     // Ping socket bind: the port is the ICMP ident (ping_bind → ping_get_port).
+    if (t.fd_table.fds[fd].fd_type == .udp_socket and t.fd_table.fds[fd].udp_ping and t.fd_table.fds[fd].udp_is_v6) {
+        if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -14;
+        if (addr_len < sa.SOCKADDR_IN6_LEN) return -22;
+        var pa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
+        if (copy.copyFromUser(&pa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) != sa.SOCKADDR_IN6_LEN) return -14;
+        const pp6 = @import("ping_policy.zig");
+        const fam_rc = pp6.family6Errno(bo.readU16Le(pa6[0..2]));
+        if (fam_rc != 0) return fam_rc;
+        const parsed = sa.parseInet6(&pa6) orelse return -97;
+        const dev_ok = parsed.scope_id == bind_addr_policy.LO_IFINDEX or (nic_mod.isActive() and parsed.scope_id == bind_addr_policy.NIC_IFINDEX);
+        const addr_rc = pp6.bindAddrErrno6(parsed.addr, bind_addr_policy.needsScope6(parsed.addr), parsed.scope_id, dev_ok, !bindAddrNotAvail6(parsed.addr));
+        if (addr_rc != 0) return addr_rc;
+        const d6 = &t.fd_table.fds[fd];
+        const bind_rc6 = pp6.bindErrno(d6.udp_ping_bound);
+        if (bind_rc6 != 0) return bind_rc6;
+        const old_key6 = d6.udpKey();
+        const nk6 = udp.pingBind(old_key6, parsed.port, .{ 0, 0, 0, 0 }, parsed.addr);
+        if (nk6 < 0) return nk6;
+        const key6: u32 = @intCast(nk6);
+        d6.udp_port = @truncate(key6);
+        d6.udp_disc = @truncate((key6 >> 16) & 0x7fff);
+        d6.udp_local_ip6 = parsed.addr;
+        d6.udp_ping_bound = true;
+        if (d6.udpKey() != old_key6) vfs_mod.udpFasyncRekey(old_key6, d6.udpKey());
+        return 0;
+    }
     if (t.fd_table.fds[fd].fd_type == .udp_socket and t.fd_table.fds[fd].udp_ping) {
         if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -14;
         if (addr_len < SOCKADDR_IN_MIN_LEN + 8) return -22;
@@ -321,7 +386,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         const bind_rc = pp.bindErrno(d.udp_ping_bound);
         if (bind_rc != 0) return bind_rc;
         const old_key = d.udpKey();
-        const nk = udp.pingBind(old_key, bo.readU16BeAt(&pa, 2), addr4);
+        const nk = udp.pingBind(old_key, bo.readU16BeAt(&pa, 2), addr4, @splat(0));
         if (nk < 0) return nk;
         const key: u32 = @intCast(nk);
         d.udp_port = @truncate(key);
@@ -899,7 +964,12 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
             t.fd_table.fds[fd].udp_connected = true;
             t.fd_table.fds[fd].udp_dst_ip6 = parsed.addr;
             t.fd_table.fds[fd].udp_dst_port = parsed.port;
-            udp.setPeer(t.fd_table.fds[fd].udpKey(), parsed.port, parsed.addr);
+            // A ping socket has no remote port: setPeer's nonzero port only marks it connected.
+            udp.setPeer(t.fd_table.fds[fd].udpKey(), if (t.fd_table.fds[fd].udp_ping) 1 else parsed.port, parsed.addr);
+            if (t.fd_table.fds[fd].udp_ping and !t.fd_table.fds[fd].udp_ping_bound) {
+                udp.pingRehash(t.fd_table.fds[fd].udpKey());
+                t.fd_table.fds[fd].udp_ping_bound = true;
+            }
             return 0;
         }
         if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, false)) return -22;
@@ -1028,7 +1098,8 @@ pub fn getpeername(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
     const desc = cur.fd_table.fds[fd];
 
     if (desc.fd_type == .udp_socket) {
-        if (!desc.udp_connected) return ENOTCONN;
+        // A ping socket has no peer port, so even a connected one has no peer name (inet_getname / inet6_getname want inet_dport).
+        if (!desc.udp_connected or desc.udp_ping) return ENOTCONN;
         var sa_buf: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
         const alen = sa.encodeUdpName(desc.udp_is_v6, desc.udp_dst_port, desc.udp_dst_ip, desc.udp_dst_ip6, &sa_buf);
         if (alen == 0) return -1;

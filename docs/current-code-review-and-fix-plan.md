@@ -9872,5 +9872,31 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 这次修复带来的局限：
   1. 范围是全局的，不分网络命名空间（MoQiOS 没有网络命名空间）；也不做 gid 映射。
   2. 没有 `/proc/sys` 目录树，只能按完整路径打开这一个文件，getdents 列不出来。
-  3. IPv6 ping 套接字仍是 EPROTONOSUPPORT；下一跳没解析时 ping 发送返回 EAGAIN；不处理发往 ping 套接字的 ICMP 错误。
+  3. IPv6 ping 套接字仍是 EPROTONOSUPPORT（已在 hello374 一节解决）；下一跳没解析时 ping 发送返回 EAGAIN；不处理发往 ping 套接字的 ICMP 错误。
   4. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
+
+## 补充：IPv6 ping 套接字（hello374）
+
+- 问题：`socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6)` 返回 EPROTONOSUPPORT，Linux 支持它（`net/ipv6/ping.c`）。检查时还发现两个缺陷：
+  1. `icmpv6.sendEchoReply` 要求请求者有 NDP 条目，发往 ::1 的回显请求得不到应答。
+  2. 已连接的 ping 套接字 getpeername 会报告对端，Linux 返回 ENOTCONN，因为 ping 套接字没有对端端口。
+- 宿主机实测（Linux，root 身份在 `unshare --map-auto --map-root-user -n` 里，lo 已启用，方法写在 `user/hello374.c` 文件头）：S、P、E、B、C、F 共 6 项全部通过。第一版测试的 C 项预期 getpeername 报告 ::1，实测是 ENOTCONN，IPv4 ping 套接字也一样，于是按实测改了测试，内核随之修正。
+- 红灯（未修改的内核，只加了 hello374 的 root 启动配置，SMP=2，hello374 临时放在 init 序列最前面）：6 项全部失败。socket 返回 EPROTONOSUPPORT；F 项里 IPv4 那半边正常。
+- 修复：
+  1. `namespace_policy.socketArgs` 接受 AF_INET6 + SOCK_DGRAM + 58。`socket()` 把它交给 `pingCreate(true)`，同样受 `net.ipv4.ping_group_range` 限制。
+  2. `udp.pingOpen` 带上地址族。IPv4 和 IPv6 ping 套接字共用一张 ident 表，`pingBind` 也记录 IPv6 绑定地址。
+  3. 新增 `udp.deliverPing6`，只投给 IPv6 ping 套接字；`deliverPing` 跳过 IPv6 套接字。
+  4. `icmpv6.handlePacket` 把类型 129、161 的回显应答交给 ping 套接字。新增 `icmpv6.sendFrom6`，按伪首部算校验和并选路。
+  5. `ping_policy` 新增 `sendErrno6`、`setIdent`、`destErrno6`、`replyIdent6`、`bindAddrErrno6`、`pickReceiver6`、`family6Errno`。
+  6. socket_syscall 新增 `pingSend6` 和 IPv6 ping 的 bind 分支。IPv6 connect 给 ping 套接字设对端时，端口按 1 处理，并做散列。getpeername 对 ping 套接字返回 ENOTCONN。
+  7. SO_PROTOCOL 对 IPv6 ping 套接字报告 58。
+  8. `icmpv6.sendEchoReply` 对本机请求者走 lo。
+  9. `capability_profile` 给 hello374 设 uid 0、gid 0，用来写范围文件。
+- 测试：hello374（QEMU，6 项）。新增 host 测试「IPv6 ping sockets: SOCK_DGRAM/IPPROTO_ICMPV6 share the ident table but only take replies of their own family (hello374)」。host 测试「udp: connect records the peer address ...」钉住的 setPeer 行随第 6 条更新。
+- 变异验证：`pickReceiver6` 不再检查绑定地址时，hello374 这条 host 测试失败，文件已恢复。
+- 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello374 PASS。本轮没有跑 riscv64、aarch64。
+- 局限：
+  1. 下一跳未解析时 ping 发送返回 EAGAIN，Linux 会把报文挂起并返回成功。
+  2. 不处理发往 ping 套接字的 ICMPv6 错误，也没有 IPV6_RECVERR；不支持 IPV6_* 的辅助数据（cmsg）。
+  3. 除了 ::1，IPv6 回显只能经 QEMU user 网络验证；外部主机发来的 ping 进不来。
+

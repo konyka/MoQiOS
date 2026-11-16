@@ -153,8 +153,8 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
     if (std.mem.eql(u8, name, "hello179")) {
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_admin = true, .cap_setuid = true }, .initial_init = false };
     }
-    if (std.mem.eql(u8, name, "hello371") or std.mem.eql(u8, name, "hello372") or std.mem.eql(u8, name, "hello373")) {
-        // Ping socket tests: root, which alone may write /proc/sys/net/ipv4/ping_group_range (mode 0644), holding CAP_SETUID and
+    if (std.mem.eql(u8, name, "hello371") or std.mem.eql(u8, name, "hello372") or std.mem.eql(u8, name, "hello373") or std.mem.eql(u8, name, "hello374")) {
+        // Ping socket tests (IPv4 and IPv6): root, which alone may write /proc/sys/net/ipv4/ping_group_range (mode 0644), holding CAP_SETUID and
         // CAP_SETGID so hello373's children take other uids, gids and supplementary groups, and CAP_NET_RAW for its raw socket.
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_setuid = true, .cap_setgid = true, .cap_net_raw = true }, .initial_init = false };
     }

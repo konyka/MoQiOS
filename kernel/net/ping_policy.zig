@@ -83,6 +83,75 @@ pub fn pickReceiver(holders: []const Holder, src: [4]u8, dst: [4]u8) ?usize {
     return best;
 }
 
+// ── IPv6 ping sockets (socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6), net/ipv6/ping.c) ──
+
+pub const ICMPV6_ECHO_REQUEST: u8 = 128;
+pub const ICMPV6_ECHO_REPLY: u8 = 129;
+pub const ICMPV6_EXT_ECHO_REQUEST: u8 = 160;
+pub const ICMPV6_EXT_ECHO_REPLY: u8 = 161;
+const EAFNOSUPPORT: i64 = -97;
+const EADDRNOTAVAIL: i64 = -99;
+const ENODEV: i64 = -19;
+
+/// ping_common_sendmsg for AF_INET6: a whole ICMPv6 header, an echo request (or an extended one) with code 0.
+pub fn sendErrno6(len: usize, icmp_type: u8, code: u8) i64 {
+    if (len > MAX_MESSAGE) return EMSGSIZE;
+    if (len < HEADER_LEN) return EINVAL;
+    if ((icmp_type != ICMPV6_ECHO_REQUEST and icmp_type != ICMPV6_EXT_ECHO_REQUEST) or code != 0) return EINVAL;
+    return 0;
+}
+
+/// ping_v6_sendmsg: the id field is the socket's ident (the checksum, over the IPv6 pseudo-header, is set once the source is known).
+pub fn setIdent(msg: []u8, ident: u16) void {
+    msg[4] = @truncate(ident >> 8);
+    msg[5] = @truncate(ident);
+}
+
+/// ping_v6_sendmsg: a destination that needs a scope sent with no interface, or a v4-mapped one, is EINVAL.
+pub fn destErrno6(dst: [16]u8, scoped: bool, oif: u8) i64 {
+    if (scoped and oif == 0) return EINVAL;
+    if (std.mem.allEqual(u8, dst[0..10], 0) and dst[10] == 0xff and dst[11] == 0xff) return EINVAL;
+    return 0;
+}
+
+/// The ident of the IPv6 ping socket an ICMPv6 message is for (icmpv6_rcv → ping_rcv: echo replies and extended echo replies
+/// with code 0), null for anything else.
+pub fn replyIdent6(msg: []const u8) ?u16 {
+    if (msg.len < HEADER_LEN) return null;
+    if ((msg[0] != ICMPV6_ECHO_REPLY and msg[0] != ICMPV6_EXT_ECHO_REPLY) or msg[1] != 0) return null;
+    return (@as(u16, msg[4]) << 8) | msg[5];
+}
+
+/// ping_check_bind_addr for AF_INET6 (after the length and family checks): a group is EINVAL, as is an address that needs a scope
+/// without one; a scope naming no interface is ENODEV; an address of another host EADDRNOTAVAIL. `scoped`: the address needs a
+/// scope; `dev_ok`: the scope names an interface; `local`: the address is this host's.
+pub fn bindAddrErrno6(addr: [16]u8, scoped: bool, scope_id: u32, dev_ok: bool, local: bool) i64 {
+    const any = std.mem.allEqual(u8, &addr, 0);
+    if (!any and addr[0] == 0xff) return EINVAL;
+    if (scoped and scope_id == 0) return EINVAL;
+    if (scope_id != 0 and !dev_ok) return ENODEV;
+    if (!any and !local) return EADDRNOTAVAIL;
+    return 0;
+}
+
+/// An IPv6 ping socket holding the ident of a reply: when it was hashed and the address it is bound to (:: for none).
+pub const Holder6 = struct { seq: u32, bound: [16]u8 };
+
+/// ping_lookup for an IPv6 reply to `dst`: the most recently hashed holder whose bound address is :: or `dst`.
+pub fn pickReceiver6(holders: []const Holder6, dst: [16]u8) ?usize {
+    var best: ?usize = null;
+    for (holders, 0..) |h, i| {
+        if (!std.mem.allEqual(u8, &h.bound, 0) and !std.mem.eql(u8, &h.bound, &dst)) continue;
+        if (best == null or h.seq > holders[best.?].seq) best = i;
+    }
+    return best;
+}
+
+/// The address family errno of a sockaddr given to an IPv6 ping socket (EAFNOSUPPORT for anything but AF_INET6).
+pub fn family6Errno(family: u16) i64 {
+    return if (family == 10) 0 else EAFNOSUPPORT;
+}
+
 /// net.ipv4.ping_group_range: the groups (inclusive) that may create ping sockets. The default, 1 0, is empty: nobody may.
 pub const GroupRange = struct { low: u32 = 1, high: u32 = 0 };
 

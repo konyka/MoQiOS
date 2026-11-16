@@ -40,6 +40,7 @@ pub const SOCK_SEQPACKET: u32 = 5;
 pub const IPPROTO_TCP: u32 = 6;
 pub const IPPROTO_UDP: u32 = 17;
 pub const IPPROTO_ICMP: u32 = 1;
+pub const IPPROTO_ICMPV6: u32 = 58;
 
 pub const Kind = enum { tcp, udp, ping, unix_stream, unix_dgram, unix_seqpacket, raw };
 
@@ -50,7 +51,7 @@ pub fn identity(kind: Kind, v6: bool) Identity {
     return switch (kind) {
         .tcp => .{ .domain = inet, .sock_type = SOCK_STREAM, .protocol = IPPROTO_TCP },
         .udp => .{ .domain = inet, .sock_type = SOCK_DGRAM, .protocol = IPPROTO_UDP },
-        .ping => .{ .domain = inet, .sock_type = SOCK_DGRAM, .protocol = IPPROTO_ICMP },
+        .ping => .{ .domain = inet, .sock_type = SOCK_DGRAM, .protocol = if (v6) IPPROTO_ICMPV6 else IPPROTO_ICMP },
         .unix_stream => .{ .domain = AF_UNIX, .sock_type = SOCK_STREAM, .protocol = 0 },
         .unix_dgram => .{ .domain = AF_UNIX, .sock_type = SOCK_DGRAM, .protocol = 0 },
         .unix_seqpacket => .{ .domain = AF_UNIX, .sock_type = SOCK_SEQPACKET, .protocol = 0 },
