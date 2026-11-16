@@ -201,6 +201,24 @@ pub fn setEntry(ip: [4]u8, mac: ?[6]u8, perm: bool) i64 {
     return 0;
 }
 
+/// /proc/net/arp: the header and one line per entry (arp_policy.formatProcLine), all on the NIC. Returns the bytes written.
+pub fn formatProc(out: []u8) usize {
+    var snap: [MAX_ARP_ENTRIES]ArpEntry = undefined;
+    {
+        const saved = arp_lock.acquire();
+        defer arp_lock.release(saved);
+        snap = cache;
+    }
+    if (out.len < policy.PROC_HEADER.len) return 0;
+    @memcpy(out[0..policy.PROC_HEADER.len], policy.PROC_HEADER);
+    var n: usize = policy.PROC_HEADER.len;
+    for (snap) |e| {
+        if (!e.valid) continue;
+        n += policy.formatProcLine(out[n..], e.ip, e.mac, e.perm, "eth0");
+    }
+    return n;
+}
+
 pub fn resolve(ip: [4]u8) ?[6]u8 {
     const saved = arp_lock.acquire();
     defer arp_lock.release(saved);

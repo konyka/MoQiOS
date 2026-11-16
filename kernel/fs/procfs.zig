@@ -30,6 +30,8 @@ pub const ProcFile = enum(u8) {
     tcpstats,
     /// /proc/sys/net/ipv4/ping_group_range: the groups that may create ping sockets (two gids); root may write it (mode 0644).
     ping_group_range,
+    /// /proc/net/arp: the IPv4 neighbour table (arp.formatProc).
+    net_arp,
     /// The /proc directory itself and /proc/<pid> (also reached as /proc/self): directories, listed by getdents64.
     root_dir,
     pid_dir,
@@ -168,6 +170,7 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
         .lostats => generateLoStats(buf, max_len),
         .tcpstats => generateTcpStats(buf, max_len),
         .ping_group_range => @intCast(@import("../net/udp.zig").pingGroupRead(buf[0..@min(max_len, 32)])),
+        .net_arp => @intCast(@import("../net/arp.zig").formatProc(buf[0..max_len])),
         .root_dir, .pid_dir, .mount_dir, .fd_dir => 0,
     };
 }

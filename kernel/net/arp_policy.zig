@@ -193,3 +193,27 @@ fn readU16(b: []const u8, at: usize) u16 {
 fn readU32(b: []const u8, at: usize) u32 {
     return @as(u32, b[at]) | (@as(u32, b[at + 1]) << 8) | (@as(u32, b[at + 2]) << 16) | (@as(u32, b[at + 3]) << 24);
 }
+
+// ── /proc/net/arp ──
+
+/// arp_seq_show's header line.
+pub const PROC_HEADER = "IP address       HW type     Flags       HW address            Mask     Device\n";
+
+/// One /proc/net/arp line, as arp_format_neigh_entry prints it: "%-16s 0x%-10x0x%-10x%-17s     *        %s\n" (address, hardware
+/// type, the SIOCGARP flags, MAC, device). Returns the bytes written to `out`, 0 when it does not fit.
+pub fn formatProcLine(out: []u8, ip: [4]u8, mac: [6]u8, perm: bool, dev: []const u8) usize {
+    var tmp: [128]u8 = undefined;
+    var addr: [16]u8 = undefined;
+    const a = std.fmt.bufPrint(&addr, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) catch return 0;
+    var hw: [17]u8 = undefined;
+    const h = std.fmt.bufPrint(&hw, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{ mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] }) catch return 0;
+    const flags: u32 = if (perm) ATF_COM | ATF_PERM else ATF_COM;
+    var ty: [12]u8 = undefined;
+    const t = std.fmt.bufPrint(&ty, "{x}", .{ARPHRD_ETHER}) catch return 0;
+    var fl: [12]u8 = undefined;
+    const f = std.fmt.bufPrint(&fl, "{x}", .{flags}) catch return 0;
+    const line = std.fmt.bufPrint(&tmp, "{s: <16} 0x{s: <10}0x{s: <10}{s: <17}     *        {s}\n", .{ a, t, f, h, dev }) catch return 0;
+    if (line.len > out.len) return 0;
+    @memcpy(out[0..line.len], line);
+    return line.len;
+}

@@ -1767,6 +1767,13 @@ pub const FdTable = struct {
                     return -13; // EACCES
                 }
                 pfile = .ping_group_range;
+            } else if (str.eql(rest, "net/arp")) {
+                // Mode 0444: no one opens it for writing.
+                if (is_writable) {
+                    self.freeFd(slot);
+                    return -13; // EACCES
+                }
+                pfile = .net_arp;
             } else if (procDirPid(rest)) |dir_pid| {
                 // /proc/<pid>, /proc/<pid>/ and /proc/self: the process's directory.
                 pfile = .pid_dir;

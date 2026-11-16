@@ -14265,3 +14265,18 @@ test "arp policy: SIOCSARP checks, permanent entries and the device / hardware f
     try std.testing.expect(std.mem.indexOf(u8, io, "return arp.setEntry(sr.ip, sr.mac, sr.perm);") != null);
     try std.testing.expect(std.mem.indexOf(u8, io, "ap.answerGet(&req, e.mac, e.perm);") != null);
 }
+
+test "arp policy: /proc/net/arp lines use arp_format_neigh_entry's layout (Linux measured, hello378)" {
+    const ap = kt.arp_policy;
+    var buf: [160]u8 = undefined;
+    const n = ap.formatProcLine(&buf, .{ 10, 0, 2, 77 }, .{ 2, 0, 0, 0, 0, 0x77 }, true, "v0");
+    try std.testing.expectEqualStrings("10.0.2.77        0x1         0x6         02:00:00:00:00:77     *        v0\n", buf[0..n]);
+    const m = ap.formatProcLine(&buf, .{ 10, 0, 2, 2 }, .{ 0x4a, 0xb4, 0x56, 0xa7, 0x43, 0x42 }, false, "eth0");
+    try std.testing.expectEqualStrings("10.0.2.2         0x1         0x2         4a:b4:56:a7:43:42     *        eth0\n", buf[0..m]);
+    try std.testing.expectEqual(@as(usize, 0), ap.formatProcLine(buf[0..20], .{ 10, 0, 2, 2 }, .{ 0, 0, 0, 0, 0, 0 }, false, "eth0"));
+    try std.testing.expectEqualStrings("IP address       HW type     Flags       HW address            Mask     Device\n", ap.PROC_HEADER);
+
+    try std.testing.expect(std.mem.indexOf(u8, kt.arp_source, "n += policy.formatProcLine(out[n..], e.ip, e.mac, e.perm, \"eth0\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".net_arp => @intCast(@import(\"../net/arp.zig\").formatProc(buf[0..max_len])),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "} else if (str.eql(rest, \"net/arp\")) {") != null);
+}

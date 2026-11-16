@@ -158,6 +158,10 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // CAP_SETGID so hello373's children take other uids, gids and supplementary groups, and CAP_NET_RAW for its raw socket.
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_setuid = true, .cap_setgid = true, .cap_net_raw = true }, .initial_init = false };
     }
+    if (std.mem.eql(u8, name, "hello378")) {
+        // /proc/net/arp test: CAP_NET_ADMIN to set and remove the entries it then looks for.
+        return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_net_admin = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello377")) {
         // SIOCSARP test: root holding CAP_NET_ADMIN to set entries, and CAP_SETUID so a child's setuid(1000) drops it and the EPERM
         // refusal is observable.

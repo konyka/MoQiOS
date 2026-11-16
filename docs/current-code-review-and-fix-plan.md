@@ -9917,7 +9917,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：SMP=2、SMP=1 各一份通过，SMP=4 跑了三份（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello375 PASS。三份 SMP=4 里 hello375 都是 PASS：第一份只有已记录的偶发项 hello286 M（19/20）失败；第二份是 hello108「RT task lost the CPU to reaping」（已记录为宿主机负载引起的偶发失败）和 hello325 G（`hits 0`，hello330 一节记录过同样的现象）失败；第三份通过。riscv64、aarch64 的 `zig build -Darch=...` 返回 0，没有在这两个架构上跑 QEMU。
 - 局限：
   1. TCP 和 IPv6（`sendToV6From`、`icmpv6.sendFrom6`）的发送不挂起。TCP 由重传补发；IPv6 已在 hello376 一节解决。
-  2. 不支持代理条目（ATF_PUBL），也没有 `/proc/net/arp`；静态条目已在 hello377 一节解决。
+  2. 不支持代理条目（ATF_PUBL）；静态条目已在 hello377 一节解决，`/proc/net/arp` 已在 hello378 一节解决。
   3. ARP 缓存仍是 16 项、没有老化，满了不加新条目。
 
 ## 补充：IPv6 帧等待邻居通告（hello376）
@@ -9952,7 +9952,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异验证：ATF_PERM 不再隐含 ATF_COM、硬件族 0 不再取设备类型，两种情况下这条 host 测试都失败，文件已恢复。
 - 完整 smoke：SMP=2、SMP=1 各一份通过，SMP=4 跑了三份（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello377 PASS。三份 SMP=4 里 hello377 都是 PASS：第一份只有 hello325 G 失败，第二份只有 hello286 M 失败（都是已记录的偶发项），第三份通过。SMP=2 那份在 hello341 测试修正之前构建，第三份 SMP=4 和 SMP=1 带着修正。没有在 riscv64、aarch64 上跑 QEMU。
 - 局限：
-  1. 不支持代理条目（ATF_PUBL，EOPNOTSUPP）；没有 `/proc/net/arp`。
+  1. 不支持代理条目（ATF_PUBL，EOPNOTSUPP）；`/proc/net/arp` 已在 hello378 一节解决。
   2. 没有 ATF_COM 时 Linux 留下的不完整邻居，MoQiOS 不建，SIOCGARP 返回 ENXIO。
   3. ARP 缓存仍是 16 项、没有老化；永久条目不会被挤掉，全满时新条目 ENOBUFS（Linux 也是）。
 
@@ -9962,3 +9962,20 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 原因：C 的循环每轮先调用一次 `connect`（握手还没完成，返回 EALREADY，-114），再调用 `accept`。握手如果恰好在这两次调用之间完成，accept 成功、循环结束，`again` 停在 -114，检查就失败了。这是测试本身的竞争，内核行为没有问题：连接确实完成了。
 - 修正：`user/hello341.c` 在 accept 成功之后，再问几次发起方的 `connect`，直到它返回 0 或 EISCONN（-106）。检查条件不变。宿主机 Linux 上 4 项全部通过。内核没有改动。
 - 同一轮的完整 smoke 里，SMP=4 有两份失败，hello377 在这两份里都是 PASS：一份是 hello325 G（`hits 0`，hello330 一节记录过），另一份是 hello286 M（19/20，已记录的偶发项）。
+
+## 补充：/proc/net/arp（hello378）
+
+- 问题：打开 `/proc/net/arp` 返回 ENOENT。`arp`、`ip neigh` 的老路径和很多脚本靠这个文件查看 IPv4 邻居表。
+- 宿主机实测（Linux，root 在 `unshare --map-auto --map-root-user -n` 里，veth 环境同 hello375，方法写在 `user/hello378.c` 文件头）：H、P、O、D、W 共 5 项全部通过。表头是 `IP address       HW type     Flags       HW address            Mask     Device`；每行格式按 `net/ipv4/arp.c` 的 `arp_format_neigh_entry`，永久条目 flags 0x6，普通条目 0x2；文件模式 0444，以写方式打开返回 EACCES。
+- 红灯（未修改的内核，只加了 hello378 的启动配置，SMP=2，hello378 临时放在 init 序列最前面）：H、P、O 失败，打开返回 ENOENT（-2）；D、W 因为文件不存在而碰巧通过。
+- 修复：
+  1. `arp_policy` 新增 `PROC_HEADER` 和 `formatProcLine`。
+  2. `arp.zig` 新增 `formatProc`：在锁内拷一份缓存快照，锁外逐行格式化。
+  3. `procfs` 新增 `net_arp`，`vfs` 在 `/proc/net/arp` 上打开它，以写方式打开返回 EACCES。
+  4. `capability_profile` 给 hello378 设 uid 1000 和 CAP_NET_ADMIN，用来设置和删除它要查找的条目。
+- 测试：hello378（QEMU，5 项）。新增 host 测试「arp policy: /proc/net/arp lines use arp_format_neigh_entry's layout (Linux measured, hello378)」，钉住了 Linux 实测的两行原文。
+- 变异验证：地址列宽从 16 改成 15，这条 host 测试失败，文件已恢复。
+- 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello378 PASS。没有在 riscv64、aarch64 上跑 QEMU。
+- 局限：
+  1. 没有 `/proc/net` 目录列表，只能按完整路径打开这个文件。
+  2. 只列网卡上的条目，设备一律写 eth0。没有不完整条目（Linux 会列出 flags 0x0、MAC 全 0 的条目）。
