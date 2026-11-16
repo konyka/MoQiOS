@@ -9896,7 +9896,26 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异验证：`pickReceiver6` 不再检查绑定地址时，hello374 这条 host 测试失败，文件已恢复。
 - 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello374 PASS。本轮没有跑 riscv64、aarch64。
 - 局限：
-  1. 下一跳未解析时 ping 发送返回 EAGAIN，Linux 会把报文挂起并返回成功。
+  1. 下一跳未解析时 ping 发送返回 EAGAIN，Linux 会把报文挂起并返回成功。IPv4 已在 hello375 一节解决；IPv6（NDP）仍返回 EAGAIN。
   2. 不处理发往 ping 套接字的 ICMPv6 错误，也没有 IPV6_RECVERR；不支持 IPV6_* 的辅助数据（cmsg）。
   3. 除了 ::1，IPv6 回显只能经 QEMU user 网络验证；外部主机发来的 ping 进不来。
 
+## 补充：IPv4 帧等待 ARP 应答，SIOCGARP/SIOCDARP（hello375）
+
+- 问题：UDP `sendToFrom` 和 `icmp.sendFrom` 在下一跳没有 ARP 条目时只发 ARP 请求，报文本身丢掉。UDP 静默丢包，ping 套接字返回 EAGAIN，发往新邻居的第一个数据报总会丢。Linux 把帧挂在邻居上等应答，发送返回字节数。另外 `SIOCGARP` 和 `SIOCDARP` 都返回 ENOTTY，用户态无法查看或删除邻居条目。核对时还发现 `kernel-subsystems.md` 4.3 节写的「哈希表」「老化机制」与代码不符：实际是 16 项线性表，没有老化。这一节已按代码改正。
+- 宿主机实测（Linux，`unshare --map-auto --map-root-user -n` 里建一对 veth，远端持有 10.0.2.2 和 10.0.2.3，本端 10.0.2.15/24，方法写在 `user/hello375.c` 文件头）：G、D、R、U、Q 共 5 项全部通过。发往不应答的 10.0.2.99 时，UDP sendto、connected send 和 ping 都返回 16，4 秒内什么也收不到，SO_ERROR 是 0。SIOCGARP 返回 flags ATF_COM、hw family 1。SIOCDARP 返回 0，之后 SIOCGARP 和再次 SIOCDARP 都是 ENXIO。AF_INET6 地址是 EPFNOSUPPORT，未知设备 ENODEV，对目录 fd 是 ENOTTY。
+- 红灯（未修改的内核，只加了 hello375 的启动配置，SMP=2，hello375 临时放在 init 序列最前面）：5 项全部失败。ioctl 都是 -25，ping 网关返回 -11，发往刚删除的条目的 UDP 返回 -1。
+- 修复：
+  1. 新文件 `net/arp_policy.zig`：挂起队列的决策（`pickSlot`、`expired`、`firstForHop`、`probeDue`，最多 8 帧，每秒重问，3 秒丢弃），以及 arpreq 的检查和应答（`parseRequest`、`answerGet`、`notFound`）。
+  2. `arp.zig` 新增 `queueFrame`、`flushPending`（`handlePacket` 记下发送者后调用）、`timerTick`、`deleteEntry`。
+  3. UDP `sendToFrom` 和 `icmp.sendFrom` 在 ARP 未命中时照常组帧，交给 `arp.queueFrame`，返回成功。
+  4. 调度器的两条维护路径在 `neighborTimerTick` 之后调用 `arp.timerTick`。
+  5. `fs/ioctl.zig` 新增 SIOCGARP、SIOCDARP 分支，只接受套接字，SIOCDARP 检查 CAP_NET_ADMIN。
+  6. `capability_profile` 给 hello375 设 uid 0、gid 0（写 ping_group_range）和 CAP_NET_ADMIN（SIOCDARP）。
+- 测试：hello375（QEMU，5 项）。新增 host 测试「arp policy: frames wait for a next hop's MAC ...」「arp policy: SIOCGARP / SIOCDARP request checks and the answer layout ...」「arp: unresolved IPv4 sends queue the frame ...」。host 测试「IPv4 的下一跳」钉住的 UDP 源码行随第 3 条更新。
+- 变异验证：`firstForHop` 恒为 true、去掉 SIOCDARP 的 CAP_NET_ADMIN 检查、`handlePacket` 不再调用 `flushPending`，三种情况下各有对应的 host 测试失败，文件已恢复。
+- 完整 smoke：SMP=2、SMP=1 各一份通过，SMP=4 跑了三份（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello375 PASS。三份 SMP=4 里 hello375 都是 PASS：第一份只有已记录的偶发项 hello286 M（19/20）失败；第二份是 hello108「RT task lost the CPU to reaping」（已记录为宿主机负载引起的偶发失败）和 hello325 G（`hits 0`，hello330 一节记录过同样的现象）失败；第三份通过。riscv64、aarch64 的 `zig build -Darch=...` 返回 0，没有在这两个架构上跑 QEMU。
+- 局限：
+  1. TCP 和 IPv6（`sendToV6From`、`icmpv6.sendFrom6`）的发送不挂起。TCP 由重传补发；IPv6 UDP 仍丢包，IPv6 ping 返回 EAGAIN。
+  2. 不支持 SIOCSARP（静态条目和代理条目），也没有 `/proc/net/arp`。
+  3. ARP 缓存仍是 16 项、没有老化，满了不加新条目。

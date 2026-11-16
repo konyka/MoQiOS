@@ -5145,7 +5145,7 @@ test "IPv4 next hop: an off-link address goes through the gateway, and a SYN wai
     try std.testing.expectEqual([4]u8{ 10, 0, 3, 1 }, r.nextHop4(.{ 10, 0, 3, 1 }, our, .{ 255, 255, 0, 0 }, gw));
 
     const us = kt.udp_source;
-    try std.testing.expect(std.mem.indexOf(u8, us, "arp.resolve(hop) orelse {\n            arp.sendArpRequest(hop);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "break :resolve arp.resolve(hop) orelse blk: {\n            wait_hop = hop;") != null);
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "const hop = netif.nextHop4(tcb.remote_ip);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "arp.resolve(hop) orelse {\n        arp.sendArpRequest(hop);") != null);
@@ -14098,4 +14098,89 @@ test "ntp policy: clock_adjtime on other clocks and the struct timex layout (Lin
     try std.testing.expectEqual(@as(i32, 0x40), std.mem.readInt(i32, buf[40..44], .little));
     try std.testing.expectEqual(@as(u32, np.ADJ_TAI), std.mem.readInt(u32, buf[0..4], .little)); // modes untouched
     try std.testing.expectEqual(@as(u8, 0), buf[100]); // PPS fields zeroed
+}
+
+test "arp policy: frames wait for a next hop's MAC, one ARP request per neighbour, dropped after three probes (Linux measured)" {
+    const ap = kt.arp_policy;
+    var slots: [ap.MAX_PENDING]ap.Slot = @splat(.{});
+    const hop = [4]u8{ 10, 0, 2, 99 };
+    try std.testing.expect(ap.firstForHop(&slots, hop, 0));
+    slots[0] = .{ .used = true, .hop = hop, .queued_ns = 100, .next_probe_ns = 100 + ap.PROBE_INTERVAL_NS };
+    // A second frame for the same neighbour does not ask again; another neighbour does.
+    try std.testing.expect(!ap.firstForHop(&slots, hop, 200));
+    try std.testing.expect(ap.firstForHop(&slots, .{ 10, 0, 2, 2 }, 200));
+    try std.testing.expectEqual(@as(usize, 1), ap.pickSlot(&slots, 200));
+    // Re-asked every second, dropped at three seconds.
+    try std.testing.expect(!ap.probeDue(slots[0], 100 + ap.PROBE_INTERVAL_NS - 1));
+    try std.testing.expect(ap.probeDue(slots[0], 100 + ap.PROBE_INTERVAL_NS));
+    try std.testing.expect(!ap.expired(slots[0], 100 + ap.HOLD_NS - 1));
+    try std.testing.expect(ap.expired(slots[0], 100 + ap.HOLD_NS));
+    try std.testing.expect(!ap.probeDue(slots[0], 100 + ap.HOLD_NS));
+    try std.testing.expect(ap.firstForHop(&slots, hop, 100 + ap.HOLD_NS));
+    try std.testing.expectEqual(@as(u64, 3_000_000_000), ap.HOLD_NS);
+    // A full queue: an expired slot is reused, else the oldest frame goes.
+    for (&slots, 0..) |*s, i| s.* = .{ .used = true, .hop = hop, .queued_ns = 1000 + @as(u64, @intCast(i)) * 10 };
+    slots[5].queued_ns = 500;
+    try std.testing.expectEqual(@as(usize, 5), ap.pickSlot(&slots, 1100));
+    try std.testing.expectEqual(@as(usize, 0), ap.pickSlot(&slots, 1000 + ap.HOLD_NS));
+}
+
+fn arpReq(family: u16, ip: [4]u8, flags: u32, dev: []const u8) [kt.arp_policy.ARPREQ_SIZE]u8 {
+    var r: [kt.arp_policy.ARPREQ_SIZE]u8 = @splat(0);
+    std.mem.writeInt(u16, r[0..2], family, .little);
+    @memcpy(r[4..8], &ip);
+    std.mem.writeInt(u32, r[32..36], flags, .little);
+    @memcpy(r[52..][0..dev.len], dev);
+    return r;
+}
+
+test "arp policy: SIOCGARP / SIOCDARP request checks and the answer layout (Linux measured)" {
+    const ap = kt.arp_policy;
+    const gw = [4]u8{ 10, 0, 2, 2 };
+    var r = arpReq(2, gw, 0, "eth0");
+    try std.testing.expectEqual(@as(i64, -1), ap.parseRequest(ap.SIOCDARP, &r, false, true).err);
+    try std.testing.expectEqual(gw, ap.parseRequest(ap.SIOCDARP, &r, true, true).ok.ip);
+    try std.testing.expectEqual(ap.Device.eth, ap.parseRequest(ap.SIOCGARP, &r, false, true).ok.dev);
+    r = arpReq(10, gw, 0, "eth0");
+    try std.testing.expectEqual(@as(i64, -96), ap.parseRequest(ap.SIOCGARP, &r, false, true).err);
+    r = arpReq(2, gw, ap.ATF_NETMASK, "eth0");
+    try std.testing.expectEqual(@as(i64, -22), ap.parseRequest(ap.SIOCGARP, &r, false, true).err);
+    r = arpReq(2, gw, 0, "");
+    try std.testing.expectEqual(@as(i64, -19), ap.parseRequest(ap.SIOCGARP, &r, false, true).err);
+    try std.testing.expectEqual(ap.Device.eth, ap.parseRequest(ap.SIOCDARP, &r, true, true).ok.dev);
+    try std.testing.expectEqual(@as(i64, -19), ap.parseRequest(ap.SIOCDARP, &r, true, false).err);
+    r = arpReq(2, gw, 0, "nosuch0");
+    try std.testing.expectEqual(@as(i64, -19), ap.parseRequest(ap.SIOCGARP, &r, false, true).err);
+    r = arpReq(2, gw, 0, "eth0");
+    try std.testing.expectEqual(@as(i64, -19), ap.parseRequest(ap.SIOCGARP, &r, false, false).err);
+    r = arpReq(2, gw, 0, "lo");
+    try std.testing.expectEqual(ap.Device.lo, ap.parseRequest(ap.SIOCGARP, &r, false, true).ok.dev);
+    r = arpReq(2, gw, ap.ATF_PUBL, "eth0");
+    try std.testing.expectEqual(@as(i64, -6), ap.parseRequest(ap.SIOCGARP, &r, false, true).err);
+    try std.testing.expectEqual(@as(i64, -6), ap.notFound());
+
+    r = arpReq(2, gw, 0, "eth0");
+    @memset(r[16..32], 0xAA);
+    ap.answerGet(&r, .{ 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 });
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, r[16..18], .little));
+    try std.testing.expectEqualSlices(u8, &.{ 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 }, r[18..24]);
+    try std.testing.expectEqual(@as(u8, 0), r[24]);
+    try std.testing.expectEqual(ap.ATF_COM, std.mem.readInt(u32, r[32..36], .little));
+    try std.testing.expectEqualSlices(u8, "eth0", r[52..56]);
+    try std.testing.expectEqualSlices(u8, &gw, r[4..8]);
+}
+
+test "arp: unresolved IPv4 sends queue the frame, ARP replies flush it, the timer re-asks, ioctl wires SIOCGARP/SIOCDARP" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "arp.queueFrame(hop, &send_pkt, frame_len);\n        return true;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "arp.queueFrame(hop, &pkt, frame_len);\n        return 0;") != null);
+    const as = kt.arp_source;
+    const add = std.mem.indexOf(u8, as, "addToCache(sender_ip, sender_mac);\n    flushPending(sender_ip, sender_mac);");
+    try std.testing.expect(add != null);
+    try std.testing.expect(std.mem.indexOf(u8, as, "if (ask) sendArpRequest(hop);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, as, "@memcpy(out[0..6], &mac);\n        _ = nic.sendPacket(&out, n);") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.sched_source, "@import(\"../net/arp.zig\").timerTick();"));
+    const io = kt.ioctl_source;
+    try std.testing.expect(std.mem.indexOf(u8, io, "ap.SIOCGARP, ap.SIOCDARP => {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, io, "if (cmd == ap.SIOCDARP) return if (arp.deleteEntry(r.ip)) 0 else ap.notFound();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, io, "const mac = arp.resolve(r.ip) orelse return ap.notFound();") != null);
 }

@@ -127,6 +127,27 @@ fn netdeviceIoctl(cmd: u64, arg: u64) i64 {
     return 0;
 }
 
+const ap = @import("../net/arp_policy.zig");
+
+/// SIOCGARP / SIOCDARP: look up or remove the neighbour-cache entry of the struct arpreq's protocol address (arp(7)).
+fn arpIoctl(cmd: u64, arg: u64, cur_idx: u32) i64 {
+    if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;
+    var req: [ap.ARPREQ_SIZE]u8 = undefined;
+    if (copy.copyFromUser(&req, @ptrFromInt(arg), ap.ARPREQ_SIZE) != ap.ARPREQ_SIZE) return -14;
+    const admin = @import("../ipc/capability.zig").hasSysCap(cur_idx, "cap_net_admin");
+    const r = switch (ap.parseRequest(cmd, &req, admin, @import("../net/nic.zig").isActive())) {
+        .ok => |ok| ok,
+        .err => |e| return e,
+    };
+    if (r.dev == .lo) return ap.notFound();
+    const arp = @import("../net/arp.zig");
+    if (cmd == ap.SIOCDARP) return if (arp.deleteEntry(r.ip)) 0 else ap.notFound();
+    const mac = arp.resolve(r.ip) orelse return ap.notFound();
+    ap.answerGet(&req, mac);
+    if (copy.copyToUser(@ptrFromInt(arg), &req, ap.ARPREQ_SIZE) != ap.ARPREQ_SIZE) return -14;
+    return 0;
+}
+
 /// SIOCGIFCONF: struct ifconf { int ifc_len; (pad) char *ifc_buf; }. Fills as
 /// many ifreq records as ifc_buf holds and sets ifc_len to the bytes written;
 /// a NULL ifc_buf asks only for the size needed.
@@ -331,6 +352,13 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
                 else => return -25, // ENOTTY
             }
             return netdeviceIoctl(cmd, arg);
+        },
+        ap.SIOCGARP, ap.SIOCDARP => {
+            switch (desc0.fd_type) {
+                .tcp_socket, .udp_socket, .unix_socket, .raw_socket => {},
+                else => return -25, // ENOTTY
+            }
+            return arpIoctl(cmd, arg, cur_idx0);
         },
         FIONBIO => {
             if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;

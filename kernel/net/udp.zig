@@ -970,6 +970,8 @@ pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, data
     // IP_MULTICAST_LOOP and IP_MULTICAST_TTL say.
     const out_if: u8 = if (opts4.mc4_index != 0) opts4.mc4_index else @intCast(@import("bind_addr_policy.zig").NIC_IFINDEX);
     const via_lo = loopback or (group and out_if == lo.IFINDEX);
+    // A next hop with no ARP entry yet: the frame is built and waits for it (arp.queueFrame), and the send succeeds, as in Linux.
+    var wait_hop: ?[4]u8 = null;
     const dst_mac = if (via_lo)
         our_mac
     else if (dst_ip[0] == 255 and dst_ip[1] == 255 and dst_ip[2] == 255 and dst_ip[3] == 255)
@@ -979,9 +981,9 @@ pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, data
     else resolve: {
         // An off-link destination is reached through the gateway, whose MAC is the one to resolve.
         const hop = netif.nextHop4(dst_ip);
-        break :resolve arp.resolve(hop) orelse {
-            arp.sendArpRequest(hop);
-            return false;
+        break :resolve arp.resolve(hop) orelse blk: {
+            wait_hop = hop;
+            break :blk [6]u8{ 0, 0, 0, 0, 0, 0 };
         };
     };
 
@@ -1018,6 +1020,10 @@ pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, data
     // IP_MULTICAST_LOOP: when this host is a member of the group on the outgoing interface (the NIC here) a copy is delivered locally
     // too, arriving on that interface (Linux ip_mc_output, ip_check_mc_rcu, dev_loopback_xmit).
     if (group and !via_lo and opts4.mc4_loop and (mcast.alwaysJoined4(dst_ip) or hostJoined4(dst_ip, out_if))) _ = lo.sendPacketOn(&send_pkt, frame_len, out_if);
+    if (wait_hop) |hop| {
+        arp.queueFrame(hop, &send_pkt, frame_len);
+        return true;
+    }
 
     const ok = if (via_lo) lo.sendPacket(&send_pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.

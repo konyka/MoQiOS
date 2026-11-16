@@ -342,6 +342,7 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
         // SK-79: NDP incomplete Neighbor Solicitation retransmit (RetransTimer).
         const icmpv6 = @import("../net/icmpv6.zig");
         icmpv6.neighborTimerTick(100);
+        @import("../net/arp.zig").timerTick();
         // Drive alarm() / setitimer(ITIMER_REAL) expiration checks
         // v53.46: Bitmap scan — only check tasks with active timers (O(active) vs O(64)).
         {
@@ -692,6 +693,8 @@ fn bspSlowMaintenance() void {
     _ = @import("../net/lo.zig").drain();
     // SK-79: NDP incomplete Neighbor Solicitation retransmit (RetransTimer).
     @import("../net/icmpv6.zig").neighborTimerTick(100);
+    // ARP: ask again for neighbours frames wait on, drop those that never answered.
+    @import("../net/arp.zig").timerTick();
 }
 
 /// J2 fine-grained tick: identical decision structure to `timerTickLegacy`,

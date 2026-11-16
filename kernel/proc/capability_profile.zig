@@ -158,6 +158,10 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // CAP_SETGID so hello373's children take other uids, gids and supplementary groups, and CAP_NET_RAW for its raw socket.
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_setuid = true, .cap_setgid = true, .cap_net_raw = true }, .initial_init = false };
     }
+    if (std.mem.eql(u8, name, "hello375")) {
+        // Neighbour-table test: root, to write ping_group_range for its ping socket, holding CAP_NET_ADMIN for SIOCDARP.
+        return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_admin = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello95") or std.mem.eql(u8, name, "hello114")) {
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_sys_mount = true }, .initial_init = false };
     }
