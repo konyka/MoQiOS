@@ -335,7 +335,8 @@ const TcpTcb = struct {
     shut_rd: bool = false,
     /// A RST answered our SYN: connect() fails with ECONNREFUSED.
     refused: bool = false,
-    /// A send found the ring full (Linux SOCK_NOSPACE): the ACK that frees enough of it sends O_ASYNC owners POLL_OUT once.
+    /// A send found the ring full (Linux SOCK_NOSPACE): the ACK that frees enough of it sends O_ASYNC owners POLL_OUT once. Set under
+    /// the same tcp_lock hold that found the ring full, so an ACK cannot slip in between and miss it.
     async_nospace: bool = false,
     /// local_port was set by bind(); otherwise connect() treats it as stale.
     bound_explicitly: bool = false,
@@ -550,13 +551,6 @@ fn noteWriteSpace(tcb: *TcpTcb) void {
     if (tcp_util.roomUnder(used, sendLimit(tcb)) * 2 < used) return;
     tcb.async_nospace = false;
     noteFasync(tcbIdx(tcb), fcntl_policy.POLL_OUT);
-}
-
-/// A send on TCB `idx` found the send ring full (Linux sets SOCK_NOSPACE there).
-fn markNoSpace(idx: u32) void {
-    const lock_flags = tcp_lock.acquire();
-    defer tcp_lock.release(lock_flags);
-    if (tcbs[idx].active) tcbs[idx].async_nospace = true;
 }
 
 /// Send the queued O_ASYNC notes. Called with tcp_lock released.
@@ -3390,6 +3384,7 @@ pub fn tcpSend(tcb_idx: u32, data: [*]const u8, len: u32) i64 {
     const to_copy = @min(len, free_space);
     ringWrite(&tcb.send_buf, SEND_BUF_SIZE, tcb.send_tail, data, to_copy);
     tcb.send_tail = (tcb.send_tail + to_copy) % SEND_BUF_SIZE;
+    if (to_copy < len) tcb.async_nospace = true;
     const queued: u32 = to_copy;
 
     // Send as much as we can from the buffer
@@ -3441,6 +3436,7 @@ pub fn tcpSendFromUser(tcb_idx: u32, user_addr: u64, len: u32) i64 {
         const to_copy = @min(chunk, free_space);
         ringWrite(&tcb.send_buf, SEND_BUF_SIZE, tcb.send_tail, &stage, to_copy);
         tcb.send_tail = (tcb.send_tail + to_copy) % SEND_BUF_SIZE;
+        if (to_copy < chunk) tcb.async_nospace = true;
         tcp_lock.release(lock_flags);
 
         total += to_copy;
@@ -3897,7 +3893,6 @@ pub fn tcpSendBlocking(tcb_idx: u32, addr: u64, is_user: bool, len: u32, nonbloc
         else
             tcpSendKernel(tcb_idx, @ptrFromInt(addr + done), rest);
         const result: i64 = if (r == 0) -11 else r;
-        if (r >= 0 and r < rest) markNoSpace(tcb_idx);
         switch (np.writeProgress(len, done, result, nonblock)) {
             .done => return len,
             .again => {

@@ -14293,3 +14293,18 @@ test "procfs: /proc/net, /proc/sys, /proc/sys/net and /proc/sys/net/ipv4 are dir
     try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "procfs.subdirEntryAt(desc.proc_file_type, pos)") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "} else if (procfs.subdirByPath(rest)) |dir| {") != null);
 }
+
+test "tcp: a send that finds the ring full sets async_nospace in the same tcp_lock section that queued, so an ACK in between cannot lose POLL_OUT (hello325 G)" {
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "fn markNoSpace(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "markNoSpace(tcb_idx)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ts,
+        \\    tcb.send_tail = (tcb.send_tail + to_copy) % SEND_BUF_SIZE;
+        \\    if (to_copy < len) tcb.async_nospace = true;
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts,
+        \\        tcb.send_tail = (tcb.send_tail + to_copy) % SEND_BUF_SIZE;
+        \\        if (to_copy < chunk) tcb.async_nospace = true;
+        \\        tcp_lock.release(lock_flags);
+    ) != null);
+}

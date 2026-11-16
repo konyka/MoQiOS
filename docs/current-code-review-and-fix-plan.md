@@ -8882,7 +8882,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - `kernel/net/tcp.zig`：
     - 新增 `fasync_queue`（32 项）、`noteFasync`、`flushFasync`：状态机在持有 `tcp_lock` 时记下原因，`handlePacket`、`handlePacketV6` 的 defer 和 `timerTick` 在释放锁之后统一发送。一次处理可以同时通知监听套接字和子连接，不受 `pending_idx` 只记一个的限制。
     - 通知点：SYN_SENT 收到 SYN-ACK 发 POLL_OUT；SYN_RECEIVED 收到 ACK 时 `noteListenerReadable` 在 backlog 里找到监听套接字，发 POLL_IN；三处数据入环和 ESTABLISHED 的 FIN 发 POLL_IN；三处 RST（含 SYN_SENT 的拒绝）和重传超时放弃发 POLL_ERR。
-    - TCB 新增 `async_nospace`：`tcpSendBlocking` 一次没能放下全部数据时置位；ACK 腾出空间、空闲空间不少于仍排队数据的一半时（`sk_stream_wspace >= sk_stream_min_wspace`）清位并发一次 POLL_OUT。
+    - TCB 新增 `async_nospace`：一次发送没能放下全部数据时置位（后来改为在写环的同一次持锁里置位，见「满环发送的 `async_nospace` 与 ACK 的竞争」一节）；ACK 腾出空间、空闲空间不少于仍排队数据的一半时（`sk_stream_wspace >= sk_stream_min_wspace`）清位并发一次 POLL_OUT。
     - `tcpWaitConnected` 拆出 `connectOutcome`：等待被信号打断时先看握手结果，已经建立或失败就返回结果而不是 EINTR。
   - `tests/main.zig`：fcntl policy 单测改为 `tcp_socket` 保留 `O_ASYNC`。
 - 绿灯：目标机定向 SMP=2、SMP=4 各一份 hello325 A–K 全过；`zig build test` 通过。
@@ -9995,3 +9995,11 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 局限：
   1. 目录内容是固定的，只列出 MoQiOS 已有的两个文件；Linux 的 `/proc/net` 和 `/proc/sys` 还有很多别的条目。
   2. `/proc/net` 是目录，不是 Linux 上指向 `self/net` 的符号链接；没有 `/proc/<pid>/net`。
+
+## 补充：满环发送的 `async_nospace` 与 ACK 的竞争（hello325 G 偶发）
+
+- 问题：`tcpSendBlocking` 在 `tcpSend`/`tcpSendFromUser` 返回、`tcp_lock` 已经释放之后，才调用 `markNoSpace` 重新加锁置 `async_nospace`。两次加锁之间，另一个 CPU 上处理的 ACK 可能已经腾出空间并调用了 `noteWriteSpace`；那时标志还没置位，POLL_OUT 不发，之后也不会再发。Linux 在 `sk_stream_wait_memory` 之前、同一次持锁时设置 SOCK_NOSPACE。
+- 修复（`kernel/net/tcp.zig`）：删掉 `markNoSpace`。`tcpSend` 在同一次持锁、发现放不下全部数据时（`to_copy < len`）置 `async_nospace`；`tcpSendFromUser` 在把某一块写进环、发现放不下时（`to_copy < chunk`）在释放锁之前置位。
+- host 测试 "tcp: a send that finds the ring full sets async_nospace in the same tcp_lock section ..."：修复前失败；修复后通过。变异验证：把 `tcpSendFromUser` 的置位条件改成 `false and ...` 时这条测试失败，文件已恢复。
+- 没有 QEMU 红灯：这是两个 CPU 之间的时序窗口，在未修改的内核上无法稳定复现；之前完整 smoke 里 SMP=4 偶尔出现的 hello325 G `hits 0` 可能就是这个窗口（hello330 一节修正过测试自身的清零时机之后仍偶发），修复后是否消失只能靠后续多轮 smoke 观察。
+- 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`。没有在 riscv64、aarch64 上跑 QEMU。
