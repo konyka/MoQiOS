@@ -4325,7 +4325,7 @@ test "a frame the full loopback queue refuses is a loss, not a failed send (hell
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.udp_source, "lo.sendPacket(&send_pkt, frame_len) or lo.dropIsLoss(frame_len)"));
     // Both TCP connect paths keep a loopback connection whose SYN was dropped: the retransmit timer resends it.
     const ts = kt.tcp_source;
-    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!synLostOnLoopback(tcb, netif.isLoopback(remote_ip))) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!synLostOnLoopback(tcb, netif.isLocal4(remote_ip))) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (!synLostOnLoopback(tcb, netif.isLoopbackV6(remote_ip6))) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "    if (!loopback) return false;\n    advanceSndNxt(tcb, SYN, 0);\n    return true;") != null);
 }
@@ -4844,6 +4844,30 @@ test "UDP connect(AF_UNSPEC) clears the peer, its filter and the tied interface 
         try std.testing.expect(std.mem.indexOf(u8, us[d..end], line) != null);
 }
 
+test "IPv4 traffic to our own address goes over lo like 127/8 (hello370)" {
+    const r = kt.route4_policy;
+    const our = [4]u8{ 10, 0, 2, 15 };
+    try std.testing.expect(r.isLocal4(.{ 127, 0, 0, 1 }, our));
+    try std.testing.expect(r.isLocal4(.{ 127, 9, 9, 9 }, our));
+    try std.testing.expect(r.isLocal4(our, our));
+    try std.testing.expect(!r.isLocal4(.{ 10, 0, 2, 2 }, our));
+    try std.testing.expect(!r.isLocal4(.{ 10, 0, 2, 16 }, our));
+    try std.testing.expect(!r.isLocal4(.{ 0, 0, 0, 0 }, our));
+
+    const ts = kt.tcp_source;
+    // TX: segments to our own address are queued on lo; the SYN that lo dropped is resent like any loopback one.
+    try std.testing.expect(std.mem.indexOf(u8, ts, "    const loopback = netif.isLocal4(tcb.remote_ip);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!synLostOnLoopback(tcb, netif.isLocal4(remote_ip))) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "loop_dst = tcb.active and !tcb.is_v6 and netif.isLocal4(tcb.remote_ip);") != null);
+    // RX: the checksum covers the address the segment was sent to, and a segment no connection takes is answered with a RST.
+    try std.testing.expect(std.mem.indexOf(u8, ts, "    const csum_dst = if (netif.isLocal4(dst_ip)) dst_ip else netif.getOurIp();\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "    if (!netif.isLocal4(src_ip) or !netif.isLocal4(dst_ip)) return;\n") != null);
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "    const loopback = netif.isLocal4(dst_ip);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "unreach.shouldReply(netif.isLocal4(src_ip) and netif.isLocal4(dst_ip), false, bound)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "        const via_lo = netif.isLocal4(src_ip);\n") != null);
+}
+
 test "a connect whose neighbor never resolves fails with EHOSTUNREACH after 3 s (hello369)" {
     const rp = kt.tcp_recv_policy;
     // Measured on the monotonic clock: the 100 ms maintenance pass runs late under load, so counting passes stretched 3 s to 7.8 s.
@@ -4884,7 +4908,12 @@ test "IPv4 next hop: an off-link address goes through the gateway, and a SYN wai
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "const hop = netif.nextHop4(tcb.remote_ip);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "arp.resolve(hop) orelse {\n        arp.sendArpRequest(hop);") != null);
-    const lost = std.mem.indexOf(u8, ts, "if (!synLostOnLoopback(tcb, netif.isLoopback(remote_ip))) {").?;
+    // An echo reply goes back the way any other datagram would: through the gateway to an off-link requester, over lo to a loopback one.
+    const is = kt.icmp_source;
+    try std.testing.expect(std.mem.indexOf(u8, is, "const hop = netif.nextHop4(src_ip);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, is, "arp.resolve(hop) orelse {\n                arp.sendArpRequest(hop);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, is, "if (via_lo) _ = lo.sendPacket(&pkt, frame_len) else _ = nic.sendPacket(&pkt, frame_len);") != null);
+    const lost = std.mem.indexOf(u8, ts, "if (!synLostOnLoopback(tcb, netif.isLocal4(remote_ip))) {").?;
     try std.testing.expect(std.mem.indexOfPos(u8, ts, lost, "if (!synAwaitsNeighbor(tcb, arp.resolve(netif.nextHop4(remote_ip)) == null)) {").? <
         std.mem.indexOfPos(u8, ts, lost, "tcb.state = .closed;").?);
 }

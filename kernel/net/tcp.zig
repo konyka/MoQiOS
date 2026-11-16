@@ -1415,7 +1415,7 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16, 
     const tcp_off: u16 = 34;
     @memset(send_pkt[0 .. tcp_off + 20], 0);
     // F2: 127.0.0.0/8 goes to the loopback device — no ARP, no hardware NIC.
-    const loopback = netif.isLoopback(tcb.remote_ip);
+    const loopback = netif.isLocal4(tcb.remote_ip);
     const our_mac = netif.getMac();
     // An off-link peer is reached through the gateway; a missing entry asks for it, and the retransmit timer sends again.
     const hop = netif.nextHop4(tcb.remote_ip);
@@ -2965,7 +2965,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, e
     if (bo.readU16BeAt(data, 16) == 0) return;
     // F2: a loopback segment was checksummed against its 127/8 wire
     // destination, not the primary interface address.
-    const csum_dst = if (netif.isLoopback(dst_ip)) dst_ip else netif.getOurIp();
+    const csum_dst = if (netif.isLocal4(dst_ip)) dst_ip else netif.getOurIp();
     if (tcpChecksum(src_ip, csum_dst, data, tcp_len) != 0) return;
 
     // v53.41: Collect epoll events — notify after releasing tcp_lock to avoid blocking all TCP connections
@@ -3040,7 +3040,7 @@ fn hasListener(port: u16, is_v6: bool, dst_ip: [4]u8, dst_ip6: [16]u8) bool {
 /// reflected reset from a host that may be rate-limited or filtered.
 fn sendLoopbackReset(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16, flags: u8, ack_num: u32, seq_num: u32, payload_len: u32) void {
     if (flags & RST != 0) return;
-    if (!netif.isLoopback(src_ip) or !netif.isLoopback(dst_ip)) return;
+    if (!netif.isLocal4(src_ip) or !netif.isLocal4(dst_ip)) return;
     const reply = tcp_util.resetReply(flags & ACK != 0, ack_num, seq_num, payload_len, flags & SYN != 0, flags & FIN != 0);
     var pkt: [1518]u8 = undefined;
     const tcp_off: u16 = 34;
@@ -3268,7 +3268,7 @@ pub fn tcpConnectSocket(tcb_idx: u32, remote_ip: [4]u8, remote_port: u16) i64 {
     tcb.state = .syn_sent;
 
     if (!sendSegment(tcb, probeEcnSynFlags(true), undefined, 0)) {
-        if (!synLostOnLoopback(tcb, netif.isLoopback(remote_ip))) {
+        if (!synLostOnLoopback(tcb, netif.isLocal4(remote_ip))) {
             if (!synAwaitsNeighbor(tcb, arp.resolve(netif.nextHop4(remote_ip)) == null)) {
                 tcb.state = .closed;
                 return -1;
@@ -3454,7 +3454,7 @@ pub fn tcpSendFromUser(tcb_idx: u32, user_addr: u64, len: u32) i64 {
             defer tcp_lock.release(lock_flags);
             const tcb = &tcbs[tcb_idx];
             if (tcb.active and (tcb.state == .established or tcb.state == .close_wait)) flushSendBuffer(tcb);
-            loop_dst = tcb.active and !tcb.is_v6 and netif.isLoopback(tcb.remote_ip);
+            loop_dst = tcb.active and !tcb.is_v6 and netif.isLocal4(tcb.remote_ip);
         }
         // A 127/8 peer may be blocked in recv waiting for these segments and
         // pumps nothing itself; deliver the loopback queue now, outside

@@ -9786,3 +9786,22 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   2. 只覆盖 connect 的 SYN。已建立的连接下一跳失效时仍按重传超时处理。
   3. ICMP 回显应答仍直接对请求的源地址做 ARP，子网外来的 ping 得不到应答。
   4. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
+
+## 补充：发往本机 IPv4 地址的报文走 lo，ICMP 回显应答经网关（hello370）
+
+- 背景：hello369 的局限 3（ICMP 回显应答直接对请求的源地址做 ARP，子网外来的 ping 得不到应答）。查这条时又发现一个缺陷：IPv4 只把 127/8 当回环，发往网卡自己的地址（10.0.2.15）的报文要对自己做 ARP，而网卡不会应答自己的 ARP，所以 UDP sendto 返回 -1，TCP connect 在 hello369 之后等 ARP 3 秒报 EHOSTUNREACH。IPv6 早已把本机地址送到 lo（`ndp.isOwnAddress`），IPv4 没有对应的处理。
+- Linux 依据：本机地址在 local 路由表里，`ip_route_output` 选中 lo（RTN_LOCAL），报文经 loopback 设备送回本机；`icmp_reply` 和其他输出一样查路由，子网外的请求方经网关。
+- 宿主机实测（Linux，`unshare -rn` 加一对 veth，对端不配地址，方法写在 `user/hello370.c` 文件头）：U、T、R 共 3 项全部通过。另外实测到：ping 套接字（`SOCK_DGRAM`/`IPPROTO_ICMP`）发往 127.0.0.1 和 10.0.2.15 都收到回显应答，id 被换成套接字的端口；MoQiOS 没有 ping 套接字，见局限 1。
+- 红灯（未修改的内核，SMP=2，hello370 临时放在 init 序列最前面）：U、T、R 全部失败。U 的 sendto 是 -1；T 的 connect 是 -113（等 ARP 3 秒，hello369 的行为）；R 也是 -113，不是 -111。第一次红灯时 T 的 connect 失败后测试还去 accept，阻塞住了，之后改为只在 connect 成功时才 accept 和收发。
+- 修复：
+  1. `kernel/net/route4_policy.zig`：新增 `isLocal4(ip, our)`，127/8 或接口自己的地址。`kernel/net/netif.zig` 新增 `isLocal4(ip)`。
+  2. `kernel/net/udp.zig`：`sendToFrom` 对本机地址走 lo；收包时没人接收的本机数据报回端口不可达。
+  3. `kernel/net/tcp.zig`：`sendSegmentSeq` 对本机地址走 lo；SYN 被 lo 丢掉时按回环处理（`synLostOnLoopback`）；发完数据后对本机对端排空 lo 队列；收包时校验和按本机目的地址算；`sendLoopbackReset` 对本机地址也回 RST。
+  4. `kernel/net/icmp.zig`：回显应答对本机请求方走 lo，否则对下一跳（`netif.nextHop4`，子网外是网关）做 ARP，缺条目时向下一跳发 ARP 请求。`kernel/host_test.zig` 新增 `icmp_source`。
+- 测试：hello370（QEMU，3 项）；新增 host 测试「IPv4 traffic to our own address goes over lo like 127/8 (hello370)」；hello368 的 host 测试新增回显应答经下一跳、本机走 lo 的钉住检查，hello369 和 hello368 里对 `synLostOnLoopback` 的钉住行改为 `isLocal4`。
+- 变异验证：`isLocal4` 只认 127/8，hello370 这条 host 测试失败，文件已恢复。
+- 完整 smoke：SMP=2、SMP=1、SMP=4 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello370 PASS。本轮没有跑 riscv64、aarch64。
+- 这次修复带来的局限：
+  1. 没有 ping 套接字（`SOCK_DGRAM`/`IPPROTO_ICMP`），回显应答的新路径只有 host 测试的钉住检查，QEMU 里没有端到端测试：QEMU user 网络不会把外部的 ping 转给客户机。
+  2. 只有一个网卡地址；DHCP 换地址后，换之前建立的、绑在旧地址上的连接不会迁移。
+  3. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。

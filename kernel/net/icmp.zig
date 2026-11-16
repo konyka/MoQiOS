@@ -5,6 +5,7 @@ const ipv4 = @import("ipv4.zig");
 const arp = @import("arp.zig");
 const bo = @import("../lib/byte_order.zig");
 const echo_policy = @import("icmp_echo_policy.zig");
+const lo = @import("lo.zig");
 
 /// Build an ICMP echo reply frame into `out` (which must hold at least 256
 /// bytes) from an echo `req` of `req_len` bytes. Pure: no ARP/NIC side
@@ -80,15 +81,20 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
         // Echo request → send echo reply
         const our_mac = netif.getMac();
 
-        // Resolve MAC for the sender
-        const dst_mac = arp.resolve(src_ip) orelse {
-            arp.sendArpRequest(src_ip);
-            return;
+        // The reply goes back the way any datagram to the requester would: over lo to a 127/8 requester, else to the MAC of the
+        // next hop, which is the gateway for an off-link requester (Linux icmp_reply routes it like any other output).
+        const via_lo = netif.isLocal4(src_ip);
+        const dst_mac = if (via_lo) our_mac else resolve: {
+            const hop = netif.nextHop4(src_ip);
+            break :resolve arp.resolve(hop) orelse {
+                arp.sendArpRequest(hop);
+                return;
+            };
         };
 
         var pkt: [echo_policy.FRAME_BUF_LEN]u8 = undefined;
         const frame_len = buildEchoReplyMtu(&pkt, data, len, netif.getMtu(), dst_ip, src_ip, our_mac, dst_mac);
-        _ = nic.sendPacket(&pkt, frame_len);
+        if (via_lo) _ = lo.sendPacket(&pkt, frame_len) else _ = nic.sendPacket(&pkt, frame_len);
     } else if (icmp_type == 3 and icmp_code == 3) {
         // Port unreachable for a UDP datagram we sent: tell the connected socket.
         const unreach = @import("icmp_unreach_policy.zig");

@@ -612,7 +612,7 @@ pub fn handlePacketOn(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32,
     }
     const bound = enqueue(hdr.dst_port, ip16, hdr.src_port, hdr.dst_port, dst_ip, @splat(0), data[8..][0..actual_payload], false);
     const unreach = @import("icmp_unreach_policy.zig");
-    if (unreach.shouldReply(netif.isLoopback(src_ip) and netif.isLoopback(dst_ip), false, bound)) {
+    if (unreach.shouldReply(netif.isLocal4(src_ip) and netif.isLocal4(dst_ip), false, bound)) {
         sendPortUnreachable(src_ip, dst_ip, data, hdr.udp_len);
     }
 }
@@ -779,7 +779,7 @@ pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, data
 
     const our_mac = netif.getMac();
     // F2: 127.0.0.0/8 goes to the loopback device — no ARP, no hardware NIC.
-    const loopback = netif.isLoopback(dst_ip);
+    const loopback = netif.isLocal4(dst_ip);
     // Limited broadcast has no ARP entry (arp.resolve would fail and nothing
     // would ever be transmitted) — use the broadcast MAC directly. DHCP
     // DISCOVER/REQUEST depend on this.

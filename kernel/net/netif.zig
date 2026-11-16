@@ -49,6 +49,11 @@ pub fn isLoopback(ip: [4]u8) bool {
     return lo.isLoopback(ip);
 }
 
+/// 127/8 or this host's own address (route4_policy.isLocal4): sent over lo, not out of the NIC.
+pub fn isLocal4(ip: [4]u8) bool {
+    return @import("route4_policy.zig").isLocal4(ip, getOurIp());
+}
+
 /// K3: IPv6 loopback classifier — ::1 only (all-zero except the last byte).
 pub fn isLoopbackV6(ip: [16]u8) bool {
     for (ip[0..15]) |b| {

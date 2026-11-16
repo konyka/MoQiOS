@@ -9,3 +9,9 @@ pub fn nextHop4(dst: [4]u8, our: [4]u8, mask: [4]u8, gw: [4]u8) [4]u8 {
     }
     return dst;
 }
+
+/// Whether `ip` is this host's: the 127/8 block or the interface's own address `our`. Traffic to it goes over lo (Linux routes a
+/// local address through the local table to the loopback device), and the loopback-only replies (RST, port unreachable) apply.
+pub fn isLocal4(ip: [4]u8, our: [4]u8) bool {
+    return ip[0] == 127 or @as(u32, @bitCast(ip)) == @as(u32, @bitCast(our));
+}
