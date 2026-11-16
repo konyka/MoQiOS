@@ -45,7 +45,7 @@ pub fn getdents64(fd: u32, buf_ptr: u64, buf_size: u64) i64 {
         return getdents64Tmpfs(desc, buf_ptr, buf_size, cur.fsuid, cur.fsgid, cur.effective_caps);
     }
 
-    // procfs directories (/proc and /proc/<pid>) and the synthetic directories above mount points
+    // procfs directories (/proc, /proc/<pid>, /proc/net, /proc/sys...) and the synthetic directories above mount points
     if (desc.fd_type == .proc_file) {
         if (!@import("procfs.zig").isDir(desc.proc_file_type)) return -20; // ENOTDIR
         if (desc.proc_file_type == .mount_dir) return getdents64MountDir(desc, buf_ptr, buf_size);
@@ -189,7 +189,7 @@ fn getdents64MountDir(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64
     return @intCast(written);
 }
 
-/// List /proc or /proc/<pid>. The descriptor offset is the position in the listing (the entries are produced on demand from the live task
+/// List /proc, /proc/<pid> or one of the fixed directories below /proc (net, sys). The descriptor offset is the position in the listing (the entries are produced on demand from the live task
 /// table, so a process that starts or exits between two calls can shift later positions).
 fn getdents64Proc(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i64 {
     const procfs = @import("procfs.zig");
@@ -200,7 +200,12 @@ fn getdents64Proc(desc: *vfs_mod.FileDescriptor, buf_ptr: u64, buf_size: u64) i6
     var pos: u32 = start;
     var exhausted = false;
     while (true) : (pos += 1) {
-        const e = (if (desc.proc_file_type == .root_dir) procfs.rootEntryAt(pos) else procfs.pidEntryAt(pos)) orelse {
+        const e = (if (desc.proc_file_type == .root_dir)
+            procfs.rootEntryAt(pos)
+        else if (procfs.isSubdir(desc.proc_file_type))
+            procfs.subdirEntryAt(desc.proc_file_type, pos)
+        else
+            procfs.pidEntryAt(pos)) orelse {
             exhausted = true;
             break;
         };

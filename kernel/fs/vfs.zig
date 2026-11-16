@@ -1774,6 +1774,13 @@ pub const FdTable = struct {
                     return -13; // EACCES
                 }
                 pfile = .net_arp;
+            } else if (procfs.subdirByPath(rest)) |dir| {
+                // /proc/net, /proc/sys, /proc/sys/net, /proc/sys/net/ipv4: directories (mode 0555).
+                if (is_writable) {
+                    self.freeFd(slot);
+                    return -21; // EISDIR
+                }
+                pfile = dir;
             } else if (procDirPid(rest)) |dir_pid| {
                 // /proc/<pid>, /proc/<pid>/ and /proc/self: the process's directory.
                 pfile = .pid_dir;

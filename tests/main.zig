@@ -14280,3 +14280,16 @@ test "arp policy: /proc/net/arp lines use arp_format_neigh_entry's layout (Linux
     try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".net_arp => @intCast(@import(\"../net/arp.zig\").formatProc(buf[0..max_len])),") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "} else if (str.eql(rest, \"net/arp\")) {") != null);
 }
+
+test "procfs: /proc/net, /proc/sys, /proc/sys/net and /proc/sys/net/ipv4 are directories listing their files (Linux measured, hello379)" {
+    const pf = kt.procfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, pf, "const root_dirs = [_][]const u8{ \"net\", \"sys\" };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".net_dir => &.{.{ .name = \"arp\", .dtype = DT_REG }},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_dir => &.{.{ .name = \"net\", .dtype = DT_DIR }},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_net_dir => &.{.{ .name = \"ipv4\", .dtype = DT_DIR }},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{.{ .name = \"ping_group_range\", .dtype = DT_REG }},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, "return file == .root_dir or file == .pid_dir or file == .mount_dir or file == .fd_dir or isSubdir(file);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, "if (std.mem.eql(u8, body, \"sys/net/ipv4\")) return .sys_ipv4_dir;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "procfs.subdirEntryAt(desc.proc_file_type, pos)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "} else if (procfs.subdirByPath(rest)) |dir| {") != null);
+}

@@ -9871,7 +9871,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：前三份 SMP=2 失败（见修复 6–8）。最终构建：SMP=2、SMP=1、SMP=4 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello373 PASS。本轮没有跑 riscv64、aarch64。
 - 这次修复带来的局限：
   1. 范围是全局的，不分网络命名空间（MoQiOS 没有网络命名空间）；也不做 gid 映射。
-  2. 没有 `/proc/sys` 目录树，只能按完整路径打开这一个文件，getdents 列不出来。
+  2. 没有 `/proc/sys` 目录树，只能按完整路径打开这一个文件，getdents 列不出来。（已在 hello379 一节解决）
   3. IPv6 ping 套接字仍是 EPROTONOSUPPORT（已在 hello374 一节解决）；下一跳没解析时 ping 发送返回 EAGAIN；不处理发往 ping 套接字的 ICMP 错误。
   4. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
 
@@ -9977,5 +9977,21 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异验证：地址列宽从 16 改成 15，这条 host 测试失败，文件已恢复。
 - 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello378 PASS。没有在 riscv64、aarch64 上跑 QEMU。
 - 局限：
-  1. 没有 `/proc/net` 目录列表，只能按完整路径打开这个文件。
+  1. 没有 `/proc/net` 目录列表，只能按完整路径打开这个文件。（已在 hello379 一节解决）
   2. 只列网卡上的条目，设备一律写 eth0。没有不完整条目（Linux 会列出 flags 0x0、MAC 全 0 的条目）。
+
+## 补充：/proc/net 与 /proc/sys 目录（hello379）
+
+- 问题：`/proc/net`、`/proc/sys`、`/proc/sys/net`、`/proc/sys/net/ipv4` 打开都返回 ENOENT，`/proc` 的列表里也没有 net 和 sys。里面的 `arp` 和 `ping_group_range` 只能按完整路径打开，`ls`、`sysctl -a`、按目录遍历的程序都看不到它们。
+- 宿主机实测（Linux，普通用户，方法写在 `user/hello379.c` 文件头）：R、N、S、F、E 共 5 项全部通过。`/proc` 把 sys 列为目录，net 列为符号链接（DT_LNK，指向 self/net）；这几个目录 fstat 都是 S_IFDIR，带不带结尾斜杠都能打开；目录下不存在的名字是 ENOENT，对 `/proc/net/arp` 调用 getdents64 是 ENOTDIR。
+- 红灯（未修改的内核，SMP=2，hello379 临时放在 init 序列最前面）：R、N、S 失败，目录打开返回 ENOENT，`/proc` 列表里没有 net 和 sys；F、E 通过。
+- 修复：
+  1. `procfs` 新增 `net_dir`、`sys_dir`、`sys_net_dir`、`sys_ipv4_dir`、`isSubdir`、`subdirByPath`、`subdirEntryAt`，`isDir` 包含这四个目录，`rootEntryAt` 在文件之后列出 net 和 sys。
+  2. `getdents64Proc` 对这四个目录调用 `subdirEntryAt`。
+  3. `vfs` 打开 `/proc/<目录>` 时识别它们，以写方式打开返回 EISDIR。
+- 测试：hello379（QEMU，5 项）。新增 host 测试「procfs: /proc/net, /proc/sys, /proc/sys/net and /proc/sys/net/ipv4 are directories listing their files (Linux measured, hello379)」，钉住目录内容和分派代码。
+- 变异验证：getdents 不再把这四个目录交给 `subdirEntryAt` 时，这条 host 测试失败，文件已恢复。
+- 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello379 PASS。没有在 riscv64、aarch64 上跑 QEMU。
+- 局限：
+  1. 目录内容是固定的，只列出 MoQiOS 已有的两个文件；Linux 的 `/proc/net` 和 `/proc/sys` 还有很多别的条目。
+  2. `/proc/net` 是目录，不是 Linux 上指向 `self/net` 的符号链接；没有 `/proc/<pid>/net`。

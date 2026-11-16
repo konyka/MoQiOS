@@ -40,10 +40,61 @@ pub const ProcFile = enum(u8) {
     mount_dir,
     /// /proc/self/fd (or /proc/<pid>/fd): one entry per open descriptor of the process, named by its number.
     fd_dir,
+    /// /proc/net, /proc/sys, /proc/sys/net and /proc/sys/net/ipv4: the directories above the files MoQiOS has there, listed by
+    /// getdents64 (subdirEntryAt).
+    net_dir,
+    sys_dir,
+    sys_net_dir,
+    sys_ipv4_dir,
 };
 
 pub fn isDir(file: ProcFile) bool {
-    return file == .root_dir or file == .pid_dir or file == .mount_dir or file == .fd_dir;
+    return file == .root_dir or file == .pid_dir or file == .mount_dir or file == .fd_dir or isSubdir(file);
+}
+
+/// One of the fixed directories below /proc (net, sys and the sys tree).
+pub fn isSubdir(file: ProcFile) bool {
+    return file == .net_dir or file == .sys_dir or file == .sys_net_dir or file == .sys_ipv4_dir;
+}
+
+/// The fixed directory a path below /proc names ("net", "sys/net/", ...), or null.
+pub fn subdirByPath(rest: []const u8) ?ProcFile {
+    var body = rest;
+    if (body.len > 1 and body[body.len - 1] == '/') body = body[0 .. body.len - 1];
+    if (std.mem.eql(u8, body, "net")) return .net_dir;
+    if (std.mem.eql(u8, body, "sys")) return .sys_dir;
+    if (std.mem.eql(u8, body, "sys/net")) return .sys_net_dir;
+    if (std.mem.eql(u8, body, "sys/net/ipv4")) return .sys_ipv4_dir;
+    return null;
+}
+
+const SubEntry = struct { name: []const u8, dtype: u8 };
+
+fn subdirChildren(dir: ProcFile) []const SubEntry {
+    return switch (dir) {
+        .net_dir => &.{.{ .name = "arp", .dtype = DT_REG }},
+        .sys_dir => &.{.{ .name = "net", .dtype = DT_DIR }},
+        .sys_net_dir => &.{.{ .name = "ipv4", .dtype = DT_DIR }},
+        .sys_ipv4_dir => &.{.{ .name = "ping_group_range", .dtype = DT_REG }},
+        else => &.{},
+    };
+}
+
+/// The entry at position `pos` of one of the fixed directories ("." and "..", then its children), or null past the end.
+pub fn subdirEntryAt(dir: ProcFile, pos: u32) ?DirEntry {
+    var e: DirEntry = .{};
+    if (pos == 0) {
+        e.set(".", DT_DIR);
+        return e;
+    }
+    if (pos == 1) {
+        e.set("..", DT_DIR);
+        return e;
+    }
+    const kids = subdirChildren(dir);
+    if (pos - 2 >= kids.len) return null;
+    e.set(kids[pos - 2].name, kids[pos - 2].dtype);
+    return e;
 }
 
 /// One directory entry for getdents64: a name and its DT_* type.
@@ -65,6 +116,8 @@ const DT_LNK: u8 = 10;
 
 /// The files /proc lists besides the per-process directories, in listing order.
 const root_files = [_][]const u8{ "meminfo", "cpuinfo", "uptime", "version", "loadavg", "filesystems", "stat", "sched_stats", "vma_stats", "irqtime", "irqwindow", "lostats", "tcpstats" };
+/// The fixed directories /proc lists after its files.
+const root_dirs = [_][]const u8{ "net", "sys" };
 /// What a /proc/<pid> directory lists.
 const pid_files = [_][]const u8{ "status", "maps", "stat", "cmdline", "rss", "comm", "fd" };
 
@@ -80,11 +133,15 @@ pub fn rootEntryAt(pos: u32) ?DirEntry {
         e.set("..", DT_DIR);
         return e;
     }
-    const files: u32 = root_files.len;
-    if (pos - 2 < files) {
+    if (pos - 2 < root_files.len) {
         e.set(root_files[pos - 2], DT_REG);
         return e;
     }
+    if (pos - 2 - root_files.len < root_dirs.len) {
+        e.set(root_dirs[pos - 2 - root_files.len], DT_DIR);
+        return e;
+    }
+    const files: u32 = root_files.len + root_dirs.len;
     if (pos - 2 == files) {
         e.set("self", DT_LNK);
         return e;
@@ -171,7 +228,7 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
         .tcpstats => generateTcpStats(buf, max_len),
         .ping_group_range => @intCast(@import("../net/udp.zig").pingGroupRead(buf[0..@min(max_len, 32)])),
         .net_arp => @intCast(@import("../net/arp.zig").formatProc(buf[0..max_len])),
-        .root_dir, .pid_dir, .mount_dir, .fd_dir => 0,
+        .root_dir, .pid_dir, .mount_dir, .fd_dir, .net_dir, .sys_dir, .sys_net_dir, .sys_ipv4_dir => 0,
     };
 }
 

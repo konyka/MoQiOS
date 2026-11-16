@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello378`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello379`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -373,6 +373,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello376 | IPv6 下一跳未解析时帧挂起等邻居通告：连到 [fec0::99]:9 的套接字名字在 fec0::/64 里（A，最多等 10 秒）；发往路由器 fec0::2 的回显请求返回 16 并收到应答（R）；发往 [fec0::3]:9 的 UDP 返回 16（U）；发往不应答的 fec0::99 时 sendto、connected send、ping 都返回 16，4 秒内收不到任何东西，SO_ERROR 0（Q） |
 | hello377 | SIOCSARP 设置 ARP 条目：带 ATF_PERM 建永久条目，SIOCGARP 报 flags 0x6、MAC 和族 1，发往它的 UDP 返回 16 且条目还在（P）；不带 ATF_PERM 是普通条目（0x2），再次设置换 MAC，永久条目被重设为普通条目（T）；没有 ATF_COM 时新条目 EINVAL、已有永久条目保留 MAC 变成普通条目（C）；不给设备名时同链路地址装到网卡上，链路外地址 ENETUNREACH（N）；硬件族 0 取设备类型，族 772 和 eth0 不符 EINVAL，未知设备 ENODEV，AF_INET6 EPFNOSUPPORT，lo 上族 1 EINVAL（E）；uid 1000 的子进程 SIOCSARP EPERM、SIOCGARP 仍可读（U）；SIOCDARP 删掉（D） |
 | hello378 | `/proc/net/arp`：只读打开，开头是 Linux 的表头（H）；SIOCSARP 设的永久条目 10.0.2.77 那一行 flags 0x6、MAC 正确、硬件类型 0x1（P），普通条目 10.0.2.78 那一行 flags 0x2（O），每 37 字节读一次，验证从文件中间开始的读；SIOCDARP 后两行都消失（D）；以写方式打开被拒绝（W） |
+| hello379 | `/proc` 子目录：`/proc` 列出 sys（目录）和 net（目录或符号链接）（R）；`/proc/net` 和 `/proc/net/` 的 fstat 是 S_IFDIR，列出 arp（普通文件）（N）；`/proc/sys` 列出 net，`/proc/sys/net` 列出 ipv4，`/proc/sys/net/ipv4/` 列出 ping_group_range（S）；ping_group_range 仍可读出两个数（F）；`/proc/sys/nosuch`、`/proc/net/nosuch` 是 ENOENT，对 `/proc/net/arp` 调用 getdents64 是 ENOTDIR（E） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
