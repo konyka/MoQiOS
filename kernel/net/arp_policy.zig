@@ -109,8 +109,8 @@ pub const Request = struct { ip: [4]u8, dev: Device };
 
 /// arp_ioctl's checks before the table is looked at: CAP_NET_ADMIN for SIOCDARP, an AF_INET protocol address, no netmask or
 /// "don't publish" flag without ATF_PUBL, a netmask (when given) of /32, and a device that exists (arp_req_dev_by_name; SIOCGARP
-/// needs one named, SIOCDARP without a name means the NIC, the only interface an off-host address routes through). Proxy entries
-/// (ATF_PUBL) are not kept, so asking about one is ENXIO.
+/// needs one named, SIOCDARP without a name means the NIC, the only interface an off-host address routes through). SIOCGARP looks
+/// in the neighbour cache only, so asking about a proxy entry (ATF_PUBL) is ENXIO; SIOCDARP with ATF_PUBL goes to parsePublic.
 pub fn parseRequest(cmd: u64, req: *const [ARPREQ_SIZE]u8, net_admin: bool, nic_active: bool) union(enum) { ok: Request, err: i64 } {
     if (cmd == SIOCDARP and !net_admin) return .{ .err = EPERM };
     if (readU16(req, 0) != 2) return .{ .err = EPFNOSUPPORT };
@@ -143,8 +143,8 @@ pub const SetRequest = struct {
 
 /// SIOCSARP (arp_ioctl, arp_req_dev, arp_req_set): CAP_NET_ADMIN, an AF_INET address and the netmask rules shared with the other
 /// requests; the device is the named one (ENODEV when unknown; hardware family 0 then means the device's own type, and with ATF_COM
-/// another family is EINVAL) or, unnamed, the one the address routes through (ENETUNREACH off-link). Proxy entries (ATF_PUBL) are
-/// not kept (EOPNOTSUPP). The hardware family has to be the device type: ARPHRD_ETHER on the NIC, ARPHRD_LOOPBACK on lo.
+/// another family is EINVAL) or, unnamed, the one the address routes through (ENETUNREACH off-link). Requests with ATF_PUBL are
+/// handled by parsePublic before this is called; here they are EOPNOTSUPP. The hardware family has to be the device type: ARPHRD_ETHER on the NIC, ARPHRD_LOOPBACK on lo.
 pub fn parseSet(req: *const [ARPREQ_SIZE]u8, net_admin: bool, nic_active: bool, route: Route) union(enum) { ok: SetRequest, err: i64 } {
     if (!net_admin) return .{ .err = EPERM };
     if (readU16(req, 0) != 2) return .{ .err = EPFNOSUPPORT };
@@ -177,6 +177,72 @@ pub fn parseSet(req: *const [ARPREQ_SIZE]u8, net_admin: bool, nic_active: bool, 
         .mac = if ((flags & ATF_COM) != 0) req[18..24].* else null,
         .perm = (flags & ATF_PERM) != 0,
     } };
+}
+
+// ── proxy entries (ATF_PUBL) ──
+
+/// The device a proxy entry is for: one device, or every device (no device named, Linux pneigh with dev NULL).
+pub const ProxyDev = enum { any, lo, eth };
+
+pub const ProxyEntry = struct { ip: [4]u8, dev: ProxyDev };
+
+/// Whether the arpreq asks for a proxy entry: SIOCSARP and SIOCDARP then go to arp_req_set_public / arp_req_delete_public.
+pub fn isPublic(req: *const [ARPREQ_SIZE]u8) bool {
+    return (readU32(req, 32) & ATF_PUBL) != 0;
+}
+
+/// SIOCSARP / SIOCDARP with ATF_PUBL (arp_ioctl, arp_req_dev, arp_req_set_public, arp_req_delete_public): CAP_NET_ADMIN, an AF_INET
+/// address and a netmask of /32 or 0 (anything else EINVAL; no ATF_NETMASK means /32). The device is the named one (ENODEV when
+/// unknown); unnamed it is every device, except that SIOCSARP with ATF_COM picks the device whose hardware address the request
+/// carries (dev_getbyhwaddr; none is ENODEV). A /32 netmask names a proxy entry; netmask 0 switches the device's proxy_arp setting
+/// (on for SIOCSARP, off for SIOCDARP) and keeps no entry. `nic_mac` is the NIC's address.
+pub fn parsePublic(cmd: u64, req: *const [ARPREQ_SIZE]u8, net_admin: bool, nic_active: bool, nic_mac: [6]u8) union(enum) {
+    entry: ProxyEntry,
+    toggle: ProxyDev,
+    err: i64,
+} {
+    if (!net_admin) return .{ .err = EPERM };
+    if (readU16(req, 0) != 2) return .{ .err = EPFNOSUPPORT };
+    const flags = readU32(req, 32);
+    var mask: u32 = 0xffff_ffff;
+    if ((flags & ATF_NETMASK) != 0) {
+        mask = readU32(req, 40);
+        if (mask != 0 and mask != 0xffff_ffff) return .{ .err = EINVAL };
+    }
+    var dev: ProxyDev = .any;
+    if (req[52] != 0) {
+        dev = switch (deviceByName(req[52..68], nic_active)) {
+            .lo => .lo,
+            .eth => .eth,
+            .none => return .{ .err = ENODEV },
+        };
+    } else if (cmd == SIOCSARP and (flags & ATF_COM) != 0) {
+        const family = readU16(req, 16);
+        const ha: [6]u8 = req[18..24].*;
+        if (family == ARPHRD_ETHER and nic_active and std.mem.eql(u8, &ha, &nic_mac)) {
+            dev = .eth;
+        } else if (family == ARPHRD_LOOPBACK and std.mem.allEqual(u8, &ha, 0)) {
+            dev = .lo;
+        } else return .{ .err = ENODEV };
+    }
+    if (mask == 0) return .{ .toggle = dev };
+    return .{ .entry = .{ .ip = req[4..8].*, .dev = dev } };
+}
+
+/// One /proc/net/arp line for a proxy entry, as arp_format_pneigh_entry prints it: the device type (0 for every device), flags
+/// ATF_PUBL|ATF_PERM, a zero MAC and the device name ("*" for every device). Returns the bytes written, 0 when it does not fit.
+pub fn formatProxyLine(out: []u8, ip: [4]u8, dev: ProxyDev) usize {
+    const hatype: u16 = switch (dev) {
+        .any => 0,
+        .lo => ARPHRD_LOOPBACK,
+        .eth => ARPHRD_ETHER,
+    };
+    const name: []const u8 = switch (dev) {
+        .any => "*",
+        .lo => "lo",
+        .eth => "eth0",
+    };
+    return formatLine(out, ip, hatype, ATF_PUBL | ATF_PERM, @splat(0), name);
 }
 
 fn devType(dev: Device) u16 {
@@ -225,14 +291,17 @@ pub const PROC_HEADER = "IP address       HW type     Flags       HW address    
 /// One /proc/net/arp line, as arp_format_neigh_entry prints it: "%-16s 0x%-10x0x%-10x%-17s     *        %s\n" (address, hardware
 /// type, the SIOCGARP flags, MAC, device). Returns the bytes written to `out`, 0 when it does not fit.
 pub fn formatProcLine(out: []u8, ip: [4]u8, mac: [6]u8, perm: bool, dev: []const u8) usize {
+    return formatLine(out, ip, ARPHRD_ETHER, if (perm) ATF_COM | ATF_PERM else ATF_COM, mac, dev);
+}
+
+fn formatLine(out: []u8, ip: [4]u8, hatype: u16, flags: u32, mac: [6]u8, dev: []const u8) usize {
     var tmp: [128]u8 = undefined;
     var addr: [16]u8 = undefined;
     const a = std.fmt.bufPrint(&addr, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) catch return 0;
     var hw: [17]u8 = undefined;
     const h = std.fmt.bufPrint(&hw, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{ mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] }) catch return 0;
-    const flags: u32 = if (perm) ATF_COM | ATF_PERM else ATF_COM;
     var ty: [12]u8 = undefined;
-    const t = std.fmt.bufPrint(&ty, "{x}", .{ARPHRD_ETHER}) catch return 0;
+    const t = std.fmt.bufPrint(&ty, "{x}", .{hatype}) catch return 0;
     var fl: [12]u8 = undefined;
     const f = std.fmt.bufPrint(&fl, "{x}", .{flags}) catch return 0;
     const line = std.fmt.bufPrint(&tmp, "{s: <16} 0x{s: <10}0x{s: <10}{s: <17}     *        {s}\n", .{ a, t, f, h, dev }) catch return 0;

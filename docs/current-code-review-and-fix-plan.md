@@ -9917,7 +9917,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：SMP=2、SMP=1 各一份通过，SMP=4 跑了三份（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello375 PASS。三份 SMP=4 里 hello375 都是 PASS：第一份只有已记录的偶发项 hello286 M（19/20）失败；第二份是 hello108「RT task lost the CPU to reaping」（已记录为宿主机负载引起的偶发失败）和 hello325 G（`hits 0`，hello330 一节记录过同样的现象）失败；第三份通过。riscv64、aarch64 的 `zig build -Darch=...` 返回 0，没有在这两个架构上跑 QEMU。
 - 局限：
   1. TCP 和 IPv6（`sendToV6From`、`icmpv6.sendFrom6`）的发送不挂起。TCP 由重传补发；IPv6 已在 hello376 一节解决。
-  2. 不支持代理条目（ATF_PUBL）；静态条目已在 hello377 一节解决，`/proc/net/arp` 已在 hello378 一节解决。
+  2. 不支持代理条目（ATF_PUBL）；静态条目已在 hello377 一节解决，`/proc/net/arp` 已在 hello378 一节解决。（代理条目后来在 hello382 一节解决）
   3. ARP 缓存仍是 16 项、没有老化，满了不加新条目（满表问题后来在 hello380 一节修复：新邻居占用最久没更新的普通条目）。
 
 ## 补充：IPv6 帧等待邻居通告（hello376）
@@ -9952,7 +9952,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 变异验证：ATF_PERM 不再隐含 ATF_COM、硬件族 0 不再取设备类型，两种情况下这条 host 测试都失败，文件已恢复。
 - 完整 smoke：SMP=2、SMP=1 各一份通过，SMP=4 跑了三份（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello377 PASS。三份 SMP=4 里 hello377 都是 PASS：第一份只有 hello325 G 失败，第二份只有 hello286 M 失败（都是已记录的偶发项），第三份通过。SMP=2 那份在 hello341 测试修正之前构建，第三份 SMP=4 和 SMP=1 带着修正。没有在 riscv64、aarch64 上跑 QEMU。
 - 局限：
-  1. 不支持代理条目（ATF_PUBL，EOPNOTSUPP）；`/proc/net/arp` 已在 hello378 一节解决。
+  1. 不支持代理条目（ATF_PUBL，EOPNOTSUPP）；`/proc/net/arp` 已在 hello378 一节解决。（代理条目后来在 hello382 一节解决）
   2. 没有 ATF_COM 时 Linux 留下的不完整邻居，MoQiOS 不建，SIOCGARP 返回 ENXIO。
   3. ARP 缓存仍是 16 项、没有老化；永久条目不会被挤掉，全满时新条目 ENOBUFS（Linux 也是）。
 
@@ -10031,3 +10031,20 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 局限：
   1. 上限仍是固定的 64，不按 optmem 计算；Linux 上的上限高得多。
   2. 仍不发 MLD 报告，没有源过滤；e1000 仍以组播混杂方式接收所有组播帧。
+
+## 补充：代理 ARP 条目（ATF_PUBL，hello382）
+
+- 问题：SIOCSARP 带 ATF_PUBL 返回 EOPNOTSUPP；SIOCDARP 带 ATF_PUBL 被当成普通条目删除，netmask 0（设备的 proxy_arp 开关）也不认。`arp -s ... pub` 和 `ip neigh add proxy` 一类配置在 MoQiOS 上失败。
+- 宿主机实测（`user/hello382.c`，root、`unshare -n`、hello375 的 veth 环境）：P、N、M、C、D 共 5 项通过。要点：代理条目和邻居缓存是两张表，同一地址可以同时有；SIOCGARP 只查邻居缓存；不指名设备的代理条目对所有设备有效，`/proc/net/arp` 里 type 为 0、设备为 `*`；删除不存在的代理条目是 ENOENT（普通条目是 ENXIO）。
+- 修复：
+  1. `arp_policy` 新增 `ProxyDev`、`ProxyEntry`、`isPublic`、`parsePublic`（`entry` / `toggle` / `err`）和 `formatProxyLine`；`formatProcLine` 改成调用共用的 `formatLine`，输出不变。
+  2. `arp.zig` 新增 16 项代理表、`setProxy`（重复设置返回 0，满了 ENOBUFS）、`deleteProxy`；`formatProc` 在缓存条目之后列出代理条目。
+  3. `ioctl.zig` 的 `arpIoctl` 对带 ATF_PUBL 的 SIOCSARP、SIOCDARP 先走 `parsePublic`；netmask 0 返回 0，不建条目。
+  4. `capability_profile` 给 hello382 设 uid 1000 和 CAP_NET_ADMIN。
+- host 测试 "arp policy: SIOCSARP / SIOCDARP with ATF_PUBL keep proxy entries per device ..."：实现前编译失败（没有 `isPublic`）；实现后通过。变异验证：`parsePublic` 不识别 netmask 0 时测试失败，文件已恢复。原有测试里 parseSet 对 ATF_PUBL 返回 EOPNOTSUPP 的断言仍成立（这条路径现在不会被 ioctl 走到）。
+- 红灯：未修改的内核（只保留启动配置）上定向 SMP=2，P、N、M、C、D 全部失败：设置返回 -95（EOPNOTSUPP），删除返回 -6。绿灯：5 项全部通过。
+- 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello382 PASS。没有在 riscv64、aarch64 上跑 QEMU。
+- 局限：
+  1. 不代答：Linux 只在转发、且代理地址经另一块设备出去时回 ARP 应答；MoQiOS 只有一块网卡、不转发，代理条目只保存、列出和删除。
+  2. proxy_arp 开关（netmask 0）被接受但不保存，也没有 `/proc/sys/net/ipv4/conf/*/proxy_arp`。
+  3. 代理表固定 16 项；不支持 ATF_DONTPUB 的区别处理。

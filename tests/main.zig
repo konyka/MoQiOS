@@ -14352,3 +14352,51 @@ test "mcast policy: one IPv6 socket can join 64 groups, the 65th is ENOMEM (Linu
     }
     try std.testing.expectEqual(@as(u8, 0), mem.n);
 }
+
+test "arp policy: SIOCSARP / SIOCDARP with ATF_PUBL keep proxy entries per device, a zero netmask toggles proxy ARP (Linux measured, hello382)" {
+    const ap = kt.arp_policy;
+    const ip: [4]u8 = .{ 10, 0, 2, 90 };
+    const mac: [6]u8 = .{ 0x52, 0x54, 0, 0x12, 0x34, 0x56 };
+    var r = arpReq(2, ip, ap.ATF_PUBL, "eth0");
+    try std.testing.expect(ap.isPublic(&r));
+    try std.testing.expect(!ap.isPublic(&arpReq(2, ip, ap.ATF_COM, "eth0")));
+    try std.testing.expectEqual(ap.ProxyDev.eth, ap.parsePublic(ap.SIOCSARP, &r, true, true, mac).entry.dev);
+    try std.testing.expectEqual(@as(i64, -1), ap.parsePublic(ap.SIOCSARP, &r, false, true, mac).err);
+    try std.testing.expectEqual(ap.ProxyDev.lo, ap.parsePublic(ap.SIOCDARP, &arpReq(2, ip, ap.ATF_PUBL, "lo"), true, true, mac).entry.dev);
+    try std.testing.expectEqual(@as(i64, -19), ap.parsePublic(ap.SIOCSARP, &arpReq(2, ip, ap.ATF_PUBL, "nope0"), true, true, mac).err);
+    try std.testing.expectEqual(@as(i64, -96), ap.parsePublic(ap.SIOCSARP, &arpReq(10, ip, ap.ATF_PUBL, "eth0"), true, true, mac).err);
+    // No device: every device; with ATF_COM the device whose address is the given MAC (dev_getbyhwaddr), else ENODEV.
+    r = arpReq(2, ip, ap.ATF_PUBL, "");
+    try std.testing.expectEqual(ap.ProxyDev.any, ap.parsePublic(ap.SIOCSARP, &r, true, true, mac).entry.dev);
+    r = arpSetReq(ip, ap.ATF_PUBL | ap.ATF_COM, 1, "");
+    try std.testing.expectEqual(@as(i64, -19), ap.parsePublic(ap.SIOCSARP, &r, true, true, mac).err);
+    @memcpy(r[18..24], &mac);
+    try std.testing.expectEqual(ap.ProxyDev.eth, ap.parsePublic(ap.SIOCSARP, &r, true, true, mac).entry.dev);
+    try std.testing.expectEqual(@as(i64, -19), ap.parsePublic(ap.SIOCSARP, &r, true, false, mac).err);
+    // ATF_NETMASK: /32 is an entry, 0 the per-device proxy_arp switch, anything else EINVAL.
+    r = arpReq(2, ip, ap.ATF_PUBL | ap.ATF_NETMASK, "eth0");
+    std.mem.writeInt(u32, r[40..44], 0x00ff_ffff, .little);
+    try std.testing.expectEqual(@as(i64, -22), ap.parsePublic(ap.SIOCSARP, &r, true, true, mac).err);
+    std.mem.writeInt(u32, r[40..44], 0, .little);
+    try std.testing.expect(ap.parsePublic(ap.SIOCSARP, &r, true, true, mac) == .toggle);
+    try std.testing.expect(ap.parsePublic(ap.SIOCDARP, &r, true, true, mac) == .toggle);
+    std.mem.writeInt(u32, r[40..44], 0xffff_ffff, .little);
+    try std.testing.expect(ap.parsePublic(ap.SIOCSARP, &r, true, true, mac) == .entry);
+
+    // /proc/net/arp: arp_format_pneigh_entry's line, flags ATF_PUBL|ATF_PERM, a zero MAC, the device type and name or 0 and "*".
+    var buf: [160]u8 = undefined;
+    var n = ap.formatProxyLine(&buf, ip, .eth);
+    try std.testing.expectEqualStrings("10.0.2.90        0x1         0xc         00:00:00:00:00:00     *        eth0\n", buf[0..n]);
+    n = ap.formatProxyLine(&buf, ip, .any);
+    try std.testing.expectEqualStrings("10.0.2.90        0x0         0xc         00:00:00:00:00:00     *        *\n", buf[0..n]);
+    n = ap.formatProxyLine(&buf, ip, .lo);
+    try std.testing.expectEqualStrings("10.0.2.90        0x304       0xc         00:00:00:00:00:00     *        lo\n", buf[0..n]);
+
+    const as = kt.arp_source;
+    try std.testing.expect(std.mem.indexOf(u8, as, "pub fn setProxy(ip: [4]u8, dev: policy.ProxyDev) i64 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, as, "pub fn deleteProxy(ip: [4]u8, dev: policy.ProxyDev) bool {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, as, "n += policy.formatProxyLine(out[n..], e.ip, e.dev);") != null);
+    const io = kt.ioctl_source;
+    try std.testing.expect(std.mem.indexOf(u8, io, "if (cmd != ap.SIOCGARP and ap.isPublic(&req)) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, io, "return if (arp.deleteProxy(p.ip, p.dev)) 0 else -2; // ENOENT") != null);
+}

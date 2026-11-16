@@ -190,13 +190,53 @@ pub fn setEntry(ip: [4]u8, mac: ?[6]u8, perm: bool) i64 {
     return 0;
 }
 
-/// /proc/net/arp: the header and one line per entry (arp_policy.formatProcLine), all on the NIC. Returns the bytes written.
+/// Proxy entries (SIOCSARP with ATF_PUBL, Linux pneigh_create): addresses kept per device, or for every device. They are listed in
+/// /proc/net/arp and removed with SIOCDARP ATF_PUBL; with one NIC and no forwarding nothing is answered for them (arp_process only
+/// proxies an address that routes out another device).
+const MAX_PROXY_ENTRIES: usize = 16;
+const ProxySlot = struct { used: bool = false, ip: [4]u8 = .{ 0, 0, 0, 0 }, dev: policy.ProxyDev = .any };
+var proxy: [MAX_PROXY_ENTRIES]ProxySlot = @splat(.{});
+
+fn findProxyLocked(ip: [4]u8, dev: policy.ProxyDev) ?usize {
+    for (0..MAX_PROXY_ENTRIES) |i| {
+        if (proxy[i].used and proxy[i].dev == dev and @as(u32, @bitCast(proxy[i].ip)) == @as(u32, @bitCast(ip))) return i;
+    }
+    return null;
+}
+
+/// Add the proxy entry (`ip`, `dev`); setting one that exists succeeds and changes nothing. ENOBUFS when the table is full.
+pub fn setProxy(ip: [4]u8, dev: policy.ProxyDev) i64 {
+    const saved = arp_lock.acquire();
+    defer arp_lock.release(saved);
+    if (findProxyLocked(ip, dev) != null) return 0;
+    for (0..MAX_PROXY_ENTRIES) |i| {
+        if (!proxy[i].used) {
+            proxy[i] = .{ .used = true, .ip = ip, .dev = dev };
+            return 0;
+        }
+    }
+    return -105; // ENOBUFS
+}
+
+/// Remove the proxy entry (`ip`, `dev`); false when there is none (pneigh_delete's ENOENT).
+pub fn deleteProxy(ip: [4]u8, dev: policy.ProxyDev) bool {
+    const saved = arp_lock.acquire();
+    defer arp_lock.release(saved);
+    const i = findProxyLocked(ip, dev) orelse return false;
+    proxy[i].used = false;
+    return true;
+}
+
+/// /proc/net/arp: the header, one line per cache entry (arp_policy.formatProcLine, all on the NIC), then one per proxy entry
+/// (arp_policy.formatProxyLine), as arp_seq_show walks the neighbours before the proxy table. Returns the bytes written.
 pub fn formatProc(out: []u8) usize {
     var snap: [MAX_ARP_ENTRIES]ArpEntry = undefined;
+    var psnap: [MAX_PROXY_ENTRIES]ProxySlot = undefined;
     {
         const saved = arp_lock.acquire();
         defer arp_lock.release(saved);
         snap = cache;
+        psnap = proxy;
     }
     if (out.len < policy.PROC_HEADER.len) return 0;
     @memcpy(out[0..policy.PROC_HEADER.len], policy.PROC_HEADER);
@@ -204,6 +244,10 @@ pub fn formatProc(out: []u8) usize {
     for (snap) |e| {
         if (!e.valid) continue;
         n += policy.formatProcLine(out[n..], e.ip, e.mac, e.perm, "eth0");
+    }
+    for (psnap) |e| {
+        if (!e.used) continue;
+        n += policy.formatProxyLine(out[n..], e.ip, e.dev);
     }
     return n;
 }
