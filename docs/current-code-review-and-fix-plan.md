@@ -9917,7 +9917,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：SMP=2、SMP=1 各一份通过，SMP=4 跑了三份（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello375 PASS。三份 SMP=4 里 hello375 都是 PASS：第一份只有已记录的偶发项 hello286 M（19/20）失败；第二份是 hello108「RT task lost the CPU to reaping」（已记录为宿主机负载引起的偶发失败）和 hello325 G（`hits 0`，hello330 一节记录过同样的现象）失败；第三份通过。riscv64、aarch64 的 `zig build -Darch=...` 返回 0，没有在这两个架构上跑 QEMU。
 - 局限：
   1. TCP 和 IPv6（`sendToV6From`、`icmpv6.sendFrom6`）的发送不挂起。TCP 由重传补发；IPv6 已在 hello376 一节解决。
-  2. 不支持 SIOCSARP（静态条目和代理条目），也没有 `/proc/net/arp`。
+  2. 不支持代理条目（ATF_PUBL），也没有 `/proc/net/arp`；静态条目已在 hello377 一节解决。
   3. ARP 缓存仍是 16 项、没有老化，满了不加新条目。
 
 ## 补充：IPv6 帧等待邻居通告（hello376）
@@ -9937,3 +9937,28 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 局限：
   1. TCP 的发送不挂起，由重传补发。
   2. IPv6 队列不按邻居失败（NDP 3 次请求无应答）立即清空，而是等 3 秒作废。
+
+## 补充：SIOCSARP 设置 ARP 条目（hello377）
+
+- 问题：只有 SIOCGARP 和 SIOCDARP，没有 SIOCSARP，用户态无法往邻居缓存里放静态条目（`ip neigh add`、`arp -s`、网络测试脚本会用）。核对 Linux 源码（`net/ipv4/arp.c` 的 `arp_ioctl`、`arp_req_dev`、`arp_req_dev_by_name`、`arp_req_set`）时还发现三处此前没注意到的行为，都按实测写进了测试。
+- 宿主机实测（Linux，root 在 `unshare --map-auto --map-root-user -n` 里，veth 环境同 hello375，方法写在 `user/hello377.c` 文件头）：P、T、C、N、E、U、D 共 7 项全部通过。要点：硬件族写 0 时取设备自己的类型（lo 是 ARPHRD_LOOPBACK 772），且带 ATF_COM 时硬件族必须等于设备类型（lo 上的 AF_INET 请求仍被接受，只是不留条目）；没给设备名时按 `RT_SCOPE_LINK` 的路由选（本机地址到 lo，同链路到网卡，都没有是 ENETUNREACH），此时硬件族必须是 1；没有 ATF_COM 时新条目 EINVAL，Linux 会留一个不完整的邻居。第一版测试以为硬件族 0 是 EINVAL，实测是接受，按实测改了测试。Linux 的 ATF_PUBL 会建代理条目（实测返回 0），MoQiOS 不支持代理 ARP，返回 EOPNOTSUPP，测试不覆盖这一项。
+- 红灯（未修改的内核，只加了 hello377 的启动配置，SMP=2，hello377 临时放在 init 序列最前面）：7 项全部失败，SIOCSARP 返回 ENOTTY（-25）。
+- 修复：
+  1. `arp_policy` 新增 `parseSet`、`Route`、`SetRequest`、`ARPHRD_LOOPBACK`、`ATF_PERM`；`answerGet` 多一个 `perm` 参数。
+  2. `arp.zig` 的条目加 `perm` 字段（收到的 ARP 不再改动永久条目），新增 `lookupEntry` 和 `setEntry`（装了 MAC 就 `flushPending`）。
+  3. `ioctl.zig` 的 SIOCSARP 分支按本机地址 / 同链路 / 其他选路由，lo 上接受但不保留。
+  4. `capability_profile` 给 hello377 设 uid 0、gid 0、CAP_NET_ADMIN 和 CAP_SETUID（子进程 setuid(1000) 后验证 EPERM）。
+- 测试：hello377（QEMU，7 项）。新增 host 测试「arp policy: SIOCSARP checks, permanent entries and the device / hardware family rules (Linux measured, hello377)」；hello375 的 host 测试跟着 `answerGet` 的新参数更新。
+- 变异验证：ATF_PERM 不再隐含 ATF_COM、硬件族 0 不再取设备类型，两种情况下这条 host 测试都失败，文件已恢复。
+- 完整 smoke：SMP=2、SMP=1 各一份通过，SMP=4 跑了三份（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello377 PASS。三份 SMP=4 里 hello377 都是 PASS：第一份只有 hello325 G 失败，第二份只有 hello286 M 失败（都是已记录的偶发项），第三份通过。SMP=2 那份在 hello341 测试修正之前构建，第三份 SMP=4 和 SMP=1 带着修正。没有在 riscv64、aarch64 上跑 QEMU。
+- 局限：
+  1. 不支持代理条目（ATF_PUBL，EOPNOTSUPP）；没有 `/proc/net/arp`。
+  2. 没有 ATF_COM 时 Linux 留下的不完整邻居，MoQiOS 不建，SIOCGARP 返回 ENXIO。
+  3. ARP 缓存仍是 16 项、没有老化；永久条目不会被挤掉，全满时新条目 ENOBUFS（Linux 也是）。
+
+### hello341 C 的竞争（测试修正）
+
+- 现象：hello376 那次提交（a2df92a）的 CI（43841161673）`smoke-qemu` SMP=2 失败，只有 hello341 C 一项：`connect again -114` 而 accept 已经拿到连接（6）。之前的会话记录里出现过同样的失败。
+- 原因：C 的循环每轮先调用一次 `connect`（握手还没完成，返回 EALREADY，-114），再调用 `accept`。握手如果恰好在这两次调用之间完成，accept 成功、循环结束，`again` 停在 -114，检查就失败了。这是测试本身的竞争，内核行为没有问题：连接确实完成了。
+- 修正：`user/hello341.c` 在 accept 成功之后，再问几次发起方的 `connect`，直到它返回 0 或 EISCONN（-106）。检查条件不变。宿主机 Linux 上 4 项全部通过。内核没有改动。
+- 同一轮的完整 smoke 里，SMP=4 有两份失败，hello377 在这两份里都是 PASS：一份是 hello325 G（`hits 0`，hello330 一节记录过），另一份是 hello286 M（19/20，已记录的偶发项）。

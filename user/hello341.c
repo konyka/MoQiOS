@@ -91,6 +91,11 @@ int main(void) {
         if (again != 0 && again != -106) again = connect4(c, 18871);
         a = accept_(l);
     }
+    /* The handshake can finish between that iteration's connect (EALREADY) and accept: ask the connecting side again. */
+    for (int i = 0; i < 100 && a >= 0 && again != 0 && again != -106; i++) {
+        again = connect4(c, 18871);
+        if (again != 0 && again != -106) pump();
+    }
     snprintf(msg, sizeof msg, "C: the connection completes (connect again %ld) and is accepted (%ld)", again, a);
     check((again == 0 || again == -106) && a >= 0, msg);
 

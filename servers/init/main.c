@@ -493,6 +493,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello374"); /* IPv6 ping sockets */
     run_test("hello375"); /* IPv4 frames wait for ARP; SIOCGARP/SIOCDARP */
     run_test("hello376"); /* IPv6 frames wait for Neighbor Discovery */
+    run_test("hello377"); /* SIOCSARP: permanent and ordinary ARP entries */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

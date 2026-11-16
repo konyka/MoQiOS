@@ -10,6 +10,8 @@ const ArpEntry = struct {
     ip: [4]u8,
     mac: [6]u8,
     valid: bool,
+    /// Set with SIOCSARP and ATF_PERM (NUD_PERMANENT): received ARP no longer changes it.
+    perm: bool = false,
 };
 
 var cache: [MAX_ARP_ENTRIES]ArpEntry = @splat(.{ .ip = @splat(0), .mac = @splat(0), .valid = false });
@@ -144,6 +146,61 @@ pub fn handlePacket(data: [*]const u8, len: u32) void {
     }
 }
 
+pub const Entry = struct { mac: [6]u8, perm: bool };
+
+/// The entry for `ip` with its state (SIOCGARP).
+pub fn lookupEntry(ip: [4]u8) ?Entry {
+    const saved = arp_lock.acquire();
+    defer arp_lock.release(saved);
+    for (0..MAX_ARP_ENTRIES) |i| {
+        if (cache[i].valid and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) return .{ .mac = cache[i].mac, .perm = cache[i].perm };
+    }
+    return null;
+}
+
+/// SIOCSARP (arp_req_set → neigh_update with NEIGH_UPDATE_F_ADMIN): install `mac` for `ip`, permanent or not, replacing what is
+/// there; with no MAC given the entry keeps its MAC and only its state changes, and a new entry cannot be made (EINVAL). A full
+/// table gives up its first non-permanent entry; when every entry is permanent the request fails with ENOBUFS. Frames waiting for
+/// `ip` go out once it has a MAC.
+pub fn setEntry(ip: [4]u8, mac: ?[6]u8, perm: bool) i64 {
+    var installed: ?[6]u8 = null;
+    {
+        const saved = arp_lock.acquire();
+        defer arp_lock.release(saved);
+        var slot: ?usize = null;
+        for (0..MAX_ARP_ENTRIES) |i| {
+            if (cache[i].valid and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) slot = i;
+        }
+        if (slot == null) {
+            const m = mac orelse return -22; // EINVAL
+            for (0..MAX_ARP_ENTRIES) |i| {
+                if (!cache[i].valid) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot == null) {
+                for (0..MAX_ARP_ENTRIES) |i| {
+                    if (!cache[i].perm) {
+                        slot = i;
+                        break;
+                    }
+                }
+            }
+            const i = slot orelse return -105; // ENOBUFS
+            cache[i] = .{ .ip = ip, .mac = m, .valid = true, .perm = perm };
+            installed = m;
+        } else {
+            const i = slot.?;
+            if (mac) |m| cache[i].mac = m;
+            cache[i].perm = perm;
+            installed = cache[i].mac;
+        }
+    }
+    if (installed) |m| flushPending(ip, m);
+    return 0;
+}
+
 pub fn resolve(ip: [4]u8) ?[6]u8 {
     const saved = arp_lock.acquire();
     defer arp_lock.release(saved);
@@ -189,14 +246,14 @@ fn addToCache(ip: [4]u8, mac: [6]u8) void {
     // Update existing entry
     for (0..MAX_ARP_ENTRIES) |i| {
         if (cache[i].valid and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) {
-            cache[i].mac = mac;
+            if (!cache[i].perm) cache[i].mac = mac;
             return;
         }
     }
     // Add new entry
     for (0..MAX_ARP_ENTRIES) |i| {
         if (!cache[i].valid) {
-            cache[i] = .{ .ip = ip, .mac = mac, .valid = true };
+            cache[i] = .{ .ip = ip, .mac = mac, .valid = true, .perm = false };
             return;
         }
     }

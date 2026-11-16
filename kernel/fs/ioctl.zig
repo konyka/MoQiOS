@@ -129,21 +129,33 @@ fn netdeviceIoctl(cmd: u64, arg: u64) i64 {
 
 const ap = @import("../net/arp_policy.zig");
 
-/// SIOCGARP / SIOCDARP: look up or remove the neighbour-cache entry of the struct arpreq's protocol address (arp(7)).
+/// SIOCGARP / SIOCDARP / SIOCSARP: look up, remove or set the neighbour-cache entry of the struct arpreq's protocol address (arp(7)).
 fn arpIoctl(cmd: u64, arg: u64, cur_idx: u32) i64 {
     if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;
     var req: [ap.ARPREQ_SIZE]u8 = undefined;
     if (copy.copyFromUser(&req, @ptrFromInt(arg), ap.ARPREQ_SIZE) != ap.ARPREQ_SIZE) return -14;
     const admin = @import("../ipc/capability.zig").hasSysCap(cur_idx, "cap_net_admin");
+    const arp = @import("../net/arp.zig");
+    if (cmd == ap.SIOCSARP) {
+        const netif = @import("../net/netif.zig");
+        const ip4: [4]u8 = req[4..8].*;
+        const route: ap.Route = if (netif.isLocal4(ip4)) .lo else if (@as(u32, @bitCast(netif.nextHop4(ip4))) == @as(u32, @bitCast(ip4))) .link else .unreachable_;
+        const sr = switch (ap.parseSet(&req, admin, @import("../net/nic.zig").isActive(), route)) {
+            .ok => |ok| ok,
+            .err => |e| return e,
+        };
+        // lo resolves nothing (NUD_NOARP): the request is accepted and nothing is kept, as Linux shows.
+        if (sr.dev == .lo) return 0;
+        return arp.setEntry(sr.ip, sr.mac, sr.perm);
+    }
     const r = switch (ap.parseRequest(cmd, &req, admin, @import("../net/nic.zig").isActive())) {
         .ok => |ok| ok,
         .err => |e| return e,
     };
     if (r.dev == .lo) return ap.notFound();
-    const arp = @import("../net/arp.zig");
     if (cmd == ap.SIOCDARP) return if (arp.deleteEntry(r.ip)) 0 else ap.notFound();
-    const mac = arp.resolve(r.ip) orelse return ap.notFound();
-    ap.answerGet(&req, mac);
+    const e = arp.lookupEntry(r.ip) orelse return ap.notFound();
+    ap.answerGet(&req, e.mac, e.perm);
     if (copy.copyToUser(@ptrFromInt(arg), &req, ap.ARPREQ_SIZE) != ap.ARPREQ_SIZE) return -14;
     return 0;
 }
@@ -353,7 +365,7 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
             }
             return netdeviceIoctl(cmd, arg);
         },
-        ap.SIOCGARP, ap.SIOCDARP => {
+        ap.SIOCGARP, ap.SIOCDARP, ap.SIOCSARP => {
             switch (desc0.fd_type) {
                 .tcp_socket, .udp_socket, .unix_socket, .raw_socket => {},
                 else => return -25, // ENOTTY

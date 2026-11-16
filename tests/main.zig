@@ -14161,7 +14161,7 @@ test "arp policy: SIOCGARP / SIOCDARP request checks and the answer layout (Linu
 
     r = arpReq(2, gw, 0, "eth0");
     @memset(r[16..32], 0xAA);
-    ap.answerGet(&r, .{ 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 });
+    ap.answerGet(&r, .{ 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 }, false);
     try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, r[16..18], .little));
     try std.testing.expectEqualSlices(u8, &.{ 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 }, r[18..24]);
     try std.testing.expectEqual(@as(u8, 0), r[24]);
@@ -14180,9 +14180,9 @@ test "arp: unresolved IPv4 sends queue the frame, ARP replies flush it, the time
     try std.testing.expect(std.mem.indexOf(u8, as, "@memcpy(out[0..6], &mac);\n        _ = nic.sendPacket(&out, n);") != null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.sched_source, "@import(\"../net/arp.zig\").timerTick();"));
     const io = kt.ioctl_source;
-    try std.testing.expect(std.mem.indexOf(u8, io, "ap.SIOCGARP, ap.SIOCDARP => {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, io, "ap.SIOCGARP, ap.SIOCDARP, ap.SIOCSARP => {") != null);
     try std.testing.expect(std.mem.indexOf(u8, io, "if (cmd == ap.SIOCDARP) return if (arp.deleteEntry(r.ip)) 0 else ap.notFound();") != null);
-    try std.testing.expect(std.mem.indexOf(u8, io, "const mac = arp.resolve(r.ip) orelse return ap.notFound();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, io, "const e = arp.lookupEntry(r.ip) orelse return ap.notFound();") != null);
 }
 
 test "ndp queue: unresolved IPv6 sends queue the frame and ndp.update flushes it; slots expire after the hold time (hello376)" {
@@ -14205,4 +14205,63 @@ test "ndp queue: unresolved IPv6 sends queue the frame and ndp.update flushes it
     const qs = kt.ndp_queue_source;
     try std.testing.expect(std.mem.indexOf(u8, qs, "@memcpy(out[0..6], &mac);\n        _ = nic.sendPacket(&out, n);") != null);
     try std.testing.expect(std.mem.indexOf(u8, qs, "if (!pending[i].used or policy.expired(pending[i], now) or !sameAddr(pending[i].hop, ip)) continue;") != null);
+}
+
+fn arpSetReq(ip: [4]u8, flags: u32, hwfam: u16, dev: []const u8) [kt.arp_policy.ARPREQ_SIZE]u8 {
+    var r = arpReq(2, ip, flags, dev);
+    std.mem.writeInt(u16, r[16..18], hwfam, .little);
+    @memcpy(r[18..24], &[_]u8{ 2, 0, 0, 0, 0, 0x77 });
+    return r;
+}
+
+test "arp policy: SIOCSARP checks, permanent entries and the device / hardware family rules (Linux measured, hello377)" {
+    const ap = kt.arp_policy;
+    const ip = [4]u8{ 10, 0, 2, 77 };
+    var r = arpSetReq(ip, ap.ATF_COM | ap.ATF_PERM, 1, "eth0");
+    try std.testing.expectEqual(@as(i64, -1), ap.parseSet(&r, false, true, .link).err);
+    const ok = ap.parseSet(&r, true, true, .link).ok;
+    try std.testing.expect(ok.perm);
+    try std.testing.expectEqual(ap.Device.eth, ok.dev);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 0, 0, 0, 0, 0x77 }, &ok.mac.?);
+    // ATF_PERM alone implies ATF_COM; no ATF_COM means no MAC.
+    r = arpSetReq(ip, ap.ATF_PERM, 1, "eth0");
+    try std.testing.expect(ap.parseSet(&r, true, true, .link).ok.mac != null);
+    r = arpSetReq(ip, 0, 1, "eth0");
+    try std.testing.expect(ap.parseSet(&r, true, true, .link).ok.mac == null);
+    try std.testing.expect(!ap.parseSet(&r, true, true, .link).ok.perm);
+    // Hardware family 0 takes the named device's type; another one is EINVAL, also on lo (ARPHRD_LOOPBACK).
+    r = arpSetReq(ip, ap.ATF_COM, 0, "eth0");
+    try std.testing.expectEqual(ap.Device.eth, ap.parseSet(&r, true, true, .link).ok.dev);
+    r = arpSetReq(ip, ap.ATF_COM, 772, "eth0");
+    try std.testing.expectEqual(@as(i64, -22), ap.parseSet(&r, true, true, .link).err);
+    r = arpSetReq(ip, ap.ATF_COM, 1, "lo");
+    try std.testing.expectEqual(@as(i64, -22), ap.parseSet(&r, true, true, .link).err);
+    r = arpSetReq(ip, ap.ATF_COM, 0, "lo");
+    try std.testing.expectEqual(ap.Device.lo, ap.parseSet(&r, true, true, .link).ok.dev);
+    r = arpSetReq(ip, ap.ATF_COM, 1, "nope0");
+    try std.testing.expectEqual(@as(i64, -19), ap.parseSet(&r, true, true, .link).err);
+    var r6 = arpSetReq(ip, ap.ATF_COM, 1, "eth0");
+    std.mem.writeInt(u16, r6[0..2], 10, .little);
+    try std.testing.expectEqual(@as(i64, -96), ap.parseSet(&r6, true, true, .link).err);
+    // Unnamed: the route decides; hardware family 0 there is EINVAL (no device type to borrow).
+    r = arpSetReq(ip, ap.ATF_COM, 1, "");
+    try std.testing.expectEqual(ap.Device.eth, ap.parseSet(&r, true, true, .link).ok.dev);
+    try std.testing.expectEqual(@as(i64, -101), ap.parseSet(&r, true, true, .unreachable_).err);
+    try std.testing.expectEqual(@as(i64, -101), ap.parseSet(&r, true, false, .link).err);
+    r = arpSetReq(ip, ap.ATF_COM, 0, "");
+    try std.testing.expectEqual(@as(i64, -22), ap.parseSet(&r, true, true, .link).err);
+    r = arpSetReq(ip, ap.ATF_COM | ap.ATF_PUBL, 1, "eth0");
+    try std.testing.expectEqual(@as(i64, -95), ap.parseSet(&r, true, true, .link).err);
+
+    r = arpReq(2, ip, 0, "eth0");
+    ap.answerGet(&r, .{ 2, 0, 0, 0, 0, 0x77 }, true);
+    try std.testing.expectEqual(ap.ATF_COM | ap.ATF_PERM, std.mem.readInt(u32, r[32..36], .little));
+
+    const as = kt.arp_source;
+    try std.testing.expect(std.mem.indexOf(u8, as, "if (!cache[i].perm) cache[i].mac = mac;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, as, "const m = mac orelse return -22; // EINVAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, as, "if (installed) |m| flushPending(ip, m);") != null);
+    const io = kt.ioctl_source;
+    try std.testing.expect(std.mem.indexOf(u8, io, "return arp.setEntry(sr.ip, sr.mac, sr.perm);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, io, "ap.answerGet(&req, e.mac, e.perm);") != null);
 }

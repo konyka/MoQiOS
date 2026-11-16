@@ -63,10 +63,12 @@ pub const SIOCDARP: u64 = 0x8953;
 pub const SIOCGARP: u64 = 0x8954;
 pub const SIOCSARP: u64 = 0x8955;
 pub const ATF_COM: u32 = 0x02;
+pub const ATF_PERM: u32 = 0x04;
 pub const ATF_PUBL: u32 = 0x08;
 pub const ATF_NETMASK: u32 = 0x20;
 pub const ATF_DONTPUB: u32 = 0x40;
 pub const ARPHRD_ETHER: u16 = 1;
+pub const ARPHRD_LOOPBACK: u16 = 772;
 /// struct arpreq: arp_pa (sockaddr) @0, arp_ha @16, arp_flags @32, arp_netmask @36, arp_dev[16] @52.
 pub const ARPREQ_SIZE: usize = 68;
 
@@ -75,6 +77,8 @@ const ENXIO: i64 = -6;
 const EINVAL: i64 = -22;
 const ENODEV: i64 = -19;
 const EPFNOSUPPORT: i64 = -96;
+const EOPNOTSUPP: i64 = -95;
+const ENETUNREACH: i64 = -101;
 
 pub const Device = enum { none, lo, eth };
 
@@ -101,6 +105,61 @@ pub fn parseRequest(cmd: u64, req: *const [ARPREQ_SIZE]u8, net_admin: bool, nic_
     return .{ .ok = .{ .ip = req[4..8].*, .dev = dev } };
 }
 
+/// Where an address without a device name routes (arp_req_dev: ip_route_output with RT_SCOPE_LINK): this host's own addresses to
+/// lo, on-link ones to the NIC; anything else has no link route.
+pub const Route = enum { lo, link, unreachable_ };
+
+pub const SetRequest = struct {
+    ip: [4]u8,
+    dev: Device,
+    /// The MAC to install; null without ATF_COM (the entry keeps the MAC it has, and a new one cannot be made).
+    mac: ?[6]u8,
+    /// ATF_PERM: NUD_PERMANENT, which received ARP no longer changes.
+    perm: bool,
+};
+
+/// SIOCSARP (arp_ioctl, arp_req_dev, arp_req_set): CAP_NET_ADMIN, an AF_INET address and the netmask rules shared with the other
+/// requests; the device is the named one (ENODEV when unknown; hardware family 0 then means the device's own type, and with ATF_COM
+/// another family is EINVAL) or, unnamed, the one the address routes through (ENETUNREACH off-link). Proxy entries (ATF_PUBL) are
+/// not kept (EOPNOTSUPP). The hardware family has to be the device type: ARPHRD_ETHER on the NIC, ARPHRD_LOOPBACK on lo.
+pub fn parseSet(req: *const [ARPREQ_SIZE]u8, net_admin: bool, nic_active: bool, route: Route) union(enum) { ok: SetRequest, err: i64 } {
+    if (!net_admin) return .{ .err = EPERM };
+    if (readU16(req, 0) != 2) return .{ .err = EPFNOSUPPORT };
+    var flags = readU32(req, 32);
+    if ((flags & ATF_PUBL) == 0 and (flags & (ATF_NETMASK | ATF_DONTPUB)) != 0) return .{ .err = EINVAL };
+    if ((flags & ATF_NETMASK) != 0) {
+        const mask = readU32(req, 40);
+        if (mask != 0 and mask != 0xffff_ffff) return .{ .err = EINVAL };
+    }
+    var family = readU16(req, 16);
+    var dev: Device = .none;
+    if (req[52] != 0) {
+        dev = deviceByName(req[52..68], nic_active);
+        if (dev == .none) return .{ .err = ENODEV };
+        if (family == 0) family = devType(dev);
+        if ((flags & ATF_COM) != 0 and family != devType(dev)) return .{ .err = EINVAL };
+    } else if ((flags & ATF_PUBL) == 0) {
+        dev = switch (route) {
+            .lo => .lo,
+            .link => if (nic_active) .eth else return .{ .err = ENETUNREACH },
+            .unreachable_ => return .{ .err = ENETUNREACH },
+        };
+    }
+    if ((flags & ATF_PUBL) != 0) return .{ .err = EOPNOTSUPP };
+    if (family != devType(dev)) return .{ .err = EINVAL };
+    if ((flags & ATF_PERM) != 0) flags |= ATF_COM;
+    return .{ .ok = .{
+        .ip = req[4..8].*,
+        .dev = dev,
+        .mac = if ((flags & ATF_COM) != 0) req[18..24].* else null,
+        .perm = (flags & ATF_PERM) != 0,
+    } };
+}
+
+fn devType(dev: Device) u16 {
+    return if (dev == .lo) ARPHRD_LOOPBACK else ARPHRD_ETHER;
+}
+
 fn deviceByName(name: []const u8, nic_active: bool) Device {
     const n = std.mem.indexOfScalar(u8, name, 0) orelse name.len;
     if (std.mem.eql(u8, name[0..n], "lo")) return .lo;
@@ -108,14 +167,15 @@ fn deviceByName(name: []const u8, nic_active: bool) Device {
     return .none;
 }
 
-/// The SIOCGARP answer for an entry with MAC `mac` on `dev`: the hardware address (family ARPHRD_ETHER) and ATF_COM; the request's
-/// device name stays. lo keeps no entries (NUD_NOARP), so nothing is found there.
-pub fn answerGet(req: *[ARPREQ_SIZE]u8, mac: [6]u8) void {
+/// The SIOCGARP answer for an entry with MAC `mac` on `dev`: the hardware address (family ARPHRD_ETHER) and ATF_COM, with ATF_PERM
+/// too for a permanent entry (arp_state_to_flags); the request's device name stays. lo keeps no entries (NUD_NOARP), so nothing is
+/// found there.
+pub fn answerGet(req: *[ARPREQ_SIZE]u8, mac: [6]u8, perm: bool) void {
     @memset(req[16..32], 0);
     req[16] = @truncate(ARPHRD_ETHER);
     req[17] = 0;
     @memcpy(req[18..24], &mac);
-    req[32] = @truncate(ATF_COM);
+    req[32] = @truncate(if (perm) ATF_COM | ATF_PERM else ATF_COM);
     req[33] = 0;
     req[34] = 0;
     req[35] = 0;
