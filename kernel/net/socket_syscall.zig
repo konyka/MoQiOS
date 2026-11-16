@@ -232,7 +232,7 @@ fn socketCreate(domain: u32, sock_type: u32) i64 {
             const idx = udp.ensurePortExclusive(port, false, t.fsuid);
             switch (udp_util.scanAction(idx)) {
                 .skip_in_use => continue,
-                .abort_full => return -1,
+                .abort_full => return -105, // ENOBUFS
                 .use => {
                     // v53.49: Use allocFd() O(1) bitmap instead of duplicated linear scan
                     const fd_slot = t.fd_table.allocFd() orelse {
@@ -277,7 +277,7 @@ fn socketCreate(domain: u32, sock_type: u32) i64 {
                 const idx6 = udp.ensurePortExclusive(port6, true, t.fsuid);
                 switch (udp_util.scanAction(idx6)) {
                     .skip_in_use => continue,
-                    .abort_full => return -1,
+                    .abort_full => return -105, // ENOBUFS
                     .use => {
                         const fd_slot6 = t.fd_table.allocFd() orelse {
                             udp.releasePort(port6); // roll back the port registration

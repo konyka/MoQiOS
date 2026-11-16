@@ -92,6 +92,19 @@ pub fn pickReceiverConnected(cands: []const Candidate, src_ip: [16]u8, src_port:
 
 // ── autobind (inet_autobind, __udp_disconnect) ──
 
+/// Largest discriminator a socket key carries (bits 16..30; bit 31 marks a ping socket, see udp.PING_KEY).
+pub const MAX_DISC: u16 = 0x7fff;
+
+/// The smallest discriminator not in `used` (the ones the sockets already on a port hold), so every key stays unique however many
+/// sockets share the port. Null when all MAX_DISC + 1 are taken.
+pub fn firstFreeDisc(used: []const u16) ?u16 {
+    var d: u32 = 0;
+    while (d <= MAX_DISC) : (d += 1) {
+        if (std.mem.indexOfScalar(u16, used, @intCast(d)) == null) return @intCast(d);
+    }
+    return null;
+}
+
 pub const EPHEMERAL_LOW: u16 = 49152;
 pub const EPHEMERAL_HIGH: u16 = 65535;
 

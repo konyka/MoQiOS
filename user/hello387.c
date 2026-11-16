@@ -65,7 +65,7 @@ static long sendmsg_(long s, const void *b, int n, const unsigned char *to) {
 }
 static long name_(long s, unsigned char *a) { int l = 16; return syscall3(126, s, (long)a, (long)&l); }
 static long peer_(long s, unsigned char *a) { int l = 16; return syscall3(127, s, (long)a, (long)&l); }
-static long setint(long s, int lvl, int opt, int v) { return syscall5(134, s, lvl, opt, (long)&v, 4); }
+static long setint(long s, int lvl, int opt, int v) { return syscall5(132, s, lvl, opt, (long)&v, 4); }
 static long getint(long s, int opt) { int v = -1; int l = 4; long r = syscall5(133, s, 1, opt, (long)&v, (long)&l); return r < 0 ? r : v; }
 static long put_(const char *p, const char *t) { long fd = syscall3(9, (long)p, 1, 0); if (fd < 0) return fd; long r = syscall3(1, fd, (long)t, strlen(t)); syscall1(11, fd); return r; }
 static long get_(const char *p, char *b, int n) { long fd = syscall3(9, (long)p, 0, 0); if (fd < 0) return fd; long r = syscall3(10, fd, (long)b, n); syscall1(11, fd); return r; }

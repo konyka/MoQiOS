@@ -10108,7 +10108,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 红灯：未修改的内核（只保留启动配置）上定向 SMP=2，A、R、D、C、B、W、V 失败：新套接字报 49152、断开不退、bind 端口 0 报 0。E 在旧内核上本来就成立（它只要求失败后仍有端口）。
 - 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello385 PASS；SMP=2 那份构建时 hello366 的注释还没改（只改注释，行为不变），SMP=4、SMP=1 带着改动。riscv64、aarch64 交叉构建通过，没有在这两个架构上跑 QEMU。
 - 局限：
-  1. 端口号在 socket() 时就预留，所以未命名的套接字仍占着 `MAX_PORTS`（64）里的一个槽；Linux 的 sk 不占端口哈希表的位置。
+  1. 端口号在 socket() 时就预留，所以未命名的套接字仍占着 `MAX_PORTS`（64）里的一个槽；Linux 的 sk 不占端口哈希表的位置。（后来在 hello388 一节把表放大到 256 个槽，未命名套接字仍占槽）
   2. 未命名套接字预留的编号只是「首选」：被别人 bind 走之后第一次命名会换一个端口，和 Linux 相同，但 MoQiOS 换端口时要改描述符的键，Linux 只在哈希表里移动。
 
 ## 补充：绑定 127/8 的套接字不能经网卡发送（hello386）
@@ -10151,3 +10151,24 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 只有 proxy_arp 和 route_localnet 两个参数；Linux 每个设备还有几十个（forwarding、rp_filter、arp_ignore、accept_local 等）。
   2. 没有 `default` 向新设备传播的时机（设备固定），也没有 `route_localnet` 影响校验源地址的那一半（`fib_validate_source`，MoQiOS 不做入向校验）。
 
+## 补充：UDP 套接字表 64 → 256，回环 UDP 立即投递（hello388）
+
+- 背景：hello385 局限 1。UDP 和 ping 套接字共用 `udp.zig` 里 64 个槽的静态表，未命名的套接字也占槽；第 65 个 `socket()` 返回 -1（EPERM）。同一端口上共享者的判别号用 64 位位图选，最多 64 个共享者。
+- 宿主机实测（`user/hello388.c`，root、`unshare -n`、只开 lo）：S、B、R、V、C 共 5 项通过。要点：
+  1. 一个进程同时开 100 个 IPv4 UDP 套接字都成功，每个 sendto 127.0.0.1:9 都拿到端口，100 个端口互不相同。
+  2. 100 个设 SO_REUSEADDR 的套接字都能绑 127.0.0.1:40388，发一个数据报恰好一个套接字收到。
+  3. 100 个 IPv6 UDP 套接字同样都能开、都能发。
+  4. 紧接着 100 个发往无人端口的数据报之后，一个套接字发给另一个仍然立即收到（Linux 回环发送直接进 `netif_rx`，不排队）。
+- 定向测试时发现的第二个问题：在 MoQiOS 上 S 项改好后，B 项（以及 C 项）仍然失败，收到的是 EAGAIN。`/proc/lostats` 显示 `dropped=86 high_water=16`：100 个发往 127.0.0.1:9 的数据报和它们引出的 ICMP 端口不可达把 16 项的回环队列塞满了，之后的数据报被 `dropIsLoss` 当作丢包吞掉，没人 drain 队列，就一直满着。
+- 修复：
+  1. `udp.zig`：`MAX_PORTS` 64 → 256（每槽 8 个 1.5 KiB 队列项，共约 3 MiB）。
+  2. `udp_port_policy.firstFreeDisc(used)`：在 0..`MAX_DISC`（0x7fff，键的第 16–30 位；第 31 位是 `PING_KEY`）里取最小的未用判别号；`rebind`、`autobind`、`pingBind` 三处的 64 位位图都换成它，用尽时分别返回 EADDRINUSE、EAGAIN、EADDRINUSE。
+  3. `socket_syscall.zig`：表满时 IPv4、IPv6 的 UDP `socket()` 返回 ENOBUFS（-105），不再是 -1。
+  4. `lo.sendNow`：UDP 的 IPv4、IPv6 回环发送入队后立刻 drain，队列满时先 drain 再重试一次；仍然放不进才算丢包。调用点不持有 udp_lock 或 tcp_lock（drain 会重入接收路径）。TCP 的回环路径不变（它在锁外自己 drain）。
+  5. 测试程序本身的错误（如实）：hello386、hello387、hello388 最初把 setsockopt 写成 134 号调用，MoQiOS 的 134 是 recvmmsg，setsockopt 是 132。hello388 的 R 项因此 SO_REUSEADDR 没设上（-22），bind 失败 -98。三个文件都改为 132。hello386 里唯一用到它的是 U 项的 SO_BROADCAST，hello387 没有调用；两者的检查结果不依赖这个选项（MoQiOS 不检查 SO_BROADCAST）。
+- host 测试 "udp (hello388): the socket table holds 256 sockets and a port's sharers get any free discriminator" 和 "lo (hello388): a UDP loopback send is delivered at once, so a burst cannot leave the queue full for the next datagram"：实现前编译失败（没有 `firstFreeDisc`）。旧的 "udp: the port table holds 64 sockets…" 已删除，hello341、hello363、hello371 的源码断言改为新代码。变异验证：`firstFreeDisc` 恒返回 0、`sendNow` 去掉入队后的 drain，各自让对应测试失败，文件已恢复。
+- 红灯：未修改的内核（只保留启动配置）上定向 SMP=2，5 项全部失败：S、V 只开到 64 个（第 65 个 -1），B、C 收不到（-11），R 只绑上 63 个（-98）。绿灯：5 项全部通过。
+- 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello388 PASS。riscv64、aarch64 交叉构建通过，没有在这两个架构上跑 QEMU。
+- 局限：
+  1. 表仍是静态的（256 个槽），Linux 只受内存和 `ulimit` 限制；未命名套接字仍占槽。
+  2. `sendNow` 在发送者上下文里处理接收，一次 drain 最多 64 帧；Linux 由软中断处理。

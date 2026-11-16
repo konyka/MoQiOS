@@ -4322,7 +4322,7 @@ test "a frame the full loopback queue refuses is a loss, not a failed send (hell
     try std.testing.expect(!lo.dropIsLoss(0));
     try std.testing.expect(!lo.dropIsLoss(lo.MAX_FRAME + 1));
     // Both UDP loopback send paths report such a drop as sent (Linux sendto on lo never fails for a full receiver).
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.udp_source, "lo.sendPacket(&send_pkt, frame_len) or lo.dropIsLoss(frame_len)"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.udp_source, "lo.sendNow(&send_pkt, frame_len) or lo.dropIsLoss(frame_len)"));
     // Both TCP connect paths keep a loopback connection whose SYN was dropped: the retransmit timer resends it.
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (!synLostOnLoopback(tcb, netif.isLocal4(remote_ip))) {") != null);
@@ -4681,7 +4681,7 @@ test "multicast outgoing interface: IP_MULTICAST_IF lo sends out lo only, IPV6_M
 
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "    const via_lo = loopback or (group and out_if == lo.IFINDEX);\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "    const ok = if (via_lo) lo.sendPacket(&send_pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    const ok = if (via_lo) lo.sendNow(&send_pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    const our_ip = if (mcast.multicastSource4(group, bound, opts4.mc4_addr)) |a| a else ") != null);
     // Options come from the sending socket's own registry key, not from whichever socket first holds the port.
     try std.testing.expect(std.mem.indexOf(u8, us, "    const opts4: ip_opt_policy.IpOpts = if (getPortOpts(src_key)) |po| po.ip else .{};\n") != null);
@@ -4904,7 +4904,7 @@ test "ping sockets: SOCK_DGRAM/IPPROTO_ICMP sends echo requests under the socket
     // A socket with no local port yet is skipped the same way (hello385).
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, us, "if (port_ping[i] or !port_named[i]) continue;"));
     try std.testing.expect(std.mem.indexOf(u8, us, "        if (port_ping[j]) continue;\n        if (portNumber(ports[j]) != new_port) continue;\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "        used |= @as(u64, 1) << @intCast(ports[j] >> 16);\n        if (!port_named[j]) continue;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "        used[nu] = @intCast((ports[j] >> 16) & 0x7fff);\n        nu += 1;\n        if (!port_named[j]) continue;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "        if (port_ping[i] != ping) continue;\n        if (!port_named[i]) continue;\n        if (portNumber(ports[i]) == port) n += 1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "const key = PING_KEY | ident;") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "        port_opts[i].flags |= @import(\"udp_port_policy.zig\").REUSEADDR_FLAG;\n        return key;") != null);
@@ -13516,12 +13516,6 @@ test "epoll: a link disabled by EPOLLONESHOT still counts for the cycle and dept
     try std.testing.expect(std.mem.indexOf(u8, es, "if (item.fd_type == .epoll and !item.is_disabled) {\n                    found") == null);
 }
 
-test "udp: the port table holds 64 sockets, and a port shared by up to 64 sockets gets a distinct discriminator each" {
-    const us = kt.udp_source;
-    try std.testing.expect(std.mem.indexOf(u8, us, "const MAX_PORTS = 64;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "var used: u64 = 0;") != null);
-}
-
 test "tcb_bitset: more than 64 slots, lowest-first iteration, firstClear respects the capacity" {
     const B = kt.tcb_bitset.Bitset(128);
     var b: B = .{};
@@ -14583,4 +14577,29 @@ test "devconf policy: net.ipv4.conf.<dev>.route_localnet gates the loopback-sour
     const as = kt.arp_source;
     try std.testing.expect(std.mem.indexOf(u8, as, "pub fn confWrite(cf: devconf.ConfFile, text: []const u8) i64 {") != null);
     try std.testing.expect(std.mem.indexOf(u8, as, "pub fn loopbackAllowed() bool {") != null);
+}
+
+test "udp (hello388): the socket table holds 256 sockets and a port's sharers get any free discriminator" {
+    const p = kt.udp_port_policy;
+    try std.testing.expectEqual(@as(?u16, 0), p.firstFreeDisc(&[_]u16{}));
+    try std.testing.expectEqual(@as(?u16, 2), p.firstFreeDisc(&[_]u16{ 1, 0, 3 }));
+    var many: [200]u16 = undefined;
+    for (&many, 0..) |*d, i| d.* = @intCast(i);
+    try std.testing.expectEqual(@as(?u16, 200), p.firstFreeDisc(&many));
+    var full: [p.MAX_DISC + 1]u16 = undefined;
+    for (&full, 0..) |*d, i| d.* = @intCast(i);
+    try std.testing.expectEqual(@as(?u16, null), p.firstFreeDisc(&full));
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "const MAX_PORTS = 256;") != null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, us, "var used: u64"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, us, "firstFreeDisc("));
+    const ss = kt.socket_syscall_source;
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ss, ".abort_full => return -1,"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, ".abort_full => return -105, // ENOBUFS"));
+}
+
+test "lo (hello388): a UDP loopback send is delivered at once, so a burst cannot leave the queue full for the next datagram" {
+    const ls = kt.lo_source;
+    try std.testing.expect(std.mem.indexOf(u8, ls, "pub fn sendNow(data: [*]const u8, len: u32) bool {\n    if (!sendPacket(data, len)) {\n        _ = drain();\n        if (!sendPacket(data, len)) return false;\n    }\n    _ = drain();\n    return true;\n}") != null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, kt.udp_source, "lo.sendPacket(&send_pkt, frame_len) or"));
 }

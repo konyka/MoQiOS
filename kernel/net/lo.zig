@@ -195,6 +195,18 @@ pub fn sendPacket(data: [*]const u8, len: u32) bool {
     return sendPacketOn(data, len, IFINDEX);
 }
 
+/// A UDP frame to lo delivered at once, as Linux loopback_xmit hands it to netif_rx: the queue is drained after the frame goes in
+/// (and once before, when a burst filled it), so frames a burst left behind, such as the ICMP errors it drew, cannot keep the next
+/// datagram out. Must not be called with tcp_lock or udp_lock held (drain re-enters the RX path). False when the frame was refused.
+pub fn sendNow(data: [*]const u8, len: u32) bool {
+    if (!sendPacket(data, len)) {
+        _ = drain();
+        if (!sendPacket(data, len)) return false;
+    }
+    _ = drain();
+    return true;
+}
+
 /// sendPacket for a frame that arrives on interface `ifindex` rather than on lo.
 pub fn sendPacketOn(data: [*]const u8, len: u32, ifindex: u8) bool {
     const saved = lo_lock.acquire();

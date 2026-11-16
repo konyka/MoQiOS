@@ -13,8 +13,8 @@ const mcast = @import("mcast_policy.zig");
 const bo = @import("../lib/byte_order.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
-/// Bound UDP sockets at once (Linux has no fixed limit; 64 sockets x 8 queued datagrams of 1.5 KiB is about 750 KiB).
-const MAX_PORTS = 64;
+/// UDP and ping sockets at once, named or not (Linux has no fixed limit; 256 sockets x 8 queued datagrams of 1.5 KiB is about 3 MiB).
+const MAX_PORTS = 256;
 const QUEUE_DEPTH = 8;
 /// IPv4 Ethernet MTU 1500 − 20 − 8.
 const MAX_UDP_PAYLOAD = 1472;
@@ -358,10 +358,12 @@ pub fn pingBind(old_key: u32, ident: u16, addr: [4]u8, addr6: [16]u8) i64 {
     defer udp_lock.release(saved);
     const oi = findPortIdxLocked(old_key) orelse return -9;
     const want: u16 = if (ident == 0) portNumber(old_key) else ident;
-    var used: u64 = 0;
+    var used: [MAX_PORTS]u16 = undefined;
+    var nu: usize = 0;
     for (0..num_ports) |j| {
         if (!port_ping[j] or j == oi or portNumber(ports[j]) != want) continue;
-        used |= @as(u64, 1) << @intCast((ports[j] >> 16) & 0x3f);
+        used[nu] = @intCast((ports[j] >> 16) & 0x7fff);
+        nu += 1;
         if (!@import("ping_policy.zig").mayShareIdent(port_opts[oi].flags, port_opts[j].flags)) return -98;
     }
     // Hashing the socket (ping_get_port) puts it at the head of the chain: replies prefer it to earlier holders of the ident.
@@ -370,7 +372,7 @@ pub fn pingBind(old_key: u32, ident: u16, addr: [4]u8, addr6: [16]u8) i64 {
     port_local_ip[oi] = addr;
     port_local_ip6[oi] = addr6;
     if (want == portNumber(old_key)) return @intCast(old_key);
-    const disc: u32 = @ctz(~used);
+    const disc: u32 = @import("udp_port_policy.zig").firstFreeDisc(used[0..nu]) orelse return -98;
     const key = PING_KEY | (disc << 16) | want;
     ports[oi] = key;
     return @intCast(key);
@@ -519,7 +521,6 @@ pub fn autobind(key: u32, out_port: *u16, out_disc: *u16) i64 {
     }
     var named_buf: [MAX_PORTS]u16 = undefined;
     var n: usize = 0;
-    var used: u64 = 0;
     for (0..num_ports) |j| {
         if (!port_named[j]) continue;
         named_buf[n] = portNumber(ports[j]);
@@ -533,11 +534,14 @@ pub fn autobind(key: u32, out_port: *u16, out_disc: *u16) i64 {
         return 0;
     }
     // The discriminator avoids every slot already on that number, unnamed ones included, so keys stay unique.
+    var used: [MAX_PORTS]u16 = undefined;
+    var nu: usize = 0;
     for (0..num_ports) |j| {
-        if (!port_ping[j] and portNumber(ports[j]) == want) used |= @as(u64, 1) << @intCast((ports[j] >> 16) & 0x3f);
+        if (port_ping[j] or portNumber(ports[j]) != want) continue;
+        used[nu] = @intCast((ports[j] >> 16) & 0x7fff);
+        nu += 1;
     }
-    if (used == ~@as(u64, 0)) return -11;
-    const disc: u16 = @intCast(@ctz(~used));
+    const disc = @import("udp_port_policy.zig").firstFreeDisc(used[0..nu]) orelse return -11;
     const ni = newSlotLocked(want | (@as(u32, disc) << 16), port_v6[oi], port_uid[oi]);
     port_opts[ni] = port_opts[oi];
     port_local_ip[ni] = port_local_ip[oi];
@@ -594,12 +598,14 @@ pub fn rebind(old_key: u32, new_port: u16, addr: [4]u8, addr6: [16]u8, dev6: u8,
     }
     const mine = port_opts[oi];
     const uid = port_uid[oi];
-    var used: u64 = 0;
+    var used: [MAX_PORTS]u16 = undefined;
+    var nu: usize = 0;
     for (0..num_ports) |j| {
         if (port_ping[j]) continue;
         if (portNumber(ports[j]) != new_port) continue;
         // An unnamed socket holds no port, but its reserved key must stay unique: its discriminator is taken all the same.
-        used |= @as(u64, 1) << @intCast(ports[j] >> 16);
+        used[nu] = @intCast((ports[j] >> 16) & 0x7fff);
+        nu += 1;
         if (!port_named[j]) continue;
         if (!port_v6[j] and !port_v6[oi] and !@import("tcp_port_policy.zig").addrsConflict(addr, port_local_ip[j])) continue;
         if (port_v6[j] and port_v6[oi] and !@import("bind_addr_policy.zig").boundDevsConflict(dev6, port_dev6[j])) continue;
@@ -607,7 +613,7 @@ pub fn rebind(old_key: u32, new_port: u16, addr: [4]u8, addr6: [16]u8, dev6: u8,
         if (!@import("udp_port_policy.zig").mayShare(mine.flags, port_opts[j].flags, uid, port_uid[j])) return -98;
     }
     if (num_ports >= MAX_PORTS) return -98;
-    const disc: u16 = @intCast(@ctz(~used));
+    const disc = @import("udp_port_policy.zig").firstFreeDisc(used[0..nu]) orelse return -98;
     const ni = newSlotLocked(new_port | (@as(u32, disc) << 16), port_v6[oi], uid);
     port_opts[ni] = mine;
     port_local_ip[ni] = addr;
@@ -1123,7 +1129,7 @@ pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, data
         return true;
     }
 
-    const ok = if (via_lo) lo.sendPacket(&send_pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);
+    const ok = if (via_lo) lo.sendNow(&send_pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.
     if (ok) ipv4.noteFullSizeSend(dst_ip, ipv4.HEADER_LEN + udp_total);
     return ok;
@@ -1192,7 +1198,7 @@ pub fn sendToV6From(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, 
         @import("ndp_queue.zig").queueFrame(hop, &send_pkt, frame_len);
         return true;
     }
-    const ok = if (is_loop) lo.sendPacket(&send_pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);
+    const ok = if (is_loop) lo.sendNow(&send_pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.
     if (ok) ipv6.noteFullSizeSend(dst_ip, ipv6.HEADER_LEN + udp_total);
     return ok;
