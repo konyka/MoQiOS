@@ -339,6 +339,9 @@ const TcpTcb = struct {
     async_nospace: bool = false,
     /// local_port was set by bind(); otherwise connect() treats it as stale.
     bound_explicitly: bool = false,
+    /// The SYN is waiting for the next hop to answer ARP or NDP (synAwaitsNeighbor) since neigh_wait_since_ns (monotonic clock).
+    neigh_wait: bool = false,
+    neigh_wait_since_ns: u64 = 0,
     /// The interface an IPv6 socket is tied to (Linux sk_bound_dev_if): set by a scoped bind or a connect to a link-local peer, 0 none.
     bound_dev6: u8 = 0,
     /// The socket's owner (Linux sk_uid): the fsuid of the task that created it, fixed at socket() and copied to accepted children.
@@ -1001,6 +1004,8 @@ fn initTcbState(t: *TcpTcb) void {
     t.async_nospace = false;
     t.bound_explicitly = false;
     t.bound_dev6 = 0;
+    t.neigh_wait = false;
+    t.neigh_wait_since_ns = 0;
     t.sock_uid = 0;
     t.persist_timer_ms = 0;
     t.persist_rto_ms = RETRANSMIT_MS;
@@ -3191,8 +3196,16 @@ fn synLostOnLoopback(tcb: *TcpTcb, loopback: bool) bool {
 /// A connect whose SYN waits for the next hop's neighbor solicitation (Linux queues it on the neighbor entry) goes on as if the SYN was
 /// lost: the sequence number counts it, so the retransmit timer resends it (soliciting again) and connect() reports EINPROGRESS or
 /// waits. `pending` says the neighbor is being solicited. Caller holds tcp_lock.
+/// Whether the next hop toward the peer of `tcb` now has a link-layer address. Caller holds tcp_lock.
+fn neighborResolved(tcb: *TcpTcb) bool {
+    if (tcb.is_v6) return ndp.resolveNextHop(tcb.remote_ip6).mac != null;
+    return arp.resolve(netif.nextHop4(tcb.remote_ip)) != null;
+}
+
 fn synAwaitsNeighbor(tcb: *TcpTcb, pending: bool) bool {
     if (!pending) return false;
+    tcb.neigh_wait = true;
+    tcb.neigh_wait_since_ns = @import("../arch/arch.zig").tsc.nanos();
     advanceSndNxt(tcb, SYN, 0);
     return true;
 }
@@ -4079,6 +4092,22 @@ pub fn timerTick(ms_elapsed: u32) void {
 fn timerTickOne(idx: u32, ms_elapsed: u32) void {
     const tcb = &tcbs[idx];
     if (tcb.state == .closed) return;
+
+    // A SYN still waiting for its next hop: once the neighbor resolves the retransmit timer carries it; if it never does, connect()
+    // fails with EHOSTUNREACH (Linux drops the queued SYN when the neighbor entry fails).
+    if (tcb.neigh_wait) {
+        if (tcb.state != .syn_sent or neighborResolved(tcb)) {
+            tcb.neigh_wait = false;
+        } else {
+            if (tcp_recv_policy.neighborGaveUp(tcb.neigh_wait_since_ns, @import("../arch/arch.zig").tsc.nanos())) {
+                tcb.neigh_wait = false;
+                tcb.options.so_error = tcp_recv_policy.EHOSTUNREACH;
+                noteFasync(idx, fcntl_policy.POLL_ERR);
+                closeTcbRemote(tcb);
+                return;
+            }
+        }
+    }
 
     // v53.6: FIN_WAIT_2 timeout — prevent orphaned TCBs if peer crashes without FIN
     if (tcb.state == .fin_wait_2) {

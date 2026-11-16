@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello368`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello369`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -363,6 +363,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello366 | UDP 的 connect(AF_UNSPEC) 断开：IPv4 已绑定已连接的套接字断开后 getpeername 是 ENOTCONN，send 是 EDESTADDRREQ，其他来源的数据报能收到，绑定的地址和端口保留（U1）；AF_UNSPEC 长度 2 返回 0，长度 1 是 EINVAL（U2）；IPv6 用 ::1 做同样的检查（U3）；绑在 [ff02::1%1] 上的套接字断开后 scope 变为 0，之后 connect 到 %2 成功（U4）；connect 到 [ff02::1%2] 后断开，名字回到 :: 和 scope 0，再 connect 到 %1 是 ENETUNREACH 而不是 EINVAL（U5）；绑 0.0.0.0 连接后名字是 127.0.0.1，断开后回到 0.0.0.0（U6）；IPv6 套接字用 AF_INET、IPv4 套接字用 AF_INET6 都是 EAFNOSUPPORT（U7） |
 | hello367 | IPv6 TCP connect 的出接口：connect 到 ff02::1%2、ff02::1 和 ff0e::1 都是 ENETUNREACH（G）；connect 到不带 scope 的 fe80::1 是 EINVAL，之后带 %2 可以发起（N）；connect 到 [fe80::1%2] 后 getsockname 报告链路本地地址和 scope 2（S）；connect 到 %9 是 ENETUNREACH，套接字留在接口 9 上，再 connect 到 %2 是 EINVAL（X）；connect 到 [fe80::1%1] 是 ENETUNREACH（L）；绑在自己的链路本地地址 %2 上的套接字 connect 到 %1 是 EINVAL，不带 scope 可以发起（B）；connect 到 [::1%9] 能连上 ::1 上的监听者，非链路本地地址忽略 scope（U） |
 | hello368 | IPv4 的下一跳：发往网关 10.0.2.2 的数据报（必要时重试到 ARP 有结果）之后，发往子网外的 192.0.2.1 和 198.51.100.7 立即成功，因为解析的是网关的 MAC（A）；非阻塞 connect 到子网外的 192.0.2.1 是 EINPROGRESS（B）；非阻塞 connect 到子网内不应答 ARP 的 10.0.2.99 是 EINPROGRESS，SYN 等 ARP 期间算作已发出（C） |
+| hello369 | 下一跳不应答 ARP/NDP 的 TCP connect 约 3 秒后以 EHOSTUNREACH 失败：非阻塞 connect 到子网内的 10.0.2.99 是 EINPROGRESS，2–6 秒内 SO_ERROR 变为 113，再读一次是 0（A）；阻塞 connect 到 10.0.2.98 在 2–6 秒内返回 -113（B）；非阻塞 connect 到自己全局 /64 里的 ::99 是 EINPROGRESS，2–6 秒内 SO_ERROR 变为 113（C） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

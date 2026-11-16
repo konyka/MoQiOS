@@ -140,6 +140,17 @@ pub fn connectProgress(state: TcpState) ConnectWait {
 
 /// errno of a failed connect: what the connection recorded (refused, timed
 /// out), ECONNREFUSED if it recorded nothing.
+/// EHOSTUNREACH: a connect whose next hop never answered ARP or NDP (Linux neigh_invalidate reports it to the queued SYN's socket).
+pub const EHOSTUNREACH: i32 = 113;
+/// How long a SYN waits for the next hop to resolve before connect() fails (Linux: 3 ARP probes 1 s apart).
+pub const NEIGH_RESOLVE_NS: u64 = 3_000_000_000;
+
+/// Whether a SYN that started waiting for its next hop at `since_ns` gives up at `now_ns` (monotonic clock: the maintenance pass
+/// that checks it runs late under load, so counting passes would stretch the wait).
+pub fn neighborGaveUp(since_ns: u64, now_ns: u64) bool {
+    return now_ns >= since_ns and now_ns - since_ns >= NEIGH_RESOLVE_NS;
+}
+
 pub fn connectFailure(so_error: i32) i64 {
     return if (so_error > 0) -@as(i64, so_error) else errno.ECONNREFUSED;
 }

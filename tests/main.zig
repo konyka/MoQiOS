@@ -4844,6 +4844,27 @@ test "UDP connect(AF_UNSPEC) clears the peer, its filter and the tied interface 
         try std.testing.expect(std.mem.indexOf(u8, us[d..end], line) != null);
 }
 
+test "a connect whose neighbor never resolves fails with EHOSTUNREACH after 3 s (hello369)" {
+    const rp = kt.tcp_recv_policy;
+    // Measured on the monotonic clock: the 100 ms maintenance pass runs late under load, so counting passes stretched 3 s to 7.8 s.
+    const start: u64 = 5_000_000_000;
+    try std.testing.expect(!rp.neighborGaveUp(start, start));
+    try std.testing.expect(!rp.neighborGaveUp(start, start + rp.NEIGH_RESOLVE_NS - 1));
+    try std.testing.expect(rp.neighborGaveUp(start, start + rp.NEIGH_RESOLVE_NS));
+    try std.testing.expect(!rp.neighborGaveUp(start, start - 1));
+    try std.testing.expectEqual(@as(u64, 3_000_000_000), rp.NEIGH_RESOLVE_NS);
+    try std.testing.expectEqual(@as(i64, -113), rp.connectFailure(rp.EHOSTUNREACH));
+
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "    if (!pending) return false;\n    tcb.neigh_wait = true;\n    tcb.neigh_wait_since_ns = @import(\"../arch/arch.zig\").tsc.nanos();\n    advanceSndNxt(tcb, SYN, 0);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "    t.neigh_wait = false;\n    t.neigh_wait_since_ns = 0;\n") != null);
+    const tick = std.mem.indexOf(u8, ts, "fn timerTickOne(idx: u32, ms_elapsed: u32) void {").?;
+    const give = std.mem.indexOfPos(u8, ts, tick, "if (tcp_recv_policy.neighborGaveUp(tcb.neigh_wait_since_ns, @import(\"../arch/arch.zig\").tsc.nanos())) {").?;
+    try std.testing.expect(give < std.mem.indexOfPos(u8, ts, tick, "if (tcb.state == .fin_wait_2) {").?);
+    try std.testing.expect(std.mem.indexOfPos(u8, ts, give, "tcb.options.so_error = tcp_recv_policy.EHOSTUNREACH;").? <
+        std.mem.indexOfPos(u8, ts, give, "closeTcbRemote(tcb);").?);
+}
+
 test "IPv4 next hop: an off-link address goes through the gateway, and a SYN waiting for ARP counts as sent (hello368)" {
     const r = kt.route4_policy;
     const our = [4]u8{ 10, 0, 2, 15 };
@@ -4918,7 +4939,7 @@ test "IPv6 TCP connect: a group is ENETUNREACH, a link-local peer needs an inter
     const lost = std.mem.indexOf(u8, ts, "if (!synLostOnLoopback(tcb, netif.isLoopbackV6(remote_ip6))) {").?;
     try std.testing.expect(std.mem.indexOfPos(u8, ts, lost, "if (!synAwaitsNeighbor(tcb, ndp.resolveNextHop(remote_ip6).solicit != null)) {").? <
         std.mem.indexOfPos(u8, ts, lost, "tcb.state = .closed;").?);
-    try std.testing.expect(std.mem.indexOf(u8, ts, "fn synAwaitsNeighbor(tcb: *TcpTcb, pending: bool) bool {\n    if (!pending) return false;\n    advanceSndNxt(tcb, SYN, 0);\n    return true;\n}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "fn synAwaitsNeighbor(tcb: *TcpTcb, pending: bool) bool {\n    if (!pending) return false;\n    tcb.neigh_wait = true;\n    tcb.neigh_wait_since_ns = @import(\"../arch/arch.zig\").tsc.nanos();\n    advanceSndNxt(tcb, SYN, 0);\n    return true;\n}") != null);
 }
 
 test "an IPv6 TCP socket's bound address takes part in conflicts, listener choice, lookup, source address and naming (hello359)" {

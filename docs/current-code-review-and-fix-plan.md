@@ -9767,3 +9767,22 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   2. ICMP 回显应答仍直接对请求的源地址做 ARP，子网外来的 ping 得不到应答。
   3. 只有一条默认路由，没有路由表，也不处理 ICMP 重定向。
   4. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
+
+## 补充：下一跳不应答时 connect 以 EHOSTUNREACH 失败（hello369）
+
+- 背景：hello368 的局限 1。等 ARP 或 NDP 的 SYN 被当作已发出后，只由重传定时器重发，下一跳一直不应答时要重传到 ETIMEDOUT（110）才失败：非阻塞 connect 的 SO_ERROR 在 8 秒内一直是 0，阻塞 connect 等了约 320 秒才返回 -110。
+- Linux 依据：没有邻居条目时 SYN 挂在邻居条目上，邻居条目探测失败后（默认 3 次，各隔 1 秒）`neigh_invalidate` 对挂起的报文报 EHOSTUNREACH，TCP 把它作为连接错误（`tcp_v4_err`/`tcp_v6_err` 之外的 `sk_err`），connect 失败。
+- 宿主机实测（Linux，`unshare -rn` 加一对 veth，对端不配地址，方法写在 `user/hello369.c` 文件头）：A、B、C 共 3 项全部通过，三项都是约 3.1 秒后报 113。另外实测到：链路本地对端（fe80::1%v0）10 秒内没有报错，所以测试 C 用自己全局 /64 里的地址。
+- 红灯（未修改的内核，SMP=2，hello369 临时放在 init 序列最前面）：A、B、C 全部失败。A、C 的 SO_ERROR 8 秒后仍是 0；B 在 320077 ms 后返回 -110。
+- 修复：
+  1. `kernel/net/tcp_recv_policy.zig`：新增 `EHOSTUNREACH`、`NEIGH_RESOLVE_NS`（3 秒）和 `neighborGaveUp(since_ns, now_ns)`。
+  2. `kernel/net/tcp.zig`：TCB 新增 `neigh_wait`、`neigh_wait_since_ns`，复位时清零；`synAwaitsNeighbor` 置上标记并记下单调时钟；新增 `neighborResolved`；`timerTickOne` 在最前面检查标记：离开 SYN_SENT 或下一跳已解析时清掉，否则按单调时钟判断，满 3 秒时 SO_ERROR 设为 EHOSTUNREACH、发 POLL_ERR、关闭连接。
+  3. 第一版按 `timerTick` 传入的 100 ms 累计等待时间。第一份完整 smoke 里 A、B、C 都在约 7.8 秒后才报 113，超出 2–6 秒的范围：hello369 排在序列后段时，100 ms 一次的维护过程在负载下被推迟，按次数累计把 3 秒拉长到 7.8 秒。改为按单调时钟计时后通过。
+- 测试：hello369（QEMU，3 项）；新增 host 测试「a connect whose neighbor never resolves fails with EHOSTUNREACH after 3 s (hello369)」。hello367 的 host 测试改为钉住 `synAwaitsNeighbor` 的新函数体，检查的行为没变。
+- 变异验证：`neighborGaveUp` 恒返回 false，hello369 这条 host 测试失败，文件已恢复（按单调时钟的版本重新验证过一次）。改成单调时钟之前，先把 host 测试改成两个参数的形式，测试编译失败，实现后通过。
+- 完整 smoke：第一版（按次数累计）的 SMP=2 里 A、B、C 都在约 7.8 秒后才报 113 而失败（见修复 3）。最终构建（单调时钟）：SMP=2、SMP=1、SMP=4 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello369 PASS。本轮没有跑 riscv64、aarch64。
+- 这次修复带来的局限：
+  1. 等待期间不单独重发 ARP/NDP 请求，靠重传定时器重发 SYN 时顺带再发；默认 RTO 2 秒，所以 3 秒内只多发一次。
+  2. 只覆盖 connect 的 SYN。已建立的连接下一跳失效时仍按重传超时处理。
+  3. ICMP 回显应答仍直接对请求的源地址做 ARP，子网外来的 ping 得不到应答。
+  4. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
