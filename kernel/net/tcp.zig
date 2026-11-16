@@ -339,6 +339,8 @@ const TcpTcb = struct {
     async_nospace: bool = false,
     /// local_port was set by bind(); otherwise connect() treats it as stale.
     bound_explicitly: bool = false,
+    /// The interface an IPv6 socket is tied to (Linux sk_bound_dev_if): set by a scoped bind or a connect to a link-local peer, 0 none.
+    bound_dev6: u8 = 0,
     /// The socket's owner (Linux sk_uid): the fsuid of the task that created it, fixed at socket() and copied to accepted children.
     /// SO_REUSEPORT groups only share between equal owners; kept with the socket so it outlives the creating task.
     sock_uid: u32 = 0,
@@ -998,6 +1000,7 @@ fn initTcbState(t: *TcpTcb) void {
     t.refused = false;
     t.async_nospace = false;
     t.bound_explicitly = false;
+    t.bound_dev6 = 0;
     t.sock_uid = 0;
     t.persist_timer_ms = 0;
     t.persist_rto_ms = RETRANSMIT_MS;
@@ -3182,6 +3185,15 @@ fn synLostOnLoopback(tcb: *TcpTcb, loopback: bool) bool {
     return true;
 }
 
+/// A connect whose SYN waits for the next hop's neighbor solicitation (Linux queues it on the neighbor entry) goes on as if the SYN was
+/// lost: the sequence number counts it, so the retransmit timer resends it (soliciting again) and connect() reports EINPROGRESS or
+/// waits. `pending` says the neighbor is being solicited. Caller holds tcp_lock.
+fn synAwaitsNeighbor(tcb: *TcpTcb, pending: bool) bool {
+    if (!pending) return false;
+    advanceSndNxt(tcb, SYN, 0);
+    return true;
+}
+
 /// Whether another connection already uses the 4-tuple TCB `tcb_idx` would connect with (its local port to `remote_port` at
 /// `remote_ip`, or `remote_ip6` when that is given). A live holder makes it taken (tcp_port_policy.tupleTakenBy); an unreferenced
 /// TIME_WAIT leftover on the tuple is freed so the new connection is the only TCB that matches it. Caller holds tcp_lock.
@@ -3282,8 +3294,10 @@ pub fn tcpConnectSocketV6(tcb_idx: u32, remote_ip6: [16]u8, remote_port: u16) i6
 
     if (!sendSegment(tcb, probeEcnSynFlags(true), undefined, 0)) {
         if (!synLostOnLoopback(tcb, netif.isLoopbackV6(remote_ip6))) {
-            tcb.state = .closed;
-            return -1;
+            if (!synAwaitsNeighbor(tcb, ndp.resolveNextHop(remote_ip6).solicit != null)) {
+                tcb.state = .closed;
+                return -1;
+            }
         }
     }
 
@@ -4389,11 +4403,11 @@ pub fn tcpBind(tcb_idx: u32, port: u16) i64 {
 
 /// Bind a TCB to a local IPv4 address and port (the address is the wildcard for IPv6). Returns 0 or -errno.
 pub fn tcpBindAddr(tcb_idx: u32, port: u16, addr: [4]u8) i64 {
-    return tcpBindAddr46(tcb_idx, port, addr, @splat(0));
+    return tcpBindAddr46(tcb_idx, port, addr, @splat(0), 0);
 }
 
 /// Bind a TCB to a local address and port: `addr` for an IPv4 socket, `addr6` for an IPv6 one. Returns 0 or -errno.
-pub fn tcpBindAddr46(tcb_idx: u32, port: u16, addr: [4]u8, addr6: [16]u8) i64 {
+pub fn tcpBindAddr46(tcb_idx: u32, port: u16, addr: [4]u8, addr6: [16]u8, dev6: u8) i64 {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
@@ -4414,7 +4428,22 @@ pub fn tcpBindAddr46(tcb_idx: u32, port: u16, addr: [4]u8, addr6: [16]u8) i64 {
 
     tcb.local_port = port;
     tcb.bound_explicitly = port != 0;
+    tcb.bound_dev6 = dev6;
     return 0;
+}
+
+/// connect() of the IPv6 socket `tcb_idx` to `dst`%`scope_id`: ties it to the interface bind_addr_policy.streamConnectDev6 picks (also
+/// when the route check then fails, as Linux does) and returns that errno, 0 when the connect may go on.
+pub fn tcpConnectDev6(tcb_idx: u32, dst: [16]u8, scope_id: u32) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS) return -1;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active or !tcb.is_v6) return -1;
+    if (tcb.state != .closed) return 0;
+    const r = @import("bind_addr_policy.zig").streamConnectDev6(dst, scope_id, tcb.bound_dev6);
+    tcb.bound_dev6 = r.dev;
+    return r.err;
 }
 
 /// Start listening for connections on a bound TCB.

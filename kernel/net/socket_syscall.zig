@@ -304,7 +304,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         if (scope_rc != 0) return scope_rc;
         if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;
         if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
-        return net_mod.tcp.tcpBindAddr46(tcb_idx, parsed.port, net_mod.tcp_port_policy.WILDCARD4, parsed.addr);
+        return net_mod.tcp.tcpBindAddr46(tcb_idx, parsed.port, net_mod.tcp_port_policy.WILDCARD4, parsed.addr, bind_addr_policy.boundDev6(parsed.addr, parsed.scope_id));
     }
     if (addr_len < SOCKADDR_IN_MIN_LEN) return -22;
     if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, false)) return -22;
@@ -847,6 +847,9 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN)
             return -22;
         const parsed = sa.parseInet6(&sa6) orelse return -97;
+        // A link-local peer ties the socket to its interface; a group or a missing interface fails before the handshake starts.
+        const dev_rc = net_mod.tcp.tcpConnectDev6(tcb_idx, parsed.addr, parsed.scope_id);
+        if (dev_rc != 0) return dev_rc;
         return finishTcpConnect(t, fd, net_mod.tcp.tcpConnectSocketV6(tcb_idx, parsed.addr, parsed.port));
     }
     if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, false)) return -22;

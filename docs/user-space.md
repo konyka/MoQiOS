@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello366`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello367`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -361,6 +361,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello364 | IPv6 套接字绑定的接口（sin6_scope_id → sk_bound_dev_if）：ff01::1 不带 scope 是 EINVAL，scope 9 是 ENODEV（S）；同一端口上 ff02::1%1 和 ff02::1%2 都能绑（B1）；同接口重复、接口与 `::` 之间仍是 EADDRINUSE（B2）；全局地址忽略 scope（B3）；getsockname 报告绑定的接口（N）；发往 [ff02::1%2] 的数据报只到绑在接口 2 上的套接字（D）；IPv6 成员只比较组、本机成员按出接口判断（J、J2）；IPv6 TCP 绑组播地址是 EINVAL，IPv4 TCP 可以绑 239.1.1.1（T） |
 | hello365 | IPv6 数据报的出接口：sendto 的 sin6_scope_id 对需要 scope 的地址选出接口，未绑定时 ff02::1%1、%9 和 fe80::1%1 是 ENETUNREACH，全局组忽略 scope（S1）；绑在 ff02::1%1 上的套接字只能带 scope 2 发往 ff02::1，发往 ff0e::1 也走 lo 而失败，发往 ::1 可以（S2）；`IPV6_MULTICAST_IF` 为 lo 时带 scope 2 可以发出，scope 0 不行（S3），这份副本在网卡上回送给在网卡上加入的成员（S4）；发往 [ff02::1:6%2] 的源地址是带 scope 2 的链路本地地址（R）；connect 到需要 scope 的地址把套接字绑到该接口：scope 0 是 EINVAL 且不算已连接（C1），%2 成功并命名 scope 2（C2），%9 是 ENETUNREACH 但接口留下，之后换 %2 是 EINVAL（C3、C5），已连接的套接字仍按自己的接口检查 sendto（C4），没有 scope 的组用 `IPV6_MULTICAST_IF`（C6），全局地址忽略 scope（C7） |
 | hello366 | UDP 的 connect(AF_UNSPEC) 断开：IPv4 已绑定已连接的套接字断开后 getpeername 是 ENOTCONN，send 是 EDESTADDRREQ，其他来源的数据报能收到，绑定的地址和端口保留（U1）；AF_UNSPEC 长度 2 返回 0，长度 1 是 EINVAL（U2）；IPv6 用 ::1 做同样的检查（U3）；绑在 [ff02::1%1] 上的套接字断开后 scope 变为 0，之后 connect 到 %2 成功（U4）；connect 到 [ff02::1%2] 后断开，名字回到 :: 和 scope 0，再 connect 到 %1 是 ENETUNREACH 而不是 EINVAL（U5）；绑 0.0.0.0 连接后名字是 127.0.0.1，断开后回到 0.0.0.0（U6）；IPv6 套接字用 AF_INET、IPv4 套接字用 AF_INET6 都是 EAFNOSUPPORT（U7） |
+| hello367 | IPv6 TCP connect 的出接口：connect 到 ff02::1%2、ff02::1 和 ff0e::1 都是 ENETUNREACH（G）；connect 到不带 scope 的 fe80::1 是 EINVAL，之后带 %2 可以发起（N）；connect 到 [fe80::1%2] 后 getsockname 报告链路本地地址和 scope 2（S）；connect 到 %9 是 ENETUNREACH，套接字留在接口 9 上，再 connect 到 %2 是 EINVAL（X）；connect 到 [fe80::1%1] 是 ENETUNREACH（L）；绑在自己的链路本地地址 %2 上的套接字 connect 到 %1 是 EINVAL，不带 scope 可以发起（B）；connect 到 [::1%9] 能连上 ::1 上的监听者，非链路本地地址忽略 scope（U） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

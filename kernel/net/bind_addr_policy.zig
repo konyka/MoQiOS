@@ -114,6 +114,22 @@ pub fn connectDev6(dst: [16]u8, scope_id: u32, bound_dev: u8, mc_if: u8) Connect
     return .{ .dev = dev, .err = routeErrno6(dst, oif) };
 }
 
+/// connect() of an IPv6 stream socket tied to `bound_dev` (0 none) to `dst` with `scope_id` (Linux tcp_v6_connect): a group is
+/// ENETUNREACH before anything else; a link-local peer's scope must match the bound interface (EINVAL) and ties the socket to it,
+/// and with no interface at all it is EINVAL. The route is then checked through that interface, and a failure leaves it tied.
+pub fn streamConnectDev6(dst: [16]u8, scope_id: u32, bound_dev: u8) Connect6 {
+    if (dst[0] == 0xff) return .{ .dev = bound_dev, .err = ENETUNREACH };
+    var dev = bound_dev;
+    if (needsScope6(dst)) {
+        if (scope_id != 0) {
+            if (dev != 0 and dev != scope_id) return .{ .dev = dev, .err = EINVAL };
+            dev = ifIndex8(scope_id);
+        }
+        if (dev == 0) return .{ .dev = dev, .err = EINVAL };
+    }
+    return .{ .dev = dev, .err = routeErrno6(dst, dev) };
+}
+
 /// An IPv6 stream socket cannot bind a multicast address (Linux __inet6_bind: EINVAL before the scope checks).
 pub fn streamBindErrno6(addr: [16]u8) i64 {
     return if (addr[0] == 0xff) EINVAL else 0;

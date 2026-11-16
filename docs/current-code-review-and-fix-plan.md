@@ -9727,3 +9727,23 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   2. IPv6 TCP 仍不记录绑定的接口，connect 也不看 scope。
   3. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
   4. hello302（SIGSTOP 打断 nanosleep）的可变延迟一项在 SMP=2 上偶发失败一次，最慢 416 ms，根因没有查。
+
+## 补充：IPv6 TCP connect 按 sin6_scope_id 选出接口（hello367）
+
+- 背景：hello366 的局限 2。IPv6 TCP 不记录绑定的接口，connect 也不看 scope：connect 到组播地址会真的发 SYN（阻塞套接字一直等握手），connect 到链路本地地址不管带不带 scope 都返回 -1。
+- Linux 依据：`tcp_v6_connect`（`net/ipv6/tcp_ipv6.c`）：组播地址是 ENETUNREACH；链路本地地址带 scope 时必须和 sk_bound_dev_if 一致（`sk_dev_equal_l3scope`，否则 EINVAL），然后写入 sk_bound_dev_if；仍没有接口是 EINVAL。之后路由按 `flowi6_oif = sk_bound_dev_if` 查找，失败是 ENETUNREACH，写入的接口不撤销。`inet6_bind` 对 scoped 地址同样写入 sk_bound_dev_if。
+- 宿主机实测（Linux，`unshare -rn` 加 dummy 网卡 d0 和链路本地地址 fe80::7，方法写在 `user/hello367.c` 文件头）：G、N、S、X、L、B、U 共 7 项全部通过。另外实测到：已接受的连接 getsockname 和 getpeername 都报告 scope 2；connect 到 ::1 的连接报告 scope 0。
+- 红灯（未修改的内核，SMP=2，hello367 临时放在 init 序列最前面）：G、N、S、X、L、B 失败，U 通过。G 里 connect 到 ff02::1%2 返回 EINPROGRESS，之后再 connect 是 EALREADY；N、S、X、L、B 的 connect 都是 -1（NDP 解析失败，SYN 没有发出）。第一次红灯用阻塞套接字做 G，connect 到组播地址一直等握手，测试卡住，之后 G 改用非阻塞套接字。
+- 修复：
+  1. `kernel/net/bind_addr_policy.zig`：新增 `streamConnectDev6`。
+  2. `kernel/net/tcp.zig`：TCB 新增 `bound_dev6`，复位时清零；`tcpBindAddr46` 多了 `dev6` 参数；新增 `tcpConnectDev6`，在锁内只对 CLOSED 状态的套接字按策略写回接口。
+  3. `kernel/net/socket_syscall.zig`：IPv6 TCP bind 传 `bind_addr_policy.boundDev6(parsed.addr, parsed.scope_id)`；IPv6 TCP connect 先调 `tcpConnectDev6`，出错时直接返回，不发起握手。
+  4. `kernel/net/tcp.zig`：新增 `synAwaitsNeighbor`。IPv6 connect 的 SYN 因为下一跳正在 NDP 解析而没发出时，算作已发出（和 `synLostOnLoopback` 一样推进 snd_nxt），connect 返回 EINPROGRESS 或继续等待，重传定时器之后重发 SYN 并再次发起邻居请求。Linux 把这个 SYN 挂在邻居条目上等解析结果。改动前这种情况 connect 直接返回 -1。第一份完整 smoke 里 N、S、B 失败，原因就是这个：fe80::1 没有缓存的邻居，connect 返回 -1。
+- 测试：hello367（QEMU，7 项）；新增 host 测试「IPv6 TCP connect: a group is ENETUNREACH, a link-local peer needs an interface and ties the socket to it (hello367)」。「TCP bind errors and SO_REUSEADDR sharing」和 hello359 的 host 测试改为钉住新的 `tcpBindAddr46` 调用，检查的行为没变。
+- 变异验证：`streamConnectDev6` 去掉组播的 ENETUNREACH，或 `tcpConnectDev6` 不写回 `bound_dev6`，hello367 这条 host 测试都失败，文件已恢复。`synAwaitsNeighbor` 的钉住检查先写，在函数还不存在时失败，实现后通过。
+- 完整 smoke：加上 `synAwaitsNeighbor` 之前的第一份 SMP=2 里 N、S、B 失败（见修复 4）。最终构建：SMP=2、SMP=1、SMP=4 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello367 PASS。本轮没有跑 riscv64、aarch64。
+- 这次修复带来的局限：
+  1. `bound_dev6` 只用于 connect 的检查，数据段的出接口和收包仍不看它：MoQiOS 只有 lo 和一块网卡，链路本地地址总是走网卡，所以行为上没有差别。监听套接字也不按 `bound_dev6` 过滤到达的连接。
+  2. 已接受的 IPv6 连接 getsockname、getpeername 的 scope 仍用 `nameScope6` 报告网卡（2），和 Linux 一致；但子连接不继承 `bound_dev6`。
+  3. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
+  4. IPv4 TCP connect 在 ARP 解析失败时仍返回 -1（Linux 同样把 SYN 挂起等 ARP 结果），本次没有改。

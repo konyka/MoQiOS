@@ -4844,6 +4844,59 @@ test "UDP connect(AF_UNSPEC) clears the peer, its filter and the tied interface 
         try std.testing.expect(std.mem.indexOf(u8, us[d..end], line) != null);
 }
 
+test "IPv6 TCP connect: a group is ENETUNREACH, a link-local peer needs an interface and ties the socket to it (hello367)" {
+    const bp = kt.bind_addr_policy;
+    var ff02: [16]u8 = @splat(0);
+    ff02[0] = 0xff;
+    ff02[1] = 0x02;
+    ff02[15] = 1;
+    var ff0e = ff02;
+    ff0e[1] = 0x0e;
+    var ll: [16]u8 = @splat(0);
+    ll[0] = 0xfe;
+    ll[1] = 0x80;
+    ll[15] = 7;
+    var lo6: [16]u8 = @splat(0);
+    lo6[15] = 1;
+    var uni: [16]u8 = @splat(0);
+    uni[0] = 0x20;
+    uni[1] = 0x01;
+    uni[15] = 9;
+    // tcp_v6_connect: any group is ENETUNREACH before the scope is looked at.
+    try std.testing.expectEqual(bp.Connect6{ .dev = 0, .err = bp.ENETUNREACH }, bp.streamConnectDev6(ff02, 2, 0));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 0, .err = bp.ENETUNREACH }, bp.streamConnectDev6(ff02, 0, 0));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 0, .err = bp.ENETUNREACH }, bp.streamConnectDev6(ff0e, 0, 0));
+    // A link-local peer: the scope must match the bound interface, and some interface is required.
+    try std.testing.expectEqual(bp.Connect6{ .dev = 0, .err = bp.EINVAL }, bp.streamConnectDev6(ll, 0, 0));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 2, .err = 0 }, bp.streamConnectDev6(ll, 2, 0));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 9, .err = bp.ENETUNREACH }, bp.streamConnectDev6(ll, 9, 0));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 9, .err = bp.EINVAL }, bp.streamConnectDev6(ll, 2, 9));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 2, .err = bp.EINVAL }, bp.streamConnectDev6(ll, 1, 2));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 2, .err = 0 }, bp.streamConnectDev6(ll, 0, 2));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 1, .err = bp.ENETUNREACH }, bp.streamConnectDev6(ll, 1, 0));
+    // Any other address ignores the scope.
+    try std.testing.expectEqual(bp.Connect6{ .dev = 0, .err = 0 }, bp.streamConnectDev6(lo6, 9, 0));
+    try std.testing.expectEqual(bp.Connect6{ .dev = 0, .err = 0 }, bp.streamConnectDev6(uni, 9, 0));
+
+    const ss = kt.socket_syscall_source;
+    const dev_at = std.mem.indexOf(u8, ss, "const dev_rc = net_mod.tcp.tcpConnectDev6(tcb_idx, parsed.addr, parsed.scope_id);").?;
+    try std.testing.expect(dev_at < std.mem.indexOfPos(u8, ss, dev_at, "net_mod.tcp.tcpConnectSocketV6(tcb_idx, parsed.addr, parsed.port)").?);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "return net_mod.tcp.tcpBindAddr46(tcb_idx, parsed.port, net_mod.tcp_port_policy.WILDCARD4, parsed.addr, bind_addr_policy.boundDev6(parsed.addr, parsed.scope_id));") != null);
+    const ts = kt.tcp_source;
+    const f = std.mem.indexOf(u8, ts, "pub fn tcpConnectDev6(").?;
+    const fe = std.mem.indexOfPos(u8, ts, f, "\n}\n").?;
+    // Only a socket that may still connect is retied; a connected or connecting one gets its connect error from tcpConnectSocketV6.
+    try std.testing.expect(std.mem.indexOf(u8, ts[f..fe], "if (tcb.state != .closed) return 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts[f..fe], "tcb.bound_dev6 = r.dev;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "    t.bound_dev6 = 0;\n") != null);
+    // A SYN held back while the neighbor is being solicited counts as sent, so connect() is EINPROGRESS and the retransmit timer
+    // resends it (and solicits again), as Linux queues it on the neighbor entry.
+    const lost = std.mem.indexOf(u8, ts, "if (!synLostOnLoopback(tcb, netif.isLoopbackV6(remote_ip6))) {").?;
+    try std.testing.expect(std.mem.indexOfPos(u8, ts, lost, "if (!synAwaitsNeighbor(tcb, ndp.resolveNextHop(remote_ip6).solicit != null)) {").? <
+        std.mem.indexOfPos(u8, ts, lost, "tcb.state = .closed;").?);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "fn synAwaitsNeighbor(tcb: *TcpTcb, pending: bool) bool {\n    if (!pending) return false;\n    advanceSndNxt(tcb, SYN, 0);\n    return true;\n}") != null);
+}
+
 test "an IPv6 TCP socket's bound address takes part in conflicts, listener choice, lookup, source address and naming (hello359)" {
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "        if (tcb.is_v6 and !tcp_port_policy.addrsConflict6(tcb.local_ip6, tcbs[i].local_ip6)) continue;\n") != null);
@@ -4859,7 +4912,7 @@ test "an IPv6 TCP socket's bound address takes part in conflicts, listener choic
     try std.testing.expect(std.mem.indexOf(u8, ts, "tcp_port_policy.nameAddr6(tcb.local_ip6, tcb.remote_port != 0, tcb.remote_ip6,") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "    const is_loop = netif.isLoopbackV6(tcb.remote_ip6) or ndp.isOwnAddress(tcb.remote_ip6, netif.getMac());\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "    const is_loop = netif.isLoopbackV6(dst_ip) or ndp.isOwnAddress(dst_ip, netif.getMac());\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "return net_mod.tcp.tcpBindAddr46(tcb_idx, parsed.port, net_mod.tcp_port_policy.WILDCARD4, parsed.addr);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "return net_mod.tcp.tcpBindAddr46(tcb_idx, parsed.port, net_mod.tcp_port_policy.WILDCARD4, parsed.addr, bind_addr_policy.boundDev6(parsed.addr, parsed.scope_id));") != null);
     const p = kt.tcp_port_policy;
     const wild: [16]u8 = @splat(0);
     var loop6 = wild;
@@ -11797,7 +11850,7 @@ test "TCP bind errors and SO_REUSEADDR sharing" {
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ts, "return tcp_port_policy.CONNECT_EADDRNOTAVAIL;"));
     // Both bind paths (IPv4 and IPv6) refuse a privileged port without the capability with EACCES.
     const ss = kt.socket_syscall_source;
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n        return net_mod.tcp.tcpBindAddr46(tcb_idx, parsed.port, net_mod.tcp_port_policy.WILDCARD4, parsed.addr);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n        return net_mod.tcp.tcpBindAddr46(tcb_idx, parsed.port, net_mod.tcp_port_policy.WILDCARD4, parsed.addr, bind_addr_policy.boundDev6(parsed.addr, parsed.scope_id));"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n    return net_mod.tcp.tcpBindAddr(tcb_idx, port, .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] });"));
     // UDP (IPv4 and IPv6) refuses a privileged port the same way; no bare -1 is left in any bind path.
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n            return udpRebind(t, fd, parsed.port, .{ 0, 0, 0, 0 }, parsed.addr, bind_addr_policy.boundDev6(parsed.addr, parsed.scope_id));") != null);
