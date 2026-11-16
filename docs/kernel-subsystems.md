@@ -1811,7 +1811,7 @@ e1000 (中断驱动) / virtio-net (Virtqueue)
 
 文件: `arp.zig`
 
-- ARP 缓存：16 项的线性表，没有老化，满了不再加新条目
+- ARP 缓存：16 项的线性表，没有按时间老化；满了时新邻居（收到的 ARP 报文或 SIOCSARP）占用最久没更新的普通条目，永久条目不让出（`arp_policy.pickCacheSlot`，对应 Linux `neigh_forced_gc`；hello380）
 - 请求/应答；收到任何 ARP 报文都记下发送者
 - 下一跳没解析时挂起 IPv4 帧，每秒重问一次，3 秒后丢弃（hello375）
 - SIOCGARP / SIOCDARP（hello375）

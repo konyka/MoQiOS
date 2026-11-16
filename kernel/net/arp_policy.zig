@@ -57,6 +57,29 @@ pub fn probeDue(s: Slot, now: u64) bool {
     return s.used and !expired(s, now) and now >= s.next_probe_ns;
 }
 
+// ── the cache ──
+
+/// The fields pickCacheSlot reads of a cache entry.
+pub const CacheSlot = struct {
+    valid: bool = false,
+    perm: bool = false,
+    /// When the entry was last set or confirmed by a received ARP packet (Linux neighbour->updated).
+    updated_ns: u64 = 0,
+};
+
+/// The slot a new neighbour takes: a free one, else the ordinary entry updated longest ago (neigh_forced_gc removes entries not
+/// updated recently when the table is full; permanent ones are never removed). Null when every entry is permanent.
+/// `slots` is an array or slice of anything with CacheSlot's fields.
+pub fn pickCacheSlot(slots: anytype) ?usize {
+    var oldest: ?usize = null;
+    for (slots, 0..) |s, i| {
+        if (!s.valid) return i;
+        if (s.perm) continue;
+        if (oldest == null or s.updated_ns < slots[oldest.?].updated_ns) oldest = i;
+    }
+    return oldest;
+}
+
 // ── SIOCGARP / SIOCDARP ──
 
 pub const SIOCDARP: u64 = 0x8953;

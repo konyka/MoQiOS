@@ -9918,7 +9918,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 局限：
   1. TCP 和 IPv6（`sendToV6From`、`icmpv6.sendFrom6`）的发送不挂起。TCP 由重传补发；IPv6 已在 hello376 一节解决。
   2. 不支持代理条目（ATF_PUBL）；静态条目已在 hello377 一节解决，`/proc/net/arp` 已在 hello378 一节解决。
-  3. ARP 缓存仍是 16 项、没有老化，满了不加新条目。
+  3. ARP 缓存仍是 16 项、没有老化，满了不加新条目（满表问题后来在 hello380 一节修复：新邻居占用最久没更新的普通条目）。
 
 ## 补充：IPv6 帧等待邻居通告（hello376）
 
@@ -10003,3 +10003,18 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - host 测试 "tcp: a send that finds the ring full sets async_nospace in the same tcp_lock section ..."：修复前失败；修复后通过。变异验证：把 `tcpSendFromUser` 的置位条件改成 `false and ...` 时这条测试失败，文件已恢复。
 - 没有 QEMU 红灯：这是两个 CPU 之间的时序窗口，在未修改的内核上无法稳定复现；之前完整 smoke 里 SMP=4 偶尔出现的 hello325 G `hits 0` 可能就是这个窗口（hello330 一节修正过测试自身的清零时机之后仍偶发），修复后是否消失只能靠后续多轮 smoke 观察。
 - 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`。没有在 riscv64、aarch64 上跑 QEMU。
+
+## 补充：ARP 缓存满了不再学习新邻居（hello380）
+
+- 问题：`arp.zig` 的 `addToCache` 只在有空槽时加新条目。16 项都被占（例如用 SIOCSARP 设了 16 个普通条目）之后，收到的 ARP 应答不再进缓存，发往网关或新邻居的帧一直挂起，3 秒后丢弃，连接不上。Linux `neigh_alloc` 在表超过阈值时跑 `neigh_forced_gc`，删掉最近没更新的条目，永久条目不删，所以新邻居总能进表。SIOCSARP 在表满时让出的是「第一个」普通条目，而不是最久没更新的。
+- 宿主机实测（`user/hello380.c`，root、`unshare -n`、hello375 的 veth 环境）：F、G、O、D 都通过；Linux 上 16 个条目全部保留（表阈值更高）。
+- 修复：
+  - `kernel/net/arp_policy.zig` 新增 `CacheSlot` 和 `pickCacheSlot`：先取空槽，否则取 `updated_ns` 最小的普通条目，全是永久条目时返回 null。
+  - `kernel/net/arp.zig`：条目新增 `updated_ns`，SIOCSARP 设置和收到 ARP 报文时更新。`addToCache` 和 `setEntry` 都改用 `pickCacheSlot`；`setEntry` 在全是永久条目时仍返回 ENOBUFS，收到的报文这时不进缓存。
+- host 测试 "arp policy: a full cache gives a new neighbour the slot of the ordinary entry updated longest ago ..."：实现前编译失败（没有 `CacheSlot`）；实现后通过。变异验证：`pickCacheSlot` 不跳过永久条目时测试失败，文件已恢复。
+- 红灯：未修改的内核（只保留 hello380 的启动配置）上定向 SMP=2，hello380 G 失败：网关条目 -6（ENXIO）。绿灯：F、G、O、D 全部通过，O 是 15/16（一个普通条目让给了网关）。
+- 启动配置：hello380 以 uid 1000 运行，带 CAP_NET_ADMIN。
+- 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello380 PASS。没有在 riscv64、aarch64 上跑 QEMU。
+- 局限：
+  1. 仍没有按时间老化（Linux 的 REACHABLE → STALE → 重新探测）；条目只会在表满时被挤掉、或被 SIOCDARP 删除。
+  2. 表大小固定为 16 项。

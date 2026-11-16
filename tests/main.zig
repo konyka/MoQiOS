@@ -14308,3 +14308,24 @@ test "tcp: a send that finds the ring full sets async_nospace in the same tcp_lo
         \\        tcp_lock.release(lock_flags);
     ) != null);
 }
+
+test "arp policy: a full cache gives a new neighbour the slot of the ordinary entry updated longest ago, never a permanent one (Linux neigh_forced_gc, hello380)" {
+    const ap = kt.arp_policy;
+    const S = ap.CacheSlot;
+    // A free slot is taken first.
+    try std.testing.expectEqual(@as(?usize, 1), ap.pickCacheSlot(&[_]S{ .{ .valid = true, .updated_ns = 5 }, .{}, .{} }));
+    // Full: the oldest ordinary entry, skipping an older permanent one.
+    try std.testing.expectEqual(@as(?usize, 2), ap.pickCacheSlot(&[_]S{
+        .{ .valid = true, .updated_ns = 50 },
+        .{ .valid = true, .perm = true, .updated_ns = 1 },
+        .{ .valid = true, .updated_ns = 10 },
+        .{ .valid = true, .updated_ns = 30 },
+    }));
+    // Every entry permanent: nothing can go.
+    try std.testing.expectEqual(@as(?usize, null), ap.pickCacheSlot(&[_]S{ .{ .valid = true, .perm = true }, .{ .valid = true, .perm = true } }));
+
+    const src = kt.arp_source;
+    try std.testing.expect(std.mem.indexOf(u8, src, "const i = policy.pickCacheSlot(&cache) orelse return;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const i = slot orelse policy.pickCacheSlot(&cache) orelse return -105; // ENOBUFS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "cache[i].updated_ns = nowNs();") != null);
+}

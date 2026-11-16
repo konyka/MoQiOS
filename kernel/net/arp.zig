@@ -12,6 +12,8 @@ const ArpEntry = struct {
     valid: bool,
     /// Set with SIOCSARP and ATF_PERM (NUD_PERMANENT): received ARP no longer changes it.
     perm: bool = false,
+    /// Last set by SIOCSARP or confirmed by a received ARP packet: a full cache gives up the ordinary entry updated longest ago.
+    updated_ns: u64 = 0,
 };
 
 var cache: [MAX_ARP_ENTRIES]ArpEntry = @splat(.{ .ip = @splat(0), .mac = @splat(0), .valid = false });
@@ -160,7 +162,7 @@ pub fn lookupEntry(ip: [4]u8) ?Entry {
 
 /// SIOCSARP (arp_req_set → neigh_update with NEIGH_UPDATE_F_ADMIN): install `mac` for `ip`, permanent or not, replacing what is
 /// there; with no MAC given the entry keeps its MAC and only its state changes, and a new entry cannot be made (EINVAL). A full
-/// table gives up its first non-permanent entry; when every entry is permanent the request fails with ENOBUFS. Frames waiting for
+/// table gives up the non-permanent entry updated longest ago; when every entry is permanent the request fails with ENOBUFS. Frames waiting for
 /// `ip` go out once it has a MAC.
 pub fn setEntry(ip: [4]u8, mac: ?[6]u8, perm: bool) i64 {
     var installed: ?[6]u8 = null;
@@ -173,27 +175,14 @@ pub fn setEntry(ip: [4]u8, mac: ?[6]u8, perm: bool) i64 {
         }
         if (slot == null) {
             const m = mac orelse return -22; // EINVAL
-            for (0..MAX_ARP_ENTRIES) |i| {
-                if (!cache[i].valid) {
-                    slot = i;
-                    break;
-                }
-            }
-            if (slot == null) {
-                for (0..MAX_ARP_ENTRIES) |i| {
-                    if (!cache[i].perm) {
-                        slot = i;
-                        break;
-                    }
-                }
-            }
-            const i = slot orelse return -105; // ENOBUFS
-            cache[i] = .{ .ip = ip, .mac = m, .valid = true, .perm = perm };
+            const i = slot orelse policy.pickCacheSlot(&cache) orelse return -105; // ENOBUFS
+            cache[i] = .{ .ip = ip, .mac = m, .valid = true, .perm = perm, .updated_ns = nowNs() };
             installed = m;
         } else {
             const i = slot.?;
             if (mac) |m| cache[i].mac = m;
             cache[i].perm = perm;
+            cache[i].updated_ns = nowNs();
             installed = cache[i].mac;
         }
     }
@@ -265,16 +254,13 @@ fn addToCache(ip: [4]u8, mac: [6]u8) void {
     for (0..MAX_ARP_ENTRIES) |i| {
         if (cache[i].valid and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) {
             if (!cache[i].perm) cache[i].mac = mac;
+            cache[i].updated_ns = nowNs();
             return;
         }
     }
-    // Add new entry
-    for (0..MAX_ARP_ENTRIES) |i| {
-        if (!cache[i].valid) {
-            cache[i] = .{ .ip = ip, .mac = mac, .valid = true, .perm = false };
-            return;
-        }
-    }
+    // A new neighbour: a free slot, else the ordinary entry updated longest ago (Linux neigh_forced_gc).
+    const i = policy.pickCacheSlot(&cache) orelse return;
+    cache[i] = .{ .ip = ip, .mac = mac, .valid = true, .perm = false, .updated_ns = nowNs() };
 }
 
 fn sendArpReply(target_ip: [4]u8, target_mac: [6]u8) void {
