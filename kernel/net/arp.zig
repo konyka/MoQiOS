@@ -218,6 +218,41 @@ pub fn setProxy(ip: [4]u8, dev: policy.ProxyDev) i64 {
     return -105; // ENOBUFS
 }
 
+const devconf = @import("devconf_policy.zig");
+/// net.ipv4.conf.{all,default,lo,eth0}.proxy_arp, indexed by devconf.Dev. Kept and reported only: MoQiOS does not forward, so no
+/// proxy reply is ever due.
+var proxy_arp_conf: [4]i32 = @splat(0);
+
+/// The conf entry a proxy device names: no device is all (arp_req_set_proxy's IPV4_DEVCONF_ALL).
+pub fn confDev(d: policy.ProxyDev) devconf.Dev {
+    return switch (d) {
+        .any => .all,
+        .lo => .lo,
+        .eth => .eth,
+    };
+}
+
+pub fn setProxyArp(dev: devconf.Dev, v: i32) void {
+    const saved = arp_lock.acquire();
+    defer arp_lock.release(saved);
+    proxy_arp_conf[@intFromEnum(dev)] = v;
+}
+
+/// A write at offset 0 to /proc/sys/net/ipv4/conf/<dev>/proxy_arp: the bytes consumed or -EINVAL (devconf.writeInt).
+pub fn proxyArpWrite(dev: devconf.Dev, text: []const u8) i64 {
+    const w = devconf.writeInt(text);
+    if (w.value) |v| setProxyArp(dev, v);
+    return w.ret;
+}
+
+/// The text of /proc/sys/net/ipv4/conf/<dev>/proxy_arp.
+pub fn proxyArpRead(dev: devconf.Dev, out: []u8) usize {
+    const saved = arp_lock.acquire();
+    const v = proxy_arp_conf[@intFromEnum(dev)];
+    arp_lock.release(saved);
+    return devconf.formatInt(out, v);
+}
+
 /// Remove the proxy entry (`ip`, `dev`); false when there is none (pneigh_delete's ENOENT).
 pub fn deleteProxy(ip: [4]u8, dev: policy.ProxyDev) bool {
     const saved = arp_lock.acquire();

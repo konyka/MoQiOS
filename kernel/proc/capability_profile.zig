@@ -162,6 +162,11 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // Proxy ARP test: CAP_NET_ADMIN to set and remove proxy entries.
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_net_admin = true }, .initial_init = false };
     }
+    if (std.mem.eql(u8, name, "hello383")) {
+        // net.ipv4.conf.<dev>.proxy_arp: uid 1000 with CAP_NET_ADMIN, which sets the switch with SIOCSARP and opens the sysctls for
+        // writing (net_ctl_permissions); a child drops the capability with capset and gets EACCES.
+        return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_net_admin = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello380")) {
         // Full ARP cache test: CAP_NET_ADMIN to fill the cache with SIOCSARP and remove the entries again.
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_net_admin = true }, .initial_init = false };

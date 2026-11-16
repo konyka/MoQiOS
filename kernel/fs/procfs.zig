@@ -30,6 +30,9 @@ pub const ProcFile = enum(u8) {
     tcpstats,
     /// /proc/sys/net/ipv4/ping_group_range: the groups that may create ping sockets (two gids); root may write it (mode 0644).
     ping_group_range,
+    /// /proc/sys/net/ipv4/conf/<dev>/proxy_arp: the device's proxy ARP switch, an int (arp.proxyArpRead); the device
+    /// (devconf_policy.Dev) is kept in proc_pid. Root or a holder of CAP_NET_ADMIN may write it (mode 0644, net_ctl_permissions).
+    proxy_arp,
     /// /proc/net/arp: the IPv4 neighbour table (arp.formatProc).
     net_arp,
     /// The /proc directory itself and /proc/<pid> (also reached as /proc/self): directories, listed by getdents64.
@@ -46,6 +49,10 @@ pub const ProcFile = enum(u8) {
     sys_dir,
     sys_net_dir,
     sys_ipv4_dir,
+    /// /proc/sys/net/ipv4/conf (all, default, lo and eth0 while the NIC is up) and one device's directory below it (the device in
+    /// proc_pid); both listed by getdents64 (subdirEntryAt).
+    sys_conf_dir,
+    conf_dev_dir,
 };
 
 pub fn isDir(file: ProcFile) bool {
@@ -54,7 +61,12 @@ pub fn isDir(file: ProcFile) bool {
 
 /// One of the fixed directories below /proc (net, sys and the sys tree).
 pub fn isSubdir(file: ProcFile) bool {
-    return file == .net_dir or file == .sys_dir or file == .sys_net_dir or file == .sys_ipv4_dir;
+    return file == .net_dir or file == .sys_dir or file == .sys_net_dir or file == .sys_ipv4_dir or file == .sys_conf_dir or file == .conf_dev_dir;
+}
+
+/// A /proc/sys file (proc_sys_call_handler): a read past offset 0 returns nothing, and so does a write there (sysctl_writes_strict).
+pub fn isSysctl(file: ProcFile) bool {
+    return file == .ping_group_range or file == .proxy_arp;
 }
 
 /// The fixed directory a path below /proc names ("net", "sys/net/", ...), or null.
@@ -70,12 +82,22 @@ pub fn subdirByPath(rest: []const u8) ?ProcFile {
 
 const SubEntry = struct { name: []const u8, dtype: u8 };
 
+/// The directories of /proc/sys/net/ipv4/conf in Linux's order; eth0 is listed only while the NIC is up.
+const conf_devs = [_]SubEntry{
+    .{ .name = "all", .dtype = DT_DIR },
+    .{ .name = "default", .dtype = DT_DIR },
+    .{ .name = "lo", .dtype = DT_DIR },
+    .{ .name = "eth0", .dtype = DT_DIR },
+};
+
 fn subdirChildren(dir: ProcFile) []const SubEntry {
     return switch (dir) {
         .net_dir => &.{.{ .name = "arp", .dtype = DT_REG }},
         .sys_dir => &.{.{ .name = "net", .dtype = DT_DIR }},
         .sys_net_dir => &.{.{ .name = "ipv4", .dtype = DT_DIR }},
-        .sys_ipv4_dir => &.{.{ .name = "ping_group_range", .dtype = DT_REG }},
+        .sys_ipv4_dir => &.{ .{ .name = "conf", .dtype = DT_DIR }, .{ .name = "ping_group_range", .dtype = DT_REG } },
+        .sys_conf_dir => if (@import("../net/nic.zig").isActive()) &conf_devs else conf_devs[0..3],
+        .conf_dev_dir => &.{.{ .name = "proxy_arp", .dtype = DT_REG }},
         else => &.{},
     };
 }
@@ -227,8 +249,9 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
         .lostats => generateLoStats(buf, max_len),
         .tcpstats => generateTcpStats(buf, max_len),
         .ping_group_range => @intCast(@import("../net/udp.zig").pingGroupRead(buf[0..@min(max_len, 32)])),
+        .proxy_arp => @intCast(@import("../net/arp.zig").proxyArpRead(@enumFromInt(pid), buf[0..@min(max_len, 16)])),
         .net_arp => @intCast(@import("../net/arp.zig").formatProc(buf[0..max_len])),
-        .root_dir, .pid_dir, .mount_dir, .fd_dir, .net_dir, .sys_dir, .sys_net_dir, .sys_ipv4_dir => 0,
+        .root_dir, .pid_dir, .mount_dir, .fd_dir, .net_dir, .sys_dir, .sys_net_dir, .sys_ipv4_dir, .sys_conf_dir, .conf_dev_dir => 0,
     };
 }
 

@@ -10046,5 +10046,28 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello382 PASS。没有在 riscv64、aarch64 上跑 QEMU。
 - 局限：
   1. 不代答：Linux 只在转发、且代理地址经另一块设备出去时回 ARP 应答；MoQiOS 只有一块网卡、不转发，代理条目只保存、列出和删除。
-  2. proxy_arp 开关（netmask 0）被接受但不保存，也没有 `/proc/sys/net/ipv4/conf/*/proxy_arp`。
+  2. proxy_arp 开关（netmask 0）被接受但不保存，也没有 `/proc/sys/net/ipv4/conf/*/proxy_arp`。（后来在 hello383 一节解决）
   3. 代理表固定 16 项；不支持 ATF_DONTPUB 的区别处理。
+
+## 补充：net.ipv4.conf.<dev>.proxy_arp（hello383）
+
+- 背景：hello382 局限 2。SIOCSARP / SIOCDARP 带 ATF_PUBL 和 netmask 0 返回 0，但值不保存；`/proc/sys/net/ipv4/conf` 不存在（open 是 ENOENT，`/proc/sys/net/ipv4` 也不列出它）。另外两处和 Linux 不一致：/proc/sys 文件的 read 在偏移不为 0 时仍按偏移返回内容；ping_group_range 只允许 euid 0 以写方式打开，持有 CAP_NET_ADMIN 的普通用户被拒绝（Linux `net_ctl_permissions` 允许）。
+- 宿主机实测（`user/hello383.c`，root、`unshare -n`、hello375 的 veth 环境；P 项的无能力子进程在宿主机上用 setresuid(1000)）：L、R、I、W1、W2、D、P 共 7 项通过。要点：
+  1. 四个值互相独立：写 default 不影响 lo 和 v0，写 all 不影响 default 和 v0；不指名设备的 netmask 0 开关改的是 all。
+  2. 写入是 proc_dointvec 的单个 int：`0x10` 是 16、`010` 是 8、`-2147483648` 可以、`2147483648` 是 EINVAL；21 个字符的数字 EINVAL、20 个可以；`7 8` 返回 2（只消费第一个数和后面的空白）；空写返回 0。
+  3. 同一描述符的第二次 write（偏移 1）返回 1，但不改值；pwrite 偏移 1 同样；再读和 pread 偏移 1 都是 0 字节。
+  4. 未知设备、设备目录下的未知文件都是 ENOENT；目录 mode 0555，文件 0644。
+- 修复：
+  1. 新增 `kernel/net/devconf_policy.zig`：`Dev`（all/default/lo/eth）、`lookup`（把 `/proc/` 之后的路径解析成 conf 目录、设备目录或 proxy_arp 文件，eth0 只在网卡启用时存在）、`writeInt`（proc_dointvec 一个 int 的解析）、`formatInt`。
+  2. `arp.zig` 新增 `proxy_arp_conf`（四个 int，`arp_lock` 保护）、`confDev`、`setProxyArp`、`proxyArpWrite`、`proxyArpRead`；`ioctl.zig` 的 `.toggle` 分支调用 `setProxyArp`（SIOCSARP 为 1，SIOCDARP 为 0）。
+  3. `procfs.zig` 新增 `proxy_arp`、`sys_conf_dir`、`conf_dev_dir`（设备编号放在 `proc_pid`），`/proc/sys/net/ipv4` 列出 `conf`；新增 `isSysctl`。
+  4. `vfs.zig`：open 走 `devconf_policy.lookup`（目录以写方式打开 EISDIR，文件写打开要 fsuid 0 或 CAP_NET_ADMIN，否则 EACCES）；ping_group_range 的写打开同样接受 CAP_NET_ADMIN；write 和 pwrite 统一走 `sysctlWrite`（偏移不为 0 时返回 count、不改值）；read 和 pread 在 sysctl 文件偏移不为 0 时返回 0。
+  5. `capability_profile` 给 hello383 设 uid 1000 和 CAP_NET_ADMIN；子进程用 capset 去掉能力。
+- host 测试 "devconf policy: net.ipv4.conf.<dev>.proxy_arp paths, proc_dointvec writes, set by ATF_PUBL netmask 0 (hello383)"：实现前编译失败（host_test 没有 `devconf_policy`）；实现后通过。变异验证：`writeInt` 不检查数字后的字符时测试失败，文件已恢复。hello373、hello379 两个测试里的源码断言按新文本更新。
+- 红灯：未修改的内核（只保留启动配置）上定向 SMP=2，7 项全部失败：conf 目录 ENOENT，写 proxy_arp ENOENT，ping_group_range 写打开 -13（EACCES）。绿灯：7 项全部通过。第一次绿灯时 L 项报 -38，是测试程序在 MoQiOS 上用了宿主机的 getdents64 编号 217，改成 MoQiOS 的 173 后通过（宿主机版本不受影响）。
+- 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello383 PASS。riscv64、aarch64 交叉构建通过，没有在这两个架构上跑 QEMU。
+- 局限：
+  1. 只有 proxy_arp 一个设备参数；`conf/<dev>/` 下 Linux 的其他文件（forwarding、rp_filter、arp_ignore 等）都没有。
+  2. 开关只保存和报告：MoQiOS 不转发、只有一块网卡，不会因此代答 ARP。
+  3. 写 default 不传播到设备，和 Linux 对已有地址的设备一致；MoQiOS 没有“新设备从 default 继承”的时机，因为设备是固定的。
+

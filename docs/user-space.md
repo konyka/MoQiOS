@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello382`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello383`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -377,6 +377,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello380 | ARP 缓存满了仍能学到新邻居：用 SIOCSARP 设 16 个普通条目，再设一次第一个（F）；向已删除条目的网关发 UDP，应答被缓存，SIOCGARP 报告 0x2（G）；刚设过的条目还在，16 个里至少留下 15 个（O）；SIOCDARP 删除它们（D） |
 | hello381 | 一个 IPv6 UDP 套接字加入多个组播组：在 lo 上加入 64 个不同的组都成功，再加第一个是 EADDRINUSE（J）；64 个都能退出，再退第一个是 EADDRNOTAVAIL（D） |
 | hello382 | 代理 ARP 条目（ATF_PUBL）：在 eth0 上设置成功、重复设置也成功，`/proc/net/arp` 列出 type 0x1、flags 0xc、MAC 全 0 的一行，SIOCGARP 是 ENXIO（P）；不指名设备时是所有设备（type 0x0、设备 `*`），带 ATF_COM 而 MAC 不属于任何设备是 ENODEV（N）；netmask /24 是 EINVAL，netmask 0 开关 proxy_arp、不列出（M）；同地址的普通条目与代理条目并存，不带 ATF_PUBL 的 SIOCDARP 只删普通条目（C）；SIOCDARP ATF_PUBL 删除代理条目，再删是 ENOENT（D） |
+| hello383 | net.ipv4.conf.<dev>.proxy_arp：`/proc/sys/net/ipv4` 列出 `conf` 目录，`conf` 列出 all、default、lo、eth0，设备目录列出 proxy_arp，未知设备或文件 ENOENT（L）；四个值都读 `0\n`，再读和 pread 偏移 1 都是 0 字节（R）；SIOCSARP ATF_PUBL+netmask 0 把 eth0 的值设为 1（all 不变），SIOCDARP 清零，不指名设备时是 all，lo 是 lo（I）；写入按 proc_dointvec 解析一个 int（`0x10` 是 16、`010` 是 8、`12abc`/`4\r`/超出 int 是 EINVAL、空写返回 0），偏移不为 0 的写入整段吞掉不生效（W1、W2）；default 和 all 各自独立（D）；有 CAP_NET_ADMIN 的 uid 1000 能以写方式打开 proxy_arp 和 ping_group_range，用 capset 去掉能力的子进程得到 EACCES、仍能读（P） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

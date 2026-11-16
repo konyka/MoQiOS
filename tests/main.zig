@@ -4957,12 +4957,13 @@ test "net.ipv4.ping_group_range: who may create a ping socket, read and written 
         try std.testing.expectEqual(@as(u32, 0), prof.gid);
         try std.testing.expect(prof.caps.cap_setuid and prof.caps.cap_setgid and prof.caps.cap_net_raw);
     }
-    // socket() asks the policy with the caller's egid and supplementary groups; the procfs file is root-writable only (mode 0644).
+    // socket() asks the policy with the caller's egid and supplementary groups; the procfs file is mode 0644 owned by root, which a
+    // holder of CAP_NET_ADMIN may also write (net_ctl_permissions, hello383).
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (!udp.pingGroupAllowed(t.egid, t.groups[0..t.ngroups])) return -13; // EACCES") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "str.eql(rest, \"sys/net/ipv4/ping_group_range\")") != null);
     // Opened for writing, the descriptor is writable (writeInner refuses any other with EBADF before the procfs write is reached).
-    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "                .writable = is_writable and pfile == .ping_group_range,\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "                .writable = is_writable and procfs.isSysctl(pfile),\n") != null);
 }
 
 test "IPv6 ping sockets: SOCK_DGRAM/IPPROTO_ICMPV6 share the ident table but only take replies of their own family (hello374)" {
@@ -14287,7 +14288,7 @@ test "procfs: /proc/net, /proc/sys, /proc/sys/net and /proc/sys/net/ipv4 are dir
     try std.testing.expect(std.mem.indexOf(u8, pf, ".net_dir => &.{.{ .name = \"arp\", .dtype = DT_REG }},") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_dir => &.{.{ .name = \"net\", .dtype = DT_DIR }},") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_net_dir => &.{.{ .name = \"ipv4\", .dtype = DT_DIR }},") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{.{ .name = \"ping_group_range\", .dtype = DT_REG }},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "return file == .root_dir or file == .pid_dir or file == .mount_dir or file == .fd_dir or isSubdir(file);") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "if (std.mem.eql(u8, body, \"sys/net/ipv4\")) return .sys_ipv4_dir;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "procfs.subdirEntryAt(desc.proc_file_type, pos)") != null);
@@ -14399,4 +14400,62 @@ test "arp policy: SIOCSARP / SIOCDARP with ATF_PUBL keep proxy entries per devic
     const io = kt.ioctl_source;
     try std.testing.expect(std.mem.indexOf(u8, io, "if (cmd != ap.SIOCGARP and ap.isPublic(&req)) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, io, "return if (arp.deleteProxy(p.ip, p.dev)) 0 else -2; // ENOENT") != null);
+}
+
+test "devconf policy: net.ipv4.conf.<dev>.proxy_arp paths, proc_dointvec writes, set by ATF_PUBL netmask 0 (hello383)" {
+    const dp = kt.devconf_policy;
+    // Paths below /proc: the conf directory, a device's directory, its proxy_arp file; eth0 only while the NIC is up.
+    try std.testing.expect(dp.lookup("sys/net/ipv4/conf", true).? == .conf_dir);
+    try std.testing.expect(dp.lookup("sys/net/ipv4/conf/", true).? == .conf_dir);
+    try std.testing.expectEqual(dp.Dev.eth, dp.lookup("sys/net/ipv4/conf/eth0", true).?.dev_dir);
+    try std.testing.expectEqual(dp.Dev.all, dp.lookup("sys/net/ipv4/conf/all/", true).?.dev_dir);
+    try std.testing.expectEqual(dp.Dev.default, dp.lookup("sys/net/ipv4/conf/default/proxy_arp", true).?.proxy_arp);
+    try std.testing.expectEqual(dp.Dev.lo, dp.lookup("sys/net/ipv4/conf/lo/proxy_arp", false).?.proxy_arp);
+    try std.testing.expect(dp.lookup("sys/net/ipv4/conf/eth0/proxy_arp", false) == null);
+    try std.testing.expect(dp.lookup("sys/net/ipv4/conf/nope0/proxy_arp", true) == null);
+    try std.testing.expect(dp.lookup("sys/net/ipv4/conf/eth0/nope", true) == null);
+    try std.testing.expect(dp.lookup("sys/net/ipv4/confx", true) == null);
+    try std.testing.expect(dp.lookup("sys/net/ipv4/ping_group_range", true) == null);
+
+    // Writes as measured on Linux (hello383 W): the return value and, when it parsed, the new value.
+    const Case = struct { t: []const u8, ret: i64, v: ?i32 };
+    const cases = [_]Case{
+        .{ .t = "1\n", .ret = 2, .v = 1 },         .{ .t = "-3", .ret = 2, .v = -3 },
+        .{ .t = "x", .ret = -22, .v = null },      .{ .t = "  7  \n", .ret = 6, .v = 7 },
+        .{ .t = "7 8", .ret = 2, .v = 7 },         .{ .t = "", .ret = 0, .v = null },
+        .{ .t = "99999999999", .ret = -22, .v = null }, .{ .t = "0x10", .ret = 4, .v = 16 },
+        .{ .t = "010", .ret = 3, .v = 8 },         .{ .t = "12abc", .ret = -22, .v = null },
+        .{ .t = "4\r", .ret = -22, .v = null },    .{ .t = "\n\n", .ret = -22, .v = null },
+        .{ .t = "-2147483648", .ret = 11, .v = -2147483648 }, .{ .t = "2147483648", .ret = -22, .v = null },
+        .{ .t = "000000000000000000001", .ret = -22, .v = null }, .{ .t = "00000000000000000002", .ret = 20, .v = 2 },
+        .{ .t = "4\t", .ret = 2, .v = 4 },         .{ .t = "-", .ret = -22, .v = null },
+        .{ .t = "+1", .ret = -22, .v = null },     .{ .t = "0", .ret = 1, .v = 0 },
+    };
+    for (cases) |c| {
+        const w = dp.writeInt(c.t);
+        try std.testing.expectEqual(c.ret, w.ret);
+        try std.testing.expectEqual(c.v, w.value);
+    }
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("0\n", buf[0..dp.formatInt(&buf, 0)]);
+    try std.testing.expectEqualStrings("-2147483648\n", buf[0..dp.formatInt(&buf, -2147483648)]);
+
+    // Wiring: the values live in arp.zig; SIOCSARP / SIOCDARP with netmask 0 set them; /proc lists and opens the files; a holder of
+    // CAP_NET_ADMIN may open them (and ping_group_range) for writing (net_ctl_permissions); a sysctl reads nothing past offset 0 and
+    // a write there is swallowed (sysctl_writes_strict).
+    const as = kt.arp_source;
+    try std.testing.expect(std.mem.indexOf(u8, as, "pub fn proxyArpWrite(dev: devconf.Dev, text: []const u8) i64 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, as, "pub fn setProxyArp(dev: devconf.Dev, v: i32) void {") != null);
+    const io = kt.ioctl_source;
+    try std.testing.expect(std.mem.indexOf(u8, io, ".toggle => |d| {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, io, "arp.setProxyArp(arp.confDev(d), if (cmd == ap.SIOCSARP) 1 else 0);") != null);
+    const pf = kt.procfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".proxy_arp => @intCast(@import(\"../net/arp.zig\").proxyArpRead(@enumFromInt(pid), buf[0..@min(max_len, 16)])),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, "pub fn isSysctl(file: ProcFile) bool {") != null);
+    const vs = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, vs, "@import(\"../net/devconf_policy.zig\").lookup(rest, @import(\"../net/nic.zig\").isActive())") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vs, "if (is_writable and euid != 0 and !effective_caps.cap_net_admin) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vs, "fn sysctlWrite(desc: *FileDescriptor, buf: [*]const u8, count: usize, offset: u64) i64 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vs, "if (procfs.isSysctl(desc.proc_file_type) and offset != 0) return 0;") != null);
 }

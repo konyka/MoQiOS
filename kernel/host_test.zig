@@ -204,6 +204,7 @@ pub const bind_addr_policy = @import("net/bind_addr_policy.zig");
 pub const route4_policy = @import("net/route4_policy.zig");
 pub const ping_policy = @import("net/ping_policy.zig");
 pub const arp_policy = @import("net/arp_policy.zig");
+pub const devconf_policy = @import("net/devconf_policy.zig");
 pub const arp_source = @embedFile("net/arp.zig");
 pub const ndp_queue_source = @embedFile("net/ndp_queue.zig");
 pub const mcast_policy = @import("net/mcast_policy.zig");

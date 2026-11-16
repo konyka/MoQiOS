@@ -137,12 +137,15 @@ fn arpIoctl(cmd: u64, arg: u64, cur_idx: u32) i64 {
     const admin = @import("../ipc/capability.zig").hasSysCap(cur_idx, "cap_net_admin");
     const arp = @import("../net/arp.zig");
     if (cmd != ap.SIOCGARP and ap.isPublic(&req)) {
-        // Proxy entries (arp_req_set_public / arp_req_delete_public); a zero netmask is the device's proxy_arp switch, which keeps
-        // no entry and changes nothing else here (MoQiOS does not forward, so no proxy reply is ever due).
+        // Proxy entries (arp_req_set_public / arp_req_delete_public); a zero netmask sets the device's proxy_arp switch (on for
+        // SIOCSARP, off for SIOCDARP; no device is "all") and keeps no entry. MoQiOS does not forward, so no proxy reply is ever due.
         const pr = ap.parsePublic(cmd, &req, admin, @import("../net/nic.zig").isActive(), @import("../net/netif.zig").getMac());
         const p = switch (pr) {
             .entry => |e| e,
-            .toggle => return 0,
+            .toggle => |d| {
+                arp.setProxyArp(arp.confDev(d), if (cmd == ap.SIOCSARP) 1 else 0);
+                return 0;
+            },
             .err => |e| return e,
         };
         if (cmd == ap.SIOCSARP) return arp.setProxy(p.ip, p.dev);

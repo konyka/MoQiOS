@@ -982,6 +982,22 @@ pub fn statusFlagsOf(desc: *FileDescriptor) u32 {
 
 /// F_GETOWN / F_GETSIG: the owner (pid, -pgrp or 0) and signal (0: SIGIO) of the whole open file description.
 /// `kind` is the F_SETOWN_EX type (fcntl_policy.F_OWNER_*): a TID owner is signalled as that thread, a PID owner as its process.
+/// A write to a /proc/sys file at `offset`: ping_group_range (ipv4_ping_group_range) or a device's proxy_arp (proc_dointvec). At an
+/// offset past 0 the write is swallowed whole and changes nothing (sysctl_writes_strict, measured in hello383); the rest of /proc is
+/// read-only.
+fn sysctlWrite(desc: *FileDescriptor, buf: [*]const u8, count: usize, offset: u64) i64 {
+    const procfs = @import("procfs.zig");
+    if (!procfs.isSysctl(desc.proc_file_type)) return -1;
+    if (count > 4095) return -22;
+    if (procfs.isSysctl(desc.proc_file_type) and offset != 0) return @intCast(count);
+    const text = buf[0..count];
+    return switch (desc.proc_file_type) {
+        .ping_group_range => @import("../net/udp.zig").pingGroupWrite(text),
+        .proxy_arp => @import("../net/arp.zig").proxyArpWrite(@enumFromInt(desc.proc_pid), text),
+        else => -1,
+    };
+}
+
 /// `uid`/`euid` are the credentials of whoever set the owner (Linux sigio_perm checks them against each target).
 pub const Fown = struct { owner: i32, sig: u8, kind: u8 = 1, uid: u32 = 0, euid: u32 = 0 };
 
@@ -1761,8 +1777,9 @@ pub const FdTable = struct {
             } else if (rest.len == 8 and str.eql(rest, "tcpstats")) {
                 pfile = .tcpstats;
             } else if (str.eql(rest, "sys/net/ipv4/ping_group_range")) {
-                // Mode 0644 owned by root: opening it for writing needs fsuid 0 (Linux sysctl permissions).
-                if (is_writable and euid != 0) {
+                // Mode 0644 owned by root: opening it for writing needs fsuid 0 or CAP_NET_ADMIN, which net_ctl_permissions gives
+                // the owner's bits.
+                if (is_writable and euid != 0 and !effective_caps.cap_net_admin) {
                     self.freeFd(slot);
                     return -13; // EACCES
                 }
@@ -1774,6 +1791,28 @@ pub const FdTable = struct {
                     return -13; // EACCES
                 }
                 pfile = .net_arp;
+            } else if (@import("../net/devconf_policy.zig").lookup(rest, @import("../net/nic.zig").isActive())) |cp| {
+                // /proc/sys/net/ipv4/conf, conf/<dev> (directories, mode 0555) and conf/<dev>/proxy_arp (mode 0644 like
+                // ping_group_range). The device rides in proc_pid.
+                switch (cp) {
+                    .conf_dir => pfile = .sys_conf_dir,
+                    .dev_dir => |d| {
+                        pfile = .conf_dev_dir;
+                        pid = @intFromEnum(d);
+                    },
+                    .proxy_arp => |d| {
+                        pfile = .proxy_arp;
+                        pid = @intFromEnum(d);
+                    },
+                }
+                if (is_writable and pfile != .proxy_arp) {
+                    self.freeFd(slot);
+                    return -21; // EISDIR
+                }
+                if (is_writable and euid != 0 and !effective_caps.cap_net_admin) {
+                    self.freeFd(slot);
+                    return -13; // EACCES
+                }
             } else if (procfs.subdirByPath(rest)) |dir| {
                 // /proc/net, /proc/sys, /proc/sys/net, /proc/sys/net/ipv4: directories (mode 0555).
                 if (is_writable) {
@@ -1874,8 +1913,8 @@ pub const FdTable = struct {
                 .proc_file_type = pfile,
                 .proc_pid = pid,
                 .status_flags = status,
-                // The one writable /proc file; every other one refuses a write before it gets here (writeInner's EBADF gate).
-                .writable = is_writable and pfile == .ping_group_range,
+                // The writable /proc files are the sysctls; every other one refuses a write before it gets here (writeInner's EBADF gate).
+                .writable = is_writable and procfs.isSysctl(pfile),
             };
             self.publishFd(slot);
             return @intCast(slot);
@@ -2250,6 +2289,7 @@ pub const FdTable = struct {
                 const procfs = @import("procfs.zig");
                 if (@import("namespace_policy.zig").readGate(procfs.isDir(desc.proc_file_type)) != 0) return -21; // EISDIR
                 var scratch: [4096]u8 = undefined;
+                if (procfs.isSysctl(desc.proc_file_type) and desc.offset != 0) return 0;
                 const generated = if (procfs.consumesOnRead(desc.proc_file_type) and desc.offset != 0) 0 else procfs.procRead(desc.proc_file_type, desc.proc_pid, &scratch, 4096);
                 if (desc.offset >= generated) return 0;
                 const avail = generated - @as(u32, @intCast(desc.offset));
@@ -2477,10 +2517,9 @@ pub const FdTable = struct {
                 return n;
             },
             .proc_file => {
-                // Only /proc/sys/net/ipv4/ping_group_range takes writes (ipv4_ping_group_range); the rest of /proc is read-only.
-                if (desc.proc_file_type != .ping_group_range) return -1;
-                if (count > 4095) return -22;
-                return @import("../net/udp.zig").pingGroupWrite(buf[0..@intCast(count)]);
+                const n = sysctlWrite(desc, buf, count, desc.offset);
+                if (n > 0) desc.offset += @intCast(n);
+                return n;
             },
             .pidfd => return -1,
             .inotify => return -1, // inotify is read-only via special path
@@ -2586,6 +2625,7 @@ pub const FdTable = struct {
                 const procfs = @import("procfs.zig");
                 if (@import("namespace_policy.zig").readGate(procfs.isDir(desc.proc_file_type)) != 0) return -21; // EISDIR
                 var scratch: [4096]u8 = undefined;
+                if (procfs.isSysctl(desc.proc_file_type) and offset != 0) return 0;
                 const generated = if (procfs.consumesOnRead(desc.proc_file_type) and desc.offset != 0) 0 else procfs.procRead(desc.proc_file_type, desc.proc_pid, &scratch, 4096);
                 if (offset >= generated) return 0;
                 const avail = generated - @as(u32, @intCast(offset));
@@ -2644,7 +2684,10 @@ pub const FdTable = struct {
                 if (ops.write == null) return -1;
                 return -29; // ESPIPE
             },
-            .proc_file => return -1, // proc files are read-only
+            .proc_file => {
+                if (!desc.writable) return -9; // EBADF
+                return sysctlWrite(desc, buf, count, offset);
+            },
             .pidfd => return -1,
             .fat32_file => {
                 if (!desc.writable) return -9; // EBADF
