@@ -1,10 +1,10 @@
 /* hello371: IPv4 ping sockets (socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)), Linux net/ipv4/ping.c. The user writes an ICMP echo
  * request; the kernel puts the socket's ident in the id field and checksums it; the echo replies whose id is that ident come back
  * on the socket, from the address that answered. Also: recvfrom on an IPv4 datagram socket reports a 16-byte sockaddr_in.
- * Measured on the host (build with -DHOST, run in `unshare -rn` with lo up, a veth pair whose far end has no address, and the
- * namespace's ping_group_range opened to group 0:
- *   echo "0 0" > /proc/sys/net/ipv4/ping_group_range; ip link set lo up; ip link add v0 type veth peer name v1;
- *   ip link set v1 up; ip link set v0 up; ip addr add 10.0.2.15/24 dev v0; ip route add default via 10.0.2.2 dev v0):
+ * The test opens net.ipv4.ping_group_range to group 0 itself (hello373) and puts the old range back. Measured on the host (build
+ * with -DHOST, run as root in `unshare --map-auto --map-root-user -n` with lo up and a veth pair whose far end has no address:
+ *   ip link set lo up; ip link add v0 type veth peer name v1; ip link set v1 up; ip link set v0 up;
+ *   ip addr add 10.0.2.15/24 dev v0; ip route add default via 10.0.2.2 dev v0):
  *   P. a ping socket names port 0 and reports SO_PROTOCOL 1; an echo request to 127.0.0.1 comes back as an echo reply with the
  *      same sequence number and data, the socket's ident as id, a valid checksum, from 127.0.0.1 (address length 16); the socket
  *      then names its ident;
@@ -19,6 +19,7 @@
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
@@ -63,6 +64,45 @@ static void pump(void) { long t[2] = { 0, 20000000 }; syscall1(104, 0); syscall2
 static void close_(long s) { syscall1(11, s); }
 #define FAM(a, f) do { (a)[0] = (unsigned char)(f); (a)[1] = 0; } while (0)
 #endif
+/* Ping sockets need the caller's group in net.ipv4.ping_group_range (empty by default): open it to group 0 for the test and put
+ * back what was there (on the host the namespace starts with the default range, as MoQiOS does). */
+static char range_saved[48];
+static long range_fd(int wr) {
+#ifdef HOST
+    return rc(open("/proc/sys/net/ipv4/ping_group_range", wr ? O_WRONLY : O_RDONLY));
+#else
+    return syscall3(9, (long)"/proc/sys/net/ipv4/ping_group_range", wr ? 1 : 0, 0);
+#endif
+}
+static long range_io(long fd, char *b, int n, int wr) {
+#ifdef HOST
+    return rc(wr ? write((int)fd, b, n) : read((int)fd, b, n));
+#else
+    return syscall3(wr ? 1 : 10, fd, (long)b, n);
+#endif
+}
+static long open_ping_range(void) {
+    long fd = range_fd(0);
+    if (fd < 0) return fd;
+    long n = range_io(fd, range_saved, sizeof range_saved - 1, 0);
+    close_(fd);
+    if (n <= 0) return -1;
+    range_saved[n] = 0;
+    fd = range_fd(1);
+    if (fd < 0) return fd;
+    char zero[] = "0 0";
+    long w = range_io(fd, zero, 3, 1);
+    close_(fd);
+    return w;
+}
+static void restore_ping_range(void) {
+    long fd = range_fd(1);
+    if (fd < 0) return;
+    int n = 0;
+    while (range_saved[n] && range_saved[n] != '\n') n++;
+    range_io(fd, range_saved, n, 1);
+    close_(fd);
+}
 static int failures;
 static char msg[400];
 static void check(int ok, const char *w) {
@@ -99,6 +139,7 @@ static long wait_msg(long s, unsigned char *b, int n, unsigned char *from, long 
 }
 int main(void) {
     print("hello371: IPv4 ping sockets\n");
+    long range_rc = open_ping_range();
     unsigned char lo4[4] = { 127, 0, 0, 1 }, gw[4] = { 10, 0, 2, 2 }, far[4] = { 10, 0, 2, 99 }, grp[4] = { 224, 0, 0, 1 };
     unsigned char a[32], from[32], name[16], own[4];
     unsigned char req[16] = { 8, 0, 0, 0, 0, 0, 0, 7, 'p', 'i', 'n', 'g', '3', '7', '1', '!' }, rep[64];
@@ -206,6 +247,8 @@ int main(void) {
     check(ua == 2 && ulen == 16 && zero && ub == 2 && flen == 16 && from[8] == 0xee, msg);
     close_(ur); close_(us);
 
+    restore_ping_range();
+    if (range_rc != 3) { print("hello371:   FAIL could not open net.ipv4.ping_group_range\n"); failures++; }
     print(failures ? "hello371: FAIL\n" : "hello371: PASS\n");
     return failures ? 1 : 0;
 }

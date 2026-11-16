@@ -28,6 +28,8 @@ pub const ProcFile = enum(u8) {
     lostats,
     /// TCB table snapshot: connections per state, unreferenced leftovers, SYNs dropped for lack of a slot, TIME_WAIT slots given away.
     tcpstats,
+    /// /proc/sys/net/ipv4/ping_group_range: the groups that may create ping sockets (two gids); root may write it (mode 0644).
+    ping_group_range,
     /// The /proc directory itself and /proc/<pid> (also reached as /proc/self): directories, listed by getdents64.
     root_dir,
     pid_dir,
@@ -165,6 +167,7 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
         .irqwindow => generateIrqWindow(buf, max_len),
         .lostats => generateLoStats(buf, max_len),
         .tcpstats => generateTcpStats(buf, max_len),
+        .ping_group_range => @intCast(@import("../net/udp.zig").pingGroupRead(buf[0..@min(max_len, 32)])),
         .root_dir, .pid_dir, .mount_dir, .fd_dir => 0,
     };
 }

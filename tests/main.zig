@@ -4911,6 +4911,60 @@ test "ping sockets: SOCK_DGRAM/IPPROTO_ICMP sends echo requests under the socket
     try std.testing.expectEqual(@as(u32, 2), kt.sockopt_policy.identity(.ping, false).sock_type);
 }
 
+test "net.ipv4.ping_group_range: who may create a ping socket, read and written as two gids (hello373)" {
+    const pp = kt.ping_policy;
+    // Default: nobody (1 0), shown as the overflow gid twice (from_kgid_munged of an empty range).
+    var r = pp.GroupRange{};
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("65534\t65534\n", buf[0..pp.formatRange(r, &buf)]);
+    try std.testing.expect(!pp.groupAllowed(r, 0, &.{}));
+    // proc_doulongvec_minmax: up to two decimal values separated by blanks; a missing high value keeps the old one.
+    try std.testing.expectEqual(@as(i64, 3), pp.writeRange(&r, "0 0"));
+    try std.testing.expectEqualStrings("0\t0\n", buf[0..pp.formatRange(r, &buf)]);
+    try std.testing.expect(pp.groupAllowed(r, 0, &.{}));
+    try std.testing.expect(!pp.groupAllowed(r, 5, &.{}));
+    try std.testing.expect(pp.groupAllowed(r, 5, &.{ 3, 0 }));
+    try std.testing.expectEqual(@as(i64, 4), pp.writeRange(&r, "0 0\n"));
+    try std.testing.expectEqual(@as(i64, 7), pp.writeRange(&r, "  2\t9  "));
+    try std.testing.expectEqualStrings("2\t9\n", buf[0..pp.formatRange(r, &buf)]);
+    try std.testing.expect(pp.groupAllowed(r, 9, &.{}) and pp.groupAllowed(r, 2, &.{}) and !pp.groupAllowed(r, 10, &.{}));
+    try std.testing.expectEqual(@as(i64, 1), pp.writeRange(&r, "7"));
+    try std.testing.expectEqualStrings("7\t9\n", buf[0..pp.formatRange(r, &buf)]);
+    // Three values: the first two are taken (proc_doulongvec stops at maxlen) and the bytes up to the third are consumed.
+    try std.testing.expectEqual(@as(i64, 4), pp.writeRange(&r, "1 2 3"));
+    try std.testing.expectEqualStrings("1\t2\n", buf[0..pp.formatRange(r, &buf)]);
+    // An inverted range means nobody again.
+    try std.testing.expectEqual(@as(i64, 3), pp.writeRange(&r, "5 3"));
+    try std.testing.expectEqualStrings("65534\t65534\n", buf[0..pp.formatRange(r, &buf)]);
+    try std.testing.expect(!pp.groupAllowed(r, 4, &.{}));
+    // Junk, a negative value or one past GID_T_MAX (2^32 - 2) is EINVAL and changes nothing.
+    _ = pp.writeRange(&r, "1 1");
+    try std.testing.expectEqual(@as(i64, -22), pp.writeRange(&r, "x"));
+    try std.testing.expectEqual(@as(i64, -22), pp.writeRange(&r, "-1 3"));
+    try std.testing.expectEqual(@as(i64, -22), pp.writeRange(&r, "0 4294967295"));
+    try std.testing.expectEqual(@as(i64, 12), pp.writeRange(&r, "0 4294967294"));
+    try std.testing.expectEqual(@as(i64, -22), pp.writeRange(&r, "1 4294967295"));
+    try std.testing.expectEqualStrings("0\t4294967294\n", buf[0..pp.formatRange(r, &buf)]);
+    try std.testing.expectEqual(@as(i64, 0), pp.writeRange(&r, ""));
+    try std.testing.expectEqualStrings("0\t4294967294\n", buf[0..pp.formatRange(r, &buf)]);
+
+    // The ping tests run as root (the file is root-writable only) holding CAP_SETUID/CAP_SETGID for hello373's children and
+    // CAP_NET_RAW for its raw-socket check.
+    const cp = kt.capability_profile;
+    for ([_][]const u8{ "hello371", "hello372", "hello373" }) |name| {
+        const prof = cp.profileForLaunch(name, true, false);
+        try std.testing.expectEqual(@as(u32, 0), prof.uid);
+        try std.testing.expectEqual(@as(u32, 0), prof.gid);
+        try std.testing.expect(prof.caps.cap_setuid and prof.caps.cap_setgid and prof.caps.cap_net_raw);
+    }
+    // socket() asks the policy with the caller's egid and supplementary groups; the procfs file is root-writable only (mode 0644).
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (!udp.pingGroupAllowed(t.egid, t.groups[0..t.ngroups])) return -13; // EACCES") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "str.eql(rest, \"sys/net/ipv4/ping_group_range\")") != null);
+    // Opened for writing, the descriptor is writable (writeInner refuses any other with EBADF before the procfs write is reached).
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "                .writable = is_writable and pfile == .ping_group_range,\n") != null);
+}
+
 test "ping sockets sharing an ident: the reply goes to the one hashed last that takes it (hello372)" {
     const pp = kt.ping_policy;
     const any = [4]u8{ 0, 0, 0, 0 };

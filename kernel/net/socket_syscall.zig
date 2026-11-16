@@ -89,11 +89,13 @@ fn udpRebind(t: *task_mod.Task, fd: u32, new_port: u16, addr: [4]u8, addr6: [16]
     return 0;
 }
 
-/// socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP): a ping socket on the first free ICMP ident. Linux lets only the groups in
-/// net.ipv4.ping_group_range create one (none by default); this kernel has no such sysctl and lets every task.
+/// socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP): a ping socket on the first free ICMP ident, for a task whose egid or a supplementary
+/// group lies in net.ipv4.ping_group_range (empty by default; root sets it through /proc/sys/net/ipv4/ping_group_range).
 fn pingCreate() i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
+    // ping_init_sock: the egid or a supplementary group must lie in net.ipv4.ping_group_range.
+    if (!udp.pingGroupAllowed(t.egid, t.groups[0..t.ngroups])) return -13; // EACCES
     const key = udp.pingOpen(t.fsuid) orelse return -105; // ENOBUFS
     const fd_slot = t.fd_table.allocFd() orelse {
         udp.releasePort(key);

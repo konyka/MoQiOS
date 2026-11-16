@@ -2,6 +2,8 @@
 //! kernel puts the socket's ident (its "port") in the id field and checksums it, and the echo replies whose id is that ident are
 //! queued on the socket.
 
+const std = @import("std");
+
 const EINVAL: i64 = -22;
 const EMSGSIZE: i64 = -90;
 
@@ -79,6 +81,111 @@ pub fn pickReceiver(holders: []const Holder, src: [4]u8, dst: [4]u8) ?usize {
         if (best == null or h.seq > holders[best.?].seq) best = i;
     }
     return best;
+}
+
+/// net.ipv4.ping_group_range: the groups (inclusive) that may create ping sockets. The default, 1 0, is empty: nobody may.
+pub const GroupRange = struct { low: u32 = 1, high: u32 = 0 };
+
+/// The overflow gid shown for an empty range (from_kgid_munged of an unmapped gid).
+const OVERFLOW_GID: u32 = 65534;
+/// GID_T_MAX: (gid_t)-1 is the invalid gid, so the largest value accepted is one below it.
+const GID_T_MAX: u64 = 0xffff_fffe;
+
+/// ping_init_sock: the caller's egid or one of its supplementary groups lies in the range.
+pub fn groupAllowed(r: GroupRange, egid: u32, groups: []const u32) bool {
+    if (r.low > r.high) return false;
+    if (egid >= r.low and egid <= r.high) return true;
+    for (groups) |g| {
+        if (g >= r.low and g <= r.high) return true;
+    }
+    return false;
+}
+
+/// The text a read of the file gives: the two gids separated by a tab and ended by a newline; an empty range reads as the overflow
+/// gid twice. Returns the length written to `out` (at least 23 bytes).
+pub fn formatRange(r: GroupRange, out: []u8) usize {
+    const lo: u32 = if (r.low > r.high) OVERFLOW_GID else r.low;
+    const hi: u32 = if (r.low > r.high) OVERFLOW_GID else r.high;
+    var n = putDecimal(out, 0, lo);
+    out[n] = '\t';
+    n = putDecimal(out, n + 1, hi);
+    out[n] = '\n';
+    return n + 1;
+}
+
+/// A write of `text` (ipv4_ping_group_range through proc_doulongvec_minmax): up to two unsigned values (decimal, 0x hex or 0 octal)
+/// separated by blanks; a missing second value keeps the old high end; a value past GID_T_MAX, a negative one or a non-number is
+/// EINVAL and changes nothing; an inverted range is stored as the empty one. Returns the bytes consumed (through the blanks after the
+/// last value taken) or -EINVAL.
+pub fn writeRange(r: *GroupRange, text: []const u8) i64 {
+    var vals: [2]u64 = .{ r.low, r.high };
+    var i: usize = 0;
+    var got: usize = 0;
+    while (got < 2) {
+        while (i < text.len and isSpace(text[i])) i += 1;
+        if (i >= text.len) break;
+        if (text[i] == '-') return EINVAL;
+        const v = parseUlong(text, &i) orelse return EINVAL;
+        if (i < text.len and !isSep(text[i])) return EINVAL;
+        if (v > GID_T_MAX) return EINVAL;
+        vals[got] = v;
+        got += 1;
+    }
+    if (got == 0) return if (text.len == 0) 0 else EINVAL;
+    // The trailing blanks are consumed too; anything after them (a third value) is left, so the write returns less than it was given.
+    while (i < text.len and isSpace(text[i])) i += 1;
+    if (vals[1] < vals[0]) {
+        r.* = .{};
+    } else {
+        r.* = .{ .low = @intCast(vals[0]), .high = @intCast(vals[1]) };
+    }
+    return @intCast(i);
+}
+
+fn isSpace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0b or c == 0x0c;
+}
+
+fn isSep(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n';
+}
+
+/// strtoul with base 0: 0x/0X hex, a leading 0 octal, else decimal. Null when no digit follows or the value overflows 64 bits.
+fn parseUlong(text: []const u8, pos: *usize) ?u64 {
+    var i = pos.*;
+    var base: u64 = 10;
+    if (i + 1 < text.len and text[i] == '0' and (text[i + 1] == 'x' or text[i + 1] == 'X')) {
+        base = 16;
+        i += 2;
+    } else if (i < text.len and text[i] == '0') {
+        base = 8;
+    }
+    const start = i;
+    var v: u64 = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        const d: u64 = if (c >= '0' and c <= '9') c - '0' else if (c >= 'a' and c <= 'f') c - 'a' + 10 else if (c >= 'A' and c <= 'F') c - 'A' + 10 else break;
+        if (d >= base) break;
+        v = std.math.mul(u64, v, base) catch return null;
+        v = std.math.add(u64, v, d) catch return null;
+    }
+    if (i == start) return null;
+    pos.* = i;
+    return v;
+}
+
+fn putDecimal(out: []u8, at: usize, v: u32) usize {
+    var tmp: [10]u8 = undefined;
+    var n: usize = 0;
+    var x = v;
+    while (true) {
+        tmp[n] = @intCast('0' + x % 10);
+        n += 1;
+        x /= 10;
+        if (x == 0) break;
+    }
+    for (0..n) |k| out[at + k] = tmp[n - 1 - k];
+    return at + n;
 }
 
 fn checksum(buf: []const u8) u16 {

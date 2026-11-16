@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello372`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello373`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -367,6 +367,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello370 | 发往本机 IPv4 地址（网卡的 10.0.2.15）的报文走 lo：数据报送到绑在通配地址上的套接字，源地址是本机地址（U）；TCP connect 到本机地址能连上通配地址上的监听者，双向收发数据，两端的名字都是本机地址（T）；connect 到本机地址上没人监听的端口是 ECONNREFUSED（R） |
 | hello371 | IPv4 ping 套接字（`SOCK_DGRAM`/`IPPROTO_ICMP`）：新套接字名字的端口是 0，SO_PROTOCOL 是 1；发往 127.0.0.1 的回显请求收到回显应答，序号和数据不变，id 是套接字的 ident，校验和正确，来源 127.0.0.1、地址长度 16，之后名字报告 ident（P）；发往本机网卡地址的请求由该地址应答（O）；不到 8 字节、类型不是回显请求、code 不是 0、地址不到 16 字节是 EINVAL，AF_INET6 地址是 EAFNOSUPPORT，未连接又没给地址是 EDESTADDRREQ，空队列 recv 是 EAGAIN（E）；bind 4371 后名字是 4371，再 bind 是 EINVAL，另一个 ping 套接字也能 bind 4371（两者都有 SO_REUSEADDR），清掉 SO_REUSEADDR 的是 EADDRINUSE，UDP 的 4371 不冲突，10.0.2.99 和 224.0.0.1 是 EADDRNOTAVAIL（B）；connect 后用 send 发出并收到应答（C）；UDP recvfrom 报告 16 字节的地址长度，sin_zero 清零，调用方只给 8 字节时也报告 16（U） |
 | hello372 | 共用 ident 的 ping 套接字：A、B 都 bind 4700，A 和 B 发出的请求，应答都交给后 bind 的 B，C 再 bind 4700 后交给 C（L）；先绑 127.0.0.1、后绑通配地址时应答交给后者，先绑通配、后绑本机网卡地址时发往 127.0.0.1 的应答交给前者（S）；D 第一次发送得到 ident，E bind 这个 ident 后 D 的应答交给 E（A）；新套接字名字是 0.0.0.0:0，connect 到 127.0.0.1 后名字是 127.0.0.1 和 ident；4701 上后绑、连到 127.0.0.1 的套接字照样收到来自 127.0.0.2 的应答（C） |
+| hello373 | `net.ipv4.ping_group_range`：默认读出 `65534\t65534\n`，连 root 也不能建 ping 套接字（EACCES）（D）；写入 `0 0` 返回 3、读回 `0\t0\n`，root 之后可以建；写入 `2 9` 后 egid 9 和 egid 0 但附加组含 7 的进程可以，egid 10 不行；raw 套接字不看这个范围（W）；写入 `7` 只改下界（`7\t9\n`），`5 3`（倒置）读回空范围，`x`、`-1 3` 和超过 4294967294 的值是 EINVAL 且不改变范围，`1 2 3` 设为 `1\t2\n` 并返回 4（P）；uid 1 的进程不能以写方式打开这个文件，但能读（U）；测试结束时恢复原来的范围 |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

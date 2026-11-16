@@ -9850,3 +9850,27 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   3. 下一跳没解析时发送返回 EAGAIN，Linux 把报文挂在邻居条目上并返回成功。
   4. 不处理发往 ping 套接字的 ICMP 错误，也没有 `IP_RECVERR`。
   5. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
+
+## 补充：net.ipv4.ping_group_range（hello373）
+
+- 背景：hello371 的局限 1。没有 `ping_group_range`，所有任务都能建 ping 套接字，Linux 默认谁都不能（范围为空），要由 root 通过 `/proc/sys/net/ipv4/ping_group_range` 打开。
+- Linux 依据：`ping_init_sock`（`net/ipv4/ping.c`）检查 egid 和附加组是否在范围内，否则 EACCES；`ipv4_ping_group_range`（`net/ipv4/sysctl_net_ipv4.c`）用 `proc_doulongvec_minmax` 读写两个值，上限 GID_T_MAX（4294967294），倒置的范围存为空范围（读出 65534 两次）；文件模式 0644。
+- 宿主机实测（Linux，root 身份在 `unshare --map-auto --map-root-user -n` 里，gid 0–65535 都有映射，方法写在 `user/hello373.c` 文件头）：D、W、P、U 共 4 项全部通过。实测细节：只写一个值时只改下界；`1 2 3` 设为 1–2，返回 4（第三个值没被读取）；`0x10 0x20` 和 `010 20` 分别按十六进制和八进制解析；`3,4`、`3 4x` 是 EINVAL；只有 gid 0 有映射的用户命名空间里写入其他 gid 都是 EINVAL（gid_valid），所以测试用 `--map-auto`。
+- 红灯（未修改的内核，SMP=2，hello373 临时放在 init 序列最前面）：4 项全部失败。文件不存在（ENOENT），root 不经许可就能建 ping 套接字。
+- 修复：
+  1. `kernel/net/ping_policy.zig`：新增 `GroupRange`、`groupAllowed`、`formatRange`、`writeRange`（含 base 0 的 strtoul 解析）。
+  2. `kernel/net/udp.zig`：新增 `ping_groups`（默认空范围）和 `pingGroupAllowed`、`pingGroupRead`、`pingGroupWrite`，都在 `udp_lock` 下。
+  3. `kernel/net/socket_syscall.zig`：`pingCreate` 先用调用者的 egid 和附加组查 `pingGroupAllowed`，否则 EACCES。
+  4. `kernel/fs/procfs.zig` 新增 `.ping_group_range`；`kernel/fs/vfs.zig` 打开 `/proc/sys/net/ipv4/ping_group_range`（以写方式打开要求 fsuid 0，否则 EACCES），`write` 交给 `pingGroupWrite`，其余 procfs 文件仍然只读。
+  5. hello371、hello372 开头把范围设为 `0 0`，结束时恢复原来的范围；文件头的宿主机实测方法改为 `--map-auto`。
+  6. 第一份完整 smoke 里 hello371、hello372、hello373 都失败：测试的 MoQiOS 分支把 read 写成了系统调用 0（Linux 的号），MoQiOS 的 read 是 10，读文件返回 ENOSYS，范围没能打开。改成 10 之后重跑。
+  7. 第二份完整 smoke 里 hello373 的 W、P、U 失败，hello371、hello372 也失败：init 起测试程序时默认是 uid 1000、没有能力，打不开只有 root 能写的范围文件（EACCES）。`kernel/proc/capability_profile.zig` 给 hello371–hello373 加上启动配置：uid 0、gid 0，带 CAP_SETUID、CAP_SETGID（hello373 的子进程换 uid、gid 和附加组）和 CAP_NET_RAW（hello373 的 raw 套接字检查）；host 测试钉住这个配置。
+  8. 第三份完整 smoke 里 W、P 失败：写入返回 EBADF。vfs 的 `writeInner` 在分派到各类文件之前先查描述符的 `writable`，procfs 描述符一律没有置这个标记，写入走不到新加的分支。改为以写方式打开范围文件时置上 `writable`（其他 procfs 文件仍然不置），并去掉分支里重复的访问模式检查；host 测试钉住这一行。
+- 测试：hello373（QEMU，4 项）；新增 host 测试「net.ipv4.ping_group_range: who may create a ping socket, read and written as two gids (hello373)」。
+- 变异验证：`groupAllowed` 对附加组不再放行，hello373 这条 host 测试失败，文件已恢复。
+- 完整 smoke：前三份 SMP=2 失败（见修复 6–8）。最终构建：SMP=2、SMP=1、SMP=4 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello373 PASS。本轮没有跑 riscv64、aarch64。
+- 这次修复带来的局限：
+  1. 范围是全局的，不分网络命名空间（MoQiOS 没有网络命名空间）；也不做 gid 映射。
+  2. 没有 `/proc/sys` 目录树，只能按完整路径打开这一个文件，getdents 列不出来。
+  3. IPv6 ping 套接字仍是 EPROTONOSUPPORT；下一跳没解析时 ping 发送返回 EAGAIN；不处理发往 ping 套接字的 ICMP 错误。
+  4. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。

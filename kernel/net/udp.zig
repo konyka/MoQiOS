@@ -291,6 +291,30 @@ fn newSlotLocked(key: u32, is_v6: bool, uid: u32) u16 {
     return @intCast(idx);
 }
 
+/// net.ipv4.ping_group_range (/proc/sys/net/ipv4/ping_group_range): who may create a ping socket. Empty by default, as in Linux.
+var ping_groups: @import("ping_policy.zig").GroupRange = .{};
+
+/// Whether a task with effective gid `egid` and supplementary `groups` may create a ping socket (ping_init_sock).
+pub fn pingGroupAllowed(egid: u32, groups: []const u32) bool {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    return @import("ping_policy.zig").groupAllowed(ping_groups, egid, groups);
+}
+
+/// The text of /proc/sys/net/ipv4/ping_group_range.
+pub fn pingGroupRead(out: []u8) usize {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    return @import("ping_policy.zig").formatRange(ping_groups, out);
+}
+
+/// A write to /proc/sys/net/ipv4/ping_group_range: the bytes consumed or -EINVAL (ping_policy.writeRange).
+pub fn pingGroupWrite(text: []const u8) i64 {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    return @import("ping_policy.zig").writeRange(&ping_groups, text);
+}
+
 /// Ping socket keys carry PING_KEY in the discriminator so they never equal a UDP socket's key; the ident is the low 16 bits.
 pub const PING_KEY: u32 = 0x8000_0000;
 

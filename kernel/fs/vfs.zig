@@ -1760,6 +1760,13 @@ pub const FdTable = struct {
                 pfile = .lostats;
             } else if (rest.len == 8 and str.eql(rest, "tcpstats")) {
                 pfile = .tcpstats;
+            } else if (str.eql(rest, "sys/net/ipv4/ping_group_range")) {
+                // Mode 0644 owned by root: opening it for writing needs fsuid 0 (Linux sysctl permissions).
+                if (is_writable and euid != 0) {
+                    self.freeFd(slot);
+                    return -13; // EACCES
+                }
+                pfile = .ping_group_range;
             } else if (procDirPid(rest)) |dir_pid| {
                 // /proc/<pid>, /proc/<pid>/ and /proc/self: the process's directory.
                 pfile = .pid_dir;
@@ -1853,6 +1860,8 @@ pub const FdTable = struct {
                 .proc_file_type = pfile,
                 .proc_pid = pid,
                 .status_flags = status,
+                // The one writable /proc file; every other one refuses a write before it gets here (writeInner's EBADF gate).
+                .writable = is_writable and pfile == .ping_group_range,
             };
             self.publishFd(slot);
             return @intCast(slot);
@@ -2453,7 +2462,12 @@ pub const FdTable = struct {
                 }
                 return n;
             },
-            .proc_file => return -1, // proc files are read-only
+            .proc_file => {
+                // Only /proc/sys/net/ipv4/ping_group_range takes writes (ipv4_ping_group_range); the rest of /proc is read-only.
+                if (desc.proc_file_type != .ping_group_range) return -1;
+                if (count > 4095) return -22;
+                return @import("../net/udp.zig").pingGroupWrite(buf[0..@intCast(count)]);
+            },
             .pidfd => return -1,
             .inotify => return -1, // inotify is read-only via special path
             .mqueue => return -22, // EINVAL: an mq descriptor has no write (Linux mqueue_file_operations)
