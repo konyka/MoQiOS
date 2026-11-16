@@ -14516,3 +14516,23 @@ test "udp autobind: an unbound UDP socket has no port until bind, connect or a s
     try std.testing.expect(std.mem.count(u8, ss, "const ab = udpAutobind(&t.fd_table.fds[fd]);") >= 2);
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (desc.udp_ping and !desc.udp_ping_bound) 0 else if (!desc.udp_ping and !udp.isNamed(desc.udpKey())) 0 else desc.udp_port;") != null);
 }
+
+test "route4 policy: a socket bound to 127/8 cannot send or connect out through the NIC (Linux __mkroute_output, hello386)" {
+    const rp = kt.route4_policy;
+    const our = [4]u8{ 10, 0, 2, 15 };
+    const lb = [4]u8{ 127, 0, 0, 1 };
+    try std.testing.expectEqual(@as(i64, -22), rp.loopbackSourceErrno(lb, .{ 10, 0, 2, 2 }, our));
+    try std.testing.expectEqual(@as(i64, -22), rp.loopbackSourceErrno(lb, .{ 8, 8, 8, 8 }, our));
+    try std.testing.expectEqual(@as(i64, -22), rp.loopbackSourceErrno(lb, .{ 10, 0, 2, 255 }, our));
+    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(lb, .{ 127, 9, 9, 9 }, our));
+    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(lb, our, our));
+    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(lb, .{ 255, 255, 255, 255 }, our));
+    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(lb, .{ 224, 0, 0, 1 }, our));
+    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(.{ 0, 0, 0, 0 }, .{ 10, 0, 2, 2 }, our));
+    try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(our, lb, our));
+
+    // Wired into UDP sendto / sendmsg / connect, the ping send and connect, and TCP connect, before anything is sent.
+    const ss = kt.socket_syscall_source;
+    // Five call sites: the ping send, sendto and sendmsg of UDP, the UDP/ping connect and the TCP connect.
+    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, ss, "route4_policy.zig\").loopbackSourceErrno("));
+}

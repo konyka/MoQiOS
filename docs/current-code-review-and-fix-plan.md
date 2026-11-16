@@ -9364,7 +9364,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 这次修复带来的局限：
   1. 只做了 IPv4。IPv6 TCB 仍不记录本地地址，`[::1]:p` 和 `[::]:p` 仍算同一个端口，getsockname 仍按对端选源地址。
   2. ~~已建立连接的查找（`findTcbByTuple`）和 connect 的 4 元组检查（`connectTupleTaken`）仍只看本地端口和对端，不看本地地址；两个本地地址不同、端口相同的连接如果连向同一对端会被当作同一个 4 元组。~~（hello346 已补上 IPv4。）
-  3. 绑定网卡地址、对端在回环上（或反过来）的组合按 `sourceAddr` 选源地址，没有做 Linux 那样的路由检查和 `EINVAL`。
+  3. 绑定网卡地址、对端在回环上（或反过来）的组合按 `sourceAddr` 选源地址，没有做 Linux 那样的路由检查和 `EINVAL`。（绑定回环地址、对端经网卡的一半后来在 hello386 一节解决；绑定网卡地址、对端在回环上的一半 Linux 也照发，不算缺陷。）
   4. UDP 的 getsockname 仍报告网卡地址，UDP 端口冲突也不区分本地地址。（hello347 已补上 getsockname 和源地址，hello348 补上端口冲突和收包分派。）
 
 ## 补充：只有本地地址不同的 TCP 连接是两个连接（hello346）
@@ -10110,4 +10110,23 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 局限：
   1. 端口号在 socket() 时就预留，所以未命名的套接字仍占着 `MAX_PORTS`（64）里的一个槽；Linux 的 sk 不占端口哈希表的位置。
   2. 未命名套接字预留的编号只是「首选」：被别人 bind 走之后第一次命名会换一个端口，和 Linux 相同，但 MoQiOS 换端口时要改描述符的键，Linux 只在哈希表里移动。
+
+## 补充：绑定 127/8 的套接字不能经网卡发送（hello386）
+
+- 背景：hello345 局限 3 的一半。MoQiOS 让绑定 127.0.0.1 的 UDP 套接字把源地址为 127.0.0.1 的数据报从网卡发给网关（sendto 返回 1，connect 返回 0）；ping 套接字也一样；TCP connect 会真的发 SYN，阻塞时等 3 秒报 EHOSTUNREACH（113），非阻塞时返回 EINPROGRESS。Linux 的 `__mkroute_output` 在 `route_localnet` 关闭时拒绝非回环设备上的回环源地址，返回 EINVAL，什么也不发出：这些包对端无法回复，按 RFC 1122 也不应出现在线路上。
+- 宿主机实测（`user/hello386.c`，root、`unshare -n`、hello375 的 veth 环境）：U、M、C、T、B、P 共 6 项通过。要点：
+  1. 判断只看目的地址经哪个设备出去：另一个 127/8 地址、本机网卡地址走 lo，照发；网关、站外地址、子网广播走网卡，EINVAL。
+  2. 255.255.255.255 和组播照发：`ip_route_output_key_hash_rcu` 对它们直接用源地址所在的设备，不经 `__mkroute_output` 的检查。
+  3. connect 失败后套接字仍未连接（getpeername ENOTCONN，send EDESTADDRREQ）；TCP 的 SO_ERROR 是 0，之后还能连本机监听者。
+  4. 反过来，绑定网卡地址发往 127.0.0.1 照发，所以 hello345 局限 3 的另一半不是缺陷。
+- 修复：
+  1. `route4_policy.loopbackSourceErrno(bound, dst, our)`：绑定地址不是 127/8 时返回 0；目的地址是本机（`isLocal4`）、受限广播、组播或 0.0.0.0 时返回 0；其余返回 EINVAL。
+  2. `socket_syscall.zig` 在五处调用它：ping 发送（`pingSend`）、UDP sendto、UDP sendmsg（`udpSendBytes`）、UDP 和 ping 的 connect（在标记已连接之前）、TCP connect（在 `tcpConnectSocket` 之前，所以不建连接、不发 SYN）。
+  3. `capability_profile` 给 hello386 设 uid 0（写 ping_group_range）和 CAP_NET_RAW、CAP_NET_BIND_SERVICE、CAP_NET_ADMIN。
+- host 测试 "route4 policy: a socket bound to 127/8 cannot send or connect out through the NIC (Linux __mkroute_output, hello386)"：实现前编译失败（没有 `loopbackSourceErrno`），策略加上后接线计数仍失败，五处接上后通过。变异验证：`loopbackSourceErrno` 不看绑定地址时测试失败，文件已恢复。
+- 红灯：未修改的内核（只保留启动配置）上定向 SMP=2，U、M、C、T、P 失败：发往网关的 sendto 返回 1、connect 返回 0、TCP connect 等 3 秒报 -113、非阻塞 -115、ping 发往网关返回 8。B 在旧内核上本来就通过。绿灯：6 项全部通过。第一次绿灯时 M 项失败，原因在测试程序：MoQiOS 版本用了调用号 141（MoQiOS 的 pwritev），改成 MoQiOS 的 sendmsg 调用号 129 后通过；宿主机版本走 libc，不受影响。
+- 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello386 PASS；已有测试里没有依赖回环源地址经网卡发出的。riscv64、aarch64 交叉构建通过，没有在这两个架构上跑 QEMU。
+- 局限：
+  1. 只做了 IPv4。IPv6 不受影响：Linux 允许从 ::1 发往别的主机（hello358 实测 sendto 成功），MoQiOS 也照发。
+  2. 没有 `route_localnet` 开关（`/proc/sys/net/ipv4/conf/*/route_localnet`），检查总是打开的，等于 Linux 的默认值。
 

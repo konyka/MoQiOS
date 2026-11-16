@@ -1831,6 +1831,7 @@ e1000 (中断驱动) / virtio-net (Virtqueue)
 - 头部校验和
 - TTL、协议字段（1=ICMP, 6=TCP, 17=UDP）
 - 不支持分片/重组（MTU 1500，单帧）
+- 绑定 127/8 地址的套接字只能发往经 lo 的目的地址（另一个 127/8 地址、本机网卡地址）以及受限广播和组播；发往其他地址（网关、站外、子网广播）的 UDP sendto/sendmsg/connect、ping 发送和 connect、TCP connect 都返回 EINVAL，什么也不发出（Linux `__mkroute_output` 对非回环设备上的回环源地址返回 EINVAL）。判断在 `route4_policy.loopbackSourceErrno`（hello386）
 
 ### 4.5 ICMP ✅
 
