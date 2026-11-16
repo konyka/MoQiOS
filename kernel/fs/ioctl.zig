@@ -170,7 +170,7 @@ fn arpIoctl(cmd: u64, arg: u64, cur_idx: u32) i64 {
     if (r.dev == .lo) return ap.notFound();
     if (cmd == ap.SIOCDARP) return if (arp.deleteEntry(r.ip)) 0 else ap.notFound();
     const e = arp.lookupEntry(r.ip) orelse return ap.notFound();
-    ap.answerGet(&req, e.mac, e.perm);
+    ap.answerGet(&req, e.mac, ap.entryFlags(e.has_mac, e.perm));
     if (copy.copyToUser(@ptrFromInt(arg), &req, ap.ARPREQ_SIZE) != ap.ARPREQ_SIZE) return -14;
     return 0;
 }

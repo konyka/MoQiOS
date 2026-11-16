@@ -500,6 +500,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello381"); /* one IPv6 socket joins 64 multicast groups */
     run_test("hello382"); /* proxy ARP entries (ATF_PUBL) */
     run_test("hello383"); /* net.ipv4.conf.<dev>.proxy_arp sysctls, set by ATF_PUBL netmask 0 */
+    run_test("hello384"); /* incomplete IPv4 neighbours (flags 0x0) */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

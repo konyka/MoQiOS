@@ -14,6 +14,9 @@ const ArpEntry = struct {
     perm: bool = false,
     /// Last set by SIOCSARP or confirmed by a received ARP packet: a full cache gives up the ordinary entry updated longest ago.
     updated_ns: u64 = 0,
+    /// False for a neighbour asked for whose MAC is not known yet (Linux NUD_INCOMPLETE, then NUD_FAILED when nobody answers): it is
+    /// listed and reported with flags 0 and resolves nothing until a reply or SIOCSARP gives it a MAC.
+    has_mac: bool = true,
 };
 
 var cache: [MAX_ARP_ENTRIES]ArpEntry = @splat(.{ .ip = @splat(0), .mac = @splat(0), .valid = false });
@@ -148,20 +151,21 @@ pub fn handlePacket(data: [*]const u8, len: u32) void {
     }
 }
 
-pub const Entry = struct { mac: [6]u8, perm: bool };
+pub const Entry = struct { mac: [6]u8, perm: bool, has_mac: bool };
 
 /// The entry for `ip` with its state (SIOCGARP).
 pub fn lookupEntry(ip: [4]u8) ?Entry {
     const saved = arp_lock.acquire();
     defer arp_lock.release(saved);
     for (0..MAX_ARP_ENTRIES) |i| {
-        if (cache[i].valid and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) return .{ .mac = cache[i].mac, .perm = cache[i].perm };
+        if (cache[i].valid and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) return .{ .mac = cache[i].mac, .perm = cache[i].perm, .has_mac = cache[i].has_mac };
     }
     return null;
 }
 
 /// SIOCSARP (arp_req_set → neigh_update with NEIGH_UPDATE_F_ADMIN): install `mac` for `ip`, permanent or not, replacing what is
-/// there; with no MAC given the entry keeps its MAC and only its state changes, and a new entry cannot be made (EINVAL). A full
+/// there; with no MAC given the entry keeps its MAC and only its state changes, and an entry without one, new or still waiting for
+/// its MAC, cannot be made complete (EINVAL; the waiting one stays as it is). A full
 /// table gives up the non-permanent entry updated longest ago; when every entry is permanent the request fails with ENOBUFS. Frames waiting for
 /// `ip` go out once it has a MAC.
 pub fn setEntry(ip: [4]u8, mac: ?[6]u8, perm: bool) i64 {
@@ -180,7 +184,9 @@ pub fn setEntry(ip: [4]u8, mac: ?[6]u8, perm: bool) i64 {
             installed = m;
         } else {
             const i = slot.?;
-            if (mac) |m| cache[i].mac = m;
+            const m = mac orelse if (cache[i].has_mac) cache[i].mac else return -22; // EINVAL
+            cache[i].mac = m;
+            cache[i].has_mac = true;
             cache[i].perm = perm;
             cache[i].updated_ns = nowNs();
             installed = cache[i].mac;
@@ -278,7 +284,7 @@ pub fn formatProc(out: []u8) usize {
     var n: usize = policy.PROC_HEADER.len;
     for (snap) |e| {
         if (!e.valid) continue;
-        n += policy.formatProcLine(out[n..], e.ip, e.mac, e.perm, "eth0");
+        n += policy.formatProcLine(out[n..], e.ip, e.mac, policy.entryFlags(e.has_mac, e.perm), "eth0");
     }
     for (psnap) |e| {
         if (!e.used) continue;
@@ -291,14 +297,27 @@ pub fn resolve(ip: [4]u8) ?[6]u8 {
     const saved = arp_lock.acquire();
     defer arp_lock.release(saved);
     for (0..MAX_ARP_ENTRIES) |i| {
-        if (cache[i].valid and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) {
+        if (cache[i].valid and cache[i].has_mac and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) {
             return cache[i].mac;
         }
     }
     return null;
 }
 
+/// Asking for `ip` makes it a neighbour without a MAC unless it is one already (__neigh_event_send creates the entry and starts it
+/// INCOMPLETE); a full table gives it the ordinary entry updated longest ago, as for a new neighbour, and none when all are permanent.
+fn noteIncomplete(ip: [4]u8) void {
+    const saved = arp_lock.acquire();
+    defer arp_lock.release(saved);
+    for (0..MAX_ARP_ENTRIES) |i| {
+        if (cache[i].valid and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) return;
+    }
+    const i = policy.pickCacheSlot(&cache) orelse return;
+    cache[i] = .{ .ip = ip, .mac = @splat(0), .valid = true, .perm = false, .updated_ns = nowNs(), .has_mac = false };
+}
+
 pub fn sendArpRequest(target_ip: [4]u8) void {
+    noteIncomplete(target_ip);
     var pkt: [64]u8 = @splat(0);
     const our_mac = netif.getMac();
     const our_ip = netif.getOurIp();
@@ -332,7 +351,10 @@ fn addToCache(ip: [4]u8, mac: [6]u8) void {
     // Update existing entry
     for (0..MAX_ARP_ENTRIES) |i| {
         if (cache[i].valid and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) {
-            if (!cache[i].perm) cache[i].mac = mac;
+            if (!cache[i].perm) {
+                cache[i].mac = mac;
+                cache[i].has_mac = true;
+            }
             cache[i].updated_ns = nowNs();
             return;
         }

@@ -9953,7 +9953,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：SMP=2、SMP=1 各一份通过，SMP=4 跑了三份（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello377 PASS。三份 SMP=4 里 hello377 都是 PASS：第一份只有 hello325 G 失败，第二份只有 hello286 M 失败（都是已记录的偶发项），第三份通过。SMP=2 那份在 hello341 测试修正之前构建，第三份 SMP=4 和 SMP=1 带着修正。没有在 riscv64、aarch64 上跑 QEMU。
 - 局限：
   1. 不支持代理条目（ATF_PUBL，EOPNOTSUPP）；`/proc/net/arp` 已在 hello378 一节解决。（代理条目后来在 hello382 一节解决）
-  2. 没有 ATF_COM 时 Linux 留下的不完整邻居，MoQiOS 不建，SIOCGARP 返回 ENXIO。
+  2. 没有 ATF_COM 时 Linux 留下的不完整邻居，MoQiOS 不建，SIOCGARP 返回 ENXIO。（后来在 hello384 一节解决：不完整邻居由发出的 ARP 请求建立，SIOCSARP 不带 MAC 仍是 EINVAL，和 Linux 一致）
   3. ARP 缓存仍是 16 项、没有老化；永久条目不会被挤掉，全满时新条目 ENOBUFS（Linux 也是）。
 
 ### hello341 C 的竞争（测试修正）
@@ -9978,7 +9978,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello378 PASS。没有在 riscv64、aarch64 上跑 QEMU。
 - 局限：
   1. 没有 `/proc/net` 目录列表，只能按完整路径打开这个文件。（已在 hello379 一节解决）
-  2. 只列网卡上的条目，设备一律写 eth0。没有不完整条目（Linux 会列出 flags 0x0、MAC 全 0 的条目）。
+  2. 只列网卡上的条目，设备一律写 eth0。没有不完整条目（Linux 会列出 flags 0x0、MAC 全 0 的条目）。（不完整条目后来在 hello384 一节解决）
 
 ## 补充：/proc/net 与 /proc/sys 目录（hello379）
 
@@ -10070,4 +10070,24 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 只有 proxy_arp 一个设备参数；`conf/<dev>/` 下 Linux 的其他文件（forwarding、rp_filter、arp_ignore 等）都没有。
   2. 开关只保存和报告：MoQiOS 不转发、只有一块网卡，不会因此代答 ARP。
   3. 写 default 不传播到设备，和 Linux 对已有地址的设备一致；MoQiOS 没有“新设备从 default 继承”的时机，因为设备是固定的。
+
+## 补充：不完整的 IPv4 邻居（hello384）
+
+- 背景：hello377 局限 2、hello378 局限 2。MoQiOS 的 ARP 缓存只放有 MAC 的条目。发往同链路、还没解析的地址时，帧挂在 `arp.queueFrame` 上，但缓存里没有对应条目，所以 SIOCGARP 返回 ENXIO，`/proc/net/arp` 也看不到它。Linux 在 `__neigh_event_send` 时就建好邻居（NUD_INCOMPLETE，无人应答后变为 NUD_FAILED，直到垃圾回收才删），SIOCGARP 返回 0、flags 0，`/proc/net/arp` 列出 flags 0x0、MAC 全 0 的一行。
+- 宿主机实测（`user/hello384.c`，root、`unshare -n`、hello375 的 veth 环境，10.0.2.97 和 10.0.2.98 无人应答）：I、T、F、S、P、D 共 6 项通过。要点：
+  1. UDP sendto 和非阻塞 TCP connect 都会留下不完整条目；4 秒后无人应答，条目仍在，flags 仍为 0。
+  2. 不带 ATF_COM 的 SIOCSARP 对不完整条目是 EINVAL，条目不变；带 MAC 后变为 flags 0x2。
+  3. ATF_PERM 不带 MAC 也成功，flags 0x6、MAC 全 0（MoQiOS 原来就是这样）。
+  4. SIOCDARP 能删不完整条目。
+- 修复：
+  1. `arp_policy` 新增 `entryFlags(has_mac, perm)`（`arp_state_to_flags`）；`answerGet` 和 `formatProcLine` 改为接受 flags。
+  2. `arp.zig` 的条目新增 `has_mac`（默认 true）。`sendArpRequest` 先调用 `noteIncomplete`：地址不在表里时建一个没有 MAC 的条目，表满时按 `pickCacheSlot` 挤掉最久没更新的普通条目。`resolve` 跳过没有 MAC 的条目；收到 ARP 时 `addToCache` 填上 MAC；`setEntry` 不带 MAC 时，对没有 MAC 的条目返回 EINVAL。
+  3. `ioctl.zig` 的 SIOCGARP 按 `entryFlags` 回答。
+  4. `capability_profile` 给 hello384 设 uid 1000 和 CAP_NET_ADMIN。
+- host 测试 "arp policy: an incomplete neighbour (no MAC yet) reads flags 0 in SIOCGARP and /proc/net/arp (Linux measured, hello384)"：实现前编译失败（没有 `entryFlags`）；实现后通过。变异验证：`entryFlags` 对没有 MAC 的条目也返回 ATF_COM 时测试失败，文件已恢复。hello375、hello377、hello378 的 host 测试按新的参数更新。
+- 红灯：未修改的内核（只保留启动配置）上定向 SMP=2，I、T、F、S 失败（SIOCGARP -6，`/proc/net/arp` 没有这一行）；P、D 在旧内核上本来就通过。绿灯：6 项全部通过。
+- 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello384 PASS。riscv64、aarch64 交叉构建通过，没有在这两个架构上跑 QEMU。
+- 局限：
+  1. 不完整条目和普通条目一样占 16 项缓存，不会自动删除（Linux 由垃圾回收删 NUD_FAILED 条目）；缓存满时它们和普通条目一起按最久没更新的规则让位。
+  2. 没有状态机：不区分 INCOMPLETE 和 FAILED，有 MAC 的条目也不区分 REACHABLE 和 STALE，不按时间老化。
 

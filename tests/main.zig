@@ -14162,7 +14162,7 @@ test "arp policy: SIOCGARP / SIOCDARP request checks and the answer layout (Linu
 
     r = arpReq(2, gw, 0, "eth0");
     @memset(r[16..32], 0xAA);
-    ap.answerGet(&r, .{ 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 }, false);
+    ap.answerGet(&r, .{ 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 }, ap.entryFlags(true, false));
     try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, r[16..18], .little));
     try std.testing.expectEqualSlices(u8, &.{ 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 }, r[18..24]);
     try std.testing.expectEqual(@as(u8, 0), r[24]);
@@ -14255,29 +14255,29 @@ test "arp policy: SIOCSARP checks, permanent entries and the device / hardware f
     try std.testing.expectEqual(@as(i64, -95), ap.parseSet(&r, true, true, .link).err);
 
     r = arpReq(2, ip, 0, "eth0");
-    ap.answerGet(&r, .{ 2, 0, 0, 0, 0, 0x77 }, true);
+    ap.answerGet(&r, .{ 2, 0, 0, 0, 0, 0x77 }, ap.entryFlags(true, true));
     try std.testing.expectEqual(ap.ATF_COM | ap.ATF_PERM, std.mem.readInt(u32, r[32..36], .little));
 
     const as = kt.arp_source;
-    try std.testing.expect(std.mem.indexOf(u8, as, "if (!cache[i].perm) cache[i].mac = mac;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, as, "if (!cache[i].perm) {\n                cache[i].mac = mac;") != null);
     try std.testing.expect(std.mem.indexOf(u8, as, "const m = mac orelse return -22; // EINVAL") != null);
     try std.testing.expect(std.mem.indexOf(u8, as, "if (installed) |m| flushPending(ip, m);") != null);
     const io = kt.ioctl_source;
     try std.testing.expect(std.mem.indexOf(u8, io, "return arp.setEntry(sr.ip, sr.mac, sr.perm);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, io, "ap.answerGet(&req, e.mac, e.perm);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, io, "ap.answerGet(&req, e.mac, ap.entryFlags(e.has_mac, e.perm));") != null);
 }
 
 test "arp policy: /proc/net/arp lines use arp_format_neigh_entry's layout (Linux measured, hello378)" {
     const ap = kt.arp_policy;
     var buf: [160]u8 = undefined;
-    const n = ap.formatProcLine(&buf, .{ 10, 0, 2, 77 }, .{ 2, 0, 0, 0, 0, 0x77 }, true, "v0");
+    const n = ap.formatProcLine(&buf, .{ 10, 0, 2, 77 }, .{ 2, 0, 0, 0, 0, 0x77 }, ap.entryFlags(true, true), "v0");
     try std.testing.expectEqualStrings("10.0.2.77        0x1         0x6         02:00:00:00:00:77     *        v0\n", buf[0..n]);
-    const m = ap.formatProcLine(&buf, .{ 10, 0, 2, 2 }, .{ 0x4a, 0xb4, 0x56, 0xa7, 0x43, 0x42 }, false, "eth0");
+    const m = ap.formatProcLine(&buf, .{ 10, 0, 2, 2 }, .{ 0x4a, 0xb4, 0x56, 0xa7, 0x43, 0x42 }, ap.entryFlags(true, false), "eth0");
     try std.testing.expectEqualStrings("10.0.2.2         0x1         0x2         4a:b4:56:a7:43:42     *        eth0\n", buf[0..m]);
-    try std.testing.expectEqual(@as(usize, 0), ap.formatProcLine(buf[0..20], .{ 10, 0, 2, 2 }, .{ 0, 0, 0, 0, 0, 0 }, false, "eth0"));
+    try std.testing.expectEqual(@as(usize, 0), ap.formatProcLine(buf[0..20], .{ 10, 0, 2, 2 }, .{ 0, 0, 0, 0, 0, 0 }, ap.ATF_COM, "eth0"));
     try std.testing.expectEqualStrings("IP address       HW type     Flags       HW address            Mask     Device\n", ap.PROC_HEADER);
 
-    try std.testing.expect(std.mem.indexOf(u8, kt.arp_source, "n += policy.formatProcLine(out[n..], e.ip, e.mac, e.perm, \"eth0\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.arp_source, "n += policy.formatProcLine(out[n..], e.ip, e.mac, policy.entryFlags(e.has_mac, e.perm), \"eth0\");") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".net_arp => @intCast(@import(\"../net/arp.zig\").formatProc(buf[0..max_len])),") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "} else if (str.eql(rest, \"net/arp\")) {") != null);
 }
@@ -14458,4 +14458,32 @@ test "devconf policy: net.ipv4.conf.<dev>.proxy_arp paths, proc_dointvec writes,
     try std.testing.expect(std.mem.indexOf(u8, vs, "if (is_writable and euid != 0 and !effective_caps.cap_net_admin) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, vs, "fn sysctlWrite(desc: *FileDescriptor, buf: [*]const u8, count: usize, offset: u64) i64 {") != null);
     try std.testing.expect(std.mem.indexOf(u8, vs, "if (procfs.isSysctl(desc.proc_file_type) and offset != 0) return 0;") != null);
+}
+
+test "arp policy: an incomplete neighbour (no MAC yet) reads flags 0 in SIOCGARP and /proc/net/arp (Linux measured, hello384)" {
+    const ap = kt.arp_policy;
+    // arp_state_to_flags: NUD_PERMANENT is ATF_PERM|ATF_COM, another valid state ATF_COM, INCOMPLETE / FAILED 0.
+    try std.testing.expectEqual(@as(u32, 0), ap.entryFlags(false, false));
+    try std.testing.expectEqual(ap.ATF_COM, ap.entryFlags(true, false));
+    try std.testing.expectEqual(ap.ATF_COM | ap.ATF_PERM, ap.entryFlags(true, true));
+    var buf: [160]u8 = undefined;
+    const n = ap.formatProcLine(&buf, .{ 10, 0, 2, 98 }, .{ 0, 0, 0, 0, 0, 0 }, ap.entryFlags(false, false), "eth0");
+    try std.testing.expectEqualStrings("10.0.2.98        0x1         0x0         00:00:00:00:00:00     *        eth0\n", buf[0..n]);
+    var r = arpReq(2, .{ 10, 0, 2, 98 }, 0, "eth0");
+    @memset(r[16..32], 0xAA);
+    ap.answerGet(&r, .{ 0, 0, 0, 0, 0, 0 }, ap.entryFlags(false, false));
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, r[16..18], .little));
+    try std.testing.expect(std.mem.allEqual(u8, r[18..24], 0));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, r[32..36], .little));
+
+    // The cache keeps entries without a MAC: an ARP request for an address not in the table adds one (__neigh_event_send), resolve
+    // skips it, a reply completes it, SIOCSARP without a MAC on it is EINVAL (__neigh_update with no lladdr on an invalid entry).
+    const as = kt.arp_source;
+    try std.testing.expect(std.mem.indexOf(u8, as, "    has_mac: bool = true,\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, as, "fn noteIncomplete(ip: [4]u8) void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, as, "pub fn sendArpRequest(target_ip: [4]u8) void {\n    noteIncomplete(target_ip);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, as, "if (cache[i].valid and cache[i].has_mac and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, as, "            const m = mac orelse if (cache[i].has_mac) cache[i].mac else return -22; // EINVAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, as, "n += policy.formatProcLine(out[n..], e.ip, e.mac, policy.entryFlags(e.has_mac, e.perm), \"eth0\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.ioctl_source, "ap.answerGet(&req, e.mac, ap.entryFlags(e.has_mac, e.perm));") != null);
 }

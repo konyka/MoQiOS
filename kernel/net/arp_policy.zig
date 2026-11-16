@@ -256,15 +256,21 @@ fn deviceByName(name: []const u8, nic_active: bool) Device {
     return .none;
 }
 
-/// The SIOCGARP answer for an entry with MAC `mac` on `dev`: the hardware address (family ARPHRD_ETHER) and ATF_COM, with ATF_PERM
-/// too for a permanent entry (arp_state_to_flags); the request's device name stays. lo keeps no entries (NUD_NOARP), so nothing is
-/// found there.
-pub fn answerGet(req: *[ARPREQ_SIZE]u8, mac: [6]u8, perm: bool) void {
+/// The flags SIOCGARP and /proc/net/arp report for an entry (arp_state_to_flags): ATF_PERM|ATF_COM for a permanent one, ATF_COM
+/// for one with a MAC, 0 for one still waiting for its MAC (NUD_INCOMPLETE, or NUD_FAILED when nobody answered).
+pub fn entryFlags(has_mac: bool, perm: bool) u32 {
+    if (perm) return ATF_COM | ATF_PERM;
+    return if (has_mac) ATF_COM else 0;
+}
+
+/// The SIOCGARP answer for an entry with MAC `mac` on `dev`: the hardware address (family ARPHRD_ETHER, all zero while unknown) and
+/// `flags` (entryFlags); the request's device name stays. lo keeps no entries (NUD_NOARP), so nothing is found there.
+pub fn answerGet(req: *[ARPREQ_SIZE]u8, mac: [6]u8, flags: u32) void {
     @memset(req[16..32], 0);
     req[16] = @truncate(ARPHRD_ETHER);
     req[17] = 0;
     @memcpy(req[18..24], &mac);
-    req[32] = @truncate(if (perm) ATF_COM | ATF_PERM else ATF_COM);
+    req[32] = @truncate(flags);
     req[33] = 0;
     req[34] = 0;
     req[35] = 0;
@@ -289,9 +295,9 @@ fn readU32(b: []const u8, at: usize) u32 {
 pub const PROC_HEADER = "IP address       HW type     Flags       HW address            Mask     Device\n";
 
 /// One /proc/net/arp line, as arp_format_neigh_entry prints it: "%-16s 0x%-10x0x%-10x%-17s     *        %s\n" (address, hardware
-/// type, the SIOCGARP flags, MAC, device). Returns the bytes written to `out`, 0 when it does not fit.
-pub fn formatProcLine(out: []u8, ip: [4]u8, mac: [6]u8, perm: bool, dev: []const u8) usize {
-    return formatLine(out, ip, ARPHRD_ETHER, if (perm) ATF_COM | ATF_PERM else ATF_COM, mac, dev);
+/// type, the SIOCGARP flags (entryFlags), MAC, device). Returns the bytes written to `out`, 0 when it does not fit.
+pub fn formatProcLine(out: []u8, ip: [4]u8, mac: [6]u8, flags: u32, dev: []const u8) usize {
+    return formatLine(out, ip, ARPHRD_ETHER, flags, mac, dev);
 }
 
 fn formatLine(out: []u8, ip: [4]u8, hatype: u16, flags: u32, mac: [6]u8, dev: []const u8) usize {
