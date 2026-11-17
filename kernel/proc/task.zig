@@ -1197,7 +1197,7 @@ pub fn exitTask(requested_code: i32) void {
         // Interrupts off: a context switch of this task inside the write would nest a second writer in the sequence count.
         const irq_flags = arch_irq_ctl.saveAndDisable();
         cpu_time_policy.writeBegin(&t.cpu_seq);
-        const slice = @import("rusage_policy.zig").runtimeUs(0, t.sched_in_tsc, tsc_mod.read(), tsc_mod.tsc_freq_mhz);
+        const slice = @import("rusage_policy.zig").runtimeUs(0, t.sched_in_tsc, sched.switchTsc(), tsc_mod.tsc_freq_mhz);
         if (t.is_user) t.utime_us +|= slice else t.stime_us +|= slice;
         t.sched_in_tsc = 0;
         cpu_time_policy.writeEnd(&t.cpu_seq);

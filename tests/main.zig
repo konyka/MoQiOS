@@ -14603,3 +14603,18 @@ test "lo (hello388): a UDP loopback send is delivered at once, so a burst cannot
     try std.testing.expect(std.mem.indexOf(u8, ls, "pub fn sendNow(data: [*]const u8, len: u32) bool {\n    if (!sendPacket(data, len)) {\n        _ = drain();\n        if (!sendPacket(data, len)) return false;\n    }\n    _ = drain();\n    return true;\n}") != null);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, kt.udp_source, "lo.sendPacket(&send_pkt, frame_len) or"));
 }
+
+test "sched: a switch reads the TSC for the outgoing slice inside the CPU-time write, not before it (hello314 A)" {
+    // A reader on another CPU that read a later TSC than the switch's, and snapshotted the task before the write began, counted the
+    // slice up to its own time; the fold then added less and the next reading went backwards. Reading the TSC after writeBegin
+    // orders it after every snapshot the write did not invalidate.
+    const src = kt.sched_source;
+    var n: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, src, from, "    cpu_time_policy.writeBegin(&old_task.cpu_seq);\n    // The end of the slice is read only after the write began")) |at| : (from = at + 1) n += 1;
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, "    const now_tsc = switchTsc();\n"));
+    try std.testing.expect(std.mem.indexOf(u8, src, "const now_tsc = tsc_mod.read();\n    // The slice is folded") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "runtimeUs(0, t.sched_in_tsc, sched.switchTsc(), tsc_mod.tsc_freq_mhz);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "asm volatile (\"lfence\" ::: .{ .memory = true });\n    return @import(\"../arch/arch.zig\").tsc.read();") != null);
+}

@@ -564,10 +564,12 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
 
     // CPU time accounting: accumulate time spent in this task
     const tsc_mod = @import("../arch/arch.zig").tsc;
-    const now_tsc = tsc_mod.read();
     // The slice is folded and sched_in_tsc cleared in one sequence-counted step: a reader on another CPU (a CPU clock, a CPU
     // timer tick) must never see the slice both folded and still in flight, nor a stale start once the task is off the CPU.
     cpu_time_policy.writeBegin(&old_task.cpu_seq);
+    // The end of the slice is read only after the write began: a reader whose snapshot this write did not invalidate took its
+    // own TSC earlier, so the folded slice is never shorter than the one that reader counted in flight (hello314 A).
+    const now_tsc = switchTsc();
     if (old_task.sched_in_tsc != 0 and tsc_mod.tsc_freq_mhz != 0) {
         const elapsed_tsc = now_tsc -| old_task.sched_in_tsc;
         const elapsed_us = elapsed_tsc / tsc_mod.tsc_freq_mhz;
@@ -622,6 +624,13 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
         }
         sched_lock.release(flags);
     }
+}
+
+/// TSC for a context switch's CPU-time fold. rdtsc is not ordered after earlier instructions, lfence makes it wait for the
+/// cpu_seq write that precedes it.
+pub inline fn switchTsc() u64 {
+    if (comptime builtin.cpu.arch == .x86_64) asm volatile ("lfence" ::: .{ .memory = true });
+    return @import("../arch/arch.zig").tsc.read();
 }
 
 /// Timed-wait expiry — every BSP hardware tick, so futex / mq / epoll /
@@ -947,10 +956,12 @@ fn timerTickFg(frame: *idt.InterruptFrame) void {
 
     // CPU time accounting: accumulate time spent in this task
     const tsc_mod = @import("../arch/arch.zig").tsc;
-    const now_tsc = tsc_mod.read();
     // The slice is folded and sched_in_tsc cleared in one sequence-counted step: a reader on another CPU (a CPU clock, a CPU
     // timer tick) must never see the slice both folded and still in flight, nor a stale start once the task is off the CPU.
     cpu_time_policy.writeBegin(&old_task.cpu_seq);
+    // The end of the slice is read only after the write began: a reader whose snapshot this write did not invalidate took its
+    // own TSC earlier, so the folded slice is never shorter than the one that reader counted in flight (hello314 A).
+    const now_tsc = switchTsc();
     if (old_task.sched_in_tsc != 0 and tsc_mod.tsc_freq_mhz != 0) {
         const elapsed_tsc = now_tsc -| old_task.sched_in_tsc;
         const elapsed_us = elapsed_tsc / tsc_mod.tsc_freq_mhz;

@@ -9706,7 +9706,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   2. IPv6 UDP 还不支持 AF_UNSPEC 断开（family 不是 AF_INET6 时返回 EAFNOSUPPORT）。Linux 实测断开后接口被清掉（绑在 ff02::1%1 上的套接字 getsockname 的 scope 变为 0，之后 connect 到 %2 成功），由 connect 写入的接口也要随之清掉。
   3. 仍不发 IGMP/MLD 报告，e1000 不按加入的组设 MTA，也没有源过滤。
   4. hello302（SIGSTOP 打断 nanosleep）的可变延迟一项在 SMP=2 上偶发失败一次，最慢 416 ms，根因没有查。
-  4. hello314 A（进程 CPU 时钟不倒退）在 SMP=4 上偶发失败一次：11364 次读数里倒退 1 次，最多 67 us。hello314 修复后的完整 smoke 里没见过，根因没有查；候选是 `groupTimesLocked` 对各成员分别取快照，成员切换时一个成员的片已折入、另一个的片还按旧时间算。
+  4. hello314 A（进程 CPU 时钟不倒退）在 SMP=4 上偶发失败一次：11364 次读数里倒退 1 次，最多 67 us。hello314 修复后的完整 smoke 里没见过，根因没有查；候选是 `groupTimesLocked` 对各成员分别取快照，成员切换时一个成员的片已折入、另一个的片还按旧时间算。（后来在「切换在写序列计数之后才读 TSC（hello314 A 偶发倒退）」一节查明并修复：根因不是这个候选，而是切换先读 TSC、后开始写。）
 
 ## 补充：UDP 的 connect(AF_UNSPEC) 断开（hello366）
 
@@ -10172,3 +10172,18 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 局限：
   1. 表仍是静态的（256 个槽），Linux 只受内存和 `ulimit` 限制；未命名套接字仍占槽。
   2. `sendNow` 在发送者上下文里处理接收，一次 drain 最多 64 帧；Linux 由软中断处理。
+
+## 补充：切换在写序列计数之后才读 TSC（hello314 A 偶发倒退）
+
+- 背景：hello365 一节局限 4。SMP=4 完整 smoke 里 hello314 A 偶发失败一次：11364 次读数里进程 CPU 时钟倒退 1 次，最多 67 us。
+- 根因（从代码推出，没有在 QEMU 上稳定复现）：两条切换路径（`timerTickLegacy`、`timerTickFg`）先 `now_tsc = tsc.read()`，然后才 `writeBegin(&old_task.cpu_seq)` 折算这一片。QEMU TCG 的每个 vCPU 是宿主机上的一个线程，可能在任意两条客户机指令之间被宿主机挂起几十微秒。挂起正好落在读 TSC 和 `writeBegin` 之间时，另一个 CPU 上的读者读到更晚的 TSC，`cpuSnapshot` 拿到的序列号仍是偶数、校验也通过，它按「正在跑」把这一片算到自己的 TSC。写者恢复后只折进到它更早读的 TSC 为止，下一次读数就少了挂起的那段时间。67 us 和一次宿主机调度延迟的量级相符。之前怀疑的「`groupTimesLocked` 逐个成员取快照」不是原因：线程回收时的 `foldThreadTimeLocked` 和读者都在 task_lock 下，成员各自的快照用的是同一个读者 TSC，每个成员单独都不会倒退。
+- 修复：
+  1. `sched.zig` 新增 `switchTsc()`（x86 上先 `lfence` 再 `rdtsc`，防止 `rdtsc` 被提前到 `writeBegin` 之前执行）。两条切换路径改为先 `writeBegin`，再 `const now_tsc = switchTsc();`。切入任务的 `sched_in_tsc` 仍用这个值。
+  2. `task.exitTask` 折算最后一片时也改用 `sched.switchTsc()`（它本来就在 `writeBegin` 之后读）。
+  3. 这样一来，读者的 TSC 早于它的快照，能通过校验的快照又早于 `writeBegin`，`writeBegin` 早于折算用的 TSC，折进去的片不会比任何读者按「正在跑」算的短。
+- host 测试 "sched: a switch reads the TSC for the outgoing slice inside the CPU-time write, not before it (hello314 A)"：实现前失败（两条路径都是先读 TSC）；实现后通过。变异验证：`sched.zig` 和 `task.zig` 换回修改前的文件，这条测试失败；文件已恢复，用 cmp 确认。
+- 没有新增测试程序：倒退要靠宿主机恰好在那两条指令之间挂起 vCPU 线程才会出现，没有办法在目标机上稳定触发。hello314 继续留在 smoke 里观察。
+- 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello314 PASS。riscv64、aarch64 交叉构建通过，没有在这两个架构上跑 QEMU。
+- 局限：
+  1. 修复的效果只能靠以后的 smoke 观察，本轮没有在目标机上复现过倒退（红灯），所以算不上验证过。
+  2. 非 x86 架构上 `switchTsc` 不加屏障，只读计数器；这两个架构上没有验证这个顺序。
