@@ -102,8 +102,6 @@ pub fn handlePacket(
     if (len < 8) return;
     // v53.37: Verify ICMPv6 checksum (RFC 4443 §2.3). checksum() returns 0 for valid packets.
     if (checksum(src_ip, dst_ip, data, len) != 0) return;
-    // Raw ICMPv6 sockets see every message before the kernel handles it (icmpv6_rcv → raw6_local_deliver).
-    @import("raw_icmp.zig").deliver6(data[0..len], src_ip, dst_ip);
     // An echo reply is for the IPv6 ping socket whose ident is its id (icmpv6_rcv → ping_rcv).
     if (@import("ping_policy.zig").replyIdent6(data[0..len])) |ident| {
         @import("udp.zig").deliverPing6(ident, src_ip, dst_ip, data[0..len]);
@@ -362,6 +360,12 @@ pub fn sendEchoReply(
 /// next hop's MAC; while that is being solicited the frame waits in ndp_queue and the send succeeds, as Linux queues it on the
 /// neighbour). Returns 0, or -EMSGSIZE past the path MTU, -ENETUNREACH with no route, -ENOBUFS when the device drops it.
 pub fn sendFrom6(bound: [16]u8, dst: [16]u8, msg: []u8, ip: ipo.IpOpts) i64 {
+    return sendProto6(bound, dst, ipv6.PROTO_ICMPV6, 2, msg, ip);
+}
+
+/// sendFrom6 for a message of next header `next_header` (an IPv6 raw socket of that protocol): the kernel writes the RFC 2460 checksum at
+/// `csum_off` when there is one (rawv6_push_pending_frames, the two bytes there count as zero), else `msg` goes out as given.
+pub fn sendProto6(bound: [16]u8, dst: [16]u8, next_header: u8, csum_off: ?u32, msg: []u8, ip: ipo.IpOpts) i64 {
     if (msg.len + ipv6.HEADER_LEN > ipv6.getSendMtu(dst)) return -90;
     const our_mac = netif.getMac();
     const via_lo = netif.isLoopbackV6(dst) or ndp.isOwnAddress(dst, our_mac);
@@ -376,15 +380,18 @@ pub fn sendFrom6(bound: [16]u8, dst: [16]u8, msg: []u8, ip: ipo.IpOpts) i64 {
         };
     };
     const src = @import("tcp_port_policy.zig").sourceAddr6(bound, dst, if (via_lo) dst else ndp.selectSourceAddress(dst, our_mac));
-    msg[2] = 0;
-    msg[3] = 0;
-    const csum = checksum(src, dst, msg.ptr, @intCast(msg.len));
-    msg[2] = @truncate(csum >> 8);
-    msg[3] = @truncate(csum);
+    if (csum_off) |off| {
+        const rp = @import("raw_icmp_policy.zig");
+        msg[off] = 0;
+        msg[off + 1] = 0;
+        const csum = rp.finishSum6(rp.sum6(src, dst, next_header, msg), next_header);
+        msg[off] = @truncate(csum >> 8);
+        msg[off + 1] = @truncate(csum);
+    }
     var pkt: [1518]u8 = @splat(0);
     const icmp_off: usize = 14 + ipv6.HEADER_LEN;
     @memcpy(pkt[icmp_off..][0..msg.len], msg);
-    ipv6.buildHeader(pkt[14..].ptr, src, dst, ipv6.PROTO_ICMPV6, @intCast(msg.len));
+    ipv6.buildHeader(pkt[14..].ptr, src, dst, next_header, @intCast(msg.len));
     if (ipo.ipv6NeedsPatch(ip)) ipo.patchIpv6(pkt[14..][0..40], ip);
     const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, @intCast(ipv6.HEADER_LEN + msg.len));
     if (wait_hop) |hop| {

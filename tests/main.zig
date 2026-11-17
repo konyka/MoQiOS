@@ -14732,7 +14732,8 @@ test "raw ICMPv6 socket policy (hello391): protocol, filter, destination, length
     const rp = kt.raw_icmp_policy;
     try std.testing.expectEqual(@as(i64, 0), rp.protocolErrno6(58));
     try std.testing.expectEqual(@as(i64, -93), rp.protocolErrno6(0));
-    try std.testing.expectEqual(@as(i64, -93), rp.protocolErrno6(1));
+    // hello403: any protocol but 0 (and IPPROTO_RAW, which needs IPV6_HDRINCL) is an IPv6 raw socket.
+    try std.testing.expectEqual(@as(i64, 0), rp.protocolErrno6(1));
     const any6: [16]u8 = @splat(0);
     var l6: [16]u8 = @splat(0);
     l6[15] = 1;
@@ -14759,14 +14760,14 @@ test "raw ICMPv6 socket policy (hello391): protocol, filter, destination, length
     try std.testing.expectEqual(@as(u32, 32), rp.filterGetLen(64));
     try std.testing.expectEqual(@as(u32, 8), rp.filterGetLen(8));
     // rawv6_sendmsg: the destination first, then the length.
-    try std.testing.expectEqual(@as(i64, -89), rp.sendtoErrno6(false, 0, 0, 0, false));
-    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno6(false, 0, 0, 0, true));
-    try std.testing.expectEqual(@as(i64, -22), rp.sendtoErrno6(true, 16, 10, 0, false));
-    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno6(true, 24, 10, 0, false));
-    try std.testing.expectEqual(@as(i64, -97), rp.sendtoErrno6(true, 28, 2, 0, false));
-    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno6(true, 28, 0, 0, false));
-    try std.testing.expectEqual(@as(i64, -22), rp.sendtoErrno6(true, 28, 10, 17, false));
-    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno6(true, 28, 10, 58, false));
+    try std.testing.expectEqual(@as(i64, -89), rp.sendtoErrno6(false, 0, 0, 0, false, 58));
+    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno6(false, 0, 0, 0, true, 58));
+    try std.testing.expectEqual(@as(i64, -22), rp.sendtoErrno6(true, 16, 10, 0, false, 58));
+    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno6(true, 24, 10, 0, false, 58));
+    try std.testing.expectEqual(@as(i64, -97), rp.sendtoErrno6(true, 28, 2, 0, false, 58));
+    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno6(true, 28, 0, 0, false, 58));
+    try std.testing.expectEqual(@as(i64, -22), rp.sendtoErrno6(true, 28, 10, 17, false, 58));
+    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno6(true, 28, 10, 58, false, 58));
     try std.testing.expectEqual(@as(i64, -14), rp.lengthErrno(true, 0));
     try std.testing.expectEqual(@as(i64, -14), rp.lengthErrno(true, 1));
     try std.testing.expectEqual(@as(i64, -22), rp.lengthErrno(true, 2));
@@ -14784,7 +14785,7 @@ test "raw ICMPv6 socket policy (hello391): protocol, filter, destination, length
     m6[15] = 1;
     try std.testing.expect(rp.dest6(m6) == null);
     try std.testing.expect(rp.isMapped6(m6) and !rp.isMapped6(l6));
-    const n = rp.sockName6(l6);
+    const n = rp.sockName6(l6, 58);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 0, 58 }, n[0..4]);
     try std.testing.expectEqualSlices(u8, &l6, n[8..24]);
     try std.testing.expect(std.mem.allEqual(u8, n[24..28], 0) and std.mem.allEqual(u8, n[4..8], 0));
@@ -14808,11 +14809,13 @@ test "raw ICMPv6 socket policy (hello391): protocol, filter, destination, length
 }
 
 test "raw ICMPv6 socket wiring (hello391): checksummed ICMPv6 reaches raw sockets before the ping sockets, socket() makes them, shutdown works" {
-    const v6s = kt.icmpv6_source;
-    const ck = std.mem.indexOf(u8, v6s, "if (checksum(src_ip, dst_ip, data, len) != 0) return;") orelse return error.TestUnexpectedResult;
-    const dl = std.mem.indexOfPos(u8, v6s, ck, "@import(\"raw_icmp.zig\").deliver6(data[0..len], src_ip, dst_ip);") orelse return error.TestUnexpectedResult;
-    const pr = std.mem.indexOfPos(u8, v6s, ck, "@import(\"ping_policy.zig\").replyIdent6(data[0..len])") orelse return error.TestUnexpectedResult;
+    // hello403: every IPv6 packet reaches the raw sockets of its next header before the protocol handler (raw6_local_deliver),
+    // ICMPv6 included; each ICMPv6 socket checks the checksum itself (rawv6_rcv with rp->checksum set).
+    const m = kt.net_mod_source;
+    const dl = std.mem.indexOf(u8, m, "@import(\"raw_icmp.zig\").deliver6(info6.next_header, data[payload_start6 .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip);") orelse return error.TestUnexpectedResult;
+    const pr = std.mem.indexOf(u8, m, "icmpv6.handlePacket(info6.src_ip, info6.dst_ip, data + payload_start6, info6.payload_len);") orelse return error.TestUnexpectedResult;
     try std.testing.expect(dl < pr);
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmpv6_source, "raw_icmp.zig\").deliver6(") == null);
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "(domain == 2 or domain == 10) and parsed.sock_type == 3) rawCreate(protocol, domain == 10)") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "EOPNOTSUPP (raw_shutdown stays NULL)") == null);
@@ -14978,10 +14981,10 @@ test "raw ICMP sockets take SOL_IP / SOL_IPV6 options and their sends carry them
     try std.testing.expect(std.mem.indexOf(u8, so, "if (!ipo.levelApplies(level, fam)) return if (fam == .v4) -95 else -92;") != null);
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send(bound, dst, @truncate(protocol), msg, rawIpOpts(d.raw_idx))") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send6(raw.boundAddr6(d.raw_idx), to6, msg, rawIpOpts(d.raw_idx))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send6(raw.boundAddr6(d.raw_idx), to6, @truncate(raw.protocolOf(d.raw_idx)), raw.checksumOffset(d.raw_idx), msg, rawIpOpts(d.raw_idx))") != null);
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "if (ipo.ipv4NeedsPatch(ip)) ipo.patchIpv4(pkt[14..][0..20], ip, ipv4.checksum);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rs, "@import(\"icmpv6.zig\").sendFrom6(bound, dst, buf[0..msg.len], ip)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "@import(\"icmpv6.zig\").sendProto6(bound, dst, protocol, csum_off, buf[0..msg.len], ip)") != null);
     const iv = kt.icmpv6_source;
     try std.testing.expect(std.mem.indexOf(u8, iv, "pub fn sendFrom6(bound: [16]u8, dst: [16]u8, msg: []u8, ip: ipo.IpOpts) i64 {") != null);
     try std.testing.expect(std.mem.indexOf(u8, iv, "if (ipo.ipv6NeedsPatch(ip)) ipo.patchIpv6(pkt[14..][0..40], ip);") != null);
@@ -15110,8 +15113,8 @@ test "ICMP_FILTER on IPv4 raw ICMP sockets (hello399): a set bit blocks that typ
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "if (policy.icmpTypeOf(dgram)) |ty| if (policy.icmpFilterBlocks(s.icmp_filter, ty)) continue;") != null);
     const so = kt.socket_opt_source;
-    try std.testing.expect(std.mem.indexOf(u8, so, "if (level == SOL_RAW) return if (!v6 and optname == ICMP_FILTER) .icmp_filter else .noprotoopt;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, so, "if (which != .checksum and @as(i32, @bitCast(user_len)) < 0) return -22;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (!v6 and optname == ICMP_FILTER) return .icmp_filter;\n        if (v6 and optname == IPV6_CHECKSUM) return .checksum_raw;\n        return .noprotoopt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (which != .checksum and which != .checksum_raw and @as(i32, @bitCast(user_len)) < 0) return -22;") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, "bo.writeU32Le(val[0..4], @import(\"raw_icmp.zig\").getIcmpFilter(idx));") != null);
 }
 
@@ -15136,7 +15139,7 @@ test "getsockopt / setsockopt at a level the socket does not know (hello400): EO
     // UDP's own level (SOL_UDP / SOL_UDPLITE, udp_lib_getsockopt): an option it does not know is ENOPROTOOPT, not EOPNOTSUPP.
     try std.testing.expect(std.mem.indexOf(u8, so, "if (ref == .udp and (ref.udp & @import(\"udp.zig\").PING_KEY) == 0 and (level == SOL_UDP or level == SOL_UDPLITE)) return -92;") != null);
     // SOL_ICMPV6 on an IPv4 raw socket goes to ip_getsockopt / ip_setsockopt like any other level it does not know.
-    try std.testing.expect(std.mem.indexOf(u8, so, "if (level == SOL_ICMPV6) return if (!v6) null else if (optname == ICMP6_FILTER) .filter else .noprotoopt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (level == SOL_ICMPV6) return if (!v6) null else if (optname == ICMP6_FILTER) .filter else .icmpv6_level;") != null);
 }
 
 test "IPv4 raw sockets of any protocol (hello401): creation, delivery and protocol unreachable (Linux raw_v4_input)" {
@@ -15215,4 +15218,73 @@ test "IP_HDRINCL id 0 is chosen unless DF (hello402): Linux raw_send_hdrinc / ip
     try std.testing.expectEqual(@as(u16, 2), rp.nextIdent(1));
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "policy.completeHdrinclId(pkt_buf[14..][0..pkt.len], src, if (policy.needsIdent(pkt)) takeIdent() else 0);") != null);
+}
+
+test "IPv6 raw sockets of any protocol (hello403): creation, IPV6_CHECKSUM, delivery (Linux inet6_create / rawv6_sendmsg / rawv6_rcv)" {
+    const rp = kt.raw_icmp_policy;
+    // inet6_create: any protocol but IPPROTO_IP; IPPROTO_RAW needs IPV6_HDRINCL, which MoQiOS does not have.
+    try std.testing.expectEqual(@as(i64, 0), rp.protocolErrno6(58));
+    try std.testing.expectEqual(@as(i64, 0), rp.protocolErrno6(253));
+    try std.testing.expectEqual(@as(i64, 0), rp.protocolErrno6(6));
+    try std.testing.expectEqual(@as(i64, -93), rp.protocolErrno6(0));
+    try std.testing.expectEqual(@as(i64, -93), rp.protocolErrno6(255));
+    try std.testing.expectEqual(@as(i64, -93), rp.protocolErrno6(256));
+    try std.testing.expectEqual(@as(i64, -22), rp.protocolErrno6(263));
+    try std.testing.expectEqual(@as(i64, -22), rp.protocolErrno6(0xffff_ffff));
+    // rawv6_init_sk: ICMPv6 sums at offset 2, MH at 4, anything else not at all.
+    try std.testing.expectEqual(@as(?u32, 2), rp.initialChecksum6(58));
+    try std.testing.expectEqual(@as(?u32, 4), rp.initialChecksum6(135));
+    try std.testing.expectEqual(@as(?u32, null), rp.initialChecksum6(253));
+    // rawv6_sendmsg: sin6_port is the protocol, 0 meaning the socket's own.
+    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno6(true, 28, 10, 253, false, 253));
+    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno6(true, 28, 10, 0, false, 253));
+    try std.testing.expectEqual(@as(i64, -22), rp.sendtoErrno6(true, 28, 10, 17, false, 253));
+    try std.testing.expectEqual(@as(i64, -22), rp.sendtoErrno6(true, 28, 10, 58, false, 253));
+    // The length: ICMPv6 needs its type and code (EFAULT); with a checksum offset, offset >= len - 1 is EINVAL.
+    try std.testing.expectEqual(@as(i64, -14), rp.lengthErrno6(58, 2, 1));
+    try std.testing.expectEqual(@as(i64, -22), rp.lengthErrno6(58, 2, 3));
+    try std.testing.expectEqual(@as(i64, 0), rp.lengthErrno6(58, 2, 4));
+    try std.testing.expectEqual(@as(i64, 0), rp.lengthErrno6(253, null, 0));
+    try std.testing.expectEqual(@as(i64, -22), rp.lengthErrno6(253, 4, 5));
+    try std.testing.expectEqual(@as(i64, 0), rp.lengthErrno6(253, 4, 6));
+    try std.testing.expectEqual(@as(i64, -22), rp.lengthErrno6(253, 0, 0));
+    try std.testing.expectEqual(@as(i64, -22), rp.lengthErrno6(253, 0, 1));
+    try std.testing.expectEqual(@as(i64, 0), rp.lengthErrno6(253, 0, 2));
+    // IPV6_CHECKSUM (do_rawv6_setsockopt): not at SOL_IPV6 on ICMPv6 (SOL_RAW may), no odd offset, a negative value turns it off.
+    try std.testing.expectEqual(@as(i64, -22), rp.checksumOptErrno(58, false, 4));
+    try std.testing.expectEqual(@as(i64, 0), rp.checksumOptErrno(58, true, 4));
+    try std.testing.expectEqual(@as(i64, -22), rp.checksumOptErrno(253, false, 3));
+    try std.testing.expectEqual(@as(i64, 0), rp.checksumOptErrno(253, false, 4));
+    try std.testing.expectEqual(@as(i64, 0), rp.checksumOptErrno(253, false, -1));
+    try std.testing.expectEqual(@as(i64, 0), rp.checksumOptErrno(253, false, -3));
+    try std.testing.expectEqual(@as(?u32, null), rp.checksumOptValue(-1));
+    try std.testing.expectEqual(@as(?u32, 4), rp.checksumOptValue(4));
+    try std.testing.expectEqual(@as(i32, -1), rp.checksumOptRead(null));
+    try std.testing.expectEqual(@as(i32, 2), rp.checksumOptRead(2));
+    // The RFC 2460 sum over the pseudo-header (next header = the socket's protocol) and the message.
+    var l6: [16]u8 = @splat(0);
+    l6[15] = 1;
+    var msg = [_]u8{ 1, 2, 3, 4, 0, 0, 7, 8 };
+    const sum = rp.sum6(l6, l6, 253, &msg);
+    try std.testing.expectEqual(@as(u16, 0xf3ea), sum);
+    msg[4] = @truncate(sum >> 8);
+    msg[5] = @truncate(sum);
+    try std.testing.expectEqual(@as(u16, 0), rp.sum6(l6, l6, 253, &msg));
+    try std.testing.expect(rp.sum6(l6, l6, 254, &msg) != 0);
+    var odd = [_]u8{ 1, 2, 3 };
+    try std.testing.expectEqual(@as(u16, ~@as(u16, 0x0102 + 0x0300 + 1 + 1 + 3 + 253)), rp.sum6(l6, l6, 253, &odd));
+    // A UDP sum of 0 goes out as 0xffff (CSUM_MANGLED_0), any other protocol's as 0.
+    try std.testing.expectEqual(@as(u16, 0xffff), rp.finishSum6(0, 17));
+    try std.testing.expectEqual(@as(u16, 0), rp.finishSum6(0, 253));
+    try std.testing.expectEqual(@as(u16, 0x1234), rp.finishSum6(0x1234, 17));
+    // getsockname's port is the protocol; ICMP6_FILTER is EOPNOTSUPP unless the socket is ICMPv6.
+    try std.testing.expectEqual(@as(u8, 253), rp.sockName6(l6, 253)[3]);
+    try std.testing.expectEqual(@as(i64, -95), rp.icmp6FilterErrno(253));
+    try std.testing.expectEqual(@as(i64, 0), rp.icmp6FilterErrno(58));
+    const rs = kt.raw_icmp_source;
+    try std.testing.expect(std.mem.count(u8, rs, "if (s.protocol != protocol) continue;") >= 2);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "if (s.csum_off != null and policy.sum6(src, dst, s.protocol, msg) != 0) continue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "if (protocol == policy.IPPROTO_ICMPV6 and (msg.len < 4 or policy.filterBlocks(s.filter, msg[0]))) continue;") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const lrc = rp.lengthErrno6(raw.protocolOf(d.raw_idx), raw.checksumOffset(d.raw_idx), msg.len);") != null);
 }

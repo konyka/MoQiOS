@@ -1,8 +1,9 @@
 //! Raw sockets as pure decisions: IPv4 (socket(AF_INET, SOCK_RAW, p) for any protocol p, Linux net/ipv4/raw.c, measured in
-//! hello389 and hello401) and IPv6 (socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6), Linux net/ipv6/raw.c, measured in hello391).
+//! hello389 and hello401) and IPv6 (socket(AF_INET6, SOCK_RAW, p), Linux net/ipv6/raw.c, measured in hello391 and hello403).
 //! A send gets its IP header from the kernel (unless IP_HDRINCL); every IPv4 datagram this host receives is copied, IP header
-//! included, to each raw socket of its protocol whose bound address and connected peer match it; every ICMPv6 message, without its
-//! IPv6 header, to each IPv6 socket that matches and whose ICMP6_FILTER lets the type through.
+//! included, to each raw socket of its protocol whose bound address and connected peer match it; every IPv6 packet, without its
+//! IPv6 header, to each IPv6 socket of its next header that matches (an ICMPv6 one also needs ICMP6_FILTER to let the type through,
+//! and a socket with a checksum offset a right checksum).
 
 pub const IPPROTO_ICMP: u32 = 1;
 pub const SOCKADDR_IN_LEN: u32 = 16;
@@ -167,9 +168,74 @@ fn eql(a: [4]u8, b: [4]u8) bool {
     return @as(u32, @bitCast(a)) == @as(u32, @bitCast(b));
 }
 
-/// socket(AF_INET6, SOCK_RAW, protocol): MoQiOS carries ICMPv6 only (Linux takes any protocol but IPPROTO_IP).
+/// socket(AF_INET6, SOCK_RAW, protocol) (inet6_create): any protocol from 1 to 254. IPPROTO_IP (0) is EPROTONOSUPPORT, past
+/// IPPROTO_MAX (or negative) EINVAL. Linux also takes IPPROTO_RAW, whose sends are whole IPv6 packets (IPV6_HDRINCL); MoQiOS has no
+/// IPV6_HDRINCL, so 255 and the other inet protocols past it are EPROTONOSUPPORT.
 pub fn protocolErrno6(protocol: u32) i64 {
-    return if (protocol == IPPROTO_ICMPV6) 0 else EPROTONOSUPPORT;
+    if (protocol >= IPPROTO_MAX) return EINVAL;
+    if (protocol == 0 or protocol >= IPPROTO_RAW) return EPROTONOSUPPORT;
+    return 0;
+}
+
+const IPPROTO_UDP: u32 = 17;
+const IPPROTO_MH: u32 = 135;
+
+/// rawv6_init_sk: where the kernel puts a send's checksum and whether it checks a received one. ICMPv6 at offset 2, the mobility
+/// header at 4, any other protocol not at all (null) until IPV6_CHECKSUM asks.
+pub fn initialChecksum6(protocol: u32) ?u32 {
+    if (protocol == IPPROTO_ICMPV6) return 2;
+    if (protocol == IPPROTO_MH) return 4;
+    return null;
+}
+
+/// A send's length on an IPv6 raw socket of `protocol` whose checksum goes at `csum_off`: an ICMPv6 message needs its type and code
+/// (rawv6_probe_proto_opt, EFAULT), and the checksum must fit inside the message (rawv6_push_pending_frames: offset >= len - 1 is
+/// EINVAL).
+pub fn lengthErrno6(protocol: u32, csum_off: ?u32, len: usize) i64 {
+    if (protocol == IPPROTO_ICMPV6 and len < 2) return EFAULT;
+    if (csum_off) |off| if (@as(i64, off) >= @as(i64, @intCast(len)) - 1) return EINVAL;
+    return 0;
+}
+
+/// setsockopt(IPV6_CHECKSUM) (do_rawv6_setsockopt): at SOL_IPV6 an ICMPv6 socket's checksum cannot be moved (RFC 3542; SOL_RAW may),
+/// and a positive odd offset is EINVAL. A negative value turns the checksum off.
+pub fn checksumOptErrno(protocol: u32, at_sol_raw: bool, val: i32) i64 {
+    if (protocol == IPPROTO_ICMPV6 and !at_sol_raw) return EINVAL;
+    if (val > 0 and (val & 1) != 0) return EINVAL;
+    return 0;
+}
+
+pub fn checksumOptValue(val: i32) ?u32 {
+    return if (val < 0) null else @intCast(val);
+}
+
+/// getsockopt(IPV6_CHECKSUM): the offset, or -1 when the kernel computes none.
+pub fn checksumOptRead(off: ?u32) i32 {
+    return if (off) |o| @intCast(o) else -1;
+}
+
+/// The RFC 2460 checksum of `msg` behind the pseudo-header src, dst, length and next header `nh`, folded and complemented: 0 when a
+/// received message's checksum is right.
+pub fn sum6(src: [16]u8, dst: [16]u8, nh: u32, msg: []const u8) u16 {
+    var acc: u64 = 0;
+    var i: usize = 0;
+    while (i < 16) : (i += 2) acc += (@as(u64, src[i]) << 8 | src[i + 1]) + (@as(u64, dst[i]) << 8 | dst[i + 1]);
+    acc += @as(u64, msg.len >> 16) + (msg.len & 0xffff) + nh;
+    i = 0;
+    while (i + 1 < msg.len) : (i += 2) acc += @as(u64, msg[i]) << 8 | msg[i + 1];
+    if (msg.len & 1 != 0) acc += @as(u64, msg[msg.len - 1]) << 8;
+    while (acc >> 16 != 0) acc = (acc & 0xffff) + (acc >> 16);
+    return ~@as(u16, @truncate(acc));
+}
+
+/// What a send writes as its checksum: a UDP sum of 0 goes out as 0xffff (rawv6_push_pending_frames, CSUM_MANGLED_0).
+pub fn finishSum6(sum: u16, protocol: u32) u16 {
+    return if (sum == 0 and protocol == IPPROTO_UDP) 0xffff else sum;
+}
+
+/// SOL_ICMPV6 options (rawv6_setsockopt / rawv6_getsockopt): EOPNOTSUPP unless the socket's protocol is ICMPv6.
+pub fn icmp6FilterErrno(protocol: u32) i64 {
+    return if (protocol == IPPROTO_ICMPV6) 0 else -95;
 }
 
 /// raw_v6_match: bound to the wildcard or the destination, unconnected or connected to the source.
@@ -223,12 +289,12 @@ pub fn filterGetLen(user_len: u32) u32 {
 }
 
 /// rawv6_sendmsg's destination: a given address needs the first 24 bytes of a sockaddr_in6 (EINVAL), family AF_INET6 or AF_UNSPEC
-/// (EAFNOSUPPORT), and sin6_port 0 or the socket's protocol (EINVAL); without one the socket must be connected (EDESTADDRREQ).
-pub fn sendtoErrno6(have_addr: bool, addr_len: u32, family: u16, port: u16, connected: bool) i64 {
+/// (EAFNOSUPPORT), and sin6_port 0 or the socket's `protocol` (EINVAL); without one the socket must be connected (EDESTADDRREQ).
+pub fn sendtoErrno6(have_addr: bool, addr_len: u32, family: u16, port: u16, connected: bool, protocol: u32) i64 {
     if (have_addr) {
         if (addr_len < SOCKADDR_IN6_MIN) return EINVAL;
         if (family != AF_INET6 and family != 0) return EAFNOSUPPORT;
-        if (port != 0 and port != IPPROTO_ICMPV6) return EINVAL;
+        if (port != 0 and port != protocol) return EINVAL;
         return 0;
     }
     return if (connected) 0 else EDESTADDRREQ;
@@ -258,10 +324,11 @@ pub fn dest6(dst: [16]u8) ?[16]u8 {
 }
 
 /// What getsockname reports: AF_INET6, the protocol as the port (inet_num), flowinfo 0, the bound address, scope 0.
-pub fn sockName6(bound: [16]u8) [28]u8 {
+pub fn sockName6(bound: [16]u8, protocol: u32) [28]u8 {
     var out: [28]u8 = @splat(0);
     out[0] = AF_INET6;
-    out[3] = IPPROTO_ICMPV6;
+    out[2] = @truncate(protocol >> 8);
+    out[3] = @truncate(protocol);
     @memcpy(out[8..24], &bound);
     return out;
 }

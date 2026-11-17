@@ -519,6 +519,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello400"); /* getsockopt and setsockopt at a level the socket does not know */
     run_test("hello401"); /* IPv4 raw sockets of any protocol */
     run_test("hello402"); /* the IPv4 id of an IP_HDRINCL send */
+    run_test("hello403"); /* IPv6 raw sockets of any protocol, IPV6_CHECKSUM */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

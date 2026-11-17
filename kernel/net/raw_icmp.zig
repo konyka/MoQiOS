@@ -1,8 +1,8 @@
-//! Raw sockets: IPv4 of any protocol (socket(AF_INET, SOCK_RAW, p), Linux net/ipv4/raw.c) and IPv6 ICMPv6 (socket(AF_INET6,
-//! SOCK_RAW, IPPROTO_ICMPV6), net/ipv6/raw.c). Every IPv4 datagram this host receives is copied, IP header included, to each IPv4
-//! socket of its protocol whose bound address and connected peer match (raw_icmp_policy.matches; ICMP_FILTER on an ICMP one); every
-//! ICMPv6 message, without its IPv6 header, to each IPv6 socket that matches and whose ICMP6_FILTER lets the type through. A send gets
-//! its IP header (and for ICMPv6 its checksum) from the kernel, unless IP_HDRINCL. The sockets share one table; a socket lives until its last descriptor reference is gone, which is
+//! Raw sockets: IPv4 and IPv6 of any protocol (socket(AF_INET or AF_INET6, SOCK_RAW, p), Linux net/ipv4/raw.c, net/ipv6/raw.c).
+//! Every IPv4 datagram this host receives is copied, IP header included, to each IPv4 socket of its protocol whose bound address
+//! and connected peer match (raw_icmp_policy.matches; ICMP_FILTER on an ICMP one); every IPv6 packet, without its IPv6 header, to
+//! each IPv6 socket of its next header that matches (ICMP6_FILTER on an ICMPv6 one; a socket with a checksum offset drops a wrong
+//! sum). A send gets its IP header (and, at the socket's IPV6_CHECKSUM offset, its checksum) from the kernel, unless IP_HDRINCL. The sockets share one table; a socket lives until its last descriptor reference is gone, which is
 //! what lets a fork keep it. The raw Ethernet frame ioctl-style socket this replaced (read/write on the NIC) is gone.
 const policy = @import("raw_icmp_policy.zig");
 const ipv4 = @import("ipv4.zig");
@@ -40,9 +40,11 @@ const Socket = struct {
     peer: [4]u8 = @splat(0),
     /// An AF_INET6 socket: bound6 / peer6 / filter apply instead of bound / peer.
     v6: bool = false,
-    /// The IPv4 protocol the socket carries (inet_num): what it receives and the protocol of what it sends. IPPROTO_ICMPV6 on an
-    /// IPv6 socket.
+    /// The protocol the socket carries (inet_num): what it receives and the protocol (IPv6 next header) of what it sends.
     protocol: u8 = 1,
+    /// IPV6_CHECKSUM of an IPv6 socket (raw6_sock checksum/offset): where a send's checksum goes and a received one is checked, or
+    /// null for none (policy.initialChecksum6 at creation).
+    csum_off: ?u32 = null,
     bound6: [16]u8 = @splat(0),
     peer6: [16]u8 = @splat(0),
     /// connect() named a peer (an IPv6 socket may be connected to ::).
@@ -70,7 +72,7 @@ pub fn open(v6: bool, protocol: u32) ?u32 {
     defer raw_lock.release(saved);
     for (&sockets, 0..) |*s, i| {
         if (s.used) continue;
-        s.* = .{ .used = true, .refs = 1, .v6 = v6, .protocol = @truncate(protocol) };
+        s.* = .{ .used = true, .refs = 1, .v6 = v6, .protocol = @truncate(protocol), .csum_off = if (v6) policy.initialChecksum6(protocol) else null };
         if (!v6 and policy.startsHdrincl(protocol)) s.opts.ip.hdrincl = true;
         return @intCast(i);
     }
@@ -337,19 +339,24 @@ pub fn deliver(protocol: u8, dgram: []const u8, src: [4]u8, dst: [4]u8) bool {
     return took;
 }
 
-/// One checksummed ICMPv6 message that arrived on this host, `src` → `dst` (Linux icmpv6_rcv → raw6_local_deliver, before the
-/// kernel's own handling): each IPv6 socket that matches and whose ICMP6_FILTER passes the type gets a copy without the IPv6 header.
-pub fn deliver6(msg: []const u8, src: [16]u8, dst: [16]u8) void {
-    if (msg.len == 0) return;
+/// One IPv6 packet of next header `protocol` that arrived on this host, `src` → `dst`, `msg` being what follows its IPv6 header
+/// (Linux raw6_local_deliver, before the protocol handler): each IPv6 socket of that protocol that matches gets a copy. An ICMPv6
+/// socket's ICMP6_FILTER may block the type; a socket with a checksum offset drops a packet whose checksum is wrong (rawv6_rcv).
+/// Whether any socket matched (ipv6_raw_deliver's `delivered`).
+pub fn deliver6(protocol: u8, msg: []const u8, src: [16]u8, dst: [16]u8) bool {
     var notify: [MAX_SOCKETS]u32 = undefined;
     var n_notify: usize = 0;
+    var took = false;
     {
         const saved = raw_lock.acquire();
         defer raw_lock.release(saved);
         for (&sockets, 0..) |*s, i| {
             if (!s.used or !s.v6) continue;
+            if (s.protocol != protocol) continue;
             if (!policy.matches6(s.bound6, s.peer6, src, dst)) continue;
-            if (policy.filterBlocks(s.filter, msg[0])) continue;
+            took = true;
+            if (protocol == policy.IPPROTO_ICMPV6 and (msg.len < 4 or policy.filterBlocks(s.filter, msg[0]))) continue;
+            if (s.csum_off != null and policy.sum6(src, dst, s.protocol, msg) != 0) continue;
             const at = policy.enqueueSlot(s.head, s.count) orelse continue;
             const e = &s.queue[at];
             const copy_len = @min(msg.len, RAW_QUEUE_LEN);
@@ -364,17 +371,36 @@ pub fn deliver6(msg: []const u8, src: [16]u8, dst: [16]u8) void {
     for (notify[0..n_notify]) |idx| {
         @import("epoll.zig").epollNotify(.raw_socket, idx, @import("epoll.zig").EPOLLIN);
     }
+    return took;
 }
 
-/// Largest ICMPv6 message an IPv6 raw send carries (a 1500-byte frame less the IPv6 header).
+/// The socket's IPV6_CHECKSUM offset, or null when the kernel computes none.
+pub fn checksumOffset(idx: u32) ?u32 {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return null;
+    return sockets[idx].csum_off;
+}
+
+/// setsockopt(IPV6_CHECKSUM) that passed policy.checksumOptErrno.
+pub fn setChecksumOffset(idx: u32, off: ?u32) bool {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return false;
+    sockets[idx].csum_off = off;
+    return true;
+}
+
+/// Largest message an IPv6 raw send carries (a 1500-byte frame less the IPv6 header).
 pub const MAX_MESSAGE6 = 1460;
 
-/// rawv6_sendmsg: `msg` (the ICMPv6 message) from `bound` to `dst`; the kernel fills the checksum (icmpv6.sendFrom6). 0 or -errno.
-pub fn send6(bound: [16]u8, dst: [16]u8, msg: []const u8, ip: ipo.IpOpts) i64 {
+/// rawv6_sendmsg: `msg` (what follows the IPv6 header, next header `protocol`) from `bound` to `dst`; the kernel writes the checksum
+/// at `csum_off` when there is one (icmpv6.sendProto6). `msg` passed policy.lengthErrno6. 0 or -errno.
+pub fn send6(bound: [16]u8, dst: [16]u8, protocol: u8, csum_off: ?u32, msg: []const u8, ip: ipo.IpOpts) i64 {
     if (msg.len > MAX_MESSAGE6) return -90;
     var buf: [MAX_MESSAGE6]u8 = undefined;
     @memcpy(buf[0..msg.len], msg);
-    const rc = @import("icmpv6.zig").sendFrom6(bound, dst, buf[0..msg.len], ip);
+    const rc = @import("icmpv6.zig").sendProto6(bound, dst, protocol, csum_off, buf[0..msg.len], ip);
     // A frame to this host is delivered before the send returns (as loopback_xmit does), so the copy and the kernel's reply are
     // already queued for the socket.
     if (rc == 0) _ = lo.drain();

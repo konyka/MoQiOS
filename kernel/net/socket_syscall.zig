@@ -51,10 +51,11 @@ pub fn allocUnixFd(fd_table: *vfs_mod.FdTable, unix_sock_idx: u32) i32 {
     return @intCast(slot);
 }
 
-// ── Raw IPv4 and ICMPv6 sockets (net/raw_icmp.zig) ─────────────────
+// ── Raw IPv4 and IPv6 sockets (net/raw_icmp.zig) ───────────────────
 
 /// socket(AF_INET, SOCK_RAW, protocol) or, when `v6`, socket(AF_INET6, SOCK_RAW, protocol): needs CAP_NET_RAW (inet_create /
-/// inet6_create: EPERM). IPv4 takes any protocol from 1 to 255 (raw_icmp_policy.protocolErrno), IPv6 ICMPv6 only.
+/// inet6_create: EPERM). IPv4 takes any protocol from 1 to 255 (raw_icmp_policy.protocolErrno), IPv6 any from 1 to 254
+/// (protocolErrno6).
 fn rawCreate(protocol: u32, v6: bool) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
@@ -102,17 +103,17 @@ fn rawSendFrom6(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest)
             .ok => |v| v,
             .err => |e| return e,
         };
-        const rc = rp.sendtoErrno6(true, a.len, parsed.family, parsed.port, false);
+        const rc = rp.sendtoErrno6(true, a.len, parsed.family, parsed.port, false, raw.protocolOf(d.raw_idx));
         if (rc != 0) return rc;
         dst = parsed.addr;
     } else {
-        const rc = rp.sendtoErrno6(false, 0, 0, 0, raw.isConnected(d.raw_idx));
+        const rc = rp.sendtoErrno6(false, 0, 0, 0, raw.isConnected(d.raw_idx), raw.protocolOf(d.raw_idx));
         if (rc != 0) return rc;
     }
-    const lrc = rp.lengthErrno(true, msg.len);
+    const lrc = rp.lengthErrno6(raw.protocolOf(d.raw_idx), raw.checksumOffset(d.raw_idx), msg.len);
     if (lrc != 0) return lrc;
     const to6 = rp.dest6(dst) orelse return -101; // ENETUNREACH: a v4-mapped address has no IPv6 route
-    const sent = raw.send6(raw.boundAddr6(d.raw_idx), to6, msg, rawIpOpts(d.raw_idx));
+    const sent = raw.send6(raw.boundAddr6(d.raw_idx), to6, @truncate(raw.protocolOf(d.raw_idx)), raw.checksumOffset(d.raw_idx), msg, rawIpOpts(d.raw_idx));
     return if (sent < 0) sent else @intCast(msg.len);
 }
 
@@ -1374,7 +1375,7 @@ pub fn getsockname(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
         // inet_getname: AF_INET, the protocol as the port (inet_num), the bound address; a raw socket reports no peer.
         const raw = @import("raw_icmp.zig");
         if (raw.isV6(desc.raw_idx)) {
-            const name6 = @import("raw_icmp_policy.zig").sockName6(raw.boundAddr6(desc.raw_idx));
+            const name6 = @import("raw_icmp_policy.zig").sockName6(raw.boundAddr6(desc.raw_idx), raw.protocolOf(desc.raw_idx));
             return copySockaddrToUser(addr_ptr, addrlen_ptr, &name6, 28);
         }
         const name = @import("raw_icmp_policy.zig").sockName(raw.boundAddr(desc.raw_idx), raw.protocolOf(desc.raw_idx));

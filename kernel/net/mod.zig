@@ -71,6 +71,9 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
             const payload_start6: u32 = 14 + @as(u32, info6.payload_offset);
             if (payload_start6 + @as(u32, info6.payload_len) > len) return;
 
+            // raw6_local_deliver: each IPv6 raw socket of the next header gets the packet, without its IPv6 header, before the
+            // protocol handler (ip6_protocol_deliver_rcu).
+            _ = @import("raw_icmp.zig").deliver6(info6.next_header, data[payload_start6 .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip);
             switch (info6.next_header) {
                 ipv6.PROTO_ICMPV6 => {
                     icmpv6.handlePacket(info6.src_ip, info6.dst_ip, data + payload_start6, info6.payload_len);
