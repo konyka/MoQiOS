@@ -964,10 +964,8 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32, kmsg_cursor: u64
         .inotify => {
             revents |= EPOLLIN | EPOLLOUT;
         },
-        .raw_socket => {
-            if (@import("raw_icmp.zig").hasData(resource_idx)) revents |= EPOLLIN;
-            revents |= EPOLLOUT;
-        },
+        // A datagram queued, SHUT_RD (EPOLLIN | EPOLLRDHUP), both directions shut (EPOLLHUP); always writable.
+        .raw_socket => revents |= @import("raw_icmp.zig").pollEvents(resource_idx),
         // Linux mqueue_poll_file: POLLIN while a message is queued, POLLOUT while there is room.
         .mqueue => revents |= @import("../ipc/posix_mq.zig").pollEvents(resource_idx),
         .devfs_ctrl => {

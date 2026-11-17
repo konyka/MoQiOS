@@ -10225,3 +10225,17 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   2. IPv6：ICMPv6 仍只处理端口不可达（UDP），IPv6 ping 套接字收不到差错。
   3. 只按端口（UDP）或 ident（ping）匹配，不比较被引用数据报的地址；同一 ident 的多个已连接 ping 套接字都会收到。
   4. raw ICMP 套接字和 TCP 不受影响（TCP 的 ICMP 差错处理不在本切片）。
+
+## 补充：IPv6 raw ICMPv6 套接字和 raw 套接字的 shutdown（hello391）
+
+- 问题：`socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6)` 返回 ENOSYS，没法在 QEMU 里收发任意 ICMPv6（也就没法注入 ICMPv6 差错，下一切片要用）；raw 套接字的 shutdown 返回 EOPNOTSUPP，而 Linux 的 `inet_shutdown` 对 raw 套接字是生效的；IPv4 raw sendto 长度 0 返回 EMSGSIZE，Linux 是 EFAULT；connect(AF_UNSPEC) 没有清掉 bind 的地址。
+- 宿主机实测（`user/hello391.c -DHOST`，root、`unshare -n`、只有 lo，Linux 7.2.15）：13 项全部通过，结论写在 `user/hello391.c` 开头和 `docs/kernel-subsystems.md` 的 hello391 条目里。
+- 修复：`raw_icmp.zig` 的同一张表加 IPv6 套接字（`v6`、`bound6`、`peer6`、`connected`、`filter`、`shut_rd`、`shut_wr`，队列项来源扩为 16 字节），新增 `deliver6`、`send6`、`bind6`、`connect6`、`setFilter`/`getFilter`、`shutdown`、`pollEvents`；`raw_icmp_policy.zig` 新增 `protocolErrno6`、`matches6`、`filterBlocks`、`setFilter`、`filterGetLen`、`sendtoErrno6`、`lengthErrno`、`dest6`、`isMapped6`、`sockName6`、`fromName6`、`shutdownErrno`、`pollBits`、`emptyRecv`；`icmpv6.handlePacket` 在校验和之后调 `deliver6`；`socket_syscall.zig` 的 socket、sendto、recvfrom、bind、connect、getsockname、shutdown 按族分派；`socket_opt.zig` 处理 ICMP6_FILTER 和 IPV6_CHECKSUM；`epoll.zig` 的 raw 套接字就绪状态改用 `pollEvents`。
+- IPv4 raw 套接字的行为变化：sendto 长度 0、1 返回 EFAULT（原来长度 0 是 EMSGSIZE），2 字节可以发；未连接的 send 先报 EDESTADDRREQ；shutdown 生效（未连接返回 ENOTCONN）；connect(AF_UNSPEC) 同时清掉 bind 的地址。
+- host 测试 "raw ICMPv6 socket policy (hello391)…" 和 "raw ICMPv6 socket wiring (hello391)…"：实现前编译失败（`protocolErrno6` 不存在）；只有策略函数时 wiring 测试和 hello389 wiring 测试（它现在要求 `protocolErrno6` 分派）失败；实现后全部通过。已有的 bind 测试把调用 `bindAddrNotAvail6` 的路径数从 2 改为 3（新增的 `rawBind6`）。变异验证：`filterBlocks` 恒返回 false，策略测试失败；删掉 `deliver6` 调用，wiring 测试失败；两处都用 cmp 确认已恢复。
+- QEMU：定向 SMP=2 下 hello391 的 13 项（A S E P T F K C B H U Z L）全部通过。取红灯（只回退内核修复、保留能力配置）时 13 项全部失败：IPv6 raw 的 socket() 返回 -38，后续调用都是 -9；IPv4 raw 的 shutdown 返回 -95；IPv4 raw 发送 0 字节返回 -90。完整 smoke 在 SMP=2、4、1 下各通过一次（上限 1400 秒），hello373、hello389、hello390 仍然 PASS。riscv64 和 aarch64 交叉构建通过，但没有在这两个架构上跑 QEMU。
+- 局限：
+  1. IPv6 raw 套接字只支持 ICMPv6（Linux 接受 IPPROTO_IP 以外的任意协议）。
+  2. IPV6_CHECKSUM 不能设；没有组播成员资格、connect 时的路由检查（Linux 对不可达地址返回 ENETUNREACH）、sendmsg/recvmsg、SO_RCVTIMEO、IP_HDRINCL。
+  3. 两个族合计最多 16 个 raw 套接字，每个队列 8 项。
+  4. QEMU 网络上的 ICMPv6（RA、NS、MLD）也会进入 IPv6 raw 套接字，hello391 只看来源是 ::1 的报文。

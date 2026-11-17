@@ -103,7 +103,7 @@ const SockRef = union(enum) {
     tcp: u32,
     udp: u32,
     unix: u32,
-    raw,
+    raw: u32,
 };
 
 /// The socket behind `fd`: EBADF (-9) for a closed / out-of-range descriptor,
@@ -121,7 +121,7 @@ fn resolveSocket(fd: u64) union(enum) { ok: SockRef, err: i64, v6: SockRef } {
         .tcp_socket => .{ .ok = .{ .tcp = d.tcb_idx } },
         .udp_socket => if (d.udp_is_v6) .{ .v6 = .{ .udp = d.udpKey() } } else .{ .ok = .{ .udp = d.udpKey() } },
         .unix_socket => .{ .ok = .{ .unix = d.unix_sock_idx } },
-        .raw_socket => .{ .ok = .raw },
+        .raw_socket => if (@import("raw_icmp.zig").isV6(d.raw_idx)) .{ .v6 = .{ .raw = d.raw_idx } } else .{ .ok = .{ .raw = d.raw_idx } },
         else => .{ .err = -88 },
     };
 }
@@ -577,6 +577,62 @@ fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
     return 0;
 }
 
+const SOL_ICMPV6: u64 = 58;
+/// ICMP6_FILTER (SOL_ICMPV6 option 1): the per-socket type filter of an IPv6 raw ICMPv6 socket.
+const ICMP6_FILTER: u64 = 1;
+/// IPV6_CHECKSUM (SOL_IPV6 option 7): where the kernel puts the checksum; fixed at offset 2 for ICMPv6 (rawv6_setsockopt).
+const IPV6_CHECKSUM: u64 = 7;
+
+const RawV6Opt = enum { filter, checksum, noprotoopt };
+
+/// Which raw-socket option a SOL_ICMPV6 or SOL_IPV6 request names: ICMP6_FILTER and IPV6_CHECKSUM on an IPv6 socket; any other
+/// SOL_ICMPV6 option, and SOL_ICMPV6 on an IPv4 raw socket, is ENOPROTOOPT. Null: not one of these.
+fn rawV6Opt(v6: bool, level: u64, optname: u64) ?RawV6Opt {
+    if (level == SOL_ICMPV6) return if (v6 and optname == ICMP6_FILTER) .filter else .noprotoopt;
+    if (v6 and level == ipo.SOL_IPV6 and optname == IPV6_CHECKSUM) return .checksum;
+    return null;
+}
+
+fn setRawV6Opt(idx: u32, which: RawV6Opt, optval_ptr: u64, optlen: u64) i64 {
+    switch (which) {
+        .noprotoopt => return -92,
+        // rawv6_setsockopt: an ICMPv6 socket's checksum offset cannot be moved.
+        .checksum => return -22,
+        .filter => {
+            const copy_mod = @import("../mm/copy_from_user.zig");
+            const n: usize = @intCast(@min(optlen, @import("raw_icmp_policy.zig").FILTER_LEN));
+            var val: [@import("raw_icmp_policy.zig").FILTER_LEN]u8 = undefined;
+            if (n != 0) {
+                if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;
+                if (copy_mod.copyFromUser(val[0..n], @ptrFromInt(optval_ptr), n) != n) return -14;
+            }
+            return if (@import("raw_icmp.zig").setFilter(idx, val[0..n])) 0 else -9;
+        },
+    }
+}
+
+fn getRawV6Opt(idx: u32, which: RawV6Opt, optval_ptr: u64, optlen_ptr: u64) i64 {
+    if (which == .noprotoopt) return -92;
+    const copy_mod = @import("../mm/copy_from_user.zig");
+    if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;
+    if (optlen_ptr == 0 or optlen_ptr >= 0x0000_8000_0000_0000) return -14;
+    if (!copy_mod.validateUserBuffer(optlen_ptr, 4) or !copy_mod.validateUserBufferWritable(optlen_ptr, 4)) return -14;
+    var len_buf: [4]u8 = undefined;
+    if (copy_mod.copyFromUser(&len_buf, @ptrFromInt(optlen_ptr), 4) != 4) return -14;
+    const user_len = bo.readU32Le(&len_buf);
+    var val: [@import("raw_icmp_policy.zig").FILTER_LEN]u8 = @splat(0);
+    var full: u32 = 4;
+    if (which == .filter) {
+        val = @import("raw_icmp.zig").getFilter(idx);
+        full = @import("raw_icmp_policy.zig").FILTER_LEN;
+    } else bo.writeU32Le(val[0..4], 2);
+    const n = @min(user_len, full);
+    if (n > 0 and copy_mod.copyToUser(@ptrFromInt(optval_ptr), val[0..n], n) != n) return -14;
+    bo.writeU32Le(&len_buf, n);
+    if (copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &len_buf, 4) != 4) return -14;
+    return 0;
+}
+
 pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen: u64) i64 {
     const resolved = resolveSocket(fd);
     const ref: SockRef = switch (resolved) {
@@ -584,6 +640,9 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
         .err => |e| return e,
     };
     const resolved_v6 = resolved == .v6;
+    if (ref == .raw) {
+        if (rawV6Opt(resolved_v6, level, optname)) |which| return setRawV6Opt(ref.raw, which, optval_ptr, optlen);
+    }
     if (level == ipo.SOL_IP or level == ipo.SOL_IPV6) return setIpOpt(ref, resolved_v6, level, optname, optval_ptr, optlen);
     if (level != SOL_SOCKET and level != SOL_TCP) return -92; // ENOPROTOOPT
     switch (ref) {
@@ -645,6 +704,9 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
         .err => |e| return e,
     };
     const v6 = resolved == .v6;
+    if (ref == .raw) {
+        if (rawV6Opt(v6, level, optname)) |which| return getRawV6Opt(ref.raw, which, optval_ptr, optlen_ptr);
+    }
     if (level == ipo.SOL_IP or level == ipo.SOL_IPV6) return getIpOpt(ref, v6, level, optname, optval_ptr, optlen_ptr);
     if (level != SOL_SOCKET and level != SOL_TCP) return -92; // ENOPROTOOPT
     // TCP keeps its own SOL_TCP set and its SO_ERROR clearing.

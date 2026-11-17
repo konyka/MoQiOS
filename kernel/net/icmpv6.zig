@@ -101,6 +101,8 @@ pub fn handlePacket(
     if (len < 8) return;
     // v53.37: Verify ICMPv6 checksum (RFC 4443 §2.3). checksum() returns 0 for valid packets.
     if (checksum(src_ip, dst_ip, data, len) != 0) return;
+    // Raw ICMPv6 sockets see every message before the kernel handles it (icmpv6_rcv → raw6_local_deliver).
+    @import("raw_icmp.zig").deliver6(data[0..len], src_ip, dst_ip);
     // An echo reply is for the IPv6 ping socket whose ident is its id (icmpv6_rcv → ping_rcv).
     if (@import("ping_policy.zig").replyIdent6(data[0..len])) |ident| {
         @import("udp.zig").deliverPing6(ident, src_ip, dst_ip, data[0..len]);

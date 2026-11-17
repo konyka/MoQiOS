@@ -1,6 +1,8 @@
-//! IPv4 raw ICMP sockets (socket(AF_INET, SOCK_RAW, IPPROTO_ICMP), Linux net/ipv4/raw.c): every ICMP datagram this host receives
-//! is copied, IP header included, to each socket whose bound address and connected peer match (raw_icmp_policy.matches). A send gets
-//! its IP header from the kernel. The sockets share one table; a socket lives until its last descriptor reference is gone, which is
+//! Raw ICMP sockets: IPv4 (socket(AF_INET, SOCK_RAW, IPPROTO_ICMP), Linux net/ipv4/raw.c) and IPv6 (socket(AF_INET6, SOCK_RAW,
+//! IPPROTO_ICMPV6), net/ipv6/raw.c). Every ICMP datagram this host receives is copied, IP header included, to each IPv4 socket whose
+//! bound address and connected peer match (raw_icmp_policy.matches); every ICMPv6 message, without its IPv6 header, to each IPv6
+//! socket that matches and whose ICMP6_FILTER lets the type through. A send gets its IP header (and for ICMPv6 its checksum) from the
+//! kernel. The sockets share one table; a socket lives until its last descriptor reference is gone, which is
 //! what lets a fork keep it. The raw Ethernet frame ioctl-style socket this replaced (read/write on the NIC) is gone.
 const policy = @import("raw_icmp_policy.zig");
 const ipv4 = @import("ipv4.zig");
@@ -24,7 +26,8 @@ const FRAME_BUF_LEN = 14 + 20 + MAX_MESSAGE;
 const Entry = struct {
     dgram: [RAW_QUEUE_LEN]u8 = @splat(0),
     len: u16 = 0,
-    src: [4]u8 = @splat(0),
+    /// The sender: an IPv4 address in the first 4 bytes, or an IPv6 one.
+    src: [16]u8 = @splat(0),
 };
 
 const Socket = struct {
@@ -32,19 +35,28 @@ const Socket = struct {
     refs: u32 = 0,
     bound: [4]u8 = @splat(0),
     peer: [4]u8 = @splat(0),
+    /// An AF_INET6 socket: bound6 / peer6 / filter apply instead of bound / peer.
+    v6: bool = false,
+    bound6: [16]u8 = @splat(0),
+    peer6: [16]u8 = @splat(0),
+    /// connect() named a peer (an IPv6 socket may be connected to ::).
+    connected: bool = false,
+    filter: [policy.FILTER_LEN]u8 = @splat(0),
+    shut_rd: bool = false,
+    shut_wr: bool = false,
     queue: [QUEUE_DEPTH]Entry = @splat(.{}),
 };
 
 var sockets: [MAX_SOCKETS]Socket = @splat(.{});
 var raw_lock: IrqSpinlock = .{};
 
-/// A new socket on the first free slot, or null (ENOBUFS). Nothing is shared with a UDP socket.
-pub fn open() ?u32 {
+/// A new socket (an IPv6 one when `v6`) on the first free slot, or null (ENOBUFS). Nothing is shared with a UDP socket.
+pub fn open(v6: bool) ?u32 {
     const saved = raw_lock.acquire();
     defer raw_lock.release(saved);
     for (&sockets, 0..) |*s, i| {
         if (s.used) continue;
-        s.* = .{ .used = true, .refs = 1 };
+        s.* = .{ .used = true, .refs = 1, .v6 = v6 };
         return @intCast(i);
     }
     return null;
@@ -82,7 +94,7 @@ pub fn hasData(idx: u32) bool {
 }
 
 pub const RecvResult = union(enum) {
-    ok: struct { n: usize, src: [4]u8, trunc: usize },
+    ok: struct { n: usize, src: [16]u8, trunc: usize },
     eagain,
 };
 
@@ -119,7 +131,103 @@ pub fn connect(idx: u32, peer: [4]u8) bool {
     defer raw_lock.release(saved);
     if (idx >= MAX_SOCKETS or !sockets[idx].used) return false;
     sockets[idx].peer = peer;
+    sockets[idx].connected = !@import("std").mem.allEqual(u8, &peer, 0);
+    // connect(AF_UNSPEC) also forgets the bound address (__ip4_datagram_disconnect: raw_bind takes no SOCK_BINDADDR_LOCK).
+    if (!sockets[idx].connected) sockets[idx].bound = .{ 0, 0, 0, 0 };
     return true;
+}
+
+pub fn bind6(idx: u32, addr: [16]u8) bool {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return false;
+    sockets[idx].bound6 = addr;
+    return true;
+}
+
+/// connect on an IPv6 socket: `peer` (:: included) filters what is received and is where send goes; null (AF_UNSPEC) dissolves the
+/// association and forgets the bound address (__ip6_datagram_disconnect).
+pub fn connect6(idx: u32, peer: ?[16]u8) bool {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return false;
+    const s = &sockets[idx];
+    s.peer6 = peer orelse @splat(0);
+    s.connected = peer != null;
+    if (peer == null) s.bound6 = @splat(0);
+    return true;
+}
+
+pub fn isV6(idx: u32) bool {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    return idx < MAX_SOCKETS and sockets[idx].used and sockets[idx].v6;
+}
+
+pub fn boundAddr6(idx: u32) [16]u8 {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return @splat(0);
+    return sockets[idx].bound6;
+}
+
+pub fn peerAddr6(idx: u32) [16]u8 {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return @splat(0);
+    return sockets[idx].peer6;
+}
+
+pub fn getFilter(idx: u32) [policy.FILTER_LEN]u8 {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return @splat(0);
+    return sockets[idx].filter;
+}
+
+/// setsockopt(ICMP6_FILTER): the first min(len, 32) bytes of the filter.
+pub fn setFilter(idx: u32, val: []const u8) bool {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return false;
+    policy.setFilter(&sockets[idx].filter, val);
+    return true;
+}
+
+/// shutdown(how) (inet_shutdown): SHUT_RD ends receiving once the queue is empty (datagrams still queue), SHUT_WR changes nothing a
+/// raw send looks at. ENOTCONN for an unconnected socket, whose flags are set all the same.
+pub fn shutdown(idx: u32, how: u32) i64 {
+    const rc = blk: {
+        const saved = raw_lock.acquire();
+        defer raw_lock.release(saved);
+        if (idx >= MAX_SOCKETS or !sockets[idx].used) return -9;
+        const s = &sockets[idx];
+        if (how == 0 or how == 2) s.shut_rd = true;
+        if (how == 1 or how == 2) s.shut_wr = true;
+        break :blk policy.shutdownErrno(s.connected);
+    };
+    const ep = @import("epoll.zig");
+    ep.epollNotify(.raw_socket, idx, pollEvents(idx));
+    return rc;
+}
+
+pub fn shutRd(idx: u32) bool {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    return idx < MAX_SOCKETS and sockets[idx].used and sockets[idx].shut_rd;
+}
+
+/// poll / epoll readiness (policy.pollBits).
+pub fn pollEvents(idx: u32) u32 {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return 0x004;
+    const s = &sockets[idx];
+    var has = false;
+    for (s.queue) |e| {
+        if (e.len != 0) has = true;
+    }
+    return policy.pollBits(has, s.shut_rd, s.shut_wr);
 }
 
 pub fn boundAddr(idx: u32) [4]u8 {
@@ -137,8 +245,9 @@ pub fn peerAddr(idx: u32) [4]u8 {
 }
 
 pub fn isConnected(idx: u32) bool {
-    const p = peerAddr(idx);
-    return !@import("std").mem.allEqual(u8, &p, 0);
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    return idx < MAX_SOCKETS and sockets[idx].used and sockets[idx].connected;
 }
 
 /// One received ICMP datagram that arrived on this host: `dgram` starts at the IP header of `src` → `dst` (Linux raw_v4_input hands
@@ -151,13 +260,15 @@ pub fn deliver(dgram: []const u8, src: [4]u8, dst: [4]u8) void {
         defer raw_lock.release(saved);
         for (&sockets, 0..) |*s, i| {
             if (!s.used) continue;
+            if (s.v6) continue;
             if (!policy.matches(s.bound, s.peer, src, dst)) continue;
             for (&s.queue) |*e| {
                 if (e.len != 0) continue;
                 const copy_len = @min(dgram.len, RAW_QUEUE_LEN);
                 @memcpy(e.dgram[0..copy_len], dgram[0..copy_len]);
                 e.len = @intCast(copy_len);
-                e.src = src;
+                e.src = @splat(0);
+                @memcpy(e.src[0..4], &src);
                 notify[n_notify] = @intCast(i);
                 n_notify += 1;
                 break;
@@ -168,6 +279,51 @@ pub fn deliver(dgram: []const u8, src: [4]u8, dst: [4]u8) void {
         // The index is the socket's identity here: a slot freed since holds a different socket, which gets a needless wake at worst.
         @import("epoll.zig").epollNotify(.raw_socket, idx, @import("epoll.zig").EPOLLIN);
     }
+}
+
+/// One checksummed ICMPv6 message that arrived on this host, `src` → `dst` (Linux icmpv6_rcv → raw6_local_deliver, before the
+/// kernel's own handling): each IPv6 socket that matches and whose ICMP6_FILTER passes the type gets a copy without the IPv6 header.
+pub fn deliver6(msg: []const u8, src: [16]u8, dst: [16]u8) void {
+    if (msg.len == 0) return;
+    var notify: [MAX_SOCKETS]u32 = undefined;
+    var n_notify: usize = 0;
+    {
+        const saved = raw_lock.acquire();
+        defer raw_lock.release(saved);
+        for (&sockets, 0..) |*s, i| {
+            if (!s.used or !s.v6) continue;
+            if (!policy.matches6(s.bound6, s.peer6, src, dst)) continue;
+            if (policy.filterBlocks(s.filter, msg[0])) continue;
+            for (&s.queue) |*e| {
+                if (e.len != 0) continue;
+                const copy_len = @min(msg.len, RAW_QUEUE_LEN);
+                @memcpy(e.dgram[0..copy_len], msg[0..copy_len]);
+                e.len = @intCast(copy_len);
+                e.src = src;
+                notify[n_notify] = @intCast(i);
+                n_notify += 1;
+                break;
+            }
+        }
+    }
+    for (notify[0..n_notify]) |idx| {
+        @import("epoll.zig").epollNotify(.raw_socket, idx, @import("epoll.zig").EPOLLIN);
+    }
+}
+
+/// Largest ICMPv6 message an IPv6 raw send carries (a 1500-byte frame less the IPv6 header).
+pub const MAX_MESSAGE6 = 1460;
+
+/// rawv6_sendmsg: `msg` (the ICMPv6 message) from `bound` to `dst`; the kernel fills the checksum (icmpv6.sendFrom6). 0 or -errno.
+pub fn send6(bound: [16]u8, dst: [16]u8, msg: []const u8) i64 {
+    if (msg.len > MAX_MESSAGE6) return -90;
+    var buf: [MAX_MESSAGE6]u8 = undefined;
+    @memcpy(buf[0..msg.len], msg);
+    const rc = @import("icmpv6.zig").sendFrom6(bound, dst, buf[0..msg.len]);
+    // A frame to this host is delivered before the send returns (as loopback_xmit does), so the copy and the kernel's reply are
+    // already queued for the socket.
+    if (rc == 0) _ = lo.drain();
+    return rc;
 }
 
 /// raw_sendmsg: `msg` is the ICMP message (header and data). The kernel supplies the IP header; a frame that has to wait for ARP

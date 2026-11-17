@@ -13067,10 +13067,10 @@ test "bind(): an address the host does not have is EADDRNOTAVAIL, checked before
     try std.testing.expect(bp.inet6Bindable(up.link_local6, up, false));
     try std.testing.expect(!bp.inet6Bindable(up.link_local6, down, false));
     try std.testing.expect(bp.inet6Bindable(doc, up, true));
-    // Wiring: every bind path (TCP/UDP x IPv4/IPv6) asks the policy before the port rules.
+    // Wiring: every bind path (TCP/UDP x IPv4/IPv6, and the IPv6 raw socket) asks the policy before the port rules.
     const ss = kt.socket_syscall_source;
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "if (bindAddrNotAvail4("));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, ss, "if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;"));
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;\n        if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port)") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (bindAddrNotAvail4(.{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] })) return bind_addr_policy.EADDRNOTAVAIL;\n    if (net_mod.tcp_port_policy.bindNeedsPrivilege(port)") != null);
 }
@@ -14657,7 +14657,7 @@ test "raw ICMP socket wiring (hello389): received ICMP reaches raw sockets first
     const at_icmp = std.mem.indexOf(u8, m, "icmp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len);").?;
     try std.testing.expect(at_raw < at_icmp);
     const ss = kt.socket_syscall_source;
-    try std.testing.expect(std.mem.indexOf(u8, ss, "const perr = @import(\"raw_icmp_policy.zig\").protocolErrno(protocol);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const perr = if (v6) rp.protocolErrno6(protocol) else rp.protocolErrno(protocol);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "Allocate raw socket fd") == null);
     const v = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, v, ".raw_socket => @import(\"../net/raw_icmp.zig\").retain(desc.raw_idx),") != null);
@@ -14725,4 +14725,103 @@ test "ICMP errors wiring (hello390): checksummed, sent to connected UDP and ping
     const ps = std.mem.indexOf(u8, ss, "fn pingSend(d: *vfs_mod.FileDescriptor") orelse return error.TestUnexpectedResult;
     const pend = std.mem.indexOfPos(u8, ss, ps, "const pending = udp.takePendingError(d.udpKey());") orelse return error.TestUnexpectedResult;
     try std.testing.expect(pend < std.mem.indexOfPos(u8, ss, ps, "const sent = @import(\"icmp.zig\").sendFrom(").?);
+}
+
+test "raw ICMPv6 socket policy (hello391): protocol, filter, destination, lengths, names and shutdown (Linux net/ipv6/raw.c)" {
+    const rp = kt.raw_icmp_policy;
+    try std.testing.expectEqual(@as(i64, 0), rp.protocolErrno6(58));
+    try std.testing.expectEqual(@as(i64, -93), rp.protocolErrno6(0));
+    try std.testing.expectEqual(@as(i64, -93), rp.protocolErrno6(1));
+    const any6: [16]u8 = @splat(0);
+    var l6: [16]u8 = @splat(0);
+    l6[15] = 1;
+    var o6: [16]u8 = @splat(0);
+    o6[15] = 2;
+    try std.testing.expect(rp.matches6(any6, any6, l6, l6));
+    try std.testing.expect(rp.matches6(l6, l6, l6, l6));
+    try std.testing.expect(!rp.matches6(o6, any6, l6, l6));
+    try std.testing.expect(!rp.matches6(any6, o6, l6, l6));
+    try std.testing.expect(rp.matches6(o6, any6, l6, o6));
+    // ICMP6_FILTER: a set bit blocks the type; word 4 bit 1 is type 129.
+    var f: [32]u8 = @splat(0);
+    try std.testing.expect(!rp.filterBlocks(f, 128) and !rp.filterBlocks(f, 255));
+    f = @splat(0xff);
+    f[16] = 0xfd;
+    try std.testing.expect(!rp.filterBlocks(f, 129) and rp.filterBlocks(f, 128) and rp.filterBlocks(f, 1) and rp.filterBlocks(f, 255));
+    var cur: [32]u8 = @splat(0);
+    rp.setFilter(&cur, &([_]u8{0xff} ** 8));
+    try std.testing.expect(std.mem.allEqual(u8, cur[0..8], 0xff) and std.mem.allEqual(u8, cur[8..], 0));
+    rp.setFilter(&cur, &([_]u8{0x11} ** 40));
+    try std.testing.expect(std.mem.allEqual(u8, &cur, 0x11));
+    rp.setFilter(&cur, &.{});
+    try std.testing.expect(std.mem.allEqual(u8, &cur, 0x11));
+    try std.testing.expectEqual(@as(u32, 32), rp.filterGetLen(64));
+    try std.testing.expectEqual(@as(u32, 8), rp.filterGetLen(8));
+    // rawv6_sendmsg: the destination first, then the length.
+    try std.testing.expectEqual(@as(i64, -89), rp.sendtoErrno6(false, 0, 0, 0, false));
+    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno6(false, 0, 0, 0, true));
+    try std.testing.expectEqual(@as(i64, -22), rp.sendtoErrno6(true, 16, 10, 0, false));
+    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno6(true, 24, 10, 0, false));
+    try std.testing.expectEqual(@as(i64, -97), rp.sendtoErrno6(true, 28, 2, 0, false));
+    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno6(true, 28, 0, 0, false));
+    try std.testing.expectEqual(@as(i64, -22), rp.sendtoErrno6(true, 28, 10, 17, false));
+    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno6(true, 28, 10, 58, false));
+    try std.testing.expectEqual(@as(i64, -14), rp.lengthErrno(true, 0));
+    try std.testing.expectEqual(@as(i64, -14), rp.lengthErrno(true, 1));
+    try std.testing.expectEqual(@as(i64, -22), rp.lengthErrno(true, 2));
+    try std.testing.expectEqual(@as(i64, -22), rp.lengthErrno(true, 3));
+    try std.testing.expectEqual(@as(i64, 0), rp.lengthErrno(true, 4));
+    try std.testing.expectEqual(@as(i64, -14), rp.lengthErrno(false, 1));
+    try std.testing.expectEqual(@as(i64, 0), rp.lengthErrno(false, 2));
+    // :: is sent to ::1; a v4-mapped destination has no IPv6 route.
+    try std.testing.expectEqualSlices(u8, &l6, &rp.dest6(any6).?);
+    try std.testing.expectEqualSlices(u8, &o6, &rp.dest6(o6).?);
+    var m6: [16]u8 = @splat(0);
+    m6[10] = 0xff;
+    m6[11] = 0xff;
+    m6[12] = 127;
+    m6[15] = 1;
+    try std.testing.expect(rp.dest6(m6) == null);
+    try std.testing.expect(rp.isMapped6(m6) and !rp.isMapped6(l6));
+    const n = rp.sockName6(l6);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 0, 58 }, n[0..4]);
+    try std.testing.expectEqualSlices(u8, &l6, n[8..24]);
+    try std.testing.expect(std.mem.allEqual(u8, n[24..28], 0) and std.mem.allEqual(u8, n[4..8], 0));
+    const fr = rp.fromName6(l6, 2);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 0, 0 }, fr[0..4]);
+    try std.testing.expectEqualSlices(u8, &l6, fr[8..24]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 0, 0, 0 }, fr[24..28]);
+    // shutdown: ENOTCONN unless connected, the flags are set either way.
+    try std.testing.expectEqual(@as(i64, -107), rp.shutdownErrno(false));
+    try std.testing.expectEqual(@as(i64, 0), rp.shutdownErrno(true));
+    try std.testing.expectEqual(@as(u32, 0x4), rp.pollBits(false, false, false));
+    try std.testing.expectEqual(@as(u32, 0x5), rp.pollBits(true, false, false));
+    try std.testing.expectEqual(@as(u32, 0x2005), rp.pollBits(false, true, false));
+    try std.testing.expectEqual(@as(u32, 0x2015), rp.pollBits(false, true, true));
+    try std.testing.expectEqual(@as(u32, 0x4), rp.pollBits(false, false, true));
+    try std.testing.expectEqual(rp.EmptyRecv.eagain, rp.emptyRecv(true, true));
+    try std.testing.expectEqual(rp.EmptyRecv.eof, rp.emptyRecv(false, true));
+    try std.testing.expectEqual(rp.EmptyRecv.wait, rp.emptyRecv(false, false));
+    try std.testing.expectEqual(@as(u32, 58), kt.sockopt_policy.identity(.raw, true).protocol);
+    try std.testing.expectEqual(@as(u32, 10), kt.sockopt_policy.identity(.raw, true).domain);
+}
+
+test "raw ICMPv6 socket wiring (hello391): checksummed ICMPv6 reaches raw sockets before the ping sockets, socket() makes them, shutdown works" {
+    const v6s = kt.icmpv6_source;
+    const ck = std.mem.indexOf(u8, v6s, "if (checksum(src_ip, dst_ip, data, len) != 0) return;") orelse return error.TestUnexpectedResult;
+    const dl = std.mem.indexOfPos(u8, v6s, ck, "@import(\"raw_icmp.zig\").deliver6(data[0..len], src_ip, dst_ip);") orelse return error.TestUnexpectedResult;
+    const pr = std.mem.indexOfPos(u8, v6s, ck, "@import(\"ping_policy.zig\").replyIdent6(data[0..len])") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(dl < pr);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "(domain == 2 or domain == 10) and parsed.sock_type == 3) rawCreate(protocol, domain == 10)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "EOPNOTSUPP (raw_shutdown stays NULL)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "return @import(\"raw_icmp.zig\").shutdown(cur.fd_table.fds[fd].raw_idx, how);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (len == 0) return -90;") == null);
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, ".raw_socket => if (@import(\"raw_icmp.zig\").isV6(d.raw_idx))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "ICMP6_FILTER") != null);
+    const rs = kt.raw_icmp_source;
+    try std.testing.expect(std.mem.indexOf(u8, rs, "if (s.v6) continue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "policy.filterBlocks(s.filter, msg[0])") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.epoll_source, ".raw_socket => revents |= @import(\"raw_icmp.zig\").pollEvents(resource_idx),") != null);
 }

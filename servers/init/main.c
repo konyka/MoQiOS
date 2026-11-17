@@ -507,6 +507,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello388"); /* 100 UDP sockets at once: the socket table holds 256 */
     run_test("hello389"); /* raw ICMP socket */
     run_test("hello390"); /* ICMP errors for connected UDP and ping sockets */
+    run_test("hello391"); /* IPv6 raw ICMPv6 socket */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */
