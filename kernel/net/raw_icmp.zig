@@ -413,6 +413,17 @@ pub fn send(bound: [4]u8, dst: [4]u8, protocol: u8, msg: []const u8, ip: ipo.IpO
     return if (ok) 0 else -105;
 }
 
+/// The IPv4 id generator of IP_HDRINCL sends that leave the id 0 without DF (__ip_select_ident); never 0.
+var hdrincl_ident: u16 = 0;
+
+fn takeIdent() u16 {
+    while (true) {
+        const cur = @atomicLoad(u16, &hdrincl_ident, .monotonic);
+        const next = policy.nextIdent(cur);
+        if (@cmpxchgWeak(u16, &hdrincl_ident, cur, next, .monotonic, .monotonic) == null) return next;
+    }
+}
+
 /// An IP_HDRINCL send (raw_send_hdrinc): `pkt` is a whole IPv4 datagram that passed policy.hdrinclErrno. It is routed by `dst`
 /// (the sendto address or the connected peer), not by the header's destination; the kernel fills in a zero source, the total
 /// length and the header checksum (policy.completeHdrincl). Past the path MTU is EMSGSIZE.
@@ -431,7 +442,7 @@ pub fn sendHdrincl(bound: [4]u8, dst: [4]u8, pkt: []const u8) i64 {
     const src = @import("tcp_port_policy.zig").sourceAddr(bound, dst, netif.getOurIp());
     var pkt_buf: [FRAME_BUF_LEN]u8 = @splat(0);
     @memcpy(pkt_buf[14..][0..pkt.len], pkt);
-    policy.completeHdrincl(pkt_buf[14..][0..pkt.len], src);
+    policy.completeHdrinclId(pkt_buf[14..][0..pkt.len], src, if (policy.needsIdent(pkt)) takeIdent() else 0);
     const frame_len = eth.buildFrame(&pkt_buf, dst_mac, our_mac, eth.ETHERTYPE_IPV4, @intCast(pkt.len));
     if (wait_hop) |hop| {
         arp.queueFrame(hop, &pkt_buf, frame_len);

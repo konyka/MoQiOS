@@ -43,8 +43,30 @@ pub fn headerSum(hdr: []const u8) u16 {
 /// length is the send's, and the checksum is recomputed; TTL, TOS, id, flags and protocol stay as written. A shorter header (IHL
 /// below 5) goes out untouched. `pkt` passed hdrinclErrno.
 pub fn completeHdrincl(pkt: []u8, src: [4]u8) void {
+    completeHdrinclId(pkt, src, 0);
+}
+
+/// raw_send_hdrinc's `if (!iph->id) ip_select_ident(...)`: the header (at least 20 bytes) has id 0 and no DF bit, so the kernel
+/// writes one (ip_select_ident_segs leaves 0 under DF).
+pub fn needsIdent(pkt: []const u8) bool {
+    if (pkt.len < 20 or @as(usize, pkt[0] & 0x0f) * 4 < 20) return false;
+    return pkt[4] == 0 and pkt[5] == 0 and (pkt[6] & 0x40) == 0;
+}
+
+/// The id generator's next value after `cur`, skipping 0 (an id of 0 would read as "choose one").
+pub fn nextIdent(cur: u16) u16 {
+    const n = cur +% 1;
+    return if (n == 0) 1 else n;
+}
+
+/// completeHdrincl, writing `ident` as the id when the header needsIdent (`ident` is ignored otherwise).
+pub fn completeHdrinclId(pkt: []u8, src: [4]u8, ident: u16) void {
     const ihl: usize = @as(usize, pkt[0] & 0x0f) * 4;
     if (ihl < 20) return;
+    if (ident != 0 and needsIdent(pkt)) {
+        pkt[4] = @truncate(ident >> 8);
+        pkt[5] = @truncate(ident);
+    }
     if (pkt[12] == 0 and pkt[13] == 0 and pkt[14] == 0 and pkt[15] == 0) @memcpy(pkt[12..16], &src);
     pkt[2] = @truncate(pkt.len >> 8);
     pkt[3] = @truncate(pkt.len);

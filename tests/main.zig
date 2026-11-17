@@ -15041,7 +15041,7 @@ test "IP_HDRINCL wiring: raw IPv4 sends write the caller's header (hello396)" {
     try std.testing.expect(std.mem.indexOf(u8, ss, "var pbuf: [@import(\"raw_icmp.zig\").MAX_HDRINCL]u8 = undefined;") != null);
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "pub fn sendHdrincl(bound: [4]u8, dst: [4]u8, pkt: []const u8) i64 {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rs, "policy.completeHdrincl(pkt_buf[14..][0..pkt.len], src);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "policy.completeHdrinclId(pkt_buf[14..][0..pkt.len], src, if (policy.needsIdent(pkt)) takeIdent() else 0);") != null);
 }
 
 test "raw ICMP sockets take sendmsg and recvmsg (hello397)" {
@@ -15181,4 +15181,38 @@ test "IPv4 raw sockets of any protocol (hello401): creation, delivery and protoc
     try std.testing.expect(std.mem.indexOf(u8, ss, "const idx = raw.open(v6, protocol) orelse return -105; // ENOBUFS") != null);
     const so = kt.socket_opt_source;
     try std.testing.expect(std.mem.indexOf(u8, so, "facts.id.protocol = @import(\"raw_icmp.zig\").protocolOf(idx);") != null);
+}
+
+test "IP_HDRINCL id 0 is chosen unless DF (hello402): Linux raw_send_hdrinc / ip_select_ident" {
+    const rp = kt.raw_icmp_policy;
+    var p: [24]u8 = @splat(0);
+    p[0] = 0x45;
+    // No DF, id 0: the generator's value goes in, and the checksum covers it.
+    try std.testing.expect(rp.needsIdent(&p));
+    rp.completeHdrinclId(&p, .{ 127, 0, 0, 1 }, 0xbeef);
+    try std.testing.expectEqual(@as(u8, 0xbe), p[4]);
+    try std.testing.expectEqual(@as(u8, 0xef), p[5]);
+    try std.testing.expectEqual(@as(u16, 0), rp.headerSum(p[0..20]));
+    // DF set: id 0 stays 0 (ip_select_ident_segs).
+    var q: [24]u8 = @splat(0);
+    q[0] = 0x45;
+    q[6] = 0x40;
+    try std.testing.expect(!rp.needsIdent(&q));
+    rp.completeHdrinclId(&q, .{ 127, 0, 0, 1 }, 0xbeef);
+    try std.testing.expectEqual(@as(u8, 0), q[4]);
+    try std.testing.expectEqual(@as(u8, 0), q[5]);
+    // A given id is kept.
+    var g: [24]u8 = @splat(0);
+    g[0] = 0x45;
+    g[4] = 0x12;
+    g[5] = 0x34;
+    try std.testing.expect(!rp.needsIdent(&g));
+    rp.completeHdrinclId(&g, .{ 127, 0, 0, 1 }, 0xbeef);
+    try std.testing.expectEqual(@as(u8, 0x12), g[4]);
+    try std.testing.expectEqual(@as(u8, 0x34), g[5]);
+    // The generator never hands out 0 (a 0 would read as "choose one" again).
+    try std.testing.expectEqual(@as(u16, 1), rp.nextIdent(0xffff));
+    try std.testing.expectEqual(@as(u16, 2), rp.nextIdent(1));
+    const rs = kt.raw_icmp_source;
+    try std.testing.expect(std.mem.indexOf(u8, rs, "policy.completeHdrinclId(pkt_buf[14..][0..pkt.len], src, if (policy.needsIdent(pkt)) takeIdent() else 0);") != null);
 }

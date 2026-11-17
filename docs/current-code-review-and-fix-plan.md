@@ -10305,7 +10305,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - host 测试 "IP_HDRINCL policy…" 和 "IP_HDRINCL wiring…"：实现前编译失败（`IP_HDRINCL` 不存在），只有策略时 wiring 测试失败，实现后通过。第一版在 IP_HDRINCL 分支里另调一次 `loopbackSourceErrno`，hello386/hello387 的调用点计数测试（6 处）失败；改为两条路径共用一次调用后通过。变异验证：`completeHdrincl` 不补来源，策略测试失败；已恢复。
 - QEMU：hello396 6 项在完整 smoke SMP=2、SMP=4 下全过。取红灯（只回退内核修复、保留能力配置，hello396 提前到 hello3 之前）：G U I P S 失败（选项 -92，自带头的发送被当成 ICMP 报文，19 字节返回 19），O 通过（它不依赖 IP_HDRINCL）。完整 smoke：SMP=4 `PASS`；SMP=2 第一份失败在 hello108「RT task lost the CPU to reaping」（文档里已记录的负载相关偶发项，与本改动无关），重跑 `PASS`；SMP=1 `PASS`。riscv64 和 aarch64 交叉构建通过，但没有在这两个架构上跑 QEMU。
 - 局限：
-  1. id 为 0 时不另选 id（Linux 调 `ip_select_ident`），原样发 0。
+  1. id 为 0 时不另选 id（Linux 调 `ip_select_ident`），原样发 0；已在 hello402 修正。
   2. 头里的目的地址不参与路由，也不校验与 sendto 地址一致（与 Linux 相同）；IP 选项（IHL 大于 5）照发，不检查内容。
   3. 收到的副本仍只按 ICMP 分发给 raw 套接字：自带头发出的非 ICMP 数据报不会回到 raw 套接字，只交给对应协议（如 UDP）。
   4. IPv6 没有对应的 IPV6_HDRINCL。
@@ -10422,3 +10422,17 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   2. raw 套接字仍是 16 个槽，所有协议共用。
   3. 没有 IPv6 的任意协议 raw 套接字（仍只有 ICMPv6）。
   4. 协议不可达只回给回环来源，与端口不可达相同。
+
+## 补充：IP_HDRINCL 发送的 IPv4 id（hello402）
+
+- 问题：IP_HDRINCL 发送时，用户头里 id 为 0 就原样发出 0。没有 DF 的数据报 id 全为 0，在路上被分片后，接收方没法区分来自不同数据报的分片。
+- Linux 语义（3rd/linux-7.0.6 `net/ipv4/raw.c` 的 `raw_send_hdrinc`：头至少 20 字节且 `!iph->id` 时调 `ip_select_ident(net, skb, NULL)`；`include/net/ip.h` 的 `ip_select_ident_segs`：没有套接字可用时，头里有 DF 就写 0，否则用 `__ip_select_ident` 选一个）。宿主机上连续三个没有 DF 的数据报得到 0xe053、0xe065、0xe071 这样不同的 id；带 DF 的保持 0。
+- 宿主机实测（`user/hello402.c -DHOST`，root、`unshare -n`、只有 lo）：3 项（Z D G）全部通过。
+- 修复：
+  - `raw_icmp_policy.zig`：新增 `needsIdent`（头至少 20 字节、id 为 0、没有 DF）、`nextIdent`（加 1，跳过 0）、`completeHdrinclId`（需要时写入 id，再补来源、总长度和校验和）；`completeHdrincl` 改为调用它，传入 0。
+  - `raw_icmp.zig`：全局计数器 `hdrincl_ident` 和 `takeIdent`（原子比较交换，多个 CPU 同时发送时也不会发重）；`sendHdrincl` 改用 `completeHdrinclId`。
+- host 测试 "IP_HDRINCL id 0 is chosen unless DF (hello402)…"：实现前编译失败（`needsIdent` 不存在），实现后通过；hello396 wiring 测试里检查 `completeHdrincl` 调用的断言改为新的调用。变异验证：`needsIdent` 不看 DF，测试失败；已恢复。
+- QEMU：完整 smoke 在 SMP=1、SMP=2、SMP=4 下各一次 `PASS`，hello402 的 3 项全部 ok（Z 得到的 id 是 0x5 0x6 0x7），hello396 也通过。红灯：把修复撤掉、只保留注册，旧内核上 Z 失败（三个 id 都是 0x0），D、G 通过，hello402 判 FAIL。riscv64 和 aarch64 交叉构建通过，没有在这两个架构上跑 QEMU。
+- 局限：
+  1. 计数器是全局的，Linux 按目的地址分桶（`ip_idents`）并加随机扰动；MoQiOS 的 id 从 1 开始顺序递增，可以被预测。
+  2. 内核自己写的 IPv4 头（TCP、UDP、ICMP、raw 不带 IP_HDRINCL）总是 DF 加 id 0，不受影响。
