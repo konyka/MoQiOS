@@ -10360,4 +10360,32 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - QEMU：完整 smoke SMP=2、SMP=4 各一份 `PASS`，hello399 6 项全过；恢复修复后 SMP=1 完整 smoke `PASS`。取红灯（只回退内核修复、保留能力配置，hello399 提前到 hello3 之前）：G B R L H 失败（ICMP_FILTER 的 set、get 都是 -92，请求和应答都收回），N 通过（它本来就要求 ENOPROTOOPT）。riscv64 和 aarch64 交叉构建通过，但没有在这两个架构上跑 QEMU。
 - 局限：
   1. 掩码只对 IPv4 raw 套接字起作用；IPv6 用 ICMP6_FILTER（hello391）。
-  2. 不认识的层上的 getsockopt：Linux 对 IPv4 TCP、UDP、raw 和 AF_UNIX 套接字返回 EOPNOTSUPP，MoQiOS 除 SOL_IP/SOL_IPV6 外仍返回 ENOPROTOOPT。
+  2. 不认识的层上的 getsockopt：Linux 对 IPv4 TCP、UDP、raw 和 AF_UNIX 套接字返回 EOPNOTSUPP，当时 MoQiOS 返回 ENOPROTOOPT；已在 hello400 修正。
+
+## 补充：不认识的层上的 getsockopt/setsockopt（hello400）
+
+- 问题：getsockopt/setsockopt 在套接字不处理的层上一律返回 ENOPROTOOPT（-92）。Linux 的返回值取决于套接字类型：IPv4 套接字的 get 是 EOPNOTSUPP（-95），AF_UNIX 两个方向都是 EOPNOTSUPP。按 errno 区分「这个层不支持」和「这个选项不存在」的程序会判断错。
+- Linux 语义（3rd/linux-7.0.6）：
+  - IPv4：`tcp_getsockopt`、`udp_getsockopt`、`raw_getsockopt` 把自己层以外的请求交给 `ip_getsockopt`。`ip_getsockopt` 对 SOL_IP 以外的层返回 EOPNOTSUPP，`ip_setsockopt` 返回 ENOPROTOOPT（`net/ipv4/ip_sockglue.c`）。
+  - IPv6：`ipv6_getsockopt`、`ipv6_setsockopt` 对 SOL_IPV6 以外的层返回 ENOPROTOOPT（`net/ipv6/ipv6_sockglue.c`）。
+  - AF_UNIX：`unix_stream_ops` 等没有 `getsockopt`、`setsockopt`，`do_sock_getsockopt`、`do_sock_setsockopt` 对 SOL_SOCKET 以外的层返回 EOPNOTSUPP（`net/socket.c`）。
+- 宿主机实测：
+  - `user/hello400.c -DHOST`（root、`unshare -n`、只有 lo）：5 项（T U R 6 X）全部通过。
+  - 探针测了 ping 套接字：IPv4 与 UDP 相同，IPv6 与其他 IPv6 套接字相同。
+  - 探针测了 hello143 用到的 AF_UNIX 9999 层 set：-95；UDP 是 -92。
+- 修复：
+  - `ip_opt_policy.zig`：新增 `SockKind` 和 `unknownLevelErrno`。
+  - `socket_opt.zig`：新增 `unknownLevel`（TCP 按 `tcpIsV6`，UDP、raw 按描述符的族）。`sysGetSockopt`、`sysSetSockopt` 的兜底分支，UDP、AF_UNIX、raw 的非 SOL_SOCKET 分支，以及 `setIpOpt`、`getIpOpt` 对非 IP 套接字的分支都改用它。
+  - UDP 套接字在 SOL_UDP（17）、SOL_UDPLITE（136）上的 get 仍是 ENOPROTOOPT（`udp_getsockopt` 把这两层交给 `udp_lib_getsockopt`）；ping 套接字（键带 `udp.PING_KEY`）没有 UDP 层，按 IPv4 处理。
+  - `rawV6Opt`：IPv4 raw 套接字上的 SOL_ICMPV6 返回 null，交给 `unknownLevel`（`raw_getsockopt` 把 SOL_RAW 以外的层交给 `ip_getsockopt`），get 是 EOPNOTSUPP，set 仍是 ENOPROTOOPT。
+- 测试：
+  - `user/hello143.c` 里「an unknown level is refused」原来接受 ENOPROTOOPT 或 EINVAL，现在按 Linux 区分：AF_UNIX 要求 EOPNOTSUPP，UDP 要求 ENOPROTOOPT。
+  - host 测试 "getsockopt / setsockopt at a level the socket does not know (hello400)…"：实现前编译失败（`unknownLevelErrno` 不存在），实现后通过。
+  - 变异验证：IPv4 的 get 改回 -92，测试失败；已恢复。
+  - 第一版 QEMU 运行里 hello400 的 U、R 失败：UDP 套接字 get SOL_UDP 返回 -95（应为 -92），IPv4 raw 套接字 get SOL_ICMPV6 返回 -92（应为 -95）。在 host 测试里先加上这两处的断言（失败），改正后通过。
+- QEMU：
+  - 改正后完整 smoke SMP=2 `PASS`，hello400 5 项全过，hello143 PASS。
+  - 同批 SMP=4 那份卡在 hello300 的消息队列一段：日志停在 `[posix_mq] created mq=/h300q` 后的 `[fork]`，之后不再增长，没有 FAIL。这是文档里已记录的 hello300 偶发卡住，hello300 不调 getsockopt/setsockopt。那份里 hello143 已是 PASS。恢复修复后重跑 SMP=4、SMP=1 各一份，都是 `PASS`。
+  - 取红灯（只回退内核修复、保留能力配置，hello400 提前到 hello3 之前）：T U R X 失败（不认识的层一律 -92），6 通过（IPv6 本来就是 -92）；hello143 的「an unknown level is refused」失败。
+  - riscv64 和 aarch64 交叉构建通过，但没有在这两个架构上跑 QEMU。
+- 局限：各套接字自己层上的未知选项仍是 ENOPROTOOPT，与 Linux 相同；没有逐个核对 SOL_SOCKET 上每个只读或不支持选项的 errno。

@@ -459,9 +459,24 @@ fn socketFamily(ref: SockRef, v6_hint: bool) ?ipo.Family {
     };
 }
 
+/// SOL_UDP and SOL_UDPLITE: UDP's own levels (udp_lib_getsockopt / udp_lib_setsockopt), where an option this kernel lacks is
+/// ENOPROTOOPT.
+const SOL_UDP: u64 = 17;
+const SOL_UDPLITE: u64 = 136;
+
+/// The errno of a getsockopt (`get`) or setsockopt at a level the socket does not handle (ipo.unknownLevelErrno).
+fn unknownLevel(ref: SockRef, v6: bool, get: bool) i64 {
+    const kind: ipo.SockKind = switch (ref) {
+        .unix => .unix,
+        .tcp => |idx| if (@import("tcp.zig").tcpIsV6(idx)) .inet6 else .inet4,
+        .udp, .raw => if (v6) .inet6 else .inet4,
+    };
+    return ipo.unknownLevelErrno(kind, get);
+}
+
 /// setsockopt at SOL_IP / SOL_IPV6: only IP sockets, and only the level that matches their family.
 fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u64, optlen: u64) i64 {
-    const fam = socketFamily(ref, v6_hint) orelse return -92;
+    const fam = socketFamily(ref, v6_hint) orelse return unknownLevel(ref, v6_hint, false);
     if (!ipo.levelApplies(level, fam)) return -92;
     if (level == ipo.SOL_IPV6 and (optname == ipo.IPV6_ADD_MEMBERSHIP or optname == ipo.IPV6_DROP_MEMBERSHIP)) return setMembership(ref, optname, optval_ptr, optlen);
     if (level == ipo.SOL_IP and (optname == ipo.IP_ADD_MEMBERSHIP or optname == ipo.IP_DROP_MEMBERSHIP)) return setMembership4(ref, optname, optval_ptr, optlen);
@@ -564,7 +579,7 @@ fn setMembership4(ref: SockRef, optname: u64, optval_ptr: u64, optlen: u64) i64 
 }
 
 fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u64, optlen_ptr: u64) i64 {
-    const fam = socketFamily(ref, v6_hint) orelse return -92;
+    const fam = socketFamily(ref, v6_hint) orelse return unknownLevel(ref, v6_hint, true);
     // ip_getsockopt answers a level other than SOL_IP with EOPNOTSUPP; an IPv6 socket's ipv6_getsockopt with ENOPROTOOPT.
     if (!ipo.levelApplies(level, fam)) return if (fam == .v4) -95 else -92;
     const cur: ipo.IpOpts = switch (ref) {
@@ -604,11 +619,11 @@ const IPV6_CHECKSUM: u64 = 7;
 const RawV6Opt = enum { filter, checksum, icmp_filter, noprotoopt };
 
 /// Which raw-socket option a SOL_ICMPV6 or SOL_IPV6 request names: ICMP6_FILTER and IPV6_CHECKSUM on an IPv6 socket; any other
-/// SOL_ICMPV6 option, and SOL_ICMPV6 on an IPv4 raw socket, is ENOPROTOOPT. SOL_RAW ICMP_FILTER on an IPv4 socket. Null: not one of
-/// these.
+/// SOL_ICMPV6 option is ENOPROTOOPT. SOL_RAW ICMP_FILTER on an IPv4 socket. Null: not one of these (SOL_ICMPV6 on an IPv4 raw socket
+/// is a level raw_getsockopt passes on to ip_getsockopt: unknownLevel).
 fn rawV6Opt(v6: bool, level: u64, optname: u64) ?RawV6Opt {
     if (level == SOL_RAW) return if (!v6 and optname == ICMP_FILTER) .icmp_filter else .noprotoopt;
-    if (level == SOL_ICMPV6) return if (v6 and optname == ICMP6_FILTER) .filter else .noprotoopt;
+    if (level == SOL_ICMPV6) return if (!v6) null else if (optname == ICMP6_FILTER) .filter else .noprotoopt;
     if (v6 and level == ipo.SOL_IPV6 and optname == IPV6_CHECKSUM) return .checksum;
     return null;
 }
@@ -679,7 +694,7 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
         if (rawV6Opt(resolved_v6, level, optname)) |which| return setRawV6Opt(ref.raw, which, optval_ptr, optlen);
     }
     if (level == ipo.SOL_IP or level == ipo.SOL_IPV6) return setIpOpt(ref, resolved_v6, level, optname, optval_ptr, optlen);
-    if (level != SOL_SOCKET and level != SOL_TCP) return -92; // ENOPROTOOPT
+    if (level != SOL_SOCKET and level != SOL_TCP) return unknownLevel(ref, resolved_v6, false);
     switch (ref) {
         .tcp => |idx| {
             if (level == SOL_SOCKET and (sp.storedOnly(optname) or (sp.flagBit(optname) != null and optname != SO_REUSEADDR and optname != SO_KEEPALIVE))) {
@@ -699,7 +714,7 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
             return setTcpSockopt(idx, level, optname, optval_ptr, optlen);
         },
         .udp => |port| {
-            if (level != SOL_SOCKET) return -92;
+            if (level != SOL_SOCKET) return unknownLevel(ref, resolved_v6, false);
             var raw: [16]u8 = undefined;
             const n = readOptval(optval_ptr, optlen, &raw);
             if (n < 0) return n;
@@ -710,7 +725,7 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
             return if (udp_mod.setPortOpts(port, st)) 0 else -9;
         },
         .unix => |idx| {
-            if (level != SOL_SOCKET) return -92;
+            if (level != SOL_SOCKET) return unknownLevel(ref, resolved_v6, false);
             var raw: [16]u8 = undefined;
             const n = readOptval(optval_ptr, optlen, &raw);
             if (n < 0) return n;
@@ -722,7 +737,7 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
             return if (um.unixSetOpts(idx, st)) 0 else -9;
         },
         .raw => |idx| {
-            if (level != SOL_SOCKET) return -92;
+            if (level != SOL_SOCKET) return unknownLevel(ref, resolved_v6, false);
             var raw: [16]u8 = undefined;
             const n = readOptval(optval_ptr, optlen, &raw);
             if (n < 0) return n;
@@ -746,10 +761,12 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
         if (rawV6Opt(v6, level, optname)) |which| return getRawV6Opt(ref.raw, which, optval_ptr, optlen_ptr);
     }
     if (level == ipo.SOL_IP or level == ipo.SOL_IPV6) return getIpOpt(ref, v6, level, optname, optval_ptr, optlen_ptr);
-    if (level != SOL_SOCKET and level != SOL_TCP) return -92; // ENOPROTOOPT
+    // A ping socket has no UDP level: ping_getsockopt is ip_getsockopt (udp.PING_KEY marks its key).
+    if (ref == .udp and (ref.udp & @import("udp.zig").PING_KEY) == 0 and (level == SOL_UDP or level == SOL_UDPLITE)) return -92;
+    if (level != SOL_SOCKET and level != SOL_TCP) return unknownLevel(ref, v6, true);
     // TCP keeps its own SOL_TCP set and its SO_ERROR clearing.
     if (ref == .tcp and level == SOL_TCP) return getTcpSockopt(ref.tcp, level, optname, optval_ptr, optlen_ptr);
-    if (level != SOL_SOCKET) return -92;
+    if (level != SOL_SOCKET) return unknownLevel(ref, v6, true);
 
     const copy_mod = @import("../mm/copy_from_user.zig");
     if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;

@@ -127,7 +127,8 @@ static void kind_checks(const char *tag, int fd, int domain, int type, int is_st
     check(setopt(fd, SOL_SOCKET, SO_RCVTIMEO, &t, 16) == 0 && getopt(fd, SOL_SOCKET, SO_RCVTIMEO, &back, &l) == 0 && back.s == 2 && back.us == 500000, "SO_RCVTIMEO round-trips");
     check(setopt(fd, SOL_SOCKET, SO_SNDTIMEO, &t, 16) == 0 && getopt(fd, SOL_SOCKET, SO_SNDTIMEO, &back, &l) == 0 && back.s == 2, "SO_SNDTIMEO round-trips");
     check(set_int(fd, 9999, 1) == -ENOPROTOOPT_, "an unknown option is ENOPROTOOPT");
-    check(setopt(fd, 9999, SO_REUSEADDR, &v, 4) == -ENOPROTOOPT_ || setopt(fd, 9999, SO_REUSEADDR, &v, 4) == -EINVAL_, "an unknown level is refused");
+    /* Linux: an AF_UNIX socket has no setsockopt beyond SOL_SOCKET (EOPNOTSUPP); ip_setsockopt answers ENOPROTOOPT. */
+    check(setopt(fd, 9999, SO_REUSEADDR, &v, 4) == (domain == AF_UNIX ? -95 : -ENOPROTOOPT_), "an unknown level is refused (EOPNOTSUPP on AF_UNIX, ENOPROTOOPT on IP)");
     check(setopt(fd, SOL_SOCKET, SO_REUSEADDR, &v, 2) == -EINVAL_, "a too-short optlen is EINVAL");
     check(setopt(fd, SOL_SOCKET, SO_REUSEADDR, 0, 4) == -EFAULT_, "a NULL optval is EFAULT");
     (void)is_stream_unconnected;

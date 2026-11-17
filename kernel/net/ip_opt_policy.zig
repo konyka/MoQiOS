@@ -55,6 +55,20 @@ pub const IpOpts = struct {
 
 pub const Family = enum { v4, v6 };
 
+pub const SockKind = enum { inet4, inet6, unix };
+
+/// getsockopt (`get`) or setsockopt at a level the socket does not handle. An IPv4 TCP, UDP or raw socket passes it on to
+/// ip_getsockopt, which answers EOPNOTSUPP for a level other than SOL_IP; ip_setsockopt answers ENOPROTOOPT. An IPv6 socket's
+/// ipv6_getsockopt / ipv6_setsockopt answer ENOPROTOOPT. AF_UNIX has no getsockopt / setsockopt of its own beyond SOL_SOCKET, so
+/// do_sock_getsockopt / do_sock_setsockopt answer EOPNOTSUPP both ways.
+pub fn unknownLevelErrno(kind: SockKind, get: bool) i64 {
+    return switch (kind) {
+        .inet4 => if (get) -95 else -92,
+        .inet6 => -92,
+        .unix => -95,
+    };
+}
+
 /// Which level a socket of this family answers.
 pub fn levelApplies(level: u64, family: Family) bool {
     return switch (family) {

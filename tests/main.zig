@@ -15113,3 +15113,27 @@ test "ICMP_FILTER on IPv4 raw ICMP sockets (hello399): a set bit blocks that typ
     try std.testing.expect(std.mem.indexOf(u8, so, "if (which != .checksum and @as(i32, @bitCast(user_len)) < 0) return -22;") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, "bo.writeU32Le(val[0..4], @import(\"raw_icmp.zig\").getIcmpFilter(idx));") != null);
 }
+
+test "getsockopt / setsockopt at a level the socket does not know (hello400): EOPNOTSUPP or ENOPROTOOPT as Linux answers" {
+    const ip = kt.ip_opt_policy;
+    // IPv4 inet sockets: ip_getsockopt is EOPNOTSUPP for a level other than SOL_IP, ip_setsockopt ENOPROTOOPT.
+    try std.testing.expectEqual(@as(i64, -95), ip.unknownLevelErrno(.inet4, true));
+    try std.testing.expectEqual(@as(i64, -92), ip.unknownLevelErrno(.inet4, false));
+    // IPv6: ipv6_getsockopt / ipv6_setsockopt are ENOPROTOOPT.
+    try std.testing.expectEqual(@as(i64, -92), ip.unknownLevelErrno(.inet6, true));
+    try std.testing.expectEqual(@as(i64, -92), ip.unknownLevelErrno(.inet6, false));
+    // AF_UNIX has no ops->getsockopt / setsockopt: EOPNOTSUPP both ways (do_sock_getsockopt / do_sock_setsockopt).
+    try std.testing.expectEqual(@as(i64, -95), ip.unknownLevelErrno(.unix, true));
+    try std.testing.expectEqual(@as(i64, -95), ip.unknownLevelErrno(.unix, false));
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (level != SOL_SOCKET and level != SOL_TCP) return unknownLevel(ref, resolved_v6, false);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (level != SOL_SOCKET and level != SOL_TCP) return unknownLevel(ref, v6, true);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (level != SOL_SOCKET) return unknownLevel(ref, v6, true);") != null);
+    // A UNIX socket at SOL_IP / SOL_IPV6 is EOPNOTSUPP too; an IPv6 socket's SOL_IP get stays ENOPROTOOPT.
+    try std.testing.expect(std.mem.indexOf(u8, so, "const fam = socketFamily(ref, v6_hint) orelse return unknownLevel(ref, v6_hint, true);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "const fam = socketFamily(ref, v6_hint) orelse return unknownLevel(ref, v6_hint, false);") != null);
+    // UDP's own level (SOL_UDP / SOL_UDPLITE, udp_lib_getsockopt): an option it does not know is ENOPROTOOPT, not EOPNOTSUPP.
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (ref == .udp and (ref.udp & @import(\"udp.zig\").PING_KEY) == 0 and (level == SOL_UDP or level == SOL_UDPLITE)) return -92;") != null);
+    // SOL_ICMPV6 on an IPv4 raw socket goes to ip_getsockopt / ip_setsockopt like any other level it does not know.
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (level == SOL_ICMPV6) return if (!v6) null else if (optname == ICMP6_FILTER) .filter else .noprotoopt;") != null);
+}
