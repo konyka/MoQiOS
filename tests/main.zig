@@ -14896,3 +14896,54 @@ test "ICMPv6 errors wiring (hello392): every error type reaches connected IPv6 U
     const pend = std.mem.indexOfPos(u8, ss, ps, "const pending = udp.takePendingError(d.udpKey());") orelse return error.TestUnexpectedResult;
     try std.testing.expect(pend < std.mem.indexOfPos(u8, ss, ps, "const sent = @import(\"icmpv6.zig\").sendFrom6(").?);
 }
+
+test "ICMPv6 error quotes skip extension headers (hello393): hop-by-hop, routing, destination options, AH and a first fragment (Linux ipv6_skip_exthdr)" {
+    const up = kt.icmp_unreach_policy;
+    for ([_]u8{ 0, 43, 44, 51, 59, 60 }) |h| try std.testing.expect(up.isExtHdr6(h));
+    for ([_]u8{ 6, 17, 41, 50, 58, 135 }) |h| try std.testing.expect(!up.isExtHdr6(h));
+
+    // ICMPv6 header, IPv6 header (next header 0), hop-by-hop 8 bytes -> destination options 16 bytes -> fragment 8 bytes -> UDP.
+    var m: [8 + 40 + 8 + 16 + 8 + 8]u8 = @splat(0);
+    m[0] = 1;
+    m[1] = 4;
+    m[8] = 0x60;
+    m[8 + 6] = 0;
+    m[8 + 39] = 1;
+    m[48] = 60; // hop-by-hop: next destination options, length 0 -> 8 bytes
+    m[56] = 44; // destination options: next fragment, length 1 -> 16 bytes
+    m[57] = 1;
+    m[72] = 17; // fragment: next UDP, offset 0 with M set (a first fragment)
+    m[75] = 1;
+    std.mem.writeInt(u16, m[80..82], 40000, .big);
+    std.mem.writeInt(u16, m[82..84], 9, .big);
+    const s = up.skipExtHdr6(m[8..], 40, 0).?;
+    try std.testing.expectEqual(@as(usize, 72), s.off);
+    try std.testing.expectEqual(@as(u8, 17), s.nh);
+    const u = up.parseErrorQuote6(&m).?;
+    try std.testing.expect(u.kind == .udp and u.src_port == 40000 and u.dst_port == 9 and u.dst[15] == 1);
+    // A later fragment (offset 8 units) carries no transport header: the walk stops at the fragment header.
+    m[74] = 0;
+    m[75] = 8 << 3;
+    try std.testing.expectEqual(@as(u8, 44), up.skipExtHdr6(m[8..], 40, 0).?.nh);
+    try std.testing.expect(up.parseErrorQuote6(&m) == null);
+    m[75] = 1;
+    // "No next header" ends the walk with nothing.
+    m[56] = 59;
+    try std.testing.expect(up.skipExtHdr6(m[8..], 40, 0) == null);
+    try std.testing.expect(up.parseErrorQuote6(&m) == null);
+    m[56] = 44;
+    // A quote cut inside the transport header, or inside an extension header, is not parsed.
+    try std.testing.expect(up.parseErrorQuote6(m[0 .. m.len - 1]) == null);
+    try std.testing.expect(up.skipExtHdr6(m[8..60], 40, 0) == null);
+    // Routing header (next 43), and AH whose length counts 4-byte units plus 2: (1 + 2) * 4 = 12 bytes.
+    var r: [8 + 40 + 8 + 12 + 8]u8 = @splat(0);
+    r[8] = 0x60;
+    r[8 + 6] = 43;
+    r[48] = 51;
+    r[56] = 58;
+    r[57] = 1;
+    r[68] = 128;
+    std.mem.writeInt(u16, r[72..74], 0x1234, .big);
+    const e = up.parseErrorQuote6(&r).?;
+    try std.testing.expect(e.kind == .echo and e.src_port == 0x1234);
+}

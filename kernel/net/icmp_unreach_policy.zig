@@ -177,13 +177,49 @@ pub const ErrorQuote6 = struct { kind: QuoteKind, src_port: u16, dst_port: u16 =
 /// The packet quoted by an ICMPv6 error. `msg` starts at the ICMPv6 header; the quoted IPv6 header follows the 8-byte ICMPv6
 /// header, then at least 8 bytes of its payload. Only a packet carrying UDP or ICMPv6 directly is matched (Linux icmpv6_notify
 /// would also skip extension headers); an echo reply or a request with a nonzero code is for no socket (ping_supported).
+/// Linux ipv6_ext_hdr: the next-header values that are IPv6 extension headers (hop-by-hop, routing, fragment, AH, none, destination
+/// options) rather than an upper-layer protocol.
+pub fn isExtHdr6(nh: u8) bool {
+    return nh == 0 or nh == 43 or nh == 44 or nh == 51 or nh == 59 or nh == 60;
+}
+
+pub const ExtSkip6 = struct { off: usize, nh: u8 };
+
+/// Linux ipv6_skip_exthdr over `pkt` (an IPv6 packet) from `start` with next header `nh`: steps over extension headers (AH counts
+/// 4-byte units plus 2, the others 8-byte units plus 1, a fragment header is 8 bytes) and returns the offset and next header of the
+/// first non-extension header. A non-first fragment stops the walk at its fragment header; "no next header" or a header that does not
+/// fit gives null.
+pub fn skipExtHdr6(pkt: []const u8, start: usize, nh: u8) ?ExtSkip6 {
+    var off = start;
+    var next = nh;
+    while (isExtHdr6(next)) {
+        if (next == 59) return null;
+        if (off + 2 > pkt.len) return null;
+        var len: usize = undefined;
+        if (next == 44) {
+            if (off + 4 > pkt.len) return null;
+            if (std.mem.readInt(u16, pkt[off + 2 ..][0..2], .big) & ~@as(u16, 7) != 0) break;
+            len = 8;
+        } else if (next == 51) {
+            len = (@as(usize, pkt[off + 1]) + 2) << 2;
+        } else {
+            len = (@as(usize, pkt[off + 1]) + 1) << 3;
+        }
+        next = pkt[off];
+        off += len;
+    }
+    return .{ .off = off, .nh = next };
+}
+
 pub fn parseErrorQuote6(msg: []const u8) ?ErrorQuote6 {
-    if (msg.len < 8 + V6_IP_HEADER_LEN + 8) return null;
+    if (msg.len < 8 + V6_IP_HEADER_LEN) return null;
     if ((msg[8] >> 4) != 6) return null;
-    const p = 8 + V6_IP_HEADER_LEN;
+    const inner = skipExtHdr6(msg[8..], V6_IP_HEADER_LEN, msg[8 + 6]) orelse return null;
+    const p = 8 + inner.off;
+    if (msg.len < p + 8) return null;
     var dst: [16]u8 = undefined;
     @memcpy(&dst, msg[8 + 24 ..][0..16]);
-    switch (msg[8 + 6]) {
+    switch (inner.nh) {
         17 => return .{
             .kind = .udp,
             .src_port = std.mem.readInt(u16, msg[p..][0..2], .big),

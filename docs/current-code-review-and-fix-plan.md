@@ -10252,3 +10252,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 不跳过扩展头：被引用报文的下一个头必须直接是 UDP 或 ICMPv6。
   2. 没有 IPV6_RECVERR 错误队列，软差错和未连接套接字上的差错被丢弃。
   3. TCP 不处理 ICMPv6 差错；raw ICMPv6 套接字照样收到差错报文本身（hello391），但不设 SO_ERROR。
+
+## 补充：ICMPv6 差错引用报文的扩展头（hello393）
+
+- 问题：hello392 的 `parseErrorQuote6` 只看被引用 IPv6 头的下一个头字段，被引用报文带逐跳选项、路由头、目的选项、分片头或 AH 时，差错找不到 UDP 或 ping 套接字（hello392 文档里列为局限 1）。
+- Linux 语义（3rd/linux-7.0.6 `net/ipv6/icmp.c` 的 `icmpv6_notify`、`net/ipv6/exthdrs_core.c` 的 `ipv6_ext_hdr`、`ipv6_skip_exthdr`）：扩展头是 0、43、44、51、59、60；AH 长度为 (hdrlen+2)<<2，其他为 (hdrlen+1)<<3，分片头 8 字节；分片偏移非 0 时在分片头处停下；遇到 59 或读不到头时返回 -1，差错被丢弃；之后还要能读到内层 8 字节。
+- 宿主机实测（`user/hello393.c -DHOST`，root、`unshare -n`、只有 lo）：8 项全部通过。
+- 修复：`icmp_unreach_policy.zig` 新增 `isExtHdr6`、`ExtSkip6`、`skipExtHdr6`；`parseErrorQuote6` 先跳过扩展头，再要求内层头完整，然后按内层下一个头分派。`icmpv6.zig` 和 `udp.zig` 不用改。
+- host 测试 "ICMPv6 error quotes skip extension headers (hello393)…"：实现前编译失败（`isExtHdr6` 不存在），实现后通过。变异验证：让 `skipExtHdr6` 的循环不执行，测试失败；已用 cmp 确认恢复。
+- QEMU：定向 SMP=2 下 hello393 的 8 项（H D F L N T E P）全部通过。取红灯（只回退 `icmp_unreach_policy.zig`、保留能力配置）时 H、D、F、P 失败（SO_ERROR 都是 0），L、N、T、E 通过（它们本来就要求 0）。完整 smoke 在 SMP=2、4、1 下各通过一次（上限 1400 秒）。riscv64 和 aarch64 交叉构建通过，但没有在这两个架构上跑 QEMU。
+- 局限：没有 IPV6_RECVERR 错误队列；TCP 不处理 ICMPv6 差错；不处理 ESP 后的内容（与 Linux 相同）。
