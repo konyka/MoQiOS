@@ -1859,6 +1859,80 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
     return if ((flags & 0x20) != 0) @as(i64, full) else @intCast(done);
 }
 
+/// sendmsg on a raw ICMP socket (raw_sendmsg / rawv6_sendmsg): the iovecs are gathered into one message, msg_name (or the connected
+/// peer) is the destination, and the rest is the sendto path. Control messages are not read.
+fn rawSendmsg(d: *const vfs_mod.FileDescriptor, msghdr: *const [56]u8) i64 {
+    const name_ptr: u64 = bo.readU64At(msghdr, 0);
+    const name_len: u32 = bo.readU32Le(msghdr[8..12]);
+    const iov_ptr: u64 = bo.readU64At(msghdr, 16);
+    const iov_len: u64 = bo.readU64At(msghdr, 24);
+    if (iov_len > 1024) return -22;
+    if (iov_len != 0 and (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000)) return -14;
+    if (name_ptr >= 0x0000_8000_0000_0000) return -14;
+    var data: [@import("raw_icmp.zig").MAX_HDRINCL]u8 = undefined;
+    const got = gatherIov(iov_ptr, iov_len, &data);
+    if (got < 0) return got;
+    return rawSendFrom(d, data[0..@intCast(got)], if (name_ptr != 0) RawDest{ .ptr = name_ptr, .len = name_len } else null);
+}
+
+/// recvmsg on a raw ICMP socket (raw_recvmsg / rawv6_recvmsg): the next datagram is scattered over the iovecs, msg_name gets the
+/// sender (sockaddr_in, or sockaddr_in6 for an IPv6 socket), msg_controllen is 0, and msg_flags carries MSG_TRUNC when the datagram
+/// did not fit. The MSG_TRUNC flag returns the datagram's whole length.
+fn rawRecvmsg(d: *vfs_mod.FileDescriptor, msg_ptr: u64, msghdr: *const [56]u8, flags: u32) i64 {
+    const name_ptr: u64 = bo.readU64At(msghdr, 0);
+    const name_cap: u32 = bo.readU32Le(msghdr[8..12]);
+    const iov_ptr: u64 = bo.readU64At(msghdr, 16);
+    const iov_len: u64 = bo.readU64At(msghdr, 24);
+    if (iov_len > 1024) return -22;
+    if (iov_len != 0 and (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000)) return -14;
+    var data: [@import("raw_icmp.zig").RAW_QUEUE_LEN]u8 = undefined;
+    var room: usize = 0;
+    var i: usize = 0;
+    while (i < iov_len and room < data.len) : (i += 1) {
+        var iov_buf: [16]u8 = undefined;
+        if (copy.copyFromUser(&iov_buf, @ptrFromInt(iov_ptr + @as(u64, @intCast(i)) * 16), 16) != 16) return -14;
+        room += @intCast(@min(bo.readU64At(&iov_buf, 8), data.len - room));
+    }
+    var src: [16]u8 = @splat(0);
+    const got = rawRecvInto(d, data[0..room], flags | 0x20, &src);
+    if (got < 0) return got;
+    const full: usize = @intCast(got);
+    const n = @min(full, room);
+    var done: usize = 0;
+    i = 0;
+    while (i < iov_len and done < n) : (i += 1) {
+        var iov_buf: [16]u8 = undefined;
+        if (copy.copyFromUser(&iov_buf, @ptrFromInt(iov_ptr + @as(u64, @intCast(i)) * 16), 16) != 16) return -14;
+        const base = bo.readU64At(&iov_buf, 0);
+        const sz: usize = @intCast(@min(bo.readU64At(&iov_buf, 8), @as(u64, @intCast(n - done))));
+        if (sz == 0) continue;
+        if (base == 0 or base >= 0x0000_8000_0000_0000) return -14;
+        if (copy.copyToUser(@ptrFromInt(base), data[done..][0..sz], sz) != sz) return -14;
+        done += sz;
+    }
+    if (name_ptr != 0 and name_ptr < 0x0000_8000_0000_0000) {
+        const rip = @import("raw_icmp_policy.zig");
+        var name: [28]u8 = @splat(0);
+        var name_len: u32 = 16;
+        if (@import("raw_icmp.zig").isV6(d.raw_idx)) {
+            name = rip.fromName6(src, sa.nameScope6(src));
+            name_len = 28;
+        } else @memcpy(name[0..16], &rip.fromName(src[0..4].*));
+        const to_copy = @min(name_cap, name_len);
+        if (to_copy != 0 and copy.copyToUser(@ptrFromInt(name_ptr), name[0..to_copy], to_copy) != to_copy) return -14;
+        var al: [4]u8 = undefined;
+        bo.writeU32Le(&al, name_len);
+        _ = copy.copyToUser(@ptrFromInt(msg_ptr + 8), &al, 4);
+    }
+    var z8: [8]u8 = @splat(0);
+    _ = copy.copyToUser(@ptrFromInt(msg_ptr + 40), &z8, 8);
+    const truncated = full > done;
+    var fl: [4]u8 = undefined;
+    bo.writeU32Le(&fl, if (truncated) @as(u32, 0x20) else 0);
+    _ = copy.copyToUser(@ptrFromInt(msg_ptr + 48), &fl, 4);
+    return if ((flags & 0x20) != 0) @intCast(full) else @intCast(done);
+}
+
 /// sendmsg(fd, msg_ptr, flags) → bytes sent or -errno
 pub fn sendmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
     if (msg_ptr == 0 or msg_ptr >= 0x0000_8000_0000_0000) return -22;
@@ -1875,6 +1949,11 @@ pub fn sendmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
         var hdr: [56]u8 = undefined;
         if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;
         return udpSendmsg(fd, &hdr);
+    }
+    if (fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .raw_socket) {
+        var hdr: [56]u8 = undefined;
+        if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;
+        return rawSendmsg(&cur.fd_table.fds[fd], &hdr);
     }
     if (fd >= vfs_mod.MAX_FDS or cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
 
@@ -1929,6 +2008,11 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
         var hdr: [56]u8 = undefined;
         if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;
         return udpRecvmsg(cur, fd, msg_ptr, &hdr, flags);
+    }
+    if (fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .raw_socket) {
+        var hdr: [56]u8 = undefined;
+        if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;
+        return rawRecvmsg(&cur.fd_table.fds[fd], msg_ptr, &hdr, flags);
     }
     const rf_tcp = @import("recv_flags_policy.zig");
     // Supported TCP recvmsg flags: MSG_PEEK, MSG_DONTWAIT, MSG_WAITALL.

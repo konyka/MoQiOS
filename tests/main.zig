@@ -15042,3 +15042,19 @@ test "IP_HDRINCL wiring: raw IPv4 sends write the caller's header (hello396)" {
     try std.testing.expect(std.mem.indexOf(u8, rs, "pub fn sendHdrincl(bound: [4]u8, dst: [4]u8, pkt: []const u8) i64 {") != null);
     try std.testing.expect(std.mem.indexOf(u8, rs, "policy.completeHdrincl(pkt_buf[14..][0..pkt.len], src);") != null);
 }
+
+test "raw ICMP sockets take sendmsg and recvmsg (hello397)" {
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .raw_socket) {\n        var hdr: [56]u8 = undefined;\n        if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;\n        return rawSendmsg(&cur.fd_table.fds[fd], &hdr);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "return rawRecvmsg(&cur.fd_table.fds[fd], msg_ptr, &hdr, flags);") != null);
+    const at = std.mem.indexOf(u8, ss, "fn rawSendmsg(") orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, ss, at, "\n}\n") orelse return error.TestUnexpectedResult;
+    const body = ss[at..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "const got = gatherIov(iov_ptr, iov_len, &data);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "return rawSendFrom(d, data[0..@intCast(got)], if (name_ptr != 0) RawDest{ .ptr = name_ptr, .len = name_len } else null);") != null);
+    const rat = std.mem.indexOf(u8, ss, "fn rawRecvmsg(") orelse return error.TestUnexpectedResult;
+    const rend = std.mem.indexOfPos(u8, ss, rat, "\n}\n") orelse return error.TestUnexpectedResult;
+    const rbody = ss[rat..rend];
+    try std.testing.expect(std.mem.indexOf(u8, rbody, "const got = rawRecvInto(d, data[0..room], flags | 0x20, &src);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rbody, "bo.writeU32Le(&fl, if (truncated) @as(u32, 0x20) else 0);") != null);
+}

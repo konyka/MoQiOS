@@ -10309,3 +10309,19 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   2. 头里的目的地址不参与路由，也不校验与 sendto 地址一致（与 Linux 相同）；IP 选项（IHL 大于 5）照发，不检查内容。
   3. 收到的副本仍只按 ICMP 分发给 raw 套接字：自带头发出的非 ICMP 数据报不会回到 raw 套接字，只交给对应协议（如 UDP）。
   4. IPv6 没有对应的 IPV6_HDRINCL。
+
+## 补充：raw 套接字的 sendmsg/recvmsg（hello397）
+
+- 问题：raw ICMP 套接字（IPv4 和 IPv6）的 `sendmsg`/`recvmsg` 返回 ENOTSOCK（-88），只有 sendto/recvfrom 能用。用 msghdr 收发的程序（带 iovec 的 ping 实现、要读来源地址和 MSG_TRUNC 标志的工具）在 raw 套接字上用不了。
+- Linux 语义（3rd/linux-7.0.6 `net/ipv4/raw.c` 的 `raw_sendmsg`/`raw_recvmsg`、`net/ipv6/raw.c` 的 `rawv6_sendmsg`/`rawv6_recvmsg`）：sendto 本身就是带一个 iovec 的 sendmsg，目的地取 `msg_name`，没有则用已连接对端，否则 EDESTADDRREQ；recvmsg 回填来源地址和长度，截断时 `msg_flags` 带 MSG_TRUNC，调用带 MSG_TRUNC 时返回完整长度。
+- 宿主机实测（`user/hello397.c -DHOST`，root、`unshare -n`、只有 lo）：6 项（S R T E C 6）全部通过。
+- 修复（`kernel/net/socket_syscall.zig`）：
+  - 新增 `rawSendmsg`：把 iovec 聚进 `MAX_HDRINCL`（1500）字节的缓冲区，按 `msg_name` 或 null 调 `rawSendFrom`，所以长度、目的地址、IP_HDRINCL 的检查与 sendto 完全相同。
+  - 新增 `rawRecvmsg`：按 iovec 总长调 `rawRecvInto`（总是带 MSG_TRUNC 拿到完整长度），把数据分散到各 iovec，回填 `msg_name`（IPv4 16 字节、IPv6 28 字节）和 `msg_namelen`，`msg_controllen` 写 0，截断时 `msg_flags` 写 MSG_TRUNC，调用带 MSG_TRUNC 时返回完整长度。
+  - `sendmsg`/`recvmsg` 在 UDP 分支之后加 raw 分支。
+- host 测试 "raw ICMP sockets take sendmsg and recvmsg (hello397)"：实现前失败，实现后通过。变异验证：`rawRecvmsg` 调 `rawRecvInto` 时去掉 `| 0x20`，测试失败；已恢复。
+- QEMU：hello397 6 项在完整 smoke SMP=2、SMP=4 下全过。取红灯（只回退内核修复、保留能力配置，hello397 提前到 hello3 之前）：6 项全部失败，sendmsg/recvmsg 都是 -88，带 MSG_TRUNC 的 recvmsg 是 -22。完整 smoke：SMP=2、SMP=1 各一份 `PASS`；SMP=4 前两份只有已记录的偶发项 hello286 J（33/60、37/60）失败，hello397 在两份里都是 PASS（hello397 只动 raw 套接字的 sendmsg/recvmsg，不涉及信号和作业控制）。恢复修复后重跑第三份 SMP=4，`PASS`。riscv64 和 aarch64 交叉构建通过，但没有在这两个架构上跑 QEMU。
+- 局限：
+  1. 不读控制消息（没有 IP_PKTINFO、IP_TTL 一类的 cmsg），`msg_controllen` 恒为 0。
+  2. 没有 MSG_PEEK、MSG_ERRQUEUE。
+  3. sendmsg 一次最多 1500 字节（`MAX_HDRINCL`），与 sendto 相同。
