@@ -14985,3 +14985,60 @@ test "raw ICMP sockets take SOL_IP / SOL_IPV6 options and their sends carry them
     try std.testing.expect(std.mem.indexOf(u8, iv, "pub fn sendFrom6(bound: [16]u8, dst: [16]u8, msg: []u8, ip: ipo.IpOpts) i64 {") != null);
     try std.testing.expect(std.mem.indexOf(u8, iv, "if (ipo.ipv6NeedsPatch(ip)) ipo.patchIpv6(pkt[14..][0..40], ip);") != null);
 }
+
+test "IP_HDRINCL policy: the caller's IPv4 header is checked and completed (hello396)" {
+    const rp = kt.raw_icmp_policy;
+    const ipo = kt.ip_opt_policy;
+    // IP_HDRINCL is SOL_IP option 3; it is a flag kept with the other IP options and reads back as 0 or 1.
+    try std.testing.expectEqual(@as(u64, 3), ipo.IP_HDRINCL);
+    const on = switch (ipo.applySet(.{}, ipo.SOL_IP, ipo.IP_HDRINCL, &[_]u8{ 7, 0, 0, 0 })) {
+        .ok => |o| o,
+        .err => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(on.hdrincl);
+    try std.testing.expectEqual(@as(?i32, 1), ipo.getValue(on, ipo.SOL_IP, ipo.IP_HDRINCL));
+    try std.testing.expectEqual(@as(?i32, 0), ipo.getValue(.{}, ipo.SOL_IP, ipo.IP_HDRINCL));
+    // raw_send_hdrinc: shorter than an IPv4 header, or a header length past the send, is EINVAL.
+    var p: [28]u8 = @splat(0);
+    p[0] = 0x45;
+    try std.testing.expectEqual(@as(i64, -22), rp.hdrinclErrno(p[0..19]));
+    try std.testing.expectEqual(@as(i64, 0), rp.hdrinclErrno(p[0..20]));
+    p[0] = 0x4f;
+    try std.testing.expectEqual(@as(i64, -22), rp.hdrinclErrno(&p));
+    p[0] = 0x45;
+    // A zero source takes the route's; the total length and the checksum are the kernel's; TTL and id stay.
+    p[4] = 0x12;
+    p[5] = 0x34;
+    p[8] = 5;
+    p[9] = 1;
+    p[16] = 127;
+    p[19] = 1;
+    rp.completeHdrincl(&p, .{ 127, 0, 0, 1 });
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, p[12..16]);
+    try std.testing.expectEqual(@as(u16, 28), std.mem.readInt(u16, p[2..4], .big));
+    try std.testing.expect(p[8] == 5 and p[4] == 0x12 and p[5] == 0x34);
+    try std.testing.expectEqual(@as(u16, 0), rp.headerSum(p[0..20]));
+    // A source the caller gave is kept.
+    p[12] = 10;
+    rp.completeHdrincl(&p, .{ 127, 0, 0, 1 });
+    try std.testing.expectEqual(@as(u8, 10), p[12]);
+    try std.testing.expectEqual(@as(u16, 0), rp.headerSum(p[0..20]));
+    // An IHL below 5 is sent as it is (Linux only completes a header of at least 20 bytes).
+    var q: [24]u8 = @splat(0);
+    q[0] = 0x44;
+    rp.completeHdrincl(&q, .{ 127, 0, 0, 1 });
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x44} ++ [_]u8{0} ** 23), &q);
+}
+
+test "IP_HDRINCL wiring: raw IPv4 sends write the caller's header (hello396)" {
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (level == ipo.SOL_IP and optname == ipo.IP_HDRINCL and ref != .raw) return -92;") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const hdrincl = rawIpOpts(d.raw_idx).hdrincl;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const lrc = if (hdrincl) rp.hdrinclErrno(msg) else rp.lengthErrno(false, msg.len);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "raw.sendHdrincl(bound, dst, msg)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "var pbuf: [@import(\"raw_icmp.zig\").MAX_HDRINCL]u8 = undefined;") != null);
+    const rs = kt.raw_icmp_source;
+    try std.testing.expect(std.mem.indexOf(u8, rs, "pub fn sendHdrincl(bound: [4]u8, dst: [4]u8, pkt: []const u8) i64 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "policy.completeHdrincl(pkt_buf[14..][0..pkt.len], src);") != null);
+}

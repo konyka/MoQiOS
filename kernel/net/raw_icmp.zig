@@ -21,6 +21,8 @@ const QUEUE_DEPTH = 8;
 pub const RAW_QUEUE_LEN = 1500;
 /// Largest ICMP message a send carries (1472-byte UDP payload and ICMP header: the same bound the ping sockets use).
 pub const MAX_MESSAGE = 1480;
+/// Largest datagram an IP_HDRINCL send writes whole (header included): one Ethernet MTU.
+pub const MAX_HDRINCL = 20 + MAX_MESSAGE;
 /// The frame buffer of a send: ethernet, IPv4 and ICMP headers in front of the message.
 const FRAME_BUF_LEN = 14 + 20 + MAX_MESSAGE;
 
@@ -378,6 +380,34 @@ pub fn send(bound: [4]u8, dst: [4]u8, msg: []const u8, ip: ipo.IpOpts) i64 {
     return if (ok) 0 else -105;
 }
 
+/// An IP_HDRINCL send (raw_send_hdrinc): `pkt` is a whole IPv4 datagram that passed policy.hdrinclErrno. It is routed by `dst`
+/// (the sendto address or the connected peer), not by the header's destination; the kernel fills in a zero source, the total
+/// length and the header checksum (policy.completeHdrincl). Past the path MTU is EMSGSIZE.
+pub fn sendHdrincl(bound: [4]u8, dst: [4]u8, pkt: []const u8) i64 {
+    if (pkt.len > MAX_HDRINCL or pkt.len > ipv4.getSendMtu(dst)) return -90;
+    const our_mac = netif.getMac();
+    const via_lo = netif.isLocal4(dst);
+    var wait_hop: ?[4]u8 = null;
+    const dst_mac = if (via_lo) our_mac else resolve: {
+        const hop = netif.nextHop4(dst);
+        break :resolve arp.resolve(hop) orelse blk: {
+            wait_hop = hop;
+            break :blk [6]u8{ 0, 0, 0, 0, 0, 0 };
+        };
+    };
+    const src = @import("tcp_port_policy.zig").sourceAddr(bound, dst, netif.getOurIp());
+    var pkt_buf: [FRAME_BUF_LEN]u8 = @splat(0);
+    @memcpy(pkt_buf[14..][0..pkt.len], pkt);
+    policy.completeHdrincl(pkt_buf[14..][0..pkt.len], src);
+    const frame_len = eth.buildFrame(&pkt_buf, dst_mac, our_mac, eth.ETHERTYPE_IPV4, @intCast(pkt.len));
+    if (wait_hop) |hop| {
+        arp.queueFrame(hop, &pkt_buf, frame_len);
+        return 0;
+    }
+    const ok = if (via_lo) lo.sendNow(&pkt_buf, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt_buf, frame_len);
+    return if (ok) 0 else -105;
+}
+
 /// The ICMP message part of a received IPv4 datagram (the IP header is `ihl` bytes long).
 pub fn icmpMessage(dgram: []const u8) []const u8 {
     if (dgram.len < 20) return dgram[0..0];
@@ -389,5 +419,6 @@ pub fn icmpMessage(dgram: []const u8) []const u8 {
 comptime {
     // A send's frame must fit the buffer the header is built in.
     if (FRAME_BUF_LEN != 14 + 20 + MAX_MESSAGE) @compileError("raw ICMP frame buffer");
+    if (14 + MAX_HDRINCL > FRAME_BUF_LEN) @compileError("IP_HDRINCL frame buffer");
     _ = route4;
 }

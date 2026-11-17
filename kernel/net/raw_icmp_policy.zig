@@ -21,6 +21,40 @@ const AF_INET6: u16 = 10;
 /// struct icmp6_filter: 256 type bits, a set bit blocks the type.
 pub const FILTER_LEN = 32;
 
+/// IP_HDRINCL (raw_send_hdrinc): the send is a whole IPv4 datagram. Shorter than an IPv4 header, or a header length (IHL) that runs
+/// past the send, is EINVAL.
+pub fn hdrinclErrno(pkt: []const u8) i64 {
+    if (pkt.len < 20) return EINVAL;
+    if (@as(usize, pkt[0] & 0x0f) * 4 > pkt.len) return EINVAL;
+    return 0;
+}
+
+/// The RFC 1071 sum of an IPv4 header, folded and complemented: 0 when its checksum is right.
+pub fn headerSum(hdr: []const u8) u16 {
+    var acc: u32 = 0;
+    var i: usize = 0;
+    while (i + 1 < hdr.len) : (i += 2) acc += @as(u32, hdr[i]) << 8 | hdr[i + 1];
+    if (hdr.len & 1 != 0) acc += @as(u32, hdr[hdr.len - 1]) << 8;
+    while (acc >> 16 != 0) acc = (acc & 0xffff) + (acc >> 16);
+    return ~@as(u16, @truncate(acc));
+}
+
+/// What raw_send_hdrinc fills in on a caller's header of at least 20 bytes: a zero source becomes `src` (the route's), the total
+/// length is the send's, and the checksum is recomputed; TTL, TOS, id, flags and protocol stay as written. A shorter header (IHL
+/// below 5) goes out untouched. `pkt` passed hdrinclErrno.
+pub fn completeHdrincl(pkt: []u8, src: [4]u8) void {
+    const ihl: usize = @as(usize, pkt[0] & 0x0f) * 4;
+    if (ihl < 20) return;
+    if (pkt[12] == 0 and pkt[13] == 0 and pkt[14] == 0 and pkt[15] == 0) @memcpy(pkt[12..16], &src);
+    pkt[2] = @truncate(pkt.len >> 8);
+    pkt[3] = @truncate(pkt.len);
+    pkt[10] = 0;
+    pkt[11] = 0;
+    const sum = headerSum(pkt[0..ihl]);
+    pkt[10] = @truncate(sum >> 8);
+    pkt[11] = @truncate(sum);
+}
+
 /// socket(AF_INET, SOCK_RAW, protocol): MoQiOS carries ICMP only. IPPROTO_IP (0) is EPROTONOSUPPORT on Linux too; other protocols
 /// Linux would accept are refused the same way.
 pub fn protocolErrno(protocol: u32) i64 {

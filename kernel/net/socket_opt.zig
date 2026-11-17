@@ -465,6 +465,8 @@ fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
     if (!ipo.levelApplies(level, fam)) return -92;
     if (level == ipo.SOL_IPV6 and (optname == ipo.IPV6_ADD_MEMBERSHIP or optname == ipo.IPV6_DROP_MEMBERSHIP)) return setMembership(ref, optname, optval_ptr, optlen);
     if (level == ipo.SOL_IP and (optname == ipo.IP_ADD_MEMBERSHIP or optname == ipo.IP_DROP_MEMBERSHIP)) return setMembership4(ref, optname, optval_ptr, optlen);
+    // do_ip_setsockopt: IP_HDRINCL is for SOCK_RAW only; any other socket still reads it as 0.
+    if (level == ipo.SOL_IP and optname == ipo.IP_HDRINCL and ref != .raw) return -92;
     if (ref == .tcp and level == ipo.SOL_IPV6) {
         if (ipo.streamSetErrno(optname)) |e| return e;
     }

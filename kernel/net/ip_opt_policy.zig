@@ -8,6 +8,8 @@ pub const SOL_IPV6: u64 = 41;
 
 pub const IP_TOS: u64 = 1;
 pub const IP_TTL: u64 = 2;
+/// The caller writes the IPv4 header of a raw socket's sends (Linux raw_send_hdrinc).
+pub const IP_HDRINCL: u64 = 3;
 pub const IP_MULTICAST_IF: u64 = 32;
 pub const IP_MULTICAST_TTL: u64 = 33;
 pub const IP_MULTICAST_LOOP: u64 = 34;
@@ -47,6 +49,8 @@ pub const IpOpts = struct {
     mc4_all: bool = true,
     mc4_addr: [4]u8 = .{ 0, 0, 0, 0 },
     mc4_index: u8 = 0,
+    /// IP_HDRINCL: only a raw socket may set it; any other socket reads it as 0.
+    hdrincl: bool = false,
 };
 
 pub const Family = enum { v4, v6 };
@@ -91,6 +95,7 @@ pub fn applySet(cur: IpOpts, level: u64, optname: u64, val: []const u8) SetResul
                 o.mc4_ttl = if (v == -1) 1 else @intCast(v);
             },
             IP_MULTICAST_LOOP => o.mc4_loop = v != 0,
+            IP_HDRINCL => o.hdrincl = v != 0,
             IP_MULTICAST_ALL => {
                 if (v != 0 and v != 1) return .{ .err = -22 };
                 o.mc4_all = v == 1;
@@ -205,6 +210,7 @@ pub fn getValue(o: IpOpts, level: u64, optname: u64) ?i32 {
         SOL_IP => switch (optname) {
             IP_TTL => if (o.ttl == 0) DEFAULT_TTL else o.ttl,
             IP_TOS => o.tos,
+            IP_HDRINCL => @intFromBool(o.hdrincl),
             IP_MULTICAST_TTL => o.mc4_ttl,
             IP_MULTICAST_LOOP => @intFromBool(o.mc4_loop),
             IP_MULTICAST_ALL => @intFromBool(o.mc4_all),

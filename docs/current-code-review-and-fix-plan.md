@@ -10290,3 +10290,22 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 局限：
   1. raw 套接字上的组播选项（IP_ADD_MEMBERSHIP、IP_MULTICAST_TTL 生效等）仍是 ENOPROTOOPT 或不起作用；IP_MULTICAST_IF 只对 UDP 校验。
   2. 没有 IP_HDRINCL、IP_RECVERR、IPV6_RECVERR。
+
+## 补充：raw IPv4 套接字的 IP_HDRINCL（hello396）
+
+- 问题：IP_HDRINCL（SOL_IP 选项 3）在任何套接字上都是 ENOPROTOOPT，raw IPv4 套接字只能发 ICMP 报文、头由内核写。需要自己写 IP 头的工具（自定义 TTL/id 的探测、手工构造 UDP 数据报）用不了。
+- Linux 语义（3rd/linux-7.0.6 `net/ipv4/ip_sockglue.c` 的 `do_ip_setsockopt`：IP_HDRINCL 只对 SOCK_RAW，否则 ENOPROTOOPT，`ip_getsockopt` 对任何套接字读回标志；`net/ipv4/raw.c` 的 `raw_send_hdrinc`：不足 20 字节或 IHL 超出长度 EINVAL，头至少 20 字节时补来源（为 0 时）、写总长度、id 为 0 时选一个、重算校验和，其余照用户写的；路由按 sendto 地址）。
+- 宿主机实测（`user/hello396.c -DHOST`，root、`unshare -n`、只有 lo）：6 项（G U I P S O）全部通过；UDP 套接字上 get IP_HDRINCL 读 0、set ENOPROTOOPT。
+- 修复：
+  - `ip_opt_policy.zig`：新增 `IP_HDRINCL` 和 `IpOpts.hdrincl`，`applySet`/`getValue` 读写它。
+  - `socket_opt.setIpOpt`：非 raw 套接字 set IP_HDRINCL 返回 ENOPROTOOPT。
+  - `raw_icmp_policy.zig`：新增 `hdrinclErrno`、`headerSum`、`completeHdrincl`。
+  - `raw_icmp.sendHdrincl`：按目的地址选下一跳和来源，拷入用户的数据报，`completeHdrincl` 补全后成帧发出；`MAX_HDRINCL` 为 1500。
+  - `socket_syscall.rawSendFrom`：开启 IP_HDRINCL 时长度检查换成 `hdrinclErrno`，回环来源检查两条路径共用，然后走 `sendHdrincl`；sendto 的内核缓冲区从 `MAX_MESSAGE` 改为 `MAX_HDRINCL`。
+- host 测试 "IP_HDRINCL policy…" 和 "IP_HDRINCL wiring…"：实现前编译失败（`IP_HDRINCL` 不存在），只有策略时 wiring 测试失败，实现后通过。第一版在 IP_HDRINCL 分支里另调一次 `loopbackSourceErrno`，hello386/hello387 的调用点计数测试（6 处）失败；改为两条路径共用一次调用后通过。变异验证：`completeHdrincl` 不补来源，策略测试失败；已恢复。
+- QEMU：hello396 6 项在完整 smoke SMP=2、SMP=4 下全过。取红灯（只回退内核修复、保留能力配置，hello396 提前到 hello3 之前）：G U I P S 失败（选项 -92，自带头的发送被当成 ICMP 报文，19 字节返回 19），O 通过（它不依赖 IP_HDRINCL）。完整 smoke：SMP=4 `PASS`；SMP=2 第一份失败在 hello108「RT task lost the CPU to reaping」（文档里已记录的负载相关偶发项，与本改动无关），重跑 `PASS`；SMP=1 `PASS`。riscv64 和 aarch64 交叉构建通过，但没有在这两个架构上跑 QEMU。
+- 局限：
+  1. id 为 0 时不另选 id（Linux 调 `ip_select_ident`），原样发 0。
+  2. 头里的目的地址不参与路由，也不校验与 sendto 地址一致（与 Linux 相同）；IP 选项（IHL 大于 5）照发，不检查内容。
+  3. 收到的副本仍只按 ICMP 分发给 raw 套接字：自带头发出的非 ICMP 数据报不会回到 raw 套接字，只交给对应协议（如 UDP）。
+  4. IPv6 没有对应的 IPV6_HDRINCL。

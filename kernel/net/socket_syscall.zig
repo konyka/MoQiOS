@@ -137,12 +137,19 @@ pub fn rawSendFrom(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDe
         const rc = rp.sendtoErrno(false, 0, 0, raw.isConnected(d.raw_idx));
         if (rc != 0) return rc;
     }
-    // raw_sendmsg reads the type and code from the user buffer (raw_probe_proto_opt): fewer than 2 bytes is EFAULT.
-    const lrc = rp.lengthErrno(false, msg.len);
-    if (lrc != 0) return lrc;
     const bound = raw.boundAddr(d.raw_idx);
+    const hdrincl = rawIpOpts(d.raw_idx).hdrincl;
+    // IP_HDRINCL: `msg` is the whole datagram, header first (raw_send_hdrinc); otherwise raw_sendmsg reads the ICMP type and code
+    // from the user buffer (raw_probe_proto_opt), and fewer than 2 bytes is EFAULT.
+    const lrc = if (hdrincl) rp.hdrinclErrno(msg) else rp.lengthErrno(false, msg.len);
+    if (lrc != 0) return lrc;
     const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(bound, dst, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
     if (lo_rc != 0) return lo_rc;
+    // The destination still comes from the sendto address or the connected peer, not from the caller's header.
+    if (hdrincl) {
+        const hs = raw.sendHdrincl(bound, dst, msg);
+        return if (hs < 0) hs else @intCast(msg.len);
+    }
     const sent = raw.send(bound, dst, msg, rawIpOpts(d.raw_idx));
     return if (sent < 0) sent else @intCast(msg.len);
 }
@@ -836,7 +843,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
     } else if (t.fd_table.fds[fd].fd_type == .raw_socket) {
         // The destination is the address given or the connected peer; rawSendFrom checks it before the length.
         if (len != 0 and (buf == 0 or buf >= 0x0000_8000_0000_0000)) return -14;
-        var pbuf: [@import("raw_icmp.zig").MAX_MESSAGE]u8 = undefined;
+        var pbuf: [@import("raw_icmp.zig").MAX_HDRINCL]u8 = undefined;
         if (len > pbuf.len) return -90; // EMSGSIZE
         if (len != 0 and copy.copyFromUser(pbuf[0..len], @ptrFromInt(buf), len) != len) return -14;
         if (addr_ptr == 0) return rawSendFrom(&t.fd_table.fds[fd], pbuf[0..len], null);
