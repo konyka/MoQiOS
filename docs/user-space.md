@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello393`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello394`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -388,6 +388,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello391 | IPv6 raw ICMPv6 套接字（`socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6)`）和 raw 套接字的 shutdown：协议 0 是 EPROTONOSUPPORT，SO_TYPE 3、SO_PROTOCOL 58、SO_DOMAIN 10，getsockname 28 字节、端口位 58（A）；未连接 send EDESTADDRREQ，16 字节地址 EINVAL，AF_INET EAFNOSUPPORT，端口 17 EINVAL，长度 0、1 EFAULT，2、3 EINVAL（S）；向 ::1 发校验和错的回显请求，内核填好校验和，收到请求和内核的回复各 16 字节，来源 ::1 端口 0（E）；poll（P）；MSG_TRUNC（T）；ICMP6_FILTER 读写、只放行回复、8 字节只改前两个字、40 字节截断、其他选项和 IPv4 raw 上是 ENOPROTOOPT（F）；IPV6_CHECKSUM 读 2、不能设（K）；connect、write、AF_UNSPEC（C）；bind（B）；shutdown：未连接 ENOTCONN 但生效，SHUT_RD 后 POLLIN\|POLLRDHUP、非阻塞 EAGAIN、阻塞返回 0、之后的数据报照样收到，SHUT_RDWR 加 POLLHUP，IPv4 raw 一样（H）；UDP 到 [::1]:9 引起的端口不可达被看到（U）；IPv4 raw 发 0、1 字节 EFAULT，看不到 ICMPv6（Z）；listen、accept EOPNOTSUPP（L） |
 | hello392 | ICMPv6 差错送到引起它的 IPv6 套接字（经 raw ICMPv6 套接字向 ::1 写差错，引用 ::1 -> ::1 的数据报）：连到 [::1]:9 的 UDP 套接字对目的不可达码 0..7 依次得到 0 13 0 0 111 13 13 71，包过大 EMSGSIZE，超时无，参数问题码 0..2 EPROTO，未知差错类型无（U）；未连接的 UDP 套接字都不收（N）；引用发往 [::2]:9 的数据报不影响连到 [::1]:9 的套接字（A）；连到 ::1 的 IPv6 ping 套接字得到同样的 errno，只是包过大对 ping 是软差错（P）；未连接（只 bind）的 ping 套接字不收（Q）；引用回显应答或码 1 的回显请求不属于任何 ping 套接字（R）；挂起的差错显示为 POLLERR，下一次 recv 失败一次（ECONNREFUSED）然后 EAGAIN（V）；下一次 ping send 失败一次，之后 SO_ERROR 读 0（S）；UDP 上 recv 对码 1 是 EACCES 然后 EAGAIN，send 对参数问题是 EPROTO（E）。程序把 net.ipv4.ping_group_range 设为 "0 0"，结束时恢复 |
 | hello393 | ICMPv6 差错引用的报文带扩展头时照样送到后面的套接字（经 raw ICMPv6 套接字向 ::1 写端口不可达）：逐跳选项（8 字节）后接 UDP，连到 [::1]:9 的 UDP 套接字得到 ECONNREFUSED（H）；目的选项（16 字节）、路由头（8 字节）后接 UDP 也是 111（D）；首个分片（偏移 0）后接 UDP 是 111（F）；后续分片（偏移 8）读不到 UDP 头，0（L）；逐跳选项后是“无下一个头”（59），0（N）；扩展头声明的长度超出引用部分，0（T）；ESP（50）不是可跳过的扩展头，0（E）；AH（12 字节）后接回显请求，已连接的 IPv6 ping 套接字得到 111（P）。程序把 net.ipv4.ping_group_range 设为 "0 0"，结束时恢复 |
+| hello394 | raw ICMP 套接字保存 SOL_SOCKET 选项，阻塞接收遵守 SO_RCVTIMEO：IPv4 raw 套接字设 100 ms 后阻塞 recv 约 100 ms 返回 EAGAIN（T）；getsockopt 读回 0 s、100000 us（G）；SO_SNDTIMEO 2.5 s 读回 2 s、500000 us（S）；SO_RCVBUF 4096 读回 8192（B）；dup 出的描述符读到同样的超时，阻塞 recv 也超时（D）；已入队的数据报（发往 127.0.0.1 的回显请求）立即交付（R）；IPv6 raw ICMPv6 套接字同样超时并读回（6） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

@@ -10262,3 +10262,16 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - host 测试 "ICMPv6 error quotes skip extension headers (hello393)…"：实现前编译失败（`isExtHdr6` 不存在），实现后通过。变异验证：让 `skipExtHdr6` 的循环不执行，测试失败；已用 cmp 确认恢复。
 - QEMU：定向 SMP=2 下 hello393 的 8 项（H D F L N T E P）全部通过。取红灯（只回退 `icmp_unreach_policy.zig`、保留能力配置）时 H、D、F、P 失败（SO_ERROR 都是 0），L、N、T、E 通过（它们本来就要求 0）。完整 smoke 在 SMP=2、4、1 下各通过一次（上限 1400 秒）。riscv64 和 aarch64 交叉构建通过，但没有在这两个架构上跑 QEMU。
 - 局限：没有 IPV6_RECVERR 错误队列；TCP 不处理 ICMPv6 差错；不处理 ESP 后的内容（与 Linux 相同）。
+
+## 补充：raw 套接字保存 SOL_SOCKET 选项，阻塞接收遵守 SO_RCVTIMEO（hello394）
+
+- 问题：`socket_opt.sysSetSockopt` 的 raw 分支每次新建一个临时 `sp.Stored`，套用后丢弃；`sysGetSockopt` 的 raw 分支总是返回默认值。所以 raw ICMP/ICMPv6 套接字上的 SO_RCVTIMEO、SO_RCVBUF 等设置不生效，`rawRecvInto` 的阻塞接收只等数据报或信号，永远不超时（hello389、hello391 文档里都列为局限）。
+- Linux 语义（3rd/linux-7.0.6 `net/ipv4/raw.c` 的 `raw_recvmsg`、`net/ipv6/raw.c` 的 `rawv6_recvmsg`，都经 `skb_recv_datagram` 用 `sock_rcvtimeo` 等待）：队列空时阻塞到 SO_RCVTIMEO 到期返回 EAGAIN；选项属于套接字本身，dup 出的描述符共享；SO_RCVBUF 按 `sock_setsockopt` 翻倍。
+- 宿主机实测（`user/hello394.c -DHOST`，root、`unshare -n`、只有 lo）：7 项（T G S B D R 6）全部通过，超时实测 104～107 ms，SO_RCVBUF 4096 读回 8192。
+- 修复：`raw_icmp.zig` 的 `Socket` 新增 `opts: sockopt_policy.Stored`，以及加锁的 `getOpts`/`setOpts`（槽不在用时返回 null/false）；`socket_opt` 的 raw 分支照 UDP 分支读改写（失败 EBADF），get 分支读出保存的选项；`socket_syscall.rawRecvInto` 在循环前用 `udp_recv_policy.deadlineNs` 算出期限，队列空且要阻塞时先 `timedOut` 判断（到期 -11），每次睡眠取 5 ms 和期限中较早的一个。
+- host 测试 "raw ICMP sockets keep their SOL_SOCKET options and a blocking recv honours SO_RCVTIMEO"：实现前失败（`tests/main.zig:14953`），实现后通过。变异验证：删掉 `rawRecvInto` 里的 `timedOut` 判断，测试失败；已恢复。
+- QEMU：hello394 的 7 项在完整 smoke SMP=2、SMP=4 下全部通过（T 实测 106～116 ms）。取红灯（只回退内核修复、保留能力配置，hello394 提前到 hello3 之前）：旧内核上 T 项的阻塞 recv 170 秒没有返回，hello394 停在标题行。完整 smoke：SMP=2 第一份卡在 hello300 的 AF_UNIX recv 一项（日志在 `[fork]` 后不再增长，文档里已记录的 hello300 偶发卡住，与 raw 套接字无关），重跑 `PASS`；SMP=4 第一份失败在 hello312 E（线程 CPU 时钟的绝对期限读到剩余 0 us，不走本次改动的代码），重跑 `PASS`；SMP=1 `PASS`。riscv64 和 aarch64 交叉构建通过，但没有在这两个架构上跑 QEMU。
+- 局限：
+  1. raw 发送不阻塞，SO_SNDTIMEO 只保存、读回，不起作用；SO_RCVBUF 不限制队列（队列固定 8 项）。
+  2. 仍然没有 IP_HDRINCL、sendmsg/recvmsg、ICMP 以外的协议、可设置的 IPV6_CHECKSUM。
+  3. hello312 E 在 SMP=4 下出现一次剩余 0 us（新的偶发项，未复现、未查到根因）。

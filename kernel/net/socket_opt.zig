@@ -686,13 +686,16 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
             if (rc != 0) return rc;
             return if (um.unixSetOpts(idx, st)) 0 else -9;
         },
-        .raw => {
+        .raw => |idx| {
             if (level != SOL_SOCKET) return -92;
             var raw: [16]u8 = undefined;
             const n = readOptval(optval_ptr, optlen, &raw);
             if (n < 0) return n;
-            var st: sp.Stored = .{};
-            return applySol(&st, optname, raw[0..@intCast(n)], true);
+            const raw_mod = @import("raw_icmp.zig");
+            var st = raw_mod.getOpts(idx) orelse return -9;
+            const rc = applySol(&st, optname, raw[0..@intCast(n)], true);
+            if (rc != 0) return rc;
+            return if (raw_mod.setOpts(idx, st)) 0 else -9;
         },
     }
 }
@@ -744,7 +747,9 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
             stored = view.opts;
             facts = .{ .id = sp.identity(if (view.sock_type == 5) .unix_seqpacket else if (view.stream) .unix_stream else .unix_dgram, false), .accepting = view.listening, .cred = view.peer_cred };
         },
-        .raw => {},
+        .raw => |idx| {
+            stored = @import("raw_icmp.zig").getOpts(idx) orelse return -9;
+        },
     }
 
     var val: [16]u8 = undefined;

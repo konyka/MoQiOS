@@ -44,6 +44,8 @@ const Socket = struct {
     filter: [policy.FILTER_LEN]u8 = @splat(0),
     shut_rd: bool = false,
     shut_wr: bool = false,
+    /// SOL_SOCKET options (SO_RCVTIMEO, SO_RCVBUF, ...): one copy per socket, so every descriptor naming it sees the same set.
+    opts: @import("sockopt_policy.zig").Stored = .{},
     queue: [QUEUE_DEPTH]Entry = @splat(.{}),
 };
 
@@ -80,6 +82,23 @@ pub fn release(idx: u32) void {
         return;
     }
     sockets[idx] = .{};
+}
+
+/// The socket's SOL_SOCKET options, or null for a slot not in use.
+pub fn getOpts(idx: u32) ?@import("sockopt_policy.zig").Stored {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return null;
+    return sockets[idx].opts;
+}
+
+/// Replace the socket's SOL_SOCKET options; false for a slot not in use.
+pub fn setOpts(idx: u32, st: @import("sockopt_policy.zig").Stored) bool {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return false;
+    sockets[idx].opts = st;
+    return true;
 }
 
 /// Whether a datagram is queued for the socket (poll, and the wait in a blocking recv).

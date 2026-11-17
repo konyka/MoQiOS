@@ -148,12 +148,15 @@ pub fn rawSendFrom(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDe
 }
 
 /// recvfrom/recv/read on a raw ICMP socket into the kernel buffer `out`: the next datagram (IP header included; an ICMPv6 message
-/// without it), waiting for one unless the descriptor or `flags` ask not to, or SHUT_RD ended receiving (0). MSG_TRUNC returns the
-/// datagram's whole length. The sender's address (IPv4 in the first 4 bytes) goes to `from` when given.
+/// without it), waiting for one unless the descriptor or `flags` ask not to, SHUT_RD ended receiving (0), or SO_RCVTIMEO ran out
+/// (EAGAIN). MSG_TRUNC returns the datagram's whole length. The sender's address (IPv4 in the first 4 bytes) goes to `from` when
+/// given.
 pub fn rawRecvInto(d: *vfs_mod.FileDescriptor, out: []u8, flags: u32, from: ?*[16]u8) i64 {
     const raw = @import("raw_icmp.zig");
     const tsc = @import("../arch/arch.zig").tsc;
+    const urp = @import("udp_recv_policy.zig");
     const nonblock = @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(d), flags);
+    const deadline = urp.deadlineNs(tsc.nanos(), if (raw.getOpts(d.raw_idx)) |o| o.rcv_ms else 0);
     while (true) {
         _ = @import("lo.zig").drain();
         switch (raw.recv(d.raw_idx, out)) {
@@ -168,11 +171,14 @@ pub fn rawRecvInto(d: *vfs_mod.FileDescriptor, out: []u8, flags: u32, from: ?*[1
             .eof => return 0,
             .wait => {},
         }
-        // SO_RCVTIMEO is not kept for raw sockets (socket_opt's raw branch keeps no state), so a blocking receive waits for the
-        // next datagram or a signal. Short sleeps, not one long wait: the loopback device has to be pumped.
+        // A blocking receive waits for the next datagram, a signal, or the end of SO_RCVTIMEO (EAGAIN, as raw_recvmsg's
+        // skb_recv_datagram). Short sleeps, not one long wait: the loopback device has to be pumped.
+        const now = tsc.nanos();
+        if (urp.timedOut(deadline, now)) return -11;
         if (comptime @import("builtin").cpu.arch != .x86_64) return -11;
         const se = @import("../arch/x86_64/syscall_entry.zig");
-        const rc = se.sleepUntil(tsc.nanos() +| 5 * 1_000_000, 0);
+        const slice = now +| 5 * 1_000_000;
+        const rc = se.sleepUntil(if (deadline) |dl| @min(slice, dl) else slice, 0);
         if (rc < 0) return rc;
     }
 }

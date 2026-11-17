@@ -510,6 +510,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello391"); /* IPv6 raw ICMPv6 socket */
     run_test("hello392"); /* ICMPv6 errors to UDP/ping sockets */
     run_test("hello393"); /* ICMPv6 error quotes with extension headers */
+    run_test("hello394"); /* raw ICMP sockets keep SO_RCVTIMEO */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

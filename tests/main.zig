@@ -14947,3 +14947,23 @@ test "ICMPv6 error quotes skip extension headers (hello393): hop-by-hop, routing
     const e = up.parseErrorQuote6(&r).?;
     try std.testing.expect(e.kind == .echo and e.src_port == 0x1234);
 }
+
+test "raw ICMP sockets keep their SOL_SOCKET options and a blocking recv honours SO_RCVTIMEO" {
+    const rs = kt.raw_icmp_source;
+    try std.testing.expect(std.mem.indexOf(u8, rs, "opts: @import(\"sockopt_policy.zig\").Stored = .{},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "pub fn getOpts(idx: u32) ?@import(\"sockopt_policy.zig\").Stored {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "pub fn setOpts(idx: u32, st: @import(\"sockopt_policy.zig\").Stored) bool {") != null);
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "var st = raw_mod.getOpts(idx) orelse return -9;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "return if (raw_mod.setOpts(idx, st)) 0 else -9;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, ".raw => |idx| {\n            stored = @import(\"raw_icmp.zig\").getOpts(idx) orelse return -9;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "var st: sp.Stored = .{};\n            return applySol(") == null);
+    const ss = kt.socket_syscall_source;
+    const at = std.mem.indexOf(u8, ss, "pub fn rawRecvInto(") orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, ss, at, "\n}\n") orelse return error.TestUnexpectedResult;
+    const body = ss[at..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "const deadline = urp.deadlineNs(tsc.nanos(), if (raw.getOpts(d.raw_idx)) |o| o.rcv_ms else 0);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (urp.timedOut(deadline, now)) return -11;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "se.sleepUntil(if (deadline) |dl| @min(slice, dl) else slice, 0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "SO_RCVTIMEO is not kept") == null);
+}
