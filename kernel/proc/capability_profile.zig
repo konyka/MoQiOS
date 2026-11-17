@@ -158,7 +158,7 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // CAP_SETGID so hello373's children take other uids, gids and supplementary groups, and CAP_NET_RAW for its raw socket.
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_setuid = true, .cap_setgid = true, .cap_net_raw = true }, .initial_init = false };
     }
-    if (std.mem.eql(u8, name, "hello389") or std.mem.eql(u8, name, "hello390") or std.mem.eql(u8, name, "hello391")) {
+    if (std.mem.eql(u8, name, "hello389") or std.mem.eql(u8, name, "hello390") or std.mem.eql(u8, name, "hello391") or std.mem.eql(u8, name, "hello392")) {
         // Raw ICMP socket tests: socket(AF_INET[6], SOCK_RAW, IPPROTO_ICMP[V6]) wants CAP_NET_RAW (inet_create); root also lets hello390
         // write /proc/sys/net/ipv4/ping_group_range (mode 0644) for its ping sockets.
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_raw = true }, .initial_init = false };

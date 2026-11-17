@@ -1,3 +1,4 @@
+const std = @import("std");
 const nic = @import("nic.zig");
 const netif = @import("netif.zig");
 const lo = @import("lo.zig");
@@ -223,12 +224,6 @@ pub fn clearPendingErrorIfEqual(port: u32, expected: i32) void {
     if (port_err[i] == expected) port_err[i] = 0;
 }
 
-/// An ICMP port-unreachable quoted a datagram sent from `local_port` to
-/// `peer_port`: every socket connected to that peer fails with ECONNREFUSED.
-pub fn notifyUnreachable(local_port: u16, peer_port: u16) void {
-    notifyError(local_port, peer_port, 111); // ECONNREFUSED
-}
-
 /// An ICMP error (hard, positive errno `err`) quoted a datagram sent from `local_port` to `peer_port`: every socket connected to
 /// that peer takes it as its pending error (udp_err sets sk_err only on a connected socket without IP_RECVERR).
 pub fn notifyError(local_port: u16, peer_port: u16, err: i32) void {
@@ -263,6 +258,53 @@ pub fn notifyPingError(ident: u16, err: i32) void {
         defer udp_lock.release(saved);
         for (0..num_ports) |i| {
             if (!port_ping[i] or port_v6[i] or portNumber(ports[i]) != ident or port_peer[i] == 0) continue;
+            port_err[i] = err;
+            hits[n] = ports[i];
+            n += 1;
+        }
+    }
+    for (hits[0..n]) |key| {
+        @import("epoll.zig").epollNotify(.udp_socket, key, @import("epoll.zig").EPOLLERR);
+        @import("../fs/vfs.zig").udpFasyncNotify(key, @import("../fs/fcntl_policy.zig").POLL_ERR);
+    }
+}
+
+/// An ICMPv6 error (positive errno `err`, 0 for a soft one, which is dropped) quoted a datagram sent from `local_port` to
+/// [`peer_ip`]:`peer_port`: every IPv6 socket on that port connected to that peer takes it as its pending error (__udp6_lib_err
+/// sets sk_err only on a connected socket without IPV6_RECVERR, and the lookup matches the quoted destination).
+pub fn notifyError6(local_port: u16, peer_port: u16, peer_ip: [16]u8, err: i32) void {
+    if (err == 0) return;
+    var hits: [MAX_PORTS]u32 = undefined;
+    var n: usize = 0;
+    {
+        const saved = udp_lock.acquire();
+        defer udp_lock.release(saved);
+        for (0..num_ports) |i| {
+            if (port_ping[i] or !port_named[i] or !port_v6[i]) continue;
+            if (portNumber(ports[i]) != local_port) continue;
+            if (port_peer[i] != peer_port or !std.mem.eql(u8, &port_peer_ip[i], &peer_ip)) continue;
+            port_err[i] = err;
+            hits[n] = ports[i];
+            n += 1;
+        }
+    }
+    for (hits[0..n]) |key| {
+        @import("epoll.zig").epollNotify(.udp_socket, key, @import("epoll.zig").EPOLLERR);
+        @import("../fs/vfs.zig").udpFasyncNotify(key, @import("../fs/fcntl_policy.zig").POLL_ERR);
+    }
+}
+
+/// An ICMPv6 error (positive errno `err`, 0 for a soft one) quoted an echo request with ident `ident`: the connected IPv6 ping
+/// sockets with that ident take it as their pending error (icmpv6_err → ping_err).
+pub fn notifyPingError6(ident: u16, err: i32) void {
+    if (err == 0) return;
+    var hits: [MAX_PORTS]u32 = undefined;
+    var n: usize = 0;
+    {
+        const saved = udp_lock.acquire();
+        defer udp_lock.release(saved);
+        for (0..num_ports) |i| {
+            if (!port_ping[i] or !port_v6[i] or portNumber(ports[i]) != ident or port_peer[i] == 0) continue;
             port_err[i] = err;
             hits[n] = ports[i];
             n += 1;

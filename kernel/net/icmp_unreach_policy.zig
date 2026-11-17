@@ -139,3 +139,61 @@ pub fn parseErrorQuote(msg: []const u8) ?ErrorQuote {
         else => return null,
     }
 }
+
+// ── ICMPv6 errors for IPv6 UDP and ping sockets (Linux icmpv6_err_convert, __udp6_lib_err, icmpv6_err → ping_err) ──
+
+/// ICMPv6 types below 128 are errors (RFC 4443 §2.1, ICMPV6_INFOMSG_MASK); each quotes the packet that caused it.
+pub fn isError6(icmp_type: u8) bool {
+    return icmp_type & 0x80 == 0;
+}
+
+/// Destination unreachable codes 0..6: the errno and whether it is a hard error (tab_unreach). A larger code is EPROTO, hard.
+const unreach6_errno = [7]struct { errno: i32, hard: bool }{
+    .{ .errno = 101, .hard = false }, // no route: ENETUNREACH
+    .{ .errno = 13, .hard = true }, // administratively prohibited: EACCES
+    .{ .errno = 113, .hard = false }, // beyond the scope of the source (was not a neighbour): EHOSTUNREACH
+    .{ .errno = 113, .hard = false }, // address unreachable: EHOSTUNREACH
+    .{ .errno = 111, .hard = true }, // port unreachable: ECONNREFUSED
+    .{ .errno = 13, .hard = true }, // source address failed policy: EACCES
+    .{ .errno = 13, .hard = true }, // reject route: EACCES
+};
+
+/// The errno a connected IPv6 UDP (`ping` false) or ping socket without IPV6_RECVERR takes from an ICMPv6 error, 0 when it takes
+/// none: only hard errors are reported. Packet too big is EMSGSIZE and hard for a UDP socket doing path MTU discovery (the
+/// default), soft for a ping socket; time exceeded and error types Linux does not know are soft; parameter problem is EPROTO.
+pub fn errnoFor6(icmp_type: u8, code: u8, ping: bool) i32 {
+    return switch (icmp_type) {
+        1 => if (code < unreach6_errno.len) (if (unreach6_errno[code].hard) unreach6_errno[code].errno else 0) else 71,
+        2 => if (ping) 0 else 90,
+        4 => 71,
+        else => 0,
+    };
+}
+
+/// What an ICMPv6 error quotes: a UDP datagram (its ports and destination) or an echo request a ping socket sent (`src_port` is
+/// its ident).
+pub const ErrorQuote6 = struct { kind: QuoteKind, src_port: u16, dst_port: u16 = 0, dst: [16]u8 = @splat(0) };
+
+/// The packet quoted by an ICMPv6 error. `msg` starts at the ICMPv6 header; the quoted IPv6 header follows the 8-byte ICMPv6
+/// header, then at least 8 bytes of its payload. Only a packet carrying UDP or ICMPv6 directly is matched (Linux icmpv6_notify
+/// would also skip extension headers); an echo reply or a request with a nonzero code is for no socket (ping_supported).
+pub fn parseErrorQuote6(msg: []const u8) ?ErrorQuote6 {
+    if (msg.len < 8 + V6_IP_HEADER_LEN + 8) return null;
+    if ((msg[8] >> 4) != 6) return null;
+    const p = 8 + V6_IP_HEADER_LEN;
+    var dst: [16]u8 = undefined;
+    @memcpy(&dst, msg[8 + 24 ..][0..16]);
+    switch (msg[8 + 6]) {
+        17 => return .{
+            .kind = .udp,
+            .src_port = std.mem.readInt(u16, msg[p..][0..2], .big),
+            .dst_port = std.mem.readInt(u16, msg[p + 2 ..][0..2], .big),
+            .dst = dst,
+        },
+        58 => {
+            if (msg[p] != 128 or msg[p + 1] != 0) return null;
+            return .{ .kind = .echo, .src_port = std.mem.readInt(u16, msg[p + 4 ..][0..2], .big), .dst = dst };
+        },
+        else => return null,
+    }
+}

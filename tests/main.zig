@@ -4900,7 +4900,7 @@ test "ping sockets: SOCK_DGRAM/IPPROTO_ICMP sends echo requests under the socket
     try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "if (pp.replyIdent(data[0..len])) |ident| {\n        if (len > 0xffff or ipv4.checksum(data, @intCast(len)) != 0) return;\n        @import(\"udp.zig\").deliverPing(ident, src_ip, dst_ip, data[0..len]);") != null);
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8) void {") != null);
-    // notifyUnreachable, enqueue and both group paths skip ping slots; rebind only conflicts with UDP slots; the port count is per space.
+    // notifyError, enqueue and both group paths skip ping slots; rebind only conflicts with UDP slots; the port count is per space.
     // A socket with no local port yet is skipped the same way (hello385).
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, us, "if (port_ping[i] or !port_named[i]) continue;"));
     try std.testing.expect(std.mem.indexOf(u8, us, "        if (port_ping[j]) continue;\n        if (portNumber(ports[j]) != new_port) continue;\n") != null);
@@ -11409,8 +11409,8 @@ test "ICMPv6 port unreachable for UDP over ::1: quote parsing, reply rule and wi
     try std.testing.expect(std.mem.indexOf(u8, us, "pkt[icmp_off] = 1;\n    pkt[icmp_off + 1] = 4;") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + icmp_len);\n    _ = lo.sendPacket(&pkt, frame_len);") != null);
     const v6src = kt.icmpv6_source;
-    try std.testing.expect(std.mem.indexOf(u8, v6src, "DEST_UNREACHABLE => {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, v6src, "@import(\"udp.zig\").notifyUnreachable(q.src_port, q.dst_port);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v6src, "if (unreach.isError6(icmp_type)) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v6src, "@import(\"udp.zig\").notifyError6(q.src_port, q.dst_port, q.dst,") != null);
 }
 
 test "ioctl(TIOCOUTQ): socket send-queue reporting and its wiring" {
@@ -14720,7 +14720,7 @@ test "ICMP errors wiring (hello390): checksummed, sent to connected UDP and ping
     const us = kt.udp_source;
     const pe = std.mem.indexOf(u8, us, "pub fn notifyPingError(ident: u16, err: i32) void {") orelse return error.TestUnexpectedResult;
     _ = std.mem.indexOfPos(u8, us, pe, "if (!port_ping[i] or port_v6[i] or portNumber(ports[i]) != ident or port_peer[i] == 0) continue;") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, us, "pub fn notifyUnreachable(local_port: u16, peer_port: u16) void {\n    notifyError(local_port, peer_port, 111); // ECONNREFUSED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "pub fn notifyUnreachable(") == null);
     const ss = kt.socket_syscall_source;
     const ps = std.mem.indexOf(u8, ss, "fn pingSend(d: *vfs_mod.FileDescriptor") orelse return error.TestUnexpectedResult;
     const pend = std.mem.indexOfPos(u8, ss, ps, "const pending = udp.takePendingError(d.udpKey());") orelse return error.TestUnexpectedResult;
@@ -14824,4 +14824,75 @@ test "raw ICMPv6 socket wiring (hello391): checksummed ICMPv6 reaches raw socket
     try std.testing.expect(std.mem.indexOf(u8, rs, "if (s.v6) continue;") != null);
     try std.testing.expect(std.mem.indexOf(u8, rs, "policy.filterBlocks(s.filter, msg[0])") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.epoll_source, ".raw_socket => revents |= @import(\"raw_icmp.zig\").pollEvents(resource_idx),") != null);
+}
+
+test "ICMPv6 errors (hello392): hard errors map to errnos, the quote names a UDP datagram or an echo request (Linux icmpv6_err_convert)" {
+    const up = kt.icmp_unreach_policy;
+    const udp_want = [8]i32{ 0, 13, 0, 0, 111, 13, 13, 71 };
+    for (udp_want, 0..) |w, code| {
+        try std.testing.expectEqual(w, up.errnoFor6(1, @intCast(code), false));
+        try std.testing.expectEqual(w, up.errnoFor6(1, @intCast(code), true));
+    }
+    try std.testing.expectEqual(@as(i32, 71), up.errnoFor6(1, 200, false));
+    try std.testing.expectEqual(@as(i32, 90), up.errnoFor6(2, 0, false)); // packet too big: EMSGSIZE, hard for UDP
+    try std.testing.expectEqual(@as(i32, 0), up.errnoFor6(2, 0, true)); // soft for a ping socket
+    try std.testing.expectEqual(@as(i32, 0), up.errnoFor6(3, 0, false)); // time exceeded: soft
+    for ([_]u8{ 0, 1, 2 }) |c| try std.testing.expectEqual(@as(i32, 71), up.errnoFor6(4, c, false)); // parameter problem: EPROTO
+    try std.testing.expectEqual(@as(i32, 0), up.errnoFor6(5, 0, false));
+    try std.testing.expectEqual(@as(i32, 0), up.errnoFor6(100, 0, false));
+    try std.testing.expect(up.isError6(1) and up.isError6(4) and up.isError6(100) and up.isError6(127));
+    try std.testing.expect(!up.isError6(128) and !up.isError6(129) and !up.isError6(135));
+
+    var m: [8 + 40 + 8]u8 = @splat(0);
+    m[0] = 1;
+    m[1] = 4;
+    m[8] = 0x60;
+    m[8 + 6] = 17;
+    m[8 + 39] = 2;
+    std.mem.writeInt(u16, m[48..50], 40000, .big);
+    std.mem.writeInt(u16, m[50..52], 9, .big);
+    const u = up.parseErrorQuote6(&m).?;
+    try std.testing.expect(u.kind == .udp and u.src_port == 40000 and u.dst_port == 9 and u.dst[15] == 2 and u.dst[0] == 0);
+    m[8 + 6] = 58;
+    m[48] = 128;
+    m[49] = 0;
+    std.mem.writeInt(u16, m[52..54], 0x4a8f, .big);
+    const e = up.parseErrorQuote6(&m).?;
+    try std.testing.expect(e.kind == .echo and e.src_port == 0x4a8f);
+    m[48] = 129;
+    try std.testing.expect(up.parseErrorQuote6(&m) == null);
+    m[48] = 128;
+    m[49] = 1;
+    try std.testing.expect(up.parseErrorQuote6(&m) == null);
+    m[49] = 0;
+    m[8 + 6] = 6;
+    try std.testing.expect(up.parseErrorQuote6(&m) == null);
+    m[8 + 6] = 58;
+    try std.testing.expect(up.parseErrorQuote6(m[0..55]) == null);
+    m[8] = 0x40;
+    try std.testing.expect(up.parseErrorQuote6(&m) == null);
+}
+
+test "ICMPv6 errors wiring (hello392): every error type reaches connected IPv6 UDP and ping sockets, a ping send reports it" {
+    const vs = kt.icmpv6_source;
+    const at = std.mem.indexOf(u8, vs, "if (unreach.isError6(icmp_type)) {") orelse return error.TestUnexpectedResult;
+    const pt = std.mem.indexOfPos(u8, vs, at, "if (icmp_type == PACKET_TOO_BIG) handlePacketTooBig(data, len);") orelse return error.TestUnexpectedResult;
+    const q = std.mem.indexOfPos(u8, vs, pt, "const q = unreach.parseErrorQuote6(data[0..len]) orelse return;") orelse return error.TestUnexpectedResult;
+    const ue = std.mem.indexOfPos(u8, vs, q, ".udp => @import(\"udp.zig\").notifyError6(q.src_port, q.dst_port, q.dst, unreach.errnoFor6(icmp_type, icmp_code, false)),") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, vs, ue, ".echo => @import(\"udp.zig\").notifyPingError6(q.src_port, unreach.errnoFor6(icmp_type, icmp_code, true)),") orelse return error.TestUnexpectedResult;
+    // The error branch runs before the type switch, which no longer handles Destination Unreachable or Packet Too Big itself.
+    try std.testing.expect(at < std.mem.indexOf(u8, vs, "switch (icmp_type) {").?);
+    try std.testing.expect(std.mem.indexOf(u8, vs, "notifyUnreachable(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, vs, "PACKET_TOO_BIG => handlePacketTooBig(data, len),") == null);
+    const us = kt.udp_source;
+    const n6 = std.mem.indexOf(u8, us, "pub fn notifyError6(local_port: u16, peer_port: u16, peer_ip: [16]u8, err: i32) void {") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, us, n6, "if (err == 0) return;") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, us, n6, "if (port_ping[i] or !port_named[i] or !port_v6[i]) continue;") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, us, n6, "if (port_peer[i] != peer_port or !std.mem.eql(u8, &port_peer_ip[i], &peer_ip)) continue;") orelse return error.TestUnexpectedResult;
+    const p6 = std.mem.indexOf(u8, us, "pub fn notifyPingError6(ident: u16, err: i32) void {") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, us, p6, "if (!port_ping[i] or !port_v6[i] or portNumber(ports[i]) != ident or port_peer[i] == 0) continue;") orelse return error.TestUnexpectedResult;
+    const ss = kt.socket_syscall_source;
+    const ps = std.mem.indexOf(u8, ss, "fn pingSend6(d: *vfs_mod.FileDescriptor") orelse return error.TestUnexpectedResult;
+    const pend = std.mem.indexOfPos(u8, ss, ps, "const pending = udp.takePendingError(d.udpKey());") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(pend < std.mem.indexOfPos(u8, ss, ps, "const sent = @import(\"icmpv6.zig\").sendFrom6(").?);
 }

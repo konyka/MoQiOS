@@ -10239,3 +10239,16 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   2. IPV6_CHECKSUM 不能设；没有组播成员资格、connect 时的路由检查（Linux 对不可达地址返回 ENETUNREACH）、sendmsg/recvmsg、SO_RCVTIMEO、IP_HDRINCL。
   3. 两个族合计最多 16 个 raw 套接字，每个队列 8 项。
   4. QEMU 网络上的 ICMPv6（RA、NS、MLD）也会进入 IPv6 raw 套接字，hello391 只看来源是 ::1 的报文。
+
+## 补充：ICMPv6 差错送到 IPv6 UDP 和 ping 套接字（hello392）
+
+- 问题：`icmpv6.handlePacket` 只处理目的不可达里的端口不可达（码 4），而且只按端口找 UDP 套接字、不比较被引用数据报的目的地址；其他码、包过大、超时、参数问题都不会让套接字看到差错；IPv6 ping 套接字收不到任何差错；IPv6 ping 的 send 不检查挂起差错（IPv4 的 `pingSend` 会检查）。
+- Linux 语义（3rd/linux-7.0.6 `net/ipv6/icmp.c` 的 `icmpv6_err_convert`、`net/ipv6/udp.c` 的 `__udp6_lib_err`、`net/ipv4/ping.c` 的 `ping_err`）：目的不可达码 0..6 依次是 ENETUNREACH、EACCES、EHOSTUNREACH、EHOSTUNREACH、ECONNREFUSED、EACCES、EACCES，其中 1、4、5、6 是硬差错；码 7 以上 EPROTO（硬）；包过大 EMSGSIZE，UDP 上是硬差错（默认 pmtudisc），ping 上是软差错；超时 EHOSTUNREACH（软）；参数问题 EPROTO（硬）；未知差错类型 EPROTO（软）。只有已连接且没设 IPV6_RECVERR 的套接字会把硬差错记成 sk_err。ping 只认引用类型 128、码 0 的回显请求。
+- 宿主机实测（`user/hello392.c -DHOST`，root、`unshare -n`、只有 lo）：9 项全部通过，数值写在 `user/hello392.c` 开头。
+- 修复：`icmp_unreach_policy.zig` 新增 `isError6`、`unreach6_errno` 表、`errnoFor6`、`ErrorQuote6` 和 `parseErrorQuote6`；`icmpv6.handlePacket` 在类型分派之前处理所有差错类型（包过大先走 `handlePacketTooBig`），UDP 引用交给新的 `udp.notifyError6`（端口、对端端口、对端地址都匹配），回显请求引用交给 `udp.notifyPingError6`；删除 `udp.notifyUnreachable`；`socket_syscall.pingSend6` 在发送前取挂起差错。
+- host 测试 "ICMPv6 errors (hello392)…"（策略）和 "ICMPv6 errors wiring (hello392)…"（接线）：接线测试在内核修改前失败；修改后全部通过。旧的 "ICMPv6 port unreachable for UDP over ::1…" 和 hello390 wiring 测试改为检查新的分支和 `notifyUnreachable` 已删除。变异验证：去掉 `isError6` 分支，两个测试失败；`errnoFor6` 恒返回 0，策略测试失败；都已恢复。
+- QEMU：定向 SMP=2 下 hello392 的 9 项（U N A P Q R V S E）全部通过。取红灯（只回退内核修复、保留能力配置）时 U、A、P、V、S、E 失败，N、Q、R 通过：旧内核对 UDP 只在码 4 设 ECONNREFUSED（15 项里 7 项碰巧相符），引用 [::2]:9 的差错也被送到连到 [::1]:9 的套接字，ping 套接字全为 0。完整 smoke 在 SMP=2、4、1 下各通过一次（上限 1400 秒）。riscv64 和 aarch64 交叉构建通过，但没有在这两个架构上跑 QEMU。
+- 局限：
+  1. 不跳过扩展头：被引用报文的下一个头必须直接是 UDP 或 ICMPv6。
+  2. 没有 IPV6_RECVERR 错误队列，软差错和未连接套接字上的差错被丢弃。
+  3. TCP 不处理 ICMPv6 差错；raw ICMPv6 套接字照样收到差错报文本身（hello391），但不设 SO_ERROR。

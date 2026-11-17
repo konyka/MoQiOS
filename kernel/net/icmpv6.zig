@@ -109,6 +109,21 @@ pub fn handlePacket(
         return;
     }
     const icmp_type = data[0];
+    const icmp_code = data[1];
+
+    // An error about a packet this host sent (icmpv6_notify): packet too big first lowers the path MTU (icmpv6_err), then a hard
+    // error goes to the connected IPv6 UDP socket that sent the quoted datagram (__udp6_lib_err), or to the connected IPv6 ping
+    // socket whose echo request it quotes (ping_err).
+    const unreach = @import("icmp_unreach_policy.zig");
+    if (unreach.isError6(icmp_type)) {
+        if (icmp_type == PACKET_TOO_BIG) handlePacketTooBig(data, len);
+        const q = unreach.parseErrorQuote6(data[0..len]) orelse return;
+        switch (q.kind) {
+            .udp => @import("udp.zig").notifyError6(q.src_port, q.dst_port, q.dst, unreach.errnoFor6(icmp_type, icmp_code, false)),
+            .echo => @import("udp.zig").notifyPingError6(q.src_port, unreach.errnoFor6(icmp_type, icmp_code, true)),
+        }
+        return;
+    }
 
     switch (icmp_type) {
         ECHO_REQUEST => sendEchoReply(src_ip, dst_ip, data, len),
@@ -116,12 +131,6 @@ pub fn handlePacket(
         NEIGHBOR_SOLICITATION => handleNeighborSolicitation(src_ip, dst_ip, data, len),
         NEIGHBOR_ADVERTISEMENT => handleNeighborAdvertisement(src_ip, data, len),
         REDIRECT => handleRedirect(src_ip, data, len),
-        PACKET_TOO_BIG => handlePacketTooBig(data, len),
-        DEST_UNREACHABLE => {
-            // Port unreachable for a UDP datagram we sent: tell the connected socket.
-            const q = @import("icmp_unreach_policy.zig").parseQuoteV6(data[0..len]) orelse return;
-            @import("udp.zig").notifyUnreachable(q.src_port, q.dst_port);
-        },
         else => {},
     }
 }

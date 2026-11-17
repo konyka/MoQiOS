@@ -415,6 +415,9 @@ fn pingSend6(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, add
     pp.setIdent(msg[0..payload.len], d.udp_port);
     if (!d.udp_ping_bound) udp.pingRehash(d.udpKey());
     d.udp_ping_bound = true;
+    // An ICMPv6 error a connected socket took fails this send, once (sock_alloc_send_skb → sock_error).
+    const pending = udp.takePendingError(d.udpKey());
+    if (pending != 0) return -@as(i64, pending);
     const sent = @import("icmpv6.zig").sendFrom6(d.udp_local_ip6, dst, msg[0..payload.len]);
     return if (sent < 0) sent else @intCast(payload.len);
 }
