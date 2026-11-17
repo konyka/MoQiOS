@@ -522,6 +522,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello403"); /* IPv6 raw sockets of any protocol, IPV6_CHECKSUM */
     run_test("hello404"); /* IPV6_HDRINCL, IPPROTO_RAW, ICMPv6 parameter problem */
     run_test("hello405"); /* ARP NUD: STALE, DELAY, PROBE, FAILED */
+    run_test("hello406"); /* ICMP errors for TCP */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

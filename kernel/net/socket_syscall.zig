@@ -737,7 +737,7 @@ pub fn listen(fd: u32, backlog: u32) i64 {
 
     if (t.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
     const tcb_idx = t.fd_table.fds[fd].tcb_idx;
-    const result = net_mod.tcp.tcpListen(tcb_idx);
+    const result = net_mod.tcp.tcpListen(tcb_idx, backlog);
     return result;
 }
 

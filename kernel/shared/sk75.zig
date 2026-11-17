@@ -96,7 +96,7 @@ pub fn announce() void {
     }
     if (tcp.tcpSetIpv6(@intCast(listen_idx)) < 0 or
         tcp.tcpBind(@intCast(listen_idx), LOCAL) < 0 or
-        tcp.tcpListen(@intCast(listen_idx)) < 0)
+        tcp.tcpListen(@intCast(listen_idx), 32) < 0)
     {
         fail("listen setup");
         return;

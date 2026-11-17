@@ -58,7 +58,7 @@ pub fn announce() void {
     ndp.init();
     const listen0 = tcp.tcpSocket(0);
     if (listen0 < 0 or tcp.tcpSetIpv6(@intCast(listen0)) < 0 or
-        tcp.tcpBind(@intCast(listen0), LOCAL) < 0 or tcp.tcpListen(@intCast(listen0)) < 0)
+        tcp.tcpBind(@intCast(listen0), LOCAL) < 0 or tcp.tcpListen(@intCast(listen0), 32) < 0)
     {
         fail("listen0");
         return;
@@ -81,7 +81,7 @@ pub fn announce() void {
     ndp.update(PEER6, PEER_MAC);
     const listen1 = tcp.tcpSocket(0);
     if (listen1 < 0 or tcp.tcpSetIpv6(@intCast(listen1)) < 0 or
-        tcp.tcpBind(@intCast(listen1), LOCAL) < 0 or tcp.tcpListen(@intCast(listen1)) < 0)
+        tcp.tcpBind(@intCast(listen1), LOCAL) < 0 or tcp.tcpListen(@intCast(listen1), 32) < 0)
     {
         fail("listen1");
         return;

@@ -189,6 +189,15 @@ pub fn acceptErrno(state: TcpState) i64 {
     return if (state == .listen) 0 else EINVAL;
 }
 
+/// net.core.somaxconn (SOMAXCONN): listen() clamps its backlog to it.
+pub const SOMAXCONN: u32 = 4096;
+
+/// How many connections a listener's accept queue holds for listen(fd, `backlog`): __sys_listen_socket clamps the (unsigned)
+/// backlog to somaxconn and sk_acceptq_is_full refuses a new one only past it, so backlog + 1; MoQiOS's queue holds at most `cap`.
+pub fn acceptLimit(backlog: u32, cap: u32) u32 {
+    return @min(@min(backlog, SOMAXCONN) + 1, cap);
+}
+
 /// listen(): a fresh (closed) or already listening socket; a connected one is EINVAL.
 pub fn listenErrno(state: TcpState) i64 {
     return if (state == .closed or state == .listen) 0 else EINVAL;

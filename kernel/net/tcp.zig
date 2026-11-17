@@ -335,6 +335,9 @@ const TcpTcb = struct {
     shut_rd: bool = false,
     /// A RST answered our SYN: connect() fails with ECONNREFUSED.
     refused: bool = false,
+    /// The errno of the last ICMP error about an established connection (Linux sk_err_soft): SO_ERROR reports it once, and a
+    /// retransmission timeout ends the connection with it instead of ETIMEDOUT (tcp_write_err).
+    soft_err: i32 = 0,
     /// A send found the ring full (Linux SOCK_NOSPACE): the ACK that frees enough of it sends O_ASYNC owners POLL_OUT once. Set under
     /// the same tcp_lock hold that found the ring full, so an ACK cannot slip in between and miss it.
     async_nospace: bool = false,
@@ -995,6 +998,7 @@ fn initTcbState(t: *TcpTcb) void {
     t.was_established = false;
     t.shut_rd = false;
     t.refused = false;
+    t.soft_err = 0;
     t.async_nospace = false;
     t.bound_explicitly = false;
     t.bound_dev6 = 0;
@@ -1129,9 +1133,12 @@ pub fn tcpClearSoErrorIfEqual(tcb_idx: u32, expected: i32) void {
         const tcb = &tcbs[tcb_idx];
         if (tcb.options.so_error == expected) {
             tcb.options.so_error = 0;
-        } else if (expected == ECONNRESET and tcb.options.so_error == 0) {
+        } else if (expected == ECONNRESET and tcb.options.so_error == 0 and tcb.reset_by_peer) {
             // getsockopt(SO_ERROR) reported the pending reset (see tcpPendingSoError): it is consumed like a recv or send would.
             tcb.reset_by_peer = false;
+        } else if (tcb.options.so_error == 0 and !tcb.reset_by_peer and tcb.soft_err == expected) {
+            // sock_getsockopt SO_ERROR: sock_error() falls back to sk_err_soft and clears it.
+            tcb.soft_err = 0;
         }
     }
 }
@@ -1139,14 +1146,61 @@ pub fn tcpClearSoErrorIfEqual(tcb_idx: u32, expected: i32) void {
 const ECONNRESET: i32 = 104;
 
 /// The SO_ERROR value getsockopt should report: the stored connect failure, or ECONNRESET while a reset from the peer is still
-/// unreported (Linux keeps both in sk_err). Reading does not consume; tcpClearSoErrorIfEqual does that after the copy-out.
+/// unreported (Linux keeps both in sk_err), else the soft error an ICMP error left (sk_err_soft). Reading does not consume;
+/// tcpClearSoErrorIfEqual does that after the copy-out.
 pub fn tcpPendingSoError(tcb_idx: u32) i32 {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return 0;
     const tcb = &tcbs[tcb_idx];
     if (tcb.options.so_error != 0) return tcb.options.so_error;
-    return if (tcb.reset_by_peer) ECONNRESET else 0;
+    if (tcb.reset_by_peer) return ECONNRESET;
+    return tcb.soft_err;
+}
+
+/// An ICMP error quoting an IPv4 segment this host sent (tcp_v4_err): `q` names the connection by its ports and addresses and
+/// carries the quoted sequence number; `err` is its errno (0: none, as for fragmentation needed, which icmp.zig handles as path
+/// MTU), `req_abort` whether a connection still waiting in a listener's queue is dropped.
+pub fn icmpError(q: @import("icmp_unreach_policy.zig").TcpQuote, err: i32, req_abort: bool) void {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    const tcb = findTcbByTuple(q.src4, q.src_port, q.dst_port, q.dst4) orelse return;
+    applyIcmpError(tcb, q.seq, err, req_abort);
+}
+
+/// icmpError for an IPv6 segment (tcp_v6_err).
+pub fn icmpError6(q: @import("icmp_unreach_policy.zig").TcpQuote, err: i32, req_abort: bool) void {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    const tcb = findTcbByTupleV6(q.src, q.src_port, q.dst_port, q.dst) orelse return;
+    applyIcmpError(tcb, q.seq, err, req_abort);
+}
+
+/// Caller holds tcp_lock. The error counts only when the quoted sequence number lies in [snd_una, snd_nxt]; a SYN_SENT connection
+/// then fails with `err` (connect returns it, POLLERR), a queued SYN_RECEIVED one is dropped when `req_abort` and its SYN-ACK is
+/// what was quoted, an established one keeps `err` as its soft error. Ending the connection wakes its blocked callers
+/// (closeTcbRemote) and its O_ASYNC owner (POLL_ERR).
+fn applyIcmpError(tcb: *TcpTcb, seq: u32, err: i32, req_abort: bool) void {
+    const up = @import("icmp_unreach_policy.zig");
+    switch (up.tcpErrAction(tcb.state)) {
+        .ignore => {},
+        // tcp_req_err: only an error quoting the SYN-ACK itself.
+        .request => if (req_abort and seq == tcb.iss) {
+            const idx = tcbIdx(tcb);
+            if (tcbInListenBacklog(idx)) releaseOrphanedBacklogTcb(idx);
+        },
+        .abort, .soft => |act| {
+            if (err == 0) return;
+            if (!up.tcpSeqOk(seq, tcb.snd_una, tcb.snd_nxt)) return;
+            if (act == .soft) {
+                tcb.soft_err = err;
+                return;
+            }
+            tcb.options.so_error = err;
+            noteFasync(tcbIdx(tcb), fcntl_policy.POLL_ERR);
+            closeTcbRemote(tcb);
+        },
+    }
 }
 
 fn generateIss() u32 {
@@ -2158,7 +2212,7 @@ fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16,
             tcp_port_policy.localAddrMatches(tcbs[i].local_ip, tcbs[i].remote_ip, netif.getOurIp(), dst_ip) and
             tcp_util.seqGt(seq_num, tcbs[i].irs))
         {
-            if (ls.pending_tail -% ls.pending_head >= LISTEN_BACKLOG) return;
+            if (ls.pending_tail -% ls.pending_head >= ls.accept_limit) return;
             // Reuse this TIME_WAIT TCB — full state reset so no receive-ring
             // bytes, congestion state or negotiation flag of the dead
             // connection can reach the new one.
@@ -2203,7 +2257,7 @@ fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16,
     }
 
     // Check backlog capacity
-    if (ls.pending_tail -% ls.pending_head >= LISTEN_BACKLOG) return;
+    if (ls.pending_tail -% ls.pending_head >= ls.accept_limit) return;
 
     // Allocate a new TCB for this connection
     const new_tcb = allocTcb() orelse {
@@ -2308,7 +2362,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, dst_ip: [16]u8, src_port: u16, dst_port: 
         }
     }
 
-    if (ls.pending_tail -% ls.pending_head >= LISTEN_BACKLOG) return;
+    if (ls.pending_tail -% ls.pending_head >= ls.accept_limit) return;
 
     const new_tcb = allocTcb() orelse {
         syn_dropped_no_slot +%= 1;
@@ -4163,7 +4217,8 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             if (tcb.retransmit_count > 5) {
                 // Give up
                 tcpLog("[tcp] retransmit timeout, closing\n");
-                if (tcb.state == .syn_sent) tcb.options.so_error = 110; // ETIMEDOUT: connect() fails
+                // tcp_write_err: the soft error an ICMP error left, else ETIMEDOUT (connect() fails with it).
+                if (tcb.state == .syn_sent) tcb.options.so_error = if (tcb.soft_err != 0) tcb.soft_err else 110;
                 noteFasync(idx, fcntl_policy.POLL_ERR); // Linux tcp_write_err → sk_error_report
                 closeTcbRemote(tcb);
                 return;
@@ -4315,7 +4370,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
 
 // ─── Listening / Server Socket Support ──────────────────────────────────────
 
-/// Connections a listener admits from new SYNs before it drops them (the accept-queue limit).
+/// The largest accept queue a listener has, whatever its backlog (ListenSlot.accept_limit is backlog + 1 below it).
 const LISTEN_BACKLOG: u32 = 32;
 /// Size of each listener's queue ring: room for every TCB, so children migrated from a closing SO_REUSEPORT sibling always fit even past
 /// LISTEN_BACKLOG (Linux's migration does not check the backlog either).
@@ -4336,6 +4391,8 @@ const ListenSlot = struct {
     // v53.50: Ring buffer indices — O(1) enqueue/dequeue instead of O(N) array shift
     pending_head: u32 = 0,
     pending_tail: u32 = 0,
+    /// The accept queue's size from listen()'s backlog (tcp_recv_policy.acceptLimit): a SYN finding it full is dropped.
+    accept_limit: u32 = LISTEN_BACKLOG,
 };
 
 var listen_slots: [MAX_CONNECTIONS]ListenSlot = @splat(.{
@@ -4477,7 +4534,7 @@ pub fn tcpConnectDev6(tcb_idx: u32, dst: [16]u8, scope_id: u32) i64 {
 
 /// Start listening for connections on a bound TCB.
 /// Returns 0 on success, -1 on failure.
-pub fn tcpListen(tcb_idx: u32) i64 {
+pub fn tcpListen(tcb_idx: u32, backlog: u32) i64 {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
@@ -4495,9 +4552,14 @@ pub fn tcpListen(tcb_idx: u32) i64 {
 
     // listen() again on a socket that is already listening keeps its slot: a second slot would stay active after close, which only
     // frees the one it finds first, and the port would keep answering SYNs (hello184 F).
+    // listen() again sets the new backlog (inet_listen updates sk_max_ack_backlog).
+    const limit = tcp_recv_policy.acceptLimit(backlog, LISTEN_BACKLOG);
     var have = listen_active_bitmap.snapshot();
     while (have.next()) |j| {
-        if (listen_slots[j].tcb_idx == tcbIdx(tcb)) return 0;
+        if (listen_slots[j].tcb_idx == tcbIdx(tcb)) {
+            listen_slots[j].accept_limit = limit;
+            return 0;
+        }
     }
     // Set up listen slot for incoming SYN tracking (bitmap-driven free slot search)
     const i = listen_active_bitmap.firstClear() orelse return -1;
@@ -4512,6 +4574,7 @@ pub fn tcpListen(tcb_idx: u32) i64 {
     listen_slots[i].pending_head = 0;
     listen_slots[i].pending_tail = 0;
     listen_slots[i].pending_tpbs = @splat(0);
+    listen_slots[i].accept_limit = limit;
     return 0;
 }
 

@@ -171,6 +171,8 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
             }
             ipv4.updatePathMtu(msg.dst, reported);
         }
+        // An error quoting a TCP segment goes to its connection (tcp_v4_err).
+        if (unreach.parseTcpQuote(data[0..len])) |tq| @import("tcp.zig").icmpError(tq, unreach.tcpErrno(icmp_type, icmp_code), unreach.tcpReqAborts(icmp_type, icmp_code));
         // A hard error goes to the connected UDP socket that sent the quoted datagram (udp_err), or to the connected ping socket
         // whose echo request it quotes (ping_err).
         const err = unreach.errnoFor(icmp_type, icmp_code);

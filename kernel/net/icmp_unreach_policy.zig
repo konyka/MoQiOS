@@ -233,3 +233,98 @@ pub fn parseErrorQuote6(msg: []const u8) ?ErrorQuote6 {
         else => return null,
     }
 }
+
+// ── ICMP errors for TCP (Linux tcp_v4_err, tcp_v6_err) ──
+
+/// The errno an ICMP error gives a TCP connection, 0 when it gives none: destination unreachable codes 0..15 through
+/// icmp_err_convert (hard or soft alike), except fragmentation needed, which only lowers the path MTU; time exceeded EHOSTUNREACH,
+/// parameter problem EPROTO. Source quench, redirect and anything else are no error.
+pub fn tcpErrno(icmp_type: u8, code: u8) i32 {
+    return switch (icmp_type) {
+        3 => if (code == 4 or code >= unreach_errno.len) 0 else unreach_errno[code].errno,
+        11 => 113,
+        12 => 71,
+        else => 0,
+    };
+}
+
+/// tcp_v6_err (icmpv6_err_convert): destination unreachable by code (an unknown code EPROTO), time exceeded EHOSTUNREACH,
+/// parameter problem EPROTO. Packet too big only lowers the path MTU; redirect and informational messages are no error.
+pub fn tcpErrno6(icmp_type: u8, code: u8) i32 {
+    return switch (icmp_type) {
+        1 => if (code < unreach6_errno.len) unreach6_errno[code].errno else 71,
+        3 => 113,
+        4 => 71,
+        else => 0,
+    };
+}
+
+/// The quoted segment counts only when its sequence number lies in [snd_una, snd_nxt] (tcp_v4_err's `between`), so a blind error
+/// cannot end a connection.
+pub fn tcpSeqOk(seq: u32, snd_una: u32, snd_nxt: u32) bool {
+    return seq -% snd_una <= snd_nxt -% snd_una;
+}
+
+pub const TcpErrAction = enum { ignore, abort, request, soft };
+
+/// What an error with an errno does to a connection in `state`: SYN_SENT ends with it (tcp_done_with_error: connect fails, POLLERR);
+/// SYN_RECEIVED is a connection a listener has not handed out yet, which tcp_req_err drops silently or keeps (`request`, see
+/// tcpReqAborts); an established or closing connection keeps it as the soft error (sk_err_soft), which SO_ERROR reports once;
+/// TIME_WAIT, LISTEN and CLOSED take nothing.
+pub fn tcpErrAction(state: @import("tcp_recv_policy.zig").TcpState) TcpErrAction {
+    return switch (state) {
+        .syn_sent => .abort,
+        .syn_received => .request,
+        .closed, .listen, .time_wait => .ignore,
+        else => .soft,
+    };
+}
+
+/// tcp_req_err: a connection still in the listener's queue is dropped (no error reaches anyone: accept() must not report network
+/// errors) when the error quotes its SYN-ACK (sequence = its ISN) and is parameter problem, time exceeded, or net or host
+/// unreachable; for ICMPv6 when icmpv6_err_convert calls it fatal (destination unreachable but no route, beyond scope and address
+/// unreachable; parameter problem). Any other error leaves it alone.
+pub fn tcpReqAborts(icmp_type: u8, code: u8) bool {
+    return icmp_type == 12 or icmp_type == 11 or (icmp_type == 3 and (code == 0 or code == 1));
+}
+
+pub fn tcpReqAborts6(icmp_type: u8, code: u8) bool {
+    return switch (icmp_type) {
+        1 => code >= unreach6_errno.len or unreach6_errno[code].hard,
+        4 => true,
+        else => false,
+    };
+}
+
+/// What an ICMP error quotes of a TCP segment: its ports, sequence number, source (this host) and destination.
+pub const TcpQuote = struct { src_port: u16, dst_port: u16, seq: u32, src4: [4]u8 = @splat(0), dst4: [4]u8 = @splat(0), src: [16]u8 = @splat(0), dst: [16]u8 = @splat(0) };
+
+/// The TCP segment quoted by an ICMP error (`msg` starts at the ICMP header): the quoted IPv4 header, then at least 8 bytes of TCP.
+pub fn parseTcpQuote(msg: []const u8) ?TcpQuote {
+    if (msg.len < 8 + 20 + 8) return null;
+    const ihl: usize = @as(usize, msg[8] & 0x0F) * 4;
+    if (ihl < 20 or msg.len < 8 + ihl + 8 or msg[8 + 9] != 6) return null;
+    const p = 8 + ihl;
+    return .{
+        .src_port = std.mem.readInt(u16, msg[p..][0..2], .big),
+        .dst_port = std.mem.readInt(u16, msg[p + 2 ..][0..2], .big),
+        .seq = std.mem.readInt(u32, msg[p + 4 ..][0..4], .big),
+        .src4 = msg[8 + 12 ..][0..4].*,
+        .dst4 = msg[8 + 16 ..][0..4].*,
+    };
+}
+
+/// The TCP segment quoted by an ICMPv6 error, after the quoted IPv6 header and its extension headers.
+pub fn parseTcpQuote6(msg: []const u8) ?TcpQuote {
+    if (msg.len < 8 + V6_IP_HEADER_LEN or (msg[8] >> 4) != 6) return null;
+    const inner = skipExtHdr6(msg[8..], V6_IP_HEADER_LEN, msg[8 + 6]) orelse return null;
+    const p = 8 + inner.off;
+    if (inner.nh != 6 or msg.len < p + 8) return null;
+    return .{
+        .src_port = std.mem.readInt(u16, msg[p..][0..2], .big),
+        .dst_port = std.mem.readInt(u16, msg[p + 2 ..][0..2], .big),
+        .seq = std.mem.readInt(u32, msg[p + 4 ..][0..4], .big),
+        .src = msg[8 + 8 ..][0..16].*,
+        .dst = msg[8 + 24 ..][0..16].*,
+    };
+}

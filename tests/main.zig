@@ -13559,7 +13559,7 @@ test "tcp: 128 TCB slots behind a multi-word bitset; a listener's ring holds eve
     try std.testing.expect(std.mem.indexOf(u8, ts, "const LISTEN_RING: u32 = MAX_CONNECTIONS;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (sib.pending_tail -% sib.pending_head >= LISTEN_RING) continue;") != null);
     // New SYNs are still limited by the backlog, only migration may go past it.
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, ts, "if (ls.pending_tail -% ls.pending_head >= LISTEN_BACKLOG) return;"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, ts, "if (ls.pending_tail -% ls.pending_head >= ls.accept_limit) return;")); // hello406: the listen() backlog, at most LISTEN_BACKLOG
 }
 
 test "tcp accept: a connection still in its handshake stays queued and does not hide an established one behind it" {
@@ -15407,4 +15407,95 @@ test "IPv4 neighbour unreachability detection (hello405): STALE, DELAY, PROBE, F
     try std.testing.expect(std.mem.indexOf(u8, as, "policy.onUse(&cache[i].nud, nowNs());") != null);
     try std.testing.expect(std.mem.indexOf(u8, as, "switch (policy.onTick(&cache[i].nud, now)) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, as, "addToCache(sender_ip, sender_mac, opcode == 2 and std.mem.eql(u8, data[0..6], &netif.getMac()));") != null);
+}
+
+test "ICMP errors for TCP (hello406): errno, the sequence window, hard in SYN_SENT and soft once connected (Linux tcp_v4_err / tcp_v6_err)" {
+    const up = kt.icmp_unreach_policy;
+    // tcp_v4_err: destination unreachable through icmp_err_convert (fragmentation needed is path MTU only, past 15 nothing),
+    // time exceeded EHOSTUNREACH, parameter problem EPROTO; source quench and redirect nothing.
+    try std.testing.expectEqual(@as(i32, 101), up.tcpErrno(3, 0));
+    try std.testing.expectEqual(@as(i32, 113), up.tcpErrno(3, 1));
+    try std.testing.expectEqual(@as(i32, 92), up.tcpErrno(3, 2));
+    try std.testing.expectEqual(@as(i32, 111), up.tcpErrno(3, 3));
+    try std.testing.expectEqual(@as(i32, 0), up.tcpErrno(3, 4));
+    try std.testing.expectEqual(@as(i32, 113), up.tcpErrno(3, 15));
+    try std.testing.expectEqual(@as(i32, 0), up.tcpErrno(3, 16));
+    try std.testing.expectEqual(@as(i32, 113), up.tcpErrno(11, 0));
+    try std.testing.expectEqual(@as(i32, 71), up.tcpErrno(12, 0));
+    try std.testing.expectEqual(@as(i32, 0), up.tcpErrno(4, 0));
+    try std.testing.expectEqual(@as(i32, 0), up.tcpErrno(5, 1));
+    // tcp_v6_err / icmpv6_err_convert: every destination unreachable code (an unknown one EPROTO), time exceeded, parameter
+    // problem; packet too big is path MTU only.
+    try std.testing.expectEqual(@as(i32, 111), up.tcpErrno6(1, 4));
+    try std.testing.expectEqual(@as(i32, 101), up.tcpErrno6(1, 0));
+    try std.testing.expectEqual(@as(i32, 13), up.tcpErrno6(1, 1));
+    try std.testing.expectEqual(@as(i32, 113), up.tcpErrno6(1, 3));
+    try std.testing.expectEqual(@as(i32, 71), up.tcpErrno6(1, 7));
+    try std.testing.expectEqual(@as(i32, 113), up.tcpErrno6(3, 0));
+    try std.testing.expectEqual(@as(i32, 71), up.tcpErrno6(4, 0));
+    try std.testing.expectEqual(@as(i32, 0), up.tcpErrno6(2, 0));
+    // The quoted segment's sequence number must lie in [snd_una, snd_nxt] (between), wrapping included.
+    try std.testing.expect(up.tcpSeqOk(100, 100, 101));
+    try std.testing.expect(up.tcpSeqOk(101, 100, 101));
+    try std.testing.expect(!up.tcpSeqOk(99, 100, 101));
+    try std.testing.expect(!up.tcpSeqOk(102, 100, 101));
+    try std.testing.expect(up.tcpSeqOk(2, 0xffff_fff0, 5));
+    // What the error does: SYN_SENT and SYN_RECEIVED end the connection, any other state only keeps it as the soft error.
+    try std.testing.expectEqual(up.TcpErrAction.abort, up.tcpErrAction(.syn_sent));
+    try std.testing.expectEqual(up.TcpErrAction.request, up.tcpErrAction(.syn_received));
+    // tcp_req_err: a queued connection is dropped for parameter problem, time exceeded, net or host unreachable only.
+    try std.testing.expect(up.tcpReqAborts(3, 0) and up.tcpReqAborts(3, 1) and up.tcpReqAborts(11, 0) and up.tcpReqAborts(12, 0));
+    try std.testing.expect(!up.tcpReqAborts(3, 3) and !up.tcpReqAborts(3, 2));
+    try std.testing.expect(up.tcpReqAborts6(1, 1) and up.tcpReqAborts6(1, 4) and up.tcpReqAborts6(4, 0) and up.tcpReqAborts6(1, 9));
+    try std.testing.expect(!up.tcpReqAborts6(1, 0) and !up.tcpReqAborts6(1, 3) and !up.tcpReqAborts6(3, 0) and !up.tcpReqAborts6(2, 0));
+    try std.testing.expectEqual(up.TcpErrAction.soft, up.tcpErrAction(.established));
+    try std.testing.expectEqual(up.TcpErrAction.soft, up.tcpErrAction(.close_wait));
+    try std.testing.expectEqual(up.TcpErrAction.ignore, up.tcpErrAction(.time_wait));
+    try std.testing.expectEqual(up.TcpErrAction.ignore, up.tcpErrAction(.listen));
+    try std.testing.expectEqual(up.TcpErrAction.ignore, up.tcpErrAction(.closed));
+    // The quote: the TCP ports and sequence number after the quoted IPv4 header, or after the IPv6 header and its extensions.
+    var m4: [8 + 20 + 8]u8 = @splat(0);
+    m4[0] = 3;
+    m4[8] = 0x45;
+    m4[8 + 9] = 6;
+    m4[28..36].* = .{ 0x9e, 0x26, 0x00, 0x50, 0xde, 0xad, 0xbe, 0xef };
+    const q4 = up.parseTcpQuote(&m4).?;
+    try std.testing.expectEqual(@as(u16, 0x9e26), q4.src_port);
+    try std.testing.expectEqual(@as(u16, 80), q4.dst_port);
+    try std.testing.expectEqual(@as(u32, 0xdeadbeef), q4.seq);
+    m4[8 + 9] = 17;
+    try std.testing.expect(up.parseTcpQuote(&m4) == null);
+    var m6: [8 + 40 + 8]u8 = @splat(0);
+    m6[0] = 1;
+    m6[8] = 0x60;
+    m6[8 + 6] = 6;
+    m6[8 + 39] = 1;
+    m6[48..56].* = .{ 0x9e, 0x27, 0x01, 0xbb, 0, 0, 0, 7 };
+    const q6 = up.parseTcpQuote6(&m6).?;
+    try std.testing.expectEqual(@as(u16, 443), q6.dst_port);
+    try std.testing.expectEqual(@as(u32, 7), q6.seq);
+    try std.testing.expectEqual(@as(u8, 1), q6.dst[15]);
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!up.tcpSeqOk(seq, tcb.snd_una, tcb.snd_nxt)) return;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.options.so_error != 0) return tcb.options.so_error;\n    if (tcb.reset_by_peer) return ECONNRESET;\n    return tcb.soft_err;") != null);
+    const ic = kt.icmp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ic, "if (unreach.parseTcpQuote(data[0..len])) |tq| @import(\"tcp.zig\").icmpError(tq, unreach.tcpErrno(icmp_type, icmp_code), unreach.tcpReqAborts(icmp_type, icmp_code));") != null);
+    const iv = kt.icmpv6_source;
+    try std.testing.expect(std.mem.indexOf(u8, iv, "if (unreach.parseTcpQuote6(data[0..len])) |tq| @import(\"tcp.zig\").icmpError6(tq, unreach.tcpErrno6(icmp_type, icmp_code), unreach.tcpReqAborts6(icmp_type, icmp_code));") != null);
+}
+
+test "listen backlog (hello406): the accept queue holds backlog + 1, clamped to somaxconn and the ring (Linux sk_acceptq_is_full)" {
+    const rp = kt.tcp_recv_policy;
+    // __sys_listen_socket clamps (unsigned) backlog to somaxconn (4096); sk_acceptq_is_full is ack_backlog > max_ack_backlog, so
+    // backlog + 1 connections wait. MoQiOS also stops at its own queue size.
+    try std.testing.expectEqual(@as(u32, 1), rp.acceptLimit(0, 32));
+    try std.testing.expectEqual(@as(u32, 2), rp.acceptLimit(1, 32));
+    try std.testing.expectEqual(@as(u32, 4), rp.acceptLimit(3, 32));
+    try std.testing.expectEqual(@as(u32, 32), rp.acceptLimit(40, 32));
+    try std.testing.expectEqual(@as(u32, 32), rp.acceptLimit(0xffff_ffff, 32));
+    try std.testing.expectEqual(@as(u32, 41), rp.acceptLimit(40, 128));
+    const ts = kt.tcp_source;
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, ts, "if (ls.pending_tail -% ls.pending_head >= ls.accept_limit) return;"));
+    try std.testing.expect(std.mem.indexOf(u8, ts, "pub fn tcpListen(tcb_idx: u32, backlog: u32) i64 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "const result = net_mod.tcp.tcpListen(tcb_idx, backlog);") != null);
 }

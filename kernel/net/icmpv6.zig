@@ -110,12 +110,14 @@ pub fn handlePacket(
     const icmp_type = data[0];
     const icmp_code = data[1];
 
-    // An error about a packet this host sent (icmpv6_notify): packet too big first lowers the path MTU (icmpv6_err), then a hard
-    // error goes to the connected IPv6 UDP socket that sent the quoted datagram (__udp6_lib_err), or to the connected IPv6 ping
+    // An error about a packet this host sent (icmpv6_notify): packet too big first lowers the path MTU (icmpv6_err), an error
+    // quoting a TCP segment goes to its connection, and a hard error goes to the connected IPv6 UDP socket that sent the quoted datagram (__udp6_lib_err), or to the connected IPv6 ping
     // socket whose echo request it quotes (ping_err).
     const unreach = @import("icmp_unreach_policy.zig");
     if (unreach.isError6(icmp_type)) {
         if (icmp_type == PACKET_TOO_BIG) handlePacketTooBig(data, len);
+        // An error quoting a TCP segment goes to its connection (tcp_v6_err).
+        if (unreach.parseTcpQuote6(data[0..len])) |tq| @import("tcp.zig").icmpError6(tq, unreach.tcpErrno6(icmp_type, icmp_code), unreach.tcpReqAborts6(icmp_type, icmp_code));
         const q = unreach.parseErrorQuote6(data[0..len]) orelse return;
         switch (q.kind) {
             .udp => @import("udp.zig").notifyError6(q.src_port, q.dst_port, q.dst, unreach.errnoFor6(icmp_type, icmp_code, false)),

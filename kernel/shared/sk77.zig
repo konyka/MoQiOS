@@ -58,7 +58,7 @@ pub fn announce() void {
 
     const listen_idx = tcp.tcpSocket(0);
     if (listen_idx < 0 or tcp.tcpSetIpv6(@intCast(listen_idx)) < 0 or
-        tcp.tcpBind(@intCast(listen_idx), LOCAL) < 0 or tcp.tcpListen(@intCast(listen_idx)) < 0)
+        tcp.tcpBind(@intCast(listen_idx), LOCAL) < 0 or tcp.tcpListen(@intCast(listen_idx), 32) < 0)
     {
         fail("listen");
         return;
