@@ -133,6 +133,30 @@ pub fn filterBlocks(filter: [FILTER_LEN]u8, icmp_type: u8) bool {
     return (word >> @intCast(icmp_type & 31)) & 1 != 0;
 }
 
+/// icmp_filter (net/ipv4/raw.c): whether an IPv4 socket's ICMP_FILTER mask blocks ICMP type `icmp_type`. Bit n blocks type n;
+/// types 32 and up are never blocked.
+pub fn icmpFilterBlocks(mask: u32, icmp_type: u8) bool {
+    if (icmp_type >= 32) return false;
+    return (mask >> @intCast(icmp_type)) & 1 != 0;
+}
+
+/// The ICMP type of a received IPv4 datagram (IP header first), or null when it has no room for an ICMP header after the IP
+/// header: icmp_filter lets such a datagram through.
+pub fn icmpTypeOf(dgram: []const u8) ?u8 {
+    if (dgram.len < 20) return null;
+    const ihl: usize = @as(usize, dgram[0] & 0x0f) * 4;
+    if (ihl < 20 or dgram.len < ihl + 8) return null;
+    return dgram[ihl];
+}
+
+/// raw_seticmpfilter: at most 4 bytes of `val` over the current mask (little-endian struct icmp_filter), the rest unchanged.
+pub fn setIcmpFilter(mask: u32, val: []const u8) u32 {
+    var b: [4]u8 = @bitCast(mask);
+    const n = @min(val.len, 4);
+    @memcpy(b[0..n], val[0..n]);
+    return @bitCast(b);
+}
+
 /// setsockopt(ICMP6_FILTER): at most 32 bytes are taken, the rest of the filter stays as it was (rawv6_seticmpfilter).
 pub fn setFilter(filter: *[FILTER_LEN]u8, val: []const u8) void {
     const n = @min(val.len, FILTER_LEN);

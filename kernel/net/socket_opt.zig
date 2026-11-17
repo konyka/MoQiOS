@@ -592,16 +592,22 @@ fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
 }
 
 const SOL_ICMPV6: u64 = 58;
+/// SOL_RAW (255): ICMP_FILTER (option 1) on an IPv4 raw ICMP socket (raw_setsockopt); every other SOL_RAW option, and SOL_RAW on an
+/// IPv6 raw socket (IPV6_CHECKSUM there is not supported), is ENOPROTOOPT.
+const SOL_RAW: u64 = 255;
+const ICMP_FILTER: u64 = 1;
 /// ICMP6_FILTER (SOL_ICMPV6 option 1): the per-socket type filter of an IPv6 raw ICMPv6 socket.
 const ICMP6_FILTER: u64 = 1;
 /// IPV6_CHECKSUM (SOL_IPV6 option 7): where the kernel puts the checksum; fixed at offset 2 for ICMPv6 (rawv6_setsockopt).
 const IPV6_CHECKSUM: u64 = 7;
 
-const RawV6Opt = enum { filter, checksum, noprotoopt };
+const RawV6Opt = enum { filter, checksum, icmp_filter, noprotoopt };
 
 /// Which raw-socket option a SOL_ICMPV6 or SOL_IPV6 request names: ICMP6_FILTER and IPV6_CHECKSUM on an IPv6 socket; any other
-/// SOL_ICMPV6 option, and SOL_ICMPV6 on an IPv4 raw socket, is ENOPROTOOPT. Null: not one of these.
+/// SOL_ICMPV6 option, and SOL_ICMPV6 on an IPv4 raw socket, is ENOPROTOOPT. SOL_RAW ICMP_FILTER on an IPv4 socket. Null: not one of
+/// these.
 fn rawV6Opt(v6: bool, level: u64, optname: u64) ?RawV6Opt {
+    if (level == SOL_RAW) return if (!v6 and optname == ICMP_FILTER) .icmp_filter else .noprotoopt;
     if (level == SOL_ICMPV6) return if (v6 and optname == ICMP6_FILTER) .filter else .noprotoopt;
     if (v6 and level == ipo.SOL_IPV6 and optname == IPV6_CHECKSUM) return .checksum;
     return null;
@@ -612,6 +618,16 @@ fn setRawV6Opt(idx: u32, which: RawV6Opt, optval_ptr: u64, optlen: u64) i64 {
         .noprotoopt => return -92,
         // rawv6_setsockopt: an ICMPv6 socket's checksum offset cannot be moved.
         .checksum => return -22,
+        .icmp_filter => {
+            const copy_mod = @import("../mm/copy_from_user.zig");
+            const n: usize = @intCast(@min(optlen, 4));
+            var val: [4]u8 = undefined;
+            if (n != 0) {
+                if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;
+                if (copy_mod.copyFromUser(val[0..n], @ptrFromInt(optval_ptr), n) != n) return -14;
+            }
+            return if (@import("raw_icmp.zig").setIcmpFilter(idx, val[0..n])) 0 else -9;
+        },
         .filter => {
             const copy_mod = @import("../mm/copy_from_user.zig");
             const n: usize = @intCast(@min(optlen, @import("raw_icmp_policy.zig").FILTER_LEN));
@@ -634,11 +650,16 @@ fn getRawV6Opt(idx: u32, which: RawV6Opt, optval_ptr: u64, optlen_ptr: u64) i64 
     var len_buf: [4]u8 = undefined;
     if (copy_mod.copyFromUser(&len_buf, @ptrFromInt(optlen_ptr), 4) != 4) return -14;
     const user_len = bo.readU32Le(&len_buf);
+    // raw_geticmpfilter / rawv6_geticmpfilter: a negative length is EINVAL (do_rawv6_getsockopt takes it as unsigned for
+    // IPV6_CHECKSUM, so 4 bytes).
+    if (which != .checksum and @as(i32, @bitCast(user_len)) < 0) return -22;
     var val: [@import("raw_icmp_policy.zig").FILTER_LEN]u8 = @splat(0);
     var full: u32 = 4;
     if (which == .filter) {
         val = @import("raw_icmp.zig").getFilter(idx);
         full = @import("raw_icmp_policy.zig").FILTER_LEN;
+    } else if (which == .icmp_filter) {
+        bo.writeU32Le(val[0..4], @import("raw_icmp.zig").getIcmpFilter(idx));
     } else bo.writeU32Le(val[0..4], 2);
     const n = @min(user_len, full);
     if (n > 0 and copy_mod.copyToUser(@ptrFromInt(optval_ptr), val[0..n], n) != n) return -14;

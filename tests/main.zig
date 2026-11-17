@@ -15086,3 +15086,30 @@ test "raw ICMP queue is a ring and MSG_PEEK leaves the head (hello398)" {
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "switch (raw.recv(d.raw_idx, out, (flags & 0x02) != 0)) {") != null);
 }
+
+test "ICMP_FILTER on IPv4 raw ICMP sockets (hello399): a set bit blocks that type below 32 (Linux icmp_filter)" {
+    const rp = kt.raw_icmp_policy;
+    try std.testing.expect(!rp.icmpFilterBlocks(0, 8));
+    try std.testing.expect(rp.icmpFilterBlocks(1 << 8, 8));
+    try std.testing.expect(!rp.icmpFilterBlocks(1 << 8, 0));
+    try std.testing.expect(rp.icmpFilterBlocks(0x8000_0000, 31));
+    try std.testing.expect(!rp.icmpFilterBlocks(0xffff_ffff, 32));
+    try std.testing.expect(!rp.icmpFilterBlocks(0xffff_ffff, 255));
+    // The ICMP type sits at the IP header's length into the datagram; a datagram too short to hold it passes (no ICMP header).
+    var dg: [28]u8 = @splat(0);
+    dg[0] = 0x45;
+    dg[20] = 8;
+    try std.testing.expectEqual(@as(?u8, 8), rp.icmpTypeOf(&dg));
+    try std.testing.expectEqual(@as(?u8, null), rp.icmpTypeOf(dg[0..20]));
+    dg[0] = 0x46;
+    try std.testing.expectEqual(@as(?u8, null), rp.icmpTypeOf(dg[0..24]));
+    // setsockopt takes at most 4 bytes over the current mask, little-endian.
+    try std.testing.expectEqual(@as(u32, 0x1111_bbaa), rp.setIcmpFilter(0x1111_1111, &.{ 0xaa, 0xbb }));
+    try std.testing.expectEqual(@as(u32, 0x0403_0201), rp.setIcmpFilter(0, &.{ 1, 2, 3, 4, 5, 6 }));
+    const rs = kt.raw_icmp_source;
+    try std.testing.expect(std.mem.indexOf(u8, rs, "if (policy.icmpTypeOf(dgram)) |ty| if (policy.icmpFilterBlocks(s.icmp_filter, ty)) continue;") != null);
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (level == SOL_RAW) return if (!v6 and optname == ICMP_FILTER) .icmp_filter else .noprotoopt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (which != .checksum and @as(i32, @bitCast(user_len)) < 0) return -22;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "bo.writeU32Le(val[0..4], @import(\"raw_icmp.zig\").getIcmpFilter(idx));") != null);
+}

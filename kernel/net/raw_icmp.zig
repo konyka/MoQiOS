@@ -45,6 +45,8 @@ const Socket = struct {
     /// connect() named a peer (an IPv6 socket may be connected to ::).
     connected: bool = false,
     filter: [policy.FILTER_LEN]u8 = @splat(0),
+    /// ICMP_FILTER of an IPv4 socket (SOL_RAW option 1): bit n blocks ICMP type n.
+    icmp_filter: u32 = 0,
     shut_rd: bool = false,
     shut_wr: bool = false,
     /// SOL_SOCKET options (SO_RCVTIMEO, SO_RCVBUF, ...): one copy per socket, so every descriptor naming it sees the same set.
@@ -208,6 +210,22 @@ pub fn getFilter(idx: u32) [policy.FILTER_LEN]u8 {
     return sockets[idx].filter;
 }
 
+pub fn getIcmpFilter(idx: u32) u32 {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return 0;
+    return sockets[idx].icmp_filter;
+}
+
+/// setsockopt(ICMP_FILTER): the first min(len, 4) bytes of the mask.
+pub fn setIcmpFilter(idx: u32, val: []const u8) bool {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return false;
+    sockets[idx].icmp_filter = policy.setIcmpFilter(sockets[idx].icmp_filter, val);
+    return true;
+}
+
 /// setsockopt(ICMP6_FILTER): the first min(len, 32) bytes of the filter.
 pub fn setFilter(idx: u32, val: []const u8) bool {
     const saved = raw_lock.acquire();
@@ -281,6 +299,7 @@ pub fn deliver(dgram: []const u8, src: [4]u8, dst: [4]u8) void {
             if (!s.used) continue;
             if (s.v6) continue;
             if (!policy.matches(s.bound, s.peer, src, dst)) continue;
+            if (policy.icmpTypeOf(dgram)) |ty| if (policy.icmpFilterBlocks(s.icmp_filter, ty)) continue;
             const at = policy.enqueueSlot(s.head, s.count) orelse continue;
             const e = &s.queue[at];
             const copy_len = @min(dgram.len, RAW_QUEUE_LEN);

@@ -10323,7 +10323,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - QEMU：hello397 6 项在完整 smoke SMP=2、SMP=4 下全过。取红灯（只回退内核修复、保留能力配置，hello397 提前到 hello3 之前）：6 项全部失败，sendmsg/recvmsg 都是 -88，带 MSG_TRUNC 的 recvmsg 是 -22。完整 smoke：SMP=2、SMP=1 各一份 `PASS`；SMP=4 前两份只有已记录的偶发项 hello286 J（33/60、37/60）失败，hello397 在两份里都是 PASS（hello397 只动 raw 套接字的 sendmsg/recvmsg，不涉及信号和作业控制）。恢复修复后重跑第三份 SMP=4，`PASS`。riscv64 和 aarch64 交叉构建通过，但没有在这两个架构上跑 QEMU。
 - 局限：
   1. 不读控制消息（没有 IP_PKTINFO、IP_TTL 一类的 cmsg），`msg_controllen` 恒为 0。
-  2. 没有 MSG_PEEK、MSG_ERRQUEUE。
+  2. 没有 MSG_ERRQUEUE（MSG_PEEK 见 hello398）。
   3. sendmsg 一次最多 1500 字节（`MAX_HDRINCL`），与 sendto 相同。
 
 ## 补充：raw 套接字的接收队列顺序和 MSG_PEEK（hello398）
@@ -10342,3 +10342,22 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 局限：
   1. 队列仍是每个套接字 8 项、每项 1500 字节，不按 SO_RCVBUF 计量；满了直接丢弃，不计入任何统计。
   2. 不支持 MSG_PEEK 配合 SO_PEEK_OFF。
+
+## 补充：IPv4 raw 套接字的 ICMP_FILTER（hello399）
+
+- 问题：IPv4 raw ICMP 套接字没有 ICMP_FILTER（SOL_RAW 选项 1），set 和 get 都是 ENOPROTOOPT。套接字会收到本机收到的全部 ICMP 报文，只想要回显应答的 ping 类工具没法在内核里过滤掉别的类型。
+- Linux 语义（3rd/linux-7.0.6 `net/ipv4/raw.c`）：
+  - `raw_setsockopt`/`raw_getsockopt` 只把 SOL_RAW 留给自己，其他层交给 `ip_setsockopt`/`ip_getsockopt`；`do_raw_setsockopt` 只认 ICMP_FILTER，其他选项 ENOPROTOOPT。
+  - `raw_seticmpfilter` 最多拷 4 字节，其余不变；`raw_geticmpfilter` 长度为负 EINVAL，最多读 4 字节并写回长度。
+  - `raw_v4_input` 对 ICMP 数据报调 `icmp_filter`：类型小于 32 时看掩码的对应位，置位就不交给这个套接字；更大的类型不过滤；放不下 ICMP 头的数据报也不过滤。`raw_sk_init` 把掩码清零。
+  - IPv6 raw 套接字的 SOL_RAW 只有 IPV6_CHECKSUM、IPV6_HDRINCL（`do_rawv6_setsockopt`），ICMP_FILTER 是 ENOPROTOOPT。
+- 宿主机实测（`user/hello399.c -DHOST`，root、`unshare -n`、只有 lo）：6 项（G B R L N H）全部通过。另外用探针测了各种套接字在不认识的层上的返回值：IPv4 UDP、TCP 和 AF_UNIX 的 get 是 EOPNOTSUPP（-95），IPv6 套接字的 get 和所有套接字的 set 是 ENOPROTOOPT（-92）。MoQiOS 里 IPv4 套接字在 SOL_RAW、SOL_TCP 这类层上的 get 仍返回 ENOPROTOOPT，见局限。
+- 修复：
+  - `raw_icmp_policy.zig`：新增 `icmpFilterBlocks`、`icmpTypeOf`、`setIcmpFilter`。
+  - `raw_icmp.zig`：`Socket.icmp_filter`（`open` 时随整个槽清零）；`deliver` 在 `matches` 之后按掩码丢弃；新增 `getIcmpFilter`、`setIcmpFilter`。
+  - `socket_opt.zig`：`rawV6Opt` 识别 SOL_RAW（IPv4 的 ICMP_FILTER 为 `.icmp_filter`，其余 `.noprotoopt`）；`setRawV6Opt`、`getRawV6Opt` 读写掩码；getsockopt 长度为负时 EINVAL（ICMP6_FILTER 也一样，IPV6_CHECKSUM 除外）。
+- host 测试 "ICMP_FILTER on IPv4 raw ICMP sockets (hello399)…"：实现前编译失败（`icmpFilterBlocks` 不存在），实现后通过。变异验证：删掉 `deliver` 里的过滤那一行，测试失败；已恢复。
+- QEMU：完整 smoke SMP=2、SMP=4 各一份 `PASS`，hello399 6 项全过；恢复修复后 SMP=1 完整 smoke `PASS`。取红灯（只回退内核修复、保留能力配置，hello399 提前到 hello3 之前）：G B R L H 失败（ICMP_FILTER 的 set、get 都是 -92，请求和应答都收回），N 通过（它本来就要求 ENOPROTOOPT）。riscv64 和 aarch64 交叉构建通过，但没有在这两个架构上跑 QEMU。
+- 局限：
+  1. 掩码只对 IPv4 raw 套接字起作用；IPv6 用 ICMP6_FILTER（hello391）。
+  2. 不认识的层上的 getsockopt：Linux 对 IPv4 TCP、UDP、raw 和 AF_UNIX 套接字返回 EOPNOTSUPP，MoQiOS 除 SOL_IP/SOL_IPV6 外仍返回 ENOPROTOOPT。
