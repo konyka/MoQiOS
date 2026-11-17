@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello388`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello389`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -383,6 +383,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello386 | 绑定 127/8 的套接字不能经网卡发送：UDP 绑 127.0.0.1 后 sendto 网关、8.8.8.8、子网广播是 EINVAL，发往 127.9.9.9、本机 10.0.2.15、255.255.255.255、224.0.0.1 照发，名字不变（U）；sendmsg 同样（M）；connect 网关 EINVAL，之后仍未连接（C）；TCP 绑 127.0.0.1 connect 网关 EINVAL（阻塞、非阻塞都是），SO_ERROR 0，之后能连本机监听者（T）；绑网卡地址发往 127.0.0.1 照发（B）；ping 套接字绑 127.0.0.1 发往网关和 connect 都是 EINVAL，发往本机照发（P） |
 | hello387 | net.ipv4.conf.<dev>.route_localnet：设备目录列出 route_localnet 和 proxy_arp，四个值都是 0（L）；都为 0 时绑 127.0.0.1 发往网关是 EINVAL（N）；网卡置 1 或 all 置 1 就能发（1），lo 置 1 或 default 置 1 仍不能（EINVAL），因为出接口是网卡（E）；7 和 -1 都算开（V）；网卡置 1 时非阻塞 TCP connect 从 127.0.0.1 到网关是 EINPROGRESS 而不是 EINVAL（T）；测试结束四个值都回到 0（R） |
 | hello388 | UDP 套接字没有很小的全局上限：一个进程同时开 100 个 IPv4 UDP 套接字，每个都能 sendto 127.0.0.1:9 并拿到不同端口（S）；紧接着这阵发送（每个都引出一个 ICMP 端口不可达）之后，一个套接字发给另一个仍能收到（B）；100 个设 SO_REUSEADDR 的套接字都能绑 127.0.0.1:40388，发过去的数据报恰好一个收到（R）；100 个 IPv6 UDP 套接字都能开、都能发 [::1]:9（V）；全部关闭后新套接字收发正常（C） |
+| hello389 | IPv4 raw ICMP 套接字（`socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)`，要 CAP_NET_RAW）：SO_TYPE、SO_PROTOCOL、getsockname 端口位是协议号 1（A）；未连接 send/write 返回 EDESTADDRREQ，8 字节地址 EINVAL，AF_INET6 地址 EAFNOSUPPORT（S）；sendto 127.0.0.1 的回显请求，套接字收到请求和内核的回显应答两份（带 IP 头，来源 127.0.0.1 端口 0），之后 EAGAIN（E）；poll POLLIN（P）；MSG_TRUNC 返回整个长度（T）；connect 后只收对端来的、write/read 可用（C）；bind 过滤目的地址、非本机地址 EADDRNOTAVAIL（B）；connect(AF_UNSPEC) 解除连接（U）；dup 共享套接字（D）；多个 raw 套接字各收一份（M）；UDP 发往无人端口引出的端口不可达也能收到（X）；raw 套接字写的端口不可达设已连接 UDP 套接字的 SO_ERROR 111（I）；listen/accept 返回 EOPNOTSUPP（L） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

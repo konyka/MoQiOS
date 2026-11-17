@@ -96,7 +96,8 @@ pub fn sendFrom(bound: [4]u8, dst: [4]u8, msg: []const u8) i64 {
         arp.queueFrame(hop, &pkt, frame_len);
         return 0;
     }
-    const ok = if (via_lo) lo.sendPacket(&pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt, frame_len);
+    // A loopback frame is delivered at once, so a ping socket's reply is queued by the time its send returns.
+    const ok = if (via_lo) lo.sendNow(&pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt, frame_len);
     return if (ok) 0 else -105;
 }
 

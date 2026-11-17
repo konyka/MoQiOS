@@ -1251,6 +1251,8 @@ pub const FileDescriptor = struct {
     epoll_idx: u32 = 0,
     eventfd_idx: u32 = 0,
     unix_sock_idx: u32 = 0,
+    /// Raw ICMP socket slot (net/raw_icmp.zig) for .raw_socket fds.
+    raw_idx: u32 = 0,
     timerfd_idx: u32 = 0,
     inotify_idx: u32 = 0,
     tmpfs_idx: u32 = 0,
@@ -2306,14 +2308,8 @@ pub const FdTable = struct {
                 if (n > 0) desc.offset += @intCast(n);
                 return n;
             },
-            .raw_socket => {
-                // Raw socket: receive raw ethernet frame
-                const nic = @import("../net/nic.zig");
-                if (!nic.isActive()) return -1;
-                const max: u32 = @intCast(@min(count, 2048));
-                const n = nic.receivePacket(buf, max);
-                return @intCast(n);
-            },
+            // read() on a raw ICMP socket is recv() with no flags: the next datagram, IP header included.
+            .raw_socket => return @import("../net/socket_syscall.zig").rawRecvInto(desc, buf[0..count], 0, null),
         }
     }
 
@@ -2524,17 +2520,8 @@ pub const FdTable = struct {
             .pidfd => return -1,
             .inotify => return -1, // inotify is read-only via special path
             .mqueue => return -22, // EINVAL: an mq descriptor has no write (Linux mqueue_file_operations)
-            .raw_socket => {
-                // Raw socket: send raw ethernet frame
-                const nic = @import("../net/nic.zig");
-                if (!nic.isActive()) return -1;
-                if (count > 2048) return -22; // EMSGSIZE
-                const len: u32 = @intCast(count);
-                if (nic.sendPacket(buf, len)) {
-                    return @intCast(count);
-                }
-                return -1;
-            },
+            // write() on a raw ICMP socket is send() to the connected peer.
+            .raw_socket => return @import("../net/socket_syscall.zig").rawSendFrom(desc, buf[0..count], null),
         }
     }
 
@@ -2778,6 +2765,10 @@ pub const FdTable = struct {
                     self.slot_locks[i].release(flags);
                     return true;
                 },
+                .raw_socket => if (other.raw_idx == desc.raw_idx) {
+                    self.slot_locks[i].release(flags);
+                    return true;
+                },
                 .timerfd => if (other.timerfd_idx == desc.timerfd_idx) {
                     self.slot_locks[i].release(flags);
                     return true;
@@ -2918,6 +2909,7 @@ pub const FdTable = struct {
             const unix_mod = @import("../net/unix_socket.zig");
             unix_mod.unixCloseAndReap(desc.unix_sock_idx);
         }
+        if (desc.fd_type == .raw_socket) @import("../net/raw_icmp.zig").release(desc.raw_idx);
         if (desc.fd_type == .timerfd) {
             const timerfd_mod = @import("../ipc/timerfd.zig");
             timerfd_mod.timerfdClose(desc.timerfd_idx);
@@ -3298,6 +3290,7 @@ fn retainResource(desc: *const FileDescriptor) bool {
         .udp_socket => @import("../net/udp.zig").retainPort(desc.udpKey()),
         .epoll => @import("../net/epoll.zig").epollRetain(desc.epoll_idx),
         .unix_socket => @import("../net/unix_socket.zig").unixRetain(desc.unix_sock_idx),
+        .raw_socket => @import("../net/raw_icmp.zig").retain(desc.raw_idx),
         .timerfd => @import("../ipc/timerfd.zig").timerfdRetain(desc.timerfd_idx),
         .eventfd => @import("eventfd.zig").eventfdRetain(desc.eventfd_idx),
         .mqueue => return @import("../ipc/posix_mq.zig").retainDescription(desc.mq_desc_idx, desc.mq_desc_gen),
@@ -3318,6 +3311,7 @@ fn releaseResource(desc: *const FileDescriptor) void {
         .udp_socket => @import("../net/udp.zig").releasePort(desc.udpKey()),
         .epoll => @import("../net/epoll.zig").epollDestroy(desc.epoll_idx),
         .unix_socket => @import("../net/unix_socket.zig").unixCloseAndReap(desc.unix_sock_idx),
+        .raw_socket => @import("../net/raw_icmp.zig").release(desc.raw_idx),
         .timerfd => @import("../ipc/timerfd.zig").timerfdClose(desc.timerfd_idx),
         .eventfd => @import("eventfd.zig").eventfdClose(desc.eventfd_idx),
         .mqueue => @import("../ipc/posix_mq.zig").closeDescription(desc.mq_desc_idx, desc.mq_desc_gen),
@@ -3397,6 +3391,7 @@ pub fn retainSharedResources(table: *FdTable) void {
                 .udp_socket => seen = other.udpKey() == desc.udpKey(),
                 .epoll => seen = other.epoll_idx == desc.epoll_idx,
                 .unix_socket => seen = other.unix_sock_idx == desc.unix_sock_idx,
+                .raw_socket => seen = other.raw_idx == desc.raw_idx,
                 .timerfd => seen = other.timerfd_idx == desc.timerfd_idx,
                 .eventfd => seen = other.eventfd_idx == desc.eventfd_idx,
                 else => {},
@@ -3413,6 +3408,7 @@ pub fn retainSharedResources(table: *FdTable) void {
             .udp_socket => @import("../net/udp.zig").retainPort(desc.udpKey()),
             .epoll => @import("../net/epoll.zig").epollRetain(desc.epoll_idx),
             .unix_socket => @import("../net/unix_socket.zig").unixRetain(desc.unix_sock_idx),
+            .raw_socket => @import("../net/raw_icmp.zig").retain(desc.raw_idx),
             .timerfd => @import("../ipc/timerfd.zig").timerfdRetain(desc.timerfd_idx),
             .eventfd => @import("eventfd.zig").eventfdRetain(desc.eventfd_idx),
             else => {},

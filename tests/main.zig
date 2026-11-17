@@ -14527,8 +14527,8 @@ test "route4 policy: a socket bound to 127/8 cannot send or connect out through 
 
     // Wired into UDP sendto / sendmsg / connect, the ping send and connect, and TCP connect, before anything is sent.
     const ss = kt.socket_syscall_source;
-    // Five call sites: the ping send, sendto and sendmsg of UDP, the UDP/ping connect and the TCP connect.
-    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, ss, "route4_policy.zig\").loopbackSourceErrno("));
+    // Six call sites: the ping send, sendto and sendmsg of UDP, the raw ICMP send, the UDP/ping connect and the TCP connect.
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, ss, "route4_policy.zig\").loopbackSourceErrno("));
 }
 
 test "devconf policy: net.ipv4.conf.<dev>.route_localnet gates the loopback-source check on the output device (Linux IN_DEV_ROUTE_LOCALNET, hello387)" {
@@ -14565,10 +14565,10 @@ test "devconf policy: net.ipv4.conf.<dev>.route_localnet gates the loopback-sour
     try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(lb, .{ 10, 0, 2, 2 }, our, true));
     try std.testing.expectEqual(@as(i64, 0), rp.loopbackSourceErrno(lb, .{ 127, 9, 9, 9 }, our, false));
 
-    // Wiring: the five call sites pass the conf switch of the output device (the NIC here), procfs and vfs serve the new file.
+    // Wiring: the six call sites pass the conf switch of the output device (the NIC here), procfs and vfs serve the new file.
     const ss = kt.socket_syscall_source;
-    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, ss, "loopbackSourceErrno("));
-    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, ss, ".loopbackAllowed()"));
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, ss, "loopbackSourceErrno("));
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, ss, ".loopbackAllowed()"));
     const pf = kt.procfs_source;
     try std.testing.expect(std.mem.indexOf(u8, pf, ".conf_dev_dir => &.{ .{ .name = \"proxy_arp\", .dtype = DT_REG }, .{ .name = \"route_localnet\", .dtype = DT_REG } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".conf_file => @intCast(@import(\"../net/arp.zig\").confRead(@import(\"../net/devconf_policy.zig\").decode(pid), buf[0..@min(max_len, 16)])),") != null);
@@ -14617,4 +14617,52 @@ test "sched: a switch reads the TSC for the outgoing slice inside the CPU-time w
     try std.testing.expect(std.mem.indexOf(u8, src, "const now_tsc = tsc_mod.read();\n    // The slice is folded") == null);
     try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "runtimeUs(0, t.sched_in_tsc, sched.switchTsc(), tsc_mod.tsc_freq_mhz);") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "asm volatile (\"lfence\" ::: .{ .memory = true });\n    return @import(\"../arch/arch.zig\").tsc.read();") != null);
+}
+
+test "raw ICMP socket policy (hello389): protocol, delivery filter, destination and names (Linux raw.c)" {
+    const rp = kt.raw_icmp_policy;
+    try std.testing.expectEqual(@as(i64, 0), rp.protocolErrno(1));
+    try std.testing.expectEqual(@as(i64, -93), rp.protocolErrno(0));
+    try std.testing.expectEqual(@as(i64, -93), rp.protocolErrno(17));
+    const any = [4]u8{ 0, 0, 0, 0 };
+    const l1 = [4]u8{ 127, 0, 0, 1 };
+    const l2 = [4]u8{ 127, 0, 0, 2 };
+    try std.testing.expect(rp.matches(any, any, l1, l1));
+    try std.testing.expect(rp.matches(l1, l1, l1, l1));
+    try std.testing.expect(!rp.matches(l2, any, l1, l1)); // bound elsewhere
+    try std.testing.expect(!rp.matches(any, l2, l1, l1)); // connected to another peer
+    try std.testing.expect(rp.matches(l2, any, l1, l2));
+    try std.testing.expectEqual(@as(i64, -89), rp.sendtoErrno(false, 0, 0, false));
+    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno(false, 0, 0, true));
+    try std.testing.expectEqual(@as(i64, -22), rp.sendtoErrno(true, 8, 2, false));
+    try std.testing.expectEqual(@as(i64, -97), rp.sendtoErrno(true, 28, 10, false));
+    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno(true, 16, 2, false));
+    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno(true, 16, 0, false));
+    try std.testing.expectEqual(@as(i64, -22), rp.addrLenErrno(8));
+    try std.testing.expectEqual(@as(i64, 0), rp.addrLenErrno(16));
+    var dg: [28]u8 = @splat(0);
+    dg[12] = 10;
+    dg[15] = 7;
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 0, 7 }, &rp.sourceOf(&dg));
+    const n = rp.sockName(l2);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 0, 0, 1, 127, 0, 0, 2 }, n[0..8]);
+    const f = rp.fromName(l1);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 0, 0, 0, 127, 0, 0, 1 }, f[0..8]);
+    try std.testing.expectEqual(@as(u32, 1), kt.sockopt_policy.identity(.raw, false).protocol);
+}
+
+test "raw ICMP socket wiring (hello389): received ICMP reaches raw sockets first, descriptors share the socket, sends go out at once" {
+    const m = kt.net_mod_source;
+    const at_raw = std.mem.indexOf(u8, m, "@import(\"raw_icmp.zig\").deliver(data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip);") orelse return error.TestUnexpectedResult;
+    const at_icmp = std.mem.indexOf(u8, m, "icmp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len);").?;
+    try std.testing.expect(at_raw < at_icmp);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const perr = @import(\"raw_icmp_policy.zig\").protocolErrno(protocol);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "Allocate raw socket fd") == null);
+    const v = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, v, ".raw_socket => @import(\"../net/raw_icmp.zig\").retain(desc.raw_idx),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, ".raw_socket => @import(\"../net/raw_icmp.zig\").release(desc.raw_idx),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, ".raw_socket => if (other.raw_idx == desc.raw_idx) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "Raw socket: receive raw ethernet frame") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "lo.sendNow(&pkt, frame_len) or lo.dropIsLoss(frame_len)") != null);
 }

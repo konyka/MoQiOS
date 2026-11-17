@@ -853,6 +853,7 @@ fn resourceIdxFromDesc(desc: *const vfs.FileDescriptor) u32 {
         .eventfd => desc.eventfd_idx,
         .timerfd => desc.timerfd_idx,
         .unix_socket => desc.unix_sock_idx,
+        .raw_socket => desc.raw_idx,
         .devfs => desc.devfs_idx,
         .devfs_ctrl => desc.devfs_ctrl_idx,
         .mqueue => desc.mq_desc_idx,
@@ -964,7 +965,8 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32, kmsg_cursor: u64
             revents |= EPOLLIN | EPOLLOUT;
         },
         .raw_socket => {
-            revents |= EPOLLOUT; // no per-socket RX queue to test
+            if (@import("raw_icmp.zig").hasData(resource_idx)) revents |= EPOLLIN;
+            revents |= EPOLLOUT;
         },
         // Linux mqueue_poll_file: POLLIN while a message is queued, POLLOUT while there is room.
         .mqueue => revents |= @import("../ipc/posix_mq.zig").pollEvents(resource_idx),

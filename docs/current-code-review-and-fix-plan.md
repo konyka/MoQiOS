@@ -10187,3 +10187,23 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 局限：
   1. 修复的效果只能靠以后的 smoke 观察，本轮没有在目标机上复现过倒退（红灯），所以算不上验证过。
   2. 非 x86 架构上 `switchTsc` 不加屏障，只读计数器；这两个架构上没有验证这个顺序。
+
+## 补充：IPv4 raw ICMP 套接字（hello389）
+
+- 问题：`socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` 拿到的描述符读写的是网卡的原始以太网帧（vfs 直接调 `nic.receivePacket`/`sendPacket`），不是 Linux 的 raw 套接字：发送不加 IP 头，收不到回环上的 ICMP，协议参数不检查，getsockname、getpeername、bind、connect 都是 EOPNOTSUPP，SO_PROTOCOL 读出 0。仓库里唯一的使用者 hello373 只打开再关闭它。
+- 宿主机实测（`unshare --map-auto --map-root-user -n`）：`user/hello389.c` 13 项（A S E P T C B U D M X I L）全部通过。另外实测：协议 0 是 EPROTONOSUPPORT；长度为 0 的 send 是 EFAULT（MoQiOS 返回 EMSGSIZE，没有测）；connect 之后 getpeername 仍是 ENOTCONN。
+- 修复：
+  1. 新文件 `kernel/net/raw_icmp.zig`：16 个槽，每槽 8 项、每项 1500 字节的接收队列，按描述符引用计数（dup、fork 共享，最后一次 close 释放）。`deliver(dgram, src, dst)` 把收到的每个 ICMP 数据报（从 IP 头起）复制给每个匹配的套接字并唤醒 epoll；`send(bound, dst, msg)` 加 IP 头发出，回环走 `lo.sendNow`。
+  2. 新文件 `kernel/net/raw_icmp_policy.zig`：协议检查（ICMP 以外 EPROTONOSUPPORT）、接收过滤（bind 地址等于目的地址、connect 地址等于来源地址，0.0.0.0 不过滤）、sendto 的地址检查（无地址未连接 EDESTADDRREQ，长度不足 EINVAL，非 AF_INET EAFNOSUPPORT）、名字的格式（端口位是协议号）。
+  3. `mod.zig`：ICMP 数据报先交给 `raw_icmp.deliver`，再交给 `icmp.handlePacket`（Linux `raw_v4_input` 在 `icmp_rcv` 之前）。
+  4. `socket_syscall.zig`：`rawCreate`（先查 CAP_NET_RAW，EPERM；再查协议；表满 ENOBUFS）；bind（非本机地址 EADDRNOTAVAIL）、connect（AF_UNSPEC 解除）、sendto/send、recvfrom/recv（MSG_DONTWAIT、MSG_TRUNC、来源地址回填）、getsockname、getpeername（ENOTCONN）、listen/accept/shutdown（EOPNOTSUPP）都接上 raw 分支。`vfs.zig` 的 read/write 走同一套路径；引用计数、`hasSharedRef` 和 epoll 的 POLLIN 都认 `raw_socket`。`sockopt_policy` 的 SO_PROTOCOL 报真实协议。
+  5. `icmp.sendFrom`（ping 套接字）的回环发送也改为 `lo.sendNow`，回显应答仍入队（它在接收路径里，立即投递会重入 drain）。
+- 定向测试时发现的问题（如实）：第一次定向 SMP=2 绿灯时 E 项多收到一个 57 字节的数据报。两次调试输出分别是 `10.0.2.2 → 10.0.2.15` 类型 11（超时），以及 `127.0.0.1 → 10.0.2.15` 类型 3 代码 3（端口不可达），都是前面测试程序的流量引出的、不发往 127.0.0.1 的 ICMP。Linux 的 raw 套接字同样会收到这些，这不是内核错误。测试程序改为只看 `127.0.0.1 → 127.0.0.1` 的数据报（来源看回填地址，目的看 IP 头；截断读时看 IP 头里的总长度 36）。中间试过在创建时 drain 回环队列，没有用，已撤回。
+- host 测试 "raw ICMP socket policy (hello389)…" 和 "raw ICMP socket wiring (hello389)…"；hello386、hello387 里 `loopbackSourceErrno`、`loopbackAllowed` 的出现次数从 5 改为 6。变异验证：`matches` 恒返回 true，policy 测试失败；删掉 `mod.zig` 的 `deliver` 调用，wiring 测试失败；两个文件都已恢复，用 cmp 确认。
+- 红灯：未修改的内核（只保留 hello389 的启动配置）上定向 SMP=2，A（SO_PROTOCOL 0，getsockname -88）和 S（未连接 send、write、错误地址都返回 16）失败，之后 E 项阻塞在 recvfrom（读的是网卡原始帧），程序没有结束。绿灯：13 项全部通过。
+- 完整 smoke：SMP=2、SMP=1 各一份通过，SMP=4 跑了两份（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello389 PASS，hello373 仍然 PASS。SMP=4 第一份失败在 hello325 G（`hits 0`，满环发送后的 POLL_OUT，已记录的偶发项，和本切片改动的代码无关），hello389 在那一份里也是 PASS；第二份通过。riscv64、aarch64 交叉构建通过，没有在这两个架构上跑 QEMU。
+- 局限：
+  1. 只支持 IPv4 ICMP；IPv6 raw 套接字未实现（`SOCK_RAW` 加 AF_INET6 仍不可用）。
+  2. 没有 IP_HDRINCL、ICMP_FILTER，没有 sendmsg/recvmsg 的 raw 分支（sendmsg 返回 ENOTSOCK）。
+  3. SO_RCVTIMEO 不生效：阻塞接收每 5 ms 轮询一次，直到有数据或被信号打断；非 x86 架构上阻塞接收直接返回 EAGAIN。
+  4. 最多 16 个 raw 套接字，每个最多排 8 个数据报，再来的丢弃。

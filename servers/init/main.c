@@ -505,6 +505,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello386"); /* a 127/8-bound socket cannot reach out through the NIC */
     run_test("hello387"); /* net.ipv4.conf.<dev>.route_localnet */
     run_test("hello388"); /* 100 UDP sockets at once: the socket table holds 256 */
+    run_test("hello389"); /* raw ICMP socket */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

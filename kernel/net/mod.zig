@@ -49,6 +49,8 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
 
             switch (info.protocol) {
                 ipv4.PROTO_ICMP => {
+                    // Linux raw_v4_input hands raw sockets a copy of the datagram (IP header included) before the protocol handler runs.
+                    @import("raw_icmp.zig").deliver(data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip);
                     icmp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len);
                 },
                 ipv4.PROTO_TCP => {

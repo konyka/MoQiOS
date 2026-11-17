@@ -51,6 +51,127 @@ pub fn allocUnixFd(fd_table: *vfs_mod.FdTable, unix_sock_idx: u32) i32 {
     return @intCast(slot);
 }
 
+// ── IPv4 raw ICMP sockets (net/raw_icmp.zig) ───────────────────────
+
+/// socket(AF_INET, SOCK_RAW, protocol): needs CAP_NET_RAW (inet_create: EPERM), and MoQiOS carries ICMP only.
+fn rawCreate(protocol: u32) i64 {
+    const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
+    const t = task_mod.getTask(cur_idx) orelse return -1;
+    const perr = @import("raw_icmp_policy.zig").protocolErrno(protocol);
+    if (!cap_mod.hasSysCap(cur_idx, "cap_net_raw")) return -1; // EPERM
+    if (perr != 0) return perr;
+    const raw = @import("raw_icmp.zig");
+    const idx = raw.open() orelse return -105; // ENOBUFS
+    const fd_slot = t.fd_table.allocFd() orelse {
+        raw.release(idx);
+        return -24; // EMFILE
+    };
+    t.fd_table.fds[fd_slot] = .{ .fd_type = .raw_socket, .raw_idx = idx, .writable = true };
+    t.fd_table.publishFd(fd_slot);
+    return @intCast(fd_slot);
+}
+
+/// A user sockaddr_in of `addr_len` bytes at `addr_ptr`: its family and address (the port is not looked at).
+fn readInet4(addr_ptr: u64, addr_len: u32) union(enum) { ok: struct { family: u16, addr: [4]u8 }, err: i64 } {
+    if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return .{ .err = -14 };
+    var b: [16]u8 = @splat(0);
+    const n = @min(addr_len, 16);
+    if (n >= 2 and copy.copyFromUser(b[0..n], @ptrFromInt(addr_ptr), n) != n) return .{ .err = -14 };
+    return .{ .ok = .{ .family = bo.readU16Le(b[0..2]), .addr = b[4..8].* } };
+}
+
+/// sendto/send/write on a raw ICMP socket: `msg` (the ICMP message) to the address at `to` (ptr, len), or to the connected peer.
+pub fn rawSendFrom(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?struct { ptr: u64, len: u32 }) i64 {
+    const raw = @import("raw_icmp.zig");
+    const rp = @import("raw_icmp_policy.zig");
+    var dst = raw.peerAddr(d.raw_idx);
+    if (to) |a| {
+        const r = readInet4(a.ptr, a.len);
+        const parsed = switch (r) {
+            .ok => |v| v,
+            .err => |e| return e,
+        };
+        const rc = rp.sendtoErrno(true, a.len, parsed.family, false);
+        if (rc != 0) return rc;
+        dst = parsed.addr;
+    } else {
+        const rc = rp.sendtoErrno(false, 0, 0, raw.isConnected(d.raw_idx));
+        if (rc != 0) return rc;
+    }
+    const bound = raw.boundAddr(d.raw_idx);
+    const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(bound, dst, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
+    if (lo_rc != 0) return lo_rc;
+    const sent = raw.send(bound, dst, msg);
+    return if (sent < 0) sent else @intCast(msg.len);
+}
+
+/// recvfrom/recv/read on a raw ICMP socket into the kernel buffer `out`: the next datagram (IP header included), waiting for one
+/// unless the descriptor or `flags` ask not to. MSG_TRUNC returns the datagram's whole length. The sender's address goes to `from`
+/// when given.
+pub fn rawRecvInto(d: *vfs_mod.FileDescriptor, out: []u8, flags: u32, from: ?*[4]u8) i64 {
+    const raw = @import("raw_icmp.zig");
+    const tsc = @import("../arch/arch.zig").tsc;
+    const nonblock = @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(d), flags);
+    while (true) {
+        _ = @import("lo.zig").drain();
+        switch (raw.recv(d.raw_idx, out)) {
+            .ok => |r| {
+                if (from) |f| f.* = r.src;
+                return @intCast(if ((flags & 0x20) != 0) r.trunc else r.n);
+            },
+            .eagain => {},
+        }
+        if (nonblock) return -11;
+        // SO_RCVTIMEO is not kept for raw sockets (socket_opt's raw branch keeps no state), so a blocking receive waits for the
+        // next datagram or a signal. Short sleeps, not one long wait: the loopback device has to be pumped.
+        if (comptime @import("builtin").cpu.arch != .x86_64) return -11;
+        const se = @import("../arch/x86_64/syscall_entry.zig");
+        const rc = se.sleepUntil(tsc.nanos() +| 5 * 1_000_000, 0);
+        if (rc < 0) return rc;
+    }
+}
+
+/// bind on a raw ICMP socket: a whole sockaddr_in naming this host (or the wildcard); the protocol stays the port.
+fn rawBind(d: *vfs_mod.FileDescriptor, addr_ptr: u64, addr_len: u32) i64 {
+    const rp = @import("raw_icmp_policy.zig");
+    const lrc = rp.addrLenErrno(addr_len);
+    if (lrc != 0) return lrc;
+    const parsed = switch (readInet4(addr_ptr, addr_len)) {
+        .ok => |v| v,
+        .err => |e| return e,
+    };
+    // raw_bind checks the address type only (inet_addr_type_table): a group or a broadcast address is EADDRNOTAVAIL.
+    const a = parsed.addr;
+    if ((a[0] >= 224 and a[0] <= 239) or (a[0] == 255 and a[1] == 255 and a[2] == 255 and a[3] == 255) or bindAddrNotAvail4(a)) return -99;
+    _ = @import("raw_icmp.zig").bind(d.raw_idx, a);
+    return 0;
+}
+
+/// connect on a raw ICMP socket (ip4_datagram_connect): AF_UNSPEC drops the peer; otherwise the peer filters what is received and is
+/// where send and write go.
+fn rawConnect(d: *vfs_mod.FileDescriptor, addr_ptr: u64, addr_len: u32) i64 {
+    var fam: [2]u8 = @splat(0);
+    if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return -14;
+    if (addr_len >= 2 and copy.copyFromUser(&fam, @ptrFromInt(addr_ptr), 2) != 2) return -14;
+    switch (@import("socket_address_policy.zig").dgramConnectAction(addr_len, bo.readU16Le(&fam))) {
+        .einval => return -22,
+        .eafnosupport => return -97,
+        .disconnect => {
+            _ = @import("raw_icmp.zig").connect(d.raw_idx, .{ 0, 0, 0, 0 });
+            return 0;
+        },
+        .address => {},
+    }
+    if (addr_len < 16) return -22;
+    const parsed = switch (readInet4(addr_ptr, addr_len)) {
+        .ok => |v| v,
+        .err => |e| return e,
+    };
+    if (parsed.family != 2) return -97;
+    _ = @import("raw_icmp.zig").connect(d.raw_idx, parsed.addr);
+    return 0;
+}
+
 // ── Syscall implementations ────────────────────────────────────────
 
 /// socket(domain, type, protocol) → fd or -errno
@@ -61,7 +182,7 @@ pub fn socket(domain: u32, type_and_flags: u32, protocol: u32) i64 {
         .err => |e| return e,
     };
     const is_ping = parsed.sock_type == 2 and ((domain == 2 and protocol == 1) or (domain == 10 and protocol == 58));
-    const fd = if (is_ping) pingCreate(domain == 10) else socketCreate(domain, parsed.sock_type);
+    const fd = if (is_ping) pingCreate(domain == 10) else if (domain == 2 and parsed.sock_type == 3) rawCreate(protocol) else socketCreate(domain, parsed.sock_type);
     if (fd < 0) return fd;
     // SOCK_CLOEXEC / SOCK_NONBLOCK belong to the new descriptor, not to the socket type.
     const cur_idx = sched_mod.currentTaskIndex() orelse return fd;
@@ -300,19 +421,6 @@ fn socketCreate(domain: u32, sock_type: u32) i64 {
     }
 
     if (domain != 2 or sock_type != 1) {
-        // AF_INET + SOCK_RAW (type=3): raw packet socket
-        if (domain == 2 and sock_type == 3) {
-            if (!cap_mod.hasSysCap(cur_idx, "cap_net_raw")) return -1; // EPERM
-            // Allocate raw socket fd
-            // v53.49: Use allocFd() O(1) bitmap instead of duplicated linear scan
-            const fd_slot = t.fd_table.allocFd() orelse return -24; // EMFILE
-            t.fd_table.fds[fd_slot] = .{
-                .fd_type = .raw_socket,
-                .writable = true,
-            };
-            t.fd_table.publishFd(fd_slot);
-            return @intCast(fd_slot);
-        }
         return -38; // ENOSYS
     }
 
@@ -353,6 +461,8 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
 
     if (fd >= vfs_mod.MAX_FDS) return -9; // EBADF
     if (t.fd_table.fds[fd].fd_type == .none) return -9;
+
+    if (t.fd_table.fds[fd].fd_type == .raw_socket) return rawBind(&t.fd_table.fds[fd], addr_ptr, addr_len);
 
     // AF_UNIX bind
     if (t.fd_table.fds[fd].fd_type == .unix_socket) {
@@ -491,6 +601,8 @@ pub fn listen(fd: u32, backlog: u32) i64 {
 
     if (fd >= vfs_mod.MAX_FDS or t.fd_table.fds[fd].fd_type == .none) return -9; // EBADF
 
+    if (t.fd_table.fds[fd].fd_type == .raw_socket) return -95; // EOPNOTSUPP (raw_listen/raw_accept stay NULL in Linux)
+
     if (t.fd_table.fds[fd].fd_type == .unix_socket) {
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
         const result = net_mod.unix_socket.unixListen(unix_idx, backlog);
@@ -516,6 +628,8 @@ pub fn accept(fd: u32, addr_ptr: u64, addr_len_ptr: u64) i64 {
 
     if (fd >= vfs_mod.MAX_FDS) return -9;
     if (t.fd_table.fds[fd].fd_type == .none) return -9;
+
+    if (t.fd_table.fds[fd].fd_type == .raw_socket) return -95; // EOPNOTSUPP
 
     // AF_UNIX accept
     if (t.fd_table.fds[fd].fd_type == .unix_socket) {
@@ -612,6 +726,15 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         if (len > pbuf.len) return -90; // EMSGSIZE
         if (len != 0 and copy.copyFromUser(pbuf[0..len], @ptrFromInt(buf), len) != len) return -14;
         return pingSend(&t.fd_table.fds[fd], pbuf[0..len], addr_ptr, addr_len);
+    } else if (t.fd_table.fds[fd].fd_type == .raw_socket) {
+        // raw_sendmsg wants no zero-length message (EMSGSIZE), and the destination is the address given or the connected peer.
+        if (len == 0) return -90;
+        if (buf == 0 or buf >= 0x0000_8000_0000_0000) return -14;
+        var pbuf: [@import("raw_icmp.zig").MAX_MESSAGE]u8 = undefined;
+        if (len > pbuf.len) return -90; // EMSGSIZE
+        if (copy.copyFromUser(pbuf[0..len], @ptrFromInt(buf), len) != len) return -14;
+        if (addr_ptr == 0) return rawSendFrom(&t.fd_table.fds[fd], pbuf[0..len], null);
+        return rawSendFrom(&t.fd_table.fds[fd], pbuf[0..len], .{ .ptr = addr_ptr, .len = addr_len });
     } else if (t.fd_table.fds[fd].fd_type == .udp_socket) {
         // inet_send_prepare: the socket is named before anything else is checked, so even a send that fails leaves it a port.
         const ab = udpAutobind(&t.fd_table.fds[fd]);
@@ -754,6 +877,28 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
     const t = task_mod.getTask(cur_idx) orelse return -1;
 
     if (fd >= vfs_mod.MAX_FDS) return -9;
+
+    if (t.fd_table.fds[fd].fd_type == .raw_socket) {
+        var pbuf: [@import("raw_icmp.zig").RAW_QUEUE_LEN]u8 = undefined;
+        const want = @min(@as(usize, len), pbuf.len);
+        if (buf == 0 or buf >= 0x0000_8000_0000_0000) return -14;
+        if (len != 0 and !copy.validateUserBufferWritable(buf, want)) return -14;
+        var src: [4]u8 = @splat(0);
+        const got = rawRecvInto(&t.fd_table.fds[fd], pbuf[0..want], flags, &src);
+        if (got < 0) return got;
+        const copy_len: usize = @intCast(@min(@as(i64, @intCast(want)), got));
+        if (copy_len != 0 and copy.copyToUser(@ptrFromInt(buf), pbuf[0..copy_len], copy_len) != copy_len) return -14;
+        if (addr_ptr != 0 and addr_len_ptr != 0) {
+            var len_bytes: [4]u8 = undefined;
+            if (!copy.validateUserBuffer(addr_len_ptr, 4) or copy.copyFromUser(&len_bytes, @ptrFromInt(addr_len_ptr), 4) != 4) return -14;
+            const name = @import("raw_icmp_policy.zig").fromName(src);
+            const to_copy: u32 = @min(bo.readU32Le(&len_bytes), 16);
+            if (to_copy != 0 and copy.copyToUser(@ptrFromInt(addr_ptr), name[0..to_copy], to_copy) != to_copy) return -14;
+            bo.writeU32Le(&len_bytes, 16);
+            if (copy.copyToUser(@ptrFromInt(addr_len_ptr), &len_bytes, 4) != 4) return -14;
+        }
+        return got;
+    }
 
     if (t.fd_table.fds[fd].fd_type == .unix_socket) {
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
@@ -952,6 +1097,8 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
 
     if (fd >= vfs_mod.MAX_FDS) return -88;
 
+    if (t.fd_table.fds[fd].fd_type == .raw_socket) return rawConnect(&t.fd_table.fds[fd], addr_ptr, addr_len);
+
     // AF_UNIX connect: sockaddr_un (family + path), routed to unixConnect.
     if (t.fd_table.fds[fd].fd_type == .unix_socket) {
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
@@ -1103,6 +1250,12 @@ pub fn getsockname(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
     if (fd >= vfs_mod.MAX_FDS) return -88;
     const desc = cur.fd_table.fds[fd];
 
+    if (desc.fd_type == .raw_socket) {
+        // inet_getname: AF_INET, the protocol as the port (inet_num), the bound address; a raw socket reports no peer.
+        const name = @import("raw_icmp_policy.zig").sockName(@import("raw_icmp.zig").boundAddr(desc.raw_idx));
+        return copySockaddrToUser(addr_ptr, addrlen_ptr, &name, 16);
+    }
+
     if (desc.fd_type == .udp_socket) {
         var sa_buf: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
         const our4 = net_mod.tcp_port_policy.nameAddr(desc.udp_local_ip, desc.udp_connected, desc.udp_dst_ip, netif.getOurIp());
@@ -1144,6 +1297,11 @@ pub fn getpeername(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
     if (fd >= vfs_mod.MAX_FDS) return -88;
     const desc = cur.fd_table.fds[fd];
 
+    if (desc.fd_type == .raw_socket) {
+        // __inet_get_peer: without a peer port (a raw socket's inet_dport stays 0) there is no peer name.
+        return ENOTCONN;
+    }
+
     if (desc.fd_type == .udp_socket) {
         // A ping socket has no peer port, so even a connected one has no peer name (inet_getname / inet6_getname want inet_dport).
         if (!desc.udp_connected or desc.udp_ping) return ENOTCONN;
@@ -1179,6 +1337,7 @@ pub fn shutdown(fd: u32, how: u32) i64 {
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
     if (fd >= vfs_mod.MAX_FDS or cur.fd_table.fds[fd].fd_type == .none) return -9; // EBADF
+    if (cur.fd_table.fds[fd].fd_type == .raw_socket) return -95; // EOPNOTSUPP (raw_shutdown stays NULL)
     if (cur.fd_table.fds[fd].fd_type == .unix_socket) {
         return net_mod.unix_socket.unixShutdown(cur.fd_table.fds[fd].unix_sock_idx, how);
     }

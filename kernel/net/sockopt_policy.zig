@@ -55,7 +55,8 @@ pub fn identity(kind: Kind, v6: bool) Identity {
         .unix_stream => .{ .domain = AF_UNIX, .sock_type = SOCK_STREAM, .protocol = 0 },
         .unix_dgram => .{ .domain = AF_UNIX, .sock_type = SOCK_DGRAM, .protocol = 0 },
         .unix_seqpacket => .{ .domain = AF_UNIX, .sock_type = SOCK_SEQPACKET, .protocol = 0 },
-        .raw => .{ .domain = inet, .sock_type = SOCK_RAW, .protocol = 0 },
+        // MoQiOS carries one raw protocol per family: IPPROTO_ICMP, or IPPROTO_ICMPV6 on an AF_INET6 socket (sk_protocol).
+        .raw => .{ .domain = inet, .sock_type = SOCK_RAW, .protocol = if (v6) IPPROTO_ICMPV6 else IPPROTO_ICMP },
     };
 }
 
