@@ -14623,7 +14623,8 @@ test "raw ICMP socket policy (hello389): protocol, delivery filter, destination 
     const rp = kt.raw_icmp_policy;
     try std.testing.expectEqual(@as(i64, 0), rp.protocolErrno(1));
     try std.testing.expectEqual(@as(i64, -93), rp.protocolErrno(0));
-    try std.testing.expectEqual(@as(i64, -93), rp.protocolErrno(17));
+    // hello401: any protocol 1-255 is a raw IPv4 socket (inet_create; 256-262 are other inet protocols, past that EINVAL).
+    try std.testing.expectEqual(@as(i64, 0), rp.protocolErrno(17));
     const any = [4]u8{ 0, 0, 0, 0 };
     const l1 = [4]u8{ 127, 0, 0, 1 };
     const l2 = [4]u8{ 127, 0, 0, 2 };
@@ -14644,7 +14645,7 @@ test "raw ICMP socket policy (hello389): protocol, delivery filter, destination 
     dg[12] = 10;
     dg[15] = 7;
     try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 0, 7 }, &rp.sourceOf(&dg));
-    const n = rp.sockName(l2);
+    const n = rp.sockName(l2, 1);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 0, 0, 1, 127, 0, 0, 2 }, n[0..8]);
     const f = rp.fromName(l1);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 0, 0, 0, 127, 0, 0, 1 }, f[0..8]);
@@ -14653,7 +14654,7 @@ test "raw ICMP socket policy (hello389): protocol, delivery filter, destination 
 
 test "raw ICMP socket wiring (hello389): received ICMP reaches raw sockets first, descriptors share the socket, sends go out at once" {
     const m = kt.net_mod_source;
-    const at_raw = std.mem.indexOf(u8, m, "@import(\"raw_icmp.zig\").deliver(data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip);") orelse return error.TestUnexpectedResult;
+    const at_raw = std.mem.indexOf(u8, m, "@import(\"raw_icmp.zig\").deliver(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip);") orelse return error.TestUnexpectedResult;
     const at_icmp = std.mem.indexOf(u8, m, "icmp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len);").?;
     try std.testing.expect(at_raw < at_icmp);
     const ss = kt.socket_syscall_source;
@@ -14976,7 +14977,7 @@ test "raw ICMP sockets take SOL_IP / SOL_IPV6 options and their sends carry them
     // ip_getsockopt answers a level other than SOL_IP with EOPNOTSUPP; ip_setsockopt with ENOPROTOOPT.
     try std.testing.expect(std.mem.indexOf(u8, so, "if (!ipo.levelApplies(level, fam)) return if (fam == .v4) -95 else -92;") != null);
     const ss = kt.socket_syscall_source;
-    try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send(bound, dst, msg, rawIpOpts(d.raw_idx))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send(bound, dst, @truncate(protocol), msg, rawIpOpts(d.raw_idx))") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send6(raw.boundAddr6(d.raw_idx), to6, msg, rawIpOpts(d.raw_idx))") != null);
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "if (ipo.ipv4NeedsPatch(ip)) ipo.patchIpv4(pkt[14..][0..20], ip, ipv4.checksum);") != null);
@@ -15035,7 +15036,7 @@ test "IP_HDRINCL wiring: raw IPv4 sends write the caller's header (hello396)" {
     try std.testing.expect(std.mem.indexOf(u8, so, "if (level == ipo.SOL_IP and optname == ipo.IP_HDRINCL and ref != .raw) return -92;") != null);
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "const hdrincl = rawIpOpts(d.raw_idx).hdrincl;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ss, "const lrc = if (hdrincl) rp.hdrinclErrno(msg) else rp.lengthErrno(false, msg.len);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const lrc = if (hdrincl) rp.hdrinclErrno(msg) else rp.sendLengthErrno(protocol, msg.len);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "raw.sendHdrincl(bound, dst, msg)") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "var pbuf: [@import(\"raw_icmp.zig\").MAX_HDRINCL]u8 = undefined;") != null);
     const rs = kt.raw_icmp_source;
@@ -15136,4 +15137,48 @@ test "getsockopt / setsockopt at a level the socket does not know (hello400): EO
     try std.testing.expect(std.mem.indexOf(u8, so, "if (ref == .udp and (ref.udp & @import(\"udp.zig\").PING_KEY) == 0 and (level == SOL_UDP or level == SOL_UDPLITE)) return -92;") != null);
     // SOL_ICMPV6 on an IPv4 raw socket goes to ip_getsockopt / ip_setsockopt like any other level it does not know.
     try std.testing.expect(std.mem.indexOf(u8, so, "if (level == SOL_ICMPV6) return if (!v6) null else if (optname == ICMP6_FILTER) .filter else .noprotoopt;") != null);
+}
+
+test "IPv4 raw sockets of any protocol (hello401): creation, delivery and protocol unreachable (Linux raw_v4_input)" {
+    const rp = kt.raw_icmp_policy;
+    try std.testing.expectEqual(@as(i64, -93), rp.protocolErrno(0));
+    try std.testing.expectEqual(@as(i64, 0), rp.protocolErrno(6));
+    try std.testing.expectEqual(@as(i64, 0), rp.protocolErrno(253));
+    try std.testing.expectEqual(@as(i64, 0), rp.protocolErrno(255));
+    try std.testing.expectEqual(@as(i64, -93), rp.protocolErrno(256));
+    try std.testing.expectEqual(@as(i64, -22), rp.protocolErrno(263));
+    try std.testing.expectEqual(@as(i64, -22), rp.protocolErrno(0xffff_ffff));
+    // IPPROTO_RAW starts with IP_HDRINCL (inet_create).
+    try std.testing.expect(rp.startsHdrincl(255));
+    try std.testing.expect(!rp.startsHdrincl(253));
+    // getsockname's port is the protocol.
+    const n = rp.sockName(.{ 127, 0, 0, 1 }, 253);
+    try std.testing.expectEqual(@as(u8, 253), n[3]);
+    try std.testing.expectEqual(@as(u8, 0), n[2]);
+    // A send that is not ICMP needs no ICMP header: 0 and 1 bytes are fine (raw_probe_proto_opt reads 2 bytes for ICMP only).
+    try std.testing.expectEqual(@as(i64, 0), rp.sendLengthErrno(253, 0));
+    try std.testing.expectEqual(@as(i64, 0), rp.sendLengthErrno(253, 1));
+    try std.testing.expectEqual(@as(i64, -14), rp.sendLengthErrno(1, 1));
+    // ip_protocol_deliver_rcu: protocol unreachable for a local datagram no handler and no raw socket took, never for ICMP, TCP, UDP.
+    try std.testing.expect(rp.protoUnreachable(252, false));
+    try std.testing.expect(!rp.protoUnreachable(252, true));
+    try std.testing.expect(!rp.protoUnreachable(1, false));
+    try std.testing.expect(!rp.protoUnreachable(6, false));
+    try std.testing.expect(!rp.protoUnreachable(17, false));
+    // ICMP_FILTER only on an IPPROTO_ICMP socket: EOPNOTSUPP on any other (do_raw_setsockopt).
+    try std.testing.expectEqual(@as(i64, -95), rp.icmpFilterErrno(253));
+    try std.testing.expectEqual(@as(i64, 0), rp.icmpFilterErrno(1));
+    const m = kt.net_mod_source;
+    // Every IPv4 datagram reaches the raw sockets of its protocol before the protocol handler (raw_local_deliver first).
+    const at_raw = std.mem.indexOf(u8, m, "const raw_took = @import(\"raw_icmp.zig\").deliver(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip);") orelse return error.TestUnexpectedResult;
+    const at_tcp = std.mem.indexOf(u8, m, "tcp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, info.ecn_ce);").?;
+    try std.testing.expect(at_raw < at_tcp);
+    try std.testing.expect(std.mem.indexOf(u8, m, "else => if (rp.protoUnreachable(info.protocol, raw_took)) icmp.sendProtoUnreachable(data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip),") != null);
+    const rs = kt.raw_icmp_source;
+    try std.testing.expect(std.mem.indexOf(u8, rs, "if (s.protocol != protocol) continue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "if (protocol == policy.IPPROTO_ICMP) if (policy.icmpTypeOf(dgram)) |ty| if (policy.icmpFilterBlocks(s.icmp_filter, ty)) continue;") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const idx = raw.open(v6, protocol) orelse return -105; // ENOBUFS") != null);
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "facts.id.protocol = @import(\"raw_icmp.zig\").protocolOf(idx);") != null);
 }

@@ -10389,3 +10389,36 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - 取红灯（只回退内核修复、保留能力配置，hello400 提前到 hello3 之前）：T U R X 失败（不认识的层一律 -92），6 通过（IPv6 本来就是 -92）；hello143 的「an unknown level is refused」失败。
   - riscv64 和 aarch64 交叉构建通过，但没有在这两个架构上跑 QEMU。
 - 局限：各套接字自己层上的未知选项仍是 ENOPROTOOPT，与 Linux 相同；没有逐个核对 SOL_SOCKET 上每个只读或不支持选项的 errno。
+
+## 补充：任意协议的 IPv4 raw 套接字（hello401）
+
+- 问题：IPv4 raw 套接字只能是 IPPROTO_ICMP，其他协议一律 EPROTONOSUPPORT。抓 TCP、UDP 报文的工具、实现自定义协议的程序，以及按惯例用 IPPROTO_RAW 发送自带头数据报的程序都用不了。收包时只有 ICMP 数据报交给 raw 套接字。另外，本机收到没有处理者的协议时一声不响，Linux 会回 ICMP 协议不可达。
+- Linux 语义（3rd/linux-7.0.6）：
+  - `inet_create`：协议为负或不小于 IPPROTO_MAX 是 EINVAL；SOCK_RAW 的 `inetsw` 项是通配，所以任意非 0 协议都行，0 是 EPROTONOSUPPORT。`inet_num` 设为协议，IPPROTO_RAW 时打开 HDRINCL。
+  - `ip_protocol_deliver_rcu`：先调 `raw_local_deliver`，把数据报交给每个同协议、地址匹配的 raw 套接字（`raw_v4_input`、`raw_v4_match`，ICMP 还要过 `icmp_filter`），再交给协议处理函数。没有处理函数、也没有 raw 套接字收下时，回 `ICMP_PROT_UNREACH`。
+  - `raw_sendmsg`：IP 头的协议是 `sk_protocol`；`raw_probe_proto_opt` 只对 ICMP 读 2 字节。
+  - `do_raw_setsockopt`：非 ICMP 套接字上的 ICMP_FILTER 是 EOPNOTSUPP。
+- 宿主机实测：
+  - `user/hello401.c -DHOST`（root、`unshare -n`、只有 lo）：7 项（A S O U T P B）全部通过。
+  - 探针还确认了：256、262 能建套接字（SMC、MPTCP），263 是 EINVAL；IGMP（2）、PIM（103）在宿主机上有处理者，不回不可达；协议 256 的套接字发出的数据报协议字段是 0；收下与否在 ICMP_FILTER 之前判定。
+- 修复：
+  - `raw_icmp_policy.zig`：`protocolErrno` 改为接受 1 到 255；新增 `startsHdrincl`、`sendLengthErrno`、`protoUnreachable`、`icmpFilterErrno`；`sockName` 多一个协议参数。
+  - `raw_icmp.zig`：`Socket.protocol`；`open(v6, protocol)`，IPPROTO_RAW 打开 IP_HDRINCL；新增 `protocolOf`；`deliver(protocol, …)` 按协议匹配，返回是否有套接字收下；`send` 多一个协议参数。
+  - `mod.zig`：每个 IPv4 数据报先给 raw 套接字，再分给 ICMP、TCP、UDP；其他协议在没人收下时调 `icmp.sendProtoUnreachable`。
+  - `icmp.zig`：新增 `sendProtoUnreachable`，与 UDP 的端口不可达一样只回给回环来源。
+  - `socket_syscall.zig`：`rawCreate` 传协议；发送的长度检查和 IP 头协议按套接字的协议；getsockname 的端口用 `protocolOf`。
+  - `socket_opt.zig`：SO_PROTOCOL 取 `protocolOf`；ICMP_FILTER 先检查 `icmpFilterErrno`。
+- host 测试：
+  - 新测试 "IPv4 raw sockets of any protocol (hello401)…"：实现前编译失败（`startsHdrincl` 不存在、`sockName` 参数个数不对），实现后通过。
+  - hello389 的策略测试里 `protocolErrno(17)` 的期望从 -93 改为 0，`sockName` 加上协议参数。
+  - hello389、hello395、hello396 的三处源码断言按新的行文更新，检查的内容不变：先投递给 raw 再交给处理函数、发送带 IP 选项、长度检查分支。
+  - 变异验证：去掉 `deliver` 里的协议匹配，测试失败；`protoUnreachable` 只对 255 返回 true，测试失败；都已恢复。
+- QEMU：第一次运行里 T 项失败：协议 6 的 raw 套接字看到的 SYN 标志是 0xc2（SYN|ECE|CWR），MoQiOS 的主动连接请求 ECN（宿主机默认 `tcp_ecn=2` 不请求，设为 1 时也带 ECE|CWR）。测试改为只比较标志的低 6 位，宿主机在 `tcp_ecn` 为 2 和 1 时都通过。
+  - 改正后完整 smoke SMP=2、SMP=4 各一份 `PASS`，hello401 7 项全过；恢复修复后 SMP=1 完整 smoke `PASS`。
+  - 取红灯（只回退内核修复、保留能力配置，hello401 提前到 hello3 之前）：7 项全部失败。非 ICMP 的 raw 套接字都是 -93，之后的调用是 -9；-1、263 也是 -93，而不是 -22；协议 252 没有不可达回复。
+  - riscv64 和 aarch64 交叉构建通过，但没有在这两个架构上跑 QEMU。
+- 局限：
+  1. 不回不可达的只有 ICMP、TCP、UDP；IGMP 等 MoQiOS 没有处理者的协议会回协议不可达，Linux 不回。
+  2. raw 套接字仍是 16 个槽，所有协议共用。
+  3. 没有 IPv6 的任意协议 raw 套接字（仍只有 ICMPv6）。
+  4. 协议不可达只回给回环来源，与端口不可达相同。

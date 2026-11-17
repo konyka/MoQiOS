@@ -629,6 +629,10 @@ fn rawV6Opt(v6: bool, level: u64, optname: u64) ?RawV6Opt {
 }
 
 fn setRawV6Opt(idx: u32, which: RawV6Opt, optval_ptr: u64, optlen: u64) i64 {
+    if (which == .icmp_filter) {
+        const frc = @import("raw_icmp_policy.zig").icmpFilterErrno(@import("raw_icmp.zig").protocolOf(idx));
+        if (frc != 0) return frc;
+    }
     switch (which) {
         .noprotoopt => return -92,
         // rawv6_setsockopt: an ICMPv6 socket's checksum offset cannot be moved.
@@ -658,6 +662,10 @@ fn setRawV6Opt(idx: u32, which: RawV6Opt, optval_ptr: u64, optlen: u64) i64 {
 
 fn getRawV6Opt(idx: u32, which: RawV6Opt, optval_ptr: u64, optlen_ptr: u64) i64 {
     if (which == .noprotoopt) return -92;
+    if (which == .icmp_filter) {
+        const frc = @import("raw_icmp_policy.zig").icmpFilterErrno(@import("raw_icmp.zig").protocolOf(idx));
+        if (frc != 0) return frc;
+    }
     const copy_mod = @import("../mm/copy_from_user.zig");
     if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;
     if (optlen_ptr == 0 or optlen_ptr >= 0x0000_8000_0000_0000) return -14;
@@ -801,6 +809,7 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
         },
         .raw => |idx| {
             stored = @import("raw_icmp.zig").getOpts(idx) orelse return -9;
+            facts.id.protocol = @import("raw_icmp.zig").protocolOf(idx);
         },
     }
 

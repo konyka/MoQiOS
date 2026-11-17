@@ -51,10 +51,10 @@ pub fn allocUnixFd(fd_table: *vfs_mod.FdTable, unix_sock_idx: u32) i32 {
     return @intCast(slot);
 }
 
-// ── Raw ICMP and ICMPv6 sockets (net/raw_icmp.zig) ─────────────────
+// ── Raw IPv4 and ICMPv6 sockets (net/raw_icmp.zig) ─────────────────
 
 /// socket(AF_INET, SOCK_RAW, protocol) or, when `v6`, socket(AF_INET6, SOCK_RAW, protocol): needs CAP_NET_RAW (inet_create /
-/// inet6_create: EPERM), and MoQiOS carries ICMP (ICMPv6) only.
+/// inet6_create: EPERM). IPv4 takes any protocol from 1 to 255 (raw_icmp_policy.protocolErrno), IPv6 ICMPv6 only.
 fn rawCreate(protocol: u32, v6: bool) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
@@ -63,7 +63,7 @@ fn rawCreate(protocol: u32, v6: bool) i64 {
     if (!cap_mod.hasSysCap(cur_idx, "cap_net_raw")) return -1; // EPERM
     if (perr != 0) return perr;
     const raw = @import("raw_icmp.zig");
-    const idx = raw.open(v6) orelse return -105; // ENOBUFS
+    const idx = raw.open(v6, protocol) orelse return -105; // ENOBUFS
     const fd_slot = t.fd_table.allocFd() orelse {
         raw.release(idx);
         return -24; // EMFILE
@@ -140,8 +140,9 @@ pub fn rawSendFrom(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDe
     const bound = raw.boundAddr(d.raw_idx);
     const hdrincl = rawIpOpts(d.raw_idx).hdrincl;
     // IP_HDRINCL: `msg` is the whole datagram, header first (raw_send_hdrinc); otherwise raw_sendmsg reads the ICMP type and code
-    // from the user buffer (raw_probe_proto_opt), and fewer than 2 bytes is EFAULT.
-    const lrc = if (hdrincl) rp.hdrinclErrno(msg) else rp.lengthErrno(false, msg.len);
+    // from the user buffer of an ICMP socket (raw_probe_proto_opt), and fewer than 2 bytes is EFAULT.
+    const protocol = raw.protocolOf(d.raw_idx);
+    const lrc = if (hdrincl) rp.hdrinclErrno(msg) else rp.sendLengthErrno(protocol, msg.len);
     if (lrc != 0) return lrc;
     const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(bound, dst, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
     if (lo_rc != 0) return lo_rc;
@@ -150,7 +151,7 @@ pub fn rawSendFrom(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDe
         const hs = raw.sendHdrincl(bound, dst, msg);
         return if (hs < 0) hs else @intCast(msg.len);
     }
-    const sent = raw.send(bound, dst, msg, rawIpOpts(d.raw_idx));
+    const sent = raw.send(bound, dst, @truncate(protocol), msg, rawIpOpts(d.raw_idx));
     return if (sent < 0) sent else @intCast(msg.len);
 }
 
@@ -1376,7 +1377,7 @@ pub fn getsockname(fd: u32, addr_ptr: u64, addrlen_ptr: u64) i64 {
             const name6 = @import("raw_icmp_policy.zig").sockName6(raw.boundAddr6(desc.raw_idx));
             return copySockaddrToUser(addr_ptr, addrlen_ptr, &name6, 28);
         }
-        const name = @import("raw_icmp_policy.zig").sockName(raw.boundAddr(desc.raw_idx));
+        const name = @import("raw_icmp_policy.zig").sockName(raw.boundAddr(desc.raw_idx), raw.protocolOf(desc.raw_idx));
         return copySockaddrToUser(addr_ptr, addrlen_ptr, &name, 16);
     }
 

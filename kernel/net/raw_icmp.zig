@@ -1,8 +1,8 @@
-//! Raw ICMP sockets: IPv4 (socket(AF_INET, SOCK_RAW, IPPROTO_ICMP), Linux net/ipv4/raw.c) and IPv6 (socket(AF_INET6, SOCK_RAW,
-//! IPPROTO_ICMPV6), net/ipv6/raw.c). Every ICMP datagram this host receives is copied, IP header included, to each IPv4 socket whose
-//! bound address and connected peer match (raw_icmp_policy.matches); every ICMPv6 message, without its IPv6 header, to each IPv6
-//! socket that matches and whose ICMP6_FILTER lets the type through. A send gets its IP header (and for ICMPv6 its checksum) from the
-//! kernel. The sockets share one table; a socket lives until its last descriptor reference is gone, which is
+//! Raw sockets: IPv4 of any protocol (socket(AF_INET, SOCK_RAW, p), Linux net/ipv4/raw.c) and IPv6 ICMPv6 (socket(AF_INET6,
+//! SOCK_RAW, IPPROTO_ICMPV6), net/ipv6/raw.c). Every IPv4 datagram this host receives is copied, IP header included, to each IPv4
+//! socket of its protocol whose bound address and connected peer match (raw_icmp_policy.matches; ICMP_FILTER on an ICMP one); every
+//! ICMPv6 message, without its IPv6 header, to each IPv6 socket that matches and whose ICMP6_FILTER lets the type through. A send gets
+//! its IP header (and for ICMPv6 its checksum) from the kernel, unless IP_HDRINCL. The sockets share one table; a socket lives until its last descriptor reference is gone, which is
 //! what lets a fork keep it. The raw Ethernet frame ioctl-style socket this replaced (read/write on the NIC) is gone.
 const policy = @import("raw_icmp_policy.zig");
 const ipv4 = @import("ipv4.zig");
@@ -40,6 +40,9 @@ const Socket = struct {
     peer: [4]u8 = @splat(0),
     /// An AF_INET6 socket: bound6 / peer6 / filter apply instead of bound / peer.
     v6: bool = false,
+    /// The IPv4 protocol the socket carries (inet_num): what it receives and the protocol of what it sends. IPPROTO_ICMPV6 on an
+    /// IPv6 socket.
+    protocol: u8 = 1,
     bound6: [16]u8 = @splat(0),
     peer6: [16]u8 = @splat(0),
     /// connect() named a peer (an IPv6 socket may be connected to ::).
@@ -60,16 +63,26 @@ const Socket = struct {
 var sockets: [MAX_SOCKETS]Socket = @splat(.{});
 var raw_lock: IrqSpinlock = .{};
 
-/// A new socket (an IPv6 one when `v6`) on the first free slot, or null (ENOBUFS). Nothing is shared with a UDP socket.
-pub fn open(v6: bool) ?u32 {
+/// A new socket of `protocol` (an IPv6 one when `v6`) on the first free slot, or null (ENOBUFS). Nothing is shared with a UDP
+/// socket. IPPROTO_RAW starts with IP_HDRINCL set (inet_create).
+pub fn open(v6: bool, protocol: u32) ?u32 {
     const saved = raw_lock.acquire();
     defer raw_lock.release(saved);
     for (&sockets, 0..) |*s, i| {
         if (s.used) continue;
-        s.* = .{ .used = true, .refs = 1, .v6 = v6 };
+        s.* = .{ .used = true, .refs = 1, .v6 = v6, .protocol = @truncate(protocol) };
+        if (!v6 and policy.startsHdrincl(protocol)) s.opts.ip.hdrincl = true;
         return @intCast(i);
     }
     return null;
+}
+
+/// The socket's protocol (SO_PROTOCOL, the getsockname port), or 0 for a slot not in use.
+pub fn protocolOf(idx: u32) u32 {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return 0;
+    return sockets[idx].protocol;
 }
 
 /// One more descriptor names the socket (dup, fork).
@@ -287,19 +300,24 @@ pub fn isConnected(idx: u32) bool {
     return idx < MAX_SOCKETS and sockets[idx].used and sockets[idx].connected;
 }
 
-/// One received ICMP datagram that arrived on this host: `dgram` starts at the IP header of `src` → `dst` (Linux raw_v4_input hands
-/// raw sockets the skb, IP header included). Each matching socket gets its own copy; a full queue drops the datagram.
-pub fn deliver(dgram: []const u8, src: [4]u8, dst: [4]u8) void {
+/// One received IPv4 datagram of `protocol` that arrived on this host: `dgram` starts at the IP header of `src` → `dst` (Linux
+/// raw_v4_input hands raw sockets the skb, IP header included). Each matching socket of that protocol gets its own copy; a full queue
+/// drops the datagram. Whether any socket matched (raw_v4_input's `delivered`, set before ICMP_FILTER and the queue are looked at):
+/// a datagram no protocol handles is then not answered with protocol unreachable.
+pub fn deliver(protocol: u8, dgram: []const u8, src: [4]u8, dst: [4]u8) bool {
     var notify: [MAX_SOCKETS]u32 = undefined;
     var n_notify: usize = 0;
+    var took = false;
     {
         const saved = raw_lock.acquire();
         defer raw_lock.release(saved);
         for (&sockets, 0..) |*s, i| {
             if (!s.used) continue;
             if (s.v6) continue;
+            if (s.protocol != protocol) continue;
             if (!policy.matches(s.bound, s.peer, src, dst)) continue;
-            if (policy.icmpTypeOf(dgram)) |ty| if (policy.icmpFilterBlocks(s.icmp_filter, ty)) continue;
+            took = true;
+            if (protocol == policy.IPPROTO_ICMP) if (policy.icmpTypeOf(dgram)) |ty| if (policy.icmpFilterBlocks(s.icmp_filter, ty)) continue;
             const at = policy.enqueueSlot(s.head, s.count) orelse continue;
             const e = &s.queue[at];
             const copy_len = @min(dgram.len, RAW_QUEUE_LEN);
@@ -316,6 +334,7 @@ pub fn deliver(dgram: []const u8, src: [4]u8, dst: [4]u8) void {
         // The index is the socket's identity here: a slot freed since holds a different socket, which gets a needless wake at worst.
         @import("epoll.zig").epollNotify(.raw_socket, idx, @import("epoll.zig").EPOLLIN);
     }
+    return took;
 }
 
 /// One checksummed ICMPv6 message that arrived on this host, `src` → `dst` (Linux icmpv6_rcv → raw6_local_deliver, before the
@@ -362,10 +381,10 @@ pub fn send6(bound: [16]u8, dst: [16]u8, msg: []const u8, ip: ipo.IpOpts) i64 {
     return rc;
 }
 
-/// raw_sendmsg: `msg` is the ICMP message (header and data). The kernel supplies the IP header; a frame that has to wait for ARP
-/// is queued on the neighbour and the send succeeds, exactly like Linux. 0, or -EMSGSIZE past the path MTU, -ENOBUFS when the
-/// device drops it.
-pub fn send(bound: [4]u8, dst: [4]u8, msg: []const u8, ip: ipo.IpOpts) i64 {
+/// raw_sendmsg: `msg` is the payload of protocol `protocol` (for ICMP the message, header and data). The kernel supplies the IP
+/// header; a frame that has to wait for ARP is queued on the neighbour and the send succeeds, exactly like Linux. 0, or -EMSGSIZE
+/// past the path MTU, -ENOBUFS when the device drops it.
+pub fn send(bound: [4]u8, dst: [4]u8, protocol: u8, msg: []const u8, ip: ipo.IpOpts) i64 {
     if (msg.len > MAX_MESSAGE) return -90;
     if (msg.len + ipv4.HEADER_LEN > ipv4.getSendMtu(dst)) return -90;
     const our_mac = netif.getMac();
@@ -381,7 +400,7 @@ pub fn send(bound: [4]u8, dst: [4]u8, msg: []const u8, ip: ipo.IpOpts) i64 {
     const src = @import("tcp_port_policy.zig").sourceAddr(bound, dst, netif.getOurIp());
     var pkt: [FRAME_BUF_LEN]u8 = @splat(0);
     @memcpy(pkt[34..][0..msg.len], msg);
-    ipv4.buildHeader(pkt[14..].ptr, src, dst, ipv4.PROTO_ICMP, @intCast(msg.len));
+    ipv4.buildHeader(pkt[14..].ptr, src, dst, protocol, @intCast(msg.len));
     if (ipo.ipv4NeedsPatch(ip)) ipo.patchIpv4(pkt[14..][0..20], ip, ipv4.checksum);
     const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, @intCast(20 + msg.len));
     if (wait_hop) |hop| {

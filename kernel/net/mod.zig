@@ -47,10 +47,12 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
             const payload_start: u32 = 14 + @as(u32, info.payload_offset);
             if (payload_start + @as(u32, info.payload_len) > len) return;
 
+            // Linux raw_local_deliver hands each raw socket of the datagram's protocol a copy (IP header included) before the protocol
+            // handler runs.
+            const raw_took = @import("raw_icmp.zig").deliver(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip);
+            const rp = @import("raw_icmp_policy.zig");
             switch (info.protocol) {
                 ipv4.PROTO_ICMP => {
-                    // Linux raw_v4_input hands raw sockets a copy of the datagram (IP header included) before the protocol handler runs.
-                    @import("raw_icmp.zig").deliver(data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip);
                     icmp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len);
                 },
                 ipv4.PROTO_TCP => {
@@ -59,7 +61,8 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
                 ipv4.PROTO_UDP => {
                     udp.handlePacketOn(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, ifindex);
                 },
-                else => {},
+                // ip_protocol_deliver_rcu: a protocol with no handler that no raw socket took gets a protocol unreachable.
+                else => if (rp.protoUnreachable(info.protocol, raw_took)) icmp.sendProtoUnreachable(data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip),
             }
         },
         eth.ETHERTYPE_IPV6 => {

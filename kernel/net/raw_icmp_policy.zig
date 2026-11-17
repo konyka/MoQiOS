@@ -1,8 +1,8 @@
-//! Raw ICMP sockets as pure decisions: IPv4 (socket(AF_INET, SOCK_RAW, IPPROTO_ICMP), Linux net/ipv4/raw.c, measured in hello389)
-//! and IPv6 (socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6), Linux net/ipv6/raw.c, measured in hello391).
-//! A send gets its IP header from the kernel; every ICMP datagram this host receives is copied to each raw socket of its family
-//! whose bound address and connected peer match it: an IPv4 one with its IP header, an IPv6 one without (and only when its
-//! ICMP6_FILTER lets the type through).
+//! Raw sockets as pure decisions: IPv4 (socket(AF_INET, SOCK_RAW, p) for any protocol p, Linux net/ipv4/raw.c, measured in
+//! hello389 and hello401) and IPv6 (socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6), Linux net/ipv6/raw.c, measured in hello391).
+//! A send gets its IP header from the kernel (unless IP_HDRINCL); every IPv4 datagram this host receives is copied, IP header
+//! included, to each raw socket of its protocol whose bound address and connected peer match it; every ICMPv6 message, without its
+//! IPv6 header, to each IPv6 socket that matches and whose ICMP6_FILTER lets the type through.
 
 pub const IPPROTO_ICMP: u32 = 1;
 pub const SOCKADDR_IN_LEN: u32 = 16;
@@ -55,10 +55,41 @@ pub fn completeHdrincl(pkt: []u8, src: [4]u8) void {
     pkt[11] = @truncate(sum);
 }
 
-/// socket(AF_INET, SOCK_RAW, protocol): MoQiOS carries ICMP only. IPPROTO_IP (0) is EPROTONOSUPPORT on Linux too; other protocols
-/// Linux would accept are refused the same way.
+/// IPPROTO_RAW: a socket of this protocol starts with IP_HDRINCL set (inet_create).
+pub const IPPROTO_RAW: u32 = 255;
+/// IPPROTO_MAX: inet_create refuses a protocol at or past it (or negative) with EINVAL.
+const IPPROTO_MAX: u32 = 263;
+
+/// socket(AF_INET, SOCK_RAW, protocol) (inet_create): any protocol from 1 to IPPROTO_RAW. IPPROTO_IP (0) is EPROTONOSUPPORT; Linux
+/// also takes IPPROTO_SMC (256) and IPPROTO_MPTCP (262) for other socket types, which MoQiOS does not have (EPROTONOSUPPORT); past
+/// IPPROTO_MAX, and a negative protocol, is EINVAL.
 pub fn protocolErrno(protocol: u32) i64 {
-    return if (protocol == IPPROTO_ICMP) 0 else EPROTONOSUPPORT;
+    if (protocol >= IPPROTO_MAX) return EINVAL;
+    if (protocol == 0 or protocol > IPPROTO_RAW) return EPROTONOSUPPORT;
+    return 0;
+}
+
+pub fn startsHdrincl(protocol: u32) bool {
+    return protocol == IPPROTO_RAW;
+}
+
+/// The length check of a send without IP_HDRINCL: raw_probe_proto_opt reads the type and code of an ICMP message (fewer than 2 bytes
+/// is EFAULT); any other protocol's payload can be empty.
+pub fn sendLengthErrno(protocol: u32, len: usize) i64 {
+    if (protocol == IPPROTO_ICMP) return lengthErrno(false, len);
+    return 0;
+}
+
+/// ip_protocol_deliver_rcu: a datagram for this host whose protocol has no handler (MoQiOS handles ICMP, TCP and UDP) and that no
+/// raw socket took is answered with an ICMP protocol unreachable.
+pub fn protoUnreachable(protocol: u8, raw_took: bool) bool {
+    if (raw_took) return false;
+    return protocol != 1 and protocol != 6 and protocol != 17;
+}
+
+/// ICMP_FILTER (do_raw_setsockopt / do_raw_getsockopt): EOPNOTSUPP unless the socket's protocol is IPPROTO_ICMP.
+pub fn icmpFilterErrno(protocol: u32) i64 {
+    return if (protocol == IPPROTO_ICMP) 0 else -95;
 }
 
 /// raw_v4_match: a socket takes a datagram when it is bound to the wildcard or to the datagram's destination, and is unconnected or
@@ -93,10 +124,11 @@ pub fn sourceOf(dgram: []const u8) [4]u8 {
 }
 
 /// What getsockname reports: AF_INET, the protocol as the port (inet_num), the bound address.
-pub fn sockName(bound: [4]u8) [16]u8 {
+pub fn sockName(bound: [4]u8, protocol: u32) [16]u8 {
     var out: [16]u8 = @splat(0);
     out[0] = AF_INET;
-    out[3] = IPPROTO_ICMP;
+    out[2] = @truncate(protocol >> 8);
+    out[3] = @truncate(protocol);
     @memcpy(out[4..8], &bound);
     return out;
 }

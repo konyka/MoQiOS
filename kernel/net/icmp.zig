@@ -101,6 +101,29 @@ pub fn sendFrom(bound: [4]u8, dst: [4]u8, msg: []const u8) i64 {
     return if (ok) 0 else -105;
 }
 
+/// ICMP protocol unreachable (type 3 code 2) for a datagram `dgram` (IP header first) from `src_ip` to `dst_ip` whose protocol this
+/// host does not handle and no raw socket took (ip_protocol_deliver_rcu). It quotes the IP header and the first 8 bytes of payload,
+/// as the port unreachable does; like it, only a loopback datagram is answered (icmp_unreach_policy.shouldReply).
+pub fn sendProtoUnreachable(dgram: []const u8, src_ip: [4]u8, dst_ip: [4]u8) void {
+    const unreach = @import("icmp_unreach_policy.zig");
+    if (!unreach.shouldReply(netif.isLocal4(src_ip) and netif.isLocal4(dst_ip), false, false)) return;
+    if (dgram.len < 20) return;
+    const ihl: u16 = @as(u16, dgram[0] & 0x0f) * 4;
+    if (ihl < 20 or ihl > dgram.len) return;
+    const quote: usize = unreach.quoteLen(ihl, @intCast(dgram.len));
+    var pkt: [14 + 20 + 8 + 60 + 8]u8 = @splat(0);
+    if (quote > pkt.len - 42) return;
+    @memcpy(pkt[42..][0..quote], dgram[0..quote]);
+    pkt[34] = unreach.TYPE_DEST_UNREACH;
+    pkt[35] = 2;
+    const icmp_len: u16 = @intCast(8 + quote);
+    bo.writeU16BeAt(&pkt, 36, ipv4.checksum(pkt[34..].ptr, icmp_len));
+    ipv4.buildHeader(pkt[14..].ptr, dst_ip, src_ip, ipv4.PROTO_ICMP, icmp_len);
+    const mac = netif.getMac();
+    const frame_len = eth.buildFrame(&pkt, mac, mac, eth.ETHERTYPE_IPV4, 20 + icmp_len);
+    _ = lo.sendPacket(&pkt, frame_len);
+}
+
 pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) void {
     if (len < 8) return;
     // An echo reply is for the ping socket whose ident is its id (Linux icmp_rcv → ping_rcv); a bad checksum drops it.
