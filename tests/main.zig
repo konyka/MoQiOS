@@ -15114,7 +15114,7 @@ test "ICMP_FILTER on IPv4 raw ICMP sockets (hello399): a set bit blocks that typ
     try std.testing.expect(std.mem.indexOf(u8, rs, "if (policy.icmpTypeOf(dgram)) |ty| if (policy.icmpFilterBlocks(s.icmp_filter, ty)) continue;") != null);
     const so = kt.socket_opt_source;
     try std.testing.expect(std.mem.indexOf(u8, so, "if (!v6 and optname == ICMP_FILTER) return .icmp_filter;\n        if (v6 and optname == IPV6_CHECKSUM) return .checksum_raw;\n        return .noprotoopt;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, so, "if (which != .checksum and which != .checksum_raw and @as(i32, @bitCast(user_len)) < 0) return -22;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (which != .checksum and which != .checksum_raw and which != .hdrincl6 and @as(i32, @bitCast(user_len)) < 0) return -22;") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, "bo.writeU32Le(val[0..4], @import(\"raw_icmp.zig\").getIcmpFilter(idx));") != null);
 }
 
@@ -15222,12 +15222,12 @@ test "IP_HDRINCL id 0 is chosen unless DF (hello402): Linux raw_send_hdrinc / ip
 
 test "IPv6 raw sockets of any protocol (hello403): creation, IPV6_CHECKSUM, delivery (Linux inet6_create / rawv6_sendmsg / rawv6_rcv)" {
     const rp = kt.raw_icmp_policy;
-    // inet6_create: any protocol but IPPROTO_IP; IPPROTO_RAW needs IPV6_HDRINCL, which MoQiOS does not have.
+    // inet6_create: any protocol but IPPROTO_IP.
     try std.testing.expectEqual(@as(i64, 0), rp.protocolErrno6(58));
     try std.testing.expectEqual(@as(i64, 0), rp.protocolErrno6(253));
     try std.testing.expectEqual(@as(i64, 0), rp.protocolErrno6(6));
     try std.testing.expectEqual(@as(i64, -93), rp.protocolErrno6(0));
-    try std.testing.expectEqual(@as(i64, -93), rp.protocolErrno6(255));
+    try std.testing.expectEqual(@as(i64, 0), rp.protocolErrno6(255)); // hello404: IPPROTO_RAW, with IPV6_HDRINCL
     try std.testing.expectEqual(@as(i64, -93), rp.protocolErrno6(256));
     try std.testing.expectEqual(@as(i64, -22), rp.protocolErrno6(263));
     try std.testing.expectEqual(@as(i64, -22), rp.protocolErrno6(0xffff_ffff));
@@ -15287,4 +15287,50 @@ test "IPv6 raw sockets of any protocol (hello403): creation, IPV6_CHECKSUM, deli
     try std.testing.expect(std.mem.indexOf(u8, rs, "if (protocol == policy.IPPROTO_ICMPV6 and (msg.len < 4 or policy.filterBlocks(s.filter, msg[0]))) continue;") != null);
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "const lrc = rp.lengthErrno6(raw.protocolOf(d.raw_idx), raw.checksumOffset(d.raw_idx), msg.len);") != null);
+}
+
+test "IPV6_HDRINCL, IPPROTO_RAW and the ICMPv6 parameter problem (hello404): Linux rawv6_send_hdrinc / ip6_protocol_deliver_rcu" {
+    const rp = kt.raw_icmp_policy;
+    // inet6_create: IPPROTO_RAW is a raw socket and starts with HDRINCL (the same bit IP_HDRINCL sets).
+    try std.testing.expectEqual(@as(i64, 0), rp.protocolErrno6(255));
+    try std.testing.expectEqual(@as(i64, -93), rp.protocolErrno6(256));
+    try std.testing.expect(rp.startsHdrincl(255));
+    // rawv6_send_hdrinc: past the device MTU is EMSGSIZE, shorter than an IPv6 header EINVAL.
+    try std.testing.expectEqual(@as(i64, -90), rp.hdrinclErrno6(1501, 1500));
+    try std.testing.expectEqual(@as(i64, 0), rp.hdrinclErrno6(1500, 1500));
+    try std.testing.expectEqual(@as(i64, 0), rp.hdrinclErrno6(40, 1500));
+    try std.testing.expectEqual(@as(i64, -22), rp.hdrinclErrno6(39, 1500));
+    try std.testing.expectEqual(@as(i64, -22), rp.hdrinclErrno6(0, 1500));
+    // rawv6_sendmsg: an IPPROTO_RAW socket takes any sin6_port up to 255; past 255 is EINVAL for every socket.
+    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno6(true, 28, 10, 17, false, 255));
+    try std.testing.expectEqual(@as(i64, -22), rp.sendtoErrno6(true, 28, 10, 256, false, 255));
+    try std.testing.expectEqual(@as(i64, -22), rp.sendtoErrno6(true, 28, 10, 17, false, 253));
+    try std.testing.expectEqual(@as(i64, 0), rp.sendtoErrno6(true, 28, 10, 253, false, 253));
+    // ip6_protocol_deliver_rcu: a next header with no handler that no raw socket took gets a parameter problem; ICMPv6, TCP, UDP and
+    // the headers Linux handles itself (hop-by-hop, routing, fragment, AH, no next header, destination options) never do.
+    try std.testing.expect(rp.paramProblem6(252, false));
+    try std.testing.expect(rp.paramProblem6(255, false));
+    try std.testing.expect(!rp.paramProblem6(252, true));
+    for ([_]u8{ 6, 17, 58, 0, 43, 44, 51, 59, 60 }) |nh| try std.testing.expect(!rp.paramProblem6(nh, false));
+    // The message: type 4 code 1, the pointer at the next-header field (offset 6), then as much of the packet as fits 1280 bytes.
+    var pkt: [44]u8 = @splat(0);
+    pkt[0] = 0x60;
+    pkt[6] = 252;
+    var out: [rp.PARAM_PROBLEM_MAX]u8 = undefined;
+    const n = rp.paramProblemMsg(&out, &pkt);
+    try std.testing.expectEqual(@as(usize, 52), n);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 4, 1, 0, 0, 0, 0, 0, 6 }, out[0..8]);
+    try std.testing.expectEqualSlices(u8, &pkt, out[8..52]);
+    const big: [1400]u8 = @splat(0x5a);
+    try std.testing.expectEqual(@as(usize, 1240), rp.paramProblemMsg(&out, &big));
+    try std.testing.expectEqual(@as(usize, 1240), rp.PARAM_PROBLEM_MAX);
+    const m = kt.net_mod_source;
+    try std.testing.expect(std.mem.indexOf(u8, m, "const raw_took6 = @import(\"raw_icmp.zig\").deliver6(info6.next_header, data[payload_start6 .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "else => if (rp6.paramProblem6(info6.next_header, raw_took6)) icmpv6.sendParamProblem(data[14 .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip),") != null);
+    const rs = kt.raw_icmp_source;
+    try std.testing.expect(std.mem.indexOf(u8, rs, "if (policy.startsHdrincl(protocol)) s.opts.ip.hdrincl = true;") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const hs = raw.sendHdrincl6(to6, msg);") != null);
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (v6 and level == ipo.SOL_IPV6 and optname == IPV6_HDRINCL) return .hdrincl6;") != null);
 }

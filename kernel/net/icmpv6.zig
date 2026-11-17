@@ -403,6 +403,50 @@ pub fn sendProto6(bound: [16]u8, dst: [16]u8, next_header: u8, csum_off: ?u32, m
     return if (ok) 0 else -105;
 }
 
+/// An IPV6_HDRINCL send: `pkt` (IPv6 header first, at most 1500 bytes) goes out as written, routed by `dst` like sendProto6
+/// (rawv6_send_hdrinc fills in nothing). Returns 0, or -ENETUNREACH with no route, -ENOBUFS when the device drops it.
+pub fn sendHdrincl6(dst: [16]u8, pkt: []const u8) i64 {
+    const our_mac = netif.getMac();
+    const via_lo = netif.isLoopbackV6(dst) or ndp.isOwnAddress(dst, our_mac);
+    var wait_hop: ?[16]u8 = null;
+    const dst_mac = if (via_lo) our_mac else resolve: {
+        const hop = ndp.resolveNextHop(dst);
+        break :resolve hop.mac orelse blk: {
+            const t = hop.solicit orelse return -101;
+            sendNeighborSolicitation(t);
+            wait_hop = t;
+            break :blk [6]u8{ 0, 0, 0, 0, 0, 0 };
+        };
+    };
+    var frame: [1518]u8 = @splat(0);
+    if (pkt.len > frame.len - 14) return -90;
+    @memcpy(frame[14..][0..pkt.len], pkt);
+    const frame_len = eth.buildFrame(&frame, dst_mac, our_mac, eth.ETHERTYPE_IPV6, @intCast(pkt.len));
+    if (wait_hop) |hop| {
+        @import("ndp_queue.zig").queueFrame(hop, &frame, frame_len);
+        return 0;
+    }
+    const lo = @import("lo.zig");
+    const ok = if (via_lo) lo.sendPacket(&frame, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&frame, frame_len);
+    return if (ok) 0 else -105;
+}
+
+/// ICMPv6 parameter problem, unrecognized next header (ip6_protocol_deliver_rcu → icmpv6_send): `pkt` is the offending packet,
+/// IPv6 header first, `src` → `dst`. Like the port unreachable for UDP, only a ::1 → ::1 packet is answered (over lo).
+pub fn sendParamProblem(pkt: []const u8, src: [16]u8, dst: [16]u8) void {
+    if (!@import("icmp_unreach_policy.zig").shouldReplyV6(netif.isLoopbackV6(src), netif.isLoopbackV6(dst), false)) return;
+    const rp = @import("raw_icmp_policy.zig");
+    var msg: [rp.PARAM_PROBLEM_MAX]u8 = undefined;
+    const n = rp.paramProblemMsg(&msg, pkt);
+    var frame: [14 + 40 + rp.PARAM_PROBLEM_MAX]u8 = @splat(0);
+    @memcpy(frame[54..][0..n], msg[0..n]);
+    bo.writeU16BeAt(&frame, 56, checksum(dst, src, frame[54..].ptr, @intCast(n)));
+    ipv6.buildHeader(frame[14..].ptr, dst, src, ipv6.PROTO_ICMPV6, @intCast(n));
+    const mac = netif.getMac();
+    const frame_len = eth.buildFrame(&frame, mac, mac, eth.ETHERTYPE_IPV6, @intCast(40 + n));
+    _ = @import("lo.zig").sendPacket(&frame, frame_len);
+}
+
 fn handleNeighborSolicitation(
     src_ip: [16]u8,
     dst_ip: [16]u8,

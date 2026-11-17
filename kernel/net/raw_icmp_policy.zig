@@ -168,13 +168,38 @@ fn eql(a: [4]u8, b: [4]u8) bool {
     return @as(u32, @bitCast(a)) == @as(u32, @bitCast(b));
 }
 
-/// socket(AF_INET6, SOCK_RAW, protocol) (inet6_create): any protocol from 1 to 254. IPPROTO_IP (0) is EPROTONOSUPPORT, past
-/// IPPROTO_MAX (or negative) EINVAL. Linux also takes IPPROTO_RAW, whose sends are whole IPv6 packets (IPV6_HDRINCL); MoQiOS has no
-/// IPV6_HDRINCL, so 255 and the other inet protocols past it are EPROTONOSUPPORT.
+/// socket(AF_INET6, SOCK_RAW, protocol) (inet6_create): any protocol from 1 to IPPROTO_RAW, which starts with IPV6_HDRINCL set
+/// (startsHdrincl). IPPROTO_IP (0) is EPROTONOSUPPORT, and so are 256 to 262 (Linux takes them, but they name no IPv6 next header:
+/// such a socket sends nothing and receives nothing); past IPPROTO_MAX, and a negative protocol, is EINVAL.
 pub fn protocolErrno6(protocol: u32) i64 {
-    if (protocol >= IPPROTO_MAX) return EINVAL;
-    if (protocol == 0 or protocol >= IPPROTO_RAW) return EPROTONOSUPPORT;
+    return protocolErrno(protocol);
+}
+
+/// rawv6_send_hdrinc: the send is a whole IPv6 packet of at most the device MTU (EMSGSIZE) and at least an IPv6 header (EINVAL).
+pub fn hdrinclErrno6(len: usize, mtu: usize) i64 {
+    if (len > mtu) return -90;
+    if (len < 40) return EINVAL;
     return 0;
+}
+
+/// ip6_protocol_deliver_rcu: a packet for this host whose next header has no handler (MoQiOS handles ICMPv6, TCP and UDP, and
+/// treats the extension headers Linux parses as handled) and that no raw socket took is answered with a parameter problem.
+pub fn paramProblem6(nh: u8, raw_took: bool) bool {
+    if (raw_took) return false;
+    if (nh == 6 or nh == 17 or nh == 58) return false;
+    return !@import("icmp_unreach_policy.zig").isExtHdr6(nh);
+}
+
+/// The longest ICMPv6 error (RFC 4443 §2.4: the whole message within the 1280-byte minimum MTU, less the 40-byte IPv6 header).
+pub const PARAM_PROBLEM_MAX: usize = 1280 - 40;
+
+/// icmpv6_send(ICMPV6_PARAMPROB, ICMPV6_UNK_NEXTHDR, 6): type 4, code 1, a pointer to the next-header field, then as much of the
+/// offending packet `pkt` (IPv6 header first) as fits. The checksum stays 0 for the sender to fill. Returns the length.
+pub fn paramProblemMsg(out: *[PARAM_PROBLEM_MAX]u8, pkt: []const u8) usize {
+    const q = @min(pkt.len, PARAM_PROBLEM_MAX - 8);
+    out[0..8].* = .{ 4, 1, 0, 0, 0, 0, 0, 6 };
+    @memcpy(out[8..][0..q], pkt[0..q]);
+    return 8 + q;
 }
 
 const IPPROTO_UDP: u32 = 17;
@@ -294,7 +319,9 @@ pub fn sendtoErrno6(have_addr: bool, addr_len: u32, family: u16, port: u16, conn
     if (have_addr) {
         if (addr_len < SOCKADDR_IN6_MIN) return EINVAL;
         if (family != AF_INET6 and family != 0) return EAFNOSUPPORT;
-        if (port != 0 and port != protocol) return EINVAL;
+        // sin6_port is the next header: 0 means the socket's, an IPPROTO_RAW socket takes any up to 255.
+        if (port > 255) return EINVAL;
+        if (port != 0 and port != protocol and protocol != IPPROTO_RAW) return EINVAL;
         return 0;
     }
     return if (connected) 0 else EDESTADDRREQ;

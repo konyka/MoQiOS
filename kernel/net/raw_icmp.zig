@@ -66,14 +66,14 @@ var sockets: [MAX_SOCKETS]Socket = @splat(.{});
 var raw_lock: IrqSpinlock = .{};
 
 /// A new socket of `protocol` (an IPv6 one when `v6`) on the first free slot, or null (ENOBUFS). Nothing is shared with a UDP
-/// socket. IPPROTO_RAW starts with IP_HDRINCL set (inet_create).
+/// socket. IPPROTO_RAW starts with IP_HDRINCL / IPV6_HDRINCL set (inet_create, inet6_create: one HDRINCL bit for both).
 pub fn open(v6: bool, protocol: u32) ?u32 {
     const saved = raw_lock.acquire();
     defer raw_lock.release(saved);
     for (&sockets, 0..) |*s, i| {
         if (s.used) continue;
         s.* = .{ .used = true, .refs = 1, .v6 = v6, .protocol = @truncate(protocol), .csum_off = if (v6) policy.initialChecksum6(protocol) else null };
-        if (!v6 and policy.startsHdrincl(protocol)) s.opts.ip.hdrincl = true;
+        if (policy.startsHdrincl(protocol)) s.opts.ip.hdrincl = true;
         return @intCast(i);
     }
     return null;
@@ -393,6 +393,17 @@ pub fn setChecksumOffset(idx: u32, off: ?u32) bool {
 
 /// Largest message an IPv6 raw send carries (a 1500-byte frame less the IPv6 header).
 pub const MAX_MESSAGE6 = 1460;
+
+/// An IPV6_HDRINCL send (rawv6_send_hdrinc): `pkt` is a whole IPv6 packet, header first, that passed policy.hdrinclErrno6. It goes
+/// out as written, routed by `dst` (the sendto address or the connected peer), not by its header (icmpv6.sendHdrincl6).
+pub fn sendHdrincl6(dst: [16]u8, pkt: []const u8) i64 {
+    var buf: [MAX_MESSAGE6 + 40]u8 = undefined;
+    if (pkt.len > buf.len) return -90;
+    @memcpy(buf[0..pkt.len], pkt);
+    const rc = @import("icmpv6.zig").sendHdrincl6(dst, buf[0..pkt.len]);
+    if (rc == 0) _ = lo.drain();
+    return rc;
+}
 
 /// rawv6_sendmsg: `msg` (what follows the IPv6 header, next header `protocol`) from `bound` to `dst`; the kernel writes the checksum
 /// at `csum_off` when there is one (icmpv6.sendProto6). `msg` passed policy.lengthErrno6. 0 or -errno.

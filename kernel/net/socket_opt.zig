@@ -615,8 +615,10 @@ const ICMP_FILTER: u64 = 1;
 const ICMP6_FILTER: u64 = 1;
 /// IPV6_CHECKSUM (SOL_IPV6 option 7): where the kernel puts a send's checksum and checks a received one (rawv6_setsockopt).
 const IPV6_CHECKSUM: u64 = 7;
+/// IPV6_HDRINCL (SOL_IPV6 option 36): an IPv6 raw socket's sends are whole packets, header first (the HDRINCL bit IP_HDRINCL sets).
+const IPV6_HDRINCL: u64 = 36;
 
-const RawV6Opt = enum { filter, checksum, checksum_raw, icmp_filter, noprotoopt, icmpv6_level };
+const RawV6Opt = enum { filter, checksum, checksum_raw, icmp_filter, noprotoopt, icmpv6_level, hdrincl6 };
 
 /// Which raw-socket option a SOL_ICMPV6, SOL_IPV6 or SOL_RAW request names: ICMP6_FILTER and IPV6_CHECKSUM (at SOL_IPV6, or at
 /// SOL_RAW) on an IPv6 socket; any other SOL_ICMPV6 or SOL_RAW option is ENOPROTOOPT. SOL_RAW ICMP_FILTER on an IPv4 socket. Null:
@@ -629,6 +631,7 @@ fn rawV6Opt(v6: bool, level: u64, optname: u64) ?RawV6Opt {
     }
     if (level == SOL_ICMPV6) return if (!v6) null else if (optname == ICMP6_FILTER) .filter else .icmpv6_level;
     if (v6 and level == ipo.SOL_IPV6 and optname == IPV6_CHECKSUM) return .checksum;
+    if (v6 and level == ipo.SOL_IPV6 and optname == IPV6_HDRINCL) return .hdrincl6;
     return null;
 }
 
@@ -649,6 +652,17 @@ fn setRawV6Opt(idx: u32, which: RawV6Opt, optval_ptr: u64, optlen: u64) i64 {
     if (frc != 0) return frc;
     switch (which) {
         .noprotoopt, .icmpv6_level => return -92,
+        .hdrincl6 => {
+            // do_rawv6_setsockopt: an int, any nonzero value sets it.
+            if (optlen < 4) return -22;
+            if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;
+            var b: [4]u8 = undefined;
+            if (@import("../mm/copy_from_user.zig").copyFromUser(&b, @ptrFromInt(optval_ptr), 4) != 4) return -14;
+            const raw = @import("raw_icmp.zig");
+            var st = raw.getOpts(idx) orelse return -9;
+            st.ip.hdrincl = bo.readU32Le(&b) != 0;
+            return if (raw.setOpts(idx, st)) 0 else -9;
+        },
         .checksum, .checksum_raw => {
             // do_rawv6_setsockopt: an int; an ICMPv6 socket's offset cannot be moved at SOL_IPV6 (RFC 3542), an odd one is EINVAL.
             if (optlen < 4) return -22;
@@ -698,7 +712,7 @@ fn getRawV6Opt(idx: u32, which: RawV6Opt, optval_ptr: u64, optlen_ptr: u64) i64 
     const user_len = bo.readU32Le(&len_buf);
     // raw_geticmpfilter / rawv6_geticmpfilter: a negative length is EINVAL (do_rawv6_getsockopt takes it as unsigned for
     // IPV6_CHECKSUM, so 4 bytes).
-    if (which != .checksum and which != .checksum_raw and @as(i32, @bitCast(user_len)) < 0) return -22;
+    if (which != .checksum and which != .checksum_raw and which != .hdrincl6 and @as(i32, @bitCast(user_len)) < 0) return -22;
     var val: [@import("raw_icmp_policy.zig").FILTER_LEN]u8 = @splat(0);
     var full: u32 = 4;
     if (which == .filter) {
@@ -706,6 +720,8 @@ fn getRawV6Opt(idx: u32, which: RawV6Opt, optval_ptr: u64, optlen_ptr: u64) i64 
         full = @import("raw_icmp_policy.zig").FILTER_LEN;
     } else if (which == .icmp_filter) {
         bo.writeU32Le(val[0..4], @import("raw_icmp.zig").getIcmpFilter(idx));
+    } else if (which == .hdrincl6) {
+        bo.writeU32Le(val[0..4], @intFromBool((@import("raw_icmp.zig").getOpts(idx) orelse return -9).ip.hdrincl));
     } else bo.writeU32Le(val[0..4], @bitCast(@import("raw_icmp_policy.zig").checksumOptRead(@import("raw_icmp.zig").checksumOffset(idx))));
     const n = @min(user_len, full);
     if (n > 0 and copy_mod.copyToUser(@ptrFromInt(optval_ptr), val[0..n], n) != n) return -14;

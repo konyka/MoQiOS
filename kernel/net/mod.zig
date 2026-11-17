@@ -73,7 +73,8 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
 
             // raw6_local_deliver: each IPv6 raw socket of the next header gets the packet, without its IPv6 header, before the
             // protocol handler (ip6_protocol_deliver_rcu).
-            _ = @import("raw_icmp.zig").deliver6(info6.next_header, data[payload_start6 .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip);
+            const raw_took6 = @import("raw_icmp.zig").deliver6(info6.next_header, data[payload_start6 .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip);
+            const rp6 = @import("raw_icmp_policy.zig");
             switch (info6.next_header) {
                 ipv6.PROTO_ICMPV6 => {
                     icmpv6.handlePacket(info6.src_ip, info6.dst_ip, data + payload_start6, info6.payload_len);
@@ -84,7 +85,8 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
                 ipv6.PROTO_UDP => {
                     udp.handlePacketV6On(info6.src_ip, info6.dst_ip, data + payload_start6, info6.payload_len, ifindex);
                 },
-                else => {},
+                // ip6_protocol_deliver_rcu: a next header with no handler that no raw socket took gets a parameter problem.
+                else => if (rp6.paramProblem6(info6.next_header, raw_took6)) icmpv6.sendParamProblem(data[14 .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip),
             }
         },
         else => {},

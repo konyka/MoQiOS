@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello403`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello404`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -398,6 +398,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello401 | 任意协议的 IPv4 raw 套接字：协议 0 是 EPROTONOSUPPORT，-1、263 是 EINVAL；协议 253 的 SO_PROTOCOL 和 getsockname 端口都是 253、IP_HDRINCL 0，IPPROTO_RAW 的 IP_HDRINCL 1，253 上的 ICMP_FILTER 两个方向都是 EOPNOTSUPP（A）；253 套接字发 5 字节到 127.0.0.1，收回 25 字节副本（协议 253、TTL 64、来源端口 0），发 0 字节和 1 字节也可以，副本 20、21 字节（S）；另一个 253 套接字收到同样三份，254 套接字和 ICMP 套接字收不到（O）；协议 17 的 raw 套接字看到发往已绑定 UDP 套接字的数据报（32 字节、目的端口 4011），UDP 套接字照样收到（U）；协议 6 的 raw 套接字看到连接关闭端口时的 SYN 和 RST\|ACK（T）；IPPROTO_RAW 发出协议 252 的数据报，没有处理者时 ICMP 套接字收到协议不可达，开着 252 套接字时由它收下、不回不可达（P）；绑定到 127.0.0.1 的 248 套接字收不到发往 127.0.0.2 的数据报，发送方收到协议不可达（B） |
 | hello402 | IP_HDRINCL 发送的 IPv4 id（IPPROTO_RAW 套接字发往 127.0.0.1，协议 253 的套接字读副本）：id 为 0、没有 DF 的三个数据报得到三个不同的非零 id，校验和正确（Z）；id 为 0、有 DF 的三个保持 0（D）；id 0x1234 保持不变（G） |
 | hello403 | 任意协议的 IPv6 raw 套接字：协议 0 是 EPROTONOSUPPORT，-1、263 是 EINVAL；协议 253 的 SO_PROTOCOL、SO_DOMAIN、getsockname 端口，IPV6_CHECKSUM 读 -1，ICMP6_FILTER 两个方向都是 EOPNOTSUPP（A）；发往 ::1 的 5 字节和 0 字节都收到不带头的副本，来源 ::1 端口 0，端口 253 可以、17 是 EINVAL（S）；第二个 253 套接字收到同样的副本，254 和 ICMPv6 套接字收不到（O）；协议 17 的 raw 套接字看到发给已绑定 UDP 套接字的数据报，UDP 套接字照样收到（U）；协议 6 的 raw 套接字看到被拒连接的 SYN 和 RST\|ACK（T）；IPV6_CHECKSUM 设 4 读回 4，3 是 EINVAL，5 字节发送 EINVAL，8 字节发送的校验和正确，没开选项的套接字发的错和被丢掉，-1 关闭后原样收到（K） |
+| hello404 | IPV6_HDRINCL 和 IPPROTO_RAW：`socket(AF_INET6, SOCK_RAW, 255)` 建好时 IPV6_HDRINCL 为 1、IPV6_CHECKSUM 为 -1，协议 253 的套接字设 1 或 2 读回 1，2 字节的 optval 是 EINVAL，UDP、TCP 上两个方向都是 ENOPROTOOPT（A）；整包发送 44 字节，下一头部 252 的套接字收到 4 字节负载，头里的负载长度 2 只投递 2 字节、8 不投递，源地址 :: 照发，39 和 0 字节 EINVAL，只有头的 40 字节投递空副本，版本 4 的头被丢，跳数 7 保留，1501 字节 EMSGSIZE，没有目的 EDESTADDRREQ，端口 17 可以、256 是 EINVAL（S）；开着 IPV6_HDRINCL 的协议 253 套接字也能整包发送（H）；没有 raw 套接字收下的下一头部 252 得到 52 字节的参数问题（代码 1，指针 6，引用下一头部 252），有 252 套接字时没有（P）；关掉 IPV6_HDRINCL 的 IPPROTO_RAW 套接字按协议 255 发送并收到自己的副本（N） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

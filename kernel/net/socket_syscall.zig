@@ -54,8 +54,7 @@ pub fn allocUnixFd(fd_table: *vfs_mod.FdTable, unix_sock_idx: u32) i32 {
 // ── Raw IPv4 and IPv6 sockets (net/raw_icmp.zig) ───────────────────
 
 /// socket(AF_INET, SOCK_RAW, protocol) or, when `v6`, socket(AF_INET6, SOCK_RAW, protocol): needs CAP_NET_RAW (inet_create /
-/// inet6_create: EPERM). IPv4 takes any protocol from 1 to 255 (raw_icmp_policy.protocolErrno), IPv6 any from 1 to 254
-/// (protocolErrno6).
+/// inet6_create: EPERM). Either family takes any protocol from 1 to 255 (raw_icmp_policy.protocolErrno, protocolErrno6).
 fn rawCreate(protocol: u32, v6: bool) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
@@ -110,9 +109,20 @@ fn rawSendFrom6(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest)
         const rc = rp.sendtoErrno6(false, 0, 0, 0, raw.isConnected(d.raw_idx), raw.protocolOf(d.raw_idx));
         if (rc != 0) return rc;
     }
-    const lrc = rp.lengthErrno6(raw.protocolOf(d.raw_idx), raw.checksumOffset(d.raw_idx), msg.len);
-    if (lrc != 0) return lrc;
+    // IPV6_HDRINCL: `msg` is the whole packet, header first, sent as written once routed (rawv6_send_hdrinc); otherwise the
+    // ICMPv6 type and code are read before the route is looked up (rawv6_probe_proto_opt).
+    const hdrincl = rawIpOpts(d.raw_idx).hdrincl;
+    if (!hdrincl) {
+        const lrc = rp.lengthErrno6(raw.protocolOf(d.raw_idx), raw.checksumOffset(d.raw_idx), msg.len);
+        if (lrc != 0) return lrc;
+    }
     const to6 = rp.dest6(dst) orelse return -101; // ENETUNREACH: a v4-mapped address has no IPv6 route
+    if (hdrincl) {
+        const hrc = rp.hdrinclErrno6(msg.len, @import("netif.zig").getMtu());
+        if (hrc != 0) return hrc;
+        const hs = raw.sendHdrincl6(to6, msg);
+        return if (hs < 0) hs else @intCast(msg.len);
+    }
     const sent = raw.send6(raw.boundAddr6(d.raw_idx), to6, @truncate(raw.protocolOf(d.raw_idx)), raw.checksumOffset(d.raw_idx), msg, rawIpOpts(d.raw_idx));
     return if (sent < 0) sent else @intCast(msg.len);
 }
