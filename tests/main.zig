@@ -15058,3 +15058,31 @@ test "raw ICMP sockets take sendmsg and recvmsg (hello397)" {
     try std.testing.expect(std.mem.indexOf(u8, rbody, "const got = rawRecvInto(d, data[0..room], flags | 0x20, &src);") != null);
     try std.testing.expect(std.mem.indexOf(u8, rbody, "bo.writeU32Le(&fl, if (truncated) @as(u32, 0x20) else 0);") != null);
 }
+
+test "raw ICMP queue is a ring and MSG_PEEK leaves the head (hello398)" {
+    const rp = kt.raw_icmp_policy;
+    try std.testing.expectEqual(@as(?u8, 0), rp.enqueueSlot(0, 0));
+    try std.testing.expectEqual(@as(?u8, 3), rp.enqueueSlot(1, 2));
+    try std.testing.expectEqual(@as(?u8, 1), rp.enqueueSlot(6, 3));
+    try std.testing.expectEqual(@as(?u8, null), rp.enqueueSlot(5, rp.QUEUE_DEPTH));
+    const peeked = rp.afterRecv(2, 3, true);
+    try std.testing.expectEqual(@as(u8, 2), peeked.head);
+    try std.testing.expectEqual(@as(u8, 3), peeked.count);
+    const taken = rp.afterRecv(7, 3, false);
+    try std.testing.expectEqual(@as(u8, 0), taken.head);
+    try std.testing.expectEqual(@as(u8, 2), taken.count);
+    // Request A and reply A queue, A is read, request B arrives: B goes behind reply A, which the next read gets.
+    var head: u8 = 0;
+    var count: u8 = 2;
+    const after_a = rp.afterRecv(head, count, false);
+    head = after_a.head;
+    count = after_a.count;
+    try std.testing.expectEqual(@as(?u8, 2), rp.enqueueSlot(head, count));
+    try std.testing.expectEqual(@as(u8, 1), head);
+    const rs = kt.raw_icmp_source;
+    try std.testing.expect(std.mem.indexOf(u8, rs, "pub fn recv(idx: u32, out: []u8, peek: bool) RecvResult {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "const at = policy.enqueueSlot(s.head, s.count) orelse continue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "const next = policy.afterRecv(s.head, s.count, peek);") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "switch (raw.recv(d.raw_idx, out, (flags & 0x02) != 0)) {") != null);
+}

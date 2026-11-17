@@ -171,7 +171,7 @@ pub fn rawRecvInto(d: *vfs_mod.FileDescriptor, out: []u8, flags: u32, from: ?*[1
     const deadline = urp.deadlineNs(tsc.nanos(), if (raw.getOpts(d.raw_idx)) |o| o.rcv_ms else 0);
     while (true) {
         _ = @import("lo.zig").drain();
-        switch (raw.recv(d.raw_idx, out)) {
+        switch (raw.recv(d.raw_idx, out, (flags & 0x02) != 0)) {
             .ok => |r| {
                 if (from) |f| f.* = r.src;
                 return @intCast(if ((flags & 0x20) != 0) r.trunc else r.n);

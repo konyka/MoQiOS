@@ -215,6 +215,23 @@ pub fn pollBits(has_data: bool, shut_rd: bool, shut_wr: bool) u32 {
     return ev;
 }
 
+/// Datagrams a raw socket queues; the queue is a ring of this many slots, oldest first (Linux sk_receive_queue).
+pub const QUEUE_DEPTH: u8 = 8;
+
+/// The slot a new datagram goes into behind the `count` queued from `head`, or null when the queue is full (the datagram is dropped).
+pub fn enqueueSlot(head: u8, count: u8) ?u8 {
+    if (count >= QUEUE_DEPTH) return null;
+    return (head + count) % QUEUE_DEPTH;
+}
+
+pub const Ring = struct { head: u8, count: u8 };
+
+/// The ring after a receive of the head datagram: MSG_PEEK leaves it queued (skb_recv_datagram with MSG_PEEK), a read takes it.
+pub fn afterRecv(head: u8, count: u8, peek: bool) Ring {
+    if (peek or count == 0) return .{ .head = head, .count = count };
+    return .{ .head = (head + 1) % QUEUE_DEPTH, .count = count - 1 };
+}
+
 pub const EmptyRecv = enum { eagain, eof, wait };
 
 /// A receive that finds the queue empty: EAGAIN when it may not wait, 0 (end of file) once SHUT_RD, otherwise it waits.

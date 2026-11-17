@@ -17,7 +17,7 @@ const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 /// Raw ICMP sockets at once (each queues up to QUEUE_DEPTH datagrams of RAW_QUEUE_LEN bytes: about 200 KiB in all).
 pub const MAX_SOCKETS = 16;
-const QUEUE_DEPTH = 8;
+const QUEUE_DEPTH = policy.QUEUE_DEPTH;
 pub const RAW_QUEUE_LEN = 1500;
 /// Largest ICMP message a send carries (1472-byte UDP payload and ICMP header: the same bound the ping sockets use).
 pub const MAX_MESSAGE = 1480;
@@ -49,7 +49,10 @@ const Socket = struct {
     shut_wr: bool = false,
     /// SOL_SOCKET options (SO_RCVTIMEO, SO_RCVBUF, ...): one copy per socket, so every descriptor naming it sees the same set.
     opts: @import("sockopt_policy.zig").Stored = .{},
+    /// A ring, oldest first: `count` datagrams from slot `head` (policy.enqueueSlot, policy.afterRecv).
     queue: [QUEUE_DEPTH]Entry = @splat(.{}),
+    head: u8 = 0,
+    count: u8 = 0,
 };
 
 var sockets: [MAX_SOCKETS]Socket = @splat(.{});
@@ -109,10 +112,7 @@ pub fn hasData(idx: u32) bool {
     const saved = raw_lock.acquire();
     defer raw_lock.release(saved);
     if (idx >= MAX_SOCKETS or !sockets[idx].used) return false;
-    for (sockets[idx].queue) |e| {
-        if (e.len != 0) return true;
-    }
-    return false;
+    return sockets[idx].count != 0;
 }
 
 pub const RecvResult = union(enum) {
@@ -120,21 +120,22 @@ pub const RecvResult = union(enum) {
     eagain,
 };
 
-/// Take the oldest queued datagram into `out`: `n` bytes of it, and `trunc` — the datagram's whole length as MSG_TRUNC reports it.
-pub fn recv(idx: u32, out: []u8) RecvResult {
+/// Copy the oldest queued datagram into `out`: `n` bytes of it, and `trunc` — the datagram's whole length as MSG_TRUNC reports it.
+/// A read takes it off the queue; `peek` (MSG_PEEK) leaves it there for the next receive.
+pub fn recv(idx: u32, out: []u8, peek: bool) RecvResult {
     const saved = raw_lock.acquire();
     defer raw_lock.release(saved);
     if (idx >= MAX_SOCKETS or !sockets[idx].used) return .eagain;
     const s = &sockets[idx];
-    for (&s.queue) |*e| {
-        if (e.len == 0) continue;
-        const copy_len = @min(@as(usize, e.len), out.len);
-        @memcpy(out[0..copy_len], e.dgram[0..copy_len]);
-        const result: RecvResult = .{ .ok = .{ .n = copy_len, .src = e.src, .trunc = e.len } };
-        e.len = 0;
-        return result;
-    }
-    return .eagain;
+    if (s.count == 0) return .eagain;
+    const e = &s.queue[s.head];
+    const copy_len = @min(@as(usize, e.len), out.len);
+    @memcpy(out[0..copy_len], e.dgram[0..copy_len]);
+    const result: RecvResult = .{ .ok = .{ .n = copy_len, .src = e.src, .trunc = e.len } };
+    const next = policy.afterRecv(s.head, s.count, peek);
+    s.head = next.head;
+    s.count = next.count;
+    return result;
 }
 
 /// raw_bind: the socket takes only datagrams addressed to `addr` from then on.
@@ -245,11 +246,7 @@ pub fn pollEvents(idx: u32) u32 {
     defer raw_lock.release(saved);
     if (idx >= MAX_SOCKETS or !sockets[idx].used) return 0x004;
     const s = &sockets[idx];
-    var has = false;
-    for (s.queue) |e| {
-        if (e.len != 0) has = true;
-    }
-    return policy.pollBits(has, s.shut_rd, s.shut_wr);
+    return policy.pollBits(s.count != 0, s.shut_rd, s.shut_wr);
 }
 
 pub fn boundAddr(idx: u32) [4]u8 {
@@ -284,17 +281,16 @@ pub fn deliver(dgram: []const u8, src: [4]u8, dst: [4]u8) void {
             if (!s.used) continue;
             if (s.v6) continue;
             if (!policy.matches(s.bound, s.peer, src, dst)) continue;
-            for (&s.queue) |*e| {
-                if (e.len != 0) continue;
-                const copy_len = @min(dgram.len, RAW_QUEUE_LEN);
-                @memcpy(e.dgram[0..copy_len], dgram[0..copy_len]);
-                e.len = @intCast(copy_len);
-                e.src = @splat(0);
-                @memcpy(e.src[0..4], &src);
-                notify[n_notify] = @intCast(i);
-                n_notify += 1;
-                break;
-            }
+            const at = policy.enqueueSlot(s.head, s.count) orelse continue;
+            const e = &s.queue[at];
+            const copy_len = @min(dgram.len, RAW_QUEUE_LEN);
+            @memcpy(e.dgram[0..copy_len], dgram[0..copy_len]);
+            e.len = @intCast(copy_len);
+            e.src = @splat(0);
+            @memcpy(e.src[0..4], &src);
+            s.count += 1;
+            notify[n_notify] = @intCast(i);
+            n_notify += 1;
         }
     }
     for (notify[0..n_notify]) |idx| {
@@ -316,16 +312,15 @@ pub fn deliver6(msg: []const u8, src: [16]u8, dst: [16]u8) void {
             if (!s.used or !s.v6) continue;
             if (!policy.matches6(s.bound6, s.peer6, src, dst)) continue;
             if (policy.filterBlocks(s.filter, msg[0])) continue;
-            for (&s.queue) |*e| {
-                if (e.len != 0) continue;
-                const copy_len = @min(msg.len, RAW_QUEUE_LEN);
-                @memcpy(e.dgram[0..copy_len], msg[0..copy_len]);
-                e.len = @intCast(copy_len);
-                e.src = src;
-                notify[n_notify] = @intCast(i);
-                n_notify += 1;
-                break;
-            }
+            const at = policy.enqueueSlot(s.head, s.count) orelse continue;
+            const e = &s.queue[at];
+            const copy_len = @min(msg.len, RAW_QUEUE_LEN);
+            @memcpy(e.dgram[0..copy_len], msg[0..copy_len]);
+            e.len = @intCast(copy_len);
+            e.src = src;
+            s.count += 1;
+            notify[n_notify] = @intCast(i);
+            n_notify += 1;
         }
     }
     for (notify[0..n_notify]) |idx| {

@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello397`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello398`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -392,6 +392,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello395 | raw ICMP 套接字接受 IP 层选项，发送带上它们：IP_TTL 默认 64、设 7 后读回 7，发往 127.0.0.1 的回显请求回到套接字时 TTL 是 7（T）；IP_TOS 0x10 读回，请求的 TOS 字节是 0x10（Q）；IP_TTL 0 和 256 是 EINVAL，-1 恢复 64（E）；IPv4 raw 上 SOL_IPV6 的 get 是 EOPNOTSUPP、set 是 ENOPROTOOPT（L）；dup 读到同样的 TTL（D）；IPv6 raw ICMPv6 套接字的 IPV6_UNICAST_HOPS 默认 64、设 9 读回，发往 ::1 的回显请求照样发出（H）；IPV6_TCLASS 0x20 读回（C）；IPv6 raw 上 SOL_IP 两者都是 ENOPROTOOPT（S） |
 | hello396 | raw IPv4 套接字的 IP_HDRINCL：默认读 0，设 1 读 1，清掉读 0（G）；UDP 套接字上 set 是 ENOPROTOOPT、get 读 0（U）；自带头（来源 0、总长 0、校验和 0、id 0x1234、TTL 5）的回显请求发往 127.0.0.1 返回 28，套接字收到的副本 TTL 5（套接字的 IP_TTL 9 不套用）、id 0x1234、来源 127.0.0.1、总长 28、校验和正确（I）；整个写好的 UDP 数据报（来源 127.0.0.1:4000）送到绑定的 UDP 套接字（P）；19 字节、IHL 60 而只发 28 字节都是 EINVAL（S）；清掉 IP_HDRINCL 后缓冲区又是 ICMP 报文，副本带内核的头、TTL 9（O） |
 | hello397 | raw ICMP 套接字的 sendmsg/recvmsg：4 + 4 字节两个 iovec 发往 127.0.0.1 返回 8（S）；recvmsg 收到 28 字节（IP 头 0x45 起、偏移 20 处类型 8），名字族 2、127.0.0.1、namelen 16，controllen 0，flags 0（R）；10 字节缓冲区返回 10、msg_flags MSG_TRUNC，带 MSG_TRUNC 返回 28（T）；空队列 MSG_DONTWAIT 是 EAGAIN，未连接又无 msg_name 是 EDESTADDRREQ（E）；connect 之后不带 msg_name 发送 8，副本收回 28（C）；IPv6 raw 套接字发往 ::1 返回 8、recvmsg 8，名字族 10、末字节 1、namelen 28（6） |
+| hello398 | raw ICMP 套接字的 MSG_PEEK 和队列顺序：peek 拿到 28 字节回显请求的副本和来源（namelen 16），随后一次读拿到同一个数据报，之后队列空（EAGAIN）（P）；10 字节的 MSG_PEEK\|MSG_TRUNC 返回 28，数据报仍在，再读得到全部 28 字节（T）；recvmsg 带 MSG_PEEK 两次都看到同一个数据报并回填名字，再读才取走（M）；两个请求排队时 peek 看到较早的，读走它，下一次 peek 看到较晚的（O）；队列先进先出：请求 A 和应答 A 入队，读走请求 A 后请求 B 到达，下一次读拿到应答 A（F）；IPv6 raw 套接字 peek 和读都拿到来自 ::1 的 8 字节请求（6） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

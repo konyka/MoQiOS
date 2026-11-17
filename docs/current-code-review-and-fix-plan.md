@@ -10325,3 +10325,20 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. 不读控制消息（没有 IP_PKTINFO、IP_TTL 一类的 cmsg），`msg_controllen` 恒为 0。
   2. 没有 MSG_PEEK、MSG_ERRQUEUE。
   3. sendmsg 一次最多 1500 字节（`MAX_HDRINCL`），与 sendto 相同。
+
+## 补充：raw 套接字的接收队列顺序和 MSG_PEEK（hello398）
+
+- 问题：
+  1. raw ICMP 套接字的 recvfrom/recv/recvmsg 忽略 MSG_PEEK，数据报总被取走。
+  2. 接收队列不是先进先出：`deliver`/`deliver6` 把数据报放进第一个空槽，`recv` 取第一个非空槽。读走槽 0 之后到达的数据报会放进槽 0，排到槽 1 里更早的数据报前面。回环上发一个请求会排入请求和应答两项，读走请求后再发第二个请求，下一次读拿到的是第二个请求，而不是第一个应答。
+- Linux 语义（3rd/linux-7.0.6 `net/ipv4/raw.c` 的 `raw_recvmsg`、`net/ipv6/raw.c` 的 `rawv6_recvmsg` 把 flags 交给 `skb_recv_datagram`；带 MSG_PEEK 时 `__skb_try_recv_from_queue` 只增加引用，不把 skb 从 `sk_receive_queue` 摘下；`sk_receive_queue` 是先进先出的链表）。
+- 宿主机实测（`user/hello398.c -DHOST`，root、`unshare -n`、只有 lo）：6 项（P T M O F 6）全部通过。
+- 修复：
+  - `raw_icmp_policy.zig`：新增 `QUEUE_DEPTH`（8）、`enqueueSlot`（队尾槽号，满了返回 null）、`afterRecv`（读出队，peek 不变）。
+  - `raw_icmp.zig`：`Socket` 加 `head`、`count`，队列改成环；`deliver`、`deliver6` 按 `enqueueSlot` 入队；`recv` 新增 `peek` 参数，取队头后按 `afterRecv` 更新；`hasData`、`pollEvents` 改看 `count`。
+  - `socket_syscall.rawRecvInto`：把调用标志里的 MSG_PEEK（0x02）传给 `raw.recv`，recvfrom、recv、read（标志为 0）、recvmsg 共用这一处。
+- host 测试 "raw ICMP queue is a ring and MSG_PEEK leaves the head (hello398)"：实现前编译失败（`enqueueSlot` 不存在），实现后通过。变异验证：`afterRecv` 忽略 `peek`（`_ = peek;`），测试在断言处失败；已恢复。第一次变异直接删掉条件里的 `peek`，因为参数没用到而编译失败，不算有效变异，已改用上面的写法重做。
+- QEMU：第一次 smoke 里 hello398 全部失败，原因在测试程序：MoQiOS 分支把 sendto/recvfrom 的调用号写成了 118/119（应为 121/122，与 hello396 相同），改正后宿主机结果不变。之后完整 smoke SMP=2、SMP=4 各一份 `PASS`，hello398 6 项全过；恢复修复后 SMP=1 完整 smoke `PASS`。取红灯（只回退内核修复、保留能力配置，hello398 提前到 hello3 之前）：6 项全部失败（peek 把数据报取走，之后的读是 EAGAIN；O 里读到的是较晚的请求；F 里读到的是请求 B 而不是应答 A）。riscv64 和 aarch64 交叉构建通过，但没有在这两个架构上跑 QEMU。
+- 局限：
+  1. 队列仍是每个套接字 8 项、每项 1500 字节，不按 SO_RCVBUF 计量；满了直接丢弃，不计入任何统计。
+  2. 不支持 MSG_PEEK 配合 SO_PEEK_OFF。
