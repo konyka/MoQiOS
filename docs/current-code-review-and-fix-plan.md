@@ -10207,3 +10207,21 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   2. 没有 IP_HDRINCL、ICMP_FILTER，没有 sendmsg/recvmsg 的 raw 分支（sendmsg 返回 ENOTSOCK）。
   3. SO_RCVTIMEO 不生效：阻塞接收每 5 ms 轮询一次，直到有数据或被信号打断；非 x86 架构上阻塞接收直接返回 EAGAIN。
   4. 最多 16 个 raw 套接字，每个最多排 8 个数据报，再来的丢弃。
+
+## 补充：ICMP 差错送到已连接的 UDP 和 ping 套接字（hello390）
+
+- 问题：`icmp.handlePacket` 只认目的不可达代码 3（端口不可达，已连接 UDP 套接字得 ECONNREFUSED）和代码 4（路径 MTU）。其他硬差错（协议不可达、管理禁止、参数问题等）对 UDP 套接字没有任何效果；ping 套接字收不到任何差错，引用它回显请求的端口不可达被忽略。差错也不验校验和。
+- 宿主机实测（`/tmp/exp389b.c`，后来写成 `user/hello390.c`，root、`unshare -n`、只有 lo）：通过 raw ICMP 套接字向 127.0.0.1 写 20 种差错，引用已连接套接字发出的数据报。已连接的 UDP 和 ping 套接字得到的 SO_ERROR 完全一样：目的不可达代码 2 3 4 6 7 8 9 10 13 14 15 是 92 111 90 101 112 64 101 113 113 113 113，类型 12 是 71，代码 0 1 5 11 12、类型 11、5、4 都是 0。未连接（只 bind）的套接字都不报。引用回显应答的差错不报。待处理差错让下一次 recv 或 send 失败一次，然后清除。hello390 的 9 项在宿主机上全部通过。
+- 修复：
+  1. `icmp_unreach_policy.zig` 新增 `isError`（类型 3、4、5、11、12）、`errnoFor(type, code)`（Linux `icmp_err_convert` 的表，只返回硬差错的 errno，代码 4 按默认的路径 MTU 发现算硬差错）和 `parseErrorQuote`（被引用的 IPv4 数据报是 UDP 时取两个端口，是回显请求时取 ident，其他返回 null）。
+  2. `icmp.zig`：差错类型先验校验和，错就丢弃；代码 4 照旧更新路径 MTU；`errnoFor` 非 0 时按被引用的数据报交给 `udp.notifyError` 或 `udp.notifyPingError`。原来的 `icmp_type == 3 and icmp_code == 3` 分支删除。
+  3. `udp.zig`：`notifyUnreachable` 改为 `notifyError(local, peer, 111)`；`notifyError` 设任意 errno；新增 `notifyPingError(ident, err)`，只设 ident 相同、已连接（`port_peer` 非 0）的 IPv4 ping 套接字，并报 EPOLLERR 和 POLL_ERR。
+  4. `socket_syscall.pingSend`：发出前取待处理差错，有就返回它（失败一次）。ping 的 recv 原来就走 UDP 的 `takePendingError`。
+- host 测试 "ICMP errors (hello390)…"（errno 表、`isError`、引用解析）和 "ICMP errors wiring (hello390)…"（校验和在分发之前、两种分发、ping 的过滤条件、`notifyUnreachable` 成为特例、`pingSend` 在发出前取差错）：实现前编译失败（`errnoFor` 不存在）；实现后通过。变异验证：`errnoFor` 对类型 12 返回 0，第一条测试失败；删掉 `pingSend` 里取差错的两行，第二条测试失败；两个文件都已恢复，用 cmp 确认。
+- 红灯：未修改的内核（只保留 hello390 的启动配置）上定向 SMP=2，U（只有代码 3 得到 111，20 项对 9 项）、P（ping 套接字全是 0）、V（没有 POLLERR，recv 是 EAGAIN）、S（send 成功 8）、E（recv 是 EAGAIN，send 成功，SO_ERROR 留着 111）失败；N、Q、R/K 本来就是 0，通过。绿灯：9 项全部通过。
+- 完整 smoke：SMP=2、SMP=4、SMP=1 各一份通过（超时上限 1400 秒），`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=N)`，smoke 脚本要求 hello390 PASS，hello389、hello373 仍然 PASS。riscv64、aarch64 交叉构建通过，没有在这两个架构上跑 QEMU。
+- 局限：
+  1. 没有 IP_RECVERR 和错误队列（`MSG_ERRQUEUE`），软差错（超时、网络不可达等）完全看不到。
+  2. IPv6：ICMPv6 仍只处理端口不可达（UDP），IPv6 ping 套接字收不到差错。
+  3. 只按端口（UDP）或 ident（ping）匹配，不比较被引用数据报的地址；同一 ident 的多个已连接 ping 套接字都会收到。
+  4. raw ICMP 套接字和 TCP 不受影响（TCP 的 ICMP 差错处理不在本切片）。

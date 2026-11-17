@@ -113,6 +113,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
 
     const icmp_type = data[0];
     const icmp_code = data[1];
+    const unreach = @import("icmp_unreach_policy.zig");
 
     if (icmp_type == 8 and icmp_code == 0) {
         // Echo request → send echo reply
@@ -132,21 +133,29 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
         var pkt: [echo_policy.FRAME_BUF_LEN]u8 = undefined;
         const frame_len = buildEchoReplyMtu(&pkt, data, len, netif.getMtu(), dst_ip, src_ip, our_mac, dst_mac);
         if (via_lo) _ = lo.sendPacket(&pkt, frame_len) else _ = nic.sendPacket(&pkt, frame_len);
-    } else if (icmp_type == 3 and icmp_code == 3) {
-        // Port unreachable for a UDP datagram we sent: tell the connected socket.
-        const unreach = @import("icmp_unreach_policy.zig");
-        const q = unreach.parseQuote(data[0..len]) orelse return;
-        @import("udp.zig").notifyUnreachable(q.src_port, q.dst_port);
-    } else if (icmp_type == 3 and icmp_code == 4) {
-        // SK-101: Fragmentation Needed → Path MTU.
-        const msg = parseFragNeeded(data, len) orelse return;
-        var reported: u32 = msg.next_hop_mtu;
-        if (reported == 0) {
-            // Pre-RFC1191: fall back toward the invoking datagram size.
-            const inv = ipv4.parseHeader(data + 8, null) orelse return;
-            reported = @as(u32, inv.payload_offset) + inv.payload_len;
-            if (reported == 0) reported = ipv4.MIN_MTU;
+    } else if (unreach.isError(icmp_type)) {
+        // An error about a datagram this host sent (icmp_unreach): a bad checksum drops it (icmp_rcv).
+        if (len > 0xffff or ipv4.checksum(data, @intCast(len)) != 0) return;
+        if (icmp_type == 3 and icmp_code == 4) {
+            // SK-101: Fragmentation Needed → Path MTU.
+            const msg = parseFragNeeded(data, len) orelse return;
+            var reported: u32 = msg.next_hop_mtu;
+            if (reported == 0) {
+                // Pre-RFC1191: fall back toward the invoking datagram size.
+                const inv = ipv4.parseHeader(data + 8, null) orelse return;
+                reported = @as(u32, inv.payload_offset) + inv.payload_len;
+                if (reported == 0) reported = ipv4.MIN_MTU;
+            }
+            ipv4.updatePathMtu(msg.dst, reported);
         }
-        ipv4.updatePathMtu(msg.dst, reported);
+        // A hard error goes to the connected UDP socket that sent the quoted datagram (udp_err), or to the connected ping socket
+        // whose echo request it quotes (ping_err).
+        const err = unreach.errnoFor(icmp_type, icmp_code);
+        if (err == 0) return;
+        const q = unreach.parseErrorQuote(data[0..len]) orelse return;
+        switch (q.kind) {
+            .udp => @import("udp.zig").notifyError(q.src_port, q.dst_port, err),
+            .echo => @import("udp.zig").notifyPingError(q.src_port, err),
+        }
     }
 }

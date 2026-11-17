@@ -226,6 +226,12 @@ pub fn clearPendingErrorIfEqual(port: u32, expected: i32) void {
 /// An ICMP port-unreachable quoted a datagram sent from `local_port` to
 /// `peer_port`: every socket connected to that peer fails with ECONNREFUSED.
 pub fn notifyUnreachable(local_port: u16, peer_port: u16) void {
+    notifyError(local_port, peer_port, 111); // ECONNREFUSED
+}
+
+/// An ICMP error (hard, positive errno `err`) quoted a datagram sent from `local_port` to `peer_port`: every socket connected to
+/// that peer takes it as its pending error (udp_err sets sk_err only on a connected socket without IP_RECVERR).
+pub fn notifyError(local_port: u16, peer_port: u16, err: i32) void {
     var hits: [MAX_PORTS]u32 = undefined;
     var n: usize = 0;
     {
@@ -235,7 +241,7 @@ pub fn notifyUnreachable(local_port: u16, peer_port: u16) void {
             if (port_ping[i] or !port_named[i]) continue;
             if (portNumber(ports[i]) != local_port) continue;
             if (!@import("icmp_unreach_policy.zig").matchesConnected(.{ .src_port = local_port, .dst_port = peer_port }, local_port, port_peer[i] != 0, port_peer[i])) continue;
-            port_err[i] = 111; // ECONNREFUSED
+            port_err[i] = err;
             hits[n] = ports[i];
             n += 1;
         }
@@ -243,6 +249,27 @@ pub fn notifyUnreachable(local_port: u16, peer_port: u16) void {
     for (hits[0..n]) |key| {
         @import("epoll.zig").epollNotify(.udp_socket, key, @import("epoll.zig").EPOLLERR);
         // sock_def_error_report: an O_ASYNC owner gets POLL_ERR.
+        @import("../fs/vfs.zig").udpFasyncNotify(key, @import("../fs/fcntl_policy.zig").POLL_ERR);
+    }
+}
+
+/// An ICMP error (hard, positive errno `err`) quoted an echo request with ident `ident`: the IPv4 ping sockets with that ident that
+/// are connected take it as their pending error (ping_err sets sk_err only when the socket is connected and has no IP_RECVERR).
+pub fn notifyPingError(ident: u16, err: i32) void {
+    var hits: [MAX_PORTS]u32 = undefined;
+    var n: usize = 0;
+    {
+        const saved = udp_lock.acquire();
+        defer udp_lock.release(saved);
+        for (0..num_ports) |i| {
+            if (!port_ping[i] or port_v6[i] or portNumber(ports[i]) != ident or port_peer[i] == 0) continue;
+            port_err[i] = err;
+            hits[n] = ports[i];
+            n += 1;
+        }
+    }
+    for (hits[0..n]) |key| {
+        @import("epoll.zig").epollNotify(.udp_socket, key, @import("epoll.zig").EPOLLERR);
         @import("../fs/vfs.zig").udpFasyncNotify(key, @import("../fs/fcntl_policy.zig").POLL_ERR);
     }
 }
