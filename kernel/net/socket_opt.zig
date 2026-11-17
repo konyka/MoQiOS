@@ -454,6 +454,7 @@ fn socketFamily(ref: SockRef, v6_hint: bool) ?ipo.Family {
     return switch (ref) {
         .tcp => |idx| if (@import("tcp.zig").tcpIsV6(idx)) .v6 else .v4,
         .udp => if (v6_hint) .v6 else .v4,
+        .raw => |idx| if (@import("raw_icmp.zig").isV6(idx)) .v6 else .v4,
         else => null,
     };
 }
@@ -505,6 +506,15 @@ fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
             }
             return if (udp_mod.setPortOpts(port, st)) 0 else -9;
         },
+        .raw => |idx| {
+            const raw_mod = @import("raw_icmp.zig");
+            var st = raw_mod.getOpts(idx) orelse return -9;
+            switch (ipo.applySet(st.ip, level, optname, raw[0..@intCast(n)])) {
+                .err => |e| return e,
+                .ok => |v| st.ip = v,
+            }
+            return if (raw_mod.setOpts(idx, st)) 0 else -9;
+        },
         else => return -92,
     }
 }
@@ -553,10 +563,12 @@ fn setMembership4(ref: SockRef, optname: u64, optval_ptr: u64, optlen: u64) i64 
 
 fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u64, optlen_ptr: u64) i64 {
     const fam = socketFamily(ref, v6_hint) orelse return -92;
-    if (!ipo.levelApplies(level, fam)) return -92;
+    // ip_getsockopt answers a level other than SOL_IP with EOPNOTSUPP; an IPv6 socket's ipv6_getsockopt with ENOPROTOOPT.
+    if (!ipo.levelApplies(level, fam)) return if (fam == .v4) -95 else -92;
     const cur: ipo.IpOpts = switch (ref) {
         .tcp => |idx| (@import("tcp.zig").tcpGetOptions(idx) orelse return -9).ip,
         .udp => |port| (@import("udp.zig").getPortOpts(port) orelse return -9).ip,
+        .raw => |idx| (@import("raw_icmp.zig").getOpts(idx) orelse return -9).ip,
         else => return -92,
     };
     const v = ipo.getValue(cur, level, optname) orelse return -92;

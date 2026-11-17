@@ -11901,7 +11901,7 @@ test "IP socket options: dispatch and send-path wiring" {
     try std.testing.expect(std.mem.indexOf(u8, so, "if (level == ipo.SOL_IP or level == ipo.SOL_IPV6) return setIpOpt(ref, resolved_v6, level, optname, optval_ptr, optlen);") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, "if (level == ipo.SOL_IP or level == ipo.SOL_IPV6) return getIpOpt(ref, v6, level, optname, optval_ptr, optlen_ptr);") != null);
     // Only the level that matches the socket's family applies.
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, so, "if (!ipo.levelApplies(level, fam)) return -92;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, so, "if (!ipo.levelApplies(level, fam)) return -92;"));
     // The SOL_SOCKET round trip for TCP carries the IP options so a REUSEPORT/BROADCAST/DEBUG set does not wipe them.
     try std.testing.expect(std.mem.indexOf(u8, so, "        .ip = o.ip,\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, "    o.ip = st.ip;\n") != null);
@@ -14966,4 +14966,22 @@ test "raw ICMP sockets keep their SOL_SOCKET options and a blocking recv honours
     try std.testing.expect(std.mem.indexOf(u8, body, "if (urp.timedOut(deadline, now)) return -11;") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "se.sleepUntil(if (deadline) |dl| @min(slice, dl) else slice, 0)") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "SO_RCVTIMEO is not kept") == null);
+}
+
+test "raw ICMP sockets take SOL_IP / SOL_IPV6 options and their sends carry them (hello395)" {
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, ".raw => |idx| if (@import(\"raw_icmp.zig\").isV6(idx)) .v6 else .v4,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, ".raw => |idx| (@import(\"raw_icmp.zig\").getOpts(idx) orelse return -9).ip,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "var st = raw_mod.getOpts(idx) orelse return -9;\n            switch (ipo.applySet(st.ip, level, optname, raw[0..@intCast(n)])) {") != null);
+    // ip_getsockopt answers a level other than SOL_IP with EOPNOTSUPP; ip_setsockopt with ENOPROTOOPT.
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (!ipo.levelApplies(level, fam)) return if (fam == .v4) -95 else -92;") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send(bound, dst, msg, rawIpOpts(d.raw_idx))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send6(raw.boundAddr6(d.raw_idx), to6, msg, rawIpOpts(d.raw_idx))") != null);
+    const rs = kt.raw_icmp_source;
+    try std.testing.expect(std.mem.indexOf(u8, rs, "if (ipo.ipv4NeedsPatch(ip)) ipo.patchIpv4(pkt[14..][0..20], ip, ipv4.checksum);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "@import(\"icmpv6.zig\").sendFrom6(bound, dst, buf[0..msg.len], ip)") != null);
+    const iv = kt.icmpv6_source;
+    try std.testing.expect(std.mem.indexOf(u8, iv, "pub fn sendFrom6(bound: [16]u8, dst: [16]u8, msg: []u8, ip: ipo.IpOpts) i64 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, iv, "if (ipo.ipv6NeedsPatch(ip)) ipo.patchIpv6(pkt[14..][0..40], ip);") != null);
 }

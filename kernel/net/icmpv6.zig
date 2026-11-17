@@ -7,6 +7,7 @@
 //
 // All ICMPv6 messages must include the IPv6 pseudo-header in their checksum.
 
+const ipo = @import("ip_opt_policy.zig");
 const nic = @import("nic.zig");
 const netif = @import("netif.zig");
 const eth = @import("eth.zig");
@@ -360,7 +361,7 @@ pub fn sendEchoReply(
 /// bound to `bound` (:: when unbound) to `dst`: routed like an IPv6 UDP datagram (lo for ::1 and this host's addresses, else the
 /// next hop's MAC; while that is being solicited the frame waits in ndp_queue and the send succeeds, as Linux queues it on the
 /// neighbour). Returns 0, or -EMSGSIZE past the path MTU, -ENETUNREACH with no route, -ENOBUFS when the device drops it.
-pub fn sendFrom6(bound: [16]u8, dst: [16]u8, msg: []u8) i64 {
+pub fn sendFrom6(bound: [16]u8, dst: [16]u8, msg: []u8, ip: ipo.IpOpts) i64 {
     if (msg.len + ipv6.HEADER_LEN > ipv6.getSendMtu(dst)) return -90;
     const our_mac = netif.getMac();
     const via_lo = netif.isLoopbackV6(dst) or ndp.isOwnAddress(dst, our_mac);
@@ -384,6 +385,7 @@ pub fn sendFrom6(bound: [16]u8, dst: [16]u8, msg: []u8) i64 {
     const icmp_off: usize = 14 + ipv6.HEADER_LEN;
     @memcpy(pkt[icmp_off..][0..msg.len], msg);
     ipv6.buildHeader(pkt[14..].ptr, src, dst, ipv6.PROTO_ICMPV6, @intCast(msg.len));
+    if (ipo.ipv6NeedsPatch(ip)) ipo.patchIpv6(pkt[14..][0..40], ip);
     const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, @intCast(ipv6.HEADER_LEN + msg.len));
     if (wait_hop) |hop| {
         @import("ndp_queue.zig").queueFrame(hop, &pkt, frame_len);

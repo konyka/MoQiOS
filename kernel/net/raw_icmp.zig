@@ -12,6 +12,7 @@ const lo = @import("lo.zig");
 const arp = @import("arp.zig");
 const eth = @import("eth.zig");
 const route4 = @import("route4_policy.zig");
+const ipo = @import("ip_opt_policy.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 /// Raw ICMP sockets at once (each queues up to QUEUE_DEPTH datagrams of RAW_QUEUE_LEN bytes: about 200 KiB in all).
@@ -334,11 +335,11 @@ pub fn deliver6(msg: []const u8, src: [16]u8, dst: [16]u8) void {
 pub const MAX_MESSAGE6 = 1460;
 
 /// rawv6_sendmsg: `msg` (the ICMPv6 message) from `bound` to `dst`; the kernel fills the checksum (icmpv6.sendFrom6). 0 or -errno.
-pub fn send6(bound: [16]u8, dst: [16]u8, msg: []const u8) i64 {
+pub fn send6(bound: [16]u8, dst: [16]u8, msg: []const u8, ip: ipo.IpOpts) i64 {
     if (msg.len > MAX_MESSAGE6) return -90;
     var buf: [MAX_MESSAGE6]u8 = undefined;
     @memcpy(buf[0..msg.len], msg);
-    const rc = @import("icmpv6.zig").sendFrom6(bound, dst, buf[0..msg.len]);
+    const rc = @import("icmpv6.zig").sendFrom6(bound, dst, buf[0..msg.len], ip);
     // A frame to this host is delivered before the send returns (as loopback_xmit does), so the copy and the kernel's reply are
     // already queued for the socket.
     if (rc == 0) _ = lo.drain();
@@ -348,7 +349,7 @@ pub fn send6(bound: [16]u8, dst: [16]u8, msg: []const u8) i64 {
 /// raw_sendmsg: `msg` is the ICMP message (header and data). The kernel supplies the IP header; a frame that has to wait for ARP
 /// is queued on the neighbour and the send succeeds, exactly like Linux. 0, or -EMSGSIZE past the path MTU, -ENOBUFS when the
 /// device drops it.
-pub fn send(bound: [4]u8, dst: [4]u8, msg: []const u8) i64 {
+pub fn send(bound: [4]u8, dst: [4]u8, msg: []const u8, ip: ipo.IpOpts) i64 {
     if (msg.len > MAX_MESSAGE) return -90;
     if (msg.len + ipv4.HEADER_LEN > ipv4.getSendMtu(dst)) return -90;
     const our_mac = netif.getMac();
@@ -365,6 +366,7 @@ pub fn send(bound: [4]u8, dst: [4]u8, msg: []const u8) i64 {
     var pkt: [FRAME_BUF_LEN]u8 = @splat(0);
     @memcpy(pkt[34..][0..msg.len], msg);
     ipv4.buildHeader(pkt[14..].ptr, src, dst, ipv4.PROTO_ICMP, @intCast(msg.len));
+    if (ipo.ipv4NeedsPatch(ip)) ipo.patchIpv4(pkt[14..][0..20], ip, ipv4.checksum);
     const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, @intCast(20 + msg.len));
     if (wait_hop) |hop| {
         arp.queueFrame(hop, &pkt, frame_len);

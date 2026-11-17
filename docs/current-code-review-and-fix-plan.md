@@ -10275,3 +10275,18 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   1. raw 发送不阻塞，SO_SNDTIMEO 只保存、读回，不起作用；SO_RCVBUF 不限制队列（队列固定 8 项）。
   2. 仍然没有 IP_HDRINCL、sendmsg/recvmsg、ICMP 以外的协议、可设置的 IPV6_CHECKSUM。
   3. hello312 E 在 SMP=4 下出现一次剩余 0 us（新的偶发项，未复现、未查到根因）。
+
+## 补充：raw 套接字的 IP 层选项（hello395）
+
+- 问题：`socket_opt.socketFamily` 对 raw 套接字返回 null，所以 raw ICMP/ICMPv6 套接字上 SOL_IP、SOL_IPV6 的选项一律 ENOPROTOOPT；`raw_icmp.send`、`icmpv6.sendFrom6` 建 IP 头时不看任何套接字选项，TTL/跳数限制固定 64、TOS/流量类别固定 0。traceroute 一类工具靠 raw 套接字设 IP_TTL，做不到。
+- Linux 语义（3rd/linux-7.0.6 `net/ipv4/raw.c` 的 `raw_setsockopt`/`raw_getsockopt` 把 SOL_RAW 以外的层交给 `ip_setsockopt`/`ip_getsockopt`，`net/ipv6/raw.c` 交给 `ipv6_setsockopt`/`ipv6_getsockopt`；`ip_getsockopt` 对 SOL_IP 以外的层返回 EOPNOTSUPP，`ip_setsockopt` 返回 ENOPROTOOPT；raw 发送的 IP 头带套接字的 TTL、TOS）。宿主机上 IPv4 UDP、TCP 套接字 get SOL_IPV6 也是 EOPNOTSUPP（95）。
+- 宿主机实测（`user/hello395.c -DHOST`，root、`unshare -n`、只有 lo）：8 项（T Q E L D H C S）全部通过。
+- 修复：
+  - `socket_opt.zig`：`socketFamily` 按 `raw_icmp.isV6` 给 raw 定族；`setIpOpt`、`getIpOpt` 加 raw 分支，读写 `raw_icmp` 槽里 `opts.ip`；`getIpOpt` 在层与族不符时，IPv4 套接字返回 EOPNOTSUPP（-95），IPv6 套接字仍是 ENOPROTOOPT。这一处也改变了 IPv4 UDP/TCP 的 get SOL_IPV6（-92 → -95，与 Linux 一致），没有已有用户程序依赖旧值。
+  - `raw_icmp.send` 新增 `ip` 参数，建好 IPv4 头后按需 `patchIpv4`；`raw_icmp.send6` 把 `ip` 传给 `icmpv6.sendFrom6`，后者新增 `ip` 参数，建好 IPv6 头后按需 `patchIpv6`（ping 套接字的调用传默认值，行为不变）。
+  - `socket_syscall.rawIpOpts` 从槽里取选项，两个 raw 发送路径都用它。
+- host 测试 "raw ICMP sockets take SOL_IP / SOL_IPV6 options and their sends carry them (hello395)"：实现前失败，实现后通过；"IP socket options: dispatch and send-path wiring" 里 `return -92` 的计数从 2 改为 1（get 那处改成按族返回）。变异验证：把 `raw_icmp.send` 里的 `patchIpv4` 换成 `_ = ip;`，测试失败；已恢复。
+- QEMU：完整 smoke SMP=2、SMP=4、SMP=1 各通过一次（上限 1400 秒），hello395 8 项全过（T 里回到套接字的请求 TTL 是 7）。取红灯（只回退内核修复、保留能力配置，hello395 提前到 hello3 之前）：T Q E L D H C 失败（选项全是 -92，请求 TTL 64、TOS 0），S 通过（它本来就要求 ENOPROTOOPT）。riscv64 和 aarch64 交叉构建通过，但没有在这两个架构上跑 QEMU。
+- 局限：
+  1. raw 套接字上的组播选项（IP_ADD_MEMBERSHIP、IP_MULTICAST_TTL 生效等）仍是 ENOPROTOOPT 或不起作用；IP_MULTICAST_IF 只对 UDP 校验。
+  2. 没有 IP_HDRINCL、IP_RECVERR、IPV6_RECVERR。

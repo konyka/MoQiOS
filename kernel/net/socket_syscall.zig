@@ -112,7 +112,7 @@ fn rawSendFrom6(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest)
     const lrc = rp.lengthErrno(true, msg.len);
     if (lrc != 0) return lrc;
     const to6 = rp.dest6(dst) orelse return -101; // ENETUNREACH: a v4-mapped address has no IPv6 route
-    const sent = raw.send6(raw.boundAddr6(d.raw_idx), to6, msg);
+    const sent = raw.send6(raw.boundAddr6(d.raw_idx), to6, msg, rawIpOpts(d.raw_idx));
     return if (sent < 0) sent else @intCast(msg.len);
 }
 
@@ -143,8 +143,13 @@ pub fn rawSendFrom(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDe
     const bound = raw.boundAddr(d.raw_idx);
     const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(bound, dst, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
     if (lo_rc != 0) return lo_rc;
-    const sent = raw.send(bound, dst, msg);
+    const sent = raw.send(bound, dst, msg, rawIpOpts(d.raw_idx));
     return if (sent < 0) sent else @intCast(msg.len);
+}
+
+/// The IP-level options (IP_TTL, IP_TOS, IPV6_UNICAST_HOPS, IPV6_TCLASS) a raw socket's sends carry.
+fn rawIpOpts(idx: u32) @import("ip_opt_policy.zig").IpOpts {
+    return if (@import("raw_icmp.zig").getOpts(idx)) |o| o.ip else .{};
 }
 
 /// recvfrom/recv/read on a raw ICMP socket into the kernel buffer `out`: the next datagram (IP header included; an ICMPv6 message
@@ -424,7 +429,7 @@ fn pingSend6(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, add
     // An ICMPv6 error a connected socket took fails this send, once (sock_alloc_send_skb → sock_error).
     const pending = udp.takePendingError(d.udpKey());
     if (pending != 0) return -@as(i64, pending);
-    const sent = @import("icmpv6.zig").sendFrom6(d.udp_local_ip6, dst, msg[0..payload.len]);
+    const sent = @import("icmpv6.zig").sendFrom6(d.udp_local_ip6, dst, msg[0..payload.len], .{});
     return if (sent < 0) sent else @intCast(payload.len);
 }
 
