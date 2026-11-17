@@ -1831,7 +1831,7 @@ e1000 (中断驱动) / virtio-net (Virtqueue)
 
 文件: `arp.zig`
 
-- ARP 缓存：16 项的线性表，没有按时间老化；满了时新邻居（收到的 ARP 报文或 SIOCSARP）占用最久没更新的普通条目，永久条目不让出（`arp_policy.pickCacheSlot`，对应 Linux `neigh_forced_gc`；hello380）
+- ARP 缓存：16 项的线性表，按 NUD 状态老化（见下面 hello405 一条）；满了时新邻居（收到的 ARP 报文或 SIOCSARP）占用最久没更新的普通条目，永久条目不让出（`arp_policy.pickCacheSlot`，对应 Linux `neigh_forced_gc`；hello380）
 - 请求/应答；收到任何 ARP 报文都记下发送者
 - 下一跳没解析时挂起 IPv4 帧，每秒重问一次，3 秒后丢弃（hello375）
 - SIOCGARP / SIOCDARP（hello375）
@@ -1840,6 +1840,7 @@ e1000 (中断驱动) / virtio-net (Virtqueue)
 - `/proc/net/arp` 列出缓存（hello378）
 - 不完整邻居：发出 ARP 请求的地址先建一个没有 MAC 的条目（`has_mac = false`，Linux 的 NUD_INCOMPLETE / NUD_FAILED），SIOCGARP 和 `/proc/net/arp` 报 flags 0、MAC 全 0，`resolve` 不用它；收到应答或 SIOCSARP 给了 MAC 后变为普通条目，不带 MAC 的 SIOCSARP 对它是 EINVAL（hello384）
 - IPv6 下一跳正在被请求时的帧由 `ndp_queue.zig` 挂起，邻居通告到达后发出（hello376）
+- 邻居不可达检测（hello405，Linux `neigh_timer_handler`）：每个条目带 `nud: arp_policy.NudEntry`。SIOCSARP 设的普通条目是 STALE，ATF_PERM 的是 PERMANENT；收到发给本机 MAC 的单播应答变 REACHABLE，请求或广播应答只在 MAC 变了或原来没有可用 MAC 时变 STALE（`onReceive`）。`resolve` 用到 STALE 条目时变 DELAY（`onUse`）；`arp.timerTick` 每 100 ms 调 `onTick`：REACHABLE 满 30 秒变 STALE，DELAY 满 5 秒时，这期间被确认过就回 REACHABLE，否则变 PROBE 并立刻向缓存的 MAC 单播一个请求（`buildRequest`），之后每秒一个，3 个都没回就变 FAILED，`has_mac` 清掉，MAC 仍然列出，flags 0。FAILED 的条目再被请求时回到 INCOMPLETE，重新广播。没被用到的 STALE 条目一直保持。Linux 的 reachable_time 是 base_reachable_time 的 0.5 到 1.5 倍随机值，MoQiOS 固定 30 秒；没有 gc_stale_time 的回收。
 
 ### 4.4 IPv4 ✅
 

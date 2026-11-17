@@ -80,6 +80,111 @@ pub fn pickCacheSlot(slots: anytype) ?usize {
     return oldest;
 }
 
+// ── neighbour unreachability detection (net/core/neighbour.c) ──
+
+/// The states of an entry (NUD_*). incomplete and failed have no usable MAC; permanent never changes on its own.
+pub const Nud = enum { incomplete, reachable, stale, delay, probe, failed, permanent };
+
+/// base_reachable_time_ms (30 s; Linux picks reachable_time at random in [0.5, 1.5) of it, MoQiOS uses it as is),
+/// delay_first_probe_time (5 s), retrans_time_ms (1 s) and ucast_solicit (3).
+pub const REACHABLE_NS: u64 = 30 * 1_000_000_000;
+pub const DELAY_PROBE_NS: u64 = 5 * 1_000_000_000;
+pub const RETRANS_NS: u64 = 1_000_000_000;
+pub const UCAST_PROBES: u8 = 3;
+
+pub const NudEntry = struct {
+    state: Nud,
+    /// When a reply proved the neighbour reachable (neighbour->confirmed).
+    confirmed_ns: u64 = 0,
+    /// When the state last changed (neighbour->updated): DELAY and REACHABLE are timed from it.
+    since_ns: u64 = 0,
+    /// When the next PROBE solicitation is due, and how many were sent.
+    next_probe_ns: u64 = 0,
+    probes: u8 = 0,
+
+    pub fn init(state: Nud, now: u64) NudEntry {
+        return .{ .state = state, .since_ns = now, .confirmed_ns = if (state == .reachable) now else 0 };
+    }
+};
+
+/// Whether frames may go to the entry's MAC: every state that has one (NUD_VALID).
+pub fn usable(st: Nud) bool {
+    return st != .incomplete and st != .failed;
+}
+
+/// A frame is sent through the entry (__neigh_event_send): a STALE one becomes DELAY; nothing else changes here.
+pub fn onUse(e: *NudEntry, now: u64) void {
+    if (e.state != .stale) return;
+    e.state = .delay;
+    e.since_ns = now;
+}
+
+pub const TickAction = enum { none, probe, failed };
+
+/// neigh_timer_handler, run every so often: REACHABLE past reachable_time turns STALE; DELAY past delay_first_probe_time is
+/// REACHABLE again when confirmed since, else PROBE with the first solicitation due at once; PROBE asks every retrans_time and after
+/// UCAST_PROBES unanswered ones is FAILED. Returns whether to send a unicast solicitation now, or that the entry just failed.
+pub fn onTick(e: *NudEntry, now: u64) TickAction {
+    switch (e.state) {
+        .reachable => if (now -% e.confirmed_ns >= REACHABLE_NS) {
+            e.state = .stale;
+            e.since_ns = now;
+        },
+        .delay => if (now -% e.since_ns >= DELAY_PROBE_NS) {
+            if (e.confirmed_ns > e.since_ns) {
+                e.state = .reachable;
+                e.since_ns = now;
+                return .none;
+            }
+            e.state = .probe;
+            e.since_ns = now;
+            e.probes = 1;
+            e.next_probe_ns = now + RETRANS_NS;
+            return .probe;
+        },
+        .probe => if (now >= e.next_probe_ns) {
+            if (e.probes >= UCAST_PROBES) {
+                e.state = .failed;
+                e.since_ns = now;
+                return .failed;
+            }
+            e.probes += 1;
+            e.next_probe_ns = now + RETRANS_NS;
+            return .probe;
+        },
+        else => {},
+    }
+    return .none;
+}
+
+/// An ARP packet from the neighbour (arp_process → neigh_update): a unicast reply to this host proves it reachable; a request or a
+/// broadcast reply only makes it STALE, and leaves a usable entry whose MAC did not change as it is. `same_mac`: the packet's sender
+/// MAC equals the cached one.
+pub fn onReceive(e: *NudEntry, now: u64, unicast_reply: bool, same_mac: bool) void {
+    if (e.state == .permanent) return;
+    if (unicast_reply) {
+        e.state = .reachable;
+        e.confirmed_ns = now;
+        e.since_ns = now;
+        return;
+    }
+    if (usable(e.state) and same_mac) return;
+    e.state = .stale;
+    e.since_ns = now;
+}
+
+/// An ARP request from `src_mac`/`src_ip` for `target_ip`, Ethernet destination `dst_mac` (broadcast for a new neighbour, the cached
+/// MAC for a PROBE: arp_solicit), target hardware address zero.
+pub fn buildRequest(pkt: *[42]u8, dst_mac: [6]u8, src_mac: [6]u8, src_ip: [4]u8, target_ip: [4]u8) void {
+    @memcpy(pkt[0..6], &dst_mac);
+    @memcpy(pkt[6..12], &src_mac);
+    pkt[12..22].* = .{ 8, 6, 0, 1, 8, 0, 6, 4, 0, 1 };
+    @memcpy(pkt[22..28], &src_mac);
+    @memcpy(pkt[28..32], &src_ip);
+    @memset(pkt[32..38], 0);
+    @memcpy(pkt[38..42], &target_ip);
+}
+
 // ── SIOCGARP / SIOCDARP ──
 
 pub const SIOCDARP: u64 = 0x8953;

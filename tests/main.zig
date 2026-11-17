@@ -14172,7 +14172,7 @@ test "arp: unresolved IPv4 sends queue the frame, ARP replies flush it, the time
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "arp.queueFrame(hop, &send_pkt, frame_len);\n        return true;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "arp.queueFrame(hop, &pkt, frame_len);\n        return 0;") != null);
     const as = kt.arp_source;
-    const add = std.mem.indexOf(u8, as, "addToCache(sender_ip, sender_mac);\n    flushPending(sender_ip, sender_mac);");
+    const add = std.mem.indexOf(u8, as, "addToCache(sender_ip, sender_mac, opcode == 2 and std.mem.eql(u8, data[0..6], &netif.getMac()));\n    flushPending(sender_ip, sender_mac);");
     try std.testing.expect(add != null);
     try std.testing.expect(std.mem.indexOf(u8, as, "if (ask) sendArpRequest(hop);") != null);
     try std.testing.expect(std.mem.indexOf(u8, as, "@memcpy(out[0..6], &mac);\n        _ = nic.sendPacket(&out, n);") != null);
@@ -14256,7 +14256,7 @@ test "arp policy: SIOCSARP checks, permanent entries and the device / hardware f
     try std.testing.expectEqual(ap.ATF_COM | ap.ATF_PERM, std.mem.readInt(u32, r[32..36], .little));
 
     const as = kt.arp_source;
-    try std.testing.expect(std.mem.indexOf(u8, as, "if (!cache[i].perm) {\n                cache[i].mac = mac;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, as, "if (!cache[i].perm) {\n                policy.onReceive(&cache[i].nud, now, unicast_reply, cache[i].has_mac and std.mem.eql(u8, &cache[i].mac, &mac));\n                cache[i].mac = mac;") != null);
     try std.testing.expect(std.mem.indexOf(u8, as, "const m = mac orelse return -22; // EINVAL") != null);
     try std.testing.expect(std.mem.indexOf(u8, as, "if (installed) |m| flushPending(ip, m);") != null);
     const io = kt.ioctl_source;
@@ -15333,4 +15333,78 @@ test "IPV6_HDRINCL, IPPROTO_RAW and the ICMPv6 parameter problem (hello404): Lin
     try std.testing.expect(std.mem.indexOf(u8, ss, "const hs = raw.sendHdrincl6(to6, msg);") != null);
     const so = kt.socket_opt_source;
     try std.testing.expect(std.mem.indexOf(u8, so, "if (v6 and level == ipo.SOL_IPV6 and optname == IPV6_HDRINCL) return .hdrincl6;") != null);
+}
+
+test "IPv4 neighbour unreachability detection (hello405): STALE, DELAY, PROBE, FAILED (Linux neigh_timer_handler)" {
+    const ap = kt.arp_policy;
+    const s: u64 = 1_000_000_000;
+    // SIOCSARP leaves an ordinary entry STALE (arp_req_set); nothing sent to it, it stays so.
+    var e = ap.NudEntry.init(.stale, 0);
+    try std.testing.expectEqual(ap.TickAction.none, ap.onTick(&e, 100 * s));
+    try std.testing.expectEqual(ap.Nud.stale, e.state);
+    // A send moves it to DELAY (__neigh_event_send); DELAY_PROBE_TIME later, unconfirmed, it is PROBE and asks at once.
+    ap.onUse(&e, 100 * s);
+    try std.testing.expectEqual(ap.Nud.delay, e.state);
+    try std.testing.expectEqual(ap.TickAction.none, ap.onTick(&e, 104 * s));
+    try std.testing.expectEqual(ap.TickAction.probe, ap.onTick(&e, 105 * s));
+    try std.testing.expectEqual(ap.Nud.probe, e.state);
+    // A probe each RETRANS_TIME; after UCAST_PROBES unanswered ones it is FAILED (neigh_invalidate).
+    try std.testing.expectEqual(ap.TickAction.none, ap.onTick(&e, 105 * s + s / 2));
+    try std.testing.expectEqual(ap.TickAction.probe, ap.onTick(&e, 106 * s));
+    try std.testing.expectEqual(ap.TickAction.probe, ap.onTick(&e, 107 * s));
+    try std.testing.expectEqual(ap.TickAction.failed, ap.onTick(&e, 108 * s));
+    try std.testing.expectEqual(ap.Nud.failed, e.state);
+    try std.testing.expect(!ap.usable(e.state));
+    try std.testing.expectEqual(ap.TickAction.none, ap.onTick(&e, 200 * s));
+    // A unicast reply in PROBE makes it REACHABLE; REACHABLE_TIME later it is STALE again.
+    var p = ap.NudEntry.init(.stale, 0);
+    ap.onUse(&p, 0);
+    _ = ap.onTick(&p, 5 * s);
+    ap.onReceive(&p, 5 * s + 1, true, true);
+    try std.testing.expectEqual(ap.Nud.reachable, p.state);
+    try std.testing.expectEqual(ap.TickAction.none, ap.onTick(&p, 5 * s + ap.REACHABLE_NS - 1));
+    try std.testing.expectEqual(ap.Nud.reachable, p.state);
+    _ = ap.onTick(&p, 5 * s + 1 + ap.REACHABLE_NS);
+    try std.testing.expectEqual(ap.Nud.stale, p.state);
+    // A use of a REACHABLE, DELAY or PROBE entry changes nothing.
+    var r = ap.NudEntry.init(.reachable, 0);
+    ap.onUse(&r, 1);
+    try std.testing.expectEqual(ap.Nud.reachable, r.state);
+    // DELAY with a confirmation since the send goes back to REACHABLE, without a probe.
+    var d = ap.NudEntry.init(.stale, 0);
+    ap.onUse(&d, 10 * s);
+    ap.onReceive(&d, 12 * s, true, true);
+    try std.testing.expectEqual(ap.Nud.reachable, d.state);
+    // A request (or a broadcast reply) with the same MAC leaves a usable entry's state alone; a new MAC, or one for an entry without
+    // a usable MAC, makes it STALE (arp_process: NUD_STALE; neigh_update keeps the old state when nothing changes).
+    var q = ap.NudEntry.init(.reachable, 0);
+    ap.onReceive(&q, 1, false, true);
+    try std.testing.expectEqual(ap.Nud.reachable, q.state);
+    ap.onReceive(&q, 2, false, false);
+    try std.testing.expectEqual(ap.Nud.stale, q.state);
+    var f = ap.NudEntry.init(.failed, 0);
+    ap.onReceive(&f, 3, false, true);
+    try std.testing.expectEqual(ap.Nud.stale, f.state);
+    var inc = ap.NudEntry.init(.incomplete, 0);
+    ap.onReceive(&inc, 3, true, false);
+    try std.testing.expectEqual(ap.Nud.reachable, inc.state);
+    // A permanent entry never ages.
+    var pm = ap.NudEntry.init(.permanent, 0);
+    ap.onUse(&pm, 0);
+    try std.testing.expectEqual(ap.TickAction.none, ap.onTick(&pm, 1000 * s));
+    try std.testing.expectEqual(ap.Nud.permanent, pm.state);
+    for ([_]ap.Nud{ .reachable, .stale, .delay, .probe, .permanent }) |st| try std.testing.expect(ap.usable(st));
+    try std.testing.expect(!ap.usable(.incomplete));
+    // The unicast probe (arp_solicit with the cached MAC): an ARP request sent to that MAC, target hardware address zero.
+    var pkt: [42]u8 = undefined;
+    ap.buildRequest(&pkt, .{ 2, 0, 0, 0, 0, 0x60 }, .{ 0x52, 0x54, 0, 0x12, 0x34, 0x56 }, .{ 10, 0, 2, 15 }, .{ 10, 0, 2, 96 });
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 0, 0, 0, 0, 0x60, 0x52, 0x54, 0, 0x12, 0x34, 0x56, 8, 6 }, pkt[0..14]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 8, 0, 6, 4, 0, 1 }, pkt[14..22]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 2, 15 }, pkt[28..32]);
+    try std.testing.expect(std.mem.allEqual(u8, pkt[32..38], 0));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 2, 96 }, pkt[38..42]);
+    const as = kt.arp_source;
+    try std.testing.expect(std.mem.indexOf(u8, as, "policy.onUse(&cache[i].nud, nowNs());") != null);
+    try std.testing.expect(std.mem.indexOf(u8, as, "switch (policy.onTick(&cache[i].nud, now)) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, as, "addToCache(sender_ip, sender_mac, opcode == 2 and std.mem.eql(u8, data[0..6], &netif.getMac()));") != null);
 }

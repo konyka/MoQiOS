@@ -20,20 +20,25 @@ const Model = struct {
     /// notifyWoken calls, and the last task they named.
     notified: u32 = 0,
     last_notified: u32 = 0xffff_ffff,
-    /// Whether the guard was held during the last notifyWoken (must stay false).
+    /// Whether a notifyWoken caller still held the guard (must stay false).
     notified_under_guard: bool = false,
 };
 
 var model: Model = .{};
 threadlocal var my_tid: ?u32 = null;
+/// Guards this thread holds: notifyWoken asks whether its caller holds one. Another thread (the woken waiter unlocking in turn) may
+/// hold the guard at that moment, which is fine.
+threadlocal var guards_held: u32 = 0;
 
 const ModelGuard = struct {
     locked: u32 = 0,
     pub fn acquire(self: *ModelGuard) u64 {
         while (@cmpxchgWeak(u32, &self.locked, 0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+        guards_held += 1;
         return 0;
     }
     pub fn release(self: *ModelGuard, _: u64) void {
+        guards_held -= 1;
         @atomicStore(u32, &self.locked, 0, .release);
     }
 };
@@ -95,15 +100,13 @@ const Env = struct {
         std.atomic.spinLoopHint();
     }
     pub fn notifyWoken(tid: u32) void {
-        if (current_guard) |g| {
-            if (@atomicLoad(u32, &g.locked, .seq_cst) != 0) model.notified_under_guard = true;
-        }
+        if (current_guard != null and guards_held != 0) model.notified_under_guard = true;
         model.last_notified = tid;
         _ = @atomicRmw(u32, &model.notified, .Add, 1, .seq_cst);
     }
 };
 
-/// The guard of the lock under test, so notifyWoken can check it is called with the guard released.
+/// The guard of the lock under test: set while a test checks that notifyWoken is called with the caller's guard released.
 var current_guard: ?*ModelGuard = null;
 
 const Lock = kt.sleep_lock.SleepLock(Env);

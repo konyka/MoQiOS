@@ -3,6 +3,7 @@ const netif = @import("netif.zig");
 const eth = @import("eth.zig");
 const bo = @import("../lib/byte_order.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+const std = @import("std");
 
 const MAX_ARP_ENTRIES: usize = 16;
 
@@ -17,6 +18,8 @@ const ArpEntry = struct {
     /// False for a neighbour asked for whose MAC is not known yet (Linux NUD_INCOMPLETE, then NUD_FAILED when nobody answers): it is
     /// listed and reported with flags 0 and resolves nothing until a reply or SIOCSARP gives it a MAC.
     has_mac: bool = true,
+    /// The NUD state (arp_policy.Nud): `has_mac` is false while it is incomplete or failed; a failed entry keeps the MAC it had.
+    nud: policy.NudEntry = .{ .state = .stale },
 };
 
 var cache: [MAX_ARP_ENTRIES]ArpEntry = @splat(.{ .ip = @splat(0), .mac = @splat(0), .valid = false });
@@ -78,14 +81,30 @@ fn flushPending(ip: [4]u8, mac: [6]u8) void {
 }
 
 /// Called every 100 ms: ask again for the neighbours frames still wait on (arp_solicit every retrans_time) and drop the frames
-/// whose neighbour did not answer in time (NUD_FAILED).
+/// whose neighbour did not answer in time (NUD_FAILED); age the cache (neigh_timer_handler, policy.onTick), asking a neighbour in
+/// PROBE at its cached MAC and taking the MAC of one that failed out of use.
 pub fn timerTick() void {
     var ask: [policy.MAX_PENDING][4]u8 = undefined;
     var n: usize = 0;
+    var probe_ip: [MAX_ARP_ENTRIES][4]u8 = undefined;
+    var probe_mac: [MAX_ARP_ENTRIES][6]u8 = undefined;
+    var n_probe: usize = 0;
     {
         const saved = arp_lock.acquire();
         defer arp_lock.release(saved);
         const now = nowNs();
+        for (0..MAX_ARP_ENTRIES) |i| {
+            if (!cache[i].valid or cache[i].perm) continue;
+            switch (policy.onTick(&cache[i].nud, now)) {
+                .none => {},
+                .probe => {
+                    probe_ip[n_probe] = cache[i].ip;
+                    probe_mac[n_probe] = cache[i].mac;
+                    n_probe += 1;
+                },
+                .failed => cache[i].has_mac = false,
+            }
+        }
         for (0..policy.MAX_PENDING) |i| {
             if (policy.expired(pending[i], now)) {
                 pending[i].used = false;
@@ -102,6 +121,11 @@ pub fn timerTick() void {
         }
     }
     for (ask[0..n]) |h| sendArpRequest(h);
+    for (probe_ip[0..n_probe], probe_mac[0..n_probe]) |ip, mac| {
+        var pkt: [42]u8 = undefined;
+        policy.buildRequest(&pkt, mac, netif.getMac(), netif.getOurIp(), ip);
+        _ = nic.sendPacket(&pkt, pkt.len);
+    }
 }
 
 /// Remove the entry for `ip` (SIOCDARP); false when there is none.
@@ -139,7 +163,7 @@ pub fn handlePacket(data: [*]const u8, len: u32) void {
     const target_ip: [4]u8 = .{ data[38], data[39], data[40], data[41] };
 
     // Cache sender's MAC regardless, and send what waited for it.
-    addToCache(sender_ip, sender_mac);
+    addToCache(sender_ip, sender_mac, opcode == 2 and std.mem.eql(u8, data[0..6], &netif.getMac()));
     flushPending(sender_ip, sender_mac);
 
     if (opcode == 1) {
@@ -180,7 +204,7 @@ pub fn setEntry(ip: [4]u8, mac: ?[6]u8, perm: bool) i64 {
         if (slot == null) {
             const m = mac orelse return -22; // EINVAL
             const i = slot orelse policy.pickCacheSlot(&cache) orelse return -105; // ENOBUFS
-            cache[i] = .{ .ip = ip, .mac = m, .valid = true, .perm = perm, .updated_ns = nowNs() };
+            cache[i] = .{ .ip = ip, .mac = m, .valid = true, .perm = perm, .updated_ns = nowNs(), .nud = policy.NudEntry.init(if (perm) .permanent else .stale, nowNs()) };
             installed = m;
         } else {
             const i = slot.?;
@@ -189,6 +213,8 @@ pub fn setEntry(ip: [4]u8, mac: ?[6]u8, perm: bool) i64 {
             cache[i].has_mac = true;
             cache[i].perm = perm;
             cache[i].updated_ns = nowNs();
+            // arp_req_set: NUD_PERMANENT with ATF_PERM, else NUD_STALE (neigh_update with NEIGH_UPDATE_F_ADMIN).
+            cache[i].nud = policy.NudEntry.init(if (perm) .permanent else .stale, nowNs());
             installed = cache[i].mac;
         }
     }
@@ -304,11 +330,14 @@ pub fn formatProc(out: []u8) usize {
     return n;
 }
 
+/// The MAC to send a frame for `ip` to, or null when the neighbour has none (incomplete or failed: the caller queues the frame and
+/// asks). A frame sent through a STALE entry starts its reachability check (policy.onUse: DELAY, then PROBE).
 pub fn resolve(ip: [4]u8) ?[6]u8 {
     const saved = arp_lock.acquire();
     defer arp_lock.release(saved);
     for (0..MAX_ARP_ENTRIES) |i| {
         if (cache[i].valid and cache[i].has_mac and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) {
+            policy.onUse(&cache[i].nud, nowNs());
             return cache[i].mac;
         }
     }
@@ -321,10 +350,14 @@ fn noteIncomplete(ip: [4]u8) void {
     const saved = arp_lock.acquire();
     defer arp_lock.release(saved);
     for (0..MAX_ARP_ENTRIES) |i| {
-        if (cache[i].valid and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) return;
+        if (cache[i].valid and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) {
+            // A failed neighbour asked for again is INCOMPLETE (__neigh_event_send); its old MAC stays listed until a reply.
+            if (cache[i].nud.state == .failed) cache[i].nud = policy.NudEntry.init(.incomplete, nowNs());
+            return;
+        }
     }
     const i = policy.pickCacheSlot(&cache) orelse return;
-    cache[i] = .{ .ip = ip, .mac = @splat(0), .valid = true, .perm = false, .updated_ns = nowNs(), .has_mac = false };
+    cache[i] = .{ .ip = ip, .mac = @splat(0), .valid = true, .perm = false, .updated_ns = nowNs(), .has_mac = false, .nud = policy.NudEntry.init(.incomplete, nowNs()) };
 }
 
 pub fn sendArpRequest(target_ip: [4]u8) void {
@@ -356,23 +389,26 @@ pub fn sendArpRequest(target_ip: [4]u8) void {
     _ = nic.sendPacket(&pkt, 42);
 }
 
-fn addToCache(ip: [4]u8, mac: [6]u8) void {
+/// An ARP packet from `ip` at `mac` (arp_process → neigh_update): `unicast_reply` (a reply addressed to this host's MAC) proves the
+/// neighbour reachable, anything else leaves it STALE (policy.onReceive). A permanent entry keeps its MAC.
+fn addToCache(ip: [4]u8, mac: [6]u8, unicast_reply: bool) void {
     const saved = arp_lock.acquire();
     defer arp_lock.release(saved);
-    // Update existing entry
+    const now = nowNs();
     for (0..MAX_ARP_ENTRIES) |i| {
         if (cache[i].valid and @as(u32, @bitCast(cache[i].ip)) == @as(u32, @bitCast(ip))) {
             if (!cache[i].perm) {
+                policy.onReceive(&cache[i].nud, now, unicast_reply, cache[i].has_mac and std.mem.eql(u8, &cache[i].mac, &mac));
                 cache[i].mac = mac;
                 cache[i].has_mac = true;
             }
-            cache[i].updated_ns = nowNs();
+            cache[i].updated_ns = now;
             return;
         }
     }
     // A new neighbour: a free slot, else the ordinary entry updated longest ago (Linux neigh_forced_gc).
     const i = policy.pickCacheSlot(&cache) orelse return;
-    cache[i] = .{ .ip = ip, .mac = mac, .valid = true, .perm = false, .updated_ns = nowNs() };
+    cache[i] = .{ .ip = ip, .mac = mac, .valid = true, .perm = false, .updated_ns = now, .nud = policy.NudEntry.init(if (unicast_reply) .reachable else .stale, now) };
 }
 
 fn sendArpReply(target_ip: [4]u8, target_mac: [6]u8) void {
