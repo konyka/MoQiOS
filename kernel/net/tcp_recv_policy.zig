@@ -274,3 +274,50 @@ pub fn passElapsedMs(last_ns: u64, now_ns: u64) u32 {
     const ms = (now_ns - last_ns) / 1_000_000;
     return @intCast(@max(1, @min(ms, 1000)));
 }
+
+// ── TCP_SYNCNT and the SYN retransmission schedule (Linux tcp_sock_set_syncnt, tcp_write_timeout, tcp_retransmit_timer) ──
+
+/// MAX_TCP_SYNCNT, and net.ipv4.tcp_syn_retries / tcp_syn_linear_timeouts (the defaults).
+pub const MAX_SYNCNT: i32 = 127;
+pub const SYN_RETRIES: u32 = 6;
+pub const SYN_LINEAR_TIMEOUTS: u32 = 4;
+/// TCP_TIMEOUT_INIT (the first SYN's RTO) and TCP_RTO_MAX.
+pub const SYN_RTO_MS: u32 = 1000;
+pub const RTO_MAX_MS: u32 = 120_000;
+
+/// tcp_sock_set_syncnt: 1..MAX_TCP_SYNCNT, anything else EINVAL.
+pub fn syncntErrno(val: i32) i64 {
+    return if (val < 1 or val > MAX_SYNCNT) EINVAL else 0;
+}
+
+/// The socket's TCP_SYNCNT, tcp_syn_retries while it is unset (0).
+pub fn effectiveSyncnt(syn_cnt: u32) u32 {
+    return if (syn_cnt == 0) SYN_RETRIES else syn_cnt;
+}
+
+/// How long a SYN waits before the `k`-th expiry of its retransmission timer (1: the first): TCP_TIMEOUT_INIT for the first
+/// tcp_syn_linear_timeouts + 1 waits, then doubling (tcp_retransmit_timer backs off only past total_rto > linear_timeouts), at most
+/// TCP_RTO_MAX.
+pub fn synRtoMs(k: u32) u32 {
+    if (k <= SYN_LINEAR_TIMEOUTS + 1) return SYN_RTO_MS;
+    const shift = k - (SYN_LINEAR_TIMEOUTS + 1);
+    if (shift >= 7) return RTO_MAX_MS;
+    return @min(SYN_RTO_MS << @intCast(shift), RTO_MAX_MS);
+}
+
+/// tcp_model_timeout(boundary, TCP_TIMEOUT_INIT): how long `boundary` exponentially backed-off retransmissions take, in ms.
+fn modelTimeoutMs(boundary: u32) u64 {
+    const thresh: u32 = 6; // ilog2(TCP_RTO_MAX / TCP_TIMEOUT_INIT)
+    if (boundary <= thresh) return ((@as(u64, 2) << @intCast(boundary)) - 1) * SYN_RTO_MS;
+    return ((@as(u64, 2) << thresh) - 1) * SYN_RTO_MS + @as(u64, boundary - thresh) * RTO_MAX_MS;
+}
+
+/// tcp_write_timeout for SYN_SENT, at an expiry after `retransmits` retransmissions: give up once syncnt +
+/// tcp_syn_linear_timeouts of them went out, or (from the first retransmission on) once `elapsed_ms` since the SYN reaches the user
+/// timeout, or without one the time `syncnt` backed-off retransmissions would take.
+pub fn synGiveUp(retransmits: u32, syncnt: u32, elapsed_ms: u64, user_timeout_ms: u32) bool {
+    if (retransmits >= syncnt + SYN_LINEAR_TIMEOUTS) return true;
+    if (retransmits == 0) return false;
+    const limit: u64 = if (user_timeout_ms != 0) user_timeout_ms else modelTimeoutMs(syncnt);
+    return elapsed_ms >= limit;
+}

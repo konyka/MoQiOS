@@ -15532,7 +15532,8 @@ test "TCP_USER_TIMEOUT and the end of an unanswered connection (hello407): Linux
     try std.testing.expectEqual(@as(i32, 110), rp.timeoutErrno(0));
     try std.testing.expectEqual(@as(i32, 113), rp.timeoutErrno(113));
     const ts = kt.tcp_source;
-    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcp_recv_policy.retransGiveUp(tcb.retransmit_count, TCP_RETRIES, tcb.options.user_timeout_ms, rtxElapsedMs(tcb))) {") != null);
+    // hello408: SYN_SENT follows synGiveUp, every other state retransGiveUp.
+    try std.testing.expect(std.mem.indexOf(u8, ts, "tcp_recv_policy.retransGiveUp(tcb.retransmit_count, TCP_RETRIES, tcb.options.user_timeout_ms, rtxElapsedMs(tcb));\n            if (give_up) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "tcb.options.so_error = tcp_recv_policy.timeoutErrno(tcb.soft_err);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcp_recv_policy.keepaliveGiveUp(tcb.keepalive_probes, tcb.options.keep_cnt, tcb.options.user_timeout_ms, tcb.idle_ms)) {") != null);
     const so = kt.socket_opt_source;
@@ -15552,4 +15553,39 @@ test "TCP timers run on measured time (hello407): a late maintenance pass under 
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ss, "tcp.timerTick(100)"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "timerTickNow(@import(\"../arch/arch.zig\").tsc.nanos());"));
     try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "timerTick(tcp_recv_policy.passElapsedMs(last, now_ns));") != null);
+}
+
+test "TCP_SYNCNT and the SYN retransmission schedule (hello408): Linux tcp_write_timeout / tcp_model_timeout / tcp_syn_linear_timeouts" {
+    const rp = kt.tcp_recv_policy;
+    // tcp_sock_set_syncnt: 1..MAX_TCP_SYNCNT (127); unset reads tcp_syn_retries (6).
+    try std.testing.expectEqual(@as(i64, -22), rp.syncntErrno(0));
+    try std.testing.expectEqual(@as(i64, -22), rp.syncntErrno(128));
+    try std.testing.expectEqual(@as(i64, -22), rp.syncntErrno(-1));
+    try std.testing.expectEqual(@as(i64, 0), rp.syncntErrno(1));
+    try std.testing.expectEqual(@as(i64, 0), rp.syncntErrno(127));
+    try std.testing.expectEqual(@as(u32, 6), rp.effectiveSyncnt(0));
+    try std.testing.expectEqual(@as(u32, 3), rp.effectiveSyncnt(3));
+    // The wait before the k-th expiry: 1 s for the first five (tcp_syn_linear_timeouts 4, then the doubling starts), then 2, 4, ...
+    // up to TCP_RTO_MAX (120 s).
+    for (1..6) |k| try std.testing.expectEqual(@as(u32, 1000), rp.synRtoMs(@intCast(k)));
+    try std.testing.expectEqual(@as(u32, 2000), rp.synRtoMs(6));
+    try std.testing.expectEqual(@as(u32, 4000), rp.synRtoMs(7));
+    try std.testing.expectEqual(@as(u32, 120_000), rp.synRtoMs(20));
+    // An expiry, after `retransmits` retransmissions so far, gives up (instead of resending) once TCP_SYNCNT + 4 went out, or
+    // ((2 << syncnt) - 1) s passed since the SYN; with a user timeout, once that passed (never at the first expiry).
+    try std.testing.expect(!rp.synGiveUp(1, 1, 2000, 0));
+    try std.testing.expect(rp.synGiveUp(2, 1, 3000, 0));
+    try std.testing.expect(!rp.synGiveUp(4, 2, 5000, 0));
+    try std.testing.expect(rp.synGiveUp(6, 2, 7000, 0));
+    try std.testing.expect(!rp.synGiveUp(6, 3, 11000, 0));
+    try std.testing.expect(rp.synGiveUp(7, 3, 11000, 0));
+    try std.testing.expect(!rp.synGiveUp(1, 6, 2400, 2500));
+    try std.testing.expect(rp.synGiveUp(2, 6, 2500, 2500));
+    try std.testing.expect(!rp.synGiveUp(0, 6, 5000, 2500));
+    // Large syncnt: the time model saturates instead of overflowing.
+    try std.testing.expect(!rp.synGiveUp(10, 127, 1_000_000, 0));
+    try std.testing.expect(rp.synGiveUp(131, 127, 1_000_000, 0));
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.state == .syn_sent) tcp_recv_policy.synRtoMs(@as(u32, tcb.retransmit_count) + 1) else") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "tcp_recv_policy.synGiveUp(tcb.retransmit_count - 1, tcp_recv_policy.effectiveSyncnt(tcb.options.syn_cnt), rtxElapsedMs(tcb), tcb.options.user_timeout_ms)") != null);
 }

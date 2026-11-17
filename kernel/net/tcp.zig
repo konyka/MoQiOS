@@ -4229,7 +4229,8 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
         tcb.rtx_elapsed_ms +|= ms_elapsed;
         // Use per-TCB RTO if available, otherwise fall back to RETRANSMIT_MS; with TCP_USER_TIMEOUT the timer never waits past it
         // (tcp_clamp_rto_to_user_timeout, measured from when this RTO was armed).
-        const base_rto = if (tcb.rto > 0) tcb.rto else RETRANSMIT_MS;
+        // A SYN follows its own schedule: 1 s for the first waits, then doubling (tcp_syn_linear_timeouts).
+        const base_rto = if (tcb.state == .syn_sent) tcp_recv_policy.synRtoMs(@as(u32, tcb.retransmit_count) + 1) else if (tcb.rto > 0) tcb.rto else RETRANSMIT_MS;
         const current_rto = tcp_recv_policy.clampRto(base_rto, tcb.options.user_timeout_ms, tcb.rtx_elapsed_ms -| tcb.retransmit_timer);
         // SK-128: RACK timer repair before TLP/RTO (no new ACK required).
         _ = maybeRackTimerRepair(tcb, current_rto);
@@ -4252,7 +4253,11 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             // RFC 2018 §8: a receiver may renege on SACKed data, so after an
             // RTO nothing is trusted as delivered; resend from snd_una.
             tcb.sack_scoreboard_count = 0;
-            if (tcp_recv_policy.retransGiveUp(tcb.retransmit_count, TCP_RETRIES, tcb.options.user_timeout_ms, rtxElapsedMs(tcb))) {
+            const give_up = if (tcb.state == .syn_sent)
+                tcp_recv_policy.synGiveUp(tcb.retransmit_count - 1, tcp_recv_policy.effectiveSyncnt(tcb.options.syn_cnt), rtxElapsedMs(tcb), tcb.options.user_timeout_ms)
+            else
+                tcp_recv_policy.retransGiveUp(tcb.retransmit_count, TCP_RETRIES, tcb.options.user_timeout_ms, rtxElapsedMs(tcb));
+            if (give_up) {
                 // Give up (tcp_write_err): the soft error an ICMP error left, else ETIMEDOUT; connect() fails with it, an established
                 // connection reports it to its next recv, send or SO_ERROR.
                 tcpLog("[tcp] retransmit timeout, closing\n");
