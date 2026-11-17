@@ -336,9 +336,9 @@ fn timerTickLegacy(frame: *idt.InterruptFrame) void {
         const posix_timer = @import("../ipc/posix_timer.zig");
         posix_timer.timerTick(@import("../arch/arch.zig").tsc.nanos());
         // v53.12: Drive TCP timer (retransmission, TIME_WAIT/FIN_WAIT_2 timeout, delayed ACK)
-        // LAPIC fires at ~100Hz (10ms/tick), REAP_INTERVAL=10 ticks → ~100ms per maintenance pass
+        // ~100 ms per maintenance pass (REAP_INTERVAL ticks); TCP advances its timers by the time measured since the last one.
         const tcp = @import("../net/tcp.zig");
-        tcp.timerTick(100);
+        tcp.timerTickNow(@import("../arch/arch.zig").tsc.nanos());
         // SK-79: NDP incomplete Neighbor Solicitation retransmit (RetransTimer).
         const icmpv6 = @import("../net/icmpv6.zig");
         icmpv6.neighborTimerTick(100);
@@ -683,7 +683,7 @@ fn alarmTimerTick(now_ns: u64) void {
 }
 
 /// Slow maintenance — every REAP_INTERVAL BSP hardware ticks (~100 ms; the
-/// tcp/icmpv6 deltas below assume exactly that cadence).
+/// icmpv6 delta below assumes that cadence, TCP measures its own).
 fn bspSlowMaintenance() void {
     // Lock order: task_lock → pmm.lock (inside reapZombies/freeKernelStack).
     _ = task.reapZombies();
@@ -693,7 +693,7 @@ fn bspSlowMaintenance() void {
     // IPC wait expiry is owned by bspTimedWaitTick above; slow maintenance
     // must not duplicate the scan (pinned by the host test contract).
     // TCP retransmission / TIME_WAIT / FIN_WAIT_2 / delayed ACK.
-    @import("../net/tcp.zig").timerTick(100);
+    @import("../net/tcp.zig").timerTickNow(@import("../arch/arch.zig").tsc.nanos());
     // Loopback frames are otherwise only delivered by the NIC IRQ bottom
     // half and the net_poll syscall. A task blocked in recv on a 127/8
     // connection pumps neither, so give lo a kernel-side drain on this

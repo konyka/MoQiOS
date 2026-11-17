@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello406`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello407`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -401,6 +401,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello404 | IPV6_HDRINCL 和 IPPROTO_RAW：`socket(AF_INET6, SOCK_RAW, 255)` 建好时 IPV6_HDRINCL 为 1、IPV6_CHECKSUM 为 -1，协议 253 的套接字设 1 或 2 读回 1，2 字节的 optval 是 EINVAL，UDP、TCP 上两个方向都是 ENOPROTOOPT（A）；整包发送 44 字节，下一头部 252 的套接字收到 4 字节负载，头里的负载长度 2 只投递 2 字节、8 不投递，源地址 :: 照发，39 和 0 字节 EINVAL，只有头的 40 字节投递空副本，版本 4 的头被丢，跳数 7 保留，1501 字节 EMSGSIZE，没有目的 EDESTADDRREQ，端口 17 可以、256 是 EINVAL（S）；开着 IPV6_HDRINCL 的协议 253 套接字也能整包发送（H）；没有 raw 套接字收下的下一头部 252 得到 52 字节的参数问题（代码 1，指针 6，引用下一头部 252），有 252 套接字时没有（P）；关掉 IPV6_HDRINCL 的 IPPROTO_RAW 套接字按协议 255 发送并收到自己的副本（N） |
 | hello405 | ARP 邻居不可达检测（经网关 10.0.2.2，没人回答 10.0.2.95 和 10.0.2.96）：SIOCSARP 设好并发过数据的 10.0.2.96 在 3 秒时还是 flags 0x2，11 秒时变 0x0，MAC 仍然列出（F）；设好但从没发过的 10.0.2.95 在 11 秒时还是 0x2（N）；用自己 MAC 设的网关发数据后 11 秒仍是 0x2、MAC 不变（G）；用错 MAC 设的网关发数据后 2 秒仍是错的，之后真 MAC 回来、flags 0x2（W） |
 | hello406 | TCP 处理 ICMP 差错（连接发往 backlog 1 且队列已满的监听端口，所以本机不回 RST）：IPv4 每种差错一次 connect，SO_ERROR 依次是 101 113 92 111 113 113 113 71，读一次后为 0，poll 报 POLLERR（E）；序号在 ISN-1 或 ISN+1000 的端口不可达、分片需要、源抑制、重定向、代码 16 都不影响连接（I）；阻塞 connect 遇到主机不可达返回 -113（B）；已建立的连接收到引用最后一段的主机不可达，SO_ERROR 读到 113 一次，之后双向数据照常（S）；IPv6 每种差错一次 connect：111 101 113 13 113 71 71，包太大和序号越界的差错不影响（V） |
+| hello407 | TCP_USER_TIMEOUT 和无人应答的连接（测试用 IPPROTO_RAW 套接字伪造对端的 SYN-ACK，之后不再应答）：默认 0，-1 和 2 字节 EINVAL，1500 读回 1500，0 读回 0（A）；TCP_USER_TIMEOUT 1000 时未确认的数据在 1 到 4 秒后让连接结束，poll 报 POLLIN\|POLLERR\|POLLHUP，第一次 recv 是 ETIMEDOUT、SO_ERROR 随后为 0、再 recv 返回 0、send 是 EPIPE（T）；先 send 时 send 是 ETIMEDOUT（S）；保活 idle 1、intvl 1、cnt 2 在 2 到 6 秒后 POLLERR、SO_ERROR 110（K）；cnt 9 加 TCP_USER_TIMEOUT 2500 也在 2 到 6 秒后结束（U）；TCP_USER_TIMEOUT 1000 的 connect 在 1 到 4 秒后 ETIMEDOUT（C） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

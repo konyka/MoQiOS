@@ -15499,3 +15499,57 @@ test "listen backlog (hello406): the accept queue holds backlog + 1, clamped to 
     try std.testing.expect(std.mem.indexOf(u8, ts, "pub fn tcpListen(tcb_idx: u32, backlog: u32) i64 {") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "const result = net_mod.tcp.tcpListen(tcb_idx, backlog);") != null);
 }
+
+test "TCP_USER_TIMEOUT and the end of an unanswered connection (hello407): Linux tcp_write_timeout / tcp_keepalive_timer / tcp_write_err" {
+    const rp = kt.tcp_recv_policy;
+    // tcp_sock_set_user_timeout: any value from 0 (off), a negative one is EINVAL.
+    try std.testing.expectEqual(@as(i64, 0), rp.userTimeoutErrno(0));
+    try std.testing.expectEqual(@as(i64, 0), rp.userTimeoutErrno(1500));
+    try std.testing.expectEqual(@as(i64, -22), rp.userTimeoutErrno(-1));
+    // tcp_write_timeout: without a user timeout the retransmission count decides; with one, the time since the first unanswered
+    // retransmission (retrans_stamp), whatever the count.
+    try std.testing.expect(!rp.retransGiveUp(5, 5, 0, 99_000));
+    try std.testing.expect(rp.retransGiveUp(6, 5, 0, 0));
+    try std.testing.expect(!rp.retransGiveUp(2, 5, 1000, 999));
+    try std.testing.expect(rp.retransGiveUp(2, 5, 1000, 1000));
+    // The first expiry only retransmits (retransmits_timed_out is false while icsk_retransmits is 0).
+    try std.testing.expect(!rp.retransGiveUp(1, 5, 1000, 5000));
+    try std.testing.expect(!rp.retransGiveUp(6, 5, 60_000, 30_000));
+    // tcp_clamp_rto_to_user_timeout: the next timer never waits past the user timeout (at least 1 ms once it has passed).
+    try std.testing.expectEqual(@as(u32, 2000), rp.clampRto(2000, 0, 500));
+    try std.testing.expectEqual(@as(u32, 500), rp.clampRto(2000, 1000, 500));
+    try std.testing.expectEqual(@as(u32, 1), rp.clampRto(2000, 1000, 1200));
+    try std.testing.expectEqual(@as(u32, 300), rp.clampRto(300, 1000, 200));
+    // tcp_keepalive_timer: with a user timeout, the probes stop once that much time passed since the last data (and one probe
+    // went out); without one, after keepcnt probes.
+    try std.testing.expect(rp.keepaliveGiveUp(2, 2, 0, 3000));
+    try std.testing.expect(!rp.keepaliveGiveUp(1, 2, 0, 3000));
+    try std.testing.expect(!rp.keepaliveGiveUp(2, 9, 0, 3000));
+    try std.testing.expect(rp.keepaliveGiveUp(2, 9, 2500, 2500));
+    try std.testing.expect(!rp.keepaliveGiveUp(0, 9, 2500, 2600));
+    try std.testing.expect(!rp.keepaliveGiveUp(2, 2, 60_000, 3000));
+    // tcp_write_err: the connection ends with its soft error, else ETIMEDOUT, and reports it once.
+    try std.testing.expectEqual(@as(i32, 110), rp.timeoutErrno(0));
+    try std.testing.expectEqual(@as(i32, 113), rp.timeoutErrno(113));
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcp_recv_policy.retransGiveUp(tcb.retransmit_count, TCP_RETRIES, tcb.options.user_timeout_ms, rtxElapsedMs(tcb))) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "tcb.options.so_error = tcp_recv_policy.timeoutErrno(tcb.soft_err);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcp_recv_policy.keepaliveGiveUp(tcb.keepalive_probes, tcb.options.keep_cnt, tcb.options.user_timeout_ms, tcb.idle_ms)) {") != null);
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "opts.user_timeout_ms = @intCast(v);") != null);
+}
+
+test "TCP timers run on measured time (hello407): a late maintenance pass under emulation still ages connections by the real interval" {
+    const rp = kt.tcp_recv_policy;
+    // The pass reports the milliseconds since the previous one, at least 1 and at most 1 s (a stall must not fire every timer at once).
+    try std.testing.expectEqual(@as(u32, 100), rp.passElapsedMs(0, 100_000_000));
+    try std.testing.expectEqual(@as(u32, 280), rp.passElapsedMs(1_000_000_000, 1_280_000_000));
+    try std.testing.expectEqual(@as(u32, 1), rp.passElapsedMs(5, 5));
+    try std.testing.expectEqual(@as(u32, 1000), rp.passElapsedMs(0, 9_000_000_000));
+    try std.testing.expectEqual(@as(u32, 1), rp.passElapsedMs(10, 5));
+    const ss = kt.sched_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "tcp.zig\").timerTick(100)") == null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ss, "tcp.timerTick(100)"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "timerTickNow(@import(\"../arch/arch.zig\").tsc.nanos());"));
+    try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "timerTick(tcp_recv_policy.passElapsedMs(last, now_ns));") != null);
+}

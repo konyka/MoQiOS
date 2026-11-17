@@ -231,3 +231,46 @@ pub fn synGetsChallengeAck(state: TcpState) bool {
         else => false,
     };
 }
+
+// ── TCP_USER_TIMEOUT and giving up on an unanswered connection (Linux tcp_timer.c) ──
+
+/// tcp_sock_set_user_timeout: 0 turns it off, a negative value is EINVAL.
+pub fn userTimeoutErrno(val: i32) i64 {
+    return if (val < 0) EINVAL else 0;
+}
+
+/// tcp_write_timeout → retransmits_timed_out, at the `retransmits`-th expiry of the retransmission timer (1: the first): without a
+/// user timeout the connection gives up after `max_retries` retransmissions; with one, once `elapsed_ms` since the oldest
+/// unacknowledged data went out reaches it, whatever the count, but never at the first expiry, which only retransmits.
+pub fn retransGiveUp(retransmits: u32, max_retries: u32, user_timeout_ms: u32, elapsed_ms: u64) bool {
+    if (user_timeout_ms == 0) return retransmits > max_retries;
+    return retransmits >= 2 and elapsed_ms >= user_timeout_ms;
+}
+
+/// tcp_clamp_rto_to_user_timeout: the retransmission timer waits at most what is left of the user timeout (1 ms once it passed).
+pub fn clampRto(rto: u32, user_timeout_ms: u32, elapsed_ms: u64) u32 {
+    if (user_timeout_ms == 0) return rto;
+    if (elapsed_ms >= user_timeout_ms) return 1;
+    return @min(rto, @as(u32, @intCast(user_timeout_ms - elapsed_ms)));
+}
+
+/// tcp_keepalive_timer: with a user timeout the connection dies once `idle_ms` since the last data reaches it and a probe went out;
+/// without one, after `keep_cnt` unanswered probes.
+pub fn keepaliveGiveUp(probes: u32, keep_cnt: u32, user_timeout_ms: u32, idle_ms: u64) bool {
+    if (user_timeout_ms != 0) return probes > 0 and idle_ms >= user_timeout_ms;
+    return probes >= keep_cnt;
+}
+
+/// tcp_write_err: the soft error an ICMP error left, else ETIMEDOUT.
+pub fn timeoutErrno(soft_err: i32) i32 {
+    return if (soft_err != 0) soft_err else 110;
+}
+
+/// How many ms a TCP timer pass covers: the time since the previous pass, at least 1 and at most 1 s. The maintenance pass is
+/// meant to run every 100 ms but runs late when the CPU is slow (emulation); a fixed 100 would stretch every TCP timeout with it,
+/// and a stall of seconds must not fire every timer at once.
+pub fn passElapsedMs(last_ns: u64, now_ns: u64) u32 {
+    if (now_ns <= last_ns) return 1;
+    const ms = (now_ns - last_ns) / 1_000_000;
+    return @intCast(@max(1, @min(ms, 1000)));
+}

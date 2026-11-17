@@ -1,4 +1,4 @@
-/// hello177: TCP_INFO, TCP_MAXSEG, TCP_CONGESTION and the accepted-but-inert TCP options.
+/// hello177: TCP_INFO, TCP_MAXSEG, TCP_CONGESTION, TCP_USER_TIMEOUT read back, and the accepted-but-inert TCP options.
 
 #include <stdint.h>
 
@@ -175,8 +175,9 @@ void _start(void) {
     check(syscall5(SYS_SETSOCKOPT, (uint64_t)c, SOL_TCP, TCP_CONGESTION, (uint64_t)"cubic", 5) == 0, "D: selecting cubic is accepted");
     check(syscall5(SYS_SETSOCKOPT, (uint64_t)c, SOL_TCP, TCP_CONGESTION, (uint64_t)"nosuchalgo", 10) == -ENOENT_, "D: an unknown algorithm is ENOENT");
 
-    /* E: options that are accepted but have nothing to tune here */
-    check(set_int(c, TCP_USER_TIMEOUT, 5000) == 0 && get_int(c, TCP_USER_TIMEOUT) == 0, "E: TCP_USER_TIMEOUT is accepted");
+    /* E: TCP_USER_TIMEOUT is kept and read back (it bounds retransmission, hello407); the rest are accepted and have nothing
+     * to tune here. 0 turns it off again before the write below. */
+    check(set_int(c, TCP_USER_TIMEOUT, 5000) == 0 && get_int(c, TCP_USER_TIMEOUT) == 5000 && set_int(c, TCP_USER_TIMEOUT, 0) == 0, "E: TCP_USER_TIMEOUT is kept and read back");
     check(set_int(c, TCP_USER_TIMEOUT, -1) == -EINVAL_, "E: a negative TCP_USER_TIMEOUT is EINVAL");
     check(set_int(c, TCP_NOTSENT_LOWAT, 4096) == 0, "E: TCP_NOTSENT_LOWAT is accepted");
     check(set_int(c, TCP_SYNCNT, 3) == 0 && set_int(c, TCP_DEFER_ACCEPT, 1) == 0 && set_int(c, TCP_LINGER2, 10) == 0, "E: TCP_SYNCNT / TCP_DEFER_ACCEPT / TCP_LINGER2 are accepted");

@@ -83,6 +83,13 @@ const SEND_BUF_SIZE: u32 = 65536;
 const RECV_BUF_SIZE: u32 = 65536;
 const RETRANSMIT_MS: u32 = 2000; // initial RTO (ms), overridden by Jacobson/Karels
 const TCP_RTO_MIN: u32 = 200; // minimum RTO (ms)
+/// Retransmissions before an unanswered connection gives up without TCP_USER_TIMEOUT (Linux tcp_retries2 is 15).
+const TCP_RETRIES: u32 = 5;
+
+/// What tcp_write_timeout measures TCP_USER_TIMEOUT against: the time since the oldest unacknowledged data went out.
+fn rtxElapsedMs(tcb: *const TcpTcb) u64 {
+    return tcb.rtx_elapsed_ms;
+}
 const TCP_RTO_MAX: u32 = 60000; // maximum RTO (ms)
 /// RFC 6675 DupThresh for SACK loss detection (SK-112).
 const DUP_THRESH: u32 = 3;
@@ -193,6 +200,8 @@ const TcpTcb = struct {
     // Retransmission
     retransmit_timer: u32, // ms since last ack
     retransmit_count: u8,
+    /// ms since the oldest unacknowledged data went out (Linux retrans_stamp): TCP_USER_TIMEOUT is measured from it.
+    rtx_elapsed_ms: u64 = 0,
 
     // Congestion control (TCP Reno + PRR in recovery, SK-114)
     cwnd: u32, // congestion window (bytes)
@@ -924,6 +933,7 @@ fn initTcbState(t: *TcpTcb) void {
     t.recv_tail = 0;
     t.retransmit_timer = 0;
     t.retransmit_count = 0;
+    t.rtx_elapsed_ms = 0;
     t.cwnd = TCP_MSS;
     t.ssthresh = 65535;
     t.dup_ack_count = 0;
@@ -2623,6 +2633,7 @@ fn driveTcbStateMachine(
                         // and sent stale ring data under live sequence numbers.
                         tcb.retransmit_timer = 0;
                         tcb.retransmit_count = 0;
+                        tcb.rtx_elapsed_ms = 0;
                         tcb.tlp_sent = false;
                         // SK-118: new head's xmit time unknown until (re)sent.
                         tcb.head_xmit_ms = 0;
@@ -3679,6 +3690,7 @@ fn absorbDataAckBeforeFin(tcb: *TcpTcb, ack_num: u32, window: u32) void {
         }
         tcb.retransmit_timer = 0;
         tcb.retransmit_count = 0;
+        tcb.rtx_elapsed_ms = 0;
         tcb.tlp_sent = false;
         tcb.head_xmit_ms = 0;
         updateScoreboard(tcb, &.{});
@@ -3693,6 +3705,12 @@ fn absorbDataAckBeforeFin(tcb: *TcpTcb, ack_num: u32, window: u32) void {
 /// look at it), exactly as Linux does (sk_err is cleared when read); afterwards the connection reads as ended: recv returns 0 and
 /// send is EPIPE. tcp_lock held.
 fn reportRecvResult(tcb: *TcpTcb, decision: tcp_recv_policy.RecvDecision) i64 {
+    // A connection that timed out reports the error once (tcp_recvmsg: sock_error), then reads as ended.
+    if (decision == .eof and tcb.state == .closed and tcb.was_established and tcb.options.so_error != 0) {
+        const e = tcb.options.so_error;
+        tcb.options.so_error = 0;
+        return -@as(i64, e);
+    }
     const r = tcp_recv_policy.emptyResult(decision);
     if (decision == .reset) tcb.reset_by_peer = false;
     return r;
@@ -3925,6 +3943,12 @@ fn sendFailure(tcb_idx: u32, raw: i64) i64 {
     defer tcp_lock.release(lock_flags);
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return -9; // EBADF: slot torn down
+    if (tcb.state == .closed and tcb.was_established and tcb.options.so_error != 0 and !tcb.reset_by_peer) {
+        // A connection that timed out reports the error once (tcp_sendmsg: sk_stream_error), like recv.
+        const se = tcb.options.so_error;
+        tcb.options.so_error = 0;
+        return -@as(i64, se);
+    }
     const e = tcp_recv_policy.sendErrno(tcb.state, tcb.fin_pending, tcb.reset_by_peer, tcb.was_established);
     if (tcb.reset_by_peer) tcb.reset_by_peer = false; // reported once, like recv
     return e;
@@ -4126,6 +4150,17 @@ pub fn isClosed(tcb_idx: u32) bool {
 /// via sendSegment, so batch processing does not violate lock ordering.
 /// Worst-case hold time for 128 TCBs with retransmits: ~128-640us, well
 /// within the 10ms tick budget.
+var last_timer_ns: u64 = 0;
+
+/// The maintenance pass's TCP timer: advances every timer by the time measured since the previous pass (passElapsedMs), so
+/// timeouts keep their length when the pass runs late. The first pass counts as 100 ms.
+pub fn timerTickNow(now_ns: u64) void {
+    const last = @atomicLoad(u64, &last_timer_ns, .monotonic);
+    @atomicStore(u64, &last_timer_ns, now_ns, .monotonic);
+    if (last == 0) return timerTick(100);
+    timerTick(tcp_recv_policy.passElapsedMs(last, now_ns));
+}
+
 pub fn timerTick(ms_elapsed: u32) void {
     var bm = tcb_active_bitmap.snapshot();
     if (bm.isEmpty()) return;
@@ -4191,8 +4226,11 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
     // Check for unacknowledged data (use snd_max so rexmit rewind still counts).
     if (tcp_util.unackedPending(tcb.snd_una, tcb.snd_nxt, tcb.snd_max)) {
         tcb.retransmit_timer +%= ms_elapsed;
-        // Use per-TCB RTO if available, otherwise fall back to RETRANSMIT_MS
-        const current_rto = if (tcb.rto > 0) tcb.rto else RETRANSMIT_MS;
+        tcb.rtx_elapsed_ms +|= ms_elapsed;
+        // Use per-TCB RTO if available, otherwise fall back to RETRANSMIT_MS; with TCP_USER_TIMEOUT the timer never waits past it
+        // (tcp_clamp_rto_to_user_timeout, measured from when this RTO was armed).
+        const base_rto = if (tcb.rto > 0) tcb.rto else RETRANSMIT_MS;
+        const current_rto = tcp_recv_policy.clampRto(base_rto, tcb.options.user_timeout_ms, tcb.rtx_elapsed_ms -| tcb.retransmit_timer);
         // SK-128: RACK timer repair before TLP/RTO (no new ACK required).
         _ = maybeRackTimerRepair(tcb, current_rto);
         // SK-117: Tail Loss Probe before RTO (no cwnd cut).
@@ -4214,11 +4252,11 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             // RFC 2018 §8: a receiver may renege on SACKed data, so after an
             // RTO nothing is trusted as delivered; resend from snd_una.
             tcb.sack_scoreboard_count = 0;
-            if (tcb.retransmit_count > 5) {
-                // Give up
+            if (tcp_recv_policy.retransGiveUp(tcb.retransmit_count, TCP_RETRIES, tcb.options.user_timeout_ms, rtxElapsedMs(tcb))) {
+                // Give up (tcp_write_err): the soft error an ICMP error left, else ETIMEDOUT; connect() fails with it, an established
+                // connection reports it to its next recv, send or SO_ERROR.
                 tcpLog("[tcp] retransmit timeout, closing\n");
-                // tcp_write_err: the soft error an ICMP error left, else ETIMEDOUT (connect() fails with it).
-                if (tcb.state == .syn_sent) tcb.options.so_error = if (tcb.soft_err != 0) tcb.soft_err else 110;
+                tcb.options.so_error = tcp_recv_policy.timeoutErrno(tcb.soft_err);
                 noteFasync(idx, fcntl_policy.POLL_ERR); // Linux tcp_write_err → sk_error_report
                 closeTcbRemote(tcb);
                 return;
@@ -4323,9 +4361,11 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             // u64: probes*keep_intvl_ms can exceed u32 even with clamped options.
             @as(u64, tcb.idle_ms) >= @as(u64, keep_idle_ms) + @as(u64, tcb.keepalive_probes) * keep_intvl_ms)
         {
-            if (tcb.keepalive_probes >= tcb.options.keep_cnt) {
-                // Max probes reached — connection is dead
+            if (tcp_recv_policy.keepaliveGiveUp(tcb.keepalive_probes, tcb.options.keep_cnt, tcb.options.user_timeout_ms, tcb.idle_ms)) {
+                // Max probes reached, or TCP_USER_TIMEOUT since the last data: the connection is dead (tcp_write_err).
                 tcpLog("[tcp] keepalive timeout, closing\n");
+                tcb.options.so_error = tcp_recv_policy.timeoutErrno(tcb.soft_err);
+                noteFasync(idx, fcntl_policy.POLL_ERR);
                 closeTcbRemote(tcb);
                 return;
             }

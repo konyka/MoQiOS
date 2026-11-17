@@ -77,6 +77,16 @@ static void print(const char *s) {
     while (s[n]) n++;
     syscall3(SYS_WRITE, 1, (uint64_t)s, n);
 }
+static void print_dec(int64_t v) {
+    char b[24]; int n = 0;
+    if (v < 0) { print("-"); v = -v; }
+    if (v == 0) b[n++] = '0';
+    while (v > 0) { b[n++] = (char)('0' + v % 10); v /= 10; }
+    char o[24]; int k = 0;
+    while (n > 0) o[k++] = b[--n];
+    o[k] = 0;
+    print(o);
+}
 static int failures = 0;
 static void check(int ok, const char *what) {
     print(ok ? "hello173:   ok   " : "hello173:   FAIL ");
@@ -100,6 +110,8 @@ static void mk_addr(uint8_t *a, int port) {
     for (int i = 0; i < 16; i++) a[i] = 0;
     a[0] = 2; a[2] = (uint8_t)(port >> 8); a[3] = (uint8_t)port; a[4] = 127; a[7] = 1;
 }
+/* A different port pair per process: back-to-back runs must not find the previous run's connection still in TIME_WAIT. */
+static int port_off;
 static int make_pair(int port, int *cli, int *srv) {
     uint8_t sa[16];
     mk_addr(sa, port);
@@ -135,6 +147,7 @@ static int outq(int fd) {
 
 void _start(void) {
     print("hello173: ioctl(TIOCOUTQ, SIOCOUTQNSD) on sockets\n");
+    port_off = (int)((syscall1(39, 0) * 7) % 5000) * 2;
     static char buf[4096];
     for (int i = 0; i < 4096; i++) buf[i] = (char)i;
 
@@ -171,7 +184,7 @@ void _start(void) {
     /* C: TCP: an idle connection has nothing queued; with the peer not reading, the unsent/unacked rest stays queued */
     {
         int c, s;
-        check(make_pair(18173, &c, &s) == 0, "C: loopback connection");
+        check(make_pair(18173 + port_off, &c, &s) == 0, "C: loopback connection");
         check(outq(c) == 0, "C: an idle TCP socket has nothing queued");
         syscall3(SYS_WRITE, c, (uint64_t)buf, 100);
         pump(400);
@@ -198,6 +211,10 @@ void _start(void) {
             else pump(10);
         }
         check(got >= total + 100, "C: the peer receives everything that was written, promptly (< 20 s)");
+        if (got < total + 100) {
+            print("hello173:   .. drain_got="); print_dec(got); print(" total_plus_100="); print_dec(total + 100);
+            print(" sender_outq="); print_dec(outq(c)); print("\n");
+        }
         for (int i = 0; i < 40 && outq(c) != 0; i++) pump(50);
         check(outq(c) == 0, "C: once the peer read everything the queue is empty");
         syscall1(SYS_CLOSE, c);
@@ -219,7 +236,7 @@ void _start(void) {
     {
         int c, s2;
         int v = -1;
-        check(make_pair(18174, &c, &s2) == 0, "E: loopback connection");
+        check(make_pair(18173 + port_off + 1, &c, &s2) == 0, "E: loopback connection");
         check(syscall3(SYS_IOCTL, (uint64_t)c, SIOCOUTQNSD, (uint64_t)&v) == 0 && v == 0, "E: an idle TCP socket has nothing unsent");
         syscall3(SYS_FCNTL, (uint64_t)c, F_SETFL, O_NONBLOCK);
         long total = 0;
@@ -242,6 +259,10 @@ void _start(void) {
         for (int i = 0; i < 40 && outq(c) != 0; i++) pump(50);
         v = -1;
         check(syscall3(SYS_IOCTL, (uint64_t)c, SIOCOUTQNSD, (uint64_t)&v) == 0 && v == 0, "E: nothing unsent once the peer read everything");
+        if (v != 0) {
+            print("hello173:   .. E got="); print_dec(got); print(" total="); print_dec(total); print(" unsent="); print_dec(v);
+            print(" outq="); print_dec(outq(c)); print(" ms="); print_dec(now_ms() - t0); print("\n");
+        }
         syscall1(SYS_CLOSE, c);
         syscall1(SYS_CLOSE, s2);
         int sv[2];

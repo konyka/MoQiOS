@@ -55,6 +55,8 @@ pub const SocketOptions = struct {
     keep_idle: u32 = 7200, // seconds before first keepalive probe
     keep_intvl: u32 = 75, // seconds between keepalive probes
     keep_cnt: u32 = 9, // number of keepalive probes before dropping
+    /// TCP_USER_TIMEOUT in ms (0: off): how long unacknowledged data or unanswered keepalives may go before the connection gives up.
+    user_timeout_ms: u32 = 0,
     /// SO_REUSEPORT / SO_BROADCAST / SO_DEBUG bits (sockopt_policy.flagBit).
     extra_flags: u16 = 0,
     so_error: i32 = 0,
@@ -323,7 +325,16 @@ fn setTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen
                 if (!tcp_mod.tcpMaxsegSettable(tcb_idx)) return -22;
                 opts.user_mss = v;
             },
-            tip.TCP_USER_TIMEOUT, tip.TCP_DEFER_ACCEPT, tip.TCP_SYNCNT, tip.TCP_LINGER2, tip.TCP_NOTSENT_LOWAT => {
+            tip.TCP_USER_TIMEOUT => {
+                if (optlen < 4) return -22;
+                var buf: [4]u8 = undefined;
+                if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
+                const v: i32 = @bitCast(bo.readU32Le(&buf));
+                const e = @import("tcp_recv_policy.zig").userTimeoutErrno(v);
+                if (e != 0) return e;
+                opts.user_timeout_ms = @intCast(v);
+            },
+            tip.TCP_DEFER_ACCEPT, tip.TCP_SYNCNT, tip.TCP_LINGER2, tip.TCP_NOTSENT_LOWAT => {
                 // Accepted and ignored: the behaviour they tune does not exist here.
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
@@ -407,7 +418,11 @@ fn getTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen
                 val_len = 4;
                 bo.writeU32Le(val_buf[0..4], tcp_mod.tcpEffectiveMss(tcb_idx));
             },
-            tip.TCP_USER_TIMEOUT, tip.TCP_DEFER_ACCEPT, tip.TCP_SYNCNT, tip.TCP_LINGER2, tip.TCP_NOTSENT_LOWAT => {
+            tip.TCP_USER_TIMEOUT => {
+                val_len = 4;
+                bo.writeU32Le(val_buf[0..4], opts.user_timeout_ms);
+            },
+            tip.TCP_DEFER_ACCEPT, tip.TCP_SYNCNT, tip.TCP_LINGER2, tip.TCP_NOTSENT_LOWAT => {
                 val_len = 4;
                 bo.writeU32Le(val_buf[0..4], 0);
             },
