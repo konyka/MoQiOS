@@ -12162,8 +12162,7 @@ test "TCP bind errors and SO_REUSEADDR sharing" {
     try std.testing.expect(std.mem.indexOf(u8, ts, "tcp_port_policy.reuseMayShare(tcb.options.reuse_addr, tcbs[i].options.reuse_addr, tcbs[i].state == .listen)") != null);
     // listen() checks the port again (only one SO_REUSEADDR sharer may listen); accepted connections inherit SO_REUSEADDR (both families).
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.state != .listen and portConflict(tcb_idx, tcb.local_port)) return tcp_port_policy.BIND_EADDRINUSE;") != null);
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ts, "new_tcb.options.reuse_addr = listenerReuseAddr(ls);"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ts, "new_tcb.options.extra_flags |= listenerReusePortFlag(ls);"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ts, "new_tcb.options = listenerOptions(ls);"));
     // Both connect paths refuse a 4-tuple a live connection already uses.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ts, "return tcp_port_policy.CONNECT_EADDRNOTAVAIL;"));
     // Both bind paths (IPv4 and IPv6) refuse a privileged port without the capability with EACCES.
@@ -15675,6 +15674,22 @@ test "established connections give up on time (hello411): Linux tcp_write_timeou
     const so = kt.socket_opt_source;
     try std.testing.expect(std.mem.indexOf(u8, so, "opts.rto_max_ms = @intCast(v);") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, "bo.writeU32Le(val_buf[0..4], opts.rto_max_ms);") != null);
+}
+
+test "accepted connections start with the listener's options (hello412): Linux sk_clone_lock / inet_csk_clone_lock" {
+    const rp = kt.tcp_recv_policy;
+    const Opts = struct { user_timeout_ms: u32 = 0, rto_max_ms: u32 = 120_000, keep_alive: bool = false, priority: i32 = 0, so_error: i32 = 0 };
+    // Everything is copied but the error and SO_PRIORITY (sk_clone_lock clears sk_err, sk_err_soft and sk_priority).
+    const child = rp.childOptions(Opts, .{ .user_timeout_ms = 1500, .rto_max_ms = 2000, .keep_alive = true, .priority = 3, .so_error = 104 });
+    try std.testing.expectEqual(@as(u32, 1500), child.user_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 2000), child.rto_max_ms);
+    try std.testing.expect(child.keep_alive);
+    try std.testing.expectEqual(@as(i32, 0), child.priority);
+    try std.testing.expectEqual(@as(i32, 0), child.so_error);
+    const ts = kt.tcp_source;
+    // Both families' SYN paths (fresh slot and TIME_WAIT reuse) take the listener's options.
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, ts, ".options = listenerOptions(ls);"));
+    try std.testing.expect(std.mem.indexOf(u8, ts, "return tcp_recv_policy.childOptions(socket_opt.SocketOptions, tcbs[slot.tcb_idx].options);") != null);
 }
 
 test "IPv6 extension headers on input (hello410): hop-by-hop and destination options are stepped over (Linux ipv6_parse_hopopts / ip6_parse_tlv)" {

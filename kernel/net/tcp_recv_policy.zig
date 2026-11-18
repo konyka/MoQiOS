@@ -233,6 +233,15 @@ pub fn synGetsChallengeAck(state: TcpState) bool {
     };
 }
 
+/// sk_clone_lock: a connection the listener accepts starts with a copy of the listener's options, except its error and SO_PRIORITY
+/// (sk_err, sk_err_soft and sk_priority are cleared).
+pub fn childOptions(comptime T: type, listener: T) T {
+    var c = listener;
+    c.so_error = 0;
+    c.priority = 0;
+    return c;
+}
+
 // ── TCP_USER_TIMEOUT and giving up on an unanswered connection (Linux tcp_timer.c) ──
 
 /// tcp_sock_set_user_timeout: 0 turns it off, a negative value is EINVAL.

@@ -2231,6 +2231,7 @@ fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16,
             const reuse_tcb = &tcbs[i];
             tcb_generations[i] +%= 1; // a new connection on this slot
             initTcbState(reuse_tcb);
+            reuse_tcb.options = listenerOptions(ls);
             reuse_tcb.iss = generateIss();
             reuse_tcb.snd_una = reuse_tcb.iss;
             reuse_tcb.snd_nxt = reuse_tcb.iss;
@@ -2282,8 +2283,7 @@ fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16,
     new_tcb.remote_ip = src_ip;
     new_tcb.owner_task = ls.owner_task;
     new_tcb.sock_uid = listenerSockUid(ls);
-    new_tcb.options.reuse_addr = listenerReuseAddr(ls);
-    new_tcb.options.extra_flags |= listenerReusePortFlag(ls);
+    new_tcb.options = listenerOptions(ls);
     new_tcb.iss = generateIss();
     new_tcb.snd_una = new_tcb.iss;
     new_tcb.snd_nxt = new_tcb.iss;
@@ -2347,6 +2347,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, dst_ip: [16]u8, src_port: u16, dst_port: 
             const reuse_tcb = &tcbs[i];
             tcb_generations[i] +%= 1; // a new connection on this slot
             initTcbState(reuse_tcb);
+            reuse_tcb.options = listenerOptions(ls);
             reuse_tcb.iss = generateIss();
             reuse_tcb.snd_una = reuse_tcb.iss;
             reuse_tcb.snd_nxt = reuse_tcb.iss;
@@ -2387,8 +2388,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, dst_ip: [16]u8, src_port: u16, dst_port: 
     new_tcb.local_ip6 = dst_ip;
     new_tcb.owner_task = ls.owner_task;
     new_tcb.sock_uid = listenerSockUid(ls);
-    new_tcb.options.reuse_addr = listenerReuseAddr(ls);
-    new_tcb.options.extra_flags |= listenerReusePortFlag(ls);
+    new_tcb.options = listenerOptions(ls);
     new_tcb.iss = generateIss();
     new_tcb.snd_una = new_tcb.iss;
     new_tcb.snd_nxt = new_tcb.iss;
@@ -4509,17 +4509,11 @@ fn listenerSockUid(slot: *const ListenSlot) u32 {
     return tcbs[slot.tcb_idx].sock_uid;
 }
 
-/// SO_REUSEADDR of the listener behind `slot`: an accepted connection starts with it (Linux sk_clone_lock copies sk_reuse).
-fn listenerReuseAddr(slot: *const ListenSlot) bool {
-    if (slot.tcb_idx >= MAX_CONNECTIONS) return false;
-    return tcbs[slot.tcb_idx].options.reuse_addr;
-}
-
-/// The SO_REUSEPORT bit of the listener behind `slot`, which an accepted connection inherits too (sk_clone_lock copies sk_reuseport):
-/// otherwise the connections a reuseport listener accepted would keep its siblings from listening on the shared port.
-fn listenerReusePortFlag(slot: *const ListenSlot) u16 {
-    if (slot.tcb_idx >= MAX_CONNECTIONS) return 0;
-    return tcbs[slot.tcb_idx].options.extra_flags & tcp_port_policy.REUSEPORT_FLAG;
+/// The options a connection accepted on `slot` starts with: the listener's (sk_clone_lock copies the sock, so SO_REUSEADDR,
+/// SO_REUSEPORT, timeouts, keepalive and IP options carry over), defaults when the listener is gone.
+fn listenerOptions(slot: *const ListenSlot) socket_opt.SocketOptions {
+    if (slot.tcb_idx >= MAX_CONNECTIONS) return .{};
+    return tcp_recv_policy.childOptions(socket_opt.SocketOptions, tcbs[slot.tcb_idx].options);
 }
 
 /// The fsuid of the task in slot `task_idx` (0 when there is none): the owner a socket it creates gets (Linux sock_alloc,
