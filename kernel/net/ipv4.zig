@@ -56,6 +56,16 @@ pub fn buildHeader(buf: [*]u8, src_ip: [4]u8, dst_ip: [4]u8, protocol: u8, paylo
     bo.writeU16BeAt(buf, 10, csum);
 }
 
+/// Writes the identification field and the DF bit of a 20-byte header built by buildHeader, and refreshes its checksum
+/// (ipid_policy.zig decides which id and DF a packet gets).
+pub fn setIdent(buf: [*]u8, id: u16, df: bool) void {
+    bo.writeU16BeAt(buf, 4, id);
+    buf[6] = if (df) buf[6] | 0x40 else buf[6] & ~@as(u8, 0x40);
+    buf[10] = 0;
+    buf[11] = 0;
+    bo.writeU16BeAt(buf, 10, checksum(buf, @as(u16, buf[0] & 0x0f) * 4));
+}
+
 /// Internet checksum (RFC 1071) — optimized with u64 accumulator and 4-byte stride.
 pub fn checksum(buf: [*]const u8, len: u16) u16 {
     var acc: u64 = 0;

@@ -54,12 +54,6 @@ pub fn needsIdent(pkt: []const u8) bool {
     return pkt[4] == 0 and pkt[5] == 0 and (pkt[6] & 0x40) == 0;
 }
 
-/// The id generator's next value after `cur`, skipping 0 (an id of 0 would read as "choose one").
-pub fn nextIdent(cur: u16) u16 {
-    const n = cur +% 1;
-    return if (n == 0) 1 else n;
-}
-
 /// completeHdrincl, writing `ident` as the id when the header needsIdent (`ident` is ignored otherwise).
 pub fn completeHdrinclId(pkt: []u8, src: [4]u8, ident: u16) void {
     const ihl: usize = @as(usize, pkt[0] & 0x0f) * 4;

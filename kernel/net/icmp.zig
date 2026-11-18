@@ -2,6 +2,7 @@ const nic = @import("nic.zig");
 const netif = @import("netif.zig");
 const eth = @import("eth.zig");
 const ipv4 = @import("ipv4.zig");
+const ipid = @import("ipid.zig");
 const arp = @import("arp.zig");
 const bo = @import("../lib/byte_order.zig");
 const echo_policy = @import("icmp_echo_policy.zig");
@@ -51,6 +52,8 @@ pub fn buildEchoReplyMtu(
 
     // IPv4 header at offset 14, ethernet frame at offset 0.
     ipv4.buildHeader(o + 14, reply_src_ip, reply_dst_ip, ipv4.PROTO_ICMP, icmp_total);
+    // An echo reply goes out without DF and with a hashed id (icmp_reply has no socket that numbers it).
+    ipv4.setIdent(o + 14, ipid.global(reply_dst_ip, reply_src_ip, ipv4.PROTO_ICMP), false);
     return eth.buildFrame(o, reply_dst_mac, reply_src_mac, eth.ETHERTYPE_IPV4, 20 + icmp_total);
 }
 
@@ -91,6 +94,7 @@ pub fn sendFrom(bound: [4]u8, dst: [4]u8, msg: []const u8) i64 {
     var pkt: [1518]u8 = @splat(0);
     @memcpy(pkt[34..][0..msg.len], msg);
     ipv4.buildHeader(pkt[14..].ptr, src, dst, ipv4.PROTO_ICMP, @intCast(msg.len));
+    ipv4.setIdent(pkt[14..].ptr, ipid.global(dst, src, ipv4.PROTO_ICMP), true);
     const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, @intCast(20 + msg.len));
     if (wait_hop) |hop| {
         arp.queueFrame(hop, &pkt, frame_len);
@@ -119,6 +123,7 @@ pub fn sendProtoUnreachable(dgram: []const u8, src_ip: [4]u8, dst_ip: [4]u8) voi
     const icmp_len: u16 = @intCast(8 + quote);
     bo.writeU16BeAt(&pkt, 36, ipv4.checksum(pkt[34..].ptr, icmp_len));
     ipv4.buildHeader(pkt[14..].ptr, dst_ip, src_ip, ipv4.PROTO_ICMP, icmp_len);
+    ipv4.setIdent(pkt[14..].ptr, ipid.global(src_ip, dst_ip, ipv4.PROTO_ICMP), false);
     const mac = netif.getMac();
     const frame_len = eth.buildFrame(&pkt, mac, mac, eth.ETHERTYPE_IPV4, 20 + icmp_len);
     _ = lo.sendPacket(&pkt, frame_len);

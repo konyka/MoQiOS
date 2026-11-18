@@ -20,6 +20,8 @@ const netif = @import("netif.zig");
 const lo_dev = @import("lo.zig");
 const eth = @import("eth.zig");
 const ipv4 = @import("ipv4.zig");
+const ipid = @import("ipid.zig");
+const ipid_policy = @import("ipid_policy.zig");
 const ipv6 = @import("ipv6.zig");
 const arp = @import("arp.zig");
 const ndp = @import("ndp.zig");
@@ -341,6 +343,8 @@ const TcpTcb = struct {
     /// A reset after the peer's FIN (Linux tcp_reset): EPIPE in CLOSE_WAIT, ECONNRESET in CLOSING / LAST_ACK. SO_ERROR and the next
     /// send report it once; recv keeps reading EOF.
     fin_reset_err: i32 = 0,
+    /// The IPv4 id of the next segment (inet_id: random at connect and accept, one more per segment; ipid_policy.zig).
+    ip_id: u16 = 0,
     /// The handshake finished at some point (stays set after close/reset).
     was_established: bool = false,
     /// shutdown(SHUT_RD) happened: reads see EOF, later data is dropped.
@@ -1511,6 +1515,7 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16, 
     const csum = tcpChecksum(our_ip, tcb.remote_ip, send_pkt[tcp_off..].ptr, tcp_total);
     bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
     ipv4.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip, ipv4.PROTO_TCP, tcp_total);
+    if (ipid_policy.tcpUsesSocketId(flags)) ipv4.setIdent(send_pkt[14..].ptr, ipid_policy.take(&tcb.ip_id), true);
     // IP_TTL / IP_TOS (applied before ECN, which owns the low two TOS bits).
     if (ip_opt_policy.ipv4NeedsPatch(tcb.options.ip)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], tcb.options.ip, ipv4.checksum);
     // SK-131/143: ECT(1) for AccECN/L4S, else ECT(0) for classic ECN.
@@ -2260,6 +2265,7 @@ fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16,
             initTcbState(reuse_tcb);
             reuse_tcb.options = listenerOptions(ls);
             reuse_tcb.iss = generateIss();
+            reuse_tcb.ip_id = ipid.initial();
             reuse_tcb.snd_una = reuse_tcb.iss;
             reuse_tcb.snd_nxt = reuse_tcb.iss;
             reuse_tcb.snd_max = reuse_tcb.iss;
@@ -2312,6 +2318,7 @@ fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16,
     new_tcb.sock_uid = listenerSockUid(ls);
     new_tcb.options = listenerOptions(ls);
     new_tcb.iss = generateIss();
+    new_tcb.ip_id = ipid.initial();
     new_tcb.snd_una = new_tcb.iss;
     new_tcb.snd_nxt = new_tcb.iss;
     new_tcb.snd_max = new_tcb.iss;
@@ -2376,6 +2383,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, dst_ip: [16]u8, src_port: u16, dst_port: 
             initTcbState(reuse_tcb);
             reuse_tcb.options = listenerOptions(ls);
             reuse_tcb.iss = generateIss();
+            reuse_tcb.ip_id = ipid.initial();
             reuse_tcb.snd_una = reuse_tcb.iss;
             reuse_tcb.snd_nxt = reuse_tcb.iss;
             reuse_tcb.snd_max = reuse_tcb.iss;
@@ -2417,6 +2425,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, dst_ip: [16]u8, src_port: u16, dst_port: 
     new_tcb.sock_uid = listenerSockUid(ls);
     new_tcb.options = listenerOptions(ls);
     new_tcb.iss = generateIss();
+    new_tcb.ip_id = ipid.initial();
     new_tcb.snd_una = new_tcb.iss;
     new_tcb.snd_nxt = new_tcb.iss;
     new_tcb.snd_max = new_tcb.iss;
@@ -3273,6 +3282,7 @@ pub fn tcpConnect(remote_ip: [4]u8, remote_port: u16, owner_task: u32) i64 {
     tcb.owner_task = owner_task;
     tcb.sock_uid = creatorFsuid(owner_task);
     tcb.iss = generateIss();
+    tcb.ip_id = ipid.initial();
     tcb.snd_una = tcb.iss;
     tcb.snd_nxt = tcb.iss;
     tcb.snd_max = tcb.iss;
@@ -3368,6 +3378,7 @@ pub fn tcpConnectSocket(tcb_idx: u32, remote_ip: [4]u8, remote_port: u16) i64 {
     tcb.remote_port = remote_port;
     tcb.remote_ip = remote_ip;
     tcb.iss = generateIss();
+    tcb.ip_id = ipid.initial();
     tcb.snd_una = tcb.iss;
     tcb.snd_nxt = tcb.iss;
     tcb.snd_max = tcb.iss;
@@ -3411,6 +3422,7 @@ pub fn tcpConnectSocketV6(tcb_idx: u32, remote_ip6: [16]u8, remote_port: u16) i6
     tcb.remote_port = remote_port;
     tcb.remote_ip6 = remote_ip6;
     tcb.iss = generateIss();
+    tcb.ip_id = ipid.initial();
     tcb.snd_una = tcb.iss;
     tcb.snd_nxt = tcb.iss;
     tcb.snd_max = tcb.iss;

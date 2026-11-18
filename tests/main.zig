@@ -15043,7 +15043,7 @@ test "IP_HDRINCL wiring: raw IPv4 sends write the caller's header (hello396)" {
     try std.testing.expect(std.mem.indexOf(u8, ss, "var pbuf: [@import(\"raw_icmp.zig\").MAX_HDRINCL]u8 = undefined;") != null);
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "pub fn sendHdrincl(bound: [4]u8, dst: [4]u8, pkt: []const u8) i64 {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rs, "policy.completeHdrinclId(pkt_buf[14..][0..pkt.len], src, if (policy.needsIdent(pkt)) takeIdent() else 0);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "policy.completeHdrinclId(pkt_buf[14..][0..pkt.len], src, if (policy.needsIdent(pkt)) ipid.globalNonzero(dst, src, pkt[9]) else 0);") != null);
 }
 
 test "raw ICMP sockets take sendmsg and recvmsg (hello397)" {
@@ -15212,11 +15212,8 @@ test "IP_HDRINCL id 0 is chosen unless DF (hello402): Linux raw_send_hdrinc / ip
     rp.completeHdrinclId(&g, .{ 127, 0, 0, 1 }, 0xbeef);
     try std.testing.expectEqual(@as(u8, 0x12), g[4]);
     try std.testing.expectEqual(@as(u8, 0x34), g[5]);
-    // The generator never hands out 0 (a 0 would read as "choose one" again).
-    try std.testing.expectEqual(@as(u16, 1), rp.nextIdent(0xffff));
-    try std.testing.expectEqual(@as(u16, 2), rp.nextIdent(1));
     const rs = kt.raw_icmp_source;
-    try std.testing.expect(std.mem.indexOf(u8, rs, "policy.completeHdrinclId(pkt_buf[14..][0..pkt.len], src, if (policy.needsIdent(pkt)) takeIdent() else 0);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "policy.completeHdrinclId(pkt_buf[14..][0..pkt.len], src, if (policy.needsIdent(pkt)) ipid.globalNonzero(dst, src, pkt[9]) else 0);") != null);
 }
 
 test "IPv6 raw sockets of any protocol (hello403): creation, IPV6_CHECKSUM, delivery (Linux inet6_create / rawv6_sendmsg / rawv6_rcv)" {
@@ -15949,4 +15946,74 @@ test "TCP reset and timeout readiness (hello407): ERR comes with IN and HUP, the
     // state (ERR without IN/HUP), so the readiness snapshot is taken under tcp_lock (Linux tcp_poll reads under the socket lock's
     // ordering: sk_err is published together with the state by tcp_done).
     try std.testing.expect(std.mem.indexOf(u8, ts, "pub fn tcpReadiness(tcb_idx: u32) u32 {\n    const ready = @import(\"tcp_ready_policy.zig\");\n    if (tcb_idx >= MAX_CONNECTIONS) return ready.events(.{ .active = false, .state = .closed, .recv_bytes = 0, .send_space = 0, .reset_by_peer = false, .shut_rd = false, .fin_pending = false });\n    const lock_flags = tcp_lock.acquire();\n    defer tcp_lock.release(lock_flags);\n") != null);
+}
+
+test "IPv4 id and DF of kernel-built headers (hello418): per-connection ids, zero on handshakes, hashed ids without DF on errors" {
+    const ip = kt.ipid_policy;
+    var hdr: [20]u8 = undefined;
+    ipv4.buildHeader(&hdr, .{ 127, 0, 0, 1 }, .{ 127, 0, 0, 2 }, ipv4.PROTO_UDP, 8);
+    // buildHeader keeps id 0 with DF (the handshake/reset form, ip_build_and_send_pkt).
+    try std.testing.expectEqual(@as(u8, 0), hdr[4] | hdr[5]);
+    try std.testing.expectEqual(@as(u8, 0x40), hdr[6]);
+    ipv4.setIdent(&hdr, 0xbeef, false);
+    try std.testing.expectEqual(@as(u16, 0xbeef), byte_order.readU16BeAt(&hdr, 4));
+    try std.testing.expectEqual(@as(u8, 0), hdr[6] & 0x40);
+    try std.testing.expectEqual(@as(u16, 0), ipv4.checksum(&hdr, 20));
+    ipv4.setIdent(&hdr, 7, true);
+    try std.testing.expectEqual(@as(u16, 7), byte_order.readU16BeAt(&hdr, 4));
+    try std.testing.expectEqual(@as(u8, 0x40), hdr[6]);
+    try std.testing.expectEqual(@as(u16, 0), ipv4.checksum(&hdr, 20));
+    // A socket's id is used, then advanced by one (ip_select_ident_segs); it wraps through 0 like Linux.
+    var cur: u16 = 0xfffe;
+    try std.testing.expectEqual(@as(u16, 0xfffe), ip.take(&cur));
+    try std.testing.expectEqual(@as(u16, 0xffff), ip.take(&cur));
+    try std.testing.expectEqual(@as(u16, 0), ip.take(&cur));
+    try std.testing.expectEqual(@as(u16, 1), cur);
+    // The unowned generator (__ip_select_ident) picks a bucket from (daddr, saddr, protocol) and a boot secret.
+    const a = ip.bucket(.{ 127, 0, 0, 1 }, .{ 127, 0, 0, 1 }, 1, 0x1234);
+    try std.testing.expectEqual(a, ip.bucket(.{ 127, 0, 0, 1 }, .{ 127, 0, 0, 1 }, 1, 0x1234));
+    var seen: u64 = 0;
+    for (0..32) |k| {
+        const b = ip.bucket(.{ 10, 0, 2, @intCast(k) }, .{ 10, 0, 2, 15 }, 17, 0x1234);
+        try std.testing.expect(b < ip.BUCKETS);
+        seen |= @as(u64, 1) << @intCast(b);
+    }
+    try std.testing.expect(@popCount(seen) >= 8);
+    var other: bool = false;
+    for (0..16) |k| other = other or ip.bucket(.{ 127, 0, 0, 1 }, .{ 127, 0, 0, 1 }, 1, @intCast(k)) != a;
+    try std.testing.expect(other);
+    // A shared counter used again in the same tick moves on by one; after a quiet spell it first jumps ahead by less than the ticks
+    // that passed (ip_idents_reserve).
+    var c: u16 = 100;
+    var st: u32 = 50;
+    try std.testing.expectEqual(@as(u16, 100), ip.reserve(&c, &st, 50, 0xffff_ffff));
+    try std.testing.expectEqual(@as(u16, 101), ip.reserve(&c, &st, 50, 7));
+    try std.testing.expectEqual(@as(u16, 102 + 7), ip.reserve(&c, &st, 60, 7));
+    try std.testing.expectEqual(@as(u32, 60), st);
+    try std.testing.expectEqual(@as(u16, 110 + 3), ip.reserve(&c, &st, 64, 7));
+    try std.testing.expectEqual(@as(u16, 114), c);
+    // A SYN-ACK leaves with id 0 (ip_build_and_send_pkt under DF); every other segment of a connection uses its own counter.
+    try std.testing.expect(!ip.tcpUsesSocketId(0x12));
+    try std.testing.expect(ip.tcpUsesSocketId(0x02));
+    try std.testing.expect(ip.tcpUsesSocketId(0x10));
+    try std.testing.expect(ip.tcpUsesSocketId(0x11));
+    try std.testing.expect(ip.tcpUsesSocketId(0x18));
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "    if (ipid_policy.tcpUsesSocketId(flags)) ipv4.setIdent(send_pkt[14..].ptr, ipid_policy.take(&tcb.ip_id), true);\n") != null);
+    try std.testing.expect(std.mem.count(u8, ts, ".ip_id = ipid.initial();") >= 5);
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "    ipv4.setIdent(send_pkt[14..].ptr, takePortIpid(src_key, dst_ip, our_ip), true);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    port_ipid[idx] = 0;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    if (port_peer[i] == 0) return null;\n    return ipid_policy.take(&port_ipid[i]);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    port_ipid[i] = ipid.initial();\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "            port_ipid[i] = port_ipid[num_ports];\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    ipv4.setIdent(pkt[14..].ptr, ipid.global(src_ip, dst_ip, ipv4.PROTO_ICMP), false);\n") != null);
+    const is = kt.icmp_source;
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, is, "ipv4.setIdent("));
+    try std.testing.expect(std.mem.indexOf(u8, is, "    ipv4.setIdent(o + 14, ipid.global(reply_dst_ip, reply_src_ip, ipv4.PROTO_ICMP), false);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, is, "    ipv4.setIdent(pkt[14..].ptr, ipid.global(src_ip, dst_ip, ipv4.PROTO_ICMP), false);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, is, "    ipv4.setIdent(pkt[14..].ptr, ipid.global(dst, src, ipv4.PROTO_ICMP), true);\n") != null);
+    const rs = kt.raw_icmp_source;
+    try std.testing.expect(std.mem.indexOf(u8, rs, "    ipv4.setIdent(pkt[14..].ptr, ipid.global(dst, src, protocol), true);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "var hdrincl_ident") == null);
 }

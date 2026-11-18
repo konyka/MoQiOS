@@ -4,6 +4,8 @@ const netif = @import("netif.zig");
 const lo = @import("lo.zig");
 const eth = @import("eth.zig");
 const ipv4 = @import("ipv4.zig");
+const ipid = @import("ipid.zig");
+const ipid_policy = @import("ipid_policy.zig");
 const ipv6 = @import("ipv6.zig");
 const arp = @import("arp.zig");
 const ndp = @import("ndp.zig");
@@ -64,6 +66,8 @@ var port_opts: [MAX_PORTS]@import("sockopt_policy.zig").Stored = @splat(.{});
 /// Pending asynchronous error per port (ICMP port unreachable → ECONNREFUSED,
 /// positive errno) and the peer port a connect() fixed, 0 when unconnected.
 var port_err: [MAX_PORTS]i32 = @splat(0);
+/// The IPv4 id of a connected socket's next datagram (inet_id: random at connect, one more per datagram).
+var port_ipid: [MAX_PORTS]u16 = @splat(0);
 var port_peer: [MAX_PORTS]u16 = @splat(0);
 /// Peer address a connect() fixed (IPv4 in the first 4 bytes), meaningful when port_peer is nonzero.
 var port_peer_ip: [MAX_PORTS][16]u8 = @splat(@splat(0));
@@ -180,6 +184,7 @@ pub fn setPeer(port: u32, peer_port: u16, peer_ip: [16]u8) void {
     port_peer[i] = peer_port;
     port_peer_ip[i] = peer_ip;
     port_err[i] = 0;
+    port_ipid[i] = ipid.initial();
 }
 
 /// connect(AF_UNSPEC) on the socket with registry key `key`: drops the peer filter, any pending error and the interface the socket
@@ -320,6 +325,20 @@ pub fn notifyPingError6(ident: u16, err: i32) void {
 /// touch `queues` MUST stay in the same critical section: releasePort's
 /// swap-remove reshuffles slots, so an index computed under a previous lock
 /// hold can name a different port's queue by the time it is used (J1).
+/// The id of the next datagram the socket with registry key `key` sends: a connected socket's own counter, else one from the hashed
+/// counters (ip_select_ident_segs uses inet_id only when inet_daddr is set).
+fn takePortIpid(key: u32, dst: [4]u8, src: [4]u8) u16 {
+    return takeSocketIpid(key) orelse ipid.global(dst, src, ipv4.PROTO_UDP);
+}
+
+fn takeSocketIpid(key: u32) ?u16 {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(key) orelse return null;
+    if (port_peer[i] == 0) return null;
+    return ipid_policy.take(&port_ipid[i]);
+}
+
 fn findPortIdxLocked(port: u32) ?u16 {
     for (0..num_ports) |i| {
         if (ports[i] == port) return @intCast(i);
@@ -353,6 +372,7 @@ fn newSlotLocked(key: u32, is_v6: bool, uid: u32) u16 {
     port_refs[idx] = 1;
     port_opts[idx] = .{};
     port_err[idx] = 0;
+    port_ipid[idx] = 0;
     port_peer[idx] = 0;
     port_peer_ip[idx] = @splat(0);
     port_uid[idx] = uid;
@@ -728,6 +748,7 @@ fn releaseLocked(port: u32) void {
             port_refs[i] = port_refs[num_ports];
             port_opts[i] = port_opts[num_ports];
             port_err[i] = port_err[num_ports];
+            port_ipid[i] = port_ipid[num_ports];
             port_peer[i] = port_peer[num_ports];
             port_peer_ip[i] = port_peer_ip[num_ports];
             port_uid[i] = port_uid[num_ports];
@@ -987,6 +1008,7 @@ fn sendPortUnreachable(src_ip: [4]u8, dst_ip: [4]u8, udp: [*]const u8, udp_len: 
     const icmp_len: u16 = 8 + 20 + quote_udp;
     bo.writeU16BeAt(&pkt, 36, ipv4.checksum(pkt[34..].ptr, icmp_len));
     ipv4.buildHeader(pkt[14..].ptr, dst_ip, src_ip, ipv4.PROTO_ICMP, icmp_len);
+    ipv4.setIdent(pkt[14..].ptr, ipid.global(src_ip, dst_ip, ipv4.PROTO_ICMP), false);
     const mac = netif.getMac();
     const frame_len = eth.buildFrame(&pkt, mac, mac, eth.ETHERTYPE_IPV4, 20 + icmp_len);
     _ = lo_dev.sendPacket(&pkt, frame_len);
@@ -1184,6 +1206,7 @@ pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, data
 
     // Build IPv4 header at offset 14 (after ethernet header)
     ipv4.buildHeader(send_pkt[14..].ptr, our_ip, dst_ip, ipv4.PROTO_UDP, udp_total);
+    ipv4.setIdent(send_pkt[14..].ptr, takePortIpid(src_key, dst_ip, our_ip), true);
     if (ip_opt_policy.ipv4NeedsPatch(opts4)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], opts4, ipv4.checksum);
     // A datagram to a group carries IP_MULTICAST_TTL (default 1), not the unicast TTL.
     if (group) ip_opt_policy.setTtl4(send_pkt[14..][0..20], opts4.mc4_ttl, ipv4.checksum);

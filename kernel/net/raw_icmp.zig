@@ -6,6 +6,7 @@
 //! what lets a fork keep it. The raw Ethernet frame ioctl-style socket this replaced (read/write on the NIC) is gone.
 const policy = @import("raw_icmp_policy.zig");
 const ipv4 = @import("ipv4.zig");
+const ipid = @import("ipid.zig");
 const netif = @import("netif.zig");
 const nic = @import("nic.zig");
 const lo = @import("lo.zig");
@@ -438,6 +439,7 @@ pub fn send(bound: [4]u8, dst: [4]u8, protocol: u8, msg: []const u8, ip: ipo.IpO
     var pkt: [FRAME_BUF_LEN]u8 = @splat(0);
     @memcpy(pkt[34..][0..msg.len], msg);
     ipv4.buildHeader(pkt[14..].ptr, src, dst, protocol, @intCast(msg.len));
+    ipv4.setIdent(pkt[14..].ptr, ipid.global(dst, src, protocol), true);
     if (ipo.ipv4NeedsPatch(ip)) ipo.patchIpv4(pkt[14..][0..20], ip, ipv4.checksum);
     const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, @intCast(20 + msg.len));
     if (wait_hop) |hop| {
@@ -448,17 +450,6 @@ pub fn send(bound: [4]u8, dst: [4]u8, protocol: u8, msg: []const u8, ip: ipo.IpO
     // the send returns, as on Linux.
     const ok = if (via_lo) lo.sendNow(&pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt, frame_len);
     return if (ok) 0 else -105;
-}
-
-/// The IPv4 id generator of IP_HDRINCL sends that leave the id 0 without DF (__ip_select_ident); never 0.
-var hdrincl_ident: u16 = 0;
-
-fn takeIdent() u16 {
-    while (true) {
-        const cur = @atomicLoad(u16, &hdrincl_ident, .monotonic);
-        const next = policy.nextIdent(cur);
-        if (@cmpxchgWeak(u16, &hdrincl_ident, cur, next, .monotonic, .monotonic) == null) return next;
-    }
 }
 
 /// An IP_HDRINCL send (raw_send_hdrinc): `pkt` is a whole IPv4 datagram that passed policy.hdrinclErrno. It is routed by `dst`
@@ -479,7 +470,7 @@ pub fn sendHdrincl(bound: [4]u8, dst: [4]u8, pkt: []const u8) i64 {
     const src = @import("tcp_port_policy.zig").sourceAddr(bound, dst, netif.getOurIp());
     var pkt_buf: [FRAME_BUF_LEN]u8 = @splat(0);
     @memcpy(pkt_buf[14..][0..pkt.len], pkt);
-    policy.completeHdrinclId(pkt_buf[14..][0..pkt.len], src, if (policy.needsIdent(pkt)) takeIdent() else 0);
+    policy.completeHdrinclId(pkt_buf[14..][0..pkt.len], src, if (policy.needsIdent(pkt)) ipid.globalNonzero(dst, src, pkt[9]) else 0);
     const frame_len = eth.buildFrame(&pkt_buf, dst_mac, our_mac, eth.ETHERTYPE_IPV4, @intCast(pkt.len));
     if (wait_hop) |hop| {
         arp.queueFrame(hop, &pkt_buf, frame_len);
