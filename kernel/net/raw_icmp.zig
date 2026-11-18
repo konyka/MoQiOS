@@ -439,7 +439,7 @@ pub fn send(bound: [4]u8, dst: [4]u8, protocol: u8, msg: []const u8, ip: ipo.IpO
     var pkt: [FRAME_BUF_LEN]u8 = @splat(0);
     @memcpy(pkt[34..][0..msg.len], msg);
     ipv4.buildHeader(pkt[14..].ptr, src, dst, protocol, @intCast(msg.len));
-    ipv4.setIdent(pkt[14..].ptr, ipid.global(dst, src, protocol), true);
+    ipv4.setIdent(pkt[14..].ptr, ipid.unowned(dst, src, protocol, ip.pmtudisc), ipo.datagramDf(ip.pmtudisc));
     if (ipo.ipv4NeedsPatch(ip)) ipo.patchIpv4(pkt[14..][0..20], ip, ipv4.checksum);
     const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, @intCast(20 + msg.len));
     if (wait_hop) |hop| {

@@ -205,6 +205,7 @@ pub const route4_policy = @import("net/route4_policy.zig");
 pub const ping_policy = @import("net/ping_policy.zig");
 pub const raw_icmp_policy = @import("net/raw_icmp_policy.zig");
 pub const ipid_policy = @import("net/ipid_policy.zig");
+pub const ipid_source = @embedFile("net/ipid.zig");
 pub const raw_icmp_source = @embedFile("net/raw_icmp.zig");
 pub const arp_policy = @import("net/arp_policy.zig");
 pub const devconf_policy = @import("net/devconf_policy.zig");

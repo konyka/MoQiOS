@@ -3,6 +3,7 @@ const netif = @import("netif.zig");
 const eth = @import("eth.zig");
 const ipv4 = @import("ipv4.zig");
 const ipid = @import("ipid.zig");
+const ipo = @import("ip_opt_policy.zig");
 const arp = @import("arp.zig");
 const bo = @import("../lib/byte_order.zig");
 const echo_policy = @import("icmp_echo_policy.zig");
@@ -78,7 +79,7 @@ pub fn parseFragNeeded(data: [*]const u8, len: u32) ?FragNeededMsg {
 /// `dst`: routed like a UDP datagram (lo for this host's addresses, else the next hop's MAC; while that is unknown the frame waits
 /// for ARP in arp.queueFrame and the send succeeds, as Linux queues it on the neighbour). Returns 0, or -EMSGSIZE past the path
 /// MTU, -ENOBUFS when the device drops it.
-pub fn sendFrom(bound: [4]u8, dst: [4]u8, msg: []const u8) i64 {
+pub fn sendFrom(bound: [4]u8, dst: [4]u8, msg: []const u8, mode: u8) i64 {
     if (msg.len + ipv4.HEADER_LEN > ipv4.getSendMtu(dst)) return -90;
     const our_mac = netif.getMac();
     const via_lo = netif.isLocal4(dst);
@@ -94,7 +95,7 @@ pub fn sendFrom(bound: [4]u8, dst: [4]u8, msg: []const u8) i64 {
     var pkt: [1518]u8 = @splat(0);
     @memcpy(pkt[34..][0..msg.len], msg);
     ipv4.buildHeader(pkt[14..].ptr, src, dst, ipv4.PROTO_ICMP, @intCast(msg.len));
-    ipv4.setIdent(pkt[14..].ptr, ipid.global(dst, src, ipv4.PROTO_ICMP), true);
+    ipv4.setIdent(pkt[14..].ptr, ipid.unowned(dst, src, ipv4.PROTO_ICMP, mode), ipo.datagramDf(mode));
     const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, @intCast(20 + msg.len));
     if (wait_hop) |hop| {
         arp.queueFrame(hop, &pkt, frame_len);

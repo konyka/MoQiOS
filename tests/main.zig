@@ -15999,10 +15999,8 @@ test "IPv4 id and DF of kernel-built headers (hello418): per-connection ids, zer
     try std.testing.expect(ip.tcpUsesSocketId(0x11));
     try std.testing.expect(ip.tcpUsesSocketId(0x18));
     const ts = kt.tcp_source;
-    try std.testing.expect(std.mem.indexOf(u8, ts, "    if (ipid_policy.tcpUsesSocketId(flags)) ipv4.setIdent(send_pkt[14..].ptr, ipid_policy.take(&tcb.ip_id), true);\n") != null);
     try std.testing.expect(std.mem.count(u8, ts, ".ip_id = ipid.initial();") >= 5);
     const us = kt.udp_source;
-    try std.testing.expect(std.mem.indexOf(u8, us, "    ipv4.setIdent(send_pkt[14..].ptr, takePortIpid(src_key, dst_ip, our_ip), true);\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    port_ipid[idx] = 0;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    if (port_peer[i] == 0) return null;\n    return ipid_policy.take(&port_ipid[i]);\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    port_ipid[i] = ipid.initial();\n") != null);
@@ -16012,8 +16010,48 @@ test "IPv4 id and DF of kernel-built headers (hello418): per-connection ids, zer
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, is, "ipv4.setIdent("));
     try std.testing.expect(std.mem.indexOf(u8, is, "    ipv4.setIdent(o + 14, ipid.global(reply_dst_ip, reply_src_ip, ipv4.PROTO_ICMP), false);\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, is, "    ipv4.setIdent(pkt[14..].ptr, ipid.global(src_ip, dst_ip, ipv4.PROTO_ICMP), false);\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, is, "    ipv4.setIdent(pkt[14..].ptr, ipid.global(dst, src, ipv4.PROTO_ICMP), true);\n") != null);
     const rs = kt.raw_icmp_source;
-    try std.testing.expect(std.mem.indexOf(u8, rs, "    ipv4.setIdent(pkt[14..].ptr, ipid.global(dst, src, protocol), true);\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, rs, "var hdrincl_ident") == null);
+}
+
+test "IP_MTU_DISCOVER (hello419): values 0..5, default WANT, the DF bit and whether an unowned datagram is numbered" {
+    const p = kt.ip_opt_policy;
+    const ip = kt.ipid_policy;
+    const none: p.IpOpts = .{};
+    try std.testing.expectEqual(@as(?i32, 1), p.getValue(none, p.SOL_IP, p.IP_MTU_DISCOVER));
+    var v: i32 = 0;
+    while (v <= 5) : (v += 1) {
+        const r = p.applySet(none, p.SOL_IP, p.IP_MTU_DISCOVER, std.mem.asBytes(&v));
+        try std.testing.expect(r == .ok);
+        try std.testing.expectEqual(@as(?i32, v), p.getValue(r.ok, p.SOL_IP, p.IP_MTU_DISCOVER));
+    }
+    for ([_]i32{ -1, 6, 100 }) |bad| {
+        const r = p.applySet(none, p.SOL_IP, p.IP_MTU_DISCOVER, std.mem.asBytes(&bad));
+        try std.testing.expectEqual(@as(i64, -22), r.err);
+    }
+    const one_byte = [1]u8{2};
+    try std.testing.expectEqual(@as(u8, 2), p.applySet(none, p.SOL_IP, p.IP_MTU_DISCOVER, &one_byte).ok.pmtudisc);
+    // __ip_make_skb: a datagram (UDP, raw, ping) has DF under WANT, DO and PROBE; ip_queue_xmit: a TCP segment only under WANT and DO
+    // (ip_dont_fragment).
+    const dgram = [6]bool{ false, true, true, true, false, false };
+    const stream = [6]bool{ false, true, true, false, false, false };
+    // ip_sk_ignore_df: DONT, WANT and OMIT let the stack fragment, so ip_select_ident_segs numbers a datagram no socket owns even with
+    // DF; under DO, PROBE and INTERFACE a DF datagram keeps id 0, one without DF is numbered.
+    const numbered = [6]bool{ true, true, false, false, true, true };
+    for (0..6) |m| {
+        const mode: u8 = @intCast(m);
+        try std.testing.expectEqual(dgram[m], p.datagramDf(mode));
+        try std.testing.expectEqual(stream[m], p.streamDf(mode));
+        try std.testing.expectEqual(numbered[m], ip.numbersUnowned(p.datagramDf(mode), p.ignoreDf(mode)));
+    }
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "    if (ipid_policy.tcpUsesSocketId(flags)) ipv4.setIdent(send_pkt[14..].ptr, ipid_policy.take(&tcb.ip_id), ip_opt_policy.streamDf(tcb.options.ip.pmtudisc));\n") != null);
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "    ipv4.setIdent(send_pkt[14..].ptr, takePortIpid(src_key, dst_ip, our_ip, opts4.pmtudisc), ip_opt_policy.datagramDf(opts4.pmtudisc));\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.ipid_source, "pub fn unowned(daddr: [4]u8, saddr: [4]u8, protocol: u8, mode: u8) u16 {") != null);
+    const rs = kt.raw_icmp_source;
+    try std.testing.expect(std.mem.indexOf(u8, rs, "    ipv4.setIdent(pkt[14..].ptr, ipid.unowned(dst, src, protocol, ip.pmtudisc), ipo.datagramDf(ip.pmtudisc));\n") != null);
+    const is = kt.icmp_source;
+    try std.testing.expect(std.mem.indexOf(u8, is, "pub fn sendFrom(bound: [4]u8, dst: [4]u8, msg: []const u8, mode: u8) i64 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, is, "    ipv4.setIdent(pkt[14..].ptr, ipid.unowned(dst, src, ipv4.PROTO_ICMP, mode), ipo.datagramDf(mode));\n") != null);
 }

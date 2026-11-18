@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello418`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello419`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -413,6 +413,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello416 | TCP_NOTSENT_LOWAT：读回值（默认 0，设 4096、-5、0 原样读回，optlen 2 是 EINVAL）（V）；对端不读、有 u 字节未发出时，不设选项 POLLOUT，设 1024 时没有 POLLOUT 且非阻塞 send 100 是 EAGAIN，设 4u 有、2u 没有、2u+1 有（P）；设 1024 加 SO_SNDTIMEO 300 ms 时阻塞 send 约 300 ms 后 EAGAIN（B）；对端读空后没有未发出字节，POLLOUT 恢复，阻塞 send 3000 全部写入（W）；监听者设 777 时 accept 出来的连接读回 777（A） |
 | hello417 | TCP_LINGER2：读回值（默认 60，设 5、0、200、120、-1、-7、1 读回 5、60、120、120、-1、-1、1，optlen 2 是 EINVAL）（V）；linger2 1 的孤儿 300 ms 时还在，3 秒后服务端的 FIN 收到 RST、SO_ERROR 为 ECONNRESET、recv 读到 EOF（T）；不设选项时孤儿 3 秒后还在（D）；linger2 -1 时从 FIN_WAIT1 或 FIN_WAIT2 关闭，对端在 CLOSE_WAIT 看到 EPIPE（N）；没 close 的半关闭连接设 linger2 1，3 秒后仍能收到数据（H）；监听者设 7 时 accept 出来的连接读回 7（A） |
 | hello418 | 内核写的 IPv4 头的 id 和 DF（协议 17、6、1 的 raw 套接字抓 loopback 包）：未 connect 的 UDP 套接字两个数据报 id 不同、带 DF（N）；已 connect 的 UDP 套接字三个数据报 id 依次加 1、带 DF（U）；另一个已 connect 的套接字有自己的起点（R）；SYN-ACK 和对关闭端口 SYN 的 RST 是 id 0、带 DF（S）；TCP 三个数据段 id 依次加 1、带 DF（T）；两个 port unreachable 不带 DF、id 不同（E）；raw 发的 echo 请求带 DF，内核回的 echo reply 不带（P） |
+| hello419 | IP_MTU_DISCOVER：TCP、UDP、raw 默认读 1，0–5 原样保存和读回，-1 和 6 是 EINVAL（V）；未 connect 的 UDP 在模式 1、2、3 带 DF，2、3 下 id 为 0，其余模式编号（U）；raw（协议 17）在模式 1、2、3 带 DF（R）；TCP 数据段只在模式 1、2 带 DF（T）；监听者设 2，accept 出的连接读回 2（A） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

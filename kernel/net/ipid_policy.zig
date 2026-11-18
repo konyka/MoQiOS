@@ -42,6 +42,12 @@ pub fn bucket(daddr: [4]u8, saddr: [4]u8, protocol: u8, secret: u32) u32 {
     return h % BUCKETS;
 }
 
+/// ip_select_ident_segs for a datagram no connected socket numbers: one with DF that the stack may not fragment keeps id 0; any other
+/// takes a value from the shared counters.
+pub fn numbersUnowned(df: bool, ignore_df: bool) bool {
+    return !df or ignore_df;
+}
+
 /// A TCP segment with these `flags` takes the connection's id; only a SYN-ACK (sent like ip_build_and_send_pkt, DF and id 0) does not.
 pub fn tcpUsesSocketId(flags: u8) bool {
     return flags & 0x12 != 0x12;

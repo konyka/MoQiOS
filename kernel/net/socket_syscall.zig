@@ -410,7 +410,8 @@ fn pingSend(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr
     // An ICMP error a connected socket took fails this send, once (sock_alloc_send_skb → sock_error).
     const pending = udp.takePendingError(d.udpKey());
     if (pending != 0) return -@as(i64, pending);
-    const sent = @import("icmp.zig").sendFrom(d.udp_local_ip, dst, msg[0..payload.len]);
+    const ping_ip: @import("ip_opt_policy.zig").IpOpts = if (udp.getPortOpts(d.udpKey())) |po| po.ip else .{};
+    const sent = @import("icmp.zig").sendFrom(d.udp_local_ip, dst, msg[0..payload.len], ping_ip.pmtudisc);
     return if (sent < 0) sent else @intCast(payload.len);
 }
 

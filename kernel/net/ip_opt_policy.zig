@@ -10,6 +10,14 @@ pub const IP_TOS: u64 = 1;
 pub const IP_TTL: u64 = 2;
 /// The caller writes the IPv4 header of a raw socket's sends (Linux raw_send_hdrinc).
 pub const IP_HDRINCL: u64 = 3;
+/// Path MTU discovery mode (Linux inet->pmtudisc): what sets DF and whether the stack may fragment.
+pub const IP_MTU_DISCOVER: u64 = 10;
+pub const PMTUDISC_DONT: u8 = 0;
+pub const PMTUDISC_WANT: u8 = 1;
+pub const PMTUDISC_DO: u8 = 2;
+pub const PMTUDISC_PROBE: u8 = 3;
+pub const PMTUDISC_INTERFACE: u8 = 4;
+pub const PMTUDISC_OMIT: u8 = 5;
 pub const IP_MULTICAST_IF: u64 = 32;
 pub const IP_MULTICAST_TTL: u64 = 33;
 pub const IP_MULTICAST_LOOP: u64 = 34;
@@ -51,6 +59,8 @@ pub const IpOpts = struct {
     mc4_index: u8 = 0,
     /// IP_HDRINCL: only a raw socket may set it; any other socket reads it as 0.
     hdrincl: bool = false,
+    /// IP_MTU_DISCOVER, IP_PMTUDISC_WANT unless set (inet_create with ip_no_pmtu_disc 0).
+    pmtudisc: u8 = PMTUDISC_WANT,
 };
 
 pub const Family = enum { v4, v6 };
@@ -110,6 +120,11 @@ pub fn applySet(cur: IpOpts, level: u64, optname: u64, val: []const u8) SetResul
             },
             IP_MULTICAST_LOOP => o.mc4_loop = v != 0,
             IP_HDRINCL => o.hdrincl = v != 0,
+            // ip_sock_set_mtu_discover: DONT..OMIT, anything else EINVAL.
+            IP_MTU_DISCOVER => {
+                if (v < PMTUDISC_DONT or v > PMTUDISC_OMIT) return .{ .err = -22 };
+                o.pmtudisc = @intCast(v);
+            },
             IP_MULTICAST_ALL => {
                 if (v != 0 and v != 1) return .{ .err = -22 };
                 o.mc4_all = v == 1;
@@ -225,6 +240,7 @@ pub fn getValue(o: IpOpts, level: u64, optname: u64) ?i32 {
             IP_TTL => if (o.ttl == 0) DEFAULT_TTL else o.ttl,
             IP_TOS => o.tos,
             IP_HDRINCL => @intFromBool(o.hdrincl),
+            IP_MTU_DISCOVER => o.pmtudisc,
             IP_MULTICAST_TTL => o.mc4_ttl,
             IP_MULTICAST_LOOP => @intFromBool(o.mc4_loop),
             IP_MULTICAST_ALL => @intFromBool(o.mc4_all),
@@ -243,6 +259,22 @@ pub fn getValue(o: IpOpts, level: u64, optname: u64) ?i32 {
         },
         else => null,
     };
+}
+
+/// A datagram (UDP, ping, raw) of a socket in IP_MTU_DISCOVER `mode` carries DF (__ip_make_skb: DO and PROBE always, WANT while
+/// it fits the route's MTU, which every datagram sent here does; measured in hello419).
+pub fn datagramDf(mode: u8) bool {
+    return mode == PMTUDISC_WANT or mode == PMTUDISC_DO or mode == PMTUDISC_PROBE;
+}
+
+/// A TCP segment carries DF (ip_queue_xmit → ip_dont_fragment: DO, and WANT unless the route's MTU is locked).
+pub fn streamDf(mode: u8) bool {
+    return mode == PMTUDISC_WANT or mode == PMTUDISC_DO;
+}
+
+/// ip_sk_ignore_df: the stack may still fragment the socket's datagrams (DONT, WANT, OMIT).
+pub fn ignoreDf(mode: u8) bool {
+    return mode < PMTUDISC_DO or mode == PMTUDISC_OMIT;
 }
 
 /// The TTL / TOS to put in an IPv4 header (defaults when unset).

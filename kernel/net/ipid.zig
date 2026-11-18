@@ -1,6 +1,7 @@
 //! IPv4 id state (decisions in ipid_policy.zig): random per-socket starting values and the hashed counters of packets no socket owns.
 
 const policy = @import("ipid_policy.zig");
+const ipo = @import("ip_opt_policy.zig");
 const random = @import("../drivers/random.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
@@ -38,6 +39,12 @@ pub fn global(daddr: [4]u8, saddr: [4]u8, protocol: u8) u16 {
     random.getRandomBytes(@ptrCast(&rand), @sizeOf(u32));
     const now: u32 = @truncate(@import("../arch/arch.zig").interrupts.getTickCount());
     return policy.reserve(&buckets[b], &stamps[b], now, rand);
+}
+
+/// The id of a datagram no connected socket numbers, sent by a socket in IP_MTU_DISCOVER `mode` (0 or a shared counter's value).
+pub fn unowned(daddr: [4]u8, saddr: [4]u8, protocol: u8, mode: u8) u16 {
+    if (!policy.numbersUnowned(ipo.datagramDf(mode), ipo.ignoreDf(mode))) return 0;
+    return global(daddr, saddr, protocol);
 }
 
 /// global, but never 0: an IP_HDRINCL header whose id is 0 asked the kernel to choose one, and a chosen 0 would read as unchosen.

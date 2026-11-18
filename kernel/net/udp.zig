@@ -326,9 +326,9 @@ pub fn notifyPingError6(ident: u16, err: i32) void {
 /// swap-remove reshuffles slots, so an index computed under a previous lock
 /// hold can name a different port's queue by the time it is used (J1).
 /// The id of the next datagram the socket with registry key `key` sends: a connected socket's own counter, else one from the hashed
-/// counters (ip_select_ident_segs uses inet_id only when inet_daddr is set).
-fn takePortIpid(key: u32, dst: [4]u8, src: [4]u8) u16 {
-    return takeSocketIpid(key) orelse ipid.global(dst, src, ipv4.PROTO_UDP);
+/// counters, or 0 under DF when the stack may not fragment (ip_select_ident_segs uses inet_id only when inet_daddr is set).
+fn takePortIpid(key: u32, dst: [4]u8, src: [4]u8, mode: u8) u16 {
+    return takeSocketIpid(key) orelse ipid.unowned(dst, src, ipv4.PROTO_UDP, mode);
 }
 
 fn takeSocketIpid(key: u32) ?u16 {
@@ -1206,7 +1206,7 @@ pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, data
 
     // Build IPv4 header at offset 14 (after ethernet header)
     ipv4.buildHeader(send_pkt[14..].ptr, our_ip, dst_ip, ipv4.PROTO_UDP, udp_total);
-    ipv4.setIdent(send_pkt[14..].ptr, takePortIpid(src_key, dst_ip, our_ip), true);
+    ipv4.setIdent(send_pkt[14..].ptr, takePortIpid(src_key, dst_ip, our_ip, opts4.pmtudisc), ip_opt_policy.datagramDf(opts4.pmtudisc));
     if (ip_opt_policy.ipv4NeedsPatch(opts4)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], opts4, ipv4.checksum);
     // A datagram to a group carries IP_MULTICAST_TTL (default 1), not the unicast TTL.
     if (group) ip_opt_policy.setTtl4(send_pkt[14..][0..20], opts4.mc4_ttl, ipv4.checksum);

@@ -1515,7 +1515,7 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16, 
     const csum = tcpChecksum(our_ip, tcb.remote_ip, send_pkt[tcp_off..].ptr, tcp_total);
     bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
     ipv4.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip, ipv4.PROTO_TCP, tcp_total);
-    if (ipid_policy.tcpUsesSocketId(flags)) ipv4.setIdent(send_pkt[14..].ptr, ipid_policy.take(&tcb.ip_id), true);
+    if (ipid_policy.tcpUsesSocketId(flags)) ipv4.setIdent(send_pkt[14..].ptr, ipid_policy.take(&tcb.ip_id), ip_opt_policy.streamDf(tcb.options.ip.pmtudisc));
     // IP_TTL / IP_TOS (applied before ECN, which owns the low two TOS bits).
     if (ip_opt_policy.ipv4NeedsPatch(tcb.options.ip)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], tcb.options.ip, ipv4.checksum);
     // SK-131/143: ECT(1) for AccECN/L4S, else ECT(0) for classic ECN.
