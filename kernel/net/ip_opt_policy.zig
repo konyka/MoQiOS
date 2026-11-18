@@ -11,7 +11,11 @@ pub const IP_TTL: u64 = 2;
 /// The caller writes the IPv4 header of a raw socket's sends (Linux raw_send_hdrinc).
 pub const IP_HDRINCL: u64 = 3;
 /// Path MTU discovery mode (Linux inet->pmtudisc): what sets DF and whether the stack may fragment.
+pub const IP_PKTINFO: u64 = 8;
 pub const IP_MTU_DISCOVER: u64 = 10;
+/// Receive flags: recvmsg then carries an IP_TTL / IP_TOS control message (Linux inet IP_CMSG_TTL / IP_CMSG_TOS).
+pub const IP_RECVTTL: u64 = 12;
+pub const IP_RECVTOS: u64 = 13;
 pub const PMTUDISC_DONT: u8 = 0;
 pub const PMTUDISC_WANT: u8 = 1;
 pub const PMTUDISC_DO: u8 = 2;
@@ -61,6 +65,10 @@ pub const IpOpts = struct {
     hdrincl: bool = false,
     /// IP_MTU_DISCOVER, IP_PMTUDISC_WANT unless set (inet_create with ip_no_pmtu_disc 0).
     pmtudisc: u8 = PMTUDISC_WANT,
+    /// IP_PKTINFO, IP_RECVTTL, IP_RECVTOS: which control messages a received IPv4 datagram brings (ip_cmsg_recv_offset).
+    pktinfo: bool = false,
+    recvttl: bool = false,
+    recvtos: bool = false,
 };
 
 pub const Family = enum { v4, v6 };
@@ -120,6 +128,9 @@ pub fn applySet(cur: IpOpts, level: u64, optname: u64, val: []const u8) SetResul
             },
             IP_MULTICAST_LOOP => o.mc4_loop = v != 0,
             IP_HDRINCL => o.hdrincl = v != 0,
+            IP_PKTINFO => o.pktinfo = v != 0,
+            IP_RECVTTL => o.recvttl = v != 0,
+            IP_RECVTOS => o.recvtos = v != 0,
             // ip_sock_set_mtu_discover: DONT..OMIT, anything else EINVAL.
             IP_MTU_DISCOVER => {
                 if (v < PMTUDISC_DONT or v > PMTUDISC_OMIT) return .{ .err = -22 };
@@ -241,6 +252,9 @@ pub fn getValue(o: IpOpts, level: u64, optname: u64) ?i32 {
             IP_TOS => o.tos,
             IP_HDRINCL => @intFromBool(o.hdrincl),
             IP_MTU_DISCOVER => o.pmtudisc,
+            IP_PKTINFO => @intFromBool(o.pktinfo),
+            IP_RECVTTL => @intFromBool(o.recvttl),
+            IP_RECVTOS => @intFromBool(o.recvtos),
             IP_MULTICAST_TTL => o.mc4_ttl,
             IP_MULTICAST_LOOP => @intFromBool(o.mc4_loop),
             IP_MULTICAST_ALL => @intFromBool(o.mc4_all),

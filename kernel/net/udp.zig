@@ -12,6 +12,7 @@ const ndp = @import("ndp.zig");
 const icmpv6 = @import("icmpv6.zig");
 const udp_util = @import("udp_util.zig");
 const ip_opt_policy = @import("ip_opt_policy.zig");
+const ip_cmsg_policy = @import("ip_cmsg_policy.zig");
 const mcast = @import("mcast_policy.zig");
 const bo = @import("../lib/byte_order.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
@@ -32,6 +33,8 @@ const UdpEntry = struct {
     data: [MAX_UDP_PAYLOAD]u8,
     valid: bool,
     is_v6: bool,
+    /// Interface, header destination, TTL and TOS of an IPv4 datagram (IP_PKTINFO / IP_RECVTTL / IP_RECVTOS).
+    meta: ip_cmsg_policy.RecvInfo = .{},
 };
 
 /// Socket key per slot: the local port in the low 16 bits and a discriminator in the high 16 bits. The discriminator is 0 for the first
@@ -509,6 +512,7 @@ pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8) vo
                 e.data_len = @intCast(actual);
                 @memcpy(e.data[0..actual], msg[0..actual]);
                 e.is_v6 = false;
+                e.meta = .{};
                 e.valid = true;
                 notify_key = ports[i];
                 break;
@@ -549,6 +553,7 @@ pub fn deliverPing6(ident: u16, src_ip: [16]u8, dst_ip: [16]u8, msg: []const u8)
             e.data_len = @intCast(actual);
             @memcpy(e.data[0..actual], msg[0..actual]);
             e.is_v6 = true;
+            e.meta = .{};
             e.valid = true;
             notify_key = ports[i];
             break;
@@ -824,7 +829,7 @@ pub fn nextDatagramLen(port: u32, is_v6: bool) u32 {
 /// Sockets sharing the port (SO_REUSEADDR / SO_REUSEPORT) are told apart by udp_port_policy.pickReceiver.
 /// Candidates are the sockets bound to the destination address (`dst_ip` for IPv4, `dst_ip6` for an IPv6 datagram to an IPv6
 /// socket), else the wildcard ones, each preferring the datagram's address family. Returns whether any socket claims the datagram (false: ICMP port unreachable).
-fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, dst_ip: [4]u8, dst_ip6: [16]u8, payload: []const u8, is_v6: bool) bool {
+fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, dst_ip: [4]u8, dst_ip6: [16]u8, payload: []const u8, is_v6: bool, meta: ip_cmsg_policy.RecvInfo) bool {
     var notify_key: u32 = 0;
     var claimed = false;
     const was_inserted = blk: {
@@ -865,6 +870,7 @@ fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, dst_ip: [4]u
                 queues[port_idx][i].data_len = @intCast(actual);
                 @memcpy(queues[port_idx][i].data[0..actual], payload[0..actual]);
                 queues[port_idx][i].is_v6 = is_v6;
+                queues[port_idx][i].meta = meta;
                 queues[port_idx][i].valid = true;
                 notify_key = ports[port_idx];
                 break :blk true;
@@ -911,6 +917,7 @@ fn enqueueMcast(port: u16, src_ip: [16]u8, src_port: u16, group: [16]u8, payload
                 e.data_len = @intCast(actual);
                 @memcpy(e.data[0..actual], payload[0..actual]);
                 e.is_v6 = true;
+                e.meta = .{};
                 e.valid = true;
                 keys[n] = ports[i];
                 n += 1;
@@ -927,7 +934,7 @@ fn enqueueMcast(port: u16, src_ip: [16]u8, src_port: u16, group: [16]u8, payload
 /// The IPv4 counterpart of enqueueMcast (Linux __udp4_lib_mcast_deliver, ip_check_mc_rcu): a copy to every IPv4 socket on the port
 /// that socketMatches4 and socketAccepts4, while this host is a member of the group on `ifindex`, the interface the datagram arrived
 /// on, or it is 224.0.0.1.
-fn enqueueMcast4(port: u16, src_ip: [16]u8, src_port: u16, group: [4]u8, payload: []const u8, ifindex: u8) void {
+fn enqueueMcast4(port: u16, src_ip: [16]u8, src_port: u16, group: [4]u8, payload: []const u8, ifindex: u8, meta: ip_cmsg_policy.RecvInfo) void {
     var keys: [MAX_PORTS]u32 = undefined;
     var n: usize = 0;
     {
@@ -949,6 +956,7 @@ fn enqueueMcast4(port: u16, src_ip: [16]u8, src_port: u16, group: [4]u8, payload
                 e.data_len = @intCast(actual);
                 @memcpy(e.data[0..actual], payload[0..actual]);
                 e.is_v6 = false;
+                e.meta = meta;
                 e.valid = true;
                 keys[n] = ports[i];
                 n += 1;
@@ -968,6 +976,12 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
 
 /// handlePacket for a datagram that arrived on interface `ifindex` (1 lo, 2 the NIC).
 pub fn handlePacketOn(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, ifindex: u8) void {
+    handlePacketMeta(src_ip, dst_ip, data, len, ifindex, ipv4.DEFAULT_RX_TTL, 0);
+}
+
+/// handlePacketOn with the IP header's TTL and TOS, kept with the datagram for IP_RECVTTL / IP_RECVTOS.
+pub fn handlePacketMeta(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, ifindex: u8, ttl: u8, tos: u8) void {
+    const meta: ip_cmsg_policy.RecvInfo = .{ .ifindex = ifindex, .dst = dst_ip, .ttl = ttl, .tos = tos };
     const hdr = udp_util.parseHeader(data, len) orelse return;
 
     // RFC 768: checksum 0 means "no checksum" for IPv4 UDP; verify when present.
@@ -983,10 +997,10 @@ pub fn handlePacketOn(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32,
     var ip16: [16]u8 = @splat(0);
     @memcpy(ip16[0..4], &src_ip);
     if (mcast.isMulticast4(dst_ip)) {
-        enqueueMcast4(hdr.dst_port, ip16, hdr.src_port, dst_ip, data[8..][0..actual_payload], ifindex);
+        enqueueMcast4(hdr.dst_port, ip16, hdr.src_port, dst_ip, data[8..][0..actual_payload], ifindex, meta);
         return;
     }
-    const bound = enqueue(hdr.dst_port, ip16, hdr.src_port, hdr.dst_port, dst_ip, @splat(0), data[8..][0..actual_payload], false);
+    const bound = enqueue(hdr.dst_port, ip16, hdr.src_port, hdr.dst_port, dst_ip, @splat(0), data[8..][0..actual_payload], false, meta);
     const unreach = @import("icmp_unreach_policy.zig");
     if (unreach.shouldReply(netif.isLocal4(src_ip) and netif.isLocal4(dst_ip), false, bound)) {
         sendPortUnreachable(src_ip, dst_ip, data, hdr.udp_len);
@@ -1037,7 +1051,7 @@ pub fn handlePacketV6On(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: 
         enqueueMcast(hdr.dst_port, src_ip, hdr.src_port, dst_ip, data[8..][0..actual_payload], ifindex);
         return;
     }
-    const bound = enqueue(hdr.dst_port, src_ip, hdr.src_port, hdr.dst_port, .{ 0, 0, 0, 0 }, dst_ip, data[8..][0..actual_payload], true);
+    const bound = enqueue(hdr.dst_port, src_ip, hdr.src_port, hdr.dst_port, .{ 0, 0, 0, 0 }, dst_ip, data[8..][0..actual_payload], true, .{});
     if (@import("icmp_unreach_policy.zig").shouldReplyV6(netif.isLoopbackV6(src_ip), netif.isLoopbackV6(dst_ip), bound)) {
         sendPortUnreachableV6(src_ip, dst_ip, data, hdr.udp_len);
     }
@@ -1074,6 +1088,12 @@ pub fn recvFrom(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, out
 /// `out_full_len` always receives the untruncated datagram length so the
 /// caller can implement MSG_TRUNC.
 pub fn recvFromEx(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, out_src_port: *u16, out_full_len: *u16, peek: bool) i64 {
+    var meta: ip_cmsg_policy.RecvInfo = .{};
+    return recvFromMeta(port, out_buf, out_len, out_src_ip, out_src_port, out_full_len, peek, &meta);
+}
+
+/// recvFromEx that also returns what the datagram brought for the receive control messages.
+pub fn recvFromMeta(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, out_src_port: *u16, out_full_len: *u16, peek: bool, out_meta: *ip_cmsg_policy.RecvInfo) i64 {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
 
@@ -1087,6 +1107,7 @@ pub fn recvFromEx(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8, o
             out_src_ip.* = entry.src_ip[0..4].*;
             out_src_port.* = entry.src_port;
             out_full_len.* = entry.data_len;
+            out_meta.* = entry.meta;
             if (!peek) entry.valid = false;
             return n;
         }

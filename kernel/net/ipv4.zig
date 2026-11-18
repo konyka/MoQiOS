@@ -25,6 +25,9 @@ pub const MAX_PMTU_ENTRIES: u32 = 8;
 /// IPv4 header (no options) for SMSS (SK-101).
 pub const HEADER_LEN: u16 = 20;
 
+/// TTL recorded for a datagram handed to UDP without its IP header (in-kernel callers): what this stack sends by default.
+pub const DEFAULT_RX_TTL: u8 = 64;
+
 pub const Ipv4Info = struct {
     src_ip: [4]u8,
     dst_ip: [4]u8,
@@ -33,6 +36,9 @@ pub const Ipv4Info = struct {
     payload_len: u16,
     /// True when TOS ECN field is Congestion Experienced (SK-131).
     ecn_ce: bool = false,
+    /// The header's TTL and TOS byte, for IP_RECVTTL / IP_RECVTOS.
+    ttl: u8 = 0,
+    tos: u8 = 0,
 };
 
 pub fn buildHeader(buf: [*]u8, src_ip: [4]u8, dst_ip: [4]u8, protocol: u8, payload_len: u16) void {
@@ -137,6 +143,8 @@ pub fn parseHeader(data: [*]const u8, frame_len: ?u32) ?Ipv4Info {
         .payload_offset = ihl,
         .payload_len = payload_len,
         .ecn_ce = (data[1] & 0x03) == ECN_CE,
+        .ttl = data[8],
+        .tos = data[1],
     };
 }
 

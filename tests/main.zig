@@ -4626,7 +4626,7 @@ test "IPv4 UDP multicast: IP_MULTICAST_* options, group membership, member-only 
     try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, tp.sourceAddr(g1, .{ 127, 0, 0, 1 }, our));
 
     const us = kt.udp_source;
-    try std.testing.expect(std.mem.indexOf(u8, us, "    if (mcast.isMulticast4(dst_ip)) {\n        enqueueMcast4(hdr.dst_port, ip16, hdr.src_port, dst_ip, data[8..][0..actual_payload], ifindex);\n        return;\n    }\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    if (mcast.isMulticast4(dst_ip)) {\n        enqueueMcast4(hdr.dst_port, ip16, hdr.src_port, dst_ip, data[8..][0..actual_payload], ifindex, meta);\n        return;\n    }\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "        if (!mcast.alwaysJoined4(group) and !hostJoined4Locked(group, ifindex)) return;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "            if (!mcast.socketAccepts4(&port_mc4[i], port_opts[i].ip.mc4_all, group, ifindex)) continue;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    if (group) ip_opt_policy.setTtl4(send_pkt[14..][0..20], opts4.mc4_ttl, ipv4.checksum);\n") != null);
@@ -4690,7 +4690,7 @@ test "multicast outgoing interface: IP_MULTICAST_IF lo sends out lo only, IPV6_M
     const ss = kt.socket_syscall_source;
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "const src_key = "));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "const unreach6 = bind_addr_policy.routeErrno6(dst6, oif6);\n"));
-    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketOn(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, ifindex);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketMeta(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, ifindex, info.ttl, info.tos);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.lo_source, "net_mod.handleRxPacketOn(&buf, n, ifindex);") != null);
 }
 
@@ -5294,7 +5294,7 @@ test "an IPv6 UDP socket's bound address takes part in port conflicts and receiv
     try std.testing.expect(std.mem.indexOf(u8, us, "        if (port_v6[j] and port_v6[oi] and !@import(\"tcp_port_policy.zig\").addrsConflict6(addr6, port_local_ip6[j])) continue;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "                const takes = if (is_v6 and port_v6[i])\n                    @import(\"tcp_port_policy.zig\").listenerTakes6(port_local_ip6[i], dst_ip6, r[0])\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "            port_local_ip6[i] = port_local_ip6[num_ports];\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "hdr.dst_port, .{ 0, 0, 0, 0 }, dst_ip, data[8..][0..actual_payload], true);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "hdr.dst_port, .{ 0, 0, 0, 0 }, dst_ip, data[8..][0..actual_payload], true, .{});") != null);
     const p = kt.tcp_port_policy;
     const wild: [16]u8 = @splat(0);
     var loop6 = wild;
@@ -5411,7 +5411,7 @@ test "UDP sockets on one port are told apart by their bound IPv4 address: bind c
     try std.testing.expect(std.mem.indexOf(u8, us, "    port_opts[ni] = mine;\n    port_local_ip[ni] = addr;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "            port_local_ip[i] = port_local_ip[num_ports];\n            port_local_ip[num_ports] = .{ 0, 0, 0, 0 };\n            port_local_ip6[i] = port_local_ip6[num_ports];\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "                else\n                    @import(\"tcp_port_policy.zig\").listenerTakes(port_local_ip[i], dst_ip, r[0]);\n                if (!takes) continue;\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "    const bound = enqueue(hdr.dst_port, ip16, hdr.src_port, hdr.dst_port, dst_ip, @splat(0), data[8..][0..actual_payload], false);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    const bound = enqueue(hdr.dst_port, ip16, hdr.src_port, hdr.dst_port, dst_ip, @splat(0), data[8..][0..actual_payload], false, meta);\n") != null);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, us, "portBound("));
     const p = kt.tcp_port_policy;
     try std.testing.expect(!p.addrsConflict(.{ 127, 0, 0, 1 }, .{ 127, 0, 0, 2 }));
@@ -16072,4 +16072,55 @@ test "IP_MTU_DISCOVER (hello419): values 0..5, default WANT, the DF bit and whet
     const is = kt.icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, is, "pub fn sendFrom(bound: [4]u8, dst: [4]u8, msg: []const u8, mode: u8) i64 {") != null);
     try std.testing.expect(std.mem.indexOf(u8, is, "    ipv4.setIdent(pkt[14..].ptr, ipid.unowned(dst, src, ipv4.PROTO_ICMP, mode), ipo.datagramDf(mode));\n") != null);
+}
+
+test "IPv4 UDP receive control messages IP_PKTINFO / IP_RECVTTL / IP_RECVTOS (hello421): Linux ip_cmsg_recv_offset, put_cmsg" {
+    const p = kt.ip_opt_policy;
+    // On/off flags: any nonzero int sets, 0 clears; getsockopt reads 0 or 1 (inet_assign_bit / inet_test_bit).
+    var o: p.IpOpts = .{};
+    try std.testing.expectEqual(@as(?i32, 0), p.getValue(o, p.SOL_IP, p.IP_PKTINFO));
+    o = p.applySet(o, p.SOL_IP, p.IP_PKTINFO, &.{ 5, 0, 0, 0 }).ok;
+    o = p.applySet(o, p.SOL_IP, p.IP_RECVTTL, &.{ 1, 0, 0, 0 }).ok;
+    try std.testing.expectEqual(@as(?i32, 1), p.getValue(o, p.SOL_IP, p.IP_PKTINFO));
+    try std.testing.expectEqual(@as(?i32, 1), p.getValue(o, p.SOL_IP, p.IP_RECVTTL));
+    try std.testing.expectEqual(@as(?i32, 0), p.getValue(o, p.SOL_IP, p.IP_RECVTOS));
+    o = p.applySet(o, p.SOL_IP, p.IP_RECVTTL, &.{ 0, 0, 0, 0 }).ok;
+    try std.testing.expectEqual(@as(?i32, 0), p.getValue(o, p.SOL_IP, p.IP_RECVTTL));
+
+    const c = kt.ip_cmsg_policy;
+    const info: c.RecvInfo = .{ .ifindex = 1, .dst = .{ 127, 0, 0, 5 }, .ttl = 33, .tos = 0x28 };
+    var out: [128]u8 = undefined;
+    // All three, in Linux order: PKTINFO (28, padded to 32), TTL (20 -> 24), TOS (17 -> 24).
+    const all = c.build(.{ .pktinfo = true, .recvttl = true, .recvtos = true }, info, 128, &out);
+    try std.testing.expectEqual(@as(usize, 80), all.written);
+    try std.testing.expect(!all.truncated);
+    try std.testing.expectEqual(@as(u64, 28), std.mem.readInt(u64, out[0..8], .little));
+    try std.testing.expectEqual(@as(i32, 8), std.mem.readInt(i32, out[12..16], .little));
+    try std.testing.expectEqual(@as(i32, 1), std.mem.readInt(i32, out[16..20], .little));
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 5, 127, 0, 0, 5 }, out[20..28]);
+    try std.testing.expectEqual(@as(u64, 20), std.mem.readInt(u64, out[32..40], .little));
+    try std.testing.expectEqual(@as(i32, 2), std.mem.readInt(i32, out[44..48], .little));
+    try std.testing.expectEqual(@as(i32, 33), std.mem.readInt(i32, out[48..52], .little));
+    try std.testing.expectEqual(@as(u64, 17), std.mem.readInt(u64, out[56..64], .little));
+    try std.testing.expectEqual(@as(i32, 1), std.mem.readInt(i32, out[68..72], .little));
+    try std.testing.expectEqual(@as(u8, 0x28), out[72]);
+    // A 40-byte buffer: PKTINFO fits; 8 bytes are left, no room for a header, so the rest is dropped with MSG_CTRUNC.
+    const cut = c.build(.{ .pktinfo = true, .recvttl = true, .recvtos = true }, info, 40, &out);
+    try std.testing.expectEqual(@as(usize, 32), cut.written);
+    // 50 bytes: the TTL message is cut to the 18 left (cmsg_len 18) and uses them up.
+    const cut2 = c.build(.{ .pktinfo = true, .recvttl = true }, info, 50, &out);
+    try std.testing.expectEqual(@as(usize, 50), cut2.written);
+    try std.testing.expect(cut2.truncated);
+    try std.testing.expectEqual(@as(u64, 18), std.mem.readInt(u64, out[32..40], .little));
+    try std.testing.expect(cut.truncated);
+    // Nothing set: nothing written, no truncation; no buffer with a flag set: MSG_CTRUNC.
+    try std.testing.expectEqual(@as(usize, 0), c.build(.{}, info, 128, &out).written);
+    try std.testing.expect(!c.build(.{}, info, 0, &out).truncated);
+    try std.testing.expect(c.build(.{ .recvtos = true }, info, 0, &out).truncated);
+
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "pub fn handlePacketMeta(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, ifindex: u8, ttl: u8, tos: u8) void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketMeta(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, ifindex, info.ttl, info.tos);") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const cm = ip_cmsg_policy.build(ip_cmsg_policy.Wanted.of(opts_ip), meta, ctl_cap, &ctl_buf);") != null);
 }

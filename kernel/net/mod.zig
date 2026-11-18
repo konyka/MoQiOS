@@ -59,7 +59,7 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
                     tcp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, info.ecn_ce);
                 },
                 ipv4.PROTO_UDP => {
-                    udp.handlePacketOn(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, ifindex);
+                    udp.handlePacketMeta(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, ifindex, info.ttl, info.tos);
                 },
                 // ip_protocol_deliver_rcu: a protocol with no handler that no raw socket took gets a protocol unreachable.
                 else => if (rp.protoUnreachable(info.protocol, raw_took)) icmp.sendProtoUnreachable(data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip),

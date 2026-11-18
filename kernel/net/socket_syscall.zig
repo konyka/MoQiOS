@@ -22,6 +22,8 @@ const message_batch_policy = @import("message_batch_policy.zig");
 const accept4_policy = @import("accept4_policy.zig");
 const bind_addr_policy = @import("bind_addr_policy.zig");
 const nic_mod = @import("nic.zig");
+const ip_opt_policy = @import("ip_opt_policy.zig");
+const ip_cmsg_policy = @import("ip_cmsg_policy.zig");
 
 const ENOTCONN: i64 = -107;
 const SOCKADDR_UN_PATH_OFFSET: u32 = 2;
@@ -1831,10 +1833,11 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
     var src6: [16]u8 = @splat(0);
     var src_port: u16 = 0;
     const peek = (flags & 0x02) != 0;
+    var meta: ip_cmsg_policy.RecvInfo = .{};
     if (is_v6) {
         got = udp.recvFromV6Ex(port, &data, @intCast(data.len), &src6, &src_port, &full, peek);
     } else {
-        got = udp.recvFromEx(port, &data, @intCast(data.len), &src4, &src_port, &full, peek);
+        got = udp.recvFromMeta(port, &data, @intCast(data.len), &src4, &src_port, &full, peek, &meta);
     }
     if (got < 0) return got;
 
@@ -1862,12 +1865,22 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
         bo.writeU32Le(&al, alen);
         _ = copy.copyToUser(@ptrFromInt(msg_ptr + 8), &al, 4);
     }
-    // msg_controllen and msg_flags
-    var z8: [8]u8 = @splat(0);
-    _ = copy.copyToUser(@ptrFromInt(msg_ptr + 40), &z8, 8);
+    // Control messages (ip_cmsg_recv_offset: IPv4 only), then msg_controllen and msg_flags.
+    const ctl_ptr: u64 = bo.readU64At(msghdr, 32);
+    const ctl_cap: usize = if (ctl_ptr == 0) 0 else @intCast(@min(bo.readU64At(msghdr, 40), 1 << 20));
+    const opts_ip: ip_opt_policy.IpOpts = if (is_v6) .{} else if (udp.getPortOpts(port)) |po| po.ip else .{};
+    var ctl_buf: [80]u8 = undefined;
+    const cm = ip_cmsg_policy.build(ip_cmsg_policy.Wanted.of(opts_ip), meta, ctl_cap, &ctl_buf);
+    if (cm.written != 0) {
+        if (ctl_ptr >= 0x0000_8000_0000_0000) return -14;
+        if (copy.copyToUser(@ptrFromInt(ctl_ptr), ctl_buf[0..cm.written], cm.written) != cm.written) return -14;
+    }
+    var cl: [8]u8 = undefined;
+    bo.writeU64Le(&cl, cm.written);
+    _ = copy.copyToUser(@ptrFromInt(msg_ptr + 40), &cl, 8);
     const truncated = @as(usize, full) > done;
     var fl: [4]u8 = undefined;
-    bo.writeU32Le(&fl, if (truncated) @as(u32, 0x20) else 0);
+    bo.writeU32Le(&fl, (if (truncated) @as(u32, 0x20) else 0) | (if (cm.truncated) @as(u32, 0x08) else 0));
     _ = copy.copyToUser(@ptrFromInt(msg_ptr + 48), &fl, 4);
     return if ((flags & 0x20) != 0) @as(i64, full) else @intCast(done);
 }
