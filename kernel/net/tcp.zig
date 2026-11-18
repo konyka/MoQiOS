@@ -3479,9 +3479,7 @@ pub fn tcpSend(tcb_idx: u32, data: [*]const u8, len: u32) i64 {
     if (!tcb.active or !tcp_recv_policy.canQueueSend(tcb.state, tcb.fin_pending)) return -1;
 
     // Copy data to send ring buffer (batched @memcpy)
-    const used = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
-    const free_space = tcp_util.roomUnder(used, sendLimit(tcb));
-    const to_copy = @min(len, free_space);
+    const to_copy = @min(len, sendRoom(tcb));
     ringWrite(&tcb.send_buf, SEND_BUF_SIZE, tcb.send_tail, data, to_copy);
     tcb.send_tail = (tcb.send_tail + to_copy) % SEND_BUF_SIZE;
     if (to_copy < len) tcb.async_nospace = true;
@@ -3531,9 +3529,7 @@ pub fn tcpSendFromUser(tcb_idx: u32, user_addr: u64, len: u32) i64 {
             tcp_lock.release(lock_flags);
             return if (total > 0) @intCast(total) else -1;
         }
-        const used = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
-        const free_space = tcp_util.roomUnder(used, sendLimit(tcb));
-        const to_copy = @min(chunk, free_space);
+        const to_copy = @min(chunk, sendRoom(tcb));
         ringWrite(&tcb.send_buf, SEND_BUF_SIZE, tcb.send_tail, &stage, to_copy);
         tcb.send_tail = (tcb.send_tail + to_copy) % SEND_BUF_SIZE;
         if (to_copy < chunk) tcb.async_nospace = true;
@@ -3931,8 +3927,7 @@ fn waitSendSpace(tcb_idx: u32, st: *SendWait) i64 {
         // A connection that can no longer send, or a ring with room: retry
         // now, the send reports the real error / progress.
         if (!tcp_recv_policy.canQueueSend(tcb.state, tcb.fin_pending)) return 0;
-        const used = ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
-        if (tcp_util.roomUnder(used, sendLimit(tcb)) > 0) return 0;
+        if (sendRoom(tcb) > 0) return 0;
         if (tcp_recv_policy.timedOut(st.deadline, tsc.nanos())) return -11;
 
         node.task_idx = cur_idx;
@@ -4826,6 +4821,28 @@ fn sendLimit(tcb: *const TcpTcb) u32 {
     return tcp_util.bufferLimit(tcb.options.snd_buf_set, tcb.options.snd_buf_size, SEND_BUF_SIZE);
 }
 
+/// Room a send may fill now: the ring's free space under sendLimit, and none once the bytes not yet sent reach TCP_NOTSENT_LOWAT
+/// (sk_stream_memory_free).
+fn sendRoom(tcb: *const TcpTcb) u32 {
+    if (!tcp_recv_policy.notsentAllowsQueue(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat)) return 0;
+    return tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb));
+}
+
+/// TCP_NOTSENT_LOWAT changed (Linux sk_write_space from do_tcp_setsockopt): blocked writers re-check, and pollers hear if the
+/// socket is now writable.
+pub fn tcpWriteSpace(tcb_idx: u32) void {
+    if (tcb_idx >= MAX_CONNECTIONS) return;
+    {
+        const lock_flags = tcp_lock.acquire();
+        defer tcp_lock.release(lock_flags);
+        if (!tcbs[tcb_idx].active) return;
+        markSendWake(&tcbs[tcb_idx]);
+    }
+    const epoll = @import("epoll.zig");
+    const ev = tcpReadiness(tcb_idx);
+    if (ev & epoll.EPOLLOUT != 0) epoll.epollNotify(.tcp_socket, tcb_idx, ev);
+}
+
 /// Receive window ceiling: SO_RCVBUF (when set) lowers it below TCP_WINDOW.
 fn rcvWindowCap(tcb: *const TcpTcb) u32 {
     return @min(TCP_WINDOW, tcp_util.bufferLimit(tcb.options.rcv_buf_set, tcb.options.rcv_buf_size, RECV_BUF_SIZE));
@@ -4894,7 +4911,7 @@ pub fn tcpSendSpace(tcb_idx: u32) u32 {
     if (tcb_idx >= MAX_CONNECTIONS) return 0;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return 0;
-    return tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb));
+    return sendRoom(tcb);
 }
 
 /// Bytes written to the send ring that have not been sent yet (SIOCOUTQNSD): the part of the ring past the send cursor.
@@ -4915,7 +4932,7 @@ pub fn tcpReadiness(tcb_idx: u32) u32 {
         .active = tcb.active,
         .state = tcb.state,
         .recv_bytes = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE),
-        .send_space = tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb)),
+        .send_space = if (!tcp_recv_policy.notsentWritable(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat)) 0 else tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb)),
         .reset_by_peer = tcb.reset_by_peer,
         .shut_rd = tcb.shut_rd,
         .fin_pending = tcb.fin_pending,

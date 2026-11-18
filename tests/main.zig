@@ -11560,10 +11560,11 @@ test "TCP buffer limits: SO_SNDBUF / SO_RCVBUF bound the rings only when set" {
 
     // Wiring: every place that sizes the send ring or the window goes through the limit.
     const src = kt.tcp_source;
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, "const free_space = tcp_util.roomUnder(used, sendLimit(tcb));"));
-    try std.testing.expect(std.mem.indexOf(u8, src, "if (tcp_util.roomUnder(used, sendLimit(tcb)) > 0) return 0;") != null);
+    // The send paths and the writer's wait share sendRoom (hello416 adds TCP_NOTSENT_LOWAT there), which bounds the ring by sendLimit.
     try std.testing.expect(std.mem.indexOf(u8, src, "return tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb));") != null);
-    try std.testing.expect(std.mem.indexOf(u8, src, ".send_space = tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb)),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const to_copy = @min(chunk, sendRoom(tcb));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (sendRoom(tcb) > 0) return 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, " else tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb)),") != null);
     // two window recomputations (data arrival, recv) plus the new acceptance bound in processIncomingData
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, src, "RECV_BUF_SIZE), rcvWindowCap(tcb));"));
     try std.testing.expect(std.mem.indexOf(u8, src, "return @min(TCP_WINDOW, tcp_util.bufferLimit(tcb.options.rcv_buf_set, tcb.options.rcv_buf_size, RECV_BUF_SIZE));") != null);
@@ -15851,4 +15852,31 @@ test "IPv6 extension headers on input (hello410): hop-by-hop and destination opt
     const m = kt.net_mod_source;
     try std.testing.expect(std.mem.indexOf(u8, m, "const ext = rp6.walkExt6(info6.next_header, data[payload_start6 .. payload_start6 + info6.payload_len]);") != null);
     try std.testing.expect(std.mem.indexOf(u8, m, "else => if (rp6.paramProblem6(ext.nh, raw_took6)) icmpv6.sendParamProblemAt(pkt6, 1, ext.nh_field, info6.src_ip, info6.dst_ip),") != null);
+}
+
+test "TCP_NOTSENT_LOWAT (hello416): Linux tcp_stream_memory_free / tcp_poll / do_tcp_setsockopt" {
+    const rp = kt.tcp_recv_policy;
+    // 0 is the sysctl default tcp_notsent_lowat (UINT_MAX): no limit; any other value is used as a u32 (-5 is huge).
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), rp.notsentLimit(0));
+    try std.testing.expectEqual(@as(u32, 1024), rp.notsentLimit(1024));
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFB), rp.notsentLimit(-5));
+    // A send may queue more while the unsent bytes are below the limit (sk_stream_memory_free, wake 0).
+    try std.testing.expect(rp.notsentAllowsQueue(1023, 1024));
+    try std.testing.expect(!rp.notsentAllowsQueue(1024, 1024));
+    try std.testing.expect(rp.notsentAllowsQueue(60000, 0));
+    // poll/epoll report writable while twice the unsent bytes are below it (tcp_poll, wake 1).
+    try std.testing.expect(rp.notsentWritable(0, 1024));
+    try std.testing.expect(rp.notsentWritable(511, 1024));
+    try std.testing.expect(!rp.notsentWritable(512, 1024));
+    try std.testing.expect(!rp.notsentWritable(8000, 16000));
+    try std.testing.expect(rp.notsentWritable(8000, 16001));
+    try std.testing.expect(rp.notsentWritable(65535, 0));
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "opts.notsent_lowat = @bitCast(bo.readU32Le(&buf));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "bo.writeU32Le(val_buf[0..4], @bitCast(opts.notsent_lowat));") != null);
+    const ts = kt.tcp_source;
+    // Every path that queues send data, and the blocking writer's wait, use the same room.
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, ts, "sendRoom(tcb)"));
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!tcp_recv_policy.notsentAllowsQueue(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat)) return 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!tcp_recv_policy.notsentWritable(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat)) 0 else") != null);
 }

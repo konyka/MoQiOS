@@ -63,6 +63,8 @@ pub const SocketOptions = struct {
     rto_max_ms: u32 = 120_000,
     /// TCP_DEFER_ACCEPT as a count of SYN-ACK timeouts (tcp_recv_policy.deferSecsToRetrans, 0: off).
     defer_accept: u8 = 0,
+    /// TCP_NOTSENT_LOWAT as given (0: the tcp_notsent_lowat default, no limit; see tcp_recv_policy.notsentLimit).
+    notsent_lowat: i32 = 0,
     /// SO_REUSEPORT / SO_BROADCAST / SO_DEBUG bits (sockopt_policy.flagBit).
     extra_flags: u16 = 0,
     so_error: i32 = 0,
@@ -205,6 +207,7 @@ fn setTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen
     // v53.14: Work on a copy, write back under lock at the end — no raw pointer escape
     var opts = tcp_mod.tcpGetOptions(tcb_idx) orelse return -88;
     var need_flush_cork = false;
+    var need_write_space = false;
     var need_flush_ack = false;
 
     // Validate optval pointer
@@ -365,8 +368,15 @@ fn setTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen
                 const v: i32 = @bitCast(bo.readU32Le(&buf));
                 opts.defer_accept = @import("tcp_recv_policy.zig").deferSecsToRetrans(v);
             },
-            tip.TCP_LINGER2, tip.TCP_NOTSENT_LOWAT => {
-                // Accepted and ignored: the behaviour they tune does not exist here.
+            tip.TCP_NOTSENT_LOWAT => {
+                if (optlen < 4) return -22;
+                var buf: [4]u8 = undefined;
+                if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
+                opts.notsent_lowat = @bitCast(bo.readU32Le(&buf));
+                need_write_space = true;
+            },
+            tip.TCP_LINGER2 => {
+                // Accepted and ignored: the behaviour it tunes does not exist here.
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
                 if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
@@ -389,6 +399,7 @@ fn setTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen
     // v53.14: Write back options under tcp_lock, then flush outside the option lock
     _ = tcp_mod.tcpSetOptions(tcb_idx, opts);
     if (need_flush_cork) tcp_mod.tcpFlushCork(tcb_idx);
+    if (need_write_space) tcp_mod.tcpWriteSpace(tcb_idx);
     if (need_flush_ack) tcp_mod.tcpFlushAck(tcb_idx);
     return 0;
 }
@@ -465,7 +476,11 @@ fn getTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen
                 val_len = 4;
                 bo.writeU32Le(val_buf[0..4], @bitCast(@import("tcp_recv_policy.zig").deferRetransToSecs(opts.defer_accept)));
             },
-            tip.TCP_LINGER2, tip.TCP_NOTSENT_LOWAT => {
+            tip.TCP_NOTSENT_LOWAT => {
+                val_len = 4;
+                bo.writeU32Le(val_buf[0..4], @bitCast(opts.notsent_lowat));
+            },
+            tip.TCP_LINGER2 => {
                 val_len = 4;
                 bo.writeU32Le(val_buf[0..4], 0);
             },

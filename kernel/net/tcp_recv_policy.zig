@@ -475,3 +475,21 @@ pub fn zeroWindowGiveUp(user_timeout_ms: u32, rtx_ms: u64, silent_ms: u64) bool 
 pub fn zeroWindowState(state: TcpState) bool {
     return state != .syn_sent and state != .syn_received;
 }
+
+// ── TCP_NOTSENT_LOWAT (Linux tcp_stream_memory_free, tcp_notsent_lowat) ──
+
+/// tcp_notsent_lowat: the socket's value, or the sysctl default (UINT_MAX: no limit) when it is 0. The value is kept as the int the
+/// caller gave and used as a u32, so a negative one is a very large limit.
+pub fn notsentLimit(lowat: i32) u32 {
+    return if (lowat == 0) std.math.maxInt(u32) else @bitCast(lowat);
+}
+
+/// sk_stream_memory_free (wake 0): a send may queue more while the bytes written but not yet sent are below the limit.
+pub fn notsentAllowsQueue(unsent: u32, lowat: i32) bool {
+    return unsent < notsentLimit(lowat);
+}
+
+/// tcp_poll (__sk_stream_is_writeable with wake 1): the socket reports writable only while twice the unsent bytes are below it.
+pub fn notsentWritable(unsent: u32, lowat: i32) bool {
+    return (@as(u64, unsent) << 1) < notsentLimit(lowat);
+}
