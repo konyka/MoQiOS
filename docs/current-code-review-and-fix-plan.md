@@ -10911,3 +10911,21 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   2. PROBE、INTERFACE、OMIT 没有实现“不用学到的路径 MTU”和“不接受 Frag Needed”这两层区分（Linux `ip_sk_use_pmtu`、`ip_sk_accept_pmtu`），这里只影响 DF 位和 id。
   3. 没有 IPV6_MTU_DISCOVER。
   4. IP_HDRINCL 发送用用户自己写的头，不看这个选项（与 Linux 相同）；ICMP 错误报文和 echo reply 不属于任何套接字，不受影响。
+
+## 补充：hello286 J 偶发失败的排查和诊断输出
+
+- 现象：hello419 的第一轮完整 smoke 里，hello286 J（线程不断创建和退出时连续 60 次 SIGSTOP/SIGCONT）在 SMP=2 只报告了 59 次组停止，SMP=4 只有 43 次；之前在 hello403 一节也记过一次（30/60）。每次失败后同一内核重跑都通过。
+- 复现尝试（都没有复现）：
+  - SMP=4 定向运行，hello286 连跑 4 次；
+  - SMP=4 和 SMP=2 两份并行定向运行，各让 hello286 连跑 12 次；
+  - SMP=4 和 SMP=2 两份并行完整 smoke，hello286 在原来的位置。
+  - 以上 30 次 hello286 全部 PASS。
+- 读过的代码（没有找到确定的漏洞）：
+  - `signal_syscall.sendToProcessWith` 对组内每个线程发 SIGSTOP，再发给组长；
+  - `task.markStopped` 在 `task_lock` 下置位并检查组内是否还有没停的成员；
+  - `task.exitTask` 在成员退出、其余成员都已停止时代为报告（`group_stop_policy.exitCompletesStop`）；
+  - `clone.zig` 在创建线程前先处理挂起的停止（`stopWhileWaiting`），所以组停止期间不会多出一个没收到 SIGSTOP 的新线程（Linux 用 `task_join_group_stop` 做同样的事）。
+  - 一个没有排除的可能：SIGSTOP 发出后、新线程进入 `slot_bitmap` 之前，`sendToProcessWith` 已经扫描过任务表；如果父线程此时已经过了 `clone.zig` 的检查，新线程就收不到 SIGSTOP，组停止要等它自己停下或退出。这只是推测，没有证据。
+- 本轮改动：hello286 J 在 3 秒内等不到停止报告时，不再直接放弃，而是调用 `report_missing_stop`：再等 5 秒，打印报告是否迟到，然后列出该进程每个线程在 `/proc/<tid>/status` 里的 `State:`。下次再失败时，日志能区分“报告迟到”和“报告丢失”，并指出哪个线程没有停下。判定条件没有放宽：迟到的报告仍算失败。
+- 验证：宿主机（`-DHOST`）上带诊断的 hello286 通过（J 三项 60/60）；带诊断的构建跑了一份 SMP=4 完整 smoke，`PASS`，hello286 PASS，没有触发诊断输出。只改了测试程序，内核没有改动，host 测试和交叉构建不受影响。
+- 仍未解决：hello286 J 的根因；hello286 M（fork 后马上 SIGSTOP，19/20）可能是同一类问题，这一轮没有给 M 加诊断。

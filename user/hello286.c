@@ -11,6 +11,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -26,6 +27,7 @@ static void print(const char *s) { fputs(s, stdout); fflush(stdout); }
 #include "../lib/moqi_libc/include/fcntl.h"
 #include "../lib/moqi_libc/include/time.h"
 #include "../lib/moqi_libc/include/pthread.h"
+#include "../lib/moqi_libc/include/stdlib.h"
 #endif
 #ifndef WNOHANG
 #define WNOHANG 1
@@ -151,6 +153,32 @@ static int cont_runs(char *codes) {
     b[n] = 0;
     for (long i = 0; i <= n; i++) codes[i] = b[i];
     return (int)n;
+}
+/* J failed to see a stop report within 3 s: tell a late report from a lost one, and show each thread's state, so an intermittent failure
+ * leaves enough behind to find which member never stopped. */
+static void report_missing_stop(long c, int round) {
+    int st = 0;
+    long late = 0;
+    for (int i = 0; i < 500 && late == 0; i++) {
+        late = waitpid(c, &st, WUNTRACED | WNOHANG);
+        if (late == 0) nap(10);
+    }
+    printf("hello286:   note J round %d: report 5 s later: %ld status 0x%x\n", round, late, st);
+    for (int tid = (int)c; tid < (int)c + 3000; tid++) {
+        char path[64], buf[600];
+        snprintf(path, sizeof path, "/proc/%d/status", tid);
+        int fd = open(path, O_RDONLY, 0);
+        if (fd < 0) continue;
+        long n = read(fd, buf, sizeof buf - 1);
+        close(fd);
+        if (n <= 0) continue;
+        buf[n] = 0;
+        char *tg = strstr(buf, "Tgid:"), *sl = strstr(buf, "State:");
+        if (!tg || atoi(tg + 5) != (int)c) continue;
+        char *e = sl ? strchr(sl, '\n') : 0;
+        if (e) *e = 0;
+        printf("hello286:   note J thread %d %s\n", tid, sl ? sl : "?");
+    }
 }
 static int drain(void) {
     char b[256];
@@ -411,7 +439,10 @@ int main(void) {
         kill(c, SIGSTOP);
         st = 0;
         if (wait_report(c, &st, WUNTRACED) == c && st == 0x137f) stops++;
-        else break;
+        else {
+            report_missing_stop(c, round);
+            break;
+        }
         drain();
         nap(30);
         if (!drain()) quiet++;
