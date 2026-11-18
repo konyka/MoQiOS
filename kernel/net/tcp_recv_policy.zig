@@ -493,3 +493,50 @@ pub fn notsentAllowsQueue(unsent: u32, lowat: i32) bool {
 pub fn notsentWritable(unsent: u32, lowat: i32) bool {
     return (@as(u64, unsent) << 1) < notsentLimit(lowat);
 }
+
+// ── TCP_LINGER2 and the orphan in FIN_WAIT2 (Linux do_tcp_setsockopt, tcp_fin_time, tcp_close, tcp_rcv_state_process) ──
+
+/// sysctl tcp_fin_timeout default and TCP_FIN_TIMEOUT_MAX.
+pub const FIN_TIMEOUT_MS: u32 = 60_000;
+pub const FIN_TIMEOUT_MAX_MS: i32 = 120_000;
+
+/// setsockopt: a negative value is kept as -1 (abort instead of waiting), one above 120 s as 120 s, else the seconds; stored in ms.
+pub fn linger2FromUser(val: i32) i32 {
+    if (val < 0) return -1;
+    if (val > @divTrunc(FIN_TIMEOUT_MAX_MS, 1000)) return FIN_TIMEOUT_MAX_MS;
+    return val * 1000;
+}
+
+/// getsockopt: -1 stays -1; otherwise the seconds, with 0 reading back the tcp_fin_timeout default.
+pub fn linger2ToUser(ms: i32) i32 {
+    if (ms < 0) return -1;
+    const v: u32 = if (ms == 0) FIN_TIMEOUT_MS else @intCast(ms);
+    return @intCast(v / 1000);
+}
+
+/// tcp_fin_time: how long an orphan waits in FIN_WAIT2 for the peer's FIN (0: the default), never below 3.5 RTO.
+pub fn finTimeoutMs(linger2_ms: i32, rto: u32) u32 {
+    const base: u32 = if (linger2_ms <= 0) FIN_TIMEOUT_MS else @intCast(linger2_ms);
+    const floor: u64 = (@as(u64, rto) << 2) - (rto >> 1);
+    return @intCast(@max(@as(u64, base), @min(floor, std.math.maxInt(u32))));
+}
+
+/// TCP_LINGER2 < 0: an orphan in FIN_WAIT2 is reset at once instead of waiting (tcp_close, tcp_rcv_state_process).
+pub fn finWait2Aborts(orphan: bool, linger2_ms: i32) bool {
+    return orphan and linger2_ms < 0;
+}
+
+/// An orphan in FIN_WAIT2 is dropped once it has waited tcp_fin_time; a socket still open waits for the peer as long as it takes.
+pub fn finWait2Expired(orphan: bool, waited_ms: u32, linger2_ms: i32, rto: u32) bool {
+    return orphan and linger2_ms >= 0 and waited_ms >= finTimeoutMs(linger2_ms, rto);
+}
+
+/// tcp_reset after the peer's FIN: CLOSE_WAIT reports EPIPE, CLOSING and LAST_ACK ECONNRESET (as SO_ERROR and to the next send);
+/// recv keeps reading EOF. Other states report nothing here (0).
+pub fn resetErrAfterFin(state: TcpState) i32 {
+    return switch (state) {
+        .close_wait => 32,
+        .closing, .last_ack => 104,
+        else => 0,
+    };
+}

@@ -338,6 +338,9 @@ const TcpTcb = struct {
     /// A valid RST tore the connection down: a drained recv reports
     /// ECONNRESET instead of EOF.
     reset_by_peer: bool = false,
+    /// A reset after the peer's FIN (Linux tcp_reset): EPIPE in CLOSE_WAIT, ECONNRESET in CLOSING / LAST_ACK. SO_ERROR and the next
+    /// send report it once; recv keeps reading EOF.
+    fin_reset_err: i32 = 0,
     /// The handshake finished at some point (stays set after close/reset).
     was_established: bool = false,
     /// shutdown(SHUT_RD) happened: reads see EOF, later data is dropped.
@@ -1011,6 +1014,7 @@ fn initTcbState(t: *TcpTcb) void {
     t.nagle_pending = false;
     t.fin_pending = false;
     t.reset_by_peer = false;
+    t.fin_reset_err = 0;
     t.was_established = false;
     t.shut_rd = false;
     t.refused = false;
@@ -1154,6 +1158,8 @@ pub fn tcpClearSoErrorIfEqual(tcb_idx: u32, expected: i32) void {
         } else if (expected == ECONNRESET and tcb.options.so_error == 0 and tcb.reset_by_peer) {
             // getsockopt(SO_ERROR) reported the pending reset (see tcpPendingSoError): it is consumed like a recv or send would.
             tcb.reset_by_peer = false;
+        } else if (tcb.options.so_error == 0 and !tcb.reset_by_peer and tcb.fin_reset_err != 0 and tcb.fin_reset_err == expected) {
+            tcb.fin_reset_err = 0;
         } else if (tcb.options.so_error == 0 and !tcb.reset_by_peer and tcb.soft_err == expected) {
             // sock_getsockopt SO_ERROR: sock_error() falls back to sk_err_soft and clears it.
             tcb.soft_err = 0;
@@ -1173,6 +1179,7 @@ pub fn tcpPendingSoError(tcb_idx: u32) i32 {
     const tcb = &tcbs[tcb_idx];
     if (tcb.options.so_error != 0) return tcb.options.so_error;
     if (tcb.reset_by_peer) return ECONNRESET;
+    if (tcb.fin_reset_err != 0) return tcb.fin_reset_err;
     return tcb.soft_err;
 }
 
@@ -1690,7 +1697,7 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
             if (pendingBacklogCount() == before and !hasListener(dst_port, true, tcp_port_policy.WILDCARD4, dst_ip)) {
                 sendLoopbackResetV6(src_ip, dst_ip, src_port, dst_port, flags, ack_num, seq_num, payload_len);
             }
-        }
+        } else if (!hasListener(dst_port, true, tcp_port_policy.WILDCARD4, dst_ip)) sendLoopbackResetV6(src_ip, dst_ip, src_port, dst_port, flags, ack_num, seq_num, payload_len);
         return;
     };
 
@@ -2503,6 +2510,7 @@ fn driveTcbStateMachine(
                     .syn_received, .fin_wait_1, .fin_wait_2 => true,
                     else => false,
                 };
+                tcb.fin_reset_err = tcp_recv_policy.resetErrAfterFin(tcb.state);
                 pending_events.* |= epoll.EPOLLIN | epoll.EPOLLERR | epoll.EPOLLHUP | epoll.EPOLLRDHUP;
                 pending_idx.* = tcbIdx(tcb);
                 noteFasync(tcbIdx(tcb), fcntl_policy.POLL_ERR);
@@ -2968,6 +2976,13 @@ fn driveTcbStateMachine(
                 tcb.snd_nxt = ack_num;
                 tcb.retransmit_timer = 0; // v53.10: Reset for FIN_WAIT_2 timeout
                 tcb.state = .fin_wait_2;
+                // An orphan with TCP_LINGER2 < 0 does not wait for the peer's FIN: it resets at once, so the peer (still in
+                // CLOSE_WAIT) sees EPIPE, as measured on Linux.
+                if (tcp_recv_policy.finWait2Aborts(tcb.ref_count == 0, tcb.options.linger2_ms)) {
+                    _ = sendSegment(tcb, RST | ACK, undefined, 0);
+                    closeTcbRemote(tcb);
+                    return;
+                }
                 tcpLog("[tcp] ACK in FIN_WAIT_1 → FIN_WAIT_2\n");
             }
         },
@@ -3108,7 +3123,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, e
             if (pendingBacklogCount() == before and !hasListener(dst_port, false, dst_ip, @splat(0))) {
                 sendLoopbackReset(src_ip, dst_ip, src_port, dst_port, flags, ack_num, seq_num, payload_len);
             }
-        }
+        } else if (!hasListener(dst_port, false, dst_ip, @splat(0))) sendLoopbackReset(src_ip, dst_ip, src_port, dst_port, flags, ack_num, seq_num, payload_len);
         return;
     };
 
@@ -3980,6 +3995,12 @@ fn sendFailure(tcb_idx: u32, raw: i64) i64 {
         tcb.options.so_error = 0;
         return -@as(i64, se);
     }
+    if (tcb.state == .closed and tcb.fin_reset_err != 0) {
+        // A reset after the peer's FIN: the next send reports it once (sk_stream_error falls back to sock_error).
+        const fe = tcb.fin_reset_err;
+        tcb.fin_reset_err = 0;
+        return -@as(i64, fe);
+    }
     const e = tcp_recv_policy.sendErrno(tcb.state, tcb.fin_pending, tcb.reset_by_peer, tcb.was_established);
     if (tcb.reset_by_peer) tcb.reset_by_peer = false; // reported once, like recv
     return e;
@@ -4144,6 +4165,16 @@ pub fn tcpClose(tcb_idx: u32) i64 {
             tcb.state = .closed;
             deactivateTcb(tcb);
         },
+        // Already half-closed by shutdown(SHUT_WR): the orphan goes on (our FIN still needs its ACK, or the peer's FIN its own).
+        .fin_wait_1, .closing, .last_ack => {},
+        // Waiting for the peer's FIN: TCP_LINGER2 < 0 resets at once (tcp_close), else the orphan's FIN_WAIT2 timer starts now.
+        .fin_wait_2 => if (tcp_recv_policy.finWait2Aborts(true, tcb.options.linger2_ms)) {
+            _ = sendSegment(tcb, RST | ACK, undefined, 0);
+            tcb.state = .closed;
+            deactivateTcb(tcb);
+        } else {
+            tcb.retransmit_timer = 0;
+        },
         else => {
             tcb.state = .closed;
             deactivateTcb(tcb);
@@ -4230,7 +4261,8 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
     // v53.6: FIN_WAIT_2 timeout — prevent orphaned TCBs if peer crashes without FIN
     if (tcb.state == .fin_wait_2) {
         tcb.retransmit_timer +%= ms_elapsed;
-        if (tcb.retransmit_timer >= 60_000) { // 60s timeout (Linux tcp_fin_timeout default)
+        // Only an orphan gives up, after TCP_LINGER2 or the tcp_fin_timeout default (tcp_fin_time); an open socket waits for the peer.
+        if (tcp_recv_policy.finWait2Expired(tcb.ref_count == 0, tcb.retransmit_timer, tcb.options.linger2_ms, tcb.rto)) {
             closeTcbRemote(tcb);
             tcpLog("[tcp] FIN_WAIT_2 timeout → CLOSED\n");
             return;
@@ -4923,10 +4955,14 @@ pub fn tcpSendUnsent(tcb_idx: u32) u32 {
     return ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
 }
 
-/// poll/epoll readiness of a TCP socket (lock-free snapshot, like the other status queries).
+/// poll/epoll readiness of a TCP socket. The snapshot is taken under tcp_lock: a timeout stores so_error and then closes the
+/// connection in one hold, and a lock-free read on another CPU could see the error without the closed state (ERR without IN/HUP).
+/// No caller holds tcp_lock or an epoll lock here.
 pub fn tcpReadiness(tcb_idx: u32) u32 {
     const ready = @import("tcp_ready_policy.zig");
     if (tcb_idx >= MAX_CONNECTIONS) return ready.events(.{ .active = false, .state = .closed, .recv_bytes = 0, .send_space = 0, .reset_by_peer = false, .shut_rd = false, .fin_pending = false });
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
     const tcb = &tcbs[tcb_idx];
     return ready.events(.{
         .active = tcb.active,

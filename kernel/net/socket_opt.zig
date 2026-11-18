@@ -65,6 +65,8 @@ pub const SocketOptions = struct {
     defer_accept: u8 = 0,
     /// TCP_NOTSENT_LOWAT as given (0: the tcp_notsent_lowat default, no limit; see tcp_recv_policy.notsentLimit).
     notsent_lowat: i32 = 0,
+    /// TCP_LINGER2 in ms (0: the tcp_fin_timeout default, -1: an orphan in FIN_WAIT2 is reset at once); see tcp_recv_policy.linger2FromUser.
+    linger2_ms: i32 = 0,
     /// SO_REUSEPORT / SO_BROADCAST / SO_DEBUG bits (sockopt_policy.flagBit).
     extra_flags: u16 = 0,
     so_error: i32 = 0,
@@ -376,11 +378,10 @@ fn setTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen
                 need_write_space = true;
             },
             tip.TCP_LINGER2 => {
-                // Accepted and ignored: the behaviour it tunes does not exist here.
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
                 if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
-                if (@as(i32, @bitCast(bo.readU32Le(&buf))) < 0 and optname != tip.TCP_LINGER2) return -22;
+                opts.linger2_ms = @import("tcp_recv_policy.zig").linger2FromUser(@bitCast(bo.readU32Le(&buf)));
             },
             tip.TCP_CONGESTION => {
                 // Only the algorithm this stack runs can be selected.
@@ -482,7 +483,7 @@ fn getTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen
             },
             tip.TCP_LINGER2 => {
                 val_len = 4;
-                bo.writeU32Le(val_buf[0..4], 0);
+                bo.writeU32Le(val_buf[0..4], @bitCast(@import("tcp_recv_policy.zig").linger2ToUser(opts.linger2_ms)));
             },
             tip.TCP_CONGESTION => {
                 val_len = tip.CONGESTION_NAME.len + 1;

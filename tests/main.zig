@@ -11765,8 +11765,6 @@ test "TCP socket options: MAXSEG / INFO / CONGESTION wiring" {
     try std.testing.expect(std.mem.indexOf(u8, so, "if (!tcp_mod.tcpMaxsegSettable(tcb_idx)) return -22;\n                opts.user_mss = v;") != null);
     // CONGESTION: only the algorithm that runs; anything else is ENOENT.
     try std.testing.expect(std.mem.indexOf(u8, so, "if (!std.mem.eql(u8, name[0..len], tip.CONGESTION_NAME)) return -2; // ENOENT") != null);
-    // The inert options reject a negative value (except LINGER2, where negative means "no FIN_WAIT_2").
-    try std.testing.expect(std.mem.indexOf(u8, so, "< 0 and optname != tip.TCP_LINGER2) return -22;") != null);
     // TCP_INFO truncates to the caller's length and reports the length written.
     try std.testing.expect(std.mem.indexOf(u8, so, "const n: u32 = @intCast(@min(@as(usize, user_optlen), info.len));") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, "tcp_mod.tcpInfoSnapshot(tcb_idx) orelse return -88") != null);
@@ -15478,7 +15476,7 @@ test "ICMP errors for TCP (hello406): errno, the sequence window, hard in SYN_SE
     try std.testing.expectEqual(@as(u8, 1), q6.dst[15]);
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (!up.tcpSeqOk(seq, tcb.snd_una, tcb.snd_nxt)) return;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.options.so_error != 0) return tcb.options.so_error;\n    if (tcb.reset_by_peer) return ECONNRESET;\n    return tcb.soft_err;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.options.so_error != 0) return tcb.options.so_error;\n    if (tcb.reset_by_peer) return ECONNRESET;\n    if (tcb.fin_reset_err != 0) return tcb.fin_reset_err;\n    return tcb.soft_err;") != null);
     const ic = kt.icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, ic, "if (unreach.parseTcpQuote(data[0..len])) |tq| @import(\"tcp.zig\").icmpError(tq, unreach.tcpErrno(icmp_type, icmp_code), unreach.tcpReqAborts(icmp_type, icmp_code));") != null);
     const iv = kt.icmpv6_source;
@@ -15879,4 +15877,76 @@ test "TCP_NOTSENT_LOWAT (hello416): Linux tcp_stream_memory_free / tcp_poll / do
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, ts, "sendRoom(tcb)"));
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (!tcp_recv_policy.notsentAllowsQueue(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat)) return 0;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (!tcp_recv_policy.notsentWritable(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat)) 0 else") != null);
+}
+
+test "TCP_LINGER2 (hello417): Linux do_tcp_setsockopt / tcp_fin_time / orphan FIN_WAIT2 in tcp_close and tcp_rcv_state_process" {
+    const rp = kt.tcp_recv_policy;
+    // setsockopt: a negative value is kept as -1, one above TCP_FIN_TIMEOUT_MAX (120 s) as 120 s, else the seconds (stored in ms).
+    try std.testing.expectEqual(@as(i32, -1), rp.linger2FromUser(-7));
+    try std.testing.expectEqual(@as(i32, -1), rp.linger2FromUser(-1));
+    try std.testing.expectEqual(@as(i32, 0), rp.linger2FromUser(0));
+    try std.testing.expectEqual(@as(i32, 5000), rp.linger2FromUser(5));
+    try std.testing.expectEqual(@as(i32, 120_000), rp.linger2FromUser(120));
+    try std.testing.expectEqual(@as(i32, 120_000), rp.linger2FromUser(121));
+    try std.testing.expectEqual(@as(i32, 120_000), rp.linger2FromUser(std.math.maxInt(i32)));
+    // getsockopt: 0 reads back the tcp_fin_timeout default (60 s), -1 stays -1.
+    try std.testing.expectEqual(@as(i32, 60), rp.linger2ToUser(0));
+    try std.testing.expectEqual(@as(i32, 5), rp.linger2ToUser(5000));
+    try std.testing.expectEqual(@as(i32, 120), rp.linger2ToUser(120_000));
+    try std.testing.expectEqual(@as(i32, -1), rp.linger2ToUser(-1));
+    // tcp_fin_time: 0 is the 60 s default; never below 3.5 RTO.
+    try std.testing.expectEqual(@as(u32, 60_000), rp.finTimeoutMs(0, 200));
+    try std.testing.expectEqual(@as(u32, 1000), rp.finTimeoutMs(1000, 200));
+    try std.testing.expectEqual(@as(u32, 7000), rp.finTimeoutMs(1000, 2000));
+    try std.testing.expectEqual(@as(u32, 120_000), rp.finTimeoutMs(120_000, 200));
+    // Only an orphan (no descriptor left) times out or aborts; a half-closed socket still open waits for the peer.
+    try std.testing.expect(rp.finWait2Aborts(true, -1));
+    try std.testing.expect(!rp.finWait2Aborts(false, -1));
+    try std.testing.expect(!rp.finWait2Aborts(true, 0));
+    try std.testing.expect(rp.finWait2Expired(true, 1000, 1000, 200));
+    try std.testing.expect(!rp.finWait2Expired(true, 999, 1000, 200));
+    try std.testing.expect(!rp.finWait2Expired(false, 600_000, 1000, 200));
+    try std.testing.expect(!rp.finWait2Expired(true, 600_000, -1, 200));
+    try std.testing.expect(rp.finWait2Expired(true, 60_000, 0, 200));
+    try std.testing.expect(!rp.finWait2Expired(true, 59_990, 0, 200));
+    // tcp_reset after the peer's FIN: CLOSE_WAIT is EPIPE, CLOSING / LAST_ACK ECONNRESET; recv keeps reading EOF (SOCK_DONE).
+    try std.testing.expectEqual(@as(i32, 32), rp.resetErrAfterFin(.close_wait));
+    try std.testing.expectEqual(@as(i32, 104), rp.resetErrAfterFin(.last_ack));
+    try std.testing.expectEqual(@as(i32, 104), rp.resetErrAfterFin(.closing));
+    try std.testing.expectEqual(@as(i32, 0), rp.resetErrAfterFin(.time_wait));
+    try std.testing.expectEqual(@as(i32, 0), rp.resetErrAfterFin(.fin_wait_2));
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "opts.linger2_ms = @import(\"tcp_recv_policy.zig\").linger2FromUser(@bitCast(bo.readU32Le(&buf)));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "bo.writeU32Le(val_buf[0..4], @bitCast(@import(\"tcp_recv_policy.zig\").linger2ToUser(opts.linger2_ms)));") != null);
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcp_recv_policy.finWait2Expired(tcb.ref_count == 0, tcb.retransmit_timer, tcb.options.linger2_ms, tcb.rto)) {") != null);
+    // tcp_close in FIN_WAIT2 with linger2 < 0 resets; tcp_rcv_state_process does the same for an orphan reaching FIN_WAIT2.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ts, "tcp_recv_policy.finWait2Aborts("));
+    try std.testing.expect(std.mem.indexOf(u8, ts, ".fin_wait_1, .closing, .last_ack => {},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "tcb.fin_reset_err = tcp_recv_policy.resetErrAfterFin(tcb.state);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.fin_reset_err != 0) return tcb.fin_reset_err;") != null);
+    // A segment for no connection is answered with a reset on loopback (tcp_v4_send_reset / tcp_v6_send_reset), not only a SYN, unless a
+    // listener holds the port (the forged peers of hello407/411/414 rely on that).
+    try std.testing.expect(std.mem.indexOf(u8, ts, "        } else if (!hasListener(dst_port, false, dst_ip, @splat(0))) sendLoopbackReset(src_ip, dst_ip, src_port, dst_port, flags, ack_num, seq_num, payload_len);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "        } else if (!hasListener(dst_port, true, tcp_port_policy.WILDCARD4, dst_ip)) sendLoopbackResetV6(src_ip, dst_ip, src_port, dst_port, flags, ack_num, seq_num, payload_len);\n") != null);
+}
+
+test "TCP reset and timeout readiness (hello407): ERR comes with IN and HUP, the snapshot is taken under tcp_lock" {
+    const rd = kt.tcp_ready_policy;
+    const S = kt.tcp_recv_policy.TcpState;
+    // An established connection whose retransmission (or keepalive) timed out is gone: poll reports ERR and IN, and HUP when both
+    // directions are finished, like Linux tcp_poll (EPOLLERR | EPOLLHUP | EPOLLIN are always reported).
+    const timed_out = rd.events(.{ .active = true, .state = S.closed, .recv_bytes = 0, .send_space = 0, .reset_by_peer = false, .shut_rd = false, .fin_pending = false, .so_error = 110 });
+    try std.testing.expectEqual(@as(u32, rd.IN | rd.ERR | rd.HUP | rd.OUT | rd.RDHUP), timed_out);
+    // A reset by the peer reports the same.
+    const reset = rd.events(.{ .active = true, .state = S.closed, .recv_bytes = 0, .send_space = 0, .reset_by_peer = true, .shut_rd = false, .fin_pending = false });
+    try std.testing.expectEqual(@as(u32, rd.IN | rd.ERR | rd.HUP | rd.OUT | rd.RDHUP), reset);
+    // An errored connection that already has a RDHUP-ish state keeps IN and ERR.
+    const half = rd.events(.{ .active = true, .state = S.fin_wait_2, .recv_bytes = 0, .send_space = 0, .reset_by_peer = false, .shut_rd = false, .fin_pending = false, .so_error = 110 });
+    try std.testing.expect(half & rd.ERR != 0);
+    const ts = kt.tcp_source;
+    // The timeout paths store so_error and then close the connection; poll and epoll must not see the error without the closed
+    // state (ERR without IN/HUP), so the readiness snapshot is taken under tcp_lock (Linux tcp_poll reads under the socket lock's
+    // ordering: sk_err is published together with the state by tcp_done).
+    try std.testing.expect(std.mem.indexOf(u8, ts, "pub fn tcpReadiness(tcb_idx: u32) u32 {\n    const ready = @import(\"tcp_ready_policy.zig\");\n    if (tcb_idx >= MAX_CONNECTIONS) return ready.events(.{ .active = false, .state = .closed, .recv_bytes = 0, .send_space = 0, .reset_by_peer = false, .shut_rd = false, .fin_pending = false });\n    const lock_flags = tcp_lock.acquire();\n    defer tcp_lock.release(lock_flags);\n") != null);
 }
