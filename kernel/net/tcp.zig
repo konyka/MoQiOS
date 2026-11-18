@@ -364,6 +364,10 @@ const TcpTcb = struct {
     persist_timer_ms: u32,
     /// Current persist probe interval (SK-110); doubles after each probe.
     persist_rto_ms: u32,
+    /// ms since the peer last sent anything (Linux rcv_tstamp): a zero window times out only while it stays silent.
+    peer_silent_ms: u64 = 0,
+    /// ms the send window has stayed shut while data waited (Linux icsk_probes_tstamp): TCP_USER_TIMEOUT bounds it.
+    persist_shut_ms: u64 = 0,
 
     // SACK (Selective Acknowledgment) state
     sack_permitted: bool, // SACK negotiated
@@ -1017,6 +1021,8 @@ fn initTcbState(t: *TcpTcb) void {
     t.sock_uid = 0;
     t.persist_timer_ms = 0;
     t.persist_rto_ms = RETRANSMIT_MS;
+    t.peer_silent_ms = 0;
+    t.persist_shut_ms = 0;
     t.delayed_ack_pending = false;
     t.delayed_ack_ms = 0;
     t.ref_count = 1;
@@ -2438,6 +2444,7 @@ fn driveTcbStateMachine(
 
     // Any matched segment counts as activity (keepalive idle reset).
     tcb.idle_ms = 0;
+    tcb.peer_silent_ms = 0;
 
     // SK-131/139/140: ACE from AE|CWR|ECE after AccECN; else classic ECE only.
     const ace: u3 = if (tcb.accecn_ok) probeAceUnpack(data[12], flags) else 0;
@@ -4227,6 +4234,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
     if (tcp_util.unackedPending(tcb.snd_una, tcb.snd_nxt, tcb.snd_max)) {
         tcb.retransmit_timer +%= ms_elapsed;
         tcb.rtx_elapsed_ms +|= ms_elapsed;
+        tcb.peer_silent_ms +|= ms_elapsed;
         // Use per-TCB RTO if available, otherwise fall back to RETRANSMIT_MS; with TCP_USER_TIMEOUT the timer never waits past it
         // (tcp_clamp_rto_to_user_timeout, measured from when this RTO was armed).
         // A SYN follows its own schedule: 1 s for the first waits, then doubling (tcp_syn_linear_timeouts).
@@ -4255,6 +4263,8 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             tcb.sack_scoreboard_count = 0;
             const give_up = if (tcb.state == .syn_sent)
                 tcp_recv_policy.synGiveUp(tcb.retransmit_count - 1, tcp_recv_policy.effectiveSyncnt(tcb.options.syn_cnt), rtxElapsedMs(tcb), tcb.options.user_timeout_ms)
+            else if (tcb.snd_wnd == 0 and tcp_recv_policy.zeroWindowState(tcb.state))
+                tcp_recv_policy.zeroWindowGiveUp(tcb.options.user_timeout_ms, rtxElapsedMs(tcb), tcb.peer_silent_ms)
             else
                 tcp_recv_policy.retransGiveUp(tcb.retransmit_count, TCP_RETRIES, tcb.options.user_timeout_ms, rtxElapsedMs(tcb));
             if (give_up) {
@@ -4339,6 +4349,15 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
         const unsent = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
         if (probePersistActive(tcb.snd_wnd, unsent)) {
             tcb.persist_timer_ms +%= ms_elapsed;
+            tcb.persist_shut_ms +|= ms_elapsed;
+            if (tcp_recv_policy.persistGiveUp(tcb.options.user_timeout_ms, tcb.persist_shut_ms)) {
+                // tcp_probe_timer → tcp_write_err.
+                tcpLog("[tcp] zero window past TCP_USER_TIMEOUT, closing\n");
+                tcb.options.so_error = tcp_recv_policy.timeoutErrno(tcb.soft_err);
+                noteFasync(idx, fcntl_policy.POLL_ERR);
+                closeTcbRemote(tcb);
+                return;
+            }
             const interval = if (tcb.persist_rto_ms > 0) tcb.persist_rto_ms else RETRANSMIT_MS;
             if (tcb.persist_timer_ms >= interval) {
                 tcb.persist_timer_ms = 0;
@@ -4348,6 +4367,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
         } else {
             tcb.persist_timer_ms = 0;
             tcb.persist_rto_ms = RETRANSMIT_MS;
+            tcb.persist_shut_ms = 0;
         }
     }
 
@@ -6035,13 +6055,11 @@ pub fn probePersistDue(timer_ms: u32, interval_ms: u32) bool {
     return interval_ms > 0 and timer_ms >= interval_ms;
 }
 
-/// Send a 1-byte window probe, bypassing the zero send window (SK-110).
+/// Send a zero-window probe (SK-110, Linux tcp_xmit_probe_skb): an ACK without data carrying snd_una - 1, which the peer answers
+/// with an ACK showing its current window. Nothing in it waits for an acknowledgement, so the retransmission timer stays out of it
+/// and probing goes on as long as the peer answers (RFC 1122 4.2.2.17); TCP_USER_TIMEOUT bounds it (tcp_probe_timer).
 fn sendPersistProbe(tcb: *TcpTcb) bool {
     const unsent = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
     if (unsent == 0) return false;
-    var seg_buf: [1]u8 = undefined;
-    ringRead(&tcb.send_buf, SEND_BUF_SIZE, tcb.send_unacked, &seg_buf, 1);
-    if (!sendSegment(tcb, ACK | PSH, &seg_buf, 1)) return false;
-    tcb.send_unacked = (tcb.send_unacked + 1) % SEND_BUF_SIZE;
-    return true;
+    return sendSegmentSeq(tcb, ACK, undefined, 0, probeKeepaliveSeq(tcb.snd_una));
 }

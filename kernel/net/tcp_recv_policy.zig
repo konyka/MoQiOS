@@ -321,3 +321,27 @@ pub fn synGiveUp(retransmits: u32, syncnt: u32, elapsed_ms: u64, user_timeout_ms
     const limit: u64 = if (user_timeout_ms != 0) user_timeout_ms else modelTimeoutMs(syncnt);
     return elapsed_ms >= limit;
 }
+
+/// tcp_probe_timer: zero-window probing goes on as long as the peer answers (RFC 1122 4.2.2.17); with TCP_USER_TIMEOUT the
+/// connection gives up once the window has stayed shut `shut_ms` that long.
+pub fn persistGiveUp(user_timeout_ms: u32, shut_ms: u64) bool {
+    return user_timeout_ms != 0 and shut_ms >= user_timeout_ms;
+}
+
+/// tcp_retransmit_timer with a zero send window: the retransmissions are window probes (RFC 1122 4.2.2.17), and the connection
+/// times out only when tcp_rtx_probe0_timed_out says so. With TCP_USER_TIMEOUT, once `rtx_ms` of retransmitting passed it; without,
+/// only once the peer has also been silent `silent_ms` past 2 x TCP_RTO_MAX (an answering peer keeps it open).
+pub fn zeroWindowGiveUp(user_timeout_ms: u32, rtx_ms: u64, silent_ms: u64) bool {
+    var limit: u64 = 2 * @as(u64, RTO_MAX_MS);
+    if (user_timeout_ms != 0) {
+        if (rtx_ms > user_timeout_ms) return true;
+        limit = @min(limit, user_timeout_ms);
+    }
+    if (silent_ms <= limit) return false;
+    return rtx_ms > limit;
+}
+
+/// The states tcp_retransmit_timer treats a zero window as probing in (not SYN_SENT or SYN_RECEIVED).
+pub fn zeroWindowState(state: TcpState) bool {
+    return state != .syn_sent and state != .syn_received;
+}

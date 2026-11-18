@@ -15589,3 +15589,36 @@ test "TCP_SYNCNT and the SYN retransmission schedule (hello408): Linux tcp_write
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.state == .syn_sent) tcp_recv_policy.synRtoMs(@as(u32, tcb.retransmit_count) + 1) else") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "tcp_recv_policy.synGiveUp(tcb.retransmit_count - 1, tcp_recv_policy.effectiveSyncnt(tcb.options.syn_cnt), rtxElapsedMs(tcb), tcb.options.user_timeout_ms)") != null);
 }
+
+test "zero-window probes (hello409): probing goes on while the window stays shut, TCP_USER_TIMEOUT bounds it (Linux tcp_probe_timer / tcp_xmit_probe_skb)" {
+    const rp = kt.tcp_recv_policy;
+    // RFC 1122 4.2.2.17: without a user timeout probing goes on as long as the peer answers; with one, the connection ends once
+    // the window has been shut for that long (probes_tstamp is the first probe).
+    try std.testing.expect(!rp.persistGiveUp(0, 600_000));
+    try std.testing.expect(!rp.persistGiveUp(2000, 1999));
+    try std.testing.expect(rp.persistGiveUp(2000, 2000));
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcp_recv_policy.persistGiveUp(tcb.options.user_timeout_ms, tcb.persist_shut_ms)) {") != null);
+    // tcp_xmit_probe_skb: the probe carries no data and an old sequence number (snd_una - 1), so nothing it sends waits for an
+    // acknowledgement and the retransmission timer stays out of it.
+    const p = std.mem.indexOf(u8, ts, "fn sendPersistProbe(tcb: *TcpTcb) bool {") orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, ts, p, "\n}\n") orelse return error.TestUnexpectedResult;
+    const body = ts[p..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "return sendSegmentSeq(tcb, ACK, undefined, 0, probeKeepaliveSeq(tcb.snd_una));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "ringRead") == null);
+}
+
+test "retransmissions into a zero window are probes (hello409): Linux tcp_retransmit_timer / tcp_rtx_probe0_timed_out" {
+    const rp = kt.tcp_recv_policy;
+    // While the peer keeps answering (rcv_delta small) the connection never times out on its zero window; with a user timeout
+    // it ends once retransmitting has gone on past it; without one, only once the peer has been silent for 2 x TCP_RTO_MAX.
+    try std.testing.expect(!rp.zeroWindowGiveUp(0, 600_000, 1_000));
+    try std.testing.expect(!rp.zeroWindowGiveUp(0, 240_000, 240_000));
+    try std.testing.expect(rp.zeroWindowGiveUp(0, 240_001, 240_001));
+    try std.testing.expect(!rp.zeroWindowGiveUp(2000, 2000, 100));
+    try std.testing.expect(rp.zeroWindowGiveUp(2000, 2001, 100));
+    try std.testing.expect(!rp.zeroWindowGiveUp(2000, 1500, 3000));
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "else if (tcb.snd_wnd == 0 and tcp_recv_policy.zeroWindowState(tcb.state))\n                tcp_recv_policy.zeroWindowGiveUp(tcb.options.user_timeout_ms, rtxElapsedMs(tcb), tcb.peer_silent_ms)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "tcb.peer_silent_ms = 0;") != null);
+}
