@@ -15714,6 +15714,46 @@ test "SYN-ACK retransmissions of a half-open connection (hello413): Linux reqsk_
     try std.testing.expect(std.mem.indexOf(u8, ts, "else if (tcb.state == .syn_received)\n                tcp_recv_policy.synAckGiveUp(tcb.retransmit_count, tcp_recv_policy.effectiveSynAckRetries(tcb.options.syn_cnt))") != null);
 }
 
+test "the first RTO comes from the handshake (hello414): Linux tcp_clean_rtx_queue / tcp_synack_rtt_meas / tcp_init_metrics" {
+    const rp = kt.tcp_recv_policy;
+    // A SYN or SYN-ACK that went out once gives an RTT sample: the time since it was sent (Karn: none after a retransmission).
+    try std.testing.expectEqual(@as(?u32, 0), rp.handshakeRttSample(0, 0));
+    try std.testing.expectEqual(@as(?u32, 120), rp.handshakeRttSample(0, 120));
+    try std.testing.expectEqual(@as(?u32, null), rp.handshakeRttSample(1, 120));
+    try std.testing.expectEqual(@as(?u32, null), rp.handshakeRttSample(3, 9000));
+    try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), rp.handshakeRttSample(0, 1 << 40));
+    // Without any sample the first RTO is TCP_TIMEOUT_FALLBACK (RFC 6298 5.7).
+    try std.testing.expectEqual(@as(u32, 3000), rp.TIMEOUT_FALLBACK_MS);
+    const ts = kt.tcp_source;
+    const p = std.mem.indexOf(u8, ts, "fn noteHandshakeRtt(tcb: *TcpTcb, sampled: bool) void {") orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, ts, p, "\n}\n") orelse return error.TestUnexpectedResult;
+    const body = ts[p..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (tcp_recv_policy.handshakeRttSample(tcb.retransmit_count, tcb.rtx_elapsed_ms)) |m| updateRtt(tcb, m) else tcb.rto = tcp_recv_policy.TIMEOUT_FALLBACK_MS;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tcb.retransmit_count = 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tcb.rtx_elapsed_ms = 0;") != null);
+    // Both ends of the handshake take it: the client on the SYN-ACK, the server on the final ACK.
+    try std.testing.expect(std.mem.indexOf(u8, ts, "noteHandshakeRtt(tcb, ts_sampled);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "noteHandshakeRtt(tcb, false);\n                tcpLog(\"[tcp] server: connection established (ACK received)\\n\");") != null);
+}
+
+test "retransmission time counts from the send (hello414): the first timer pass after a segment went out charges only the time since then" {
+    const rp = kt.tcp_recv_policy;
+    // Sent 30 ms before a 100 ms pass ended: 30 ms, not the whole pass (Linux measures from retrans_stamp, the send time).
+    try std.testing.expectEqual(@as(u32, 30), rp.firstChargeMs(100, 1_000_000_000, 1_030_000_000));
+    // Sent before the previous pass (nothing charged yet): at most the pass.
+    try std.testing.expectEqual(@as(u32, 100), rp.firstChargeMs(100, 1_000_000_000, 1_500_000_000));
+    // No usable clock (no send stamp, no pass time, or a stamp after it): the whole pass, as before.
+    try std.testing.expectEqual(@as(u32, 100), rp.firstChargeMs(100, 0, 1_030_000_000));
+    try std.testing.expectEqual(@as(u32, 100), rp.firstChargeMs(100, 1_000_000_000, 0));
+    try std.testing.expectEqual(@as(u32, 100), rp.firstChargeMs(100, 2_000_000_000, 1_000_000_000));
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const charge = if (tcb.rtx_elapsed_ms == 0) tcp_recv_policy.firstChargeMs(ms_elapsed, tcb.rtx_start_ns, timer_now_ns) else ms_elapsed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "tcb.retransmit_timer +%= charge;\n        tcb.rtx_elapsed_ms +|= charge;") != null);
+    // The stamp is taken when a segment that uses sequence space goes out with none outstanding, and cleared with rtx_elapsed_ms.
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.rtx_start_ns == 0 and (data_len > 0 or flags & (SYN | FIN) != 0)) tcb.rtx_start_ns = @import(\"../arch/arch.zig\").tsc.nanos();") != null);
+    try std.testing.expectEqual(std.mem.count(u8, ts, "tcb.rtx_elapsed_ms = 0;"), std.mem.count(u8, ts, "tcb.rtx_start_ns = 0;"));
+}
+
 test "IPv6 extension headers on input (hello410): hop-by-hop and destination options are stepped over (Linux ipv6_parse_hopopts / ip6_parse_tlv)" {
     const rp = kt.raw_icmp_policy;
     // A destination-options header (next header 17, length 0, PadN of 4) before an 8-byte UDP header: UDP at offset 8.

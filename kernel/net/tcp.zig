@@ -198,6 +198,8 @@ const TcpTcb = struct {
     retransmit_count: u8,
     /// ms since the oldest unacknowledged data went out (Linux retrans_stamp): TCP_USER_TIMEOUT is measured from it.
     rtx_elapsed_ms: u64 = 0,
+    /// When the oldest unacknowledged segment went out (TSC ns, 0: not stamped); see tcp_recv_policy.firstChargeMs.
+    rtx_start_ns: u64 = 0,
 
     // Congestion control (TCP Reno + PRR in recovery, SK-114)
     cwnd: u32, // congestion window (bytes)
@@ -934,6 +936,7 @@ fn initTcbState(t: *TcpTcb) void {
     t.retransmit_timer = 0;
     t.retransmit_count = 0;
     t.rtx_elapsed_ms = 0;
+    t.rtx_start_ns = 0;
     t.cwnd = TCP_MSS;
     t.ssthresh = 65535;
     t.dup_ack_count = 0;
@@ -1353,6 +1356,7 @@ fn advanceSndNxt(tcb: *TcpTcb, flags: u8, data_len: u16) void {
     if (data_len > 0) tcb.snd_nxt +%= data_len;
     if (flags & SYN != 0) tcb.snd_nxt +%= 1;
     if (flags & FIN != 0) tcb.snd_nxt +%= 1;
+    if (tcb.rtx_start_ns == 0 and (data_len > 0 or flags & (SYN | FIN) != 0)) tcb.rtx_start_ns = @import("../arch/arch.zig").tsc.nanos();
     // SK-116: track highest sent so F-RTO can restore after rexmit rewind.
     if (tcp_util.seqLt(tcb.snd_max, tcb.snd_nxt)) tcb.snd_max = tcb.snd_nxt;
 }
@@ -1768,6 +1772,19 @@ fn parseTcpOptions(data: [*]const u8, data_offset: u16) TcpOptions {
         }
     }
     return opts;
+}
+
+/// The handshake completed: the SYN (or SYN-ACK) is acknowledged. Without a timestamp sample (`sampled`), the time it waited is
+/// the first RTT sample if it was sent only once, else the RTO falls back to 3 s (tcp_init_metrics); then the retransmission state
+/// starts over for the data.
+fn noteHandshakeRtt(tcb: *TcpTcb, sampled: bool) void {
+    if (!sampled) {
+        if (tcp_recv_policy.handshakeRttSample(tcb.retransmit_count, tcb.rtx_elapsed_ms)) |m| updateRtt(tcb, m) else tcb.rto = tcp_recv_policy.TIMEOUT_FALLBACK_MS;
+    }
+    tcb.retransmit_timer = 0;
+    tcb.retransmit_count = 0;
+    tcb.rtx_elapsed_ms = 0;
+    tcb.rtx_start_ns = 0;
 }
 
 /// Update RTT estimation using Jacobson/Karels algorithm.
@@ -2538,13 +2555,16 @@ fn driveTcbStateMachine(
 
                 // RTT measurement: if our SYN carried ts_val_last and
                 // the ACK echoes it back, measure initial RTT.
+                var ts_sampled = false;
                 if (opts.ts_ecr) |ecr| {
                     if (ecr == tcb.ts_val_last) {
                         const now = timestampMs();
                         const rtt_sample = now -% ecr;
                         updateRtt(tcb, rtt_sample);
+                        ts_sampled = true;
                     }
                 }
+                noteHandshakeRtt(tcb, ts_sampled);
 
                 // Initialize cwnd after handshake (SK-99: SMSS).
                 tcb.cwnd = mssForTcb(tcb);
@@ -2582,7 +2602,7 @@ fn driveTcbStateMachine(
                 tcb.snd_wnd = window;
                 tcb.state = .established;
                 tcb.was_established = true;
-                tcb.retransmit_timer = 0;
+                noteHandshakeRtt(tcb, false);
                 tcpLog("[tcp] server: connection established (ACK received)\n");
                 noteListenerReadable(tcbIdx(tcb));
 
@@ -2637,6 +2657,7 @@ fn driveTcbStateMachine(
                         tcb.retransmit_timer = 0;
                         tcb.retransmit_count = 0;
                         tcb.rtx_elapsed_ms = 0;
+                        tcb.rtx_start_ns = 0;
                         tcb.tlp_sent = false;
                         // SK-118: new head's xmit time unknown until (re)sent.
                         tcb.head_xmit_ms = 0;
@@ -3694,6 +3715,7 @@ fn absorbDataAckBeforeFin(tcb: *TcpTcb, ack_num: u32, window: u32) void {
         tcb.retransmit_timer = 0;
         tcb.retransmit_count = 0;
         tcb.rtx_elapsed_ms = 0;
+        tcb.rtx_start_ns = 0;
         tcb.tlp_sent = false;
         tcb.head_xmit_ms = 0;
         updateScoreboard(tcb, &.{});
@@ -4154,12 +4176,15 @@ pub fn isClosed(tcb_idx: u32) bool {
 /// Worst-case hold time for 128 TCBs with retransmits: ~128-640us, well
 /// within the 10ms tick budget.
 var last_timer_ns: u64 = 0;
+/// The TSC time the current timer pass runs at (0 when timerTick is called without one).
+var timer_now_ns: u64 = 0;
 
 /// The maintenance pass's TCP timer: advances every timer by the time measured since the previous pass (passElapsedMs), so
 /// timeouts keep their length when the pass runs late. The first pass counts as 100 ms.
 pub fn timerTickNow(now_ns: u64) void {
     const last = @atomicLoad(u64, &last_timer_ns, .monotonic);
     @atomicStore(u64, &last_timer_ns, now_ns, .monotonic);
+    timer_now_ns = now_ns;
     if (last == 0) return timerTick(100);
     timerTick(tcp_recv_policy.passElapsedMs(last, now_ns));
 }
@@ -4228,8 +4253,10 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
 
     // Check for unacknowledged data (use snd_max so rexmit rewind still counts).
     if (tcp_util.unackedPending(tcb.snd_una, tcb.snd_nxt, tcb.snd_max)) {
-        tcb.retransmit_timer +%= ms_elapsed;
-        tcb.rtx_elapsed_ms +|= ms_elapsed;
+        // The first pass after the segment went out charges only the time since it was sent.
+        const charge = if (tcb.rtx_elapsed_ms == 0) tcp_recv_policy.firstChargeMs(ms_elapsed, tcb.rtx_start_ns, timer_now_ns) else ms_elapsed;
+        tcb.retransmit_timer +%= charge;
+        tcb.rtx_elapsed_ms +|= charge;
         tcb.peer_silent_ms +|= ms_elapsed;
         // Use per-TCB RTO if available, otherwise fall back to RETRANSMIT_MS; with TCP_USER_TIMEOUT the timer never waits past it
         // (tcp_clamp_rto_to_user_timeout, measured from when this RTO was armed).

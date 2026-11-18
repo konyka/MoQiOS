@@ -306,6 +306,15 @@ pub fn timeoutErrno(soft_err: i32) i32 {
     return if (soft_err != 0) soft_err else 110;
 }
 
+/// The ms the first timer pass after a segment went out charges to its retransmission time: only what passed since it was sent
+/// (`start_ns`, Linux retrans_stamp) up to the end of the pass (`now_ns`), at most the pass; the whole pass when either time is
+/// unknown. Charging the whole pass let a pass that ran late under emulation age a segment sent just before it by up to 1 s.
+pub fn firstChargeMs(pass_ms: u32, start_ns: u64, now_ns: u64) u32 {
+    if (start_ns == 0 or now_ns == 0 or start_ns > now_ns) return pass_ms;
+    const ms = (now_ns - start_ns) / 1_000_000;
+    return @intCast(@min(ms, pass_ms));
+}
+
 /// How many ms a TCP timer pass covers: the time since the previous pass, at least 1 and at most 1 s. The maintenance pass is
 /// meant to run every 100 ms but runs late when the CPU is slow (emulation); a fixed 100 would stretch every TCP timeout with it,
 /// and a stall of seconds must not fire every timer at once.
@@ -361,6 +370,17 @@ pub fn synGiveUp(retransmits: u32, syncnt: u32, elapsed_ms: u64, user_timeout_ms
     if (retransmits == 0) return false;
     const limit: u64 = if (user_timeout_ms != 0) user_timeout_ms else modelTimeoutMs(syncnt, SYN_RTO_MS, rto_max_ms);
     return elapsed_ms >= limit;
+}
+
+/// TCP_TIMEOUT_FALLBACK: the first RTO when the handshake gave no RTT sample (RFC 6298 5.7, tcp_init_metrics).
+pub const TIMEOUT_FALLBACK_MS: u32 = 3000;
+
+/// The RTT sample the handshake gives without timestamps (tcp_clean_rtx_queue for the SYN, tcp_synack_rtt_meas for the SYN-ACK):
+/// the time since the SYN or SYN-ACK went out, but only if it went out once (Karn: after a retransmission nobody knows which copy
+/// was answered).
+pub fn handshakeRttSample(retransmits: u32, elapsed_ms: u64) ?u32 {
+    if (retransmits != 0) return null;
+    return @intCast(@min(elapsed_ms, std.math.maxInt(u32)));
 }
 
 /// net.ipv4.tcp_synack_retries: SYN-ACK retransmissions before a half-open connection is dropped.
