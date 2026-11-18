@@ -404,6 +404,54 @@ pub fn synAckGiveUp(expiry: u32, max_retries: u32) bool {
     return expiry > max_retries;
 }
 
+/// secs_to_retrans(seconds, TCP_TIMEOUT_INIT, TCP_RTO_MAX): TCP_DEFER_ACCEPT seconds as a count of SYN-ACK timeouts on the 1 s
+/// doubling schedule; 0 or less turns it off.
+pub fn deferSecsToRetrans(seconds: i32) u8 {
+    if (seconds <= 0) return 0;
+    var timeout: i64 = 1;
+    var period: i64 = timeout;
+    var res: u8 = 1;
+    while (seconds > period and res < 255) {
+        res += 1;
+        timeout = @min(timeout * 2, RTO_MAX_MS / 1000);
+        period += timeout;
+    }
+    return res;
+}
+
+/// retrans_to_secs: what getsockopt(TCP_DEFER_ACCEPT) reads back, the seconds `retrans` timeouts cover.
+pub fn deferRetransToSecs(retrans: u8) i32 {
+    if (retrans == 0) return 0;
+    var timeout: i32 = 1;
+    var period: i32 = timeout;
+    var left = retrans - 1;
+    while (left > 0) : (left -= 1) {
+        timeout = @min(timeout * 2, @as(i32, RTO_MAX_MS / 1000));
+        period += timeout;
+    }
+    return period;
+}
+
+/// tcp_check_req with TCP_DEFER_ACCEPT: while fewer than `defer_retrans` SYN-ACK timeouts have passed, a bare ACK completing the
+/// handshake (no data, no FIN) is dropped; the request remembers it was acknowledged.
+pub fn deferDropsBareAck(timeouts: u32, defer_retrans: u8, payload_len: u32, fin: bool) bool {
+    return timeouts < defer_retrans and payload_len == 0 and !fin;
+}
+
+pub const SynAckExpiry = struct { give_up: bool, resend: bool };
+
+/// syn_ack_recalc at the `expiry`-th expiry (num_timeout = expiry - 1 before it). Without TCP_DEFER_ACCEPT: drop once num_timeout
+/// reaches `max_retries`, else resend. With it, a request the client already acknowledged (`acked`) is dropped only once the defer
+/// count has passed too, and its SYN-ACK is resent only from the last deferred timeout on (a last chance for the ACK).
+pub fn synAckExpiry(expiry: u32, max_retries: u32, defer_retrans: u8, acked: bool) SynAckExpiry {
+    const nt = expiry -| 1;
+    if (defer_retrans == 0) return .{ .give_up = synAckGiveUp(expiry, max_retries), .resend = true };
+    return .{
+        .give_up = nt >= max_retries and (!acked or nt >= defer_retrans),
+        .resend = !acked or nt + 1 >= defer_retrans,
+    };
+}
+
 /// tcp_probe_timer: zero-window probing goes on as long as the peer answers (RFC 1122 4.2.2.17); with TCP_USER_TIMEOUT the
 /// connection gives up once the window has stayed shut `shut_ms` that long.
 pub fn persistGiveUp(user_timeout_ms: u32, shut_ms: u64) bool {

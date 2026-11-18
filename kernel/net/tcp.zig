@@ -200,6 +200,8 @@ const TcpTcb = struct {
     rtx_elapsed_ms: u64 = 0,
     /// When the oldest unacknowledged segment went out (TSC ns, 0: not stamped); see tcp_recv_policy.firstChargeMs.
     rtx_start_ns: u64 = 0,
+    /// TCP_DEFER_ACCEPT: the client acknowledged the SYN-ACK with a bare ACK that was dropped (Linux inet_rsk(req)->acked).
+    defer_acked: bool = false,
 
     // Congestion control (TCP Reno + PRR in recovery, SK-114)
     cwnd: u32, // congestion window (bytes)
@@ -937,6 +939,7 @@ fn initTcbState(t: *TcpTcb) void {
     t.retransmit_count = 0;
     t.rtx_elapsed_ms = 0;
     t.rtx_start_ns = 0;
+    t.defer_acked = false;
     t.cwnd = TCP_MSS;
     t.ssthresh = 65535;
     t.dup_ack_count = 0;
@@ -2598,6 +2601,11 @@ fn driveTcbStateMachine(
                 // The ACK must acknowledge our SYN-ACK exactly; an unmatched
                 // ACK would let anyone establish a backlog connection blind.
                 if (ack_num != tcb.snd_nxt) return;
+                // TCP_DEFER_ACCEPT (Linux tcp_check_req): a bare ACK does not complete the connection yet.
+                if (tcp_recv_policy.deferDropsBareAck(tcb.retransmit_count, tcb.options.defer_accept, payload_len, flags & FIN != 0)) {
+                    tcb.defer_acked = true;
+                    return;
+                }
                 tcb.snd_una = ack_num;
                 tcb.snd_wnd = window;
                 tcb.state = .established;
@@ -2609,6 +2617,9 @@ fn driveTcbStateMachine(
                 // v53.41: Defer epoll notification outside tcp_lock
                 pending_events.* |= epoll.EPOLLOUT;
                 pending_idx.* = tcbIdx(tcb);
+                // The segment that completed the handshake may carry data or a FIN (always, under TCP_DEFER_ACCEPT): process it
+                // as the established connection's first segment instead of dropping it.
+                if (payload_len > 0 or flags & FIN != 0) return driveTcbStateMachine(tcb, seq_num, ack_num, flags, raw_window, opts, data, payload_offset, payload_len, pending_events, pending_idx, ecn_ce);
             }
         },
         .established => {
@@ -4289,7 +4300,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             const give_up = if (tcb.state == .syn_sent)
                 tcp_recv_policy.synGiveUp(tcb.retransmit_count - 1, tcp_recv_policy.effectiveSyncnt(tcb.options.syn_cnt), rtxElapsedMs(tcb), tcb.options.user_timeout_ms, tcb.options.rto_max_ms)
             else if (tcb.state == .syn_received)
-                tcp_recv_policy.synAckGiveUp(tcb.retransmit_count, tcp_recv_policy.effectiveSynAckRetries(tcb.options.syn_cnt))
+                tcp_recv_policy.synAckExpiry(tcb.retransmit_count, tcp_recv_policy.effectiveSynAckRetries(tcb.options.syn_cnt), tcb.options.defer_accept, tcb.defer_acked).give_up
             else if (tcb.snd_wnd == 0 and tcp_recv_policy.zeroWindowState(tcb.state))
                 tcp_recv_policy.zeroWindowGiveUp(tcb.options.user_timeout_ms, rtxElapsedMs(tcb), tcb.peer_silent_ms)
             else
@@ -4351,9 +4362,12 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
                 tcb.snd_nxt = tcb.snd_una;
                 _ = sendSegment(tcb, probeEcnSynFlags(true), undefined, 0);
             } else if (tcb.state == .syn_received) {
-                // Retransmit the SYN-ACK (Linux reqsk_timer_handler), again at the ISS.
-                tcb.snd_nxt = tcb.snd_una;
-                sendSynAck(tcb, tcb.ecn_ok);
+                // Retransmit the SYN-ACK (Linux reqsk_timer_handler), again at the ISS; under TCP_DEFER_ACCEPT a request the client
+                // acknowledged waits silently until its last deferred timeout.
+                if (tcp_recv_policy.synAckExpiry(tcb.retransmit_count, tcp_recv_policy.effectiveSynAckRetries(tcb.options.syn_cnt), tcb.options.defer_accept, tcb.defer_acked).resend) {
+                    tcb.snd_nxt = tcb.snd_una;
+                    sendSynAck(tcb, tcb.ecn_ok);
+                }
             } else if (finSent(tcb)) {
                 // v53.12: Include .closing — FIN must be retransmitted if ACK is lost.
                 // Rewind to the FIN's own seq: snd_nxt already counts it, and

@@ -61,6 +61,8 @@ pub const SocketOptions = struct {
     syn_cnt: u32 = 0,
     /// TCP_RTO_MAX_MS: the cap on the retransmission timeout (tcp_rto_max_ms, 120 s).
     rto_max_ms: u32 = 120_000,
+    /// TCP_DEFER_ACCEPT as a count of SYN-ACK timeouts (tcp_recv_policy.deferSecsToRetrans, 0: off).
+    defer_accept: u8 = 0,
     /// SO_REUSEPORT / SO_BROADCAST / SO_DEBUG bits (sockopt_policy.flagBit).
     extra_flags: u16 = 0,
     so_error: i32 = 0,
@@ -356,7 +358,14 @@ fn setTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen
                 if (e != 0) return e;
                 opts.rto_max_ms = @intCast(v);
             },
-            tip.TCP_DEFER_ACCEPT, tip.TCP_LINGER2, tip.TCP_NOTSENT_LOWAT => {
+            tip.TCP_DEFER_ACCEPT => {
+                if (optlen < 4) return -22;
+                var buf: [4]u8 = undefined;
+                if (copy_mod.copyFromUser(&buf, @ptrFromInt(optval_ptr), 4) != 4) return -14;
+                const v: i32 = @bitCast(bo.readU32Le(&buf));
+                opts.defer_accept = @import("tcp_recv_policy.zig").deferSecsToRetrans(v);
+            },
+            tip.TCP_LINGER2, tip.TCP_NOTSENT_LOWAT => {
                 // Accepted and ignored: the behaviour they tune does not exist here.
                 if (optlen < 4) return -22;
                 var buf: [4]u8 = undefined;
@@ -452,7 +461,11 @@ fn getTcpSockopt(tcb_idx: u32, level: u64, optname: u64, optval_ptr: u64, optlen
                 val_len = 4;
                 bo.writeU32Le(val_buf[0..4], opts.rto_max_ms);
             },
-            tip.TCP_DEFER_ACCEPT, tip.TCP_LINGER2, tip.TCP_NOTSENT_LOWAT => {
+            tip.TCP_DEFER_ACCEPT => {
+                val_len = 4;
+                bo.writeU32Le(val_buf[0..4], @bitCast(@import("tcp_recv_policy.zig").deferRetransToSecs(opts.defer_accept)));
+            },
+            tip.TCP_LINGER2, tip.TCP_NOTSENT_LOWAT => {
                 val_len = 4;
                 bo.writeU32Le(val_buf[0..4], 0);
             },

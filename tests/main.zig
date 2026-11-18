@@ -15711,7 +15711,7 @@ test "SYN-ACK retransmissions of a half-open connection (hello413): Linux reqsk_
     try std.testing.expect(rp.synAckGiveUp(6, 5));
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "else if (tcb.state == .syn_received) tcp_recv_policy.synAckRtoMs(@as(u32, tcb.retransmit_count) + 1, tcb.options.rto_max_ms)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ts, "else if (tcb.state == .syn_received)\n                tcp_recv_policy.synAckGiveUp(tcb.retransmit_count, tcp_recv_policy.effectiveSynAckRetries(tcb.options.syn_cnt))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "else if (tcb.state == .syn_received)\n                tcp_recv_policy.synAckExpiry(tcb.retransmit_count, tcp_recv_policy.effectiveSynAckRetries(tcb.options.syn_cnt), tcb.options.defer_accept, tcb.defer_acked).give_up") != null);
 }
 
 test "the first RTO comes from the handshake (hello414): Linux tcp_clean_rtx_queue / tcp_synack_rtt_meas / tcp_init_metrics" {
@@ -15752,6 +15752,50 @@ test "retransmission time counts from the send (hello414): the first timer pass 
     // The stamp is taken when a segment that uses sequence space goes out with none outstanding, and cleared with rtx_elapsed_ms.
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.rtx_start_ns == 0 and (data_len > 0 or flags & (SYN | FIN) != 0)) tcb.rtx_start_ns = @import(\"../arch/arch.zig\").tsc.nanos();") != null);
     try std.testing.expectEqual(std.mem.count(u8, ts, "tcb.rtx_elapsed_ms = 0;"), std.mem.count(u8, ts, "tcb.rtx_start_ns = 0;"));
+}
+
+test "TCP_DEFER_ACCEPT (hello415): Linux secs_to_retrans / retrans_to_secs / tcp_check_req / syn_ack_recalc" {
+    const rp = kt.tcp_recv_policy;
+    // Seconds become SYN-ACK retransmissions on the 1 s doubling schedule (capped at TCP_RTO_MAX 120 s); a value <= 0 turns it off.
+    try std.testing.expectEqual(@as(u8, 0), rp.deferSecsToRetrans(0));
+    try std.testing.expectEqual(@as(u8, 0), rp.deferSecsToRetrans(-5));
+    try std.testing.expectEqual(@as(u8, 1), rp.deferSecsToRetrans(1));
+    try std.testing.expectEqual(@as(u8, 2), rp.deferSecsToRetrans(3));
+    try std.testing.expectEqual(@as(u8, 3), rp.deferSecsToRetrans(5));
+    try std.testing.expectEqual(@as(u8, 7), rp.deferSecsToRetrans(100));
+    try std.testing.expectEqual(@as(u8, 255), rp.deferSecsToRetrans(std.math.maxInt(i32)));
+    // getsockopt reads back the time those retransmissions cover.
+    try std.testing.expectEqual(@as(i32, 0), rp.deferRetransToSecs(0));
+    try std.testing.expectEqual(@as(i32, 1), rp.deferRetransToSecs(1));
+    try std.testing.expectEqual(@as(i32, 3), rp.deferRetransToSecs(2));
+    try std.testing.expectEqual(@as(i32, 7), rp.deferRetransToSecs(3));
+    try std.testing.expectEqual(@as(i32, 127), rp.deferRetransToSecs(7));
+    try std.testing.expectEqual(@as(i32, 247), rp.deferRetransToSecs(8));
+    // tcp_check_req: a bare ACK (no data, no FIN) is dropped while fewer timeouts than the defer count have passed.
+    try std.testing.expect(rp.deferDropsBareAck(0, 3, 0, false));
+    try std.testing.expect(rp.deferDropsBareAck(2, 3, 0, false));
+    try std.testing.expect(!rp.deferDropsBareAck(3, 3, 0, false));
+    try std.testing.expect(!rp.deferDropsBareAck(0, 3, 4, false));
+    try std.testing.expect(!rp.deferDropsBareAck(0, 3, 0, true));
+    try std.testing.expect(!rp.deferDropsBareAck(0, 0, 0, false));
+    // syn_ack_recalc at the k-th expiry (num_timeout = k - 1): without defer, resend until tcp_synack_retries; with it, a request
+    // the client acknowledged is not resent until the last deferred timeout and not dropped before it.
+    try std.testing.expectEqual(rp.SynAckExpiry{ .give_up = false, .resend = true }, rp.synAckExpiry(1, 5, 0, false));
+    try std.testing.expectEqual(rp.SynAckExpiry{ .give_up = true, .resend = true }, rp.synAckExpiry(6, 5, 0, false));
+    try std.testing.expectEqual(rp.SynAckExpiry{ .give_up = false, .resend = false }, rp.synAckExpiry(1, 5, 3, true));
+    try std.testing.expectEqual(rp.SynAckExpiry{ .give_up = false, .resend = true }, rp.synAckExpiry(3, 5, 3, true));
+    try std.testing.expectEqual(rp.SynAckExpiry{ .give_up = false, .resend = true }, rp.synAckExpiry(1, 5, 1, true));
+    try std.testing.expectEqual(rp.SynAckExpiry{ .give_up = false, .resend = false }, rp.synAckExpiry(6, 5, 7, true));
+    try std.testing.expectEqual(rp.SynAckExpiry{ .give_up = true, .resend = true }, rp.synAckExpiry(8, 5, 7, true));
+    try std.testing.expectEqual(rp.SynAckExpiry{ .give_up = true, .resend = true }, rp.synAckExpiry(6, 5, 7, false));
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcp_recv_policy.deferDropsBareAck(tcb.retransmit_count, tcb.options.defer_accept, payload_len, flags & FIN != 0)) {\n                    tcb.defer_acked = true;\n                    return;\n                }") != null);
+    // The segment that completes the handshake is processed as an established one, so its data (or FIN) is not lost.
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (payload_len > 0 or flags & FIN != 0) return driveTcbStateMachine(tcb, seq_num, ack_num, flags, raw_window, opts, data, payload_offset, payload_len, pending_events, pending_idx, ecn_ce);") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ts, "tcp_recv_policy.synAckExpiry(tcb.retransmit_count, tcp_recv_policy.effectiveSynAckRetries(tcb.options.syn_cnt), tcb.options.defer_accept, tcb.defer_acked)"));
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "opts.defer_accept = @import(\"tcp_recv_policy.zig\").deferSecsToRetrans(v);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "@bitCast(@import(\"tcp_recv_policy.zig\").deferRetransToSecs(opts.defer_accept))") != null);
 }
 
 test "IPv6 extension headers on input (hello410): hop-by-hop and destination options are stepped over (Linux ipv6_parse_hopopts / ip6_parse_tlv)" {
