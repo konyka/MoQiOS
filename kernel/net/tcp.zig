@@ -4233,9 +4233,10 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
         tcb.peer_silent_ms +|= ms_elapsed;
         // Use per-TCB RTO if available, otherwise fall back to RETRANSMIT_MS; with TCP_USER_TIMEOUT the timer never waits past it
         // (tcp_clamp_rto_to_user_timeout, measured from when this RTO was armed).
-        // A SYN follows its own schedule: 1 s for the first waits, then doubling (tcp_syn_linear_timeouts).
+        // A SYN follows its own schedule: 1 s for the first waits, then doubling (tcp_syn_linear_timeouts); a SYN-ACK waits 1 s,
+        // doubling (tcp_reqsk_timeout), and a half-open connection is dropped after tcp_synack_retries or the listener's TCP_SYNCNT.
         // Every wait is bounded by the socket's RTO cap (inet_csk_reset_xmit_timer's max_when, TCP_RTO_MAX_MS).
-        const base_rto = @min(if (tcb.state == .syn_sent) tcp_recv_policy.synRtoMs(@as(u32, tcb.retransmit_count) + 1, tcb.options.rto_max_ms) else if (tcb.rto > 0) tcb.rto else RETRANSMIT_MS, tcb.options.rto_max_ms);
+        const base_rto = @min(if (tcb.state == .syn_sent) tcp_recv_policy.synRtoMs(@as(u32, tcb.retransmit_count) + 1, tcb.options.rto_max_ms) else if (tcb.state == .syn_received) tcp_recv_policy.synAckRtoMs(@as(u32, tcb.retransmit_count) + 1, tcb.options.rto_max_ms) else if (tcb.rto > 0) tcb.rto else RETRANSMIT_MS, tcb.options.rto_max_ms);
         const current_rto = tcp_recv_policy.clampRto(base_rto, tcb.options.user_timeout_ms, tcb.rtx_elapsed_ms -| tcb.retransmit_timer);
         // SK-128: RACK timer repair before TLP/RTO (no new ACK required).
         _ = maybeRackTimerRepair(tcb, current_rto);
@@ -4260,6 +4261,8 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             tcb.sack_scoreboard_count = 0;
             const give_up = if (tcb.state == .syn_sent)
                 tcp_recv_policy.synGiveUp(tcb.retransmit_count - 1, tcp_recv_policy.effectiveSyncnt(tcb.options.syn_cnt), rtxElapsedMs(tcb), tcb.options.user_timeout_ms, tcb.options.rto_max_ms)
+            else if (tcb.state == .syn_received)
+                tcp_recv_policy.synAckGiveUp(tcb.retransmit_count, tcp_recv_policy.effectiveSynAckRetries(tcb.options.syn_cnt))
             else if (tcb.snd_wnd == 0 and tcp_recv_policy.zeroWindowState(tcb.state))
                 tcp_recv_policy.zeroWindowGiveUp(tcb.options.user_timeout_ms, rtxElapsedMs(tcb), tcb.peer_silent_ms)
             else

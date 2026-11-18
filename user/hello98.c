@@ -71,6 +71,7 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define SYS_MMAP        8
 #define SYS_MUNMAP      12
 #define SYS_SCHED_YIELD 24
+#define SYS_NANOSLEEP   35
 #define SYS_SYSINFO     99
 #define SYS_MPROTECT    164
 #define SYS_CLONE       243
@@ -264,11 +265,25 @@ void _start(void) {
     for (int i = 0; i < 256; i++) canary[i] = 0xCA0000UL + (uint64_t)i;
 
     /* ── Phase B: memory-pressure churn under the reclaim floor ──────── */
+    /* The process before this one is torn down by the reaper thread after its waitpid returns, so its memory can still be
+     * missing here. Give the count up to 3 s to settle before judging it (as hello99 does); a stable count that is too small is
+     * a real failure. */
     uint64_t sinfo[16];
-    for (int i = 0; i < 16; i++) sinfo[i] = 0;
-    if (syscall1(SYS_SYSINFO, (uint64_t)sinfo) != 0) fail_exit("sysinfo");
-    const uint64_t freeram_pages = sinfo[5] / 4096; /* freeram at offset 40 */
-    if (freeram_pages < MARGIN_PAGES * 3) fail_exit("not enough free RAM");
+    uint64_t freeram_pages = 0;
+    for (int round = 0; round < 30; round++) {
+        for (int i = 0; i < 16; i++) sinfo[i] = 0;
+        if (syscall1(SYS_SYSINFO, (uint64_t)sinfo) != 0) fail_exit("sysinfo");
+        freeram_pages = sinfo[5] / 4096; /* freeram at offset 40 */
+        if (freeram_pages >= MARGIN_PAGES * 3) break;
+        struct { int64_t s, ns; } wait = { 0, 100000000L };
+        syscall3(SYS_NANOSLEEP, (uint64_t)&wait, 0, 0);
+    }
+    if (freeram_pages < MARGIN_PAGES * 3) {
+        print("hello98:   freeram pages=");
+        print_dec((int64_t)freeram_pages);
+        print("\n");
+        fail_exit("not enough free RAM");
+    }
     const uint64_t floor = freeram_pages - MARGIN_PAGES;
     saved_floor = syscall1(SYS_PMM_SET_RECLAIM_FLOOR, floor);
     print("hello98:   reclaim floor set (freeram pages=");

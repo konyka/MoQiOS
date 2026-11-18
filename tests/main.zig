@@ -15585,7 +15585,7 @@ test "TCP_SYNCNT and the SYN retransmission schedule (hello408): Linux tcp_write
     try std.testing.expect(!rp.synGiveUp(10, 127, 1_000_000, 0, 120_000));
     try std.testing.expect(rp.synGiveUp(131, 127, 1_000_000, 0, 120_000));
     const ts = kt.tcp_source;
-    try std.testing.expect(std.mem.indexOf(u8, ts, "const base_rto = @min(if (tcb.state == .syn_sent) tcp_recv_policy.synRtoMs(@as(u32, tcb.retransmit_count) + 1, tcb.options.rto_max_ms) else if (tcb.rto > 0) tcb.rto else RETRANSMIT_MS, tcb.options.rto_max_ms);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const base_rto = @min(if (tcb.state == .syn_sent) tcp_recv_policy.synRtoMs(@as(u32, tcb.retransmit_count) + 1, tcb.options.rto_max_ms) else if (tcb.state == .syn_received) tcp_recv_policy.synAckRtoMs(@as(u32, tcb.retransmit_count) + 1, tcb.options.rto_max_ms) else if (tcb.rto > 0) tcb.rto else RETRANSMIT_MS, tcb.options.rto_max_ms);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "tcp_recv_policy.synGiveUp(tcb.retransmit_count - 1, tcp_recv_policy.effectiveSyncnt(tcb.options.syn_cnt), rtxElapsedMs(tcb), tcb.options.user_timeout_ms, tcb.options.rto_max_ms)") != null);
 }
 
@@ -15690,6 +15690,28 @@ test "accepted connections start with the listener's options (hello412): Linux s
     // Both families' SYN paths (fresh slot and TIME_WAIT reuse) take the listener's options.
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, ts, ".options = listenerOptions(ls);"));
     try std.testing.expect(std.mem.indexOf(u8, ts, "return tcp_recv_policy.childOptions(socket_opt.SocketOptions, tcbs[slot.tcb_idx].options);") != null);
+}
+
+test "SYN-ACK retransmissions of a half-open connection (hello413): Linux reqsk_timer_handler / syn_ack_recalc / tcp_reqsk_timeout" {
+    const rp = kt.tcp_recv_policy;
+    // tcp_reqsk_timeout: TCP_TIMEOUT_INIT (1 s) doubled per earlier expiry, at most the RTO cap.
+    try std.testing.expectEqual(@as(u32, 1000), rp.synAckRtoMs(1, 120_000));
+    try std.testing.expectEqual(@as(u32, 2000), rp.synAckRtoMs(2, 120_000));
+    try std.testing.expectEqual(@as(u32, 16_000), rp.synAckRtoMs(5, 120_000));
+    try std.testing.expectEqual(@as(u32, 120_000), rp.synAckRtoMs(40, 120_000));
+    try std.testing.expectEqual(@as(u32, 1000), rp.synAckRtoMs(3, 1000));
+    // tcp_synack_retries (5), or the listener's TCP_SYNCNT, which the child inherits.
+    try std.testing.expectEqual(@as(u32, 5), rp.effectiveSynAckRetries(0));
+    try std.testing.expectEqual(@as(u32, 2), rp.effectiveSynAckRetries(2));
+    // syn_ack_recalc: the k-th expiry (num_timeout = k - 1 earlier ones) drops the request once num_timeout reaches the limit.
+    try std.testing.expect(!rp.synAckGiveUp(1, 2));
+    try std.testing.expect(!rp.synAckGiveUp(2, 2));
+    try std.testing.expect(rp.synAckGiveUp(3, 2));
+    try std.testing.expect(!rp.synAckGiveUp(5, 5));
+    try std.testing.expect(rp.synAckGiveUp(6, 5));
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "else if (tcb.state == .syn_received) tcp_recv_policy.synAckRtoMs(@as(u32, tcb.retransmit_count) + 1, tcb.options.rto_max_ms)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "else if (tcb.state == .syn_received)\n                tcp_recv_policy.synAckGiveUp(tcb.retransmit_count, tcp_recv_policy.effectiveSynAckRetries(tcb.options.syn_cnt))") != null);
 }
 
 test "IPv6 extension headers on input (hello410): hop-by-hop and destination options are stepped over (Linux ipv6_parse_hopopts / ip6_parse_tlv)" {

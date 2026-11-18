@@ -363,6 +363,27 @@ pub fn synGiveUp(retransmits: u32, syncnt: u32, elapsed_ms: u64, user_timeout_ms
     return elapsed_ms >= limit;
 }
 
+/// net.ipv4.tcp_synack_retries: SYN-ACK retransmissions before a half-open connection is dropped.
+pub const SYNACK_RETRIES: u32 = 5;
+
+/// tcp_reqsk_timeout: how long a SYN-ACK waits before the `k`-th expiry (1: the first), TCP_TIMEOUT_INIT doubled per earlier
+/// expiry, at most the RTO cap.
+pub fn synAckRtoMs(k: u32, rto_max_ms: u32) u32 {
+    const shift = k -| 1;
+    if (shift >= 17) return rto_max_ms;
+    return @min(SYN_RTO_MS << @intCast(shift), rto_max_ms);
+}
+
+/// reqsk_timer_handler: the listener's TCP_SYNCNT (the child inherits it), tcp_synack_retries while it is unset.
+pub fn effectiveSynAckRetries(syn_cnt: u32) u32 {
+    return if (syn_cnt == 0) SYNACK_RETRIES else syn_cnt;
+}
+
+/// syn_ack_recalc: the `expiry`-th expiry (num_timeout = expiry - 1 before it) drops the request once num_timeout reaches the limit.
+pub fn synAckGiveUp(expiry: u32, max_retries: u32) bool {
+    return expiry > max_retries;
+}
+
 /// tcp_probe_timer: zero-window probing goes on as long as the peer answers (RFC 1122 4.2.2.17); with TCP_USER_TIMEOUT the
 /// connection gives up once the window has stayed shut `shut_ms` that long.
 pub fn persistGiveUp(user_timeout_ms: u32, shut_ms: u64) bool {
