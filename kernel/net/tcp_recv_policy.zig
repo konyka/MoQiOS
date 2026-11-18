@@ -2,6 +2,7 @@
 //! is empty, as a function of connection state, and whether a blocking
 //! reader waits instead. Host-testable (no arch deps).
 
+const std = @import("std");
 const errno = @import("../lib/errno.zig");
 
 /// TCP connection states (RFC 793). Declaration order is ABI for
@@ -239,12 +240,42 @@ pub fn userTimeoutErrno(val: i32) i64 {
     return if (val < 0) EINVAL else 0;
 }
 
-/// tcp_write_timeout → retransmits_timed_out, at the `retransmits`-th expiry of the retransmission timer (1: the first): without a
-/// user timeout the connection gives up after `max_retries` retransmissions; with one, once `elapsed_ms` since the oldest
-/// unacknowledged data went out reaches it, whatever the count, but never at the first expiry, which only retransmits.
-pub fn retransGiveUp(retransmits: u32, max_retries: u32, user_timeout_ms: u32, elapsed_ms: u64) bool {
-    if (user_timeout_ms == 0) return retransmits > max_retries;
-    return retransmits >= 2 and elapsed_ms >= user_timeout_ms;
+/// net.ipv4.tcp_retries2, TCP_RTO_MIN, and the orphan retries tcp_orphan_retries picks while the RTO is below the cap.
+pub const RETRIES2: u32 = 15;
+pub const RTO_MIN_MS: u32 = 200;
+pub const ORPHAN_RETRIES_ALIVE: u32 = 8;
+
+pub const RetransState = struct {
+    /// The expiry of the retransmission timer this is (1: the first).
+    retransmits: u32,
+    /// Since the oldest unacknowledged data went out (retrans_stamp).
+    elapsed_ms: u64,
+    user_timeout_ms: u32 = 0,
+    rto_max_ms: u32 = RTO_MAX_MS,
+    /// Closed by its owner (SOCK_DEAD), with the RTO the timer ran on.
+    orphan: bool = false,
+    rto_ms: u32 = 0,
+};
+
+/// tcp_write_timeout → retransmits_timed_out for any state but SYN_SENT: never at the first expiry, which only retransmits. With a
+/// user timeout the connection gives up once `elapsed_ms` reaches it; without one, once it reaches the time tcp_retries2
+/// backed-off retransmissions from TCP_RTO_MIN take under the socket's RTO cap (tcp_model_timeout), whatever the count. An orphan
+/// gets tcp_orphan_retries instead: 8 while its RTO is below the cap, 0 once it reached it.
+pub fn retransGiveUp(st: RetransState) bool {
+    if (st.retransmits < 2) return false;
+    if (st.user_timeout_ms != 0) return st.elapsed_ms >= st.user_timeout_ms;
+    const boundary: u32 = if (!st.orphan) RETRIES2 else if (st.rto_ms < st.rto_max_ms) ORPHAN_RETRIES_ALIVE else 0;
+    return st.elapsed_ms >= modelTimeoutMs(boundary, RTO_MIN_MS, st.rto_max_ms);
+}
+
+/// TCP_RTO_MAX_MS: 1 s to TCP_RTO_MAX_SEC (120 s), anything else EINVAL.
+pub fn rtoMaxErrno(val: i32) i64 {
+    return if (val < 1000 or val > @as(i32, RTO_MAX_MS)) EINVAL else 0;
+}
+
+/// tcp_retransmit_timer: the RTO doubles after an expiry, at most the socket's cap.
+pub fn backoffRto(rto: u32, rto_max_ms: u32) u32 {
+    return if (rto > rto_max_ms / 2) rto_max_ms else rto * 2;
 }
 
 /// tcp_clamp_rto_to_user_timeout: the retransmission timer waits at most what is left of the user timeout (1 ms once it passed).
@@ -297,28 +328,29 @@ pub fn effectiveSyncnt(syn_cnt: u32) u32 {
 
 /// How long a SYN waits before the `k`-th expiry of its retransmission timer (1: the first): TCP_TIMEOUT_INIT for the first
 /// tcp_syn_linear_timeouts + 1 waits, then doubling (tcp_retransmit_timer backs off only past total_rto > linear_timeouts), at most
-/// TCP_RTO_MAX.
-pub fn synRtoMs(k: u32) u32 {
-    if (k <= SYN_LINEAR_TIMEOUTS + 1) return SYN_RTO_MS;
+/// the socket's RTO cap.
+pub fn synRtoMs(k: u32, rto_max_ms: u32) u32 {
+    if (k <= SYN_LINEAR_TIMEOUTS + 1) return @min(SYN_RTO_MS, rto_max_ms);
     const shift = k - (SYN_LINEAR_TIMEOUTS + 1);
-    if (shift >= 7) return RTO_MAX_MS;
-    return @min(SYN_RTO_MS << @intCast(shift), RTO_MAX_MS);
+    if (shift >= 7) return rto_max_ms;
+    return @min(SYN_RTO_MS << @intCast(shift), rto_max_ms);
 }
 
-/// tcp_model_timeout(boundary, TCP_TIMEOUT_INIT): how long `boundary` exponentially backed-off retransmissions take, in ms.
-fn modelTimeoutMs(boundary: u32) u64 {
-    const thresh: u32 = 6; // ilog2(TCP_RTO_MAX / TCP_TIMEOUT_INIT)
-    if (boundary <= thresh) return ((@as(u64, 2) << @intCast(boundary)) - 1) * SYN_RTO_MS;
-    return ((@as(u64, 2) << thresh) - 1) * SYN_RTO_MS + @as(u64, boundary - thresh) * RTO_MAX_MS;
+/// tcp_model_timeout(boundary, rto_base): how long `boundary` exponentially backed-off retransmissions starting at `rto_base` take,
+/// in ms, with the RTO capped at `rto_max_ms`.
+pub fn modelTimeoutMs(boundary: u32, rto_base: u32, rto_max_ms: u32) u64 {
+    const thresh: u32 = std.math.log2_int(u32, @max(1, rto_max_ms / rto_base));
+    if (boundary <= thresh) return ((@as(u64, 2) << @intCast(boundary)) - 1) * rto_base;
+    return ((@as(u64, 2) << @intCast(thresh)) - 1) * rto_base + @as(u64, boundary - thresh) * rto_max_ms;
 }
 
 /// tcp_write_timeout for SYN_SENT, at an expiry after `retransmits` retransmissions: give up once syncnt +
 /// tcp_syn_linear_timeouts of them went out, or (from the first retransmission on) once `elapsed_ms` since the SYN reaches the user
-/// timeout, or without one the time `syncnt` backed-off retransmissions would take.
-pub fn synGiveUp(retransmits: u32, syncnt: u32, elapsed_ms: u64, user_timeout_ms: u32) bool {
+/// timeout, or without one the time `syncnt` backed-off retransmissions from TCP_TIMEOUT_INIT would take under the RTO cap.
+pub fn synGiveUp(retransmits: u32, syncnt: u32, elapsed_ms: u64, user_timeout_ms: u32, rto_max_ms: u32) bool {
     if (retransmits >= syncnt + SYN_LINEAR_TIMEOUTS) return true;
     if (retransmits == 0) return false;
-    const limit: u64 = if (user_timeout_ms != 0) user_timeout_ms else modelTimeoutMs(syncnt);
+    const limit: u64 = if (user_timeout_ms != 0) user_timeout_ms else modelTimeoutMs(syncnt, SYN_RTO_MS, rto_max_ms);
     return elapsed_ms >= limit;
 }
 

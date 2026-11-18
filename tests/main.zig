@@ -15507,15 +15507,14 @@ test "TCP_USER_TIMEOUT and the end of an unanswered connection (hello407): Linux
     try std.testing.expectEqual(@as(i64, 0), rp.userTimeoutErrno(0));
     try std.testing.expectEqual(@as(i64, 0), rp.userTimeoutErrno(1500));
     try std.testing.expectEqual(@as(i64, -22), rp.userTimeoutErrno(-1));
-    // tcp_write_timeout: without a user timeout the retransmission count decides; with one, the time since the first unanswered
-    // retransmission (retrans_stamp), whatever the count.
-    try std.testing.expect(!rp.retransGiveUp(5, 5, 0, 99_000));
-    try std.testing.expect(rp.retransGiveUp(6, 5, 0, 0));
-    try std.testing.expect(!rp.retransGiveUp(2, 5, 1000, 999));
-    try std.testing.expect(rp.retransGiveUp(2, 5, 1000, 1000));
+    // tcp_write_timeout: without a user timeout the tcp_retries2 time model decides (hello411); with one, the time since the first
+    // unanswered retransmission (retrans_stamp), whatever the count.
+    try std.testing.expect(!rp.retransGiveUp(.{ .retransmits = 6, .elapsed_ms = 99_000 }));
+    try std.testing.expect(!rp.retransGiveUp(.{ .retransmits = 2, .elapsed_ms = 999, .user_timeout_ms = 1000 }));
+    try std.testing.expect(rp.retransGiveUp(.{ .retransmits = 2, .elapsed_ms = 1000, .user_timeout_ms = 1000 }));
     // The first expiry only retransmits (retransmits_timed_out is false while icsk_retransmits is 0).
-    try std.testing.expect(!rp.retransGiveUp(1, 5, 1000, 5000));
-    try std.testing.expect(!rp.retransGiveUp(6, 5, 60_000, 30_000));
+    try std.testing.expect(!rp.retransGiveUp(.{ .retransmits = 1, .elapsed_ms = 5000, .user_timeout_ms = 1000 }));
+    try std.testing.expect(!rp.retransGiveUp(.{ .retransmits = 6, .elapsed_ms = 30_000, .user_timeout_ms = 60_000 }));
     // tcp_clamp_rto_to_user_timeout: the next timer never waits past the user timeout (at least 1 ms once it has passed).
     try std.testing.expectEqual(@as(u32, 2000), rp.clampRto(2000, 0, 500));
     try std.testing.expectEqual(@as(u32, 500), rp.clampRto(2000, 1000, 500));
@@ -15534,7 +15533,7 @@ test "TCP_USER_TIMEOUT and the end of an unanswered connection (hello407): Linux
     try std.testing.expectEqual(@as(i32, 113), rp.timeoutErrno(113));
     const ts = kt.tcp_source;
     // hello408: SYN_SENT follows synGiveUp, every other state retransGiveUp.
-    try std.testing.expect(std.mem.indexOf(u8, ts, "tcp_recv_policy.retransGiveUp(tcb.retransmit_count, TCP_RETRIES, tcb.options.user_timeout_ms, rtxElapsedMs(tcb));\n            if (give_up) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "            });\n            if (give_up) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "tcb.options.so_error = tcp_recv_policy.timeoutErrno(tcb.soft_err);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcp_recv_policy.keepaliveGiveUp(tcb.keepalive_probes, tcb.options.keep_cnt, tcb.options.user_timeout_ms, tcb.idle_ms)) {") != null);
     const so = kt.socket_opt_source;
@@ -15568,27 +15567,27 @@ test "TCP_SYNCNT and the SYN retransmission schedule (hello408): Linux tcp_write
     try std.testing.expectEqual(@as(u32, 3), rp.effectiveSyncnt(3));
     // The wait before the k-th expiry: 1 s for the first five (tcp_syn_linear_timeouts 4, then the doubling starts), then 2, 4, ...
     // up to TCP_RTO_MAX (120 s).
-    for (1..6) |k| try std.testing.expectEqual(@as(u32, 1000), rp.synRtoMs(@intCast(k)));
-    try std.testing.expectEqual(@as(u32, 2000), rp.synRtoMs(6));
-    try std.testing.expectEqual(@as(u32, 4000), rp.synRtoMs(7));
-    try std.testing.expectEqual(@as(u32, 120_000), rp.synRtoMs(20));
+    for (1..6) |k| try std.testing.expectEqual(@as(u32, 1000), rp.synRtoMs(@intCast(k), 120_000));
+    try std.testing.expectEqual(@as(u32, 2000), rp.synRtoMs(6, 120_000));
+    try std.testing.expectEqual(@as(u32, 4000), rp.synRtoMs(7, 120_000));
+    try std.testing.expectEqual(@as(u32, 120_000), rp.synRtoMs(20, 120_000));
     // An expiry, after `retransmits` retransmissions so far, gives up (instead of resending) once TCP_SYNCNT + 4 went out, or
     // ((2 << syncnt) - 1) s passed since the SYN; with a user timeout, once that passed (never at the first expiry).
-    try std.testing.expect(!rp.synGiveUp(1, 1, 2000, 0));
-    try std.testing.expect(rp.synGiveUp(2, 1, 3000, 0));
-    try std.testing.expect(!rp.synGiveUp(4, 2, 5000, 0));
-    try std.testing.expect(rp.synGiveUp(6, 2, 7000, 0));
-    try std.testing.expect(!rp.synGiveUp(6, 3, 11000, 0));
-    try std.testing.expect(rp.synGiveUp(7, 3, 11000, 0));
-    try std.testing.expect(!rp.synGiveUp(1, 6, 2400, 2500));
-    try std.testing.expect(rp.synGiveUp(2, 6, 2500, 2500));
-    try std.testing.expect(!rp.synGiveUp(0, 6, 5000, 2500));
+    try std.testing.expect(!rp.synGiveUp(1, 1, 2000, 0, 120_000));
+    try std.testing.expect(rp.synGiveUp(2, 1, 3000, 0, 120_000));
+    try std.testing.expect(!rp.synGiveUp(4, 2, 5000, 0, 120_000));
+    try std.testing.expect(rp.synGiveUp(6, 2, 7000, 0, 120_000));
+    try std.testing.expect(!rp.synGiveUp(6, 3, 11000, 0, 120_000));
+    try std.testing.expect(rp.synGiveUp(7, 3, 11000, 0, 120_000));
+    try std.testing.expect(!rp.synGiveUp(1, 6, 2400, 2500, 120_000));
+    try std.testing.expect(rp.synGiveUp(2, 6, 2500, 2500, 120_000));
+    try std.testing.expect(!rp.synGiveUp(0, 6, 5000, 2500, 120_000));
     // Large syncnt: the time model saturates instead of overflowing.
-    try std.testing.expect(!rp.synGiveUp(10, 127, 1_000_000, 0));
-    try std.testing.expect(rp.synGiveUp(131, 127, 1_000_000, 0));
+    try std.testing.expect(!rp.synGiveUp(10, 127, 1_000_000, 0, 120_000));
+    try std.testing.expect(rp.synGiveUp(131, 127, 1_000_000, 0, 120_000));
     const ts = kt.tcp_source;
-    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.state == .syn_sent) tcp_recv_policy.synRtoMs(@as(u32, tcb.retransmit_count) + 1) else") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ts, "tcp_recv_policy.synGiveUp(tcb.retransmit_count - 1, tcp_recv_policy.effectiveSyncnt(tcb.options.syn_cnt), rtxElapsedMs(tcb), tcb.options.user_timeout_ms)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const base_rto = @min(if (tcb.state == .syn_sent) tcp_recv_policy.synRtoMs(@as(u32, tcb.retransmit_count) + 1, tcb.options.rto_max_ms) else if (tcb.rto > 0) tcb.rto else RETRANSMIT_MS, tcb.options.rto_max_ms);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "tcp_recv_policy.synGiveUp(tcb.retransmit_count - 1, tcp_recv_policy.effectiveSyncnt(tcb.options.syn_cnt), rtxElapsedMs(tcb), tcb.options.user_timeout_ms, tcb.options.rto_max_ms)") != null);
 }
 
 test "zero-window probes (hello409): probing goes on while the window stays shut, TCP_USER_TIMEOUT bounds it (Linux tcp_probe_timer / tcp_xmit_probe_skb)" {
@@ -15622,6 +15621,60 @@ test "retransmissions into a zero window are probes (hello409): Linux tcp_retran
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "else if (tcb.snd_wnd == 0 and tcp_recv_policy.zeroWindowState(tcb.state))\n                tcp_recv_policy.zeroWindowGiveUp(tcb.options.user_timeout_ms, rtxElapsedMs(tcb), tcb.peer_silent_ms)") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "tcb.peer_silent_ms = 0;") != null);
+}
+
+test "established connections give up on time (hello411): Linux tcp_write_timeout / retransmits_timed_out / tcp_model_timeout, TCP_RTO_MAX_MS" {
+    const rp = kt.tcp_recv_policy;
+    // TCP_RTO_MAX_MS: 1000..120000 ms (TCP_RTO_MAX_SEC), anything else EINVAL.
+    try std.testing.expectEqual(@as(i64, -22), rp.rtoMaxErrno(999));
+    try std.testing.expectEqual(@as(i64, -22), rp.rtoMaxErrno(120_001));
+    try std.testing.expectEqual(@as(i64, -22), rp.rtoMaxErrno(-1));
+    try std.testing.expectEqual(@as(i64, 0), rp.rtoMaxErrno(1000));
+    try std.testing.expectEqual(@as(i64, 0), rp.rtoMaxErrno(120_000));
+    // tcp_model_timeout(boundary, rto_base): doubling from rto_base until the cap, then one cap per retransmission.
+    try std.testing.expectEqual(@as(u64, 924_600), rp.modelTimeoutMs(15, 200, 120_000));
+    try std.testing.expectEqual(@as(u64, 14_400), rp.modelTimeoutMs(15, 200, 1000));
+    try std.testing.expectEqual(@as(u64, 102_200), rp.modelTimeoutMs(8, 200, 120_000));
+    try std.testing.expectEqual(@as(u64, 200), rp.modelTimeoutMs(0, 200, 120_000));
+    try std.testing.expectEqual(@as(u64, 127_000), rp.modelTimeoutMs(6, 1000, 120_000));
+    try std.testing.expectEqual(@as(u64, 4000), rp.modelTimeoutMs(3, 1000, 1000));
+    // Without a user timeout an established connection gives up once the oldest unacknowledged data waited the time tcp_retries2
+    // (15) backed-off retransmissions take, whatever the count, and never at the first expiry.
+    try std.testing.expect(!rp.retransGiveUp(.{ .retransmits = 2, .elapsed_ms = 924_599 }));
+    try std.testing.expect(rp.retransGiveUp(.{ .retransmits = 2, .elapsed_ms = 924_600 }));
+    try std.testing.expect(!rp.retransGiveUp(.{ .retransmits = 40, .elapsed_ms = 900_000 }));
+    try std.testing.expect(!rp.retransGiveUp(.{ .retransmits = 1, .elapsed_ms = 2_000_000 }));
+    try std.testing.expect(!rp.retransGiveUp(.{ .retransmits = 9, .elapsed_ms = 14_399, .rto_max_ms = 1000 }));
+    try std.testing.expect(rp.retransGiveUp(.{ .retransmits = 9, .elapsed_ms = 14_400, .rto_max_ms = 1000 }));
+    // With a user timeout, that decides (hello407).
+    try std.testing.expect(!rp.retransGiveUp(.{ .retransmits = 2, .elapsed_ms = 999, .user_timeout_ms = 1000 }));
+    try std.testing.expect(rp.retransGiveUp(.{ .retransmits = 2, .elapsed_ms = 1000, .user_timeout_ms = 1000 }));
+    try std.testing.expect(!rp.retransGiveUp(.{ .retransmits = 1, .elapsed_ms = 5000, .user_timeout_ms = 1000 }));
+    try std.testing.expect(!rp.retransGiveUp(.{ .retransmits = 30, .elapsed_ms = 30_000, .user_timeout_ms = 60_000 }));
+    // An orphan (closed, SOCK_DEAD) gets tcp_orphan_retries: 8 while its RTO is below the cap, 0 once it reached it.
+    try std.testing.expect(!rp.retransGiveUp(.{ .retransmits = 2, .elapsed_ms = 102_199, .orphan = true, .rto_ms = 400 }));
+    try std.testing.expect(rp.retransGiveUp(.{ .retransmits = 2, .elapsed_ms = 102_200, .orphan = true, .rto_ms = 400 }));
+    try std.testing.expect(rp.retransGiveUp(.{ .retransmits = 2, .elapsed_ms = 200, .orphan = true, .rto_ms = 1000, .rto_max_ms = 1000 }));
+    try std.testing.expect(!rp.retransGiveUp(.{ .retransmits = 2, .elapsed_ms = 7399, .orphan = true, .rto_ms = 800, .rto_max_ms = 1000 }));
+    // The SYN schedule and its time model follow the cap too.
+    try std.testing.expectEqual(@as(u32, 1000), rp.synRtoMs(9, 1000));
+    try std.testing.expectEqual(@as(u32, 2000), rp.synRtoMs(6, 120_000));
+    try std.testing.expect(!rp.synGiveUp(3, 3, 3999, 0, 1000));
+    try std.testing.expect(rp.synGiveUp(3, 3, 4000, 0, 1000));
+    // The backed-off RTO stops at the socket's cap.
+    try std.testing.expectEqual(@as(u32, 1000), rp.backoffRto(800, 1000));
+    try std.testing.expectEqual(@as(u32, 120_000), rp.backoffRto(100_000, 120_000));
+    try std.testing.expectEqual(@as(u32, 1600), rp.backoffRto(800, 120_000));
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "TCP_RETRIES") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "tcp_recv_policy.retransGiveUp(.{\n                    .retransmits = tcb.retransmit_count,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, ".orphan = tcb.ref_count == 0,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "tcb.rto = tcp_recv_policy.backoffRto(tcb.rto, tcb.options.rto_max_ms);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.rto > tcb.options.rto_max_ms) tcb.rto = tcb.options.rto_max_ms;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "else RETRANSMIT_MS, tcb.options.rto_max_ms);") != null);
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "opts.rto_max_ms = @intCast(v);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "bo.writeU32Le(val_buf[0..4], opts.rto_max_ms);") != null);
 }
 
 test "IPv6 extension headers on input (hello410): hop-by-hop and destination options are stepped over (Linux ipv6_parse_hopopts / ip6_parse_tlv)" {

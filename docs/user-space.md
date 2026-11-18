@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello410`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello411`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -405,6 +405,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello408 | TCP_SYNCNT 和 SYN 重传（SYN 发往队列已满的监听端口，没人应答）：默认读 6，0、128、-1、2 字节都是 EINVAL，1 和 127 读回（A）；TCP_SYNCNT 1 发 3 个 SYN、约 3 秒 ETIMEDOUT（O）；TCP_SYNCNT 2 发 6 个 SYN、约 7 秒 ETIMEDOUT（T）；TCP_SYNCNT 6 加 TCP_USER_TIMEOUT 2500 发 3 个 SYN、约 2.5 秒 ETIMEDOUT（U） |
 | hello409 | 零窗口探测和 TCP_USER_TIMEOUT（对端 SO_RCVBUF 2048 且不读）：没有用户超时时发送方 20 秒后仍然打开、SO_ERROR 0，对端随后读到全部数据（K）；TCP_USER_TIMEOUT 2000 时 1 到 5 秒内 POLLERR、SO_ERROR 110（U） |
 | hello410 | IPv6 输入的扩展头（经 IPPROTO_RAW 整包发往 ::1）：目的选项头后的 UDP 数据报交给已绑定的 UDP 套接字，协议 60 的 raw 套接字收到从目的选项头开始的 20 字节，协议 17 的收到 12 字节 UDP（D）；逐跳头后也交付，Pad1 和高两位 00 的未知选项被跳过（H）；高两位 01 的未知选项静默丢弃，10 的丢弃并回参数问题代码 2、指针 42（O）；"无下一头部"丢弃不回（N）；目的选项头后的未知下一头部 252 回参数问题代码 1、指针 40（P） |
+| hello411 | 已建立连接按时间放弃和 TCP_RTO_MAX_MS（对端用 IPPROTO_RAW 伪造，见 hello407）：TCP_RTO_MAX_MS 默认读回 120000，999、120001、2 字节值都是 EINVAL，1000 读回 1000（A）；TCP_RTO_MAX_MS 1000 时没人确认的数据在 13 到 19 秒后结束连接（SO_ERROR 110），其间 9 到 23 次数据重传，两次之间不超过 1.6 秒（R）；TCP_RTO_MAX_MS 1000、TCP_SYNCNT 3 时连到满的监听者 3.5 到 6.5 秒后 ETIMEDOUT，发出 3 到 5 个 SYN，间隔不超过 1.6 秒（C） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

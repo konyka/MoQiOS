@@ -83,14 +83,10 @@ const SEND_BUF_SIZE: u32 = 65536;
 const RECV_BUF_SIZE: u32 = 65536;
 const RETRANSMIT_MS: u32 = 2000; // initial RTO (ms), overridden by Jacobson/Karels
 const TCP_RTO_MIN: u32 = 200; // minimum RTO (ms)
-/// Retransmissions before an unanswered connection gives up without TCP_USER_TIMEOUT (Linux tcp_retries2 is 15).
-const TCP_RETRIES: u32 = 5;
-
 /// What tcp_write_timeout measures TCP_USER_TIMEOUT against: the time since the oldest unacknowledged data went out.
 fn rtxElapsedMs(tcb: *const TcpTcb) u64 {
     return tcb.rtx_elapsed_ms;
 }
-const TCP_RTO_MAX: u32 = 60000; // maximum RTO (ms)
 /// RFC 6675 DupThresh for SACK loss detection (SK-112).
 const DUP_THRESH: u32 = 3;
 const DELAYED_ACK_MS: u32 = 100; // delay ACK by 100ms (reduces ACK count ~50%)
@@ -1791,7 +1787,7 @@ fn updateRtt(tcb: *TcpTcb, m: u32) void {
     if (m > 0 and (tcb.min_rtt_ms == 0 or m < tcb.min_rtt_ms)) tcb.min_rtt_ms = m;
     tcb.rto = tcb.srtt + @max(200, 4 * tcb.rttvar);
     if (tcb.rto < TCP_RTO_MIN) tcb.rto = TCP_RTO_MIN;
-    if (tcb.rto > TCP_RTO_MAX) tcb.rto = TCP_RTO_MAX;
+    if (tcb.rto > tcb.options.rto_max_ms) tcb.rto = tcb.options.rto_max_ms;
     // SK-125: HyStart++ delay detect during slow start.
     noteHystartRtt(tcb, m);
 }
@@ -4238,7 +4234,8 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
         // Use per-TCB RTO if available, otherwise fall back to RETRANSMIT_MS; with TCP_USER_TIMEOUT the timer never waits past it
         // (tcp_clamp_rto_to_user_timeout, measured from when this RTO was armed).
         // A SYN follows its own schedule: 1 s for the first waits, then doubling (tcp_syn_linear_timeouts).
-        const base_rto = if (tcb.state == .syn_sent) tcp_recv_policy.synRtoMs(@as(u32, tcb.retransmit_count) + 1) else if (tcb.rto > 0) tcb.rto else RETRANSMIT_MS;
+        // Every wait is bounded by the socket's RTO cap (inet_csk_reset_xmit_timer's max_when, TCP_RTO_MAX_MS).
+        const base_rto = @min(if (tcb.state == .syn_sent) tcp_recv_policy.synRtoMs(@as(u32, tcb.retransmit_count) + 1, tcb.options.rto_max_ms) else if (tcb.rto > 0) tcb.rto else RETRANSMIT_MS, tcb.options.rto_max_ms);
         const current_rto = tcp_recv_policy.clampRto(base_rto, tcb.options.user_timeout_ms, tcb.rtx_elapsed_ms -| tcb.retransmit_timer);
         // SK-128: RACK timer repair before TLP/RTO (no new ACK required).
         _ = maybeRackTimerRepair(tcb, current_rto);
@@ -4262,11 +4259,18 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             // RTO nothing is trusted as delivered; resend from snd_una.
             tcb.sack_scoreboard_count = 0;
             const give_up = if (tcb.state == .syn_sent)
-                tcp_recv_policy.synGiveUp(tcb.retransmit_count - 1, tcp_recv_policy.effectiveSyncnt(tcb.options.syn_cnt), rtxElapsedMs(tcb), tcb.options.user_timeout_ms)
+                tcp_recv_policy.synGiveUp(tcb.retransmit_count - 1, tcp_recv_policy.effectiveSyncnt(tcb.options.syn_cnt), rtxElapsedMs(tcb), tcb.options.user_timeout_ms, tcb.options.rto_max_ms)
             else if (tcb.snd_wnd == 0 and tcp_recv_policy.zeroWindowState(tcb.state))
                 tcp_recv_policy.zeroWindowGiveUp(tcb.options.user_timeout_ms, rtxElapsedMs(tcb), tcb.peer_silent_ms)
             else
-                tcp_recv_policy.retransGiveUp(tcb.retransmit_count, TCP_RETRIES, tcb.options.user_timeout_ms, rtxElapsedMs(tcb));
+                tcp_recv_policy.retransGiveUp(.{
+                    .retransmits = tcb.retransmit_count,
+                    .elapsed_ms = rtxElapsedMs(tcb),
+                    .user_timeout_ms = tcb.options.user_timeout_ms,
+                    .rto_max_ms = tcb.options.rto_max_ms,
+                    .orphan = tcb.ref_count == 0,
+                    .rto_ms = base_rto,
+                });
             if (give_up) {
                 // Give up (tcp_write_err): the soft error an ICMP error left, else ETIMEDOUT; connect() fails with it, an established
                 // connection reports it to its next recv, send or SO_ERROR.
@@ -4302,7 +4306,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             if (tcp_util.seqLt(tcb.snd_max, tcb.snd_nxt)) tcb.snd_max = tcb.snd_nxt;
 
             // Exponential backoff for RTO
-            tcb.rto = @min(tcb.rto * 2, TCP_RTO_MAX);
+            tcb.rto = tcp_recv_policy.backoffRto(tcb.rto, tcb.options.rto_max_ms);
 
             // SK-108: RTO also starts at the first non-SACKed hole when possible.
             // cwnd=1 SMSS ⇒ F-RTO step-1 retransmits a single segment.
@@ -4358,10 +4362,10 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
                 closeTcbRemote(tcb);
                 return;
             }
-            const interval = if (tcb.persist_rto_ms > 0) tcb.persist_rto_ms else RETRANSMIT_MS;
+            const interval = @min(if (tcb.persist_rto_ms > 0) tcb.persist_rto_ms else RETRANSMIT_MS, tcb.options.rto_max_ms);
             if (tcb.persist_timer_ms >= interval) {
                 tcb.persist_timer_ms = 0;
-                tcb.persist_rto_ms = if (interval > TCP_RTO_MAX / 2) TCP_RTO_MAX else interval * 2;
+                tcb.persist_rto_ms = tcp_recv_policy.backoffRto(interval, tcb.options.rto_max_ms);
                 _ = sendPersistProbe(tcb);
             }
         } else {

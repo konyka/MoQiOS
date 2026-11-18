@@ -11,6 +11,7 @@ pub const TCP_DEFER_ACCEPT: u64 = 9;
 pub const TCP_SYNCNT: u64 = 7;
 pub const TCP_LINGER2: u64 = 8;
 pub const TCP_NOTSENT_LOWAT: u64 = 25;
+pub const TCP_RTO_MAX_MS: u64 = 44;
 
 /// Smallest MSS a TCP_MAXSEG set accepts and the largest (Linux: 88..=MAX_TCP_WINDOW-ish; we cap at the ring MSS).
 pub const MAXSEG_MIN: u32 = 88;
