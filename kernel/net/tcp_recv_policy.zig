@@ -494,6 +494,13 @@ pub fn notsentWritable(unsent: u32, lowat: i32) bool {
     return (@as(u64, unsent) << 1) < notsentLimit(lowat);
 }
 
+/// tcp_event_new_data_sent -> tcp_check_space -> sk_stream_write_space: data that just went out (a window opened, cwnd grew) lowered
+/// the unsent bytes from `before` to `after`; blocked writers and pollers are told when that made the socket writable by the
+/// TCP_NOTSENT_LOWAT poll rule. Without a limit the ACK that freed ring space already told them.
+pub fn notsentWakeOnSend(before: u32, after: u32, lowat: i32) bool {
+    return lowat != 0 and after < before and !notsentWritable(before, lowat) and notsentWritable(after, lowat);
+}
+
 // ── TCP_LINGER2 and the orphan in FIN_WAIT2 (Linux do_tcp_setsockopt, tcp_fin_time, tcp_close, tcp_rcv_state_process) ──
 
 /// sysctl tcp_fin_timeout default and TCP_FIN_TIMEOUT_MAX.

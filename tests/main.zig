@@ -15876,6 +15876,24 @@ test "TCP_NOTSENT_LOWAT (hello416): Linux tcp_stream_memory_free / tcp_poll / do
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (!tcp_recv_policy.notsentWritable(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat)) 0 else") != null);
 }
 
+test "TCP_NOTSENT_LOWAT wake on new data sent (hello420): Linux tcp_event_new_data_sent -> tcp_check_space -> sk_stream_write_space" {
+    const rp = kt.tcp_recv_policy;
+    // Sending data only lowers the unsent bytes: the writer and pollers hear it when the socket became writable by the poll rule.
+    try std.testing.expect(rp.notsentWakeOnSend(1500, 400, 1024));
+    try std.testing.expect(!rp.notsentWakeOnSend(1500, 600, 1024));
+    try std.testing.expect(!rp.notsentWakeOnSend(400, 300, 1024));
+    try std.testing.expect(!rp.notsentWakeOnSend(1500, 1500, 1024));
+    // No limit set: the ACK path's own wake already covers it.
+    try std.testing.expect(!rp.notsentWakeOnSend(1500, 0, 0));
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const unsent_before = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "defer if (tcp_recv_policy.notsentWakeOnSend(unsent_before, ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat)) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "write_space_pending.set(tcbIdx(tcb));") != null);
+    // The EPOLLOUT notes are sent after tcp_lock is released, wherever the lock is released.
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!write_space_pending.isEmpty()) ws = write_space_pending.takeAll();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!ws.isEmpty()) notifyWriteSpace(&ws);") != null);
+}
+
 test "TCP_LINGER2 (hello417): Linux do_tcp_setsockopt / tcp_fin_time / orphan FIN_WAIT2 in tcp_close and tcp_rcv_state_process" {
     const rp = kt.tcp_recv_policy;
     // setsockopt: a negative value is kept as -1, one above TCP_FIN_TIMEOUT_MAX (120 s) as 120 s, else the seconds (stored in ms).

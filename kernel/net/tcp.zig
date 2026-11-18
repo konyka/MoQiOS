@@ -59,8 +59,11 @@ const TcpLock = struct {
 
     inline fn release(self: *TcpLock, saved: u64) void {
         const chain = if (!recv_wake_pending.isEmpty() or !send_wake_pending.isEmpty()) takeRecvWakesLocked() else null;
+        var ws: TcbSet = .{};
+        if (!write_space_pending.isEmpty()) ws = write_space_pending.takeAll();
         self.inner.release(saved);
         if (chain != null) wakeRecvChain(chain);
+        if (!ws.isEmpty()) notifyWriteSpace(&ws);
     }
 };
 
@@ -438,6 +441,19 @@ inline fn markRecvWake(tcb: *const TcpTcb) void {
 inline fn markSendWake(tcb: *const TcpTcb) void {
     const idx = tcbIdx(tcb);
     if (send_waiters[idx] != null) send_wake_pending.set(idx);
+}
+
+/// Connections whose data going out made them writable under TCP_NOTSENT_LOWAT (flushSendBuffer, tcp_lock held); TcpLock.release
+/// takes the set and tells epoll and poll after dropping the lock.
+var write_space_pending: TcbSet = .{};
+
+/// EPOLLOUT for every connection in `ws` that is still writable. Called with tcp_lock released (tcpReadiness takes it).
+fn notifyWriteSpace(ws: *TcbSet) void {
+    const epoll = @import("epoll.zig");
+    while (ws.next()) |idx| {
+        const ev = tcpReadiness(idx);
+        if (ev & epoll.EPOLLOUT != 0) epoll.epollNotify(.tcp_socket, idx, ev);
+    }
 }
 
 /// Unlink every waiter of the slots marked by markRecvWake (tcp_lock held)
@@ -3587,6 +3603,11 @@ pub fn tcpSendFromUser(tcb_idx: u32, user_addr: u64, len: u32) i64 {
 /// Uses min(cwnd, snd_wnd) as the effective send window.
 /// When TCP_CORK is set, only full MSS segments are sent (partial segments are held).
 fn flushSendBuffer(tcb: *TcpTcb) void {
+    const unsent_before = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
+    defer if (tcp_recv_policy.notsentWakeOnSend(unsent_before, ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat)) {
+        markSendWake(tcb);
+        write_space_pending.set(tcbIdx(tcb));
+    };
     while (true) {
         // SK-108: skip SACKed ranges so selective retransmit does not resend them.
         skipSackedSendRange(tcb);

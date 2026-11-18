@@ -536,6 +536,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello417"); /* TCP_LINGER2: orphan FIN_WAIT2 timeout and reset */
     run_test("hello418"); /* IPv4 id and DF of kernel-built headers */
     run_test("hello419"); /* IP_MTU_DISCOVER */
+    run_test("hello420"); /* TCP_NOTSENT_LOWAT: a window update wakes the writer */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */
