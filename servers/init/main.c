@@ -526,6 +526,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello407"); /* TCP_USER_TIMEOUT, ETIMEDOUT once connected */
     run_test("hello408"); /* TCP_SYNCNT, SYN retransmission schedule */
     run_test("hello409"); /* zero-window probes and TCP_USER_TIMEOUT */
+    run_test("hello410"); /* IPv6 extension headers on input */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

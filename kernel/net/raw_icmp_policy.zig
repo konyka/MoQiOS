@@ -202,6 +202,80 @@ pub fn paramProblemMsg(out: *[PARAM_PROBLEM_MAX]u8, pkt: []const u8) usize {
     return 8 + q;
 }
 
+/// paramProblemMsg with any `code` and `pointer` (an offset into `pkt`, IPv6 header included): ICMPV6_HDR_FIELD (0) for a bad
+/// header, ICMPV6_UNK_NEXTHDR (1), ICMPV6_UNK_OPTION (2).
+pub fn paramProblemMsgAt(out: *[PARAM_PROBLEM_MAX]u8, pkt: []const u8, code: u8, pointer: u32) usize {
+    const n = paramProblemMsg(out, pkt);
+    out[1] = code;
+    out[4] = @truncate(pointer >> 24);
+    out[5] = @truncate(pointer >> 16);
+    out[6] = @truncate(pointer >> 8);
+    out[7] = @truncate(pointer);
+    return n;
+}
+
+/// Where the walk over a packet's extension headers ended (walkExt6).
+pub const Ext6 = struct {
+    pub const Kind = enum { deliver, drop, bad_option, bad_header };
+    kind: Kind,
+    /// The upper-layer next header (deliver), and for deliver its offset in the payload; for bad_option / bad_header the
+    /// offending byte (the option type, or the next-header field naming the misplaced header).
+    nh: u8,
+    off: usize,
+    /// Offset in the packet (IPv6 header included) of the next-header field that named `nh`: 6 in the IPv6 header, else the first
+    /// byte of the last extension header. A parameter problem about an unknown `nh` points there.
+    nh_field: u32 = 6,
+};
+
+const NEXTHDR_HOP: u8 = 0;
+const NEXTHDR_NONE: u8 = 59;
+const NEXTHDR_DEST: u8 = 60;
+
+/// The hop-by-hop and destination-options headers at the front of `payload` (what follows the IPv6 header, which named `nh`),
+/// stepped over as ipv6_parse_hopopts and ipv6_destopt_rcv do (ip6_parse_tlv): Pad1 and PadN are skipped, an unknown option
+/// acts on its top two bits (00 skip, 01 drop, 10 and 11 parameter problem code 2 pointing at it; MoQiOS sends it for 11 too,
+/// its destinations are never multicast here); an option or header running past its bounds drops the packet, "no next header"
+/// ends it, and a hop-by-hop header anywhere but first is a parameter problem code 1 (ip6_input_finish). The walk stops at the
+/// first other next header, which is delivered at `off`.
+pub fn walkExt6(nh: u8, payload: []const u8) Ext6 {
+    var next = nh;
+    var off: usize = 0;
+    var first = true;
+    var nh_field: u32 = 6;
+    while (next == NEXTHDR_HOP or next == NEXTHDR_DEST) {
+        if (next == NEXTHDR_HOP and !first) return .{ .kind = .bad_header, .nh = next, .off = off };
+        if (off + 8 > payload.len) return .{ .kind = .drop, .nh = next, .off = off };
+        const hlen = (@as(usize, payload[off + 1]) + 1) * 8;
+        if (off + hlen > payload.len) return .{ .kind = .drop, .nh = next, .off = off };
+        var i: usize = off + 2;
+        while (i < off + hlen) {
+            const ty = payload[i];
+            if (ty == 0) {
+                i += 1;
+                continue;
+            }
+            if (i + 2 > off + hlen) return .{ .kind = .drop, .nh = next, .off = i };
+            const olen: usize = payload[i + 1];
+            if (i + 2 + olen > off + hlen) return .{ .kind = .drop, .nh = next, .off = i };
+            if (ty != 1) switch (ty >> 6) {
+                0 => {},
+                1 => return .{ .kind = .drop, .nh = next, .off = i },
+                else => return .{ .kind = .bad_option, .nh = next, .off = i },
+            };
+            i += 2 + olen;
+        }
+        // The previous header's next-header byte is where a misplaced hop-by-hop header is reported.
+        const nf = off;
+        nh_field = @intCast(40 + off);
+        next = payload[off];
+        off += hlen;
+        first = false;
+        if (next == NEXTHDR_HOP) return .{ .kind = .bad_header, .nh = next, .off = nf };
+    }
+    if (next == NEXTHDR_NONE) return .{ .kind = .drop, .nh = next, .off = off, .nh_field = nh_field };
+    return .{ .kind = .deliver, .nh = next, .off = off, .nh_field = nh_field };
+}
+
 const IPPROTO_UDP: u32 = 17;
 const IPPROTO_MH: u32 = 135;
 

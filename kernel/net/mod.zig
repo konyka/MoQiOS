@@ -71,22 +71,36 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
             const payload_start6: u32 = 14 + @as(u32, info6.payload_offset);
             if (payload_start6 + @as(u32, info6.payload_len) > len) return;
 
-            // raw6_local_deliver: each IPv6 raw socket of the next header gets the packet, without its IPv6 header, before the
-            // protocol handler (ip6_protocol_deliver_rcu).
-            const raw_took6 = @import("raw_icmp.zig").deliver6(info6.next_header, data[payload_start6 .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip);
             const rp6 = @import("raw_icmp_policy.zig");
-            switch (info6.next_header) {
+            const raw6 = @import("raw_icmp.zig");
+            const pkt6 = data[14 .. payload_start6 + info6.payload_len];
+            // Hop-by-hop and destination options are stepped over (ipv6_parse_hopopts, ipv6_destopt_rcv); raw sockets of each header
+            // passed see the packet from that header on (ip6_protocol_deliver_rcu hands every header to raw6_local_deliver).
+            const ext = rp6.walkExt6(info6.next_header, data[payload_start6 .. payload_start6 + info6.payload_len]);
+            if (info6.next_header != ext.nh) _ = raw6.deliver6(info6.next_header, data[payload_start6 .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip);
+            switch (ext.kind) {
+                .deliver => {},
+                .drop => return,
+                .bad_option => return icmpv6.sendParamProblemAt(pkt6, 2, @intCast(ipv6.HEADER_LEN + ext.off), info6.src_ip, info6.dst_ip),
+                .bad_header => return icmpv6.sendParamProblemAt(pkt6, 1, @intCast(ipv6.HEADER_LEN + ext.off), info6.src_ip, info6.dst_ip),
+            }
+            const up_start: u32 = payload_start6 + @as(u32, @intCast(ext.off));
+            const up_len: u16 = info6.payload_len - @as(u16, @intCast(ext.off));
+            // raw6_local_deliver: each IPv6 raw socket of the upper-layer header gets it, before the protocol handler.
+            const raw_took6 = raw6.deliver6(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip);
+            switch (ext.nh) {
                 ipv6.PROTO_ICMPV6 => {
-                    icmpv6.handlePacket(info6.src_ip, info6.dst_ip, data + payload_start6, info6.payload_len);
+                    icmpv6.handlePacket(info6.src_ip, info6.dst_ip, data + up_start, up_len);
                 },
                 ipv6.PROTO_TCP => {
-                    tcp.handlePacketV6(info6.src_ip, info6.dst_ip, data + payload_start6, info6.payload_len, info6.ecn_ce);
+                    tcp.handlePacketV6(info6.src_ip, info6.dst_ip, data + up_start, up_len, info6.ecn_ce);
                 },
                 ipv6.PROTO_UDP => {
-                    udp.handlePacketV6On(info6.src_ip, info6.dst_ip, data + payload_start6, info6.payload_len, ifindex);
+                    udp.handlePacketV6On(info6.src_ip, info6.dst_ip, data + up_start, up_len, ifindex);
                 },
-                // ip6_protocol_deliver_rcu: a next header with no handler that no raw socket took gets a parameter problem.
-                else => if (rp6.paramProblem6(info6.next_header, raw_took6)) icmpv6.sendParamProblem(data[14 .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip),
+                // ip6_protocol_deliver_rcu: a next header with no handler that no raw socket took gets a parameter problem pointing at
+                // the next-header field that named it (the IPv6 header's, or the last extension header's).
+                else => if (rp6.paramProblem6(ext.nh, raw_took6)) icmpv6.sendParamProblemAt(pkt6, 1, ext.nh_field, info6.src_ip, info6.dst_ip),
             }
         },
         else => {},

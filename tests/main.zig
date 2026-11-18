@@ -14812,8 +14812,9 @@ test "raw ICMPv6 socket wiring (hello391): checksummed ICMPv6 reaches raw socket
     // hello403: every IPv6 packet reaches the raw sockets of its next header before the protocol handler (raw6_local_deliver),
     // ICMPv6 included; each ICMPv6 socket checks the checksum itself (rawv6_rcv with rp->checksum set).
     const m = kt.net_mod_source;
-    const dl = std.mem.indexOf(u8, m, "@import(\"raw_icmp.zig\").deliver6(info6.next_header, data[payload_start6 .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip);") orelse return error.TestUnexpectedResult;
-    const pr = std.mem.indexOf(u8, m, "icmpv6.handlePacket(info6.src_ip, info6.dst_ip, data + payload_start6, info6.payload_len);") orelse return error.TestUnexpectedResult;
+    // hello410: after the extension headers, at the upper-layer header.
+    const dl = std.mem.indexOf(u8, m, "const raw_took6 = raw6.deliver6(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip);") orelse return error.TestUnexpectedResult;
+    const pr = std.mem.indexOf(u8, m, "icmpv6.handlePacket(info6.src_ip, info6.dst_ip, data + up_start, up_len);") orelse return error.TestUnexpectedResult;
     try std.testing.expect(dl < pr);
     try std.testing.expect(std.mem.indexOf(u8, kt.icmpv6_source, "raw_icmp.zig\").deliver6(") == null);
     const ss = kt.socket_syscall_source;
@@ -15325,8 +15326,8 @@ test "IPV6_HDRINCL, IPPROTO_RAW and the ICMPv6 parameter problem (hello404): Lin
     try std.testing.expectEqual(@as(usize, 1240), rp.paramProblemMsg(&out, &big));
     try std.testing.expectEqual(@as(usize, 1240), rp.PARAM_PROBLEM_MAX);
     const m = kt.net_mod_source;
-    try std.testing.expect(std.mem.indexOf(u8, m, "const raw_took6 = @import(\"raw_icmp.zig\").deliver6(info6.next_header, data[payload_start6 .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, m, "else => if (rp6.paramProblem6(info6.next_header, raw_took6)) icmpv6.sendParamProblem(data[14 .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip),") != null);
+    // hello410: the next header after any extension headers decides, and the pointer names the field that named it.
+    try std.testing.expect(std.mem.indexOf(u8, m, "const raw_took6 = raw6.deliver6(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip);") != null);
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "if (policy.startsHdrincl(protocol)) s.opts.ip.hdrincl = true;") != null);
     const ss = kt.socket_syscall_source;
@@ -15621,4 +15622,59 @@ test "retransmissions into a zero window are probes (hello409): Linux tcp_retran
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "else if (tcb.snd_wnd == 0 and tcp_recv_policy.zeroWindowState(tcb.state))\n                tcp_recv_policy.zeroWindowGiveUp(tcb.options.user_timeout_ms, rtxElapsedMs(tcb), tcb.peer_silent_ms)") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "tcb.peer_silent_ms = 0;") != null);
+}
+
+test "IPv6 extension headers on input (hello410): hop-by-hop and destination options are stepped over (Linux ipv6_parse_hopopts / ip6_parse_tlv)" {
+    const rp = kt.raw_icmp_policy;
+    // A destination-options header (next header 17, length 0, PadN of 4) before an 8-byte UDP header: UDP at offset 8.
+    var dst = [_]u8{ 17, 0, 1, 4, 0, 0, 0, 0, 0x30, 0x39, 0x1f, 0x90, 0, 12, 0, 0 };
+    const w = rp.walkExt6(60, &dst);
+    try std.testing.expectEqual(rp.Ext6.Kind.deliver, w.kind);
+    try std.testing.expectEqual(@as(u8, 17), w.nh);
+    try std.testing.expectEqual(@as(usize, 8), w.off);
+    // Pad1 options (type 0, one byte each) are fine too.
+    var pad1 = [_]u8{ 17, 0, 0, 0, 0, 0, 0, 0 };
+    try std.testing.expectEqual(rp.Ext6.Kind.deliver, rp.walkExt6(60, &pad1).kind);
+    // Hop-by-hop works the same way; only it may come first.
+    try std.testing.expectEqual(rp.Ext6.Kind.deliver, rp.walkExt6(0, &dst).kind);
+    // An unknown option: top bits 00 skip it, 01 drop silently, 10 parameter problem code 2 (pointer at the option), 11 the same
+    // unless the destination is multicast.
+    dst[2] = 0x01;
+    try std.testing.expectEqual(rp.Ext6.Kind.deliver, rp.walkExt6(60, &dst).kind);
+    dst[2] = 0x40;
+    try std.testing.expectEqual(rp.Ext6.Kind.drop, rp.walkExt6(60, &dst).kind);
+    dst[2] = 0x80;
+    const u = rp.walkExt6(60, &dst);
+    try std.testing.expectEqual(rp.Ext6.Kind.bad_option, u.kind);
+    try std.testing.expectEqual(@as(usize, 2), u.off);
+    dst[2] = 0xc0;
+    try std.testing.expectEqual(rp.Ext6.Kind.bad_option, rp.walkExt6(60, &dst).kind);
+    dst[2] = 1;
+    // An option running past its header, and a header running past the packet, are dropped.
+    var over = [_]u8{ 17, 0, 1, 9, 0, 0, 0, 0 };
+    try std.testing.expectEqual(rp.Ext6.Kind.drop, rp.walkExt6(60, &over).kind);
+    var short = [_]u8{ 17, 1, 1, 4, 0, 0, 0, 0 };
+    try std.testing.expectEqual(rp.Ext6.Kind.drop, rp.walkExt6(60, &short).kind);
+    // No next header (59) ends the packet: nothing is delivered and nothing is answered.
+    var none = [_]u8{ 59, 0, 1, 4, 0, 0, 0, 0 };
+    try std.testing.expectEqual(rp.Ext6.Kind.drop, rp.walkExt6(60, &none).kind);
+    // A next header that is not an extension MoQiOS parses is where the walk stops, offset 0 when there is none.
+    try std.testing.expectEqual(@as(usize, 0), rp.walkExt6(17, &dst).off);
+    try std.testing.expectEqual(@as(u32, 6), rp.walkExt6(17, &dst).nh_field);
+    try std.testing.expectEqual(@as(u32, 40), rp.walkExt6(60, &dst).nh_field);
+    try std.testing.expectEqual(@as(u8, 252), rp.walkExt6(252, &dst).nh);
+    // A hop-by-hop header after the first one is a parameter problem code 1 pointing at its next-header field.
+    var hbh2 = [_]u8{ 0, 0, 1, 4, 0, 0, 0, 0, 17, 0, 1, 4, 0, 0, 0, 0 };
+    const h = rp.walkExt6(60, &hbh2);
+    try std.testing.expectEqual(rp.Ext6.Kind.bad_header, h.kind);
+    try std.testing.expectEqual(@as(usize, 0), h.off);
+    // The parameter problem names its code and the offset in the packet (IPv6 header included).
+    var out: [rp.PARAM_PROBLEM_MAX]u8 = undefined;
+    var pkt: [48]u8 = @splat(0);
+    const n = rp.paramProblemMsgAt(&out, &pkt, 2, 42);
+    try std.testing.expectEqual(@as(usize, 56), n);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 4, 2, 0, 0, 0, 0, 0, 42 }, out[0..8]);
+    const m = kt.net_mod_source;
+    try std.testing.expect(std.mem.indexOf(u8, m, "const ext = rp6.walkExt6(info6.next_header, data[payload_start6 .. payload_start6 + info6.payload_len]);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "else => if (rp6.paramProblem6(ext.nh, raw_took6)) icmpv6.sendParamProblemAt(pkt6, 1, ext.nh_field, info6.src_ip, info6.dst_ip),") != null);
 }

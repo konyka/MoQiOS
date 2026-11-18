@@ -436,10 +436,15 @@ pub fn sendHdrincl6(dst: [16]u8, pkt: []const u8) i64 {
 /// ICMPv6 parameter problem, unrecognized next header (ip6_protocol_deliver_rcu → icmpv6_send): `pkt` is the offending packet,
 /// IPv6 header first, `src` → `dst`. Like the port unreachable for UDP, only a ::1 → ::1 packet is answered (over lo).
 pub fn sendParamProblem(pkt: []const u8, src: [16]u8, dst: [16]u8) void {
+    sendParamProblemAt(pkt, 1, 6, src, dst);
+}
+
+/// sendParamProblem with any code and pointer (icmpv6_param_prob: a bad header field, an unknown next header, an unknown option).
+pub fn sendParamProblemAt(pkt: []const u8, code: u8, pointer: u32, src: [16]u8, dst: [16]u8) void {
     if (!@import("icmp_unreach_policy.zig").shouldReplyV6(netif.isLoopbackV6(src), netif.isLoopbackV6(dst), false)) return;
     const rp = @import("raw_icmp_policy.zig");
     var msg: [rp.PARAM_PROBLEM_MAX]u8 = undefined;
-    const n = rp.paramProblemMsg(&msg, pkt);
+    const n = rp.paramProblemMsgAt(&msg, pkt, code, pointer);
     var frame: [14 + 40 + rp.PARAM_PROBLEM_MAX]u8 = @splat(0);
     @memcpy(frame[54..][0..n], msg[0..n]);
     bo.writeU16BeAt(&frame, 56, checksum(dst, src, frame[54..].ptr, @intCast(n)));
