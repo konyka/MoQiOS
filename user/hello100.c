@@ -305,7 +305,7 @@ static void phase_b(void) {
     syscall1(SYS_CLOSE, (u64)fd);
 
     struct ksigaction act = { segv_handler, 0, 0, 0 };
-    if (syscall3(SYS_SIGACTION, SIGSEGV, (u64)&act, 0) != 0)
+    if (syscall4(SYS_SIGACTION, SIGSEGV, (u64)&act, 0, 8) != 0)
         fail_exit("B sigaction");
 
     fd = syscall3(SYS_OPEN, (u64)"/tmp/h100.dat", O_RDONLY, 0);

@@ -30,6 +30,13 @@ static inline int64_t syscall3(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
     __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx) : "rcx", "r11", "memory");
     return ret;
 }
+static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
+    int64_t ret;
+    register uint64_t rdx __asm__("rdx") = a3;
+    register uint64_t r10 __asm__("r10") = a4;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10) : "rcx", "r11", "memory");
+    return ret;
+}
 
 static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3,
                                uint64_t a4, uint64_t a5, uint64_t a6) {
@@ -93,7 +100,7 @@ static void segv_handler(int sig) {
 
 static int register_segv(void) {
     struct ksigaction act = { segv_handler, 0, 0, 0 };
-    return syscall3(SYS_SIGACTION, SIGSEGV, (uint64_t)&act, 0) == 0 ? 0 : 1;
+    return syscall4(SYS_SIGACTION, SIGSEGV, (uint64_t)&act, 0, 8) == 0 ? 0 : 1;
 }
 
 static int test_null_fault(void) {

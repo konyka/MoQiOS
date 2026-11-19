@@ -4,7 +4,7 @@
 #include "hostsys.h"
 
 long sigaction(int sig, const struct ksigaction *act, struct ksigaction *oldact) {
-    return MSYS3(SYS_sigaction, sig, act, oldact);
+    return MSYS4(SYS_sigaction, sig, act, oldact, 8);
 }
 
 /* Signal numbers the library accepts: 1..64 without glibc's two reserved real-time signals (32 and 33). */

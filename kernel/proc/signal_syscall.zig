@@ -284,7 +284,7 @@ fn killAll(cur: *task_mod.Task, signum: u32) i64 {
     return bp.result(candidates);
 }
 
-/// sigaction(signum, act_ptr, oldact_ptr) → 0 or -errno
+/// rt_sigaction(signum, act_ptr, oldact_ptr, sigsetsize) → 0 or -errno
 ///
 /// ABI note: Linux x86_64 struct sigaction is 152 bytes — handler@0, flags@8,
 /// restorer@16, mask@24 (128-byte sigset). The legacy MoQiOS users (sh.c,
@@ -295,7 +295,9 @@ fn killAll(cur: *task_mod.Task, signum: u32) i64 {
 /// semantics only when the buffer validates for the full 152-byte Linux
 /// struct. For the legacy users restorer@24 is 0, so even when the wider
 /// probe succeeds the applied mask is 0 — their behavior is unchanged.
-pub fn sigaction(signum: u32, act_ptr: u64, oldact_ptr: u64) i64 {
+pub fn sigaction(signum: u32, act_ptr: u64, oldact_ptr: u64, sigsetsize: u64) i64 {
+    // rt_sigaction: a sigset that is not 8 bytes is EINVAL before anything else is looked at.
+    if (!action_policy.sigsetSizeValid(sigsetsize)) return -22;
     if (signum == 0 or signum > 64) return -22;
     // SIGKILL/SIGSTOP cannot be caught or ignored; a pure query is fine.
     if (!action_policy.actionChangeAllowed(signum, act_ptr != 0)) return -22;

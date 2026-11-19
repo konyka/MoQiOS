@@ -20,6 +20,13 @@ static inline int64_t syscall3(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
     __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx) : "rcx", "r11", "memory");
     return ret;
 }
+static inline int64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
+    int64_t ret;
+    register uint64_t rdx __asm__("rdx") = a3;
+    register uint64_t r10 __asm__("r10") = a4;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10) : "rcx", "r11", "memory");
+    return ret;
+}
 
 static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3,
                                uint64_t a4, uint64_t a5, uint64_t a6) {
@@ -120,7 +127,7 @@ void _start(void) {
      * sigsuspend with a mask that unblocks it runs the handler, returns
      * EINTR, and restores the ORIGINAL mask (not the temporary one). */
     struct { uint64_t handler, flags, restorer, mask; } act = { (uint64_t)on_usr1, 0, 0, 0 };
-    if (syscall3(SYS_SIGACTION, SIGUSR1, (uint64_t)&act, 0) != 0) fail("sigaction SIGUSR1");
+    if (syscall4(SYS_SIGACTION, SIGUSR1, (uint64_t)&act, 0, 8) != 0) fail("sigaction SIGUSR1");
     uint64_t blocked = observed_mask | ((uint64_t)1 << (SIGUSR1 - 1));
     if (syscall6(SYS_SIGPROCMASK, 2, (uint64_t)&blocked, 0, 8, 0, 0) != 0) fail("block SIGUSR1");
     syscall2(SYS_TKILL, (uint64_t)syscall1(SYS_GETPID, 0), SIGUSR1);

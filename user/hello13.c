@@ -26,6 +26,13 @@ static long syscall3(long n, long a1, long a2, long a3) {
     __asm__ volatile ("syscall" : "=a"(ret) : "a"(n), "D"(a1), "S"(a2), "d"(a3) : "rcx", "r11", "memory");
     return ret;
 }
+static long syscall4(long n, long a1, long a2, long a3, long a4) {
+    long ret;
+    register long rdx __asm__("rdx") = a3;
+    register long r10 __asm__("r10") = a4;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(n), "D"(a1), "S"(a2), "r"(rdx), "r"(r10) : "rcx", "r11", "memory");
+    return ret;
+}
 
 static void print(const char *s) {
     int len = 0;
@@ -53,7 +60,7 @@ void _start(void) {
     print("hello13: step 1 - register SIGUSR1 handler\n");
 
     struct ksigaction act = { sigusr1_handler, 0, 0, 0 };
-    long ret = syscall3(SYS_sigaction, 10, (long)&act, 0);
+    long ret = syscall4(SYS_sigaction, 10, (long)&act, 0, 8);
     if (ret != 0) {
         print("hello13: sigaction failed\n");
         syscall3(SYS_exit, 1, 0, 0);

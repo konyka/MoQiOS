@@ -140,7 +140,7 @@ void _start(void) {
     int64_t pid;
 
     print("hello89: start\n");
-    failures += check(syscall3(SYS_SIGACTION, SIGUSR1, (uint64_t)&handled, 0) == 0,
+    failures += check(syscall4(SYS_SIGACTION, SIGUSR1, (uint64_t)&handled, 0, 8) == 0,
                       "install SIGUSR1 handler");
     failures += check(syscall6(SYS_SIGPROCMASK, 2, (uint64_t)&signal_mask, 0, 8, 0, 0) == 0,
                       "block test signals");

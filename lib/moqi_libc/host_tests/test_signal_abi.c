@@ -167,7 +167,7 @@ int main(void) {
     old_handler_reply = 1; /* SIG_IGN was installed */
     errno_slot = 0;
     CHECK(signal(SIGUSR1, handler_a) == SIG_IGN && errno_slot == 0);
-    CHECK(ncalls == 1 && c_nr[0] == SYS_sigaction && c_a1[0] == SIGUSR1);
+    CHECK(ncalls == 1 && c_nr[0] == SYS_sigaction && c_a1[0] == SIGUSR1 && c_a4[0] == 8); /* rt_sigaction wants sigsetsize 8 (hello440) */
     CHECK(c_act_handler[0] == (unsigned long)handler_a);
     CHECK(c_act_flags[0] == 0x10000000UL);          /* SA_RESTART: BSD semantics, glibc's default */
     CHECK(c_act_mask[0] == 1UL << 9);               /* the signal is blocked while it runs */

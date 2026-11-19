@@ -300,7 +300,7 @@ void _start(void) {
     syscall3(SYS_SETAFFINITY, 0, 8, (uint64_t)&cpu0_mask);
 
     struct ksigaction sa = { on_alarm, 0, 0, 0 };
-    check(syscall3(SYS_SIGACTION, SIGALRM, (uint64_t)&sa, 0) == 0, "sigaction(SIGALRM)");
+    check(syscall4(SYS_SIGACTION, SIGALRM, (uint64_t)&sa, 0, 8) == 0, "sigaction(SIGALRM)");
 
     probe_getrusage(start);
     probe_spinner_progress();

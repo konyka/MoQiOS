@@ -6,7 +6,9 @@
  * 0 and the RTO is TCP_RTO_MIN, 200 ms), and the client queues 1500 bytes it cannot send. Measured on the host (build with -DHOST,
  * run as root in `unshare --map-auto --map-root-user -n` with lo up and
  * `nft add table ip f; nft add chain ip f out '{ type filter hook output priority 0; }'; nft add rule ip f out tcp flags rst drop`):
- *   P. the first window probe comes 150..900 ms after the data was queued, the second 1.5 to 3 times as long after the first. */
+ *   P. the first window probe comes 221 ms after the data was queued and the second 402 ms after the first (the base doubles).
+ *      Accepted: the first within 150..900 ms and the second 300..1200 ms later; the old fixed 2 s start gives about 2000 and 4000.
+ *      (The kernel's TCP timers run every ~100 ms, so the first probe can be one pass late; the ratio of the two is not checked.) */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -176,8 +178,8 @@ int main(void) {
     long at[2];
     if (s >= 0) probes(40531, cp, t0, 6000, at, 2);
     long gap = (at[0] >= 0 && at[1] >= 0) ? at[1] - at[0] : -1;
-    snprintf(msg, sizeof msg, "P: forged peer %ld; first window probe after %ld ms, second %ld ms later (>=0; 150..900; 1.5x..3x of the first)", s, at[0], gap);
-    check(s >= 0 && at[0] >= 150 && at[0] <= 900 && gap * 2 >= at[0] * 3 && gap <= at[0] * 3 + 100, msg);
+    snprintf(msg, sizeof msg, "P: forged peer %ld; first window probe after %ld ms, second %ld ms later (>=0; 150..900; 300..1200)", s, at[0], gap);
+    check(s >= 0 && at[0] >= 150 && at[0] <= 900 && gap >= 300 && gap <= 1200, msg);
     if (s >= 0) close_(s);
     close_(kid[0]); close_(kid[1]); close_(L); close_(rt); close_(rr);
     print(failures == 0 ? "hello439: PASS\n" : "hello439: FAIL\n");

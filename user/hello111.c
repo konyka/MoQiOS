@@ -77,7 +77,7 @@ static void on_chld(int s) { (void)s; chld_hits++; }
 
 static long install(int sig, uint64_t handler) {
     struct ksigaction a = { handler, 0, 0, 0 };
-    return syscall3(SYS_SIGACTION, sig, (uint64_t)&a, 0);
+    return syscall4(SYS_SIGACTION, sig, (uint64_t)&a, 0, 8);
 }
 
 void _start(void) {

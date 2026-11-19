@@ -16770,3 +16770,15 @@ test "the zero-window probe timer starts from the connection's RTO and the initi
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello439", true, false).caps.cap_net_raw);
     try std.testing.expect(std.mem.indexOf(u8, ts, "tcb.persist_rto_ms > 0) tcb.persist_rto_ms else tcp_recv_policy.probe0BaseMs(tcb.rto)") != null);
 }
+
+test "rt_sigaction requires sigsetsize 8 before anything else (hello440)" {
+    // Linux rt_sigaction: sigsetsize != sizeof(sigset_t) is EINVAL before the act copy and do_sigaction. The dispatcher used not
+    // to pass the fourth argument at all, so every size was accepted; libc's sigaction did not pass it either.
+    const ss = kt.signal_syscall_source;
+    const f = std.mem.indexOf(u8, ss, "pub fn sigaction(signum: u32, act_ptr: u64, oldact_ptr: u64, sigsetsize: u64) i64 {").?;
+    const body = ss[f..];
+    const size_check = std.mem.indexOf(u8, body, "if (!action_policy.sigsetSizeValid(sigsetsize)) return -22;").?;
+    const sig_check = std.mem.indexOf(u8, body, "if (signum == 0 or signum > 64) return -22;").?;
+    try std.testing.expect(size_check < sig_check);
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "signal_syscall_mod.sigaction(@truncate(frame.rdi), frame.rsi, frame.rdx, frame.r10)") != null);
+}

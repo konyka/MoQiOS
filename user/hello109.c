@@ -90,7 +90,7 @@ static void set_mask(uint64_t m) {
 
 static long install(int sig, void (*h)(int), unsigned long flags, unsigned long mask) {
     struct ksigaction a = { h, flags, 0, mask };
-    return syscall3(SYS_SIGACTION, sig, (uint64_t)&a, 0);
+    return syscall4(SYS_SIGACTION, sig, (uint64_t)&a, 0, 8);
 }
 
 static int64_t self_tid(void) { return syscall1(SYS_GETPID, 0); }
@@ -140,7 +140,7 @@ void _start(void) {
     raise_sig(SIGUSR1);
     check(usr1_hits == 2, "C: SA_RESETHAND handler ran once");
     struct ksigaction cur = { 0, 0, 0, 0 };
-    syscall3(SYS_SIGACTION, SIGUSR1, 0, (uint64_t)&cur);
+    syscall4(SYS_SIGACTION, SIGUSR1, 0, (uint64_t)&cur, 8);
     check(cur.handler == 0, "C: disposition reset to SIG_DFL");
 
     /* D. FPU state survives a handler that clobbers xmm registers. */
@@ -164,7 +164,7 @@ void _start(void) {
     /* E. SIGKILL / SIGSTOP dispositions are immutable. */
     check(install(SIGKILL, on_usr1, 0, 0) == -22, "E: sigaction(SIGKILL, handler) is EINVAL");
     check(install(SIGSTOP, (void (*)(int))1, 0, 0) == -22, "E: sigaction(SIGSTOP, SIG_IGN) is EINVAL");
-    check(syscall3(SYS_SIGACTION, SIGKILL, 0, (uint64_t)&cur) == 0, "E: querying SIGKILL is allowed");
+    check(syscall4(SYS_SIGACTION, SIGKILL, 0, (uint64_t)&cur, 8) == 0, "E: querying SIGKILL is allowed");
 
     /* F. sigtimedwait blocks until its timeout, then EAGAIN; a pending
      *    blocked signal in the set returns at once with its number. */

@@ -3247,7 +3247,7 @@ fn execTail(frame: *SyscallFrame, prepared: execve_mod.Prepared) void {
 }
 
 fn syscallSigaction(frame: *SyscallFrame) void {
-    frame.rax = @bitCast(signal_syscall_mod.sigaction(@truncate(frame.rdi), frame.rsi, frame.rdx));
+    frame.rax = @bitCast(signal_syscall_mod.sigaction(@truncate(frame.rdi), frame.rsi, frame.rdx, frame.r10));
 }
 
 fn syscallSigprocmask(frame: *SyscallFrame) void {

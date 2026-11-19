@@ -49,6 +49,13 @@ static inline s64 syscall3(u64 nr, u64 a1, u64 a2, u64 a3) {
     __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx) : "rcx", "r11", "memory");
     return ret;
 }
+static inline s64 syscall4(u64 nr, u64 a1, u64 a2, u64 a3, u64 a4) {
+    s64 ret;
+    register u64 rdx __asm__("rdx") = a3;
+    register u64 r10 __asm__("r10") = a4;
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a1), "S"(a2), "r"(rdx), "r"(r10) : "rcx", "r11", "memory");
+    return ret;
+}
 
 static inline s64 syscall6(u64 nr, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6) {
     s64 ret;
@@ -355,7 +362,7 @@ void _start(void) {
     print("hello99: PROT_NONE reservation vs swap-entry encoding\n");
 
     struct ksigaction act = { segv_handler, 0, 0, 0 };
-    if (syscall3(SYS_SIGACTION, SIGSEGV, (u64)&act, 0) != 0)
+    if (syscall4(SYS_SIGACTION, SIGSEGV, (u64)&act, 0, 8) != 0)
         fail_exit("sigaction");
 
     /* Phase 1: no swap — the reservation/restore contract. */
