@@ -81,6 +81,15 @@ pub fn recvDeadlineNs(now_ns: u64, timeout_ms: u32) ?u64 {
     return now_ns +| @as(u64, timeout_ms) * 1_000_000;
 }
 
+/// What a blocking connect returns once SO_SNDTIMEO ran out with the handshake still going (Linux __inet_stream_connect keeps the
+/// EINPROGRESS it set before inet_wait_for_connect).
+pub const CONNECT_TIMED_OUT: i64 = -115;
+
+/// Deadline of a blocking connect: SO_SNDTIMEO (sock_sndtimeo), none when it is 0.
+pub fn connectDeadlineNs(now_ns: u64, snd_timeout_ms: u32) ?u64 {
+    return recvDeadlineNs(now_ns, snd_timeout_ms);
+}
+
 /// True once `now_ns` reached the deadline; never without one.
 pub fn timedOut(deadline_ns: ?u64, now_ns: u64) bool {
     const d = deadline_ns orelse return false;

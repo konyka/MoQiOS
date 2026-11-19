@@ -3462,20 +3462,31 @@ pub fn tcpConnectSocketV6(tcb_idx: u32, remote_ip6: [16]u8, remote_port: u16) i6
 
 /// Block until the handshake started by tcpConnectSocket finishes: 0 when the
 /// connection is established, a negative errno when it was refused or timed
-/// out (the recorded SO_ERROR is consumed), -EINTR on a signal (the handshake
-/// keeps running). The loopback queue is pumped on every pass: a 127/8 peer
+/// out (the recorded SO_ERROR is consumed), -EINTR on a signal and -EINPROGRESS once SO_SNDTIMEO ran out (the handshake keeps
+/// running either way). The loopback queue is pumped on every pass: a 127/8 peer
 /// answers only when its segments are delivered.
 pub fn tcpWaitConnected(tcb_idx: u32) i64 {
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const poll = @import("../fs/poll.zig");
+    const tsc = @import("../arch/arch.zig").tsc;
+    // SO_SNDTIMEO bounds the wait (sock_sndtimeo); when it runs out the handshake keeps going and connect() is EINPROGRESS.
+    const deadline = tcp_recv_policy.connectDeadlineNs(tsc.nanos(), sndTimeoutMs(tcb_idx));
     while (true) {
         if (connectOutcome(tcb_idx)) |r| return r;
+        if (tcp_recv_policy.timedOut(deadline, tsc.nanos())) return tcp_recv_policy.CONNECT_TIMED_OUT;
         _ = lo_dev.drain();
-        const w = poll.waitSlice(null);
+        const w = poll.waitSlice(deadline);
         // The handshake's own outcome wins over a signal that arrived with it (Linux inet_wait_for_connect checks the state
         // first): an O_ASYNC owner connecting itself gets its POLL_OUT / POLL_ERR and still sees connect() succeed or fail.
         if (w < 0) return connectOutcome(tcb_idx) orelse w;
     }
+}
+
+/// The SO_SNDTIMEO of `tcb_idx`, in milliseconds (0: none).
+fn sndTimeoutMs(tcb_idx: u32) u32 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    return tcbs[tcb_idx].options.snd_timeout_ms;
 }
 
 /// Where a blocking connect on `tcb_idx` stands: 0 connected, a negative errno when it failed (SO_ERROR is consumed), null while

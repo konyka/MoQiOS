@@ -16619,3 +16619,20 @@ test "rt_sigprocmask / rt_sigsuspend / rt_sigtimedwait need sigsetsize 8 and rt_
     const tw = idx(u8, src, "pub fn rtSigtimedwait(").?;
     try std.testing.expect(idx(u8, src[tw..], "if (!action_policy.sigsetSizeValid(sigset_size)) return -22;\n    if (sigset_ptr == 0") != null);
 }
+
+test "SO_SNDTIMEO bounds a blocking TCP connect: EINPROGRESS once it runs out (hello432)" {
+    // Linux __inet_stream_connect: timeo = sock_sndtimeo(sk, nonblock); inet_wait_for_connect returns 0 when it expires and the call
+    // fails with the EINPROGRESS set before the wait. tcpWaitConnected used to wait with no deadline at all.
+    const rp = kt.tcp_recv_policy;
+    try std.testing.expectEqual(@as(i64, -115), rp.CONNECT_TIMED_OUT);
+    try std.testing.expect(rp.connectDeadlineNs(1000, 0) == null);
+    try std.testing.expectEqual(@as(?u64, 1000 + 300 * 1_000_000), rp.connectDeadlineNs(1000, 300));
+    const ts = kt.tcp_source;
+    const w = std.mem.indexOf(u8, ts, "pub fn tcpWaitConnected(").?;
+    const w_end = std.mem.indexOf(u8, ts[w..], "\n}\n").? + w;
+    const body = ts[w..w_end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "tcp_recv_policy.connectDeadlineNs(tsc.nanos(), sndTimeoutMs(tcb_idx))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (tcp_recv_policy.timedOut(deadline, tsc.nanos())) return tcp_recv_policy.CONNECT_TIMED_OUT;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "poll.waitSlice(deadline)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "poll.waitSlice(null)") == null);
+}
