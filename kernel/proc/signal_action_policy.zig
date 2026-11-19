@@ -41,6 +41,12 @@ pub fn pendingSizeValid(sigsetsize: u64) bool {
     return sigsetsize <= SIGSET_SIZE;
 }
 
+/// Whether a pending set wakes a task asleep in rt_sigtimedwait for `sigwait_mask`: one of the signals it waits for arrived (Linux
+/// leaves them out of the blocked set during the wait, so signal_wake_up wakes it). 0 means the task is not in such a wait.
+pub fn wakesSigwaiter(sigwait_mask: u64, pending: u64) bool {
+    return sigwait_mask & pending != 0;
+}
+
 const testing = @import("std").testing;
 
 test "an unblocked ignored signal is dropped at send; a blocked one is kept" {

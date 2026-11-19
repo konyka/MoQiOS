@@ -136,14 +136,14 @@ pub fn sendToProcessInfo(tid: u32, signum: u32, info: @import("siginfo_policy.zi
 /// do not come here.
 fn processRecipient(target: *task_mod.Task, tid: u32, signum: u32) u32 {
     const bit = @as(u64, 1) << @intCast(signum - 1);
-    const named_blocks = (target.signal_mask & bit) != 0;
+    const named_blocks = !takesNow(target, bit);
     var other: ?u32 = null;
     if (named_blocks) {
         const group = threadGroupId(target);
         for (0..task_mod.MAX_TASKS) |i| {
             const t = task_mod.getTask(@intCast(i)) orelse continue;
             if (t.tid == tid or t.state == .zombie or threadGroupId(t) != group) continue;
-            if ((t.signal_mask & bit) == 0) {
+            if (takesNow(t, bit)) {
                 other = t.tid;
                 break;
             }
@@ -153,9 +153,21 @@ fn processRecipient(target: *task_mod.Task, tid: u32, signum: u32) u32 {
         if (other == null) {
             // Or, not load-then-store: two CPUs can hold different signals at once.
             _ = @atomicRmw(u64, &target.grp().held_signals, .Or, bit, .seq_cst);
+            // A thread that entered rt_sigtimedwait for it after the scan above takes it from the held set: wake it.
+            for (0..task_mod.MAX_TASKS) |i| {
+                const t = task_mod.getTask(@intCast(i)) orelse continue;
+                if (t.state == .zombie or threadGroupId(t) != group) continue;
+                if (@atomicLoad(u64, &t.sigwait_mask, .acquire) & bit != 0) sig_mod.kickIfBlocked(@intCast(i));
+            }
         }
     }
     return @import("group_stop_policy.zig").processRecipient(tid, named_blocks, other);
+}
+
+/// Whether `t` takes the signal of mask bit `bit` now: it does not block it, or it is asleep in rt_sigtimedwait for it (Linux leaves
+/// the waited signals out of the blocked set during that wait, so wants_signal picks such a thread).
+fn takesNow(t: *task_mod.Task, bit: u64) bool {
+    return (t.signal_mask & bit) == 0 or @import("signal_action_policy.zig").wakesSigwaiter(@atomicLoad(u64, &t.sigwait_mask, .acquire), bit);
 }
 
 /// After `cur` changed its mask: take every held process-directed signal it no longer blocks from the sibling it was queued on, so
@@ -226,7 +238,7 @@ pub fn handOffHeld(t: *task_mod.Task) void {
             if (s.tid == t.tid or s.state == .zombie or threadGroupId(s) != group) continue;
             if (@atomicLoad(u32, &s.exiting, .acquire) != 0) continue;
             if (any == null) any = @intCast(i);
-            if (s.signal_mask & bit == 0) {
+            if (takesNow(s, bit)) {
                 free = @intCast(i);
                 break;
             }
@@ -651,6 +663,10 @@ pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_s
         deadline = tsc.nanos() +| total;
     }
 
+    // Published for the whole call: a send of a waited signal wakes this task (signal.kickIfBlocked), as Linux leaves the waited
+    // signals out of the blocked set while it sleeps.
+    @atomicStore(u64, &cur.sigwait_mask, mask, .release);
+    defer @atomicStore(u64, &cur.sigwait_mask, 0, .release);
     while (true) {
         // A process-directed signal every thread blocks is held for the process: any thread waiting for it takes it (with its
         // siginfo) from the sibling it was queued on, as Linux dequeue_signal takes from the shared set.
@@ -681,18 +697,19 @@ pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_s
         if (deadline) |d| {
             if (tsc.nanos() >= d) return -11; // EAGAIN: timed out
         }
-        // Sleep until the next tick or the deadline, whichever is sooner. A bare yield does not sleep: the task stays .running, the
-        // scheduler picks it again at once, and this syscall runs with interrupts masked, so a CPU with nothing else to run took no
-        // timer interrupt for the whole wait. On the BSP that stopped every POSIX timer, alarm and timed wait too (hello288 P/R).
-        // The waited signals are normally blocked, so a send does not wake us; the tick does (sched.sleepTimerTick), within 10 ms.
-        const now = tsc.nanos();
-        const wake = if (deadline) |d| @min(d, now +| SIGWAIT_POLL_NS) else now +| SIGWAIT_POLL_NS;
+        // Sleep until a waited or actionable signal arrives (the send wakes us through sigwait_mask) or the deadline passes. A bare
+        // yield does not sleep: the task stays .running, the scheduler picks it again at once, and this syscall runs with interrupts
+        // masked, so a CPU with nothing else to run took no timer interrupt for the whole wait. On the BSP that stopped every POSIX
+        // timer, alarm and timed wait too (hello288 P/R). Without a timeout the task stays blocked until a send wakes it.
         const bit = @as(u64, 1) << @intCast(cur_idx);
-        @atomicStore(u64, &cur.sleep_deadline_ns, wake, .release);
-        _ = @atomicRmw(u64, &sched.sleep_bm, .Or, bit, .seq_cst);
+        if (deadline) |d| {
+            @atomicStore(u64, &cur.sleep_deadline_ns, d, .release);
+            _ = @atomicRmw(u64, &sched.sleep_bm, .Or, bit, .seq_cst);
+        }
         task_mod.blockTask(cur_idx);
-        // A signal that arrived between the checks above and the block does not wait for the tick.
-        if ((@atomicLoad(u64, &cur.pending_signals, .seq_cst) & mask) != 0 or sig_mod.pendingActionable(cur) or sig_mod.pendingFatal(cur) != null)
+        // A signal that arrived between the checks above and the block (queued here or held for the process) ends the sleep now.
+        const arrived = @atomicLoad(u64, &cur.pending_signals, .seq_cst) | @atomicLoad(u64, &cur.grp().held_signals, .seq_cst);
+        if ((arrived & mask) != 0 or sig_mod.pendingActionable(cur) or sig_mod.pendingFatal(cur) != null)
             task_mod.unblockTask(cur_idx);
         sched.forceReschedule();
         sched.repairCurrentAfterBlock();
@@ -700,9 +717,6 @@ pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_s
         _ = @atomicRmw(u64, &sched.sleep_bm, .And, ~bit, .seq_cst);
     }
 }
-
-/// How long rt_sigtimedwait sleeps before it looks at the pending set again: one scheduler tick.
-const SIGWAIT_POLL_NS: u64 = 10_000_000;
 
 /// rt_sigqueueinfo(tgid, sig, uinfo_ptr) → 0 or -errno
 pub fn rtSigqueueinfo(tgid: u32, sig: u32, uinfo_ptr: u64) i64 {

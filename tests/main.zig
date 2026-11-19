@@ -16636,3 +16636,23 @@ test "SO_SNDTIMEO bounds a blocking TCP connect: EINPROGRESS once it runs out (h
     try std.testing.expect(std.mem.indexOf(u8, body, "poll.waitSlice(deadline)") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "poll.waitSlice(null)") == null);
 }
+
+test "a signal sent to a task asleep in rt_sigtimedwait for it wakes the task at once (hello433)" {
+    // Linux do_sigtimedwait: while it sleeps the waited signals are left out of the blocked set, so signal_wake_up wakes the
+    // waiter. rt_sigtimedwait used to sleep until a 10 ms poll because kickIfBlocked only woke tasks for actionable signals.
+    const ap = kt.signal_action_policy;
+    try std.testing.expect(ap.wakesSigwaiter(1 << 9, 1 << 9));
+    try std.testing.expect(!ap.wakesSigwaiter(1 << 9, 1 << 11));
+    try std.testing.expect(!ap.wakesSigwaiter(1 << 9, 0));
+    const ss = kt.signal_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "SIGWAIT_POLL_NS") == null);
+    const tw = std.mem.indexOf(u8, ss, "pub fn rtSigtimedwait(").?;
+    const tw_end = std.mem.indexOf(u8, ss[tw..], "\n}\n").? + tw;
+    const body = ss[tw..tw_end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "@atomicStore(u64, &cur.sigwait_mask, mask, .release);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "@atomicStore(u64, &cur.sigwait_mask, 0, .release);") != null);
+    const sg = kt.signal_source;
+    const k = std.mem.indexOf(u8, sg, "pub fn kickIfBlocked(").?;
+    const k_end = std.mem.indexOf(u8, sg[k..], "\n}\n").? + k;
+    try std.testing.expect(std.mem.indexOf(u8, sg[k..k_end], "action_policy.wakesSigwaiter(") != null);
+}

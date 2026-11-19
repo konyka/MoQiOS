@@ -13,6 +13,7 @@ const task = @import("task.zig");
 const siginfo = @import("siginfo_policy.zig");
 const sigqueue = @import("sigqueue_policy.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
+const action_policy = @import("signal_action_policy.zig");
 
 /// Guards every task's rt_queue.
 var rt_queue_lock: IrqSpinlock = .{};
@@ -269,7 +270,12 @@ pub fn kickIfBlocked(idx: u32) void {
     const t = task.getTask(idx) orelse return;
     // Keep blocked waits asleep for signals masked by the current wait mask.
     // The pending bit remains set and can wake the task after the mask changes.
-    if (t.state == .blocked and pendingActionable(t)) {
+    // A task in rt_sigtimedwait also wakes for a signal it waits for, which it normally blocks.
+    if (t.state != .blocked) return;
+    // A process-directed signal held for the process counts too: any thread waiting for it takes it.
+    const arrived = @atomicLoad(u64, &t.pending_signals, .seq_cst) | @atomicLoad(u64, &t.grp().held_signals, .seq_cst);
+    const waited = action_policy.wakesSigwaiter(@atomicLoad(u64, &t.sigwait_mask, .acquire), arrived);
+    if (waited or pendingActionable(t)) {
         task.unblockTask(idx);
     }
 }

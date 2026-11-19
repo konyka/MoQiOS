@@ -321,6 +321,8 @@ pub const Task = struct {
     /// nanosleep() wake deadline in TSC nanoseconds (0 = not sleeping).
     /// Scanned every timer tick against sched.sleep_bm — see sched.sleepTimerTick.
     sleep_deadline_ns: u64 = 0,
+    /// The set an rt_sigtimedwait in progress waits for (0 = none): a send of one of these wakes the task (signal.kickIfBlocked).
+    sigwait_mask: u64 = 0,
 
     /// ITIMER_REAL: next expiration deadline (ns) and recurring interval (ns).
     itimer_real_value: u64 = 0,
@@ -858,6 +860,7 @@ fn reserveSlotLocked() ?u32 {
     // into the ready queue.
     _ = @atomicRmw(u64, &@import("sched.zig").sleep_bm, .And, ~(@as(u64, 1) << @intCast(slot)), .seq_cst);
     tasks[slot].sleep_deadline_ns = 0;
+    tasks[slot].sigwait_mask = 0;
     tasks[slot].stopped = false;
     tasks[slot].stop_signum = 0;
     tasks[slot].group_exit_code = null;

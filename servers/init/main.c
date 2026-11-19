@@ -549,6 +549,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello430"); /* ping socket recvmsg control messages */
     run_test("hello431"); /* sigsetsize must be 8 (rt_sigpending accepts up to 8) */
     run_test("hello432"); /* SO_SNDTIMEO bounds a blocking TCP connect */
+    run_test("hello433"); /* a signal wakes its rt_sigtimedwait waiter at once */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */
