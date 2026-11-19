@@ -5,6 +5,7 @@
 // setsockopt, getsockopt, getsockname, getpeername, net_poll,
 // recvmmsg, sendmmsg.
 
+const std = @import("std");
 const sched_mod = @import("../proc/sched.zig");
 const task_mod = @import("../proc/task.zig");
 const cap_mod = @import("../ipc/capability.zig");
@@ -1780,9 +1781,15 @@ fn sendCaps() ip_cmsg_policy.SendCaps {
     return .{ .net_admin = cap_mod.hasSysCap(idx, "cap_net_admin"), .net_raw = cap_mod.hasSysCap(idx, "cap_net_raw") };
 }
 
+/// Whether `a` is an address of the NIC (its link-local or a global one), for IPV6_PKTINFO's source check.
+fn isOwnNicAddr6(a: [16]u8) bool {
+    return ndp.isOwnAddress(a, netif.getMac());
+}
+
 /// Send `payload` as one datagram on UDP socket `fd` (the sendto UDP path without the user-buffer copy). `control` is sendmsg's
-/// msg_control: on an IPv4 socket it is parsed once the destination is known (udp_sendmsg: EDESTADDRREQ comes first), and its
-/// IP_TTL / IP_TOS / IP_PKTINFO apply to this datagram only. An IPv6 or ping socket does not read it.
+/// msg_control: it is parsed once the destination is known (udp_sendmsg / udpv6_sendmsg: EDESTADDRREQ comes first), and its
+/// IP_TTL / IP_TOS / IP_PKTINFO (IPv4) or IPV6_HOPLIMIT / IPV6_TCLASS / IPV6_PKTINFO (IPv6) apply to this datagram only. A ping
+/// socket does not read it.
 fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32, control: []const u8) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
@@ -1808,10 +1815,18 @@ fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32, cont
             dst_port6 = d.udp_dst_port;
         } else return -89;
         const n6 = @min(payload.len, 1232);
-        const oif6 = udp.sendOif6(src_key, dst6, scope6);
+        var oif6 = udp.sendOif6(src_key, dst6, scope6);
+        // ip6_datagram_send_ctl runs once the destination is known; IPV6_PKTINFO may name the interface and the source.
+        const ctx6: ip_cmsg_policy.Ctx6 = .{ .pre_oif = oif6, .nic_active = nic_mod.isActive(), .isOwnNic = isOwnNicAddr6 };
+        const ov6 = switch (ip_cmsg_policy.parseSend6(control, sendCaps(), ctx6)) {
+            .ok => |v| v,
+            .err => |e| return e,
+        };
+        if (ov6.pktinfo and ov6.oif != 0) oif6 = @intCast(@min(ov6.oif, 255));
+        const src6 = if (ov6.pktinfo and !std.mem.allEqual(u8, &ov6.src, 0)) ov6.src else d.udp_local_ip6;
         const unreach6 = bind_addr_policy.routeErrno6(dst6, oif6);
         if (unreach6 != 0) return unreach6;
-        return if (udp.sendToV6From(d.udp_local_ip6, dst6, dst_port6, src_key, oif6, payload.ptr, @intCast(n6))) @intCast(n6) else -1;
+        return if (udp.sendToV6FromOv(src6, dst6, dst_port6, src_key, oif6, payload.ptr, @intCast(n6), ov6.hops, ov6.tclass)) @intCast(n6) else -1;
     }
     var dst_ip: [4]u8 = .{ 0, 0, 0, 0 };
     var dst_port: u16 = 0;

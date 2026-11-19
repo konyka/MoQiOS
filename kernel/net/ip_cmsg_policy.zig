@@ -268,3 +268,141 @@ pub fn oifErrno4(oif: u32, nic_active: bool) i64 {
     if (oif == 0 or oif == 1 or (oif == 2 and nic_active)) return 0;
     return -19;
 }
+
+fn noNicAddress(_: [16]u8) bool {
+    return false;
+}
+
+/// What the IPv6 send path knows before the control messages are read: the interface the destination's scope or the socket's
+/// binding already chose (0 for none), whether the NIC (interface 2) is up, and which addresses are the NIC's.
+pub const Ctx6 = struct {
+    pre_oif: u32 = 0,
+    nic_active: bool = false,
+    isOwnNic: *const fn ([16]u8) bool = noNicAddress,
+};
+
+/// What the control messages of one IPv6 UDP sendmsg change for that datagram (Linux struct ipcm6_cookie and the flowi6 fields
+/// ip6_datagram_send_ctl fills): IPV6_HOPLIMIT and IPV6_TCLASS replace the socket's values (a hop limit of -1 keeps it, null here);
+/// IPV6_PKTINFO names the source address (:: lets the stack choose) and the outgoing interface (`oif`, 0 for none).
+pub const Send6 = struct {
+    hops: ?u8 = null,
+    tclass: ?u8 = null,
+    pktinfo: bool = false,
+    oif: u32 = 0,
+    src: [16]u8 = @splat(0),
+};
+
+const IPV6_2292PKTINFO: i32 = 2;
+const IPV6_2292HOPOPTS: i32 = 3;
+const IPV6_2292DSTOPTS: i32 = 4;
+const IPV6_2292RTHDR: i32 = 5;
+const IPV6_2292HOPLIMIT: i32 = 8;
+const IPV6_FLOWINFO: i32 = 11;
+const IPV6_HOPOPTS: i32 = 54;
+const IPV6_RTHDRDSTOPTS: i32 = 55;
+const IPV6_RTHDR: i32 = 57;
+const IPV6_DSTOPTS: i32 = 59;
+const IPV6_DONTFRAG: i32 = 62;
+
+fn isLinkLocal6(a: [16]u8) bool {
+    return a[0] == 0xfe and (a[1] & 0xc0) == 0x80;
+}
+
+fn isLoopback6(a: [16]u8) bool {
+    return std.mem.eql(u8, a[0..15], &@as([15]u8, @splat(0))) and a[15] == 1;
+}
+
+fn isAny6(a: [16]u8) bool {
+    return std.mem.allEqual(u8, &a, 0);
+}
+
+/// An int that must fill the message exactly and lie in -1..255.
+fn int6(m: Cmsg) ?i32 {
+    if (m.data.len != 4) return null;
+    const v: i32 = @bitCast(readU32(m.data));
+    if (v < -1 or v > 255) return null;
+    return v;
+}
+
+/// The control messages of an IPv6 UDP sendmsg (Linux udp_cmsg_send, then ip6_datagram_send_ctl): SOL_UDP first as for IPv4, then
+/// every message in order. SOL_SOCKET goes through __sock_cmsg_send, other levels are skipped, an unknown SOL_IPV6 type is EINVAL.
+/// Extension headers (hop-by-hop, destination options, routing) need CAP_NET_RAW and are then refused with EOPNOTSUPP: this stack
+/// does not send them.
+pub fn parseSend6(control: []const u8, caps: SendCaps, ctx: Ctx6) union(enum) { ok: Send6, err: i64 } {
+    var off: usize = 0;
+    var need_ip = false;
+    while (cmsgAt(control, off) catch return .{ .err = -22 }) |m| : (off = nextOff(off, m.len)) {
+        if (m.level != SOL_UDP) {
+            need_ip = true;
+            continue;
+        }
+        if (m.typ != UDP_SEGMENT or m.data.len != 2) return .{ .err = -22 };
+    }
+    var out: Send6 = .{ .oif = ctx.pre_oif };
+    if (!need_ip) return .{ .ok = .{} };
+    off = 0;
+    while (cmsgAt(control, off) catch return .{ .err = -22 }) |m| : (off = nextOff(off, m.len)) {
+        if (m.level == scm.SOL_SOCKET) {
+            const rc = sockCmsg(m, caps);
+            if (rc != 0) return .{ .err = rc };
+            continue;
+        }
+        if (m.level != @as(i32, @intCast(ipo.SOL_IPV6))) continue;
+        switch (m.typ) {
+            IPV6_2292PKTINFO, @as(i32, @intCast(ipo.IPV6_PKTINFO)) => {
+                if (m.data.len < 20) return .{ .err = -22 };
+                const addr: [16]u8 = m.data[0..16].*;
+                const ifx = readU32(m.data[16..20]);
+                if (ifx != 0) {
+                    if (out.oif != 0 and ifx != out.oif) return .{ .err = -22 };
+                    out.oif = ifx;
+                }
+                if (out.oif != 0) {
+                    if (!(out.oif == 1 or (out.oif == 2 and ctx.nic_active))) return .{ .err = -19 };
+                } else if (isLinkLocal6(addr)) return .{ .err = -22 };
+                out.pktinfo = true;
+                if (!isAny6(addr)) {
+                    // Loopback and link-local sources must belong to the interface itself (ipv6_chk_addr strict), others to any.
+                    const strict = isLoopback6(addr) or isLinkLocal6(addr);
+                    const on_lo = isLoopback6(addr);
+                    const on_nic = ctx.nic_active and !on_lo and ctx.isOwnNic(addr);
+                    const ok = if (on_lo) (!strict or out.oif == 0 or out.oif == 1) else if (on_nic) (!strict or out.oif == 0 or out.oif == 2) else false;
+                    if (!ok) return .{ .err = -22 };
+                    out.src = addr;
+                }
+            },
+            IPV6_FLOWINFO => if (m.data.len < 4) return .{ .err = -22 },
+            IPV6_2292HOPLIMIT, @as(i32, @intCast(ipo.IPV6_HOPLIMIT)) => {
+                const v = int6(m) orelse return .{ .err = -22 };
+                out.hops = if (v < 0) null else @intCast(v);
+            },
+            @as(i32, @intCast(ipo.IPV6_TCLASS)) => {
+                const v = int6(m) orelse return .{ .err = -22 };
+                out.tclass = @truncate(@as(u32, @bitCast(v)));
+            },
+            IPV6_DONTFRAG => {
+                if (m.data.len != 4) return .{ .err = -22 };
+                const v: i32 = @bitCast(readU32(m.data));
+                if (v < 0 or v > 1) return .{ .err = -22 };
+            },
+            IPV6_2292HOPOPTS, IPV6_HOPOPTS, IPV6_2292DSTOPTS, IPV6_DSTOPTS, IPV6_RTHDRDSTOPTS => {
+                if (m.data.len < 2) return .{ .err = -22 };
+                const len = (@as(usize, m.data[1]) + 1) * 8;
+                if (m.data.len < len) return .{ .err = -22 };
+                if (!caps.net_raw) return .{ .err = -1 };
+                return .{ .err = -95 };
+            },
+            IPV6_2292RTHDR, IPV6_RTHDR => {
+                if (m.data.len < 4) return .{ .err = -22 };
+                // Only a type 2 (Mobile IPv6) routing header with one segment can be valid (no capability is checked); this stack
+                // sends none.
+                if (m.data[2] != 2 or m.data[1] != 2 or m.data[3] != 1) return .{ .err = -22 };
+                if (m.data.len < 24) return .{ .err = -22 };
+                return .{ .err = -95 };
+            },
+            else => return .{ .err = -22 },
+        }
+    }
+    if (!out.pktinfo) out.oif = 0;
+    return .{ .ok = out };
+}

@@ -4826,7 +4826,8 @@ test "IPv6 send interface: sendto's sin6_scope_id, the bound interface and IPV6_
     try std.testing.expect(std.mem.indexOf(u8, us, "    const out_if6 = mcast.outInterface(oif);\n") != null);
     const ss = kt.socket_syscall_source;
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "scope6 = parsed.scope_id;"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "const oif6 = udp.sendOif6(src_key, dst6, scope6);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "const oif6 = udp.sendOif6(src_key, dst6, scope6);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "var oif6 = udp.sendOif6(src_key, dst6, scope6);"));
     const conn_at = std.mem.indexOf(u8, ss, "const dev_rc = udp.connectDev6(t.fd_table.fds[fd].udpKey(), parsed.addr, parsed.scope_id);").?;
     try std.testing.expect(conn_at < std.mem.indexOfPos(u8, ss, conn_at, "t.fd_table.fds[fd].udp_connected = true;").?);
 }
@@ -5261,7 +5262,7 @@ test "an IPv6 UDP datagram leaves from its socket's bound address; NDP is sent a
     try std.testing.expect(std.mem.indexOf(u8, us, "    const our_ip = @import(\"tcp_port_policy.zig\").sourceAddr6(bound, dst_ip, if (is_loop) dst_ip else ndp.selectSourceAddress(dst_ip, our_mac));\n") != null);
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (udp.sendToV6From(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, oif6, &tmp6, @intCast(n6))) {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ss, "return if (udp.sendToV6From(d.udp_local_ip6, dst6, dst_port6, src_key, oif6, payload.ptr, @intCast(n6))) @intCast(n6) else -1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "return if (udp.sendToV6FromOv(src6, dst6, dst_port6, src_key, oif6, payload.ptr, @intCast(n6), ov6.hops, ov6.tclass)) @intCast(n6) else -1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "udp.sendToV6(dst6") == null);
     const iv = kt.icmpv6_source;
     try std.testing.expect(std.mem.indexOf(u8, iv, "pub const NDP_HOP_LIMIT: u8 = 255;\n") != null);
@@ -16260,4 +16261,116 @@ test "IPv4 UDP sendmsg control messages IP_TTL / IP_TOS / IP_PKTINFO (hello423):
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "ip_cmsg_policy.parseSend4(control, sendCaps())") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "pub fn sendToFromOv(") != null);
+}
+
+test "IPv6 UDP sendmsg control messages IPV6_HOPLIMIT / IPV6_TCLASS / IPV6_PKTINFO (hello424): Linux ip6_datagram_send_ctl" {
+    const c = kt.ip_cmsg_policy;
+    var b: [256]u8 = @splat(0);
+    const W = struct {
+        fn put(buf: []u8, off: usize, level: i32, typ: i32, data: []const u8, len: ?u64) usize {
+            const l: u64 = len orelse 16 + data.len;
+            std.mem.writeInt(u64, buf[off..][0..8], l, .little);
+            std.mem.writeInt(i32, buf[off + 8 ..][0..4], level, .little);
+            std.mem.writeInt(i32, buf[off + 12 ..][0..4], typ, .little);
+            @memcpy(buf[off + 16 ..][0..data.len], data);
+            return off + ((16 + data.len + 7) & ~@as(usize, 7));
+        }
+        fn int(v: i32) [4]u8 {
+            var o: [4]u8 = undefined;
+            std.mem.writeInt(i32, &o, v, .little);
+            return o;
+        }
+        fn pk(addr: [16]u8, ifx: u32) [20]u8 {
+            var o: [20]u8 = undefined;
+            @memcpy(o[0..16], &addr);
+            std.mem.writeInt(u32, o[16..20], ifx, .little);
+            return o;
+        }
+        var own: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ .{0x15};
+        var own_ll: [16]u8 = .{ 0xfe, 0x80 } ++ @as([13]u8, @splat(0)) ++ .{0x15};
+        fn isOwn(a: [16]u8) bool {
+            return std.mem.eql(u8, &a, &own) or std.mem.eql(u8, &a, &own_ll);
+        }
+    };
+    const lo6: [16]u8 = @as([15]u8, @splat(0)) ++ .{1};
+    const any6: [16]u8 = @splat(0);
+    const caps: c.SendCaps = .{};
+    const ctx: c.Ctx6 = .{ .nic_active = true, .isOwnNic = W.isOwn };
+    try std.testing.expectEqual(c.Send6{}, c.parseSend6(b[0..0], caps, ctx).ok);
+    // IPV6_HOPLIMIT 7 (and RFC 2292's IPV6_2292HOPLIMIT 8), 0 is a hop limit too, -1 keeps the socket's; IPV6_TCLASS 0x4b, -1 sends 0xff.
+    var o = W.put(&b, 0, 41, 52, &W.int(7), null);
+    o = W.put(&b, o, 41, 67, &W.int(0x4b), null);
+    const both = c.parseSend6(b[0..o], caps, ctx).ok;
+    try std.testing.expectEqual(@as(?u8, 7), both.hops);
+    try std.testing.expectEqual(@as(?u8, 0x4b), both.tclass);
+    o = W.put(&b, 0, 41, 8, &W.int(0), null);
+    try std.testing.expectEqual(@as(?u8, 0), c.parseSend6(b[0..o], caps, ctx).ok.hops);
+    o = W.put(&b, 0, 41, 52, &W.int(-1), null);
+    try std.testing.expectEqual(@as(?u8, null), c.parseSend6(b[0..o], caps, ctx).ok.hops);
+    o = W.put(&b, 0, 41, 67, &W.int(-1), null);
+    try std.testing.expectEqual(@as(?u8, 0xff), c.parseSend6(b[0..o], caps, ctx).ok.tclass);
+    // Skipped: IPV6_DONTFRAG 1, IPV6_FLOWINFO, SOL_IP, SCM_RIGHTS.
+    o = W.put(&b, 0, 41, 62, &W.int(1), null);
+    o = W.put(&b, o, 41, 11, &W.int(1), null);
+    o = W.put(&b, o, 0, 2, &W.int(3), null);
+    o = W.put(&b, o, 1, 1, &W.int(3), null);
+    try std.testing.expectEqual(c.Send6{}, c.parseSend6(b[0..o], caps, ctx).ok);
+    // EINVAL.
+    const bad = [_]struct { ty: i32, d: []const u8 }{
+        .{ .ty = 52, .d = &W.int(256) }, .{ .ty = 52, .d = &W.int(-2) }, .{ .ty = 52, .d = &.{5} },
+        .{ .ty = 67, .d = &W.int(256) }, .{ .ty = 67, .d = &W.int(-2) }, .{ .ty = 67, .d = &.{5} },
+        .{ .ty = 62, .d = &W.int(2) },   .{ .ty = 99, .d = &W.int(3) },  .{ .ty = 50, .d = &(@as([16]u8, @splat(0))) },
+        .{ .ty = 57, .d = &.{ 0, 0, 0, 0 } }, // a type 0 routing header
+    };
+    for (bad) |x| {
+        @memset(&b, 0);
+        const n = W.put(&b, 0, 41, x.ty, x.d, null);
+        try std.testing.expectEqual(@as(i64, -22), c.parseSend6(b[0..n], caps, ctx).err);
+    }
+    // Extension headers need CAP_NET_RAW (and are not sent: EOPNOTSUPP once allowed).
+    o = W.put(&b, 0, 41, 54, &.{ 17, 0, 1, 4, 0, 0, 0, 0 }, null);
+    try std.testing.expectEqual(@as(i64, -1), c.parseSend6(b[0..o], caps, ctx).err);
+    try std.testing.expectEqual(@as(i64, -95), c.parseSend6(b[0..o], .{ .net_raw = true }, ctx).err);
+    o = W.put(&b, 0, 41, 54, &.{ 17, 1, 1, 4, 0, 0, 0, 0 }, null); // hdrlen 1 says 16 bytes, only 8 given
+    try std.testing.expectEqual(@as(i64, -22), c.parseSend6(b[0..o], caps, ctx).err);
+
+    // IPV6_PKTINFO: :: and interface 0 change nothing; ::1 (also on lo) or an address of the NIC is the source; an interface that
+    // does not exist is ENODEV; a link-local source needs an interface; an address that is not ours, or a group, is EINVAL.
+    o = W.put(&b, 0, 41, 50, &W.pk(any6, 0), null);
+    const p0 = c.parseSend6(b[0..o], caps, ctx).ok;
+    try std.testing.expect(p0.pktinfo and p0.oif == 0 and std.mem.eql(u8, &p0.src, &any6));
+    o = W.put(&b, 0, 41, 50, &W.pk(lo6, 1), null);
+    const p1 = c.parseSend6(b[0..o], caps, ctx).ok;
+    try std.testing.expect(p1.oif == 1 and std.mem.eql(u8, &p1.src, &lo6));
+    o = W.put(&b, 0, 41, 2, &W.pk(W.own, 0), null);
+    try std.testing.expectEqualSlices(u8, &W.own, &c.parseSend6(b[0..o], caps, ctx).ok.src);
+    o = W.put(&b, 0, 41, 50, &(W.pk(W.own_ll, 2) ++ @as([4]u8, @splat(0))), null);
+    try std.testing.expectEqual(@as(u32, 2), c.parseSend6(b[0..o], caps, ctx).ok.oif);
+    o = W.put(&b, 0, 41, 50, &W.pk(any6, 99), null);
+    try std.testing.expectEqual(@as(i64, -19), c.parseSend6(b[0..o], caps, ctx).err);
+    o = W.put(&b, 0, 41, 50, &W.pk(any6, 2), null);
+    try std.testing.expectEqual(@as(i64, -19), c.parseSend6(b[0..o], caps, .{ .isOwnNic = W.isOwn }).err);
+    o = W.put(&b, 0, 41, 50, &W.pk(W.own_ll, 0), null);
+    try std.testing.expectEqual(@as(i64, -22), c.parseSend6(b[0..o], caps, ctx).err);
+    o = W.put(&b, 0, 41, 50, &W.pk(lo6, 2), null);
+    try std.testing.expectEqual(@as(i64, -22), c.parseSend6(b[0..o], caps, ctx).err);
+    var other: [16]u8 = W.own;
+    other[15] = 0x99;
+    o = W.put(&b, 0, 41, 50, &W.pk(other, 0), null);
+    try std.testing.expectEqual(@as(i64, -22), c.parseSend6(b[0..o], caps, ctx).err);
+    const grp: [16]u8 = .{ 0xff, 0x02 } ++ @as([13]u8, @splat(0)) ++ .{1};
+    o = W.put(&b, 0, 41, 50, &W.pk(grp, 0), null);
+    try std.testing.expectEqual(@as(i64, -22), c.parseSend6(b[0..o], caps, ctx).err);
+    // An interface that differs from the one the destination's scope (or the socket's binding) chose is EINVAL.
+    o = W.put(&b, 0, 41, 50, &W.pk(any6, 2), null);
+    try std.testing.expectEqual(@as(i64, -22), c.parseSend6(b[0..o], caps, .{ .pre_oif = 1, .nic_active = true, .isOwnNic = W.isOwn }).err);
+    try std.testing.expect(c.parseSend6(b[0..o], caps, .{ .pre_oif = 2, .nic_active = true, .isOwnNic = W.isOwn }) == .ok);
+    // Messages are handled in order: a bad IPV6_PKTINFO before a bad IPV6_HOPLIMIT reports its own error.
+    o = W.put(&b, 0, 41, 50, &W.pk(any6, 99), null);
+    o = W.put(&b, o, 41, 52, &W.int(999), null);
+    try std.testing.expectEqual(@as(i64, -19), c.parseSend6(b[0..o], caps, ctx).err);
+
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "ip_cmsg_policy.parseSend6(control, sendCaps(), ctx6)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "pub fn sendToV6FromOv(") != null);
 }

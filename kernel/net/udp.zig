@@ -1286,6 +1286,12 @@ pub fn sendToV6(dst_ip: [16]u8, dst_port: u16, src_port: u16, data: [*]const u8,
 /// are that socket's own, also when other sockets share its port. `oif` is the interface it leaves through (sendOif6, 0 for the
 /// default route); a group copy looped back to this host arrives on it.
 pub fn sendToV6From(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, oif: u8, data: [*]const u8, data_len: u16) bool {
+    return sendToV6FromOv(bound, dst_ip, dst_port, src_key, oif, data, data_len, null, null);
+}
+
+/// sendToV6From with sendmsg's IPV6_HOPLIMIT / IPV6_TCLASS control messages: `hops_ov` replaces the hop limit (the multicast one
+/// too; 0 is a hop limit) and `tclass_ov` the whole traffic class byte, ECN bits included, for this datagram only.
+pub fn sendToV6FromOv(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, oif: u8, data: [*]const u8, data_len: u16, hops_ov: ?u8, tclass_ov: ?u8) bool {
     if (data_len > MAX_UDP_PAYLOAD_V6) return false;
     const src_port = portNumber(src_key);
 
@@ -1330,6 +1336,11 @@ pub fn sendToV6From(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, 
     const group = mcast.isMulticast(dst_ip);
     // A datagram to a group carries IPV6_MULTICAST_HOPS (default 1), not the unicast hop limit.
     if (group) send_pkt[14 + 7] = opts.mc_hops;
+    if (hops_ov) |v| send_pkt[14 + 7] = v;
+    if (tclass_ov) |tc| {
+        send_pkt[14] = (send_pkt[14] & 0xF0) | (tc >> 4);
+        send_pkt[15] = (send_pkt[15] & 0x0F) | (tc << 4);
+    }
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + udp_total);
     // IPV6_MULTICAST_LOOP: when this host is a member of the group on the outgoing interface a copy is delivered locally too,
     // arriving on that interface (Linux ip6_finish_output2 checks ipv6_chk_mcast_addr on the device).
