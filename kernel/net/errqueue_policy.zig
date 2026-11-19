@@ -71,6 +71,17 @@ pub fn oversize(payload: usize, mtu: u16, pmtudisc: u8, recverr: bool) ?struct {
     return .{ .info = mtu, .queue = recverr and (pmtudisc == 2 or pmtudisc == 3) };
 }
 
+/// oversize for IPv6 (__ip6_append_data): 40 + 8 header bytes; ee_info is the MTU too.
+pub fn oversize6(payload: usize, mtu: u16, pmtudisc: u8, recverr: bool) ?struct { info: u32, queue: bool } {
+    if (40 + 8 + payload <= mtu) return null;
+    return .{ .info = mtu, .queue = recverr and (pmtudisc == 2 or pmtudisc == 3) };
+}
+
+/// The IPv6 entry ipv6_local_error makes: origin LOCAL, the destination (a sockaddr_in6) and port as msg_name, no payload.
+pub fn localEntry6(errno: i32, info: u32, dst: [16]u8, port: u16) Entry {
+    return .{ .errno = errno, .info = info, .dst = dst, .dst_port = port, .local = true, .v6 = true };
+}
+
 /// The error-queue entry ip_local_error makes: origin LOCAL, the destination and port as msg_name, no payload.
 pub fn localEntry(errno: i32, info: u32, dst: [4]u8, port: u16) Entry {
     var e: Entry = .{ .errno = errno, .info = info, .dst_port = port, .local = true };
@@ -95,8 +106,11 @@ pub fn encodeExtErr(e: Entry) struct { bytes: [44]u8, len: usize } {
     out[6] = e.icmp_code;
     std.mem.writeInt(u32, out[8..12], e.info, .little);
     if (e.v6) {
-        out[16] = 10; // AF_INET6
-        @memcpy(out[24..40], &e.offender);
+        // ipv6_recv_error fills the offender only for an ICMPv6 origin.
+        if (!e.local) {
+            out[16] = 10; // AF_INET6
+            @memcpy(out[24..40], &e.offender);
+        }
         return .{ .bytes = out, .len = 44 };
     }
     // ip_recv_error fills the offender only for an ICMP origin (ipv4_datagram_support_cmsg); a local error leaves it zero.

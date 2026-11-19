@@ -17017,3 +17017,19 @@ test "an oversized UDP datagram is EMSGSIZE, never a cut copy, and a local IP_RE
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (udpOversize4(src_key, dst_ip, dst_port, full_len)) |e| return e;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "const n = @min(payload.len, 1472);") == null);
 }
+
+test "IPv6 UDP: IPV6_MTU_DISCOVER, 1452-byte datagrams and a local IPV6_RECVERR EMSGSIZE (hello449 E)" {
+    // Linux __ip6_append_data / ipv6_local_error; the kernel cut IPv6 datagrams to 1232 bytes and had no IPV6_MTU_DISCOVER.
+    const ipo = kt.ip_opt_policy;
+    const set = ipo.applySet(.{}, ipo.SOL_IPV6, ipo.IPV6_MTU_DISCOVER, &.{ 2, 0, 0, 0 });
+    try std.testing.expect(set == .ok and set.ok.pmtudisc6 == 2);
+    try std.testing.expectEqual(@as(?i32, 1), ipo.getValue(.{}, ipo.SOL_IPV6, ipo.IPV6_MTU_DISCOVER));
+    try std.testing.expect(ipo.applySet(.{}, ipo.SOL_IPV6, ipo.IPV6_MTU_DISCOVER, &.{ 6, 0, 0, 0 }) == .err);
+    const eq = kt.errqueue_policy;
+    try std.testing.expect(eq.oversize6(1452, 1500, 1, false) == null);
+    try std.testing.expect(eq.oversize6(1453, 1500, 2, true).?.queue);
+    const b = eq.encodeExtErr(eq.localEntry6(90, 1500, @splat(0), 1));
+    try std.testing.expectEqual(@as(usize, 44), b.len);
+    try std.testing.expectEqual(@as(u8, eq.SO_EE_ORIGIN_LOCAL), b.bytes[4]);
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "const MAX_UDP_PAYLOAD_V6 = 1452;") != null);
+}

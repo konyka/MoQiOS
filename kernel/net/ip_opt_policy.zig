@@ -37,6 +37,8 @@ pub const IP_ADD_MEMBERSHIP: u64 = 35;
 pub const IP_DROP_MEMBERSHIP: u64 = 36;
 pub const IP_MULTICAST_ALL: u64 = 49;
 pub const IPV6_UNICAST_HOPS: u64 = 16;
+/// IPv6 path MTU discovery mode (Linux np->pmtudisc), the same values as IP_MTU_DISCOVER; IPV6_PMTUDISC_WANT unless set.
+pub const IPV6_MTU_DISCOVER: u64 = 23;
 pub const IPV6_MULTICAST_IF: u64 = 17;
 pub const IPV6_MULTICAST_HOPS: u64 = 18;
 pub const IPV6_MULTICAST_LOOP: u64 = 19;
@@ -92,6 +94,7 @@ pub const IpOpts = struct {
     recvtclass6: bool = false,
     origdst6: bool = false,
     recverr6: bool = false,
+    pmtudisc6: u8 = PMTUDISC_WANT,
 };
 
 pub const Family = enum { v4, v6 };
@@ -206,6 +209,12 @@ pub fn applySet(cur: IpOpts, level: u64, optname: u64, val: []const u8) SetResul
                 o.mc_all = v != 0;
             },
             // do_ipv6_setsockopt: the boolean options need a full int.
+            // do_ipv6_setsockopt: IPV6_PMTUDISC_DONT..OMIT, anything else EINVAL.
+            IPV6_MTU_DISCOVER => {
+                if (val.len < 4) return .{ .err = -22 };
+                if (v < PMTUDISC_DONT or v > PMTUDISC_OMIT) return .{ .err = -22 };
+                o.pmtudisc6 = @intCast(v);
+            },
             IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVTCLASS, IPV6_RECVORIGDSTADDR, IPV6_RECVERR => {
                 if (val.len < 4) return .{ .err = -22 };
                 switch (optname) {
@@ -312,6 +321,7 @@ pub fn getValue(o: IpOpts, level: u64, optname: u64) ?i32 {
             IPV6_RECVTCLASS => @intFromBool(o.recvtclass6),
             IPV6_RECVORIGDSTADDR => @intFromBool(o.origdst6),
             IPV6_RECVERR => @intFromBool(o.recverr6),
+            IPV6_MTU_DISCOVER => o.pmtudisc6,
             else => null,
         },
         else => null,

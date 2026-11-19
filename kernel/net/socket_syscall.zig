@@ -946,10 +946,8 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         const pending_send_err = udp.takePendingError(t.fd_table.fds[fd].udpKey());
         if (pending_send_err != 0) return -@as(i64, pending_send_err);
         if (is_v6) {
-            var tmp6: [1232]u8 = undefined;
-            const to_copy6 = @min(len, 1232);
-            const n6 = copy.copyFromUser(&tmp6, @ptrFromInt(buf), to_copy6);
-            if (n6 == 0) return -1;
+            var tmp6: [1452]u8 = undefined;
+            const to_copy6 = @min(len, tmp6.len);
             var dst6: [16]u8 = @splat(0);
             var dst_port6: u16 = 0;
             var scope6: u32 = 0;
@@ -971,6 +969,9 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
             const oif6 = udp.sendOif6(src_key, dst6, scope6);
             const unreach6 = bind_addr_policy.routeErrno6(dst6, oif6);
             if (unreach6 != 0) return unreach6;
+            if (udpOversize6(src_key, dst6, dst_port6, len)) |e| return e;
+            const n6 = copy.copyFromUser(&tmp6, @ptrFromInt(buf), to_copy6);
+            if (n6 == 0) return -1;
             if (udp.sendToV6From(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, oif6, &tmp6, @intCast(n6))) {
                 return @intCast(n6);
             } else {
@@ -1213,8 +1214,8 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
             user_addr_len = @bitCast(len_bytes);
         }
         if (is_v6) {
-            var tmp6: [1232]u8 = undefined;
-            const to_read6 = @min(len, 1232);
+            var tmp6: [1452]u8 = undefined;
+            const to_read6 = @min(len, tmp6.len);
             if (!copy.validateUserBufferWritable(buf, to_read6)) return -14; // EFAULT
             if (addr_ptr != 0) {
                 const addr_copy_len = @min(user_addr_len, sa.SOCKADDR_IN6_LEN);
@@ -1903,7 +1904,8 @@ fn udpSendBytesFull(fd: u32, payload: []const u8, full_len: usize, addr_ptr: u64
             dst6 = d.udp_dst_ip6;
             dst_port6 = d.udp_dst_port;
         } else return -89;
-        const n6 = @min(payload.len, 1232);
+        if (udpOversize6(src_key, dst6, dst_port6, full_len)) |e| return e;
+        const n6 = payload.len;
         var oif6 = udp.sendOif6(src_key, dst6, scope6);
         // ip6_datagram_send_ctl runs once the destination is known; IPV6_PKTINFO may name the interface and the source.
         const ctx6: ip_cmsg_policy.Ctx6 = .{ .pre_oif = oif6, .nic_active = nic_mod.isActive(), .isOwnNic = isOwnNicAddr6 };
@@ -1946,6 +1948,15 @@ fn udpSendBytesFull(fd: u32, payload: []const u8, full_len: usize, addr_ptr: u64
     if (lo_rc != 0) return lo_rc;
     if (udpOversize4(src_key, dst_ip, dst_port, full_len)) |e| return e;
     return if (udp.sendToFromOv(src, dst_ip, dst_port, src_key, payload.ptr, @intCast(payload.len), ov.ttl, ov.tos)) @intCast(payload.len) else -1;
+}
+
+/// udpOversize4 for IPv6 (__ip6_append_data → ipv6_local_error): EMSGSIZE for a datagram over the path MTU, queued with IPV6_RECVERR
+/// under IPV6_PMTUDISC_DO or PROBE.
+fn udpOversize6(key: u32, dst: [16]u8, dst_port: u16, len: usize) ?i64 {
+    const ipo = (udp.getPortOpts(key) orelse return null).ip;
+    const o = errq.oversize6(len, @import("ipv6.zig").getSendMtu(dst), ipo.pmtudisc6, ipo.recverr6) orelse return null;
+    if (o.queue) udp.queueLocalError(key, errq.localEntry6(90, o.info, dst, dst_port));
+    return -90; // EMSGSIZE
 }
 
 /// A UDP datagram that does not fit the path MTU (this stack does not fragment): EMSGSIZE, and with IP_RECVERR under IP_PMTUDISC_DO or

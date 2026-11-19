@@ -8,7 +8,12 @@
  *   B. recvmsg(MSG_ERRQUEUE) -> 0 bytes, msg_namelen 16 (2, 47491, 127.0.0.1), flags MSG_ERRQUEUE, controllen 48, SOL_IP/11 with
  *      errno 90, origin 1 (LOCAL), type 0, code 0, ee_info 1500; a second read EAGAIN;
  *   C. the same send without IP_RECVERR: EMSGSIZE, nothing queued, no POLLERR;
- *   D. a datagram that fits (1472) still goes out whole (1472). */
+ *   D. a datagram that fits (1472) still goes out whole (1472);
+ *   E. IPv6 to [::1]:47492 with IPV6_MTU_DISCOVER DO (SOL_IPV6 23; it reads back 2, default 1) and IPV6_RECVERR: 1600 bytes are
+ *      EMSGSIZE and the error queue gives 0 bytes, msg_namelen 28 (10, 47492, ::1), SOL_IPV6/25 with errno 90, origin 1 and ee_info the
+ *      path MTU (1500 here); a datagram of that MTU less 48 (1452) goes out and arrives whole. (This kernel raises a lowered path MTU
+ *      after a full-size send succeeds, SK-104, so "one byte more" is not checked: it may fit by then.) The kernel used
+ *      to cut IPv6 datagrams to 1232 bytes and send those. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -28,6 +33,9 @@ static long send_(long s, const void *b, long n) { return rc(send((int)s, b, n, 
 static long recv_(long s, void *b, long n) { return rc(recv((int)s, b, n, MSG_DONTWAIT)); }
 static long recvmsg_(long s, void *m, int fl) { return rc(recvmsg((int)s, m, fl)); }
 static long poll1(long s) { struct pollfd p = { (int)s, POLLIN, 0 }; long r = poll(&p, 1, 0); return r < 0 ? -errno : p.revents; }
+static long bind6_(long s, const void *a) { return rc(bind((int)s, a, 28)); }
+static long connect6_(long s, const void *a) { return rc(connect((int)s, a, 28)); }
+static long getint(long s, int lv, int o) { int v = -1; socklen_t l = 4; long r = rc(getsockopt((int)s, lv, o, &v, &l)); return r < 0 ? r : v; }
 #else
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
 #include "../lib/moqi_libc/include/stdio.h"
@@ -42,6 +50,9 @@ static long send_(long s, const void *b, long n) { return syscall6(121, s, (long
 static long recv_(long s, void *b, long n) { return syscall6(122, s, (long)b, n, 0x40, 0, 0); }
 static long recvmsg_(long s, void *m, int fl) { return syscall3(130, s, (long)m, fl); }
 static long poll1(long s) { struct { int fd; short ev, rev; } p = { (int)s, 1, 0 }; long r = syscall3(SYS_poll, (long)&p, 1, 0); return r < 0 ? r : (unsigned short)p.rev; }
+static long bind6_(long s, const void *a) { return syscall3(118, s, (long)a, 28); }
+static long connect6_(long s, const void *a) { return syscall3(124, s, (long)a, 28); }
+static long getint(long s, int lv, int o) { int v = -1; int l = 4; long r = syscall5(133, s, lv, o, (long)&v, (long)&l); return r < 0 ? r : v; }
 #endif
 static int failures;
 static char msg[600];
@@ -112,6 +123,46 @@ int main(void) {
     long got = recv_(rx, rbuf, sizeof rbuf);
     snprintf(msg, sizeof msg, "D: a 1472-byte datagram %ld, received %ld (1472 1472)", rf, got);
     check(rf == 1472 && got == 1472, msg);
+
+    unsigned char a6[28];
+    memset(a6, 0, 28);
+    a6[0] = 10;
+    a6[2] = 47492 >> 8;
+    a6[3] = 47492 & 0xff;
+    a6[23] = 1;
+    long rx6 = sock(10, 2, 0);
+    long b6 = bind6_(rx6, a6);
+    long s6 = sock(10, 2, 0);
+    long d0 = getint(s6, 41, 23);
+    long p6 = setopt(s6, 41, 23, 2), e6 = setopt(s6, 41, 25, 1), c6 = connect6_(s6, a6);
+    long d1 = getint(s6, 41, 23);
+    /* The path MTU to ::1 is learnt from the local error itself (an earlier test may have lowered it with a packet too big); the
+     * largest datagram is then that MTU less 48 header bytes: 1452 on a 1500-byte link. */
+    long bad6 = send_(s6, big, 1600);
+    memset(&m, 0, sizeof m);
+    memset(name, 0, sizeof name);
+    memset(ctl, 0, sizeof ctl);
+    m.name = name;
+    m.nl = sizeof name;
+    m.iov = &io;
+    m.iovlen = 1;
+    m.ctl = ctl;
+    m.ctllen = sizeof ctl;
+    long q6 = recvmsg_(s6, &m, 0x2000 | 0x40);
+    int port6 = (name[2] << 8) | name[3];
+    int mtu6 = rd32(ctl + 24);
+    long fit = mtu6 - 48;
+    long ok6 = fit > 0 && fit <= 1452 ? send_(s6, big, fit) : -1;
+    long got6 = recv_(rx6, rbuf, sizeof rbuf);
+    snprintf(msg, sizeof msg, "E: IPv6 bind %ld, pmtudisc %ld -> set %ld -> %ld, recverr %ld, connect %ld; 1600 %ld; errqueue %ld namelen %u family %d port %d last %d, "
+             "[%ld %d/%d] errno %d origin %d mtu %d; %ld bytes %ld received %ld "
+             "(0, 1 0 2, 0, 0; -90; 0 28 10 47492 1, [60 41/25] 90 1 <=1500; mtu-48 sent and received)",
+             b6, d0, p6, d1, e6, c6, bad6, q6, m.nl, name[0], port6, name[23], rd64(ctl), rd32(ctl + 8), rd32(ctl + 12), rd32(ctl + 16), ctl[20], mtu6,
+             fit, ok6, got6);
+    check(b6 == 0 && d0 == 1 && p6 == 0 && d1 == 2 && e6 == 0 && c6 == 0 && bad6 == -90 && q6 == 0 && m.nl == 28 && name[0] == 10 &&
+              port6 == 47492 && name[23] == 1 && rd64(ctl) == 60 && rd32(ctl + 8) == 41 && rd32(ctl + 12) == 25 && rd32(ctl + 16) == 90 && ctl[20] == 1 &&
+              mtu6 >= 1280 && mtu6 <= 1500 && ok6 == fit && got6 == fit,
+          msg);
 
     print(failures ? "hello449: FAIL\n" : "hello449: PASS\n");
     return failures ? 1 : 0;

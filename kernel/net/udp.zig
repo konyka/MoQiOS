@@ -23,7 +23,8 @@ const QUEUE_DEPTH = 8;
 /// IPv4 Ethernet MTU 1500 − 20 − 8.
 const MAX_UDP_PAYLOAD = 1472;
 /// IPv6 minimum MTU 1280 − 40 − 8.
-const MAX_UDP_PAYLOAD_V6 = 1232;
+/// The largest IPv6 UDP payload one 1500-byte frame carries (1500 - 40 - 8), what the queue keeps and a send may hold.
+const MAX_UDP_PAYLOAD_V6 = 1452;
 
 const UdpEntry = struct {
     src_ip: [16]u8,
@@ -1433,7 +1434,7 @@ pub fn sendToV6From(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, 
 /// sendToV6From with sendmsg's IPV6_HOPLIMIT / IPV6_TCLASS control messages: `hops_ov` replaces the hop limit (the multicast one
 /// too; 0 is a hop limit) and `tclass_ov` the whole traffic class byte, ECN bits included, for this datagram only.
 pub fn sendToV6FromOv(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, oif: u8, data: [*]const u8, data_len: u16, hops_ov: ?u8, tclass_ov: ?u8) bool {
-    if (data_len > MAX_UDP_PAYLOAD_V6) return false;
+    if (data_len > MAX_UDP_PAYLOAD) return false;
     const src_port = portNumber(src_key);
 
     const nh = ndp.resolveNextHop(dst_ip);
