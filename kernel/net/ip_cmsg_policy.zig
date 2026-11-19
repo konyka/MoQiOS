@@ -1,4 +1,4 @@
-//! IPv4 receive control messages (Linux ip_cmsg_recv_offset, ip_cmsg_recv_pktinfo / _ttl / _tos, put_cmsg). A message is
+//! IPv4 and IPv6 receive control messages (Linux ip_cmsg_recv_offset, ip_cmsg_recv_pktinfo / _ttl / _tos, put_cmsg). A message is
 //! { u64 cmsg_len; i32 level; i32 type; data } padded to 8 bytes; IP_PKTINFO carries a struct in_pktinfo (i32 ifindex, in_addr
 //! spec_dst, in_addr addr), IP_TTL an int and IP_TOS one byte, in that order. Host-testable.
 
@@ -23,6 +23,19 @@ pub const Wanted = struct {
     pub fn of(o: ipo.IpOpts) Wanted {
         return .{ .pktinfo = o.pktinfo, .recvttl = o.recvttl, .recvtos = o.recvtos };
     }
+
+    /// The IPv6 flags in the same slots: IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVTCLASS.
+    pub fn of6(o: ipo.IpOpts) Wanted {
+        return .{ .pktinfo = o.pktinfo6, .recvttl = o.recvhops6, .recvtos = o.recvtclass6 };
+    }
+};
+
+/// What an IPv6 datagram brings with it: the interface it arrived on, the header destination, hop limit and traffic class.
+pub const RecvInfo6 = struct {
+    ifindex: u8 = 0,
+    dst: [16]u8 = @splat(0),
+    hops: u8 = 0,
+    tclass: u8 = 0,
 };
 
 pub const Built = struct {
@@ -74,5 +87,31 @@ pub fn build(w: Wanted, info: RecvInfo, cap_in: usize, out: []u8) Built {
         put(out, &used, cap, @intCast(ipo.SOL_IP), @intCast(ipo.IP_TTL), &t, &truncated);
     }
     if (w.recvtos) put(out, &used, cap, @intCast(ipo.SOL_IP), @intCast(ipo.IP_TOS), &.{info.tos}, &truncated);
+    return .{ .written = used, .truncated = truncated };
+}
+
+/// ip6_datagram_recv_common_ctl then _specific_ctl: IPV6_PKTINFO (struct in6_pktinfo: in6_addr, then int ifindex), IPV6_HOPLIMIT
+/// (int), IPV6_TCLASS (int), in that order (`out` holds at least min(cap, 88) bytes).
+pub fn build6(w: Wanted, info: RecvInfo6, cap_in: usize, out: []u8) Built {
+    const cap = @min(cap_in, out.len);
+    var used: usize = 0;
+    var truncated = false;
+    const lv: i32 = @intCast(ipo.SOL_IPV6);
+    if (w.pktinfo) {
+        var pi: [20]u8 = undefined;
+        @memcpy(pi[0..16], &info.dst);
+        std.mem.writeInt(i32, pi[16..20], info.ifindex, .little);
+        put(out, &used, cap, lv, @intCast(ipo.IPV6_PKTINFO), &pi, &truncated);
+    }
+    if (w.recvttl) {
+        var h: [4]u8 = undefined;
+        std.mem.writeInt(i32, &h, info.hops, .little);
+        put(out, &used, cap, lv, @intCast(ipo.IPV6_HOPLIMIT), &h, &truncated);
+    }
+    if (w.recvtos) {
+        var t: [4]u8 = undefined;
+        std.mem.writeInt(i32, &t, info.tclass, .little);
+        put(out, &used, cap, lv, @intCast(ipo.IPV6_TCLASS), &t, &truncated);
+    }
     return .{ .written = used, .truncated = truncated };
 }

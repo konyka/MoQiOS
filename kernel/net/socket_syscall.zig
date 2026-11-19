@@ -1834,8 +1834,9 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
     var src_port: u16 = 0;
     const peek = (flags & 0x02) != 0;
     var meta: ip_cmsg_policy.RecvInfo = .{};
+    var meta6: ip_cmsg_policy.RecvInfo6 = .{};
     if (is_v6) {
-        got = udp.recvFromV6Ex(port, &data, @intCast(data.len), &src6, &src_port, &full, peek);
+        got = udp.recvFromV6Meta(port, &data, @intCast(data.len), &src6, &src_port, &full, peek, &meta6);
     } else {
         got = udp.recvFromMeta(port, &data, @intCast(data.len), &src4, &src_port, &full, peek, &meta);
     }
@@ -1865,12 +1866,15 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
         bo.writeU32Le(&al, alen);
         _ = copy.copyToUser(@ptrFromInt(msg_ptr + 8), &al, 4);
     }
-    // Control messages (ip_cmsg_recv_offset: IPv4 only), then msg_controllen and msg_flags.
+    // Control messages (ip_cmsg_recv_offset for IPv4, ip6_datagram_recv_ctl for IPv6), then msg_controllen and msg_flags.
     const ctl_ptr: u64 = bo.readU64At(msghdr, 32);
     const ctl_cap: usize = if (ctl_ptr == 0) 0 else @intCast(@min(bo.readU64At(msghdr, 40), 1 << 20));
-    const opts_ip: ip_opt_policy.IpOpts = if (is_v6) .{} else if (udp.getPortOpts(port)) |po| po.ip else .{};
-    var ctl_buf: [80]u8 = undefined;
-    const cm = ip_cmsg_policy.build(ip_cmsg_policy.Wanted.of(opts_ip), meta, ctl_cap, &ctl_buf);
+    const opts_ip: ip_opt_policy.IpOpts = if (udp.getPortOpts(port)) |po| po.ip else .{};
+    var ctl_buf: [96]u8 = undefined;
+    const cm = if (is_v6)
+        ip_cmsg_policy.build6(ip_cmsg_policy.Wanted.of6(opts_ip), meta6, ctl_cap, &ctl_buf)
+    else
+        ip_cmsg_policy.build(ip_cmsg_policy.Wanted.of(opts_ip), meta, ctl_cap, &ctl_buf);
     if (cm.written != 0) {
         if (ctl_ptr >= 0x0000_8000_0000_0000) return -14;
         if (copy.copyToUser(@ptrFromInt(ctl_ptr), ctl_buf[0..cm.written], cm.written) != cm.written) return -14;

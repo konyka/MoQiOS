@@ -36,6 +36,13 @@ pub const IPV6_ADD_MEMBERSHIP: u64 = 20;
 pub const IPV6_DROP_MEMBERSHIP: u64 = 21;
 pub const IPV6_V6ONLY: u64 = 26;
 pub const IPV6_MULTICAST_ALL: u64 = 29;
+/// Receive flags: recvmsg then carries an IPV6_PKTINFO / IPV6_HOPLIMIT / IPV6_TCLASS control message (Linux rxopt.bits.rxinfo,
+/// rxhlim, rxtclass; ip6_datagram_recv_common_ctl / _specific_ctl).
+pub const IPV6_RECVPKTINFO: u64 = 49;
+pub const IPV6_PKTINFO: u64 = 50;
+pub const IPV6_RECVHOPLIMIT: u64 = 51;
+pub const IPV6_HOPLIMIT: u64 = 52;
+pub const IPV6_RECVTCLASS: u64 = 66;
 pub const IPV6_TCLASS: u64 = 67;
 
 pub const DEFAULT_TTL: u8 = 64;
@@ -69,6 +76,10 @@ pub const IpOpts = struct {
     pktinfo: bool = false,
     recvttl: bool = false,
     recvtos: bool = false,
+    /// IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVTCLASS: the same for a received IPv6 datagram.
+    pktinfo6: bool = false,
+    recvhops6: bool = false,
+    recvtclass6: bool = false,
 };
 
 pub const Family = enum { v4, v6 };
@@ -180,6 +191,15 @@ pub fn applySet(cur: IpOpts, level: u64, optname: u64, val: []const u8) SetResul
                 if (val.len < 4) return .{ .err = -22 };
                 o.mc_all = v != 0;
             },
+            // do_ipv6_setsockopt: the boolean options need a full int.
+            IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVTCLASS => {
+                if (val.len < 4) return .{ .err = -22 };
+                switch (optname) {
+                    IPV6_RECVPKTINFO => o.pktinfo6 = v != 0,
+                    IPV6_RECVHOPLIMIT => o.recvhops6 = v != 0,
+                    else => o.recvtclass6 = v != 0,
+                }
+            },
             else => return .{ .err = -92 },
         },
         else => return .{ .err = -92 },
@@ -269,6 +289,9 @@ pub fn getValue(o: IpOpts, level: u64, optname: u64) ?i32 {
             IPV6_MULTICAST_LOOP => @intFromBool(o.mc_loop),
             IPV6_MULTICAST_IF => o.mc_if,
             IPV6_MULTICAST_ALL => @intFromBool(o.mc_all),
+            IPV6_RECVPKTINFO => @intFromBool(o.pktinfo6),
+            IPV6_RECVHOPLIMIT => @intFromBool(o.recvhops6),
+            IPV6_RECVTCLASS => @intFromBool(o.recvtclass6),
             else => null,
         },
         else => null,

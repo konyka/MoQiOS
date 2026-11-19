@@ -4515,7 +4515,7 @@ test "IPv6 UDP multicast: IPV6_MULTICAST_* options, group membership, member-onl
     try std.testing.expectEqual(@as(u8, 1), m.outInterface(1));
 
     const us = kt.udp_source;
-    try std.testing.expect(std.mem.indexOf(u8, us, "    if (mcast.isMulticast(dst_ip)) {\n        enqueueMcast(hdr.dst_port, src_ip, hdr.src_port, dst_ip, data[8..][0..actual_payload], ifindex);\n        return;\n    }\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    if (mcast.isMulticast(dst_ip)) {\n        enqueueMcast(hdr.dst_port, src_ip, hdr.src_port, dst_ip, data[8..][0..actual_payload], ifindex, meta6);\n        return;\n    }\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "        if (!mcast.alwaysJoined(group) and !hostJoinedLocked(group, ifindex)) return;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "            if (!mcast.socketAccepts(&port_mc[i], port_opts[i].ip.mc_all, group)) continue;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    if (group) send_pkt[14 + 7] = opts.mc_hops;\n") != null);
@@ -4759,7 +4759,7 @@ test "IPv6 bind ties a link-scoped socket to its sin6_scope_id interface: separa
     const stream_at = std.mem.indexOf(u8, ss, "const stream_rc = bind_addr_policy.streamBindErrno6(parsed.addr);").?;
     try std.testing.expect(stream_at < std.mem.indexOfPos(u8, ss, stream_at, "inet6ScopeErrno(parsed.addr").?);
     try std.testing.expect(std.mem.indexOf(u8, ss, "sa.writeInet6(&sa_buf, name_port, our6, sa.boundScope6(our6, udp.boundDev6(desc.udpKey())))") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketV6On(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketV6Meta(info6.src_ip, info6.dst_ip, data + up_start, up_len, ifindex,") != null);
 }
 
 test "IPv6 send interface: sendto's sin6_scope_id, the bound interface and IPV6_MULTICAST_IF pick it, lo carries only ::1; connect ties a scoped peer's interface (hello365)" {
@@ -5294,7 +5294,7 @@ test "an IPv6 UDP socket's bound address takes part in port conflicts and receiv
     try std.testing.expect(std.mem.indexOf(u8, us, "        if (port_v6[j] and port_v6[oi] and !@import(\"tcp_port_policy.zig\").addrsConflict6(addr6, port_local_ip6[j])) continue;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "                const takes = if (is_v6 and port_v6[i])\n                    @import(\"tcp_port_policy.zig\").listenerTakes6(port_local_ip6[i], dst_ip6, r[0])\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "            port_local_ip6[i] = port_local_ip6[num_ports];\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "hdr.dst_port, .{ 0, 0, 0, 0 }, dst_ip, data[8..][0..actual_payload], true, .{});") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "hdr.dst_port, .{ 0, 0, 0, 0 }, dst_ip, data[8..][0..actual_payload], true, .{}, meta6);") != null);
     const p = kt.tcp_port_policy;
     const wild: [16]u8 = @splat(0);
     var loop6 = wild;
@@ -5411,7 +5411,7 @@ test "UDP sockets on one port are told apart by their bound IPv4 address: bind c
     try std.testing.expect(std.mem.indexOf(u8, us, "    port_opts[ni] = mine;\n    port_local_ip[ni] = addr;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "            port_local_ip[i] = port_local_ip[num_ports];\n            port_local_ip[num_ports] = .{ 0, 0, 0, 0 };\n            port_local_ip6[i] = port_local_ip6[num_ports];\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "                else\n                    @import(\"tcp_port_policy.zig\").listenerTakes(port_local_ip[i], dst_ip, r[0]);\n                if (!takes) continue;\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "    const bound = enqueue(hdr.dst_port, ip16, hdr.src_port, hdr.dst_port, dst_ip, @splat(0), data[8..][0..actual_payload], false, meta);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    const bound = enqueue(hdr.dst_port, ip16, hdr.src_port, hdr.dst_port, dst_ip, @splat(0), data[8..][0..actual_payload], false, meta, .{});\n") != null);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, us, "portBound("));
     const p = kt.tcp_port_policy;
     try std.testing.expect(!p.addrsConflict(.{ 127, 0, 0, 1 }, .{ 127, 0, 0, 2 }));
@@ -16122,5 +16122,43 @@ test "IPv4 UDP receive control messages IP_PKTINFO / IP_RECVTTL / IP_RECVTOS (he
     try std.testing.expect(std.mem.indexOf(u8, us, "pub fn handlePacketMeta(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, ifindex: u8, ttl: u8, tos: u8) void {") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketMeta(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, ifindex, info.ttl, info.tos);") != null);
     const ss = kt.socket_syscall_source;
-    try std.testing.expect(std.mem.indexOf(u8, ss, "const cm = ip_cmsg_policy.build(ip_cmsg_policy.Wanted.of(opts_ip), meta, ctl_cap, &ctl_buf);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "ip_cmsg_policy.build(ip_cmsg_policy.Wanted.of(opts_ip), meta, ctl_cap, &ctl_buf);") != null);
+}
+
+test "IPv6 UDP receive control messages IPV6_RECVPKTINFO / IPV6_RECVHOPLIMIT / IPV6_RECVTCLASS (hello422): Linux ip6_datagram_recv_*_ctl" {
+    const p = kt.ip_opt_policy;
+    var o: p.IpOpts = .{};
+    try std.testing.expectEqual(@as(?i32, 0), p.getValue(o, p.SOL_IPV6, p.IPV6_RECVPKTINFO));
+    o = p.applySet(o, p.SOL_IPV6, p.IPV6_RECVPKTINFO, &.{ 5, 0, 0, 0 }).ok;
+    o = p.applySet(o, p.SOL_IPV6, p.IPV6_RECVTCLASS, &.{ 1, 0, 0, 0 }).ok;
+    try std.testing.expectEqual(@as(?i32, 1), p.getValue(o, p.SOL_IPV6, p.IPV6_RECVPKTINFO));
+    try std.testing.expectEqual(@as(?i32, 0), p.getValue(o, p.SOL_IPV6, p.IPV6_RECVHOPLIMIT));
+    try std.testing.expectEqual(@as(?i32, 1), p.getValue(o, p.SOL_IPV6, p.IPV6_RECVTCLASS));
+    // A full int is required (optlen < sizeof(int) is EINVAL).
+    try std.testing.expectEqual(@as(i64, -22), p.applySet(o, p.SOL_IPV6, p.IPV6_RECVHOPLIMIT, &.{1}).err);
+
+    const c = kt.ip_cmsg_policy;
+    var dst: [16]u8 = @splat(0);
+    dst[15] = 1;
+    const info: c.RecvInfo6 = .{ .ifindex = 1, .dst = dst, .hops = 33, .tclass = 0x28 };
+    var out: [128]u8 = undefined;
+    const all = c.build6(.{ .pktinfo = true, .recvttl = true, .recvtos = true }, info, 128, &out);
+    try std.testing.expectEqual(@as(usize, 88), all.written);
+    try std.testing.expectEqual(@as(u64, 36), std.mem.readInt(u64, out[0..8], .little));
+    try std.testing.expectEqual(@as(i32, 41), std.mem.readInt(i32, out[8..12], .little));
+    try std.testing.expectEqual(@as(i32, 50), std.mem.readInt(i32, out[12..16], .little));
+    try std.testing.expectEqualSlices(u8, &dst, out[16..32]);
+    try std.testing.expectEqual(@as(i32, 1), std.mem.readInt(i32, out[32..36], .little));
+    try std.testing.expectEqual(@as(i32, 52), std.mem.readInt(i32, out[52..56], .little));
+    try std.testing.expectEqual(@as(i32, 33), std.mem.readInt(i32, out[56..60], .little));
+    try std.testing.expectEqual(@as(i32, 67), std.mem.readInt(i32, out[76..80], .little));
+    try std.testing.expectEqual(@as(i32, 0x28), std.mem.readInt(i32, out[80..84], .little));
+    const cut = c.build6(.{ .pktinfo = true, .recvttl = true, .recvtos = true }, info, 48, &out);
+    try std.testing.expectEqual(@as(usize, 40), cut.written);
+    try std.testing.expect(cut.truncated);
+    try std.testing.expectEqual(c.Wanted{ .pktinfo = true, .recvttl = false, .recvtos = true }, c.Wanted.of6(o));
+
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "pub fn handlePacketV6Meta(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32, ifindex: u8, hops: u8, tclass: u8) void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketV6Meta(info6.src_ip, info6.dst_ip, data + up_start, up_len, ifindex, info6.hop_limit, info6.tclass);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "ip_cmsg_policy.build6(ip_cmsg_policy.Wanted.of6(opts_ip), meta6, ctl_cap, &ctl_buf)") != null);
 }

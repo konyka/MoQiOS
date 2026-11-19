@@ -38,6 +38,8 @@ pub const Ipv6Info = struct {
     payload_len: u16,
     /// True when Traffic Class ECN field is Congestion Experienced (SK-131).
     ecn_ce: bool = false,
+    /// The whole Traffic Class byte, ECN bits included (IPV6_RECVTCLASS reports it as received).
+    tclass: u8 = 0,
 };
 
 /// Build a fixed 40-byte IPv6 header at `buf`.
@@ -85,6 +87,7 @@ pub fn parseHeader(data: [*]const u8) ?Ipv6Info {
         .payload_offset = HEADER_LEN,
         .payload_len = bo.readU16BeAt(data, 4),
         .ecn_ce = (tc & 0x03) == 0x03,
+        .tclass = tc,
     };
 
     inline for (0..16) |i| info.src_ip[i] = data[8 + i];
