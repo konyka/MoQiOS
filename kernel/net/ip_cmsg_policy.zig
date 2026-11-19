@@ -11,6 +11,9 @@ const scm = @import("scm_policy.zig");
 pub const RecvInfo = struct {
     ifindex: u8 = 0,
     dst: [4]u8 = .{ 0, 0, 0, 0 },
+    /// in_pktinfo's ipi_spec_dst when it is not the destination: an ICMP echo reply never went through ipv4_pktinfo_prepare, so a
+    /// ping socket reports 0.0.0.0 (null: the destination, as for a UDP or raw datagram).
+    spec_dst: ?[4]u8 = null,
     ttl: u8 = 0,
     tos: u8 = 0,
 };
@@ -77,7 +80,7 @@ pub fn build(w: Wanted, info: RecvInfo, cap_in: usize, out: []u8) Built {
     if (w.pktinfo) {
         var pi: [12]u8 = undefined;
         std.mem.writeInt(i32, pi[0..4], info.ifindex, .little);
-        @memcpy(pi[4..8], &info.dst);
+        @memcpy(pi[4..8], &(info.spec_dst orelse info.dst));
         @memcpy(pi[8..12], &info.dst);
         put(out, &used, cap, @intCast(ipo.SOL_IP), @intCast(ipo.IP_PKTINFO), &pi, &truncated);
     }

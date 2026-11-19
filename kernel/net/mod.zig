@@ -53,7 +53,7 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
             const rp = @import("raw_icmp_policy.zig");
             switch (info.protocol) {
                 ipv4.PROTO_ICMP => {
-                    icmp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len);
+                    icmp.handlePacketMeta(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, .{ .ifindex = ifindex, .dst = info.dst_ip, .ttl = info.ttl, .tos = info.tos });
                 },
                 ipv4.PROTO_TCP => {
                     tcp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, info.ecn_ce);
@@ -90,7 +90,7 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
             const raw_took6 = raw6.deliver6(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass);
             switch (ext.nh) {
                 ipv6.PROTO_ICMPV6 => {
-                    icmpv6.handlePacket(info6.src_ip, info6.dst_ip, data + up_start, up_len);
+                    icmpv6.handlePacketMeta(info6.src_ip, info6.dst_ip, data + up_start, up_len, .{ .ifindex = ifindex, .dst = info6.dst_ip, .hops = info6.hop_limit, .tclass = info6.tclass });
                 },
                 ipv6.PROTO_TCP => {
                     tcp.handlePacketV6(info6.src_ip, info6.dst_ip, data + up_start, up_len, info6.ecn_ce);

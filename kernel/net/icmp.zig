@@ -23,7 +23,7 @@ pub fn buildEchoReply(
     reply_src_mac: [6]u8,
     reply_dst_mac: [6]u8,
 ) u16 {
-    return buildEchoReplyMtu(out[0..256], req, req_len, netif.MAX_MTU, reply_src_ip, reply_dst_ip, reply_src_mac, reply_dst_mac);
+    return buildEchoReplyMtu(out[0..256], req, req_len, netif.MAX_MTU, reply_src_ip, reply_dst_ip, reply_src_mac, reply_dst_mac, 0);
 }
 
 /// RFC 792: echo the whole request, bounded by the interface `mtu` (one
@@ -37,6 +37,7 @@ pub fn buildEchoReplyMtu(
     reply_dst_ip: [4]u8,
     reply_src_mac: [6]u8,
     reply_dst_mac: [6]u8,
+    tos: u8,
 ) u16 {
     // ICMP message: copy the request (type, code, checksum, id, seq, data).
     const icmp_total = echo_policy.replyIcmpLen(req_len, mtu, @intCast(out.len));
@@ -53,6 +54,8 @@ pub fn buildEchoReplyMtu(
 
     // IPv4 header at offset 14, ethernet frame at offset 0.
     ipv4.buildHeader(o + 14, reply_src_ip, reply_dst_ip, ipv4.PROTO_ICMP, icmp_total);
+    // The reply keeps the request's TOS (icmp_reply: ipc.tos = ip_hdr(skb)->tos); setIdent refreshes the header checksum.
+    o[14 + 1] = tos;
     // An echo reply goes out without DF and with a hashed id (icmp_reply has no socket that numbers it).
     ipv4.setIdent(o + 14, ipid.global(reply_dst_ip, reply_src_ip, ipv4.PROTO_ICMP), false);
     return eth.buildFrame(o, reply_dst_mac, reply_src_mac, eth.ETHERTYPE_IPV4, 20 + icmp_total);
@@ -139,12 +142,20 @@ pub fn sendProtoUnreachable(dgram: []const u8, src_ip: [4]u8, dst_ip: [4]u8) voi
 }
 
 pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) void {
+    handlePacketMeta(src_ip, dst_ip, data, len, .{ .dst = dst_ip });
+}
+
+/// handlePacket for a message that arrived with `meta` (interface, header destination, TTL, TOS): an echo reply's goes to the ping
+/// socket for recvmsg's control messages, an echo request's TOS to the reply.
+pub fn handlePacketMeta(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, meta: @import("ip_cmsg_policy.zig").RecvInfo) void {
     if (len < 8) return;
     // An echo reply is for the ping socket whose ident is its id (Linux icmp_rcv → ping_rcv); a bad checksum drops it.
     const pp = @import("ping_policy.zig");
     if (pp.replyIdent(data[0..len])) |ident| {
         if (len > 0xffff or ipv4.checksum(data, @intCast(len)) != 0) return;
-        @import("udp.zig").deliverPing(ident, src_ip, dst_ip, data[0..len]);
+        var m = meta;
+        m.spec_dst = .{ 0, 0, 0, 0 };
+        @import("udp.zig").deliverPing(ident, src_ip, dst_ip, data[0..len], m);
         return;
     }
 
@@ -168,7 +179,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32) v
         };
 
         var pkt: [echo_policy.FRAME_BUF_LEN]u8 = undefined;
-        const frame_len = buildEchoReplyMtu(&pkt, data, len, netif.getMtu(), dst_ip, src_ip, our_mac, dst_mac);
+        const frame_len = buildEchoReplyMtu(&pkt, data, len, netif.getMtu(), dst_ip, src_ip, our_mac, dst_mac, meta.tos);
         if (via_lo) _ = lo.sendPacket(&pkt, frame_len) else _ = nic.sendPacket(&pkt, frame_len);
     } else if (unreach.isError(icmp_type)) {
         // An error about a datagram this host sent (icmp_unreach): a bad checksum drops it (icmp_rcv).

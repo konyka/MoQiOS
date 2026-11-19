@@ -99,12 +99,18 @@ pub fn handlePacket(
     data: [*]const u8,
     len: u16,
 ) void {
+    handlePacketMeta(src_ip, dst_ip, data, len, .{ .dst = dst_ip });
+}
+
+/// handlePacket for a message that arrived with `meta6` (interface, header destination, hop limit, traffic class): an echo reply's
+/// goes to the ping socket for recvmsg's control messages, an echo request's traffic class to the reply.
+pub fn handlePacketMeta(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u16, meta6: @import("ip_cmsg_policy.zig").RecvInfo6) void {
     if (len < 8) return;
     // v53.37: Verify ICMPv6 checksum (RFC 4443 §2.3). checksum() returns 0 for valid packets.
     if (checksum(src_ip, dst_ip, data, len) != 0) return;
     // An echo reply is for the IPv6 ping socket whose ident is its id (icmpv6_rcv → ping_rcv).
     if (@import("ping_policy.zig").replyIdent6(data[0..len])) |ident| {
-        @import("udp.zig").deliverPing6(ident, src_ip, dst_ip, data[0..len]);
+        @import("udp.zig").deliverPing6(ident, src_ip, dst_ip, data[0..len], meta6);
         return;
     }
     const icmp_type = data[0];
@@ -127,7 +133,7 @@ pub fn handlePacket(
     }
 
     switch (icmp_type) {
-        ECHO_REQUEST => sendEchoReply(src_ip, dst_ip, data, len),
+        ECHO_REQUEST => sendEchoReply(src_ip, dst_ip, data, len, meta6.tclass),
         ROUTER_ADVERTISEMENT => handleRouterAdvertisement(src_ip, data, len),
         NEIGHBOR_SOLICITATION => handleNeighborSolicitation(src_ip, dst_ip, data, len),
         NEIGHBOR_ADVERTISEMENT => handleNeighborAdvertisement(src_ip, data, len),
@@ -326,6 +332,7 @@ pub fn sendEchoReply(
     our_ip_in: [16]u8,
     data: [*]const u8,
     len: u16,
+    tclass: u8,
 ) void {
     if (len < 8 or len > 1280) return;
 
@@ -349,6 +356,9 @@ pub fn sendEchoReply(
     pkt[icmp_off + 3] = 0; // checksum lo (cleared)
 
     ipv6.buildHeader(pkt[ip_off..].ptr, our_ip, requester_ip, ipv6.PROTO_ICMPV6, len);
+    // The reply keeps the request's traffic class (icmpv6_echo_reply: ipc6.tclass = ipv6_get_dsfield).
+    pkt[ip_off] = 0x60 | (tclass >> 4);
+    pkt[ip_off + 1] = (pkt[ip_off + 1] & 0x0F) | (tclass << 4);
 
     const csum = checksum(our_ip, requester_ip, pkt[icmp_off..].ptr, len);
     bo.writeU16BeAt(&pkt, icmp_off + 2, csum);

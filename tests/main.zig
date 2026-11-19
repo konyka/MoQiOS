@@ -4898,9 +4898,9 @@ test "ping sockets: SOCK_DGRAM/IPPROTO_ICMP sends echo requests under the socket
     try std.testing.expectEqual(@as(i64, -93), np.socketArgs(10, 2, 1).err);
 
     // Wiring: echo replies are offered to ping sockets before anything else, and UDP never sees a ping slot.
-    try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "if (pp.replyIdent(data[0..len])) |ident| {\n        if (len > 0xffff or ipv4.checksum(data, @intCast(len)) != 0) return;\n        @import(\"udp.zig\").deliverPing(ident, src_ip, dst_ip, data[0..len]);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "if (pp.replyIdent(data[0..len])) |ident| {\n        if (len > 0xffff or ipv4.checksum(data, @intCast(len)) != 0) return;\n        @import(\"udp.zig\").deliverPing(ident, src_ip, dst_ip, data[0..len], m);") == null and std.mem.indexOf(u8, kt.icmp_source, "if (pp.replyIdent(data[0..len])) |ident| {\n        if (len > 0xffff or ipv4.checksum(data, @intCast(len)) != 0) return;\n        var m = meta;\n        m.spec_dst = .{ 0, 0, 0, 0 };\n        @import(\"udp.zig\").deliverPing(ident, src_ip, dst_ip, data[0..len], m);") != null);
     const us = kt.udp_source;
-    try std.testing.expect(std.mem.indexOf(u8, us, "pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8) void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8, meta: ip_cmsg_policy.RecvInfo) void {") != null);
     // notifyError, enqueue and both group paths skip ping slots; rebind only conflicts with UDP slots; the port count is per space.
     // A socket with no local port yet is skipped the same way (hello385).
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, us, "if (port_ping[i] or !port_named[i]) continue;"));
@@ -5040,7 +5040,7 @@ test "IPv6 ping sockets: SOCK_DGRAM/IPPROTO_ICMPV6 share the ident table but onl
     try std.testing.expectEqual(@as(u32, 1), kt.sockopt_policy.identity(.ping, false).protocol);
 
     // Wiring: echo replies reach deliverPing6 before the ICMPv6 dispatch; each family's delivery skips the other family's sockets.
-    try std.testing.expect(std.mem.indexOf(u8, kt.icmpv6_source, "if (@import(\"ping_policy.zig\").replyIdent6(data[0..len])) |ident| {\n        @import(\"udp.zig\").deliverPing6(ident, src_ip, dst_ip, data[0..len]);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmpv6_source, "if (@import(\"ping_policy.zig\").replyIdent6(data[0..len])) |ident| {\n        @import(\"udp.zig\").deliverPing6(ident, src_ip, dst_ip, data[0..len], meta6);") != null);
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "if (!port_ping[k] or port_v6[k] or portNumber(ports[k]) != ident) continue;") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "if (!port_ping[k] or !port_v6[k] or portNumber(ports[k]) != ident) continue;") != null);
@@ -14655,7 +14655,7 @@ test "raw ICMP socket policy (hello389): protocol, delivery filter, destination 
 test "raw ICMP socket wiring (hello389): received ICMP reaches raw sockets first, descriptors share the socket, sends go out at once" {
     const m = kt.net_mod_source;
     const at_raw = std.mem.indexOf(u8, m, "@import(\"raw_icmp.zig\").deliver(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip, ifindex);") orelse return error.TestUnexpectedResult;
-    const at_icmp = std.mem.indexOf(u8, m, "icmp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len);").?;
+    const at_icmp = std.mem.indexOf(u8, m, "icmp.handlePacketMeta(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, .{").?;
     try std.testing.expect(at_raw < at_icmp);
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "const perr = if (v6) rp.protocolErrno6(protocol) else rp.protocolErrno(protocol);") != null);
@@ -14814,7 +14814,7 @@ test "raw ICMPv6 socket wiring (hello391): checksummed ICMPv6 reaches raw socket
     const m = kt.net_mod_source;
     // hello410: after the extension headers, at the upper-layer header.
     const dl = std.mem.indexOf(u8, m, "const raw_took6 = raw6.deliver6(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass);") orelse return error.TestUnexpectedResult;
-    const pr = std.mem.indexOf(u8, m, "icmpv6.handlePacket(info6.src_ip, info6.dst_ip, data + up_start, up_len);") orelse return error.TestUnexpectedResult;
+    const pr = std.mem.indexOf(u8, m, "icmpv6.handlePacketMeta(info6.src_ip, info6.dst_ip, data + up_start, up_len, .{") orelse return error.TestUnexpectedResult;
     try std.testing.expect(dl < pr);
     try std.testing.expect(std.mem.indexOf(u8, kt.icmpv6_source, "raw_icmp.zig\").deliver6(") == null);
     const ss = kt.socket_syscall_source;
@@ -16562,4 +16562,32 @@ test "IPv6 ping socket sendmsg control messages IPV6_HOPLIMIT / IPV6_TCLASS / IP
     _ = std.mem.indexOfPos(u8, ss, fs, "@import(\"icmpv6.zig\").sendProto6Ov(d.udp_local_ip6, dst, 58, 2, msg[0..payload.len], ping_ip6, ov6.hops, ov6.tclass)") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (d.udp_is_v6) return pingSend6(d, payload, addr_ptr, addr_len, control);") != null);
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello429", true, false).caps.cap_net_raw);
+}
+
+test "ping socket recvmsg control messages IP_PKTINFO / IP_TTL / IP_TOS and the IPv6 ones (hello430): ping_recvmsg -> ip_cmsg_recv, ip6_datagram_recv_*_ctl" {
+    const c = kt.ip_cmsg_policy;
+    // An echo reply never went through ipv4_pktinfo_prepare: in_pktinfo's spec_dst is 0.0.0.0, ipi_addr the header destination.
+    var out: [96]u8 = undefined;
+    const b = c.build(.{ .pktinfo = true, .recvttl = true, .recvtos = true }, .{ .ifindex = 1, .dst = .{ 127, 0, 0, 1 }, .spec_dst = .{ 0, 0, 0, 0 }, .ttl = 64, .tos = 0x28 }, 256, &out);
+    try std.testing.expectEqual(@as(usize, 80), b.written);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 127, 0, 0, 1 }, out[20..28]);
+    // A UDP datagram's spec_dst is still its destination.
+    _ = c.build(.{ .pktinfo = true }, .{ .ifindex = 1, .dst = .{ 127, 0, 0, 1 } }, 256, &out);
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1, 127, 0, 0, 1 }, out[20..28]);
+    // The IP layer's values reach the ping socket's queue entry.
+    const m = kt.net_mod_source;
+    try std.testing.expect(std.mem.indexOf(u8, m, "icmp.handlePacketMeta(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, .{ .ifindex = ifindex, .dst = info.dst_ip, .ttl = info.ttl, .tos = info.tos });") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "icmpv6.handlePacketMeta(info6.src_ip, info6.dst_ip, data + up_start, up_len, .{ .ifindex = ifindex, .dst = info6.dst_ip, .hops = info6.hop_limit, .tclass = info6.tclass });") != null);
+    const us = kt.udp_source;
+    const d4 = std.mem.indexOf(u8, us, "pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8, meta: ip_cmsg_policy.RecvInfo) void {") orelse return error.TestUnexpectedResult;
+    const d6 = std.mem.indexOf(u8, us, "pub fn deliverPing6(ident: u16, src_ip: [16]u8, dst_ip: [16]u8, msg: []const u8, meta6: ip_cmsg_policy.RecvInfo6) void {") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, us[0..d6], d4, "e.meta = meta;") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, us, d6, "e.meta6 = meta6;") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, ".spec_dst = .{ 0, 0, 0, 0 }") != null);
+    // The echo reply keeps the request's TOS / traffic class (icmp_reply: ipc.tos = ip_hdr(skb)->tos; icmpv6_echo_reply).
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "const frame_len = buildEchoReplyMtu(&pkt, data, len, netif.getMtu(), dst_ip, src_ip, our_mac, dst_mac, meta.tos);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "o[14 + 1] = tos;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmpv6_source, "pkt[ip_off] = 0x60 | (tclass >> 4);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmpv6_source, "ECHO_REQUEST => sendEchoReply(src_ip, dst_ip, data, len, meta6.tclass),") != null);
+    try std.testing.expect(kt.capability_profile.profileForLaunch("hello430", true, false).caps.cap_net_raw);
 }

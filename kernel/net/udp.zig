@@ -484,7 +484,8 @@ pub fn pingRehash(key: u32) void {
 
 /// An echo reply `msg` (ICMP header and data) from `src_ip` to `dst_ip` for ident `ident`: queued on the ping socket
 /// ping_policy.pickReceiver picks among those holding the ident (ping_lookup, ping_queue_rcv_skb). Nobody holding it drops it.
-pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8) void {
+/// `meta` (interface, destination, TTL, TOS; spec_dst 0.0.0.0) stays with it for recvmsg's control messages (ip_cmsg_recv).
+pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8, meta: ip_cmsg_policy.RecvInfo) void {
     var notify_key: u32 = 0;
     blk: {
         const saved = udp_lock.acquire();
@@ -514,7 +515,7 @@ pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8) vo
                 e.data_len = @intCast(actual);
                 @memcpy(e.data[0..actual], msg[0..actual]);
                 e.is_v6 = false;
-                e.meta = .{};
+                e.meta = meta;
                 e.meta6 = .{};
                 e.valid = true;
                 notify_key = ports[i];
@@ -528,8 +529,9 @@ pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8) vo
 }
 
 /// An ICMPv6 echo reply `msg` from `src_ip` to `dst_ip` for ident `ident`: queued on the IPv6 ping socket ping_policy.pickReceiver6
-/// picks among the IPv6 ones holding the ident (ping_lookup). Nobody holding it drops it.
-pub fn deliverPing6(ident: u16, src_ip: [16]u8, dst_ip: [16]u8, msg: []const u8) void {
+/// picks among the IPv6 ones holding the ident (ping_lookup). Nobody holding it drops it. `meta6` (interface, destination, hop
+/// limit, traffic class) stays with it for recvmsg's control messages (ip6_datagram_recv_ctl).
+pub fn deliverPing6(ident: u16, src_ip: [16]u8, dst_ip: [16]u8, msg: []const u8, meta6: ip_cmsg_policy.RecvInfo6) void {
     var notify_key: u32 = 0;
     blk: {
         const saved = udp_lock.acquire();
@@ -557,7 +559,7 @@ pub fn deliverPing6(ident: u16, src_ip: [16]u8, dst_ip: [16]u8, msg: []const u8)
             @memcpy(e.data[0..actual], msg[0..actual]);
             e.is_v6 = true;
             e.meta = .{};
-                e.meta6 = .{};
+            e.meta6 = meta6;
             e.valid = true;
             notify_key = ports[i];
             break;
