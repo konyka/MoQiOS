@@ -132,8 +132,11 @@ fn rawSendFrom6(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest)
 
 pub const RawDest = struct { ptr: u64, len: u32 };
 
-/// sendto/send/write on a raw ICMP socket: `msg` (the ICMP message) to the address at `to` (ptr, len), or to the connected peer.
-pub fn rawSendFrom(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest) i64 {
+/// sendto/send/write/sendmsg on a raw ICMP socket: `msg` (the ICMP message) to the address at `to` (ptr, len), or to the connected
+/// peer. `control` is sendmsg's msg_control (empty otherwise; an IPv6 socket does not read it): raw_sendmsg parses it with
+/// ip_cmsg_send once the destination is known. IP_TTL / IP_TOS replace the socket's values for this datagram, IP_PKTINFO names its
+/// source; an IP_HDRINCL socket's header is left as written (only a zero source is filled) and any IP options are EINVAL there.
+pub fn rawSendFrom(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest, control: []const u8) i64 {
     const raw = @import("raw_icmp.zig");
     const rp = @import("raw_icmp_policy.zig");
     if (raw.isV6(d.raw_idx)) return rawSendFrom6(d, msg, to);
@@ -151,21 +154,38 @@ pub fn rawSendFrom(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDe
         const rc = rp.sendtoErrno(false, 0, 0, raw.isConnected(d.raw_idx));
         if (rc != 0) return rc;
     }
-    const bound = raw.boundAddr(d.raw_idx);
-    const hdrincl = rawIpOpts(d.raw_idx).hdrincl;
+    var ip = rawIpOpts(d.raw_idx);
+    const hdrincl = ip.hdrincl;
+    const ov = switch (ip_cmsg_policy.parseSendPing4(control, sendCaps())) {
+        .ok => |v| v,
+        .err => |e| return e,
+    };
+    // Linux does not mangle an IP_HDRINCL header, so IP options with it make no sense (raw_sendmsg).
+    if (hdrincl and ov.retopts) return -22;
     // IP_HDRINCL: `msg` is the whole datagram, header first (raw_send_hdrinc); otherwise raw_sendmsg reads the ICMP type and code
     // from the user buffer of an ICMP socket (raw_probe_proto_opt), and fewer than 2 bytes is EFAULT.
     const protocol = raw.protocolOf(d.raw_idx);
     const lrc = if (hdrincl) rp.hdrinclErrno(msg) else rp.sendLengthErrno(protocol, msg.len);
     if (lrc != 0) return lrc;
-    const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(bound, dst, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
+    // IP_PKTINFO's ipi_spec_dst replaces the bound address as the source; the route lookup checks it, then the interface.
+    var src = raw.boundAddr(d.raw_idx);
+    if (ov.pktinfo) {
+        src = ov.spec_dst;
+        const src_rc = ip_cmsg_policy.sourceErrno4(src, netif.getOurIp(), nic_mod.isActive());
+        if (src_rc != 0) return src_rc;
+        const oif_rc = ip_cmsg_policy.oifErrno4(ov.oif, nic_mod.isActive());
+        if (oif_rc != 0) return oif_rc;
+    }
+    const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(src, dst, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
     if (lo_rc != 0) return lo_rc;
     // The destination still comes from the sendto address or the connected peer, not from the caller's header.
     if (hdrincl) {
-        const hs = raw.sendHdrincl(bound, dst, msg);
+        const hs = raw.sendHdrincl(src, dst, msg);
         return if (hs < 0) hs else @intCast(msg.len);
     }
-    const sent = raw.send(bound, dst, @truncate(protocol), msg, rawIpOpts(d.raw_idx));
+    if (ov.ttl) |v| ip.ttl = v;
+    if (ov.tos) |v| ip.tos = v;
+    const sent = raw.send(src, dst, @truncate(protocol), msg, ip);
     return if (sent < 0) sent else @intCast(msg.len);
 }
 
@@ -880,8 +900,8 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         var pbuf: [@import("raw_icmp.zig").MAX_HDRINCL]u8 = undefined;
         if (len > pbuf.len) return -90; // EMSGSIZE
         if (len != 0 and copy.copyFromUser(pbuf[0..len], @ptrFromInt(buf), len) != len) return -14;
-        if (addr_ptr == 0) return rawSendFrom(&t.fd_table.fds[fd], pbuf[0..len], null);
-        return rawSendFrom(&t.fd_table.fds[fd], pbuf[0..len], .{ .ptr = addr_ptr, .len = addr_len });
+        if (addr_ptr == 0) return rawSendFrom(&t.fd_table.fds[fd], pbuf[0..len], null, &.{});
+        return rawSendFrom(&t.fd_table.fds[fd], pbuf[0..len], .{ .ptr = addr_ptr, .len = addr_len }, &.{});
     } else if (t.fd_table.fds[fd].fd_type == .udp_socket) {
         // inet_send_prepare: the socket is named before anything else is checked, so even a send that fails leaves it a port.
         const ab = udpAutobind(&t.fd_table.fds[fd]);
@@ -1790,7 +1810,7 @@ fn udpSendmsg(fd: u32, msghdr: *const [56]u8) i64 {
     return udpSendBytes(fd, data[0..@intCast(got)], name_ptr, name_len, ctl[0..cl]);
 }
 
-/// The longest msg_control a UDP sendmsg takes (Linux allows up to net.core.optmem_max).
+/// The longest msg_control a UDP or raw sendmsg takes (Linux allows up to net.core.optmem_max).
 const UDP_SEND_CTL_MAX: usize = 512;
 
 /// Who may send the privileged SOL_SOCKET control messages (SO_MARK, a high SO_PRIORITY).
@@ -1955,8 +1975,9 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
     return if ((flags & 0x20) != 0) @as(i64, full) else @intCast(done);
 }
 
-/// sendmsg on a raw ICMP socket (raw_sendmsg / rawv6_sendmsg): the iovecs are gathered into one message, msg_name (or the connected
-/// peer) is the destination, and the rest is the sendto path. Control messages are not read.
+/// sendmsg on a raw ICMP socket (raw_sendmsg / rawv6_sendmsg): msg_control is copied in whole first (a bad pointer is EFAULT, more
+/// than UDP_SEND_CTL_MAX ENOBUFS), the iovecs are gathered into one message, msg_name (or the connected peer) is the destination,
+/// and the rest is the sendto path with the control messages (read by an IPv4 socket only).
 fn rawSendmsg(d: *const vfs_mod.FileDescriptor, msghdr: *const [56]u8) i64 {
     const name_ptr: u64 = bo.readU64At(msghdr, 0);
     const name_len: u32 = bo.readU32Le(msghdr[8..12]);
@@ -1965,10 +1986,19 @@ fn rawSendmsg(d: *const vfs_mod.FileDescriptor, msghdr: *const [56]u8) i64 {
     if (iov_len > 1024) return -22;
     if (iov_len != 0 and (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000)) return -14;
     if (name_ptr >= 0x0000_8000_0000_0000) return -14;
+    const ctl_ptr: u64 = bo.readU64At(msghdr, 32);
+    const ctl_len: u64 = bo.readU64At(msghdr, 40);
+    var ctl: [UDP_SEND_CTL_MAX]u8 = undefined;
+    if (ctl_len > UDP_SEND_CTL_MAX) return -105;
+    const cl: usize = @intCast(ctl_len);
+    if (cl != 0) {
+        if (ctl_ptr == 0 or ctl_ptr >= 0x0000_8000_0000_0000) return -14;
+        if (copy.copyFromUser(ctl[0..cl], @ptrFromInt(ctl_ptr), cl) != cl) return -14;
+    }
     var data: [@import("raw_icmp.zig").MAX_HDRINCL]u8 = undefined;
     const got = gatherIov(iov_ptr, iov_len, &data);
     if (got < 0) return got;
-    return rawSendFrom(d, data[0..@intCast(got)], if (name_ptr != 0) RawDest{ .ptr = name_ptr, .len = name_len } else null);
+    return rawSendFrom(d, data[0..@intCast(got)], if (name_ptr != 0) RawDest{ .ptr = name_ptr, .len = name_len } else null, ctl[0..cl]);
 }
 
 /// recvmsg on a raw ICMP socket (raw_recvmsg / rawv6_recvmsg): the next datagram is scattered over the iovecs, msg_name gets the

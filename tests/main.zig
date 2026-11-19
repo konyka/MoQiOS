@@ -14981,7 +14981,7 @@ test "raw ICMP sockets take SOL_IP / SOL_IPV6 options and their sends carry them
     // ip_getsockopt answers a level other than SOL_IP with EOPNOTSUPP; ip_setsockopt with ENOPROTOOPT.
     try std.testing.expect(std.mem.indexOf(u8, so, "if (!ipo.levelApplies(level, fam)) return if (fam == .v4) -95 else -92;") != null);
     const ss = kt.socket_syscall_source;
-    try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send(bound, dst, @truncate(protocol), msg, rawIpOpts(d.raw_idx))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send(src, dst, @truncate(protocol), msg, ip)") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send6(raw.boundAddr6(d.raw_idx), to6, @truncate(raw.protocolOf(d.raw_idx)), raw.checksumOffset(d.raw_idx), msg, rawIpOpts(d.raw_idx))") != null);
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "if (ipo.ipv4NeedsPatch(ip)) ipo.patchIpv4(pkt[14..][0..20], ip, ipv4.checksum);") != null);
@@ -15041,7 +15041,7 @@ test "IP_HDRINCL wiring: raw IPv4 sends write the caller's header (hello396)" {
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "const hdrincl = rawIpOpts(d.raw_idx).hdrincl;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "const lrc = if (hdrincl) rp.hdrinclErrno(msg) else rp.sendLengthErrno(protocol, msg.len);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ss, "raw.sendHdrincl(bound, dst, msg)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "raw.sendHdrincl(src, dst, msg)") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "var pbuf: [@import(\"raw_icmp.zig\").MAX_HDRINCL]u8 = undefined;") != null);
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "pub fn sendHdrincl(bound: [4]u8, dst: [4]u8, pkt: []const u8) i64 {") != null);
@@ -15056,7 +15056,7 @@ test "raw ICMP sockets take sendmsg and recvmsg (hello397)" {
     const end = std.mem.indexOfPos(u8, ss, at, "\n}\n") orelse return error.TestUnexpectedResult;
     const body = ss[at..end];
     try std.testing.expect(std.mem.indexOf(u8, body, "const got = gatherIov(iov_ptr, iov_len, &data);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "return rawSendFrom(d, data[0..@intCast(got)], if (name_ptr != 0) RawDest{ .ptr = name_ptr, .len = name_len } else null);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "return rawSendFrom(d, data[0..@intCast(got)], if (name_ptr != 0) RawDest{ .ptr = name_ptr, .len = name_len } else null, ctl[0..cl]);") != null);
     const rat = std.mem.indexOf(u8, ss, "fn rawRecvmsg(") orelse return error.TestUnexpectedResult;
     const rend = std.mem.indexOfPos(u8, ss, rat, "\n}\n") orelse return error.TestUnexpectedResult;
     const rbody = ss[rat..rend];
@@ -16420,4 +16420,28 @@ test "IPv4 ping socket sendmsg control messages IP_TTL / IP_TOS / IP_PKTINFO (he
     const prof = kt.capability_profile.profileForLaunch("hello425", true, false);
     try std.testing.expectEqual(@as(u32, 0), prof.uid);
     try std.testing.expect(prof.caps.cap_net_raw);
+}
+
+test "IPv4 raw socket sendmsg control messages IP_TTL / IP_TOS / IP_PKTINFO / IP_RETOPTS (hello426): Linux raw_sendmsg -> ip_cmsg_send" {
+    const c = kt.ip_cmsg_policy;
+    var b: [64]u8 = @splat(0);
+    // An empty IP_RETOPTS is accepted but still gives the datagram an options block (ip_options_get), which IP_HDRINCL refuses.
+    std.mem.writeInt(u64, b[0..8], 16, .little);
+    std.mem.writeInt(i32, b[8..12], 0, .little);
+    std.mem.writeInt(i32, b[12..16], 7, .little);
+    const r = c.parseSendPing4(b[0..16], .{}).ok;
+    try std.testing.expect(r.retopts);
+    try std.testing.expect(!c.parseSendPing4(b[0..0], .{}).ok.retopts);
+
+    // The control messages are parsed after the destination check and before the length / ICMP header checks.
+    const ss = kt.socket_syscall_source;
+    const fs = std.mem.indexOf(u8, ss, "pub fn rawSendFrom(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest, control: []const u8) i64 {") orelse return error.TestUnexpectedResult;
+    const dest = std.mem.indexOfPos(u8, ss, fs, "const rc = rp.sendtoErrno(false, 0, 0, raw.isConnected(d.raw_idx));") orelse return error.TestUnexpectedResult;
+    const parse = std.mem.indexOfPos(u8, ss, fs, "ip_cmsg_policy.parseSendPing4(control, sendCaps())") orelse return error.TestUnexpectedResult;
+    const hdr_opts = std.mem.indexOfPos(u8, ss, fs, "if (hdrincl and ov.retopts) return -22;") orelse return error.TestUnexpectedResult;
+    const len = std.mem.indexOfPos(u8, ss, fs, "const lrc = if (hdrincl) rp.hdrinclErrno(msg) else rp.sendLengthErrno(protocol, msg.len);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(dest < parse and parse < hdr_opts and hdr_opts < len);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "return rawSendFrom(d, data[0..@intCast(got)], if (name_ptr != 0) RawDest{ .ptr = name_ptr, .len = name_len } else null, ctl[0..cl]);") != null);
+    // The test opens raw sockets: CAP_NET_RAW.
+    try std.testing.expect(kt.capability_profile.profileForLaunch("hello426", true, false).caps.cap_net_raw);
 }

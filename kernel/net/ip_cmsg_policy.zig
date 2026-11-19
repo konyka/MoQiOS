@@ -131,6 +131,9 @@ pub const Send4 = struct {
     pktinfo: bool = false,
     oif: u32 = 0,
     spec_dst: [4]u8 = .{ 0, 0, 0, 0 },
+    /// IP_RETOPTS was given (ip_options_get: the datagram then has an options block, even an empty one, which an IP_HDRINCL raw
+    /// socket refuses with EINVAL).
+    retopts: bool = false,
 };
 
 /// The control messages parsed, or the errno that fails the send.
@@ -218,8 +221,8 @@ pub fn parseSend4(control: []const u8, caps: SendCaps) Send4Result {
     return ipCmsgSend4(control, caps);
 }
 
-/// The control messages of an IPv4 ping socket's sendmsg (ping_v4_sendmsg calls ip_cmsg_send directly, with no udp_cmsg_send
-/// pass): the rules of parseSend4 at SOL_IP and SOL_SOCKET; SOL_UDP messages are skipped like any other level.
+/// The control messages of an IPv4 ping or raw socket's sendmsg (ping_v4_sendmsg and raw_sendmsg call ip_cmsg_send directly, with
+/// no udp_cmsg_send pass): the rules of parseSend4 at SOL_IP and SOL_SOCKET; SOL_UDP messages are skipped like any other level.
 pub fn parseSendPing4(control: []const u8, caps: SendCaps) Send4Result {
     return ipCmsgSend4(control, caps);
 }
@@ -236,7 +239,10 @@ fn ipCmsgSend4(control: []const u8, caps: SendCaps) Send4Result {
         }
         if (m.level != @as(i32, @intCast(ipo.SOL_IP))) continue;
         switch (m.typ) {
-            IP_RETOPTS => if (m.data.len != 0) return .{ .err = -22 },
+            IP_RETOPTS => {
+                if (m.data.len != 0) return .{ .err = -22 };
+                out.retopts = true;
+            },
             @as(i32, @intCast(ipo.IP_PKTINFO)) => {
                 if (m.data.len != 12) return .{ .err = -22 };
                 out.pktinfo = true;

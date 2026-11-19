@@ -2521,7 +2521,7 @@ pub const FdTable = struct {
             .inotify => return -1, // inotify is read-only via special path
             .mqueue => return -22, // EINVAL: an mq descriptor has no write (Linux mqueue_file_operations)
             // write() on a raw ICMP socket is send() to the connected peer.
-            .raw_socket => return @import("../net/socket_syscall.zig").rawSendFrom(desc, buf[0..count], null),
+            .raw_socket => return @import("../net/socket_syscall.zig").rawSendFrom(desc, buf[0..count], null, &.{}),
         }
     }
 
