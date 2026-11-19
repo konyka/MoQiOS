@@ -979,8 +979,6 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         }
         var tmp_buf2: [1472]u8 = undefined;
         const to_copy2 = @min(len, 1472);
-        const n2 = copy.copyFromUser(&tmp_buf2, @ptrFromInt(buf), to_copy2);
-        if (n2 == 0) return -1;
         var dst_ip: [4]u8 = .{ 0, 0, 0, 0 };
         var dst_port: u16 = 0;
         if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
@@ -998,6 +996,9 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         }
         const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(t.fd_table.fds[fd].udp_local_ip, dst_ip, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
         if (lo_rc != 0) return lo_rc;
+        if (udpOversize4(src_key, dst_ip, dst_port, len)) |e| return e;
+        const n2 = copy.copyFromUser(&tmp_buf2, @ptrFromInt(buf), to_copy2);
+        if (n2 == 0) return -1;
         if (udp.sendToFrom(t.fd_table.fds[fd].udp_local_ip, dst_ip, dst_port, src_key, &tmp_buf2, @intCast(n2))) {
             return @intCast(n2);
         } else {
@@ -1838,10 +1839,13 @@ fn udpSendmsg(fd: u32, msghdr: *const [56]u8) i64 {
         if (copy.copyFromUser(ctl[0..cl], @ptrFromInt(ctl_ptr), cl) != cl) return -14;
     }
     var data: [1472]u8 = undefined;
+    // The datagram is the whole iovec: one longer than the buffer cannot be sent whole (EMSGSIZE in udpSendBytesFull, never a cut copy).
+    const total = iovTotal(iov_ptr, iov_len);
+    if (total < 0) return total;
     const got = gatherIov(iov_ptr, iov_len, &data);
     if (got < 0) return got;
-    if (got == 0) return 0;
-    return udpSendBytes(fd, data[0..@intCast(got)], name_ptr, name_len, ctl[0..cl]);
+    if (total == 0) return 0;
+    return udpSendBytesFull(fd, data[0..@intCast(got)], @intCast(total), name_ptr, name_len, ctl[0..cl]);
 }
 
 /// The longest msg_control a UDP or raw sendmsg takes (Linux allows up to net.core.optmem_max).
@@ -1862,7 +1866,20 @@ fn isOwnNicAddr6(a: [16]u8) bool {
 /// msg_control: it is parsed once the destination is known (udp_sendmsg / udpv6_sendmsg: EDESTADDRREQ comes first), and its
 /// IP_TTL / IP_TOS / IP_PKTINFO (IPv4) or IPV6_HOPLIMIT / IPV6_TCLASS / IPV6_PKTINFO (IPv6) apply to this datagram only. An IPv4 ping
 /// socket reads it in pingSend; an IPv6 one does not.
-fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32, control: []const u8) i64 {
+/// The summed length of `iov_len` iovecs at `iov_ptr`, or -EFAULT when the array cannot be read.
+fn iovTotal(iov_ptr: u64, iov_len: u64) i64 {
+    var total: u64 = 0;
+    var i: usize = 0;
+    while (i < iov_len) : (i += 1) {
+        var iov_buf: [16]u8 = undefined;
+        if (copy.copyFromUser(&iov_buf, @ptrFromInt(iov_ptr + @as(u64, @intCast(i)) * 16), 16) != 16) return -14;
+        total +|= bo.readU64At(&iov_buf, 8);
+    }
+    return @intCast(@min(total, 0x7FFF_FFFF));
+}
+
+/// Send one UDP datagram of `full_len` bytes of which `payload` holds the start (all of it whenever it fits a frame).
+fn udpSendBytesFull(fd: u32, payload: []const u8, full_len: usize, addr_ptr: u64, addr_len: u32, control: []const u8) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
     const d = &t.fd_table.fds[fd];
@@ -1927,8 +1944,17 @@ fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32, cont
     }
     const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(src, dst_ip, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
     if (lo_rc != 0) return lo_rc;
-    const n = @min(payload.len, 1472);
-    return if (udp.sendToFromOv(src, dst_ip, dst_port, src_key, payload.ptr, @intCast(n), ov.ttl, ov.tos)) @intCast(n) else -1;
+    if (udpOversize4(src_key, dst_ip, dst_port, full_len)) |e| return e;
+    return if (udp.sendToFromOv(src, dst_ip, dst_port, src_key, payload.ptr, @intCast(payload.len), ov.ttl, ov.tos)) @intCast(payload.len) else -1;
+}
+
+/// A UDP datagram that does not fit the path MTU (this stack does not fragment): EMSGSIZE, and with IP_RECVERR under IP_PMTUDISC_DO or
+/// PROBE a local error-queue entry (Linux __ip_append_data → ip_local_error). Null when it fits.
+fn udpOversize4(key: u32, dst_ip: [4]u8, dst_port: u16, len: usize) ?i64 {
+    const ipo = (udp.getPortOpts(key) orelse return null).ip;
+    const o = errq.oversize(len, @import("ipv4.zig").getSendMtu(dst_ip), ipo.pmtudisc, ipo.recverr) orelse return null;
+    if (o.queue) udp.queueLocalError(key, errq.localEntry(90, o.info, dst_ip, dst_port));
+    return -90; // EMSGSIZE
 }
 
 /// recvmsg on a UDP socket: wait like recvfrom, scatter the datagram over the

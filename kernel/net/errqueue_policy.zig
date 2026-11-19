@@ -27,6 +27,8 @@ pub const Entry = struct {
     offender: [16]u8 = @splat(0),
     dst: [16]u8 = @splat(0),
     v6: bool = false,
+    /// A local error (ip_local_error): origin LOCAL, no offender address.
+    local: bool = false,
     dst_port: u16 = 0,
     len: u8 = 0,
     payload: [PAYLOAD_MAX]u8 = @splat(0),
@@ -59,6 +61,23 @@ pub const Queue = struct {
     }
 };
 
+pub const SO_EE_ORIGIN_LOCAL: u8 = 1;
+
+/// A UDP datagram of `payload` bytes against a path MTU of `mtu` (this stack does not fragment): null when it fits, else the local
+/// error __ip_append_data raises, EMSGSIZE with ee_info = the MTU. `queue` is whether ip_local_error reaches the error queue: only for
+/// a socket that does path MTU discovery (IP_PMTUDISC_DO / PROBE, the modes where Linux refuses to fragment too) with IP_RECVERR.
+pub fn oversize(payload: usize, mtu: u16, pmtudisc: u8, recverr: bool) ?struct { info: u32, queue: bool } {
+    if (20 + 8 + payload <= mtu) return null;
+    return .{ .info = mtu, .queue = recverr and (pmtudisc == 2 or pmtudisc == 3) };
+}
+
+/// The error-queue entry ip_local_error makes: origin LOCAL, the destination and port as msg_name, no payload.
+pub fn localEntry(errno: i32, info: u32, dst: [4]u8, port: u16) Entry {
+    var e: Entry = .{ .errno = errno, .info = info, .dst_port = port, .local = true };
+    @memcpy(e.dst[0..4], &dst);
+    return e;
+}
+
 /// __udp4_lib_err: whether the error is queued (IP_RECVERR) and whether it becomes sk_err. Without IP_RECVERR only a hard error on a
 /// connected socket does; with it every error is queued and sets sk_err.
 pub fn route(recverr: bool, hard: bool, connected: bool) struct { queue: bool, set_err: bool } {
@@ -71,7 +90,7 @@ pub fn route(recverr: bool, hard: bool, connected: bool) struct { queue: bool, s
 pub fn encodeExtErr(e: Entry) struct { bytes: [44]u8, len: usize } {
     var out: [44]u8 = @splat(0);
     std.mem.writeInt(u32, out[0..4], @intCast(e.errno), .little);
-    out[4] = if (e.v6) SO_EE_ORIGIN_ICMP6 else SO_EE_ORIGIN_ICMP;
+    out[4] = if (e.local) SO_EE_ORIGIN_LOCAL else if (e.v6) SO_EE_ORIGIN_ICMP6 else SO_EE_ORIGIN_ICMP;
     out[5] = e.icmp_type;
     out[6] = e.icmp_code;
     std.mem.writeInt(u32, out[8..12], e.info, .little);
@@ -80,8 +99,11 @@ pub fn encodeExtErr(e: Entry) struct { bytes: [44]u8, len: usize } {
         @memcpy(out[24..40], &e.offender);
         return .{ .bytes = out, .len = 44 };
     }
-    out[16] = 2; // AF_INET
-    @memcpy(out[20..24], e.offender[0..4]);
+    // ip_recv_error fills the offender only for an ICMP origin (ipv4_datagram_support_cmsg); a local error leaves it zero.
+    if (!e.local) {
+        out[16] = 2; // AF_INET
+        @memcpy(out[20..24], e.offender[0..4]);
+    }
     return .{ .bytes = out, .len = 32 };
 }
 
@@ -96,6 +118,19 @@ test "the queue keeps order and sk_err follows its head" {
     try std.testing.expect(q.pop() == null);
     for (0..DEPTH) |_| try std.testing.expect(q.push(.{}));
     try std.testing.expect(!q.push(.{}));
+}
+
+test "an oversized datagram is a local EMSGSIZE, queued only under DO/PROBE with IP_RECVERR" {
+    try std.testing.expect(oversize(1472, 1500, 1, true) == null);
+    const o = oversize(1473, 1500, 2, true).?;
+    try std.testing.expectEqual(@as(u32, 1500), o.info);
+    try std.testing.expect(o.queue);
+    try std.testing.expect(!oversize(1600, 1500, 1, true).?.queue);
+    try std.testing.expect(!oversize(1600, 1500, 2, false).?.queue);
+    const b = encodeExtErr(localEntry(90, 1500, .{ 127, 0, 0, 1 }, 47491));
+    try std.testing.expectEqual(@as(u8, SO_EE_ORIGIN_LOCAL), b.bytes[4]);
+    try std.testing.expectEqual(@as(u32, 1500), std.mem.readInt(u32, b.bytes[8..12], .little));
+    try std.testing.expectEqual(@as(u8, 0), b.bytes[16]);
 }
 
 test "routing and the extended error layout" {

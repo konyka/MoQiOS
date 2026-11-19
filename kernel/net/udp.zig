@@ -229,6 +229,15 @@ pub fn takePendingError(port: u32) i32 {
     return e;
 }
 
+/// ip_local_error: queue a locally raised error (EMSGSIZE) on the socket with key `port`. No pending error is set and nobody is woken
+/// for it beyond poll's POLLERR (sock_queue_err_skb's report covers the queue alone).
+pub fn queueLocalError(port: u32, e: errq.Entry) void {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return;
+    _ = port_errq[i].push(e);
+}
+
 /// recvmsg(MSG_ERRQUEUE): the oldest queued error of the socket with key `port`, null when there is none. The pending error becomes the
 /// next entry's errno, or 0 (sock_dequeue_err_skb).
 pub fn takeQueuedError(port: u32) ?errq.Entry {

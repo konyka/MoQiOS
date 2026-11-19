@@ -17004,3 +17004,16 @@ test "IPv6 ping sockets with IPV6_RECVERR queue ICMPv6 errors (hello392 W)" {
     try std.testing.expectEqual(@as(i32, 71), iu.pingErrorFor6(100, 0).errno);
     try std.testing.expect(!iu.pingErrorFor6(100, 0).hard);
 }
+
+test "an oversized UDP datagram is EMSGSIZE, never a cut copy, and a local IP_RECVERR entry under DO (hello449)" {
+    // Linux __ip_append_data refuses a datagram over the MTU when it may not fragment and ip_local_error queues SO_EE_ORIGIN_LOCAL with
+    // ee_info = MTU. This stack never fragments: the send path used to copy the first 1472 bytes and send those.
+    const eq = kt.errqueue_policy;
+    try std.testing.expect(eq.oversize(1472, 1500, 1, false) == null);
+    try std.testing.expect(eq.oversize(1473, 1500, 1, false) != null);
+    try std.testing.expect(eq.oversize(1600, 1500, 2, true).?.queue);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (udpOversize4(src_key, dst_ip, dst_port, len)) |e| return e;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (udpOversize4(src_key, dst_ip, dst_port, full_len)) |e| return e;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const n = @min(payload.len, 1472);") == null);
+}
