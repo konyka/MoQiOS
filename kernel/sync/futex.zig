@@ -368,7 +368,14 @@ pub fn futex(addr: u64, raw_op: i64, val: u64, val2: u64, uaddr2: u64, val3: u64
             if (deadline != 0) armWaitDeadline(cur_idx, bucket, deadline);
 
             cur_task.state = .blocked;
+            // A default stop sent while this thread still ran was left pending (the sender saw .running and only kicked it, and
+            // its kicks end once the state reads .blocked): take it before the first sleep, with the same handshake as the
+            // re-block below, or the thread sleeps with it pending and its group stop is never reported (hello286 J).
+            _ = @atomicRmw(u64, &cur_task.pending_signals, .Or, 0, .seq_cst);
+            const sig_first = @import("../proc/signal.zig");
+            const stop_first = sig_first.pendingStop(cur_task);
             bucket.lock.release(irq_flags);
+            if (stop_first) _ = sig_first.stopWhileWaiting(cur_task);
 
             while (true) {
                 sched_mod.forceReschedule();

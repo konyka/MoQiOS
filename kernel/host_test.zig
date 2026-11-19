@@ -350,6 +350,7 @@ pub const copy_from_user_source = @embedFile("mm/copy_from_user.zig");
 pub const huge_user_impl_source = @embedFile("mm/huge_user_impl.zig");
 pub const mprotect_source = @embedFile("mm/mprotect.zig");
 pub const socket_syscall_source = @embedFile("net/socket_syscall.zig");
+pub const futex_source = @embedFile("sync/futex.zig");
 pub const ramdisk_source = @embedFile("fs/ramdisk.zig");
 pub const unlink_source = @embedFile("fs/unlink.zig");
 pub const dir_ops_source = @embedFile("fs/dir_ops.zig");

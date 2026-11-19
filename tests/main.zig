@@ -16482,3 +16482,18 @@ test "IPv6 raw socket sendmsg control messages IPV6_HOPLIMIT / IPV6_TCLASS / IPV
     try std.testing.expect(std.mem.indexOf(u8, kt.icmpv6_source, "pub fn sendProto6Ov(") != null);
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello427", true, false).caps.cap_net_raw);
 }
+
+test "FUTEX_WAIT takes a default stop already pending before its first sleep (hello286 J, CI 44472101531)" {
+    // A SIGSTOP whose bit was set while the thread still ran (the sender saw .running and only kicked it) must be taken when the
+    // thread enqueues and marks itself .blocked; sleeping with it pending leaves the group stop unreported (the churn thread stayed
+    // "S (sleeping)" while the rest of the group was stopped).
+    const fs = kt.futex_source;
+    const enq = std.mem.indexOf(u8, fs, "if (deadline != 0) armWaitDeadline(cur_idx, bucket, deadline);") orelse return error.TestUnexpectedResult;
+    const loop = std.mem.indexOfPos(u8, fs, enq, "while (true) {") orelse return error.TestUnexpectedResult;
+    const first = fs[enq..loop];
+    try std.testing.expect(std.mem.indexOf(u8, first, "_ = @atomicRmw(u64, &cur_task.pending_signals, .Or, 0, .seq_cst);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "const stop_first = sig_first.pendingStop(cur_task);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "if (stop_first) _ = sig_first.stopWhileWaiting(cur_task);") != null);
+    const rel = std.mem.indexOf(u8, first, "bucket.lock.release(irq_flags);").?;
+    try std.testing.expect(rel < std.mem.indexOf(u8, first, "if (stop_first)").?);
+}
