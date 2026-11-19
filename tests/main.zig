@@ -2240,12 +2240,7 @@ test "fcntl flags: FD_CLOEXEC is one bit, F_SETFL touches only APPEND/NONBLOCK/D
     }
     try std.testing.expectEqual(@as(u32, 2), fp.reportedFlags("tcp_socket", 1)); // any stored access mode is replaced
     try std.testing.expectEqual(@as(i64, 2), fp.F_UNLCK);
-    // Pipes have one fixed page: asking for more is ENOMEM, asking for less (or nothing) rounds up to it.
-    try std.testing.expectEqual(@as(i64, 4096), fp.setPipeSize(4096));
-    try std.testing.expectEqual(@as(i64, 4096), fp.setPipeSize(1));
-    try std.testing.expectEqual(@as(i64, 4096), fp.setPipeSize(0));
-    try std.testing.expectEqual(@as(i64, -12), fp.setPipeSize(4097));
-    try std.testing.expectEqual(@as(i64, -12), fp.setPipeSize(1 << 30));
+    // F_SETPIPE_SZ resizes a pipe since hello441 (see the hello441 test); the default stays one page.
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "pub const PIPE_BUF_SIZE: u32 = 4096;") != null); // fcntl_policy.PIPE_SIZE mirrors it
 
     // The entry points use the policy.
@@ -16794,4 +16789,25 @@ test "the tail loss probe waits 2 SRTT + TCP_RTO_MIN with one segment out, so on
     try std.testing.expectEqual(@as(u32, 260), rp.tlpTimeoutMs(30, 1000, true));
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "const tlp_to = tcp_recv_policy.tlpTimeoutMs(tcb.srtt, current_rto, pipeBytes(tcb) <= mssForTcb(tcb));") != null);
+}
+
+test "F_SETPIPE_SZ resizes a pipe: rounded to a power-of-two of pages, EPERM past pipe-max-size, EBUSY below the queued bytes (hello441)" {
+    // Linux fs/pipe.c round_pipe_size / pipe_set_size / pipe_resize_ring. The pipe used to be one fixed page (anything bigger ENOMEM).
+    const fp = kt.fcntl_policy;
+    try std.testing.expectEqual(@as(u64, 4096), fp.roundPipeSize(0).?);
+    try std.testing.expectEqual(@as(u64, 4096), fp.roundPipeSize(1).?);
+    try std.testing.expectEqual(@as(u64, 8192), fp.roundPipeSize(5000).?);
+    try std.testing.expectEqual(@as(u64, 131072), fp.roundPipeSize(100000).?);
+    try std.testing.expectEqual(@as(?u64, null), fp.roundPipeSize((1 << 31) + 1));
+    try std.testing.expectEqual(@as(i64, 0), fp.setPipeSizeErrno(131072, 4096, 0, false));
+    try std.testing.expectEqual(@as(i64, -1), fp.setPipeSizeErrno(2 << 20, 4096, 0, false)); // over pipe-max-size, unprivileged
+    try std.testing.expectEqual(@as(i64, 0), fp.setPipeSizeErrno(2 << 20, 4096, 0, true));
+    try std.testing.expectEqual(@as(i64, 0), fp.setPipeSizeErrno(2 << 20, 2 << 20, 0, false)); // not growing: allowed
+    try std.testing.expectEqual(@as(i64, -16), fp.setPipeSizeErrno(4096, 131072, 60000, false)); // EBUSY
+    try std.testing.expectEqual(@as(i64, 0), fp.setPipeSizeErrno(65536, 131072, 60000, false));
+    // The kernel keeps at most 4 MiB of pipe buffer (CAP_SYS_RESOURCE may go past pipe-max-size, not past this).
+    try std.testing.expectEqual(@as(i64, -12), fp.setPipeSizeErrno(8 << 20, 4096, 0, true));
+    const v = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, v, "pub fn pipeSetSize(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "% PIPE_BUF_SIZE") == null); // every ring index uses the pipe's own capacity
 }

@@ -67,15 +67,28 @@ fn eql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-/// A pipe here has one fixed buffer page.
+/// A pipe starts with one buffer page (Linux starts with 16; F_GETPIPE_SZ reports the real size).
 pub const PIPE_SIZE: u32 = 4096;
+/// /proc/sys/fs/pipe-max-size: the most an unprivileged F_SETPIPE_SZ may grow a pipe to.
+pub const PIPE_MAX_SIZE: u64 = 1 << 20;
+/// The largest buffer this kernel gives one pipe, even with CAP_SYS_RESOURCE (ENOMEM above).
+pub const PIPE_HARD_MAX: u64 = 4 << 20;
 pub const F_UNLCK: i64 = 2;
 
-/// F_SETPIPE_SZ: the buffer cannot grow, so anything above one page fails (ENOMEM); a request for
-/// that page or less is rounded up to it, as Linux rounds up to a page.
-pub fn setPipeSize(requested: u64) i64 {
-    if (requested > PIPE_SIZE) return -12; // ENOMEM
-    return PIPE_SIZE;
+/// round_pipe_size: at least a page, else the next power of two; null above 2^31 (EINVAL).
+pub fn roundPipeSize(requested: u64) ?u64 {
+    if (requested > (1 << 31)) return null;
+    if (requested < PIPE_SIZE) return PIPE_SIZE;
+    return std.math.ceilPowerOfTwo(u64, requested) catch null;
+}
+
+/// pipe_set_size's checks for growing a pipe of `current` bytes to `size` (already rounded) with `queued` bytes in it: past
+/// pipe-max-size needs CAP_SYS_RESOURCE (EPERM), past what this kernel can allocate is ENOMEM, a size below the queued bytes EBUSY.
+pub fn setPipeSizeErrno(size: u64, current: u64, queued: u64, cap_sys_resource: bool) i64 {
+    if (size > current and size > PIPE_MAX_SIZE and !cap_sys_resource) return -1;
+    if (size > PIPE_HARD_MAX) return -12;
+    if (size < queued) return -16;
+    return 0;
 }
 
 /// F_SETSIG's argument is an int naming a signal 0..64 (0: SIGIO); anything else is EINVAL (null). Linux f_owner_sig, measured.

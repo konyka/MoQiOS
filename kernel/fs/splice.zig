@@ -215,7 +215,7 @@ fn destinationCapacity(fd_table: *vfs.FdTable, fd: u32, dst_type: DstType) u64 {
     return switch (dst_type) {
         .tcp_socket => tcp.tcpSendSpace(fd_table.fds[fd].tcb_idx),
         .pipe_write => if (vfs.pipeState(fd_table.fds[fd].pipe_idx)) |state|
-            if (state.writable) vfs.PIPE_BUF_SIZE - 1 - state.readable else 0
+            if (state.writable) state.capacity - 1 - state.readable else 0
         else
             0,
     };

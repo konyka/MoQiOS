@@ -145,7 +145,13 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
                 .pipe_read, .pipe_write => {},
                 else => return -9, // EBADF: not a pipe
             }
-            return if (cmd == F_GETPIPE_SZ) @as(i64, policy.PIPE_SIZE) else policy.setPipeSize(arg);
+            const st = vfs.pipeState(t.fd_table.fds[fd].pipe_idx) orelse return -9;
+            if (cmd == F_GETPIPE_SZ) return st.capacity;
+            // F_SETPIPE_SZ takes an unsigned int (pipe_fcntl): the low 32 bits.
+            const size = policy.roundPipeSize(@as(u32, @truncate(arg))) orelse return -22;
+            const rc = policy.setPipeSizeErrno(size, st.capacity, st.readable, t.effective_caps.cap_sys_resource);
+            if (rc != 0) return rc;
+            return vfs.pipeSetSize(t.fd_table.fds[fd].pipe_idx, @intCast(size));
         },
         F_DUPFD_CLOEXEC => {
             return dupFd(t.fd_table, fd, arg, FD_CLOEXEC);

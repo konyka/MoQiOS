@@ -82,6 +82,10 @@ pub const MAX_PIPES: u32 = 64;
 
 pub const PipeBuffer = struct {
     buf: [PIPE_BUF_SIZE]u8,
+    /// F_SETPIPE_SZ: a bigger ring in contiguous PMM pages (HHDM address) replaces `buf`; null while the pipe has its first page.
+    ext: ?[*]u8 = null,
+    /// Ring size in bytes (`buf`'s, or `ext`'s); the pipe holds cap - 1 bytes (one slot stays empty to tell full from empty).
+    cap: u32 = PIPE_BUF_SIZE,
     head: u32,
     tail: u32,
     /// Total references (slot occupied when > 0). Kept as the sum of the
@@ -96,6 +100,73 @@ pub const PipeBuffer = struct {
     /// Changes whenever this slot is allocated for a new pipe.
     generation: u32 = 0,
 };
+
+/// The bytes of `pipe`'s ring (its first page, or the buffer F_SETPIPE_SZ gave it).
+fn ring(pipe: *PipeBuffer) [*]u8 {
+    return if (pipe.ext) |e| e else &pipe.buf;
+}
+
+/// Bytes queued in `pipe`.
+fn pipeUsed(pipe: *const PipeBuffer) u32 {
+    return if (pipe.tail >= pipe.head) pipe.tail - pipe.head else pipe.cap - pipe.head + pipe.tail;
+}
+
+fn freePipeExt(pipe: *PipeBuffer) void {
+    const e = pipe.ext orelse return;
+    const hhdm = @import("../mm/hhdm.zig");
+    @import("../mm/pmm.zig").freeContiguous(hhdm.virtToPhys(@intFromPtr(e)), pipe.cap / 4096);
+    pipe.ext = null;
+    pipe.cap = PIPE_BUF_SIZE;
+}
+
+/// F_SETPIPE_SZ on the pipe `pipe_idx`: give it a ring of `size` bytes (already rounded and checked by fcntl_policy), keeping what
+/// it holds in order. Returns the new size, -EBUSY when the queued bytes (or a splice reservation) would not fit, -ENOMEM when the
+/// pages cannot be had. A size of one page goes back to the pipe's own page.
+pub fn pipeSetSize(pipe_idx: u32, size: u32) i64 {
+    if (pipe_idx >= pipes.len) return -9;
+    const pmm = @import("../mm/pmm.zig");
+    const hhdm = @import("../mm/hhdm.zig");
+    const pages: usize = size / 4096;
+    // Allocate outside the lock; give the pages back if the resize does not happen.
+    const fresh: ?[*]u8 = if (size > PIPE_BUF_SIZE) blk: {
+        const phys = pmm.allocContiguous(pages) orelse return -12;
+        break :blk @ptrFromInt(hhdm.physToVirt(phys));
+    } else null;
+    const flags = pipe_lock.acquire();
+    const pipe = &pipes[pipe_idx];
+    const used = pipeUsed(pipe);
+    if (pipe.ref_count == 0 or used >= size or pipe.read_reservation != 0) {
+        pipe_lock.release(flags);
+        if (fresh) |f| pmm.freeContiguous(hhdm.virtToPhys(@intFromPtr(f)), pages);
+        return if (pipe.ref_count == 0) -9 else -16; // EBUSY
+    }
+    // Copy the queued bytes to the start of the new ring (which may be the pipe's own page, so go through a bounce when shrinking
+    // back onto it).
+    const old_ring = ring(pipe);
+    const old_cap = pipe.cap;
+    const old_ext = pipe.ext;
+    if (fresh) |f| {
+        var i: u32 = 0;
+        while (i < used) : (i += 1) f[i] = old_ring[(pipe.head + i) % old_cap];
+    } else {
+        var tmp: [PIPE_BUF_SIZE]u8 = undefined;
+        var i: u32 = 0;
+        while (i < used) : (i += 1) tmp[i] = old_ring[(pipe.head + i) % old_cap];
+        @memcpy(pipe.buf[0..used], tmp[0..used]);
+    }
+    pipe.ext = fresh;
+    pipe.cap = size;
+    pipe.head = 0;
+    pipe.tail = used;
+    if (size > old_cap) @import("../proc/sched.zig").wakeAll(&pipe_write_waiters[pipe_idx]);
+    pipe_lock.release(flags);
+    if (old_ext) |e| pmm.freeContiguous(hhdm.virtToPhys(@intFromPtr(e)), old_cap / 4096);
+    if (size > old_cap) {
+        const epoll_s = @import("../net/epoll.zig");
+        epoll_s.epollNotify(.pipe_write, pipe_idx, epoll_s.EPOLLOUT);
+    }
+    return size;
+}
 
 /// Identifies one active splice read reservation, including the pipe lifetime
 /// in which it was created.
@@ -162,6 +233,8 @@ fn unlinkPipeReadWaiterLocked(pipe_idx: u32, node: *@import("../proc/task.zig").
 
 pub const PipeState = struct {
     readable: u32,
+    /// Ring size in bytes (F_GETPIPE_SZ); cap - 1 bytes fit.
+    capacity: u32 = PIPE_BUF_SIZE,
     writable: bool,
     read_open: bool,
     write_open: bool,
@@ -173,13 +246,11 @@ pub fn pipeState(pipe_idx: u32) ?PipeState {
     defer pipe_lock.release(flags);
     const pipe = &pipes[pipe_idx];
     if (pipe.ref_count == 0) return null;
-    const readable = if (pipe.tail >= pipe.head)
-        pipe.tail - pipe.head
-    else
-        PIPE_BUF_SIZE - pipe.head + pipe.tail;
+    const readable = pipeUsed(pipe);
     return .{
         .readable = readable,
-        .writable = (pipe.tail + 1) % PIPE_BUF_SIZE != pipe.head,
+        .capacity = pipe.cap,
+        .writable = (pipe.tail + 1) % pipe.cap != pipe.head,
         .read_open = pipe.read_refs > 0,
         .write_open = pipe.write_refs > 0,
     };
@@ -251,7 +322,7 @@ fn pipeReadInner(pipe_idx: u32, buf: [*]u8, count: usize, status_flags: u32) i64
             pipe_lock.release(flags);
             return -11; // EAGAIN: a splice reader owns the FIFO head.
         }
-        const readable = if (pipe.tail >= pipe.head) pipe.tail - pipe.head else PIPE_BUF_SIZE - pipe.head + pipe.tail;
+        const readable = pipeUsed(pipe);
         if (readable == 0) {
             if (pipe.write_refs == 0 or nonblocking) {
                 pipe_lock.release(flags);
@@ -302,8 +373,8 @@ fn pipeReadInner(pipe_idx: u32, buf: [*]u8, count: usize, status_flags: u32) i64
         }
         var n: usize = 0;
         while (n < count and n < readable) {
-            buf[n] = pipe.buf[pipe.head];
-            pipe.head = (pipe.head + 1) % PIPE_BUF_SIZE;
+            buf[n] = ring(pipe)[pipe.head];
+            pipe.head = (pipe.head + 1) % pipe.cap;
             n += 1;
         }
         if (n > 0) sched.wakeAll(&pipe_write_waiters[pipe_idx]);
@@ -345,10 +416,10 @@ pub fn pipeReserveRead(pipe_idx: u32, buf: [*]u8, count: usize, token: *PipeRead
     defer pipe_lock.release(flags);
     const pipe = &pipes[pipe_idx];
     if (pipe.ref_count == 0 or pipe.read_reservation != 0) return -1;
-    const readable: u32 = if (pipe.tail >= pipe.head) pipe.tail - pipe.head else PIPE_BUF_SIZE - pipe.head + pipe.tail;
+    const readable: u32 = pipeUsed(pipe);
     const n: u32 = @intCast(@min(count, @as(usize, readable)));
     var i: u32 = 0;
-    while (i < n) : (i += 1) buf[i] = pipe.buf[(pipe.head + i) % PIPE_BUF_SIZE];
+    while (i < n) : (i += 1) buf[i] = ring(pipe)[(pipe.head + i) % pipe.cap];
     pipe.read_reservation = n;
     token.* = .{ .pipe_idx = pipe_idx, .generation = pipe.generation };
     return @intCast(n);
@@ -372,7 +443,7 @@ pub fn pipeReserveReadWait(pipe_idx: u32, buf: [*]u8, count: usize, token: *Pipe
             pipe_lock.release(flags);
             return -11;
         }
-        const readable: u32 = if (pipe.tail >= pipe.head) pipe.tail - pipe.head else PIPE_BUF_SIZE - pipe.head + pipe.tail;
+        const readable: u32 = pipeUsed(pipe);
         if (readable == 0) {
             if (pipe.write_refs == 0 or nonblocking) {
                 pipe_lock.release(flags);
@@ -411,7 +482,7 @@ pub fn pipeReserveReadWait(pipe_idx: u32, buf: [*]u8, count: usize, token: *Pipe
         }
         const n: u32 = @intCast(@min(count, @as(usize, readable)));
         var i: u32 = 0;
-        while (i < n) : (i += 1) buf[i] = pipe.buf[(pipe.head + i) % PIPE_BUF_SIZE];
+        while (i < n) : (i += 1) buf[i] = ring(pipe)[(pipe.head + i) % pipe.cap];
         pipe.read_reservation = n;
         token.* = .{ .pipe_idx = pipe_idx, .generation = pipe.generation };
         pipe_lock.release(flags);
@@ -429,7 +500,7 @@ pub fn pipeCommitRead(token: PipeReadToken, count: usize) i64 {
         return -1;
     }
     const n: u32 = @intCast(@min(count, @as(usize, pipe.read_reservation)));
-    pipe.head = (pipe.head + n) % PIPE_BUF_SIZE;
+    pipe.head = (pipe.head + n) % pipe.cap;
     pipe.read_reservation -= n;
     if (n > 0) @import("../proc/sched.zig").wakeAll(&pipe_write_waiters[token.pipe_idx]);
     pipe_lock.release(flags);
@@ -479,14 +550,14 @@ pub fn pipeTransfer(src_idx: u32, dst_idx: u32, count: usize) i64 {
         pipe_lock.release(flags);
         return 0;
     }
-    const readable: u32 = if (src.tail >= src.head) src.tail - src.head else PIPE_BUF_SIZE - src.head + src.tail;
-    const dst_readable: u32 = if (dst.tail >= dst.head) dst.tail - dst.head else PIPE_BUF_SIZE - dst.head + dst.tail;
-    const writable = (PIPE_BUF_SIZE - 1) - dst_readable;
+    const readable: u32 = pipeUsed(src);
+    const dst_readable: u32 = pipeUsed(dst);
+    const writable = (dst.cap - 1) - dst_readable;
     const n: u32 = @intCast(@min(count, @as(usize, @min(readable, writable))));
     var i: u32 = 0;
-    while (i < n) : (i += 1) dst.buf[(dst.tail + i) % PIPE_BUF_SIZE] = src.buf[(src.head + i) % PIPE_BUF_SIZE];
-    src.head = (src.head + n) % PIPE_BUF_SIZE;
-    dst.tail = (dst.tail + n) % PIPE_BUF_SIZE;
+    while (i < n) : (i += 1) ring(dst)[(dst.tail + i) % dst.cap] = ring(src)[(src.head + i) % src.cap];
+    src.head = (src.head + n) % src.cap;
+    dst.tail = (dst.tail + n) % dst.cap;
     if (n > 0) {
         const sched = @import("../proc/sched.zig");
         _ = sched.wakeOne(&pipe_read_waiters[dst_idx]);
@@ -529,13 +600,13 @@ pub fn pipeTransferWait(src_idx: u32, dst_idx: u32, count: usize, nonblocking: b
             pipe_lock.release(flags);
             return -11;
         }
-        const readable: u32 = if (src.tail >= src.head) src.tail - src.head else PIPE_BUF_SIZE - src.head + src.tail;
+        const readable: u32 = pipeUsed(src);
         if (readable == 0 and src.write_refs == 0) {
             pipe_lock.release(flags);
             return 0;
         }
-        const dst_readable: u32 = if (dst.tail >= dst.head) dst.tail - dst.head else PIPE_BUF_SIZE - dst.head + dst.tail;
-        const writable = (PIPE_BUF_SIZE - 1) - dst_readable;
+        const dst_readable: u32 = pipeUsed(dst);
+        const writable = (dst.cap - 1) - dst_readable;
         if (readable > 0 and writable > 0) {
             pipe_lock.release(flags);
             const moved = pipeTransfer(src_idx, dst_idx, count);
@@ -593,8 +664,8 @@ pub fn pipeWaitWritable(pipe_idx: u32, nonblocking: bool) i64 {
             pipe_lock.release(flags);
             return -1;
         }
-        const used: u32 = if (pipe.tail >= pipe.head) pipe.tail - pipe.head else PIPE_BUF_SIZE - pipe.head + pipe.tail;
-        if (pipe.read_refs == 0 or used < PIPE_BUF_SIZE - 1) {
+        const used: u32 = pipeUsed(pipe);
+        if (pipe.read_refs == 0 or used < pipe.cap - 1) {
             pipe_lock.release(flags);
             return 0;
         }
@@ -661,16 +732,16 @@ fn pipeWriteInner(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u
             return if (n > 0) @intCast(n) else -32; // EPIPE
         }
         const before = n;
-        const used: usize = if (pipe.tail >= pipe.head) pipe.tail - pipe.head else PIPE_BUF_SIZE - pipe.head + pipe.tail;
-        const room: usize = (PIPE_BUF_SIZE - 1) - used;
+        const used: usize = pipeUsed(pipe);
+        const room: usize = (pipe.cap - 1) - used;
         // A write that can fit in an empty pipe is atomic (POSIX PIPE_BUF): it goes in whole or not at all, so another writer's
         // bytes are never mixed into it. Only a bigger write is let in piecemeal.
-        const atomic = count <= PIPE_BUF_SIZE - 1;
+        const atomic = count <= PIPE_BUF_SIZE - 1; // PIPE_BUF: atomic up to one page whatever the size
         if (!atomic or room >= count) {
             while (n < count) {
-                const next = (pipe.tail + 1) % PIPE_BUF_SIZE;
+                const next = (pipe.tail + 1) % pipe.cap;
                 if (next == pipe.head) break;
-                pipe.buf[pipe.tail] = buf[n];
+                ring(pipe)[pipe.tail] = buf[n];
                 pipe.tail = next;
                 n += 1;
             }
@@ -746,6 +817,7 @@ pub fn pipeClose(pipe_idx: u32, write_end: bool) void {
         one_side_gone = (pipe.read_refs == 0) != (pipe.write_refs == 0);
         if (pipe.ref_count == 0) {
             const generation = pipe.generation;
+            freePipeExt(pipe);
             pipe.* = .{ .buf = @splat(0), .head = 0, .tail = 0, .ref_count = 0, .generation = generation };
             pipe_count -|= 1;
         }
