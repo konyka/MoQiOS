@@ -32,6 +32,10 @@ const Entry = struct {
     len: u16 = 0,
     /// The sender: an IPv4 address in the first 4 bytes, or an IPv6 one.
     src: [16]u8 = @splat(0),
+    /// What the datagram arrived with, for recvmsg's IP_PKTINFO / IP_TTL / IP_TOS (an IPv4 socket) or IPV6_PKTINFO /
+    /// IPV6_HOPLIMIT / IPV6_TCLASS (an IPv6 one).
+    meta: @import("ip_cmsg_policy.zig").RecvInfo = .{},
+    meta6: @import("ip_cmsg_policy.zig").RecvInfo6 = .{},
 };
 
 const Socket = struct {
@@ -134,7 +138,7 @@ pub fn hasData(idx: u32) bool {
 }
 
 pub const RecvResult = union(enum) {
-    ok: struct { n: usize, src: [16]u8, trunc: usize },
+    ok: struct { n: usize, src: [16]u8, trunc: usize, meta: @import("ip_cmsg_policy.zig").RecvInfo = .{}, meta6: @import("ip_cmsg_policy.zig").RecvInfo6 = .{} },
     eagain,
 };
 
@@ -149,7 +153,7 @@ pub fn recv(idx: u32, out: []u8, peek: bool) RecvResult {
     const e = &s.queue[s.head];
     const copy_len = @min(@as(usize, e.len), out.len);
     @memcpy(out[0..copy_len], e.dgram[0..copy_len]);
-    const result: RecvResult = .{ .ok = .{ .n = copy_len, .src = e.src, .trunc = e.len } };
+    const result: RecvResult = .{ .ok = .{ .n = copy_len, .src = e.src, .trunc = e.len, .meta = e.meta, .meta6 = e.meta6 } };
     const next = policy.afterRecv(s.head, s.count, peek);
     s.head = next.head;
     s.count = next.count;
@@ -306,8 +310,8 @@ pub fn isConnected(idx: u32) bool {
 /// One received IPv4 datagram of `protocol` that arrived on this host: `dgram` starts at the IP header of `src` → `dst` (Linux
 /// raw_v4_input hands raw sockets the skb, IP header included). Each matching socket of that protocol gets its own copy; a full queue
 /// drops the datagram. Whether any socket matched (raw_v4_input's `delivered`, set before ICMP_FILTER and the queue are looked at):
-/// a datagram no protocol handles is then not answered with protocol unreachable.
-pub fn deliver(protocol: u8, dgram: []const u8, src: [4]u8, dst: [4]u8) bool {
+/// a datagram no protocol handles is then not answered with protocol unreachable. `ifindex` is the interface it arrived on.
+pub fn deliver(protocol: u8, dgram: []const u8, src: [4]u8, dst: [4]u8, ifindex: u8) bool {
     var notify: [MAX_SOCKETS]u32 = undefined;
     var n_notify: usize = 0;
     var took = false;
@@ -328,6 +332,7 @@ pub fn deliver(protocol: u8, dgram: []const u8, src: [4]u8, dst: [4]u8) bool {
             e.len = @intCast(copy_len);
             e.src = @splat(0);
             @memcpy(e.src[0..4], &src);
+            e.meta = .{ .ifindex = ifindex, .dst = dst, .ttl = if (dgram.len > 8) dgram[8] else 0, .tos = if (dgram.len > 1) dgram[1] else 0 };
             s.count += 1;
             notify[n_notify] = @intCast(i);
             n_notify += 1;
@@ -343,8 +348,9 @@ pub fn deliver(protocol: u8, dgram: []const u8, src: [4]u8, dst: [4]u8) bool {
 /// One IPv6 packet of next header `protocol` that arrived on this host, `src` → `dst`, `msg` being what follows its IPv6 header
 /// (Linux raw6_local_deliver, before the protocol handler): each IPv6 socket of that protocol that matches gets a copy. An ICMPv6
 /// socket's ICMP6_FILTER may block the type; a socket with a checksum offset drops a packet whose checksum is wrong (rawv6_rcv).
-/// Whether any socket matched (ipv6_raw_deliver's `delivered`).
-pub fn deliver6(protocol: u8, msg: []const u8, src: [16]u8, dst: [16]u8) bool {
+/// Whether any socket matched (ipv6_raw_deliver's `delivered`). `ifindex`, `hops` and `tclass` are the interface it arrived on and
+/// its IPv6 header's hop limit and traffic class.
+pub fn deliver6(protocol: u8, msg: []const u8, src: [16]u8, dst: [16]u8, ifindex: u8, hops: u8, tclass: u8) bool {
     var notify: [MAX_SOCKETS]u32 = undefined;
     var n_notify: usize = 0;
     var took = false;
@@ -364,6 +370,7 @@ pub fn deliver6(protocol: u8, msg: []const u8, src: [16]u8, dst: [16]u8) bool {
             @memcpy(e.dgram[0..copy_len], msg[0..copy_len]);
             e.len = @intCast(copy_len);
             e.src = src;
+            e.meta6 = .{ .ifindex = ifindex, .dst = dst, .hops = hops, .tclass = tclass };
             s.count += 1;
             notify[n_notify] = @intCast(i);
             n_notify += 1;

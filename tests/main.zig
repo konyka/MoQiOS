@@ -14654,7 +14654,7 @@ test "raw ICMP socket policy (hello389): protocol, delivery filter, destination 
 
 test "raw ICMP socket wiring (hello389): received ICMP reaches raw sockets first, descriptors share the socket, sends go out at once" {
     const m = kt.net_mod_source;
-    const at_raw = std.mem.indexOf(u8, m, "@import(\"raw_icmp.zig\").deliver(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip);") orelse return error.TestUnexpectedResult;
+    const at_raw = std.mem.indexOf(u8, m, "@import(\"raw_icmp.zig\").deliver(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip, ifindex);") orelse return error.TestUnexpectedResult;
     const at_icmp = std.mem.indexOf(u8, m, "icmp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len);").?;
     try std.testing.expect(at_raw < at_icmp);
     const ss = kt.socket_syscall_source;
@@ -14813,7 +14813,7 @@ test "raw ICMPv6 socket wiring (hello391): checksummed ICMPv6 reaches raw socket
     // ICMPv6 included; each ICMPv6 socket checks the checksum itself (rawv6_rcv with rp->checksum set).
     const m = kt.net_mod_source;
     // hello410: after the extension headers, at the upper-layer header.
-    const dl = std.mem.indexOf(u8, m, "const raw_took6 = raw6.deliver6(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip);") orelse return error.TestUnexpectedResult;
+    const dl = std.mem.indexOf(u8, m, "const raw_took6 = raw6.deliver6(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass);") orelse return error.TestUnexpectedResult;
     const pr = std.mem.indexOf(u8, m, "icmpv6.handlePacket(info6.src_ip, info6.dst_ip, data + up_start, up_len);") orelse return error.TestUnexpectedResult;
     try std.testing.expect(dl < pr);
     try std.testing.expect(std.mem.indexOf(u8, kt.icmpv6_source, "raw_icmp.zig\").deliver6(") == null);
@@ -14964,7 +14964,7 @@ test "raw ICMP sockets keep their SOL_SOCKET options and a blocking recv honours
     try std.testing.expect(std.mem.indexOf(u8, so, ".raw => |idx| {\n            stored = @import(\"raw_icmp.zig\").getOpts(idx) orelse return -9;") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, "var st: sp.Stored = .{};\n            return applySol(") == null);
     const ss = kt.socket_syscall_source;
-    const at = std.mem.indexOf(u8, ss, "pub fn rawRecvInto(") orelse return error.TestUnexpectedResult;
+    const at = std.mem.indexOf(u8, ss, "fn rawRecvIntoMeta(") orelse return error.TestUnexpectedResult;
     const end = std.mem.indexOfPos(u8, ss, at, "\n}\n") orelse return error.TestUnexpectedResult;
     const body = ss[at..end];
     try std.testing.expect(std.mem.indexOf(u8, body, "const deadline = urp.deadlineNs(tsc.nanos(), if (raw.getOpts(d.raw_idx)) |o| o.rcv_ms else 0);") != null);
@@ -15060,8 +15060,8 @@ test "raw ICMP sockets take sendmsg and recvmsg (hello397)" {
     const rat = std.mem.indexOf(u8, ss, "fn rawRecvmsg(") orelse return error.TestUnexpectedResult;
     const rend = std.mem.indexOfPos(u8, ss, rat, "\n}\n") orelse return error.TestUnexpectedResult;
     const rbody = ss[rat..rend];
-    try std.testing.expect(std.mem.indexOf(u8, rbody, "const got = rawRecvInto(d, data[0..room], flags | 0x20, &src);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rbody, "bo.writeU32Le(&fl, if (truncated) @as(u32, 0x20) else 0);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rbody, "const got = rawRecvIntoMeta(d, data[0..room], flags | 0x20, &src, &got_meta);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rbody, "bo.writeU32Le(&fl, (if (truncated) @as(u32, 0x20) else 0) | (if (cm.truncated) @as(u32, 0x08) else 0));") != null);
 }
 
 test "raw ICMP queue is a ring and MSG_PEEK leaves the head (hello398)" {
@@ -15174,7 +15174,7 @@ test "IPv4 raw sockets of any protocol (hello401): creation, delivery and protoc
     try std.testing.expectEqual(@as(i64, 0), rp.icmpFilterErrno(1));
     const m = kt.net_mod_source;
     // Every IPv4 datagram reaches the raw sockets of its protocol before the protocol handler (raw_local_deliver first).
-    const at_raw = std.mem.indexOf(u8, m, "const raw_took = @import(\"raw_icmp.zig\").deliver(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip);") orelse return error.TestUnexpectedResult;
+    const at_raw = std.mem.indexOf(u8, m, "const raw_took = @import(\"raw_icmp.zig\").deliver(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip, ifindex);") orelse return error.TestUnexpectedResult;
     const at_tcp = std.mem.indexOf(u8, m, "tcp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, info.ecn_ce);").?;
     try std.testing.expect(at_raw < at_tcp);
     try std.testing.expect(std.mem.indexOf(u8, m, "else => if (rp.protoUnreachable(info.protocol, raw_took)) icmp.sendProtoUnreachable(data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip),") != null);
@@ -15324,7 +15324,7 @@ test "IPV6_HDRINCL, IPPROTO_RAW and the ICMPv6 parameter problem (hello404): Lin
     try std.testing.expectEqual(@as(usize, 1240), rp.PARAM_PROBLEM_MAX);
     const m = kt.net_mod_source;
     // hello410: the next header after any extension headers decides, and the pointer names the field that named it.
-    try std.testing.expect(std.mem.indexOf(u8, m, "const raw_took6 = raw6.deliver6(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "const raw_took6 = raw6.deliver6(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass);") != null);
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "if (policy.startsHdrincl(protocol)) s.opts.ip.hdrincl = true;") != null);
     const ss = kt.socket_syscall_source;
@@ -16496,4 +16496,23 @@ test "FUTEX_WAIT takes a default stop already pending before its first sleep (he
     try std.testing.expect(std.mem.indexOf(u8, first, "if (stop_first) _ = sig_first.stopWhileWaiting(cur_task);") != null);
     const rel = std.mem.indexOf(u8, first, "bucket.lock.release(irq_flags);").?;
     try std.testing.expect(rel < std.mem.indexOf(u8, first, "if (stop_first)").?);
+}
+
+test "raw socket recvmsg control messages IP_PKTINFO / IP_TTL / IP_TOS and the IPv6 ones (hello428): raw_recvmsg -> ip_cmsg_recv, rawv6_recvmsg -> ip6_datagram_recv_ctl" {
+    const c = kt.ip_cmsg_policy;
+    // The same layout as a UDP socket's: in_pktinfo, ttl as an int, tos as a byte (80 bytes for all three).
+    var out: [96]u8 = undefined;
+    const b = c.build(.{ .pktinfo = true, .recvttl = true, .recvtos = true }, .{ .ifindex = 1, .dst = .{ 127, 0, 0, 1 }, .ttl = 33, .tos = 0x28 }, 256, &out);
+    try std.testing.expectEqual(@as(usize, 80), b.written);
+    // Each queued datagram keeps what it arrived with; recvmsg lays the wanted messages out from it.
+    const rs = kt.raw_icmp_source;
+    try std.testing.expect(std.mem.indexOf(u8, rs, "meta: @import(\"ip_cmsg_policy.zig\").RecvInfo = .{},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "meta6: @import(\"ip_cmsg_policy.zig\").RecvInfo6 = .{},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "e.meta = .{ .ifindex = ifindex, .dst = dst, .ttl = if (dgram.len > 8) dgram[8] else 0, .tos = if (dgram.len > 1) dgram[1] else 0 };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "e.meta6 = .{ .ifindex = ifindex, .dst = dst, .hops = hops, .tclass = tclass };") != null);
+    const ss = kt.socket_syscall_source;
+    const fr = std.mem.indexOf(u8, ss, "fn rawRecvmsg(") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, ss, fr, "ip_cmsg_policy.build6(ip_cmsg_policy.Wanted.of6(opts_ip), got_meta.v6, ctl_cap, &ctl_buf)") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, ss, fr, "ip_cmsg_policy.build(ip_cmsg_policy.Wanted.of(opts_ip), got_meta.v4, ctl_cap, &ctl_buf)") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(kt.capability_profile.profileForLaunch("hello428", true, false).caps.cap_net_raw);
 }

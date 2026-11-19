@@ -212,6 +212,14 @@ fn rawIpOpts(idx: u32) @import("ip_opt_policy.zig").IpOpts {
 /// (EAGAIN). MSG_TRUNC returns the datagram's whole length. The sender's address (IPv4 in the first 4 bytes) goes to `from` when
 /// given.
 pub fn rawRecvInto(d: *vfs_mod.FileDescriptor, out: []u8, flags: u32, from: ?*[16]u8) i64 {
+    return rawRecvIntoMeta(d, out, flags, from, null);
+}
+
+/// What a received raw datagram arrived with, for recvmsg's control messages.
+const RawMeta = struct { v4: ip_cmsg_policy.RecvInfo = .{}, v6: ip_cmsg_policy.RecvInfo6 = .{} };
+
+/// rawRecvInto that also reports, in `meta`, the interface, destination and IP header values the datagram arrived with.
+fn rawRecvIntoMeta(d: *vfs_mod.FileDescriptor, out: []u8, flags: u32, from: ?*[16]u8, meta: ?*RawMeta) i64 {
     const raw = @import("raw_icmp.zig");
     const tsc = @import("../arch/arch.zig").tsc;
     const urp = @import("udp_recv_policy.zig");
@@ -222,6 +230,7 @@ pub fn rawRecvInto(d: *vfs_mod.FileDescriptor, out: []u8, flags: u32, from: ?*[1
         switch (raw.recv(d.raw_idx, out, (flags & 0x02) != 0)) {
             .ok => |r| {
                 if (from) |f| f.* = r.src;
+                if (meta) |m| m.* = .{ .v4 = r.meta, .v6 = r.meta6 };
                 return @intCast(if ((flags & 0x20) != 0) r.trunc else r.n);
             },
             .eagain => {},
@@ -2015,8 +2024,10 @@ fn rawSendmsg(d: *const vfs_mod.FileDescriptor, msghdr: *const [56]u8) i64 {
 }
 
 /// recvmsg on a raw ICMP socket (raw_recvmsg / rawv6_recvmsg): the next datagram is scattered over the iovecs, msg_name gets the
-/// sender (sockaddr_in, or sockaddr_in6 for an IPv6 socket), msg_controllen is 0, and msg_flags carries MSG_TRUNC when the datagram
-/// did not fit. The MSG_TRUNC flag returns the datagram's whole length.
+/// sender (sockaddr_in, or sockaddr_in6 for an IPv6 socket), the control buffer gets what IP_PKTINFO / IP_RECVTTL / IP_RECVTOS
+/// (ip_cmsg_recv) or IPV6_RECVPKTINFO / IPV6_RECVHOPLIMIT / IPV6_RECVTCLASS (ip6_datagram_recv_ctl) ask for, and msg_flags carries
+/// MSG_TRUNC when the datagram did not fit, MSG_CTRUNC when a control message did not. The MSG_TRUNC flag returns the datagram's
+/// whole length.
 fn rawRecvmsg(d: *vfs_mod.FileDescriptor, msg_ptr: u64, msghdr: *const [56]u8, flags: u32) i64 {
     const name_ptr: u64 = bo.readU64At(msghdr, 0);
     const name_cap: u32 = bo.readU32Le(msghdr[8..12]);
@@ -2033,7 +2044,8 @@ fn rawRecvmsg(d: *vfs_mod.FileDescriptor, msg_ptr: u64, msghdr: *const [56]u8, f
         room += @intCast(@min(bo.readU64At(&iov_buf, 8), data.len - room));
     }
     var src: [16]u8 = @splat(0);
-    const got = rawRecvInto(d, data[0..room], flags | 0x20, &src);
+    var got_meta: RawMeta = .{};
+    const got = rawRecvIntoMeta(d, data[0..room], flags | 0x20, &src, &got_meta);
     if (got < 0) return got;
     const full: usize = @intCast(got);
     const n = @min(full, room);
@@ -2063,11 +2075,24 @@ fn rawRecvmsg(d: *vfs_mod.FileDescriptor, msg_ptr: u64, msghdr: *const [56]u8, f
         bo.writeU32Le(&al, name_len);
         _ = copy.copyToUser(@ptrFromInt(msg_ptr + 8), &al, 4);
     }
-    var z8: [8]u8 = @splat(0);
-    _ = copy.copyToUser(@ptrFromInt(msg_ptr + 40), &z8, 8);
+    const ctl_ptr: u64 = bo.readU64At(msghdr, 32);
+    const ctl_cap: usize = if (ctl_ptr == 0) 0 else @intCast(@min(bo.readU64At(msghdr, 40), 1 << 20));
+    const opts_ip = rawIpOpts(d.raw_idx);
+    var ctl_buf: [96]u8 = undefined;
+    const cm = if (@import("raw_icmp.zig").isV6(d.raw_idx))
+        ip_cmsg_policy.build6(ip_cmsg_policy.Wanted.of6(opts_ip), got_meta.v6, ctl_cap, &ctl_buf)
+    else
+        ip_cmsg_policy.build(ip_cmsg_policy.Wanted.of(opts_ip), got_meta.v4, ctl_cap, &ctl_buf);
+    if (cm.written != 0) {
+        if (ctl_ptr >= 0x0000_8000_0000_0000) return -14;
+        if (copy.copyToUser(@ptrFromInt(ctl_ptr), ctl_buf[0..cm.written], cm.written) != cm.written) return -14;
+    }
+    var cl8: [8]u8 = undefined;
+    bo.writeU64Le(&cl8, cm.written);
+    _ = copy.copyToUser(@ptrFromInt(msg_ptr + 40), &cl8, 8);
     const truncated = full > done;
     var fl: [4]u8 = undefined;
-    bo.writeU32Le(&fl, if (truncated) @as(u32, 0x20) else 0);
+    bo.writeU32Le(&fl, (if (truncated) @as(u32, 0x20) else 0) | (if (cm.truncated) @as(u32, 0x08) else 0));
     _ = copy.copyToUser(@ptrFromInt(msg_ptr + 48), &fl, 4);
     return if ((flags & 0x20) != 0) @intCast(full) else @intCast(done);
 }

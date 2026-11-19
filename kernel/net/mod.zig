@@ -49,7 +49,7 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
 
             // Linux raw_local_deliver hands each raw socket of the datagram's protocol a copy (IP header included) before the protocol
             // handler runs.
-            const raw_took = @import("raw_icmp.zig").deliver(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip);
+            const raw_took = @import("raw_icmp.zig").deliver(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip, ifindex);
             const rp = @import("raw_icmp_policy.zig");
             switch (info.protocol) {
                 ipv4.PROTO_ICMP => {
@@ -77,7 +77,7 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
             // Hop-by-hop and destination options are stepped over (ipv6_parse_hopopts, ipv6_destopt_rcv); raw sockets of each header
             // passed see the packet from that header on (ip6_protocol_deliver_rcu hands every header to raw6_local_deliver).
             const ext = rp6.walkExt6(info6.next_header, data[payload_start6 .. payload_start6 + info6.payload_len]);
-            if (info6.next_header != ext.nh) _ = raw6.deliver6(info6.next_header, data[payload_start6 .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip);
+            if (info6.next_header != ext.nh) _ = raw6.deliver6(info6.next_header, data[payload_start6 .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass);
             switch (ext.kind) {
                 .deliver => {},
                 .drop => return,
@@ -87,7 +87,7 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
             const up_start: u32 = payload_start6 + @as(u32, @intCast(ext.off));
             const up_len: u16 = info6.payload_len - @as(u16, @intCast(ext.off));
             // raw6_local_deliver: each IPv6 raw socket of the upper-layer header gets it, before the protocol handler.
-            const raw_took6 = raw6.deliver6(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip);
+            const raw_took6 = raw6.deliver6(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass);
             switch (ext.nh) {
                 ipv6.PROTO_ICMPV6 => {
                     icmpv6.handlePacket(info6.src_ip, info6.dst_ip, data + up_start, up_len);
