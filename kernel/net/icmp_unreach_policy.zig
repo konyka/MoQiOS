@@ -193,6 +193,13 @@ pub fn errorFor6(icmp_type: u8, code: u8) ?struct { errno: i32, hard: bool } {
     };
 }
 
+/// ping_err's conversion for an IPv6 ping socket (icmpv6_err_convert): as errorFor6, except packet too big is soft for ping and an
+/// error type it does not know is a soft EPROTO. Only a socket with IPV6_RECVERR takes the soft ones.
+pub fn pingErrorFor6(icmp_type: u8, code: u8) struct { errno: i32, hard: bool } {
+    if (icmp_type == 2) return .{ .errno = 90, .hard = false };
+    return if (errorFor6(icmp_type, code)) |e| .{ .errno = e.errno, .hard = e.hard } else .{ .errno = 71, .hard = false };
+}
+
 pub fn errnoFor6(icmp_type: u8, code: u8, ping: bool) i32 {
     return switch (icmp_type) {
         1 => if (code < unreach6_errno.len) (if (unreach6_errno[code].hard) unreach6_errno[code].errno else 0) else 71,

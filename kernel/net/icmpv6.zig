@@ -144,7 +144,23 @@ pub fn handlePacketMeta(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: 
                     .payload = quoted,
                 });
             },
-            .echo => @import("udp.zig").notifyPingError6(q.src_port, unreach.errnoFor6(icmp_type, icmp_code, true)),
+            // ping_err: the quoted echo request is queued for a socket with IPV6_RECVERR, soft errors included.
+            .echo => {
+                const e = unreach.pingErrorFor6(icmp_type, icmp_code);
+                const inner = unreach.skipExtHdr6(data[8..len], 40, data[8 + 6]) orelse return;
+                @import("udp.zig").notifyPingIcmpError6(q.src_port, .{
+                    .errno = e.errno,
+                    .hard = e.hard,
+                    .icmp_type = icmp_type,
+                    .icmp_code = icmp_code,
+                    .info = if (icmp_type == PACKET_TOO_BIG) bo.readU32BeAt(data, 4) else 0,
+                    .offender = src_ip,
+                    .local_port = q.src_port,
+                    .peer_port = 0,
+                    .peer_ip = q.dst,
+                    .payload = data[0..len][8 + inner.off ..],
+                }, true);
+            },
         }
         return;
     }

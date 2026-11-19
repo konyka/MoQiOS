@@ -14,7 +14,10 @@
  *   R. an error quoting an echo reply, or an echo request with code 1, is for no ping socket;
  *   V. a pending error shows as POLLERR, fails the next ping recv once (ECONNREFUSED), then EAGAIN;
  *   S. it fails the next ping send once, and SO_ERROR reads 0 afterwards;
- *   E. on UDP too: recv is EACCES for code 1, then EAGAIN; send is EPROTO for a parameter problem.
+ *   E. on UDP too: recv is EACCES for code 1, then EAGAIN; send is EPROTO for a parameter problem;
+ *   W. an unconnected IPv6 ping socket with IPV6_RECVERR (SOL_IPV6 25) queues even soft errors (ping_err → ipv6_icmp_error): address
+ *      unreachable (1/3) gives SO_ERROR 113 and recvmsg(MSG_ERRQUEUE) returns the 8 quoted echo-request bytes, msg_name [::1] port 0
+ *      (28 bytes), IPV6_RECVERR (SOL_IPV6/25) with errno 113, origin 3, type 1, code 3; packet too big (soft for ping) gives 90.
  * The test sets net.ipv4.ping_group_range to "0 0" and puts the old value back at the end. */
 #ifdef HOST
 #define _GNU_SOURCE
@@ -45,6 +48,8 @@ static long read_(long fd, char *b, int n) { return rc(read((int)fd, b, n)); }
 static long write_(long fd, const char *b, int n) { return rc(write((int)fd, b, n)); }
 static void nap(void) { struct timespec t = { 0, 20000000 }; nanosleep(&t, 0); }
 static void close_(long s) { close((int)s); }
+static long setopt_(long s, int lv, int o, int v) { return rc(setsockopt((int)s, lv, o, &v, 4)); }
+static long recvmsg_(long s, void *m, int fl) { return rc(recvmsg((int)s, m, fl)); }
 #define FAM6(a) do { unsigned short fam = AF_INET6; memcpy(a, &fam, 2); } while (0)
 #define O_WR O_WRONLY
 #else
@@ -68,6 +73,8 @@ static long read_(long fd, char *b, int n) { return syscall3(10, fd, (long)b, n)
 static long write_(long fd, const char *b, int n) { return syscall3(1, fd, (long)b, n); }
 static void nap(void) { long t[2] = { 0, 20000000 }; syscall1(104, 0); syscall2(35, (long)t, 0); }
 static void close_(long s) { syscall1(11, s); }
+static long setopt_(long s, int lv, int o, int v) { return syscall5(132, s, lv, o, (long)&v, 4); }
+static long recvmsg_(long s, void *m, int fl) { return syscall3(130, s, (long)m, fl); }
 #define FAM6(a) do { (a)[0] = 10; (a)[1] = 0; } while (0)
 #define O_WR 1
 #endif
@@ -227,6 +234,42 @@ int main(void) {
     snprintf(msg, sizeof msg, "E: UDP recv %ld then %ld; send %ld, SO_ERROR %ld (-13 -11 -71 0)", e1, e2, e3, e4);
     check(e1 == -13 && e2 == -11 && e3 == -71 && e4 == 0, msg);
     close_(u);
+
+    long pw = psock();
+    unsigned char b43[28];
+    mk6(b43, 4393, 0);
+    long pwb = bind_(pw, b43);
+    long pwo = setopt_(pw, 41, 25, 1);
+    unsigned char ew[8] = { 128, 0, 0, 0, 4393 >> 8, 4393 & 0xff, 0, 1 };
+    inject(1, 3, 58, ew, 1);
+    long we = soerr(pw);
+    struct { void *b; unsigned long n; } wio = { sink, sizeof sink };
+    unsigned char wname[32], wctl[96];
+    struct { void *name; unsigned int nl; int pad; void *iov; unsigned long iovlen; void *ctl; unsigned long ctllen; int flags; int pad2; } wm;
+    memset(&wm, 0, sizeof wm);
+    memset(wname, 0xee, sizeof wname);
+    memset(wctl, 0, sizeof wctl);
+    wm.name = wname;
+    wm.nl = sizeof wname;
+    wm.iov = &wio;
+    wm.iovlen = 1;
+    wm.ctl = wctl;
+    wm.ctllen = sizeof wctl;
+    long wr = recvmsg_(pw, &wm, 0x2000 | 0x40);
+    int werr, wlv, wty;
+    memcpy(&wlv, wctl + 8, 4);
+    memcpy(&wty, wctl + 12, 4);
+    memcpy(&werr, wctl + 16, 4);
+    int wquote = wr == 8 && memcmp(sink, ew, 8) == 0;
+    inject(2, 0, 58, ew, 1);
+    long wq = soerr(pw);
+    snprintf(msg, sizeof msg, "W: IPV6_RECVERR ping bind %ld set %ld; SO_ERROR %ld; errqueue %ld quote %d, namelen %u family %d last %d port %d, flags 0x%x, "
+             "[%d/%d] errno %d origin %d type %d code %d; packet too big SO_ERROR %ld (0 0; 113; 8 1, 28 10 1 0, 0x2000, [41/25] 113 3 1 3; 90)", pwb, pwo, we, wr,
+             wquote, wm.nl, wname[0], wname[23], (wname[2] << 8) | wname[3], wm.flags, wlv, wty, werr, wctl[20], wctl[21], wctl[22], wq);
+    check(pwb == 0 && pwo == 0 && we == 113 && wquote && wm.nl == 28 && wname[0] == 10 && wname[23] == 1 && wname[2] == 0 && wname[3] == 0 &&
+              wm.flags == 0x2000 && wlv == 41 && wty == 25 && werr == 113 && wctl[20] == 3 && wctl[21] == 1 && wctl[22] == 3 && wq == 90,
+          msg);
+    close_(pw);
     close_(raw);
 
     long back = set_range(saved);

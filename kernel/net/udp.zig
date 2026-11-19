@@ -401,14 +401,30 @@ pub fn notifyIcmpError6(e: IcmpError6) void {
 /// sockets with that ident take it as their pending error (icmpv6_err → ping_err).
 pub fn notifyPingError6(ident: u16, err: i32) void {
     if (err == 0) return;
+    notifyPingIcmpError6(ident, .{ .errno = err, .hard = true, .icmp_type = 0, .icmp_code = 0, .offender = @splat(0), .local_port = ident, .peer_port = 0, .peer_ip = @splat(0), .payload = &.{} }, false);
+}
+
+/// ping_err for the IPv6 ping sockets holding `ident`, as notifyPingIcmpError: one with IPV6_RECVERR queues the error (soft too,
+/// connected or not; the quoted echo request, msg_name its destination with port 0) and takes it as its pending error; one without
+/// takes only a hard error, and only when connected.
+pub fn notifyPingIcmpError6(ident: u16, e: IcmpError6, queue: bool) void {
     var hits: [MAX_PORTS]u32 = undefined;
     var n: usize = 0;
     {
         const saved = udp_lock.acquire();
         defer udp_lock.release(saved);
         for (0..num_ports) |i| {
-            if (!port_ping[i] or !port_v6[i] or portNumber(ports[i]) != ident or port_peer[i] == 0) continue;
-            port_err[i] = err;
+            if (!port_ping[i] or !port_v6[i] or portNumber(ports[i]) != ident) continue;
+            const r = errq.route(queue and port_opts[i].ip.recverr6, e.hard, port_peer[i] != 0);
+            if (r.queue) {
+                var ent: errq.Entry = .{ .errno = e.errno, .icmp_type = e.icmp_type, .icmp_code = e.icmp_code, .info = e.info, .offender = e.offender, .dst = e.peer_ip, .dst_port = 0, .v6 = true };
+                const k = @min(e.payload.len, errq.PAYLOAD_MAX);
+                ent.len = @intCast(k);
+                @memcpy(ent.payload[0..k], e.payload[0..k]);
+                if (!port_errq[i].push(ent)) continue;
+            }
+            if (!r.set_err) continue;
+            port_err[i] = e.errno;
             hits[n] = ports[i];
             n += 1;
         }

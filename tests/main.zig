@@ -14875,7 +14875,7 @@ test "ICMPv6 errors wiring (hello392): every error type reaches connected IPv6 U
     const pt = std.mem.indexOfPos(u8, vs, at, "if (icmp_type == PACKET_TOO_BIG) handlePacketTooBig(data, len);") orelse return error.TestUnexpectedResult;
     const q = std.mem.indexOfPos(u8, vs, pt, "const q = unreach.parseErrorQuote6(data[0..len]) orelse return;") orelse return error.TestUnexpectedResult;
     const ue = std.mem.indexOfPos(u8, vs, q, "@import(\"udp.zig\").notifyIcmpError6(.{") orelse return error.TestUnexpectedResult;
-    _ = std.mem.indexOfPos(u8, vs, ue, ".echo => @import(\"udp.zig\").notifyPingError6(q.src_port, unreach.errnoFor6(icmp_type, icmp_code, true)),") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, vs, ue, "@import(\"udp.zig\").notifyPingIcmpError6(q.src_port, .{") orelse return error.TestUnexpectedResult;
     // The error branch runs before the type switch, which no longer handles Destination Unreachable or Packet Too Big itself.
     try std.testing.expect(at < std.mem.indexOf(u8, vs, "switch (icmp_type) {").?);
     try std.testing.expect(std.mem.indexOf(u8, vs, "notifyUnreachable(") == null);
@@ -14887,8 +14887,8 @@ test "ICMPv6 errors wiring (hello392): every error type reaches connected IPv6 U
     // Without IPV6_RECVERR only a hard error on a socket connected to that peer is taken (errqueue_policy.route).
     try std.testing.expect(!kt.errqueue_policy.route(false, false, true).set_err);
     try std.testing.expect(!kt.errqueue_policy.route(false, true, false).set_err);
-    const p6 = std.mem.indexOf(u8, us, "pub fn notifyPingError6(ident: u16, err: i32) void {") orelse return error.TestUnexpectedResult;
-    _ = std.mem.indexOfPos(u8, us, p6, "if (!port_ping[i] or !port_v6[i] or portNumber(ports[i]) != ident or port_peer[i] == 0) continue;") orelse return error.TestUnexpectedResult;
+    const p6 = std.mem.indexOf(u8, us, "pub fn notifyPingIcmpError6(ident: u16, e: IcmpError6, queue: bool) void {") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, us, p6, "if (!port_ping[i] or !port_v6[i] or portNumber(ports[i]) != ident) continue;") orelse return error.TestUnexpectedResult;
     const ss = kt.socket_syscall_source;
     const ps = std.mem.indexOf(u8, ss, "fn pingSend6(d: *vfs_mod.FileDescriptor") orelse return error.TestUnexpectedResult;
     const pend = std.mem.indexOfPos(u8, ss, ps, "const pending = udp.takePendingError(d.udpKey());") orelse return error.TestUnexpectedResult;
@@ -16991,4 +16991,16 @@ test "ping sockets with IP_RECVERR queue ICMP errors, soft ones and source quenc
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "pub fn notifyPingIcmpError(ident: u16, e: IcmpError, queue: bool) void {") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "@import(\"udp.zig\").notifyPingIcmpError(q.src_port, .{") != null);
+}
+
+test "IPv6 ping sockets with IPV6_RECVERR queue ICMPv6 errors (hello392 W)" {
+    // Linux ping_err → ipv6_icmp_error: queued with IPV6_RECVERR, soft ones too; packet too big is soft for ping, an unknown type a
+    // soft EPROTO (icmpv6_err_convert).
+    const iu = kt.icmp_unreach_policy;
+    try std.testing.expect(!iu.pingErrorFor6(2, 0).hard);
+    try std.testing.expectEqual(@as(i32, 90), iu.pingErrorFor6(2, 0).errno);
+    try std.testing.expect(!iu.pingErrorFor6(1, 3).hard);
+    try std.testing.expect(iu.pingErrorFor6(1, 4).hard);
+    try std.testing.expectEqual(@as(i32, 71), iu.pingErrorFor6(100, 0).errno);
+    try std.testing.expect(!iu.pingErrorFor6(100, 0).hard);
 }
