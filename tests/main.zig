@@ -16112,7 +16112,7 @@ test "IPv4 UDP receive control messages IP_PKTINFO / IP_RECVTTL / IP_RECVTOS (he
     try std.testing.expect(std.mem.indexOf(u8, us, "pub fn handlePacketMeta(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, ifindex: u8, ttl: u8, tos: u8) void {") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketMeta(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, ifindex, info.ttl, info.tos);") != null);
     const ss = kt.socket_syscall_source;
-    try std.testing.expect(std.mem.indexOf(u8, ss, "ip_cmsg_policy.build(ip_cmsg_policy.Wanted.of(opts_ip), meta, ctl_cap, &ctl_buf);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "ip_cmsg_policy.build(ip_cmsg_policy.Wanted.of(opts_ip).withStamp(sol_flags), meta, ctl_cap, &ctl_buf);") != null);
 }
 
 test "IPv6 UDP receive control messages IPV6_RECVPKTINFO / IPV6_RECVHOPLIMIT / IPV6_RECVTCLASS (hello422): Linux ip6_datagram_recv_*_ctl" {
@@ -16150,7 +16150,7 @@ test "IPv6 UDP receive control messages IPV6_RECVPKTINFO / IPV6_RECVHOPLIMIT / I
 
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "pub fn handlePacketV6Meta(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32, ifindex: u8, hops: u8, tclass: u8) void {") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketV6Meta(info6.src_ip, info6.dst_ip, data + up_start, up_len, ifindex, info6.hop_limit, info6.tclass);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "ip_cmsg_policy.build6(ip_cmsg_policy.Wanted.of6(opts_ip), meta6, ctl_cap, &ctl_buf)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "ip_cmsg_policy.build6(ip_cmsg_policy.Wanted.of6(opts_ip).withStamp(sol_flags), meta6, ctl_cap, &ctl_buf)") != null);
 }
 
 test "IPv4 UDP sendmsg control messages IP_TTL / IP_TOS / IP_PKTINFO (hello423): Linux udp_cmsg_send, ip_cmsg_send, __sock_cmsg_send" {
@@ -16851,4 +16851,33 @@ test "TCP urgent data: the mark, recv(MSG_OOB), POLLPRI and exceptfds (hello443)
     try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "pkt[tcp_off + 18] = 0;") == null);
     try std.testing.expect(std.mem.indexOf(u8, kt.ioctl_source, "SIOCATMARK => {") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "tcpSendOobBlocking(") != null);
+}
+
+test "receive timestamps and the original destination as control messages (hello444)" {
+    // Linux __sock_set_timestamps: SO_TIMESTAMP / SO_TIMESTAMPNS replace each other; __sock_recv_timestamp puts the stamp first;
+    // ip_cmsg_recv_dstaddr writes a sockaddr_in. The kernel used to answer ENOPROTOOPT for all four options.
+    const sp = kt.sockopt_policy;
+    var st: sp.Stored = .{};
+    try std.testing.expectEqual(@as(i64, 0), sp.applySet(&st, sp.SO_TIMESTAMP, &.{ 1, 0, 0, 0 }));
+    try std.testing.expectEqual(@as(u32, 1), sp.timestampValue(st.flags, sp.SO_TIMESTAMP));
+    try std.testing.expectEqual(@as(i64, 0), sp.applySet(&st, sp.SO_TIMESTAMPNS, &.{ 1, 0, 0, 0 }));
+    try std.testing.expectEqual(@as(u32, 0), sp.timestampValue(st.flags, sp.SO_TIMESTAMP));
+    try std.testing.expectEqual(@as(u32, 1), sp.timestampValue(st.flags, sp.SO_TIMESTAMPNS));
+    try std.testing.expectEqual(@as(i64, -22), sp.applySet(&st, sp.SO_TIMESTAMP, &.{ 1, 0 }));
+    const ipo = kt.ip_opt_policy;
+    const set = ipo.applySet(.{}, ipo.SOL_IP, ipo.IP_RECVORIGDSTADDR, &.{ 1, 0, 0, 0 });
+    try std.testing.expect(set == .ok and set.ok.origdst);
+    try std.testing.expectEqual(@as(?i32, 1), ipo.getValue(set.ok, ipo.SOL_IP, ipo.IP_RECVORIGDSTADDR));
+    const cm = kt.ip_cmsg_policy;
+    var out: [192]u8 = undefined;
+    const w = cm.Wanted.of(set.ok).withStamp(st.flags);
+    const b = cm.build(w, .{ .dst = .{ 127, 0, 0, 1 }, .dst_port = 47441, .stamp_ns = 5_000_000_123 }, 256, &out);
+    try std.testing.expectEqual(@as(usize, 64), b.written);
+    try std.testing.expectEqual(@as(i32, 35), std.mem.readInt(i32, out[12..16], .little));
+    try std.testing.expectEqual(@as(i64, 5), std.mem.readInt(i64, out[16..24], .little));
+    try std.testing.expectEqual(@as(i64, 123), std.mem.readInt(i64, out[24..32], .little));
+    try std.testing.expectEqual(@as(i32, 20), std.mem.readInt(i32, out[44..48], .little));
+    try std.testing.expectEqual(@as(u16, 47441), std.mem.readInt(u16, out[50..52], .big));
+    const cut = cm.build(w, .{ .stamp_ns = 1 }, 20, &out);
+    try std.testing.expect(cut.truncated and cut.written == 20);
 }

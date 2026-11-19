@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello443`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello444`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -438,6 +438,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello441 | F_SETPIPE_SZ：1、5000、100000 分别取整为 4096、8192、131072（A）；131072 的管道一次写入并读回 100000 字节（B）；排队 60000 字节时缩到 4096 是 EBUSY，缩到 65536 成功（C）；无特权设 2 MiB 是 EPERM（D） |
 | hello442 | signalfd：sizemask、flags、非 signalfd 描述符的 EINVAL 与 SFD_CLOEXEC（A）；kill 后 poll 报 POLLIN、读出 signalfd_siginfo（signo、code、pid）并出队（B）；一次读出多条记录，实时信号按排队顺序带值（C）；换 mask 后只读到新 mask 里的信号（D） |
 | hello443 | TCP 紧急数据：MSG_OOB 发送、SIGURG、POLLPRI、select 异常集、SIOCATMARK、FIONREAD（A）；MSG_OOB|MSG_PEEK 与 MSG_OOB 读出紧急字节、再读 EINVAL、普通读跳过它（B）；标记之后的数据和 EAGAIN（C）；普通读停在标记前（D）；SO_OOBINLINE（E）；UDP 的 EOPNOTSUPP 与管道的 ENOTTY（F） |
+| hello444 | 接收控制消息：SO_TIMESTAMP 和 IP_RECVORIGDSTADDR 的设置与读回（A）；SCM_TIMESTAMP 在前、IP_ORIGDSTADDR 在后（B）；SO_TIMESTAMPNS 替换 SO_TIMESTAMP（C）；小缓冲区的 MSG_CTRUNC（D）；IPv6 的 IPV6_ORIGDSTADDR（E） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

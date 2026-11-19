@@ -1989,12 +1989,14 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
     // Control messages (ip_cmsg_recv_offset for IPv4, ip6_datagram_recv_ctl for IPv6), then msg_controllen and msg_flags.
     const ctl_ptr: u64 = bo.readU64At(msghdr, 32);
     const ctl_cap: usize = if (ctl_ptr == 0) 0 else @intCast(@min(bo.readU64At(msghdr, 40), 1 << 20));
-    const opts_ip: ip_opt_policy.IpOpts = if (udp.getPortOpts(port)) |po| po.ip else .{};
-    var ctl_buf: [96]u8 = undefined;
+    const port_opts = udp.getPortOpts(port);
+    const opts_ip: ip_opt_policy.IpOpts = if (port_opts) |po| po.ip else .{};
+    const sol_flags: u16 = if (port_opts) |po| po.flags else 0;
+    var ctl_buf: [192]u8 = undefined;
     const cm = if (is_v6)
-        ip_cmsg_policy.build6(ip_cmsg_policy.Wanted.of6(opts_ip), meta6, ctl_cap, &ctl_buf)
+        ip_cmsg_policy.build6(ip_cmsg_policy.Wanted.of6(opts_ip).withStamp(sol_flags), meta6, ctl_cap, &ctl_buf)
     else
-        ip_cmsg_policy.build(ip_cmsg_policy.Wanted.of(opts_ip), meta, ctl_cap, &ctl_buf);
+        ip_cmsg_policy.build(ip_cmsg_policy.Wanted.of(opts_ip).withStamp(sol_flags), meta, ctl_cap, &ctl_buf);
     if (cm.written != 0) {
         if (ctl_ptr >= 0x0000_8000_0000_0000) return -14;
         if (copy.copyToUser(@ptrFromInt(ctl_ptr), ctl_buf[0..cm.written], cm.written) != cm.written) return -14;
@@ -2090,7 +2092,7 @@ fn rawRecvmsg(d: *vfs_mod.FileDescriptor, msg_ptr: u64, msghdr: *const [56]u8, f
     const ctl_ptr: u64 = bo.readU64At(msghdr, 32);
     const ctl_cap: usize = if (ctl_ptr == 0) 0 else @intCast(@min(bo.readU64At(msghdr, 40), 1 << 20));
     const opts_ip = rawIpOpts(d.raw_idx);
-    var ctl_buf: [96]u8 = undefined;
+    var ctl_buf: [192]u8 = undefined;
     const cm = if (@import("raw_icmp.zig").isV6(d.raw_idx))
         ip_cmsg_policy.build6(ip_cmsg_policy.Wanted.of6(opts_ip), got_meta.v6, ctl_cap, &ctl_buf)
     else

@@ -16,22 +16,51 @@ pub const RecvInfo = struct {
     spec_dst: ?[4]u8 = null,
     ttl: u8 = 0,
     tos: u8 = 0,
+    /// The datagram's destination port (IP_ORIGDSTADDR) and its arrival time on the real-time clock (SO_TIMESTAMP*), in ns.
+    dst_port: u16 = 0,
+    stamp_ns: u64 = 0,
 };
+
+/// Receive timestamps a socket asked for (SO_TIMESTAMP: struct timeval, SO_TIMESTAMPNS: struct timespec).
+pub const Stamp = enum { none, micro, nano };
 
 pub const Wanted = struct {
     pktinfo: bool = false,
     recvttl: bool = false,
     recvtos: bool = false,
+    origdst: bool = false,
+    stamp: Stamp = .none,
 
     pub fn of(o: ipo.IpOpts) Wanted {
-        return .{ .pktinfo = o.pktinfo, .recvttl = o.recvttl, .recvtos = o.recvtos };
+        return .{ .pktinfo = o.pktinfo, .recvttl = o.recvttl, .recvtos = o.recvtos, .origdst = o.origdst };
     }
 
-    /// The IPv6 flags in the same slots: IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVTCLASS.
+    /// The IPv6 flags in the same slots: IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVTCLASS, IPV6_RECVORIGDSTADDR.
     pub fn of6(o: ipo.IpOpts) Wanted {
-        return .{ .pktinfo = o.pktinfo6, .recvttl = o.recvhops6, .recvtos = o.recvtclass6 };
+        return .{ .pktinfo = o.pktinfo6, .recvttl = o.recvhops6, .recvtos = o.recvtclass6, .origdst = o.origdst6 };
+    }
+
+    /// `of` / `of6` plus the SOL_SOCKET timestamp flags (sockopt_policy.TS_FLAG / TSNS_FLAG in Stored.flags).
+    pub fn withStamp(self: Wanted, sol_flags: u16) Wanted {
+        var w = self;
+        w.stamp = if (sol_flags & 128 == 0) .none else if (sol_flags & 256 != 0) .nano else .micro;
+        return w;
     }
 };
+
+const SOL_SOCKET: i32 = 1;
+const SO_TIMESTAMP: i32 = 29;
+const SO_TIMESTAMPNS: i32 = 35;
+
+/// __sock_recv_timestamp: SCM_TIMESTAMP (struct timeval) or SCM_TIMESTAMPNS (struct timespec) first, at SOL_SOCKET.
+fn putStamp(out: []u8, used: *usize, cap: usize, stamp: Stamp, ns: u64, truncated: *bool) void {
+    if (stamp == .none) return;
+    var t: [16]u8 = undefined;
+    std.mem.writeInt(i64, t[0..8], @intCast(ns / std.time.ns_per_s), .little);
+    const frac = ns % std.time.ns_per_s;
+    std.mem.writeInt(i64, t[8..16], @intCast(if (stamp == .nano) frac else frac / 1000), .little);
+    put(out, used, cap, SOL_SOCKET, if (stamp == .nano) SO_TIMESTAMPNS else SO_TIMESTAMP, &t, truncated);
+}
 
 /// What an IPv6 datagram brings with it: the interface it arrived on, the header destination, hop limit and traffic class.
 pub const RecvInfo6 = struct {
@@ -39,6 +68,8 @@ pub const RecvInfo6 = struct {
     dst: [16]u8 = @splat(0),
     hops: u8 = 0,
     tclass: u8 = 0,
+    dst_port: u16 = 0,
+    stamp_ns: u64 = 0,
 };
 
 pub const Built = struct {
@@ -72,11 +103,12 @@ fn put(out: []u8, used: *usize, cap: usize, level: i32, typ: i32, data: []const 
     used.* += space;
 }
 
-/// Lay out the wanted messages for `info` in a control buffer of `cap` bytes (`out` holds at least min(cap, 80) bytes).
+/// Lay out the wanted messages for `info` in a control buffer of `cap` bytes (`out` holds at least min(cap, 144) bytes).
 pub fn build(w: Wanted, info: RecvInfo, cap_in: usize, out: []u8) Built {
     const cap = @min(cap_in, out.len);
     var used: usize = 0;
     var truncated = false;
+    putStamp(out, &used, cap, w.stamp, info.stamp_ns, &truncated);
     if (w.pktinfo) {
         var pi: [12]u8 = undefined;
         std.mem.writeInt(i32, pi[0..4], info.ifindex, .little);
@@ -90,16 +122,25 @@ pub fn build(w: Wanted, info: RecvInfo, cap_in: usize, out: []u8) Built {
         put(out, &used, cap, @intCast(ipo.SOL_IP), @intCast(ipo.IP_TTL), &t, &truncated);
     }
     if (w.recvtos) put(out, &used, cap, @intCast(ipo.SOL_IP), @intCast(ipo.IP_TOS), &.{info.tos}, &truncated);
+    if (w.origdst) {
+        // ip_cmsg_recv_dstaddr: a struct sockaddr_in of the header destination and the UDP destination port.
+        var sa: [16]u8 = @splat(0);
+        sa[0] = 2;
+        std.mem.writeInt(u16, sa[2..4], info.dst_port, .big);
+        @memcpy(sa[4..8], &info.dst);
+        put(out, &used, cap, @intCast(ipo.SOL_IP), @intCast(ipo.IP_RECVORIGDSTADDR), &sa, &truncated);
+    }
     return .{ .written = used, .truncated = truncated };
 }
 
 /// ip6_datagram_recv_common_ctl then _specific_ctl: IPV6_PKTINFO (struct in6_pktinfo: in6_addr, then int ifindex), IPV6_HOPLIMIT
-/// (int), IPV6_TCLASS (int), in that order (`out` holds at least min(cap, 88) bytes).
+/// (int), IPV6_TCLASS (int), then IPV6_ORIGDSTADDR, after the timestamp (`out` holds at least min(cap, 160) bytes).
 pub fn build6(w: Wanted, info: RecvInfo6, cap_in: usize, out: []u8) Built {
     const cap = @min(cap_in, out.len);
     var used: usize = 0;
     var truncated = false;
     const lv: i32 = @intCast(ipo.SOL_IPV6);
+    putStamp(out, &used, cap, w.stamp, info.stamp_ns, &truncated);
     if (w.pktinfo) {
         var pi: [20]u8 = undefined;
         @memcpy(pi[0..16], &info.dst);
@@ -115,6 +156,14 @@ pub fn build6(w: Wanted, info: RecvInfo6, cap_in: usize, out: []u8) Built {
         var t: [4]u8 = undefined;
         std.mem.writeInt(i32, &t, info.tclass, .little);
         put(out, &used, cap, lv, @intCast(ipo.IPV6_TCLASS), &t, &truncated);
+    }
+    if (w.origdst) {
+        // A struct sockaddr_in6 (family, port, flowinfo 0, address, scope 0), after the other IPv6 messages.
+        var sa: [28]u8 = @splat(0);
+        sa[0] = 10;
+        std.mem.writeInt(u16, sa[2..4], info.dst_port, .big);
+        @memcpy(sa[8..24], &info.dst);
+        put(out, &used, cap, lv, @intCast(ipo.IPV6_RECVORIGDSTADDR), &sa, &truncated);
     }
     return .{ .written = used, .truncated = truncated };
 }

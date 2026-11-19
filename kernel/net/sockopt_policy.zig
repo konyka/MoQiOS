@@ -25,6 +25,13 @@ pub const SO_SNDLOWAT: u64 = 19;
 pub const SO_RCVTIMEO: u64 = 20;
 pub const SO_SNDTIMEO: u64 = 21;
 pub const SO_BINDTODEVICE: u64 = 25;
+/// Receive timestamps (Linux SOCK_RCVTSTAMP / SOCK_RCVTSTAMPNS): recvmsg then brings an SCM_TIMESTAMP struct timeval or an
+/// SCM_TIMESTAMPNS struct timespec (the message type is the option number).
+pub const SO_TIMESTAMP: u64 = 29;
+pub const SO_TIMESTAMPNS: u64 = 35;
+/// Flag bits of the two in Stored.flags.
+pub const TS_FLAG: u16 = 128;
+pub const TSNS_FLAG: u16 = 256;
 pub const SO_ACCEPTCONN: u64 = 30;
 pub const SO_MARK: u64 = 36;
 pub const SO_PROTOCOL: u64 = 38;
@@ -70,7 +77,7 @@ pub fn readOnly(optname: u64) bool {
 
 /// Options kept in Stored fields that are not plain flag bits.
 pub fn storedOnly(optname: u64) bool {
-    return optname == SO_PRIORITY or optname == SO_MARK or optname == SO_BINDTODEVICE;
+    return optname == SO_PRIORITY or optname == SO_MARK or optname == SO_BINDTODEVICE or optname == SO_TIMESTAMP or optname == SO_TIMESTAMPNS;
 }
 
 /// Flag bit for a boolean option, or null.
@@ -203,8 +210,27 @@ pub fn applySetPriv(s: *Stored, optname: u64, val: []const u8, net_admin: bool, 
     }
 }
 
+/// __sock_set_timestamps: SO_TIMESTAMP on sets RCVTSTAMP and clears RCVTSTAMPNS, SO_TIMESTAMPNS on sets both; either off clears both.
+pub fn setTimestamp(flags: u16, optname: u64, on: bool) u16 {
+    var f = flags & ~(TS_FLAG | TSNS_FLAG);
+    if (on) f |= TS_FLAG | (if (optname == SO_TIMESTAMPNS) TSNS_FLAG else 0);
+    return f;
+}
+
+/// getsockopt: SO_TIMESTAMP reads 1 only for microsecond stamps, SO_TIMESTAMPNS for nanosecond ones.
+pub fn timestampValue(flags: u16, optname: u64) u32 {
+    const ns = flags & TSNS_FLAG != 0;
+    if (flags & TS_FLAG == 0) return 0;
+    return @intFromBool(if (optname == SO_TIMESTAMPNS) ns else !ns);
+}
+
 pub fn applySet(s: *Stored, optname: u64, val: []const u8) i64 {
     if (readOnly(optname)) return -92; // ENOPROTOOPT
+    if (optname == SO_TIMESTAMP or optname == SO_TIMESTAMPNS) {
+        if (val.len < 4) return -22;
+        s.flags = setTimestamp(s.flags, optname, rd32(val) != 0);
+        return 0;
+    }
     if (flagBit(optname)) |bit| {
         if (val.len < 4) return -22;
         if (rd32(val) != 0) s.flags |= bit else s.flags &= ~bit;
@@ -255,6 +281,7 @@ pub fn encodeGet(s: Stored, f: Facts, optname: u64, out: *[16]u8) ?usize {
         }
     };
     if (flagBit(optname)) |bit| return put.int(out, if (s.flags & bit != 0) 1 else 0);
+    if (optname == SO_TIMESTAMP or optname == SO_TIMESTAMPNS) return put.int(out, timestampValue(s.flags, optname));
     switch (optname) {
         SO_TYPE => return put.int(out, f.id.sock_type),
         SO_DOMAIN => return put.int(out, f.id.domain),

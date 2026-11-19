@@ -835,6 +835,22 @@ pub fn nextDatagramLen(port: u32, is_v6: bool) u32 {
 /// Sockets sharing the port (SO_REUSEADDR / SO_REUSEPORT) are told apart by udp_port_policy.pickReceiver.
 /// Candidates are the sockets bound to the destination address (`dst_ip` for IPv4, `dst_ip6` for an IPv6 datagram to an IPv6
 /// socket), else the wildcard ones, each preferring the datagram's address family. Returns whether any socket claims the datagram (false: ICMP port unreachable).
+/// A datagram's control-message facts with its destination port (IP_ORIGDSTADDR) and the real-time clock when it was queued
+/// (SO_TIMESTAMP: Linux stamps the skb when it is received).
+fn stamped(meta: ip_cmsg_policy.RecvInfo, dst_port: u16) ip_cmsg_policy.RecvInfo {
+    var m = meta;
+    m.dst_port = dst_port;
+    m.stamp_ns = @import("../proc/time_syscall.zig").wallClockNanos();
+    return m;
+}
+
+fn stamped6(meta6: ip_cmsg_policy.RecvInfo6, dst_port: u16) ip_cmsg_policy.RecvInfo6 {
+    var m = meta6;
+    m.dst_port = dst_port;
+    m.stamp_ns = @import("../proc/time_syscall.zig").wallClockNanos();
+    return m;
+}
+
 fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, dst_ip: [4]u8, dst_ip6: [16]u8, payload: []const u8, is_v6: bool, meta: ip_cmsg_policy.RecvInfo, meta6: ip_cmsg_policy.RecvInfo6) bool {
     var notify_key: u32 = 0;
     var claimed = false;
@@ -876,8 +892,8 @@ fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, dst_ip: [4]u
                 queues[port_idx][i].data_len = @intCast(actual);
                 @memcpy(queues[port_idx][i].data[0..actual], payload[0..actual]);
                 queues[port_idx][i].is_v6 = is_v6;
-                queues[port_idx][i].meta = meta;
-                queues[port_idx][i].meta6 = meta6;
+                queues[port_idx][i].meta = stamped(meta, dst_port);
+                queues[port_idx][i].meta6 = stamped6(meta6, dst_port);
                 queues[port_idx][i].valid = true;
                 notify_key = ports[port_idx];
                 break :blk true;
@@ -925,7 +941,7 @@ fn enqueueMcast(port: u16, src_ip: [16]u8, src_port: u16, group: [16]u8, payload
                 @memcpy(e.data[0..actual], payload[0..actual]);
                 e.is_v6 = true;
                 e.meta = .{};
-                e.meta6 = meta6;
+                e.meta6 = stamped6(meta6, port);
                 e.valid = true;
                 keys[n] = ports[i];
                 n += 1;
@@ -964,7 +980,7 @@ fn enqueueMcast4(port: u16, src_ip: [16]u8, src_port: u16, group: [4]u8, payload
                 e.data_len = @intCast(actual);
                 @memcpy(e.data[0..actual], payload[0..actual]);
                 e.is_v6 = false;
-                e.meta = meta;
+                e.meta = stamped(meta, port);
                 e.valid = true;
                 keys[n] = ports[i];
                 n += 1;
