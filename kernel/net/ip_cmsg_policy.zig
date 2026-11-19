@@ -115,3 +115,156 @@ pub fn build6(w: Wanted, info: RecvInfo6, cap_in: usize, out: []u8) Built {
     }
     return .{ .written = used, .truncated = truncated };
 }
+
+/// Who may use the privileged SOL_SOCKET send messages (SO_MARK, SO_PRIORITY above TC_PRIO_INTERACTIVE).
+pub const SendCaps = struct {
+    net_admin: bool = false,
+    net_raw: bool = false,
+};
+
+/// What the control messages of one IPv4 UDP sendmsg change for that datagram (Linux struct ipcm_cookie): IP_TTL and IP_TOS
+/// replace the socket's values; IP_PKTINFO names the source address (ipi_spec_dst, 0 to let the stack choose, replacing the bound
+/// one) and the outgoing interface (ipi_ifindex, 0 for none).
+pub const Send4 = struct {
+    ttl: ?u8 = null,
+    tos: ?u8 = null,
+    pktinfo: bool = false,
+    oif: u32 = 0,
+    spec_dst: [4]u8 = .{ 0, 0, 0, 0 },
+};
+
+pub const SOL_UDP: i32 = 17;
+pub const UDP_SEGMENT: i32 = 103;
+const IP_RETOPTS: i32 = 7;
+const IP_PROTOCOL: i32 = 52;
+const SO_PRIORITY: i32 = 12;
+const SO_MARK: i32 = 36;
+const SO_TIMESTAMPING_OLD: i32 = 37;
+const SO_TIMESTAMPING_NEW: i32 = 65;
+const SCM_TXTIME: i32 = 61;
+const SCM_DEVMEM_DMABUF: i32 = 79;
+const SCM_TS_OPT_ID: i32 = 81;
+/// SOF_TIMESTAMPING_TX_HARDWARE | _TX_SOFTWARE | _TX_SCHED | _TX_ACK | _TX_COMPLETION.
+const TX_RECORD_MASK: u32 = 1 | 2 | (1 << 8) | (1 << 9) | (1 << 18);
+/// TC_PRIO_INTERACTIVE: the highest SO_PRIORITY anyone may ask for.
+const TC_PRIO_INTERACTIVE: u32 = 6;
+
+const Cmsg = struct { len: usize, level: i32, typ: i32, data: []const u8 };
+
+/// for_each_cmsghdr with CMSG_OK: the message at `off`, or null at the end (fewer than a header's bytes left); error.Invalid when
+/// cmsg_len is shorter than the header or runs past the buffer.
+fn cmsgAt(control: []const u8, off: usize) error{Invalid}!?Cmsg {
+    if (off + scm.HDR > control.len) return null;
+    const len = std.mem.readInt(u64, control[off..][0..8], .little);
+    if (len < scm.HDR or len > control.len - off) return error.Invalid;
+    const l: usize = @intCast(len);
+    return .{
+        .len = l,
+        .level = std.mem.readInt(i32, control[off + 8 ..][0..4], .little),
+        .typ = std.mem.readInt(i32, control[off + 12 ..][0..4], .little),
+        .data = control[off + scm.HDR .. off + l],
+    };
+}
+
+fn nextOff(off: usize, len: usize) usize {
+    return off + ((len + 7) & ~@as(usize, 7));
+}
+
+fn readU32(d: []const u8) u32 {
+    return std.mem.readInt(u32, d[0..4], .little);
+}
+
+/// __sock_cmsg_send for a UDP socket with no SO_TXTIME and no SOF_TIMESTAMPING_OPT_ID: 0 or -errno.
+fn sockCmsg(m: Cmsg, caps: SendCaps) i64 {
+    const privileged = caps.net_admin or caps.net_raw;
+    switch (m.typ) {
+        SO_MARK => {
+            if (!privileged) return -1;
+            if (m.data.len != 4) return -22;
+        },
+        SO_TIMESTAMPING_OLD, SO_TIMESTAMPING_NEW => {
+            if (m.data.len != 4) return -22;
+            if (readU32(m.data) & ~TX_RECORD_MASK != 0) return -22;
+        },
+        SCM_TXTIME, SCM_TS_OPT_ID => return -22,
+        scm.SCM_RIGHTS, scm.SCM_CREDENTIALS => {},
+        SO_PRIORITY => {
+            if (m.data.len != 4) return -22;
+            if (readU32(m.data) > TC_PRIO_INTERACTIVE and !privileged) return -1;
+        },
+        SCM_DEVMEM_DMABUF => if (m.data.len != 4) return -22,
+        else => return -22,
+    }
+    return 0;
+}
+
+/// The control messages of an IPv4 UDP sendmsg (Linux udp_cmsg_send, then ip_cmsg_send with allow_ipv6 false): every SOL_UDP message
+/// is checked first (only a 2-byte UDP_SEGMENT is valid), then the rest in order. Other levels are skipped; at SOL_IP an unknown type
+/// is EINVAL, as is any malformed message. IP options (IP_RETOPTS) are not supported beyond an empty list.
+pub fn parseSend4(control: []const u8, caps: SendCaps) union(enum) { ok: Send4, err: i64 } {
+    var off: usize = 0;
+    var need_ip = false;
+    while (cmsgAt(control, off) catch return .{ .err = -22 }) |m| : (off = nextOff(off, m.len)) {
+        if (m.level != SOL_UDP) {
+            need_ip = true;
+            continue;
+        }
+        if (m.typ != UDP_SEGMENT or m.data.len != 2) return .{ .err = -22 };
+    }
+    var out: Send4 = .{};
+    if (!need_ip) return .{ .ok = out };
+    off = 0;
+    while (cmsgAt(control, off) catch return .{ .err = -22 }) |m| : (off = nextOff(off, m.len)) {
+        if (m.level == scm.SOL_SOCKET) {
+            const rc = sockCmsg(m, caps);
+            if (rc != 0) return .{ .err = rc };
+            continue;
+        }
+        if (m.level != @as(i32, @intCast(ipo.SOL_IP))) continue;
+        switch (m.typ) {
+            IP_RETOPTS => if (m.data.len != 0) return .{ .err = -22 },
+            @as(i32, @intCast(ipo.IP_PKTINFO)) => {
+                if (m.data.len != 12) return .{ .err = -22 };
+                out.pktinfo = true;
+                const ifx = readU32(m.data[0..4]);
+                if (ifx != 0) out.oif = ifx;
+                out.spec_dst = m.data[4..8].*;
+            },
+            @as(i32, @intCast(ipo.IP_TTL)) => {
+                if (m.data.len != 4) return .{ .err = -22 };
+                const v: i32 = @bitCast(readU32(m.data));
+                if (v < 1 or v > 255) return .{ .err = -22 };
+                out.ttl = @intCast(v);
+            },
+            @as(i32, @intCast(ipo.IP_TOS)) => {
+                const v: i32 = if (m.data.len == 4) @bitCast(readU32(m.data)) else if (m.data.len == 1) m.data[0] else return .{ .err = -22 };
+                if (v < 0 or v > 255) return .{ .err = -22 };
+                out.tos = @intCast(v);
+            },
+            IP_PROTOCOL => {
+                if (m.data.len != 4) return .{ .err = -22 };
+                const v: i32 = @bitCast(readU32(m.data));
+                if (v < 1 or v > 255) return .{ .err = -22 };
+            },
+            else => return .{ .err = -22 },
+        }
+    }
+    return .{ .ok = out };
+}
+
+/// IP_PKTINFO's ipi_spec_dst as the source address (ip_route_output_key_hash_rcu): 0 lets the stack choose; a group, the limited
+/// broadcast or a 0.x.y.z address is EINVAL; otherwise it must be an address of this host (127/8, or `our` while the NIC is up),
+/// else ENETUNREACH.
+pub fn sourceErrno4(spec: [4]u8, our: [4]u8, nic_active: bool) i64 {
+    if (@as(u32, @bitCast(spec)) == 0) return 0;
+    if ((spec[0] >= 224 and spec[0] <= 239) or @as(u32, @bitCast(spec)) == 0xffff_ffff or spec[0] == 0) return -22;
+    if (spec[0] == 127) return 0;
+    if (nic_active and @as(u32, @bitCast(spec)) == @as(u32, @bitCast(our))) return 0;
+    return -101;
+}
+
+/// IP_PKTINFO's ipi_ifindex: 0 (none), lo (1) or the NIC (2) while it is up; any other index is ENODEV.
+pub fn oifErrno4(oif: u32, nic_active: bool) i64 {
+    if (oif == 0 or oif == 1 or (oif == 2 and nic_active)) return 0;
+    return -19;
+}

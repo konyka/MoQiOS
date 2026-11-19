@@ -1191,9 +1191,17 @@ pub fn sendTo(dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, da
 /// (0.0.0.0 when unbound): the source address follows tcp_port_policy.sourceAddr, so a loopback datagram leaves from the bound
 /// loopback address or else 127.0.0.1. The IP options are that socket's own, also when other sockets share its port.
 pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, data: [*]const u8, data_len: u16) bool {
+    return sendToFromOv(bound, dst_ip, dst_port, src_key, data, data_len, null, null);
+}
+
+/// sendToFrom with sendmsg's IP_TTL / IP_TOS control messages: `ttl_ov` and `tos_ov` replace the socket's values for this datagram
+/// (Linux cork->ttl / cork->tos; the TTL replaces IP_MULTICAST_TTL too, and the TOS is the whole byte, ECN bits included).
+pub fn sendToFromOv(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, data: [*]const u8, data_len: u16, ttl_ov: ?u8, tos_ov: ?u8) bool {
     if (data_len > MAX_UDP_PAYLOAD) return false;
     const src_port = portNumber(src_key);
-    const opts4: ip_opt_policy.IpOpts = if (getPortOpts(src_key)) |po| po.ip else .{};
+    var opts4: ip_opt_policy.IpOpts = if (getPortOpts(src_key)) |po| po.ip else .{};
+    if (ttl_ov) |v| opts4.ttl = v;
+    if (tos_ov) |v| opts4.tos = v;
 
     const our_mac = netif.getMac();
     // F2: 127.0.0.0/8 goes to the loopback device — no ARP, no hardware NIC.
@@ -1250,7 +1258,7 @@ pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, data
     ipv4.setIdent(send_pkt[14..].ptr, takePortIpid(src_key, dst_ip, our_ip, opts4.pmtudisc), ip_opt_policy.datagramDf(opts4.pmtudisc));
     if (ip_opt_policy.ipv4NeedsPatch(opts4)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], opts4, ipv4.checksum);
     // A datagram to a group carries IP_MULTICAST_TTL (default 1), not the unicast TTL.
-    if (group) ip_opt_policy.setTtl4(send_pkt[14..][0..20], opts4.mc4_ttl, ipv4.checksum);
+    if (group) ip_opt_policy.setTtl4(send_pkt[14..][0..20], ttl_ov orelse opts4.mc4_ttl, ipv4.checksum);
 
     // Build ethernet frame
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, 20 + udp_total);

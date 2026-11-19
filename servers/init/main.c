@@ -539,6 +539,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello420"); /* TCP_NOTSENT_LOWAT: a window update wakes the writer */
     run_test("hello421"); /* IPv4 UDP receive control messages */
     run_test("hello422"); /* IPv6 UDP receive control messages */
+    run_test("hello423"); /* IPv4 UDP sendmsg control messages */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

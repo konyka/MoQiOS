@@ -4629,7 +4629,7 @@ test "IPv4 UDP multicast: IP_MULTICAST_* options, group membership, member-only 
     try std.testing.expect(std.mem.indexOf(u8, us, "    if (mcast.isMulticast4(dst_ip)) {\n        enqueueMcast4(hdr.dst_port, ip16, hdr.src_port, dst_ip, data[8..][0..actual_payload], ifindex, meta);\n        return;\n    }\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "        if (!mcast.alwaysJoined4(group) and !hostJoined4Locked(group, ifindex)) return;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "            if (!mcast.socketAccepts4(&port_mc4[i], port_opts[i].ip.mc4_all, group, ifindex)) continue;\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "    if (group) ip_opt_policy.setTtl4(send_pkt[14..][0..20], opts4.mc4_ttl, ipv4.checksum);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    if (group) ip_opt_policy.setTtl4(send_pkt[14..][0..20], ttl_ov orelse opts4.mc4_ttl, ipv4.checksum);\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    if (group and !via_lo and opts4.mc4_loop and (mcast.alwaysJoined4(dst_ip) or hostJoined4(dst_ip, out_if))) _ = lo.sendPacketOn(&send_pkt, frame_len, out_if);\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    else if (group)\n        mcast.multicastMac4(dst_ip)\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    port_mc4[ni] = port_mc4[oi];\n") != null);
@@ -4684,7 +4684,7 @@ test "multicast outgoing interface: IP_MULTICAST_IF lo sends out lo only, IPV6_M
     try std.testing.expect(std.mem.indexOf(u8, us, "    const ok = if (via_lo) lo.sendNow(&send_pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    const our_ip = if (mcast.multicastSource4(group, bound, opts4.mc4_addr)) |a| a else ") != null);
     // Options come from the sending socket's own registry key, not from whichever socket first holds the port.
-    try std.testing.expect(std.mem.indexOf(u8, us, "    const opts4: ip_opt_policy.IpOpts = if (getPortOpts(src_key)) |po| po.ip else .{};\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    var opts4: ip_opt_policy.IpOpts = if (getPortOpts(src_key)) |po| po.ip else .{};\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    const opts: ip_opt_policy.IpOpts = if (getPortOpts(src_key)) |po| po.ip else .{};\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "getPortOpts(src_port)") == null);
     const ss = kt.socket_syscall_source;
@@ -5429,7 +5429,8 @@ test "a UDP socket keeps its bound IPv4 address: getsockname and the datagram so
     try std.testing.expect(std.mem.indexOf(u8, ss, "        return udpRebind(t, fd, new_port, .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] }, @splat(0), 0);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "    if (rc != 0) return rc;\n    d.udp_local_ip = addr;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "const our4 = net_mod.tcp_port_policy.nameAddr(desc.udp_local_ip, desc.udp_connected, desc.udp_dst_ip, netif.getOurIp());") != null);
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "udp.sendToFrom("));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "udp.sendToFrom("));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "udp.sendToFromOv("));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ss, "udp.sendTo("));
     const p = kt.tcp_port_policy;
     try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, p.nameAddr(.{ 0, 0, 0, 0 }, false, .{ 0, 0, 0, 0 }, .{ 10, 0, 2, 15 }));
@@ -16161,4 +16162,102 @@ test "IPv6 UDP receive control messages IPV6_RECVPKTINFO / IPV6_RECVHOPLIMIT / I
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "pub fn handlePacketV6Meta(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32, ifindex: u8, hops: u8, tclass: u8) void {") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketV6Meta(info6.src_ip, info6.dst_ip, data + up_start, up_len, ifindex, info6.hop_limit, info6.tclass);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "ip_cmsg_policy.build6(ip_cmsg_policy.Wanted.of6(opts_ip), meta6, ctl_cap, &ctl_buf)") != null);
+}
+
+test "IPv4 UDP sendmsg control messages IP_TTL / IP_TOS / IP_PKTINFO (hello423): Linux udp_cmsg_send, ip_cmsg_send, __sock_cmsg_send" {
+    const c = kt.ip_cmsg_policy;
+    var b: [256]u8 = @splat(0);
+    const W = struct {
+        fn put(buf: []u8, off: usize, level: i32, typ: i32, data: []const u8, len: ?u64) usize {
+            const l: u64 = len orelse 16 + data.len;
+            std.mem.writeInt(u64, buf[off..][0..8], l, .little);
+            std.mem.writeInt(i32, buf[off + 8 ..][0..4], level, .little);
+            std.mem.writeInt(i32, buf[off + 12 ..][0..4], typ, .little);
+            @memcpy(buf[off + 16 ..][0..data.len], data);
+            return off + ((16 + data.len + 7) & ~@as(usize, 7));
+        }
+    };
+    const no_caps: c.SendCaps = .{};
+    // No message at all, or a buffer shorter than one header.
+    try std.testing.expectEqual(c.Send4{}, c.parseSend4(b[0..0], no_caps).ok);
+    try std.testing.expectEqual(c.Send4{}, c.parseSend4(b[0..8], no_caps).ok);
+    // IP_TTL 7 and IP_TOS 0x4b (an int) override the socket's values; a one-byte IP_TOS works too.
+    var o = W.put(&b, 0, 0, 2, &.{ 7, 0, 0, 0 }, null);
+    o = W.put(&b, o, 0, 1, &.{ 0x4b, 0, 0, 0 }, null);
+    const both = c.parseSend4(b[0..o], no_caps).ok;
+    try std.testing.expectEqual(@as(?u8, 7), both.ttl);
+    try std.testing.expectEqual(@as(?u8, 0x4b), both.tos);
+    o = W.put(&b, 0, 0, 1, &.{0x51}, null);
+    try std.testing.expectEqual(@as(?u8, 0x51), c.parseSend4(b[0..o], no_caps).ok.tos);
+    // IP_PKTINFO: the interface and ipi_spec_dst; ipi_addr is not looked at.
+    o = W.put(&b, 0, 0, 8, &.{ 1, 0, 0, 0, 127, 0, 0, 5, 127, 0, 0, 9 }, null);
+    const pk = c.parseSend4(b[0..o], no_caps).ok;
+    try std.testing.expect(pk.pktinfo);
+    try std.testing.expectEqual(@as(u32, 1), pk.oif);
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 5 }, pk.spec_dst);
+    // Skipped: SCM_RIGHTS, SCM_CREDENTIALS, other levels, IPV6_PKTINFO on an IPv4 socket, a valid UDP_SEGMENT.
+    o = W.put(&b, 0, 1, 1, &.{ 3, 0, 0, 0 }, null);
+    o = W.put(&b, o, 6, 1, &.{ 3, 0, 0, 0 }, null);
+    o = W.put(&b, o, 41, 50, &(@as([20]u8, @splat(0))), null);
+    o = W.put(&b, o, 17, 103, &.{ 0, 4 }, null);
+    try std.testing.expectEqual(c.Send4{}, c.parseSend4(b[0..o], no_caps).ok);
+    // EINVAL for each malformed message.
+    const bad = [_]struct { lv: i32, ty: i32, d: []const u8, len: ?u64 }{
+        .{ .lv = 0, .ty = 2, .d = &.{ 0, 0, 0, 0 }, .len = null }, // IP_TTL 0
+        .{ .lv = 0, .ty = 2, .d = &.{ 0, 1, 0, 0 }, .len = null }, // IP_TTL 256
+        .{ .lv = 0, .ty = 2, .d = &.{5}, .len = null }, // a 1-byte IP_TTL
+        .{ .lv = 0, .ty = 1, .d = &.{ 0, 1, 0, 0 }, .len = null }, // IP_TOS 256
+        .{ .lv = 0, .ty = 1, .d = &.{ 0xff, 0xff, 0xff, 0xff }, .len = null }, // IP_TOS -1
+        .{ .lv = 0, .ty = 1, .d = &.{ 3, 0 }, .len = null }, // a 2-byte IP_TOS
+        .{ .lv = 0, .ty = 99, .d = &.{ 3, 0, 0, 0 }, .len = null }, // unknown IP-level type
+        .{ .lv = 0, .ty = 2, .d = &.{ 3, 0, 0, 0 }, .len = 12 }, // cmsg_len shorter than the header
+        .{ .lv = 0, .ty = 2, .d = &.{ 3, 0, 0, 0 }, .len = 64 }, // cmsg_len past the end
+        .{ .lv = 1, .ty = 99, .d = &.{ 3, 0, 0, 0 }, .len = null }, // unknown SOL_SOCKET type
+        .{ .lv = 0, .ty = 8, .d = &(@as([16]u8, @splat(0))), .len = null }, // IP_PKTINFO of 16 bytes
+        .{ .lv = 17, .ty = 103, .d = &.{ 1, 2, 3, 4 }, .len = null }, // UDP_SEGMENT of 4 bytes
+        .{ .lv = 17, .ty = 1, .d = &.{ 1, 2 }, .len = null }, // unknown SOL_UDP type
+        .{ .lv = 1, .ty = 61, .d = &(@as([8]u8, @splat(0))), .len = null }, // SCM_TXTIME without SO_TXTIME
+        .{ .lv = 1, .ty = 37, .d = &.{ 0, 0, 1, 0 }, .len = null }, // SO_TIMESTAMPING with a receive flag
+    };
+    for (bad) |x| {
+        @memset(&b, 0);
+        const n = W.put(&b, 0, x.lv, x.ty, x.d, x.len);
+        const end: usize = if (x.len != null and x.len.? > n) 24 else n;
+        try std.testing.expectEqual(@as(i64, -22), c.parseSend4(b[0..end], no_caps).err);
+    }
+    // SO_MARK needs CAP_NET_RAW or CAP_NET_ADMIN (EPERM first, then the length); SO_PRIORITY above 6 needs them too.
+    o = W.put(&b, 0, 1, 36, &.{ 1, 0, 0, 0 }, null);
+    try std.testing.expectEqual(@as(i64, -1), c.parseSend4(b[0..o], no_caps).err);
+    try std.testing.expect(c.parseSend4(b[0..o], .{ .net_admin = true }) == .ok);
+    o = W.put(&b, 0, 1, 36, &.{ 1, 0 }, null);
+    try std.testing.expectEqual(@as(i64, -1), c.parseSend4(b[0..o], no_caps).err);
+    o = W.put(&b, 0, 1, 12, &.{ 6, 0, 0, 0 }, null);
+    try std.testing.expect(c.parseSend4(b[0..o], no_caps) == .ok);
+    o = W.put(&b, 0, 1, 12, &.{ 7, 0, 0, 0 }, null);
+    try std.testing.expectEqual(@as(i64, -1), c.parseSend4(b[0..o], no_caps).err);
+    // udp_cmsg_send looks at every SOL_UDP message before ip_cmsg_send: a bad UDP_SEGMENT after a SO_MARK is EINVAL, not EPERM.
+    o = W.put(&b, 0, 1, 36, &.{ 1, 0, 0, 0 }, null);
+    o = W.put(&b, o, 17, 103, &.{1}, null);
+    try std.testing.expectEqual(@as(i64, -22), c.parseSend4(b[0..o], no_caps).err);
+
+    // ipi_spec_dst as a source (ip_route_output_key_hash_rcu): 0 lets the stack choose, a group / broadcast / 0.x.y.z address is
+    // EINVAL, an address of no interface ENETUNREACH. The interface must exist (ENODEV).
+    try std.testing.expectEqual(@as(i64, 0), c.sourceErrno4(.{ 0, 0, 0, 0 }, .{ 10, 0, 2, 15 }, true));
+    try std.testing.expectEqual(@as(i64, 0), c.sourceErrno4(.{ 127, 0, 0, 5 }, .{ 10, 0, 2, 15 }, false));
+    try std.testing.expectEqual(@as(i64, 0), c.sourceErrno4(.{ 10, 0, 2, 15 }, .{ 10, 0, 2, 15 }, true));
+    try std.testing.expectEqual(@as(i64, -101), c.sourceErrno4(.{ 10, 0, 2, 15 }, .{ 10, 0, 2, 15 }, false));
+    try std.testing.expectEqual(@as(i64, -101), c.sourceErrno4(.{ 192, 0, 2, 1 }, .{ 10, 0, 2, 15 }, true));
+    try std.testing.expectEqual(@as(i64, -101), c.sourceErrno4(.{ 10, 0, 2, 255 }, .{ 10, 0, 2, 15 }, true));
+    try std.testing.expectEqual(@as(i64, -22), c.sourceErrno4(.{ 224, 0, 0, 1 }, .{ 10, 0, 2, 15 }, true));
+    try std.testing.expectEqual(@as(i64, -22), c.sourceErrno4(.{ 255, 255, 255, 255 }, .{ 10, 0, 2, 15 }, true));
+    try std.testing.expectEqual(@as(i64, -22), c.sourceErrno4(.{ 0, 1, 2, 3 }, .{ 10, 0, 2, 15 }, true));
+    try std.testing.expectEqual(@as(i64, 0), c.oifErrno4(0, false));
+    try std.testing.expectEqual(@as(i64, 0), c.oifErrno4(1, false));
+    try std.testing.expectEqual(@as(i64, 0), c.oifErrno4(2, true));
+    try std.testing.expectEqual(@as(i64, -19), c.oifErrno4(2, false));
+    try std.testing.expectEqual(@as(i64, -19), c.oifErrno4(99, true));
+
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "ip_cmsg_policy.parseSend4(control, sendCaps())") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "pub fn sendToFromOv(") != null);
 }

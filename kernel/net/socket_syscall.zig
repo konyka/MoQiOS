@@ -1754,16 +1754,36 @@ fn udpSendmsg(fd: u32, msghdr: *const [56]u8) i64 {
     const iov_len: u64 = bo.readU64At(msghdr, 24);
     if (iov_len > 1024) return -22;
     if (iov_len != 0 and (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000)) return -14;
+    // msg_control is copied in whole first (____sys_sendmsg): a bad pointer is EFAULT; more than this stack keeps is ENOBUFS.
+    const ctl_ptr: u64 = bo.readU64At(msghdr, 32);
+    const ctl_len: u64 = bo.readU64At(msghdr, 40);
+    var ctl: [UDP_SEND_CTL_MAX]u8 = undefined;
+    if (ctl_len > UDP_SEND_CTL_MAX) return -105;
+    const cl: usize = @intCast(ctl_len);
+    if (cl != 0) {
+        if (ctl_ptr == 0 or ctl_ptr >= 0x0000_8000_0000_0000) return -14;
+        if (copy.copyFromUser(ctl[0..cl], @ptrFromInt(ctl_ptr), cl) != cl) return -14;
+    }
     var data: [1472]u8 = undefined;
     const got = gatherIov(iov_ptr, iov_len, &data);
     if (got < 0) return got;
     if (got == 0) return 0;
-    return udpSendBytes(fd, data[0..@intCast(got)], name_ptr, name_len);
+    return udpSendBytes(fd, data[0..@intCast(got)], name_ptr, name_len, ctl[0..cl]);
 }
 
-/// Send `payload` as one datagram on UDP socket `fd` (the sendto UDP path
-/// without the user-buffer copy).
-fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32) i64 {
+/// The longest msg_control a UDP sendmsg takes (Linux allows up to net.core.optmem_max).
+const UDP_SEND_CTL_MAX: usize = 512;
+
+/// Who may send the privileged SOL_SOCKET control messages (SO_MARK, a high SO_PRIORITY).
+fn sendCaps() ip_cmsg_policy.SendCaps {
+    const idx = sched_mod.currentTaskIndex() orelse return .{};
+    return .{ .net_admin = cap_mod.hasSysCap(idx, "cap_net_admin"), .net_raw = cap_mod.hasSysCap(idx, "cap_net_raw") };
+}
+
+/// Send `payload` as one datagram on UDP socket `fd` (the sendto UDP path without the user-buffer copy). `control` is sendmsg's
+/// msg_control: on an IPv4 socket it is parsed once the destination is known (udp_sendmsg: EDESTADDRREQ comes first), and its
+/// IP_TTL / IP_TOS / IP_PKTINFO apply to this datagram only. An IPv6 or ping socket does not read it.
+fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32, control: []const u8) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
     const d = &t.fd_table.fds[fd];
@@ -1805,10 +1825,23 @@ fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32) i64 
         dst_ip = d.udp_dst_ip;
         dst_port = d.udp_dst_port;
     } else return -89;
-    const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(d.udp_local_ip, dst_ip, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
+    const ov = switch (ip_cmsg_policy.parseSend4(control, sendCaps())) {
+        .ok => |v| v,
+        .err => |e| return e,
+    };
+    // IP_PKTINFO replaces the source (ipc.addr), the bound address included; the route lookup then checks it, then the interface.
+    var src = d.udp_local_ip;
+    if (ov.pktinfo) {
+        src = ov.spec_dst;
+        const src_rc = ip_cmsg_policy.sourceErrno4(src, netif.getOurIp(), nic_mod.isActive());
+        if (src_rc != 0) return src_rc;
+        const oif_rc = ip_cmsg_policy.oifErrno4(ov.oif, nic_mod.isActive());
+        if (oif_rc != 0) return oif_rc;
+    }
+    const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(src, dst_ip, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
     if (lo_rc != 0) return lo_rc;
     const n = @min(payload.len, 1472);
-    return if (udp.sendToFrom(d.udp_local_ip, dst_ip, dst_port, src_key, payload.ptr, @intCast(n))) @intCast(n) else -1;
+    return if (udp.sendToFromOv(src, dst_ip, dst_port, src_key, payload.ptr, @intCast(n), ov.ttl, ov.tos)) @intCast(n) else -1;
 }
 
 /// recvmsg on a UDP socket: wait like recvfrom, scatter the datagram over the
