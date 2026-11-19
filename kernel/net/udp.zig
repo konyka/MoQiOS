@@ -312,14 +312,33 @@ pub fn notifyIcmpError(e: IcmpError) void {
 /// An ICMP error (hard, positive errno `err`) quoted an echo request with ident `ident`: the IPv4 ping sockets with that ident that
 /// are connected take it as their pending error (ping_err sets sk_err only when the socket is connected and has no IP_RECVERR).
 pub fn notifyPingError(ident: u16, err: i32) void {
+    notifyPingIcmpError(ident, .{ .errno = err, .hard = true, .icmp_type = 0, .icmp_code = 0, .offender = .{ 0, 0, 0, 0 }, .local_port = ident, .peer_port = 0, .peer_ip = .{ 0, 0, 0, 0 }, .payload = &.{} }, false);
+}
+
+/// ping_err for the IPv4 ping sockets holding `ident`: one with IP_RECVERR queues the error (soft too, connected or not; the payload
+/// is the quoted echo request, msg_name its destination with port 0) and takes it as its pending error; one without takes only a hard
+/// error, and only when connected. `queue` false: the caller has no quote to keep (the old hard-error-only entry point).
+pub fn notifyPingIcmpError(ident: u16, e: IcmpError, queue: bool) void {
     var hits: [MAX_PORTS]u32 = undefined;
     var n: usize = 0;
     {
         const saved = udp_lock.acquire();
         defer udp_lock.release(saved);
         for (0..num_ports) |i| {
-            if (!port_ping[i] or port_v6[i] or portNumber(ports[i]) != ident or port_peer[i] == 0) continue;
-            port_err[i] = err;
+            if (!port_ping[i] or port_v6[i] or portNumber(ports[i]) != ident) continue;
+            const recverr = queue and port_opts[i].ip.recverr;
+            const r = errq.route(recverr, e.hard, port_peer[i] != 0);
+            if (r.queue) {
+                var ent: errq.Entry = .{ .errno = e.errno, .icmp_type = e.icmp_type, .icmp_code = e.icmp_code, .info = e.info, .dst_port = 0 };
+                @memcpy(ent.offender[0..4], &e.offender);
+                @memcpy(ent.dst[0..4], &e.peer_ip);
+                const k = @min(e.payload.len, errq.PAYLOAD_MAX);
+                ent.len = @intCast(k);
+                @memcpy(ent.payload[0..k], e.payload[0..k]);
+                if (!port_errq[i].push(ent)) continue;
+            }
+            if (!r.set_err) continue;
+            port_err[i] = e.errno;
             hits[n] = ports[i];
             n += 1;
         }

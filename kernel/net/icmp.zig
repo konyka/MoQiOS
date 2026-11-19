@@ -220,9 +220,22 @@ pub fn handlePacketMeta(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u3
                     .payload = quoted,
                 });
             },
+            // ping_err: the quoted echo request is queued for a socket with IP_RECVERR, soft errors included.
             .echo => {
-                const err = unreach.errnoFor(icmp_type, icmp_code);
-                if (err != 0) @import("udp.zig").notifyPingError(q.src_port, err);
+                const e = unreach.pingErrorFor(icmp_type, icmp_code);
+                const ihl: usize = @as(usize, data[8] & 0x0F) * 4;
+                @import("udp.zig").notifyPingIcmpError(q.src_port, .{
+                    .errno = e.errno,
+                    .hard = e.hard,
+                    .icmp_type = icmp_type,
+                    .icmp_code = icmp_code,
+                    .info = if (icmp_type == 3 and icmp_code == 4) bo.readU16BeAt(data, 6) else 0,
+                    .offender = src_ip,
+                    .local_port = q.src_port,
+                    .peer_port = 0,
+                    .peer_ip = data[8 + 16 ..][0..4].*,
+                    .payload = data[0..len][8 + ihl ..],
+                }, true);
             },
         }
     }

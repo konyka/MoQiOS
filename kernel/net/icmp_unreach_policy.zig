@@ -118,6 +118,15 @@ pub fn errorFor(icmp_type: u8, code: u8) ?struct { errno: i32, hard: bool } {
     };
 }
 
+/// ping_err's conversion for an IPv4 ping socket: as errorFor, except source quench and redirect, which ping wants to see, are a soft
+/// EREMOTEIO (121), and any other type a soft EHOSTUNREACH. Only a socket with IP_RECVERR takes the soft ones.
+pub fn pingErrorFor(icmp_type: u8, code: u8) struct { errno: i32, hard: bool } {
+    return switch (icmp_type) {
+        4, 5 => .{ .errno = 121, .hard = false },
+        else => if (errorFor(icmp_type, code)) |e| .{ .errno = e.errno, .hard = e.hard } else .{ .errno = 113, .hard = false },
+    };
+}
+
 pub fn errnoFor(icmp_type: u8, code: u8) i32 {
     return switch (icmp_type) {
         3 => if (code < unreach_errno.len and unreach_errno[code].hard) unreach_errno[code].errno else 0,

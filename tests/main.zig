@@ -14705,11 +14705,13 @@ test "ICMP errors wiring (hello390): checksummed, sent to connected UDP and ping
     const at = std.mem.indexOf(u8, is, "} else if (unreach.isError(icmp_type)) {") orelse return error.TestUnexpectedResult;
     const ck = std.mem.indexOfPos(u8, is, at, "if (len > 0xffff or ipv4.checksum(data, @intCast(len)) != 0) return;") orelse return error.TestUnexpectedResult;
     const ue = std.mem.indexOfPos(u8, is, ck, "@import(\"udp.zig\").notifyIcmpError(.{") orelse return error.TestUnexpectedResult;
-    _ = std.mem.indexOfPos(u8, is, ue, "if (err != 0) @import(\"udp.zig\").notifyPingError(q.src_port, err);") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, is, ue, "@import(\"udp.zig\").notifyPingIcmpError(q.src_port, .{") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, is, "} else if (icmp_type == 3 and icmp_code == 3) {") == null);
     const us = kt.udp_source;
-    const pe = std.mem.indexOf(u8, us, "pub fn notifyPingError(ident: u16, err: i32) void {") orelse return error.TestUnexpectedResult;
-    _ = std.mem.indexOfPos(u8, us, pe, "if (!port_ping[i] or port_v6[i] or portNumber(ports[i]) != ident or port_peer[i] == 0) continue;") orelse return error.TestUnexpectedResult;
+    const pe = std.mem.indexOf(u8, us, "pub fn notifyPingIcmpError(ident: u16, e: IcmpError, queue: bool) void {") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, us, pe, "if (!port_ping[i] or port_v6[i] or portNumber(ports[i]) != ident) continue;") orelse return error.TestUnexpectedResult;
+    // Without IP_RECVERR an unconnected ping socket still takes nothing (errqueue_policy.route).
+    try std.testing.expect(!kt.errqueue_policy.route(false, true, false).set_err);
     try std.testing.expect(std.mem.indexOf(u8, us, "pub fn notifyUnreachable(") == null);
     const ss = kt.socket_syscall_source;
     const ps = std.mem.indexOf(u8, ss, "fn pingSend(d: *vfs_mod.FileDescriptor") orelse return error.TestUnexpectedResult;
@@ -16975,4 +16977,18 @@ test "a new pipe gets a 16-page ring like Linux (hello448)" {
     try std.testing.expect(std.mem.indexOf(u8, v, "pipes[i].cap = PIPE_DEFAULT_SIZE;") != null);
     // F_SETPIPE_SZ still goes down to one page.
     try std.testing.expectEqual(@as(u64, 4096), kt.fcntl_policy.roundPipeSize(1).?);
+}
+
+test "ping sockets with IP_RECVERR queue ICMP errors, soft ones and source quench included (hello390 W)" {
+    // Linux ping_err: with IP_RECVERR ip_icmp_error queues every error, connected or not; source quench and redirect are a soft
+    // EREMOTEIO there. Without it only a hard error on a connected socket is taken (as before).
+    const iu = kt.icmp_unreach_policy;
+    try std.testing.expectEqual(@as(i32, 121), iu.pingErrorFor(4, 0).errno);
+    try std.testing.expect(!iu.pingErrorFor(5, 1).hard);
+    try std.testing.expectEqual(@as(i32, 113), iu.pingErrorFor(3, 1).errno);
+    try std.testing.expect(!iu.pingErrorFor(3, 1).hard);
+    try std.testing.expect(iu.pingErrorFor(3, 3).hard);
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "pub fn notifyPingIcmpError(ident: u16, e: IcmpError, queue: bool) void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "@import(\"udp.zig\").notifyPingIcmpError(q.src_port, .{") != null);
 }
