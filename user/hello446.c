@@ -8,7 +8,9 @@
  *      10, then epoll_wait(0) -> 0;
  *   B. a child sends SIGUSR1 to the parent 100 ms after the parent sleeps in epoll_wait(3000): the wait returns 1 in well under a
  *      second (< 1500 ms);
- *   C. EPOLLONESHOT: one report, then 0 while the signal is still pending. */
+ *   C. EPOLLONESHOT: one report, then 0 while the signal is still pending;
+ *   D. the signalfd passed over an AF_UNIX socketpair with SCM_RIGHTS: the received descriptor is a new number, the sender's is
+ *      closed, and a SIGUSR1 sent to self is read through the received one (128 bytes, signo 10). */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -16,6 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -38,6 +41,10 @@ static void exit_(int c) { _exit(c); }
 static void reap(void) { int st; wait(&st); }
 static long now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000 + t.tv_nsec / 1000000; }
 static void pause_ms(long ms) { struct timespec t = { 0, ms * 1000000 }; nanosleep(&t, 0); }
+static long spair(int *sv) { long r = socketpair(1, 1, 0, sv); return r < 0 ? -errno : r; }
+static long smsg(long s, void *m) { long r = sendmsg((int)s, m, 0); return r < 0 ? -errno : r; }
+static long rmsg(long s, void *m) { long r = recvmsg((int)s, m, 0); return r < 0 ? -errno : r; }
+static void close_(long fd) { close((int)fd); }
 #define NR_SIGNALFD4 289
 #define NR_SIGPROCMASK 14
 #define NR_KILL 62
@@ -62,6 +69,10 @@ static void exit_(int c) { _exit(c); }
 static void reap(void) { int st; waitpid(-1, &st, 0); }
 static long now_ms(void) { long t[2] = { 0, 0 }; syscall2(228, 1, (long)t); return t[0] * 1000 + t[1] / 1000000; }
 static void pause_ms(long ms) { long t[2] = { 0, ms * 1000000 }; syscall2(SYS_nanosleep, (long)t, 0); }
+static long spair(int *sv) { return syscall4(53, 1, 1, 0, (long)sv); }
+static long smsg(long s, void *m) { return syscall3(129, s, (long)m, 0); }
+static long rmsg(long s, void *m) { return syscall3(130, s, (long)m, 0); }
+static void close_(long fd) { syscall1(SYS_close, fd); }
 #define NR_SIGNALFD4 225
 #define NR_SIGPROCMASK 14
 #define NR_KILL 62
@@ -122,6 +133,48 @@ int main(void) {
     r = rd(sfd, rec, sizeof rec);
     snprintf(msg, sizeof msg, "C: mod oneshot %ld, wait %ld data %lu, again %ld, read %ld (0, 1 9, 0, 128)", mo, o1, d2, o2, r);
     check(mo == 0 && o1 == 1 && d2 == 9 && o2 == 0 && r == 128, msg);
+
+    struct iov_ { void *b; unsigned long n; };
+    struct mh_ { void *name; unsigned int nl; int pad; struct iov_ *iov; unsigned long iovlen; void *ctl; unsigned long ctllen; int flags; int pad2; };
+    int sv[2];
+    long sp = spair(sv);
+    unsigned char ctl[24];
+    memset(ctl, 0, sizeof ctl);
+    unsigned long clen = 20;
+    memcpy(ctl, &clen, 8);
+    int lvl = 1, typ = 1, fdv = (int)sfd;
+    memcpy(ctl + 8, &lvl, 4);
+    memcpy(ctl + 12, &typ, 4);
+    memcpy(ctl + 16, &fdv, 4);
+    char x = 'x';
+    struct iov_ v1 = { &x, 1 };
+    struct mh_ mh1;
+    memset(&mh1, 0, sizeof mh1);
+    mh1.iov = &v1;
+    mh1.iovlen = 1;
+    mh1.ctl = ctl;
+    mh1.ctllen = 24;
+    long sn = smsg(sv[0], &mh1);
+    close_(sfd);
+    unsigned char rc[64];
+    memset(rc, 0, sizeof rc);
+    char y = 0;
+    struct iov_ v2 = { &y, 1 };
+    struct mh_ m2;
+    memset(&m2, 0, sizeof m2);
+    m2.iov = &v2;
+    m2.iovlen = 1;
+    m2.ctl = rc;
+    m2.ctllen = sizeof rc;
+    long rv = rmsg(sv[1], &m2);
+    int got_fd = -1;
+    if (rv == 1 && m2.ctllen >= 20 && rd32(rc + 8) == 1 && rd32(rc + 12) == 1) memcpy(&got_fd, rc + 16, 4);
+    sys4(NR_KILL, me(), 10, 0, 0);
+    memset(rec, 0, sizeof rec);
+    r = got_fd >= 0 ? rd(got_fd, rec, sizeof rec) : -1;
+    signo = rd32(rec);
+    snprintf(msg, sizeof msg, "D: socketpair %ld, send %ld, recv %ld fd %d, read through it %ld signo %u (0, 1, 1 >=0, 128 10)", sp, sn, rv, got_fd, r, signo);
+    check(sp == 0 && sn == 1 && rv == 1 && got_fd >= 0 && r == 128 && signo == 10, msg);
 
     print(failures ? "hello446: FAIL\n" : "hello446: PASS\n");
     return failures ? 1 : 0;

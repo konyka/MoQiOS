@@ -440,7 +440,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello443 | TCP 紧急数据：MSG_OOB 发送、SIGURG、POLLPRI、select 异常集、SIOCATMARK、FIONREAD（A）；MSG_OOB|MSG_PEEK 与 MSG_OOB 读出紧急字节、再读 EINVAL、普通读跳过它（B）；标记之后的数据和 EAGAIN（C）；普通读停在标记前（D）；SO_OOBINLINE（E）；UDP 的 EOPNOTSUPP 与管道的 ENOTTY（F） |
 | hello444 | 接收控制消息：SO_TIMESTAMP 和 IP_RECVORIGDSTADDR 的设置与读回（A）；SCM_TIMESTAMP 在前、IP_ORIGDSTADDR 在后（B）；SO_TIMESTAMPNS 替换 SO_TIMESTAMP（C）；小缓冲区的 MSG_CTRUNC（D）；IPv6 的 IPV6_ORIGDSTADDR（E） |
 | hello445 | IP_RECVERR：选项读写与空队列 EAGAIN（A）；未连接套接字收到端口不可达后的 POLLERR 与 SO_ERROR（B）；MSG_ERRQUEUE 读出负载、原目的地址和 sock_extended_err，读后队列清空（C）；未开 IP_RECVERR 的套接字收不到（D）；小缓冲区的 MSG_TRUNC 与 MSG_CTRUNC（E）；IPv6 的 IPV6_RECVERR（F） |
-| hello446 | epoll 中的 signalfd：kill 后报 EPOLLIN 和注册的 data，读走前保持就绪（A）；子进程发信号唤醒阻塞的 epoll_wait（B）；EPOLLONESHOT 只报一次（C） |
+| hello446 | epoll 中的 signalfd：kill 后报 EPOLLIN 和注册的 data，读走前保持就绪（A）；子进程发信号唤醒阻塞的 epoll_wait（B）；EPOLLONESHOT 只报一次（C）；经 SCM_RIGHTS 传递后仍可读信号（D） |
 | hello447 | MADV_WIPEONFORK：私有匿名页可标记，共享、未映射、未对齐分别为 EINVAL/ENOMEM/EINVAL（A）；子进程和孙进程读到 0，父进程不变（B）；KEEPONFORK 恢复（C）；跨两页的标记（D）；clone(SIGCHLD) 的子进程同样看到零页，DONTFORK 页在其中不存在（E） |
 | hello448 | 新管道 64 KiB：F_GETPIPE_SZ 65536（A）；非阻塞写满 64000 字节后 EAGAIN、读回一致（B）；65537 字节的写（C）；F_SETPIPE_SZ 仍可缩小（D） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
