@@ -27,6 +27,20 @@ pub fn droppedAtSend(signum: u32, handler: u64, default_ignores: bool, blocked: 
     return handler == 1 or (handler == 0 and default_ignores);
 }
 
+/// sizeof(sigset_t) in the rt_* signal ABI.
+pub const SIGSET_SIZE: u64 = 8;
+
+/// rt_sigprocmask, rt_sigsuspend and rt_sigtimedwait accept only sigsetsize == 8 (Linux returns EINVAL otherwise, before any
+/// pointer is read).
+pub fn sigsetSizeValid(sigsetsize: u64) bool {
+    return sigsetsize == SIGSET_SIZE;
+}
+
+/// rt_sigpending accepts any size up to 8 and copies exactly that many bytes out.
+pub fn pendingSizeValid(sigsetsize: u64) bool {
+    return sigsetsize <= SIGSET_SIZE;
+}
+
 const testing = @import("std").testing;
 
 test "an unblocked ignored signal is dropped at send; a blocked one is kept" {

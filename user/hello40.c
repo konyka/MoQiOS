@@ -102,11 +102,11 @@ void _start(void) {
     uint64_t expected_mask = (uint64_t)1 << 1;
     uint64_t observed_mask = 0;
     if (syscall6(SYS_SIGPROCMASK, 2, (uint64_t)&expected_mask, 0, 8, 0, 0) != 0) fail("sigprocmask set");
-    if (syscall2(SYS_RT_SIGSUSPEND, 0, 4) != -EFAULT) fail("rt_sigsuspend EFAULT");
+    if (syscall2(SYS_RT_SIGSUSPEND, 0, 8) != -EFAULT) fail("rt_sigsuspend EFAULT");
     if (syscall6(SYS_SIGPROCMASK, 2, 0, (uint64_t)&observed_mask, 8, 0, 0) != 0) fail("sigprocmask get");
     if (observed_mask != expected_mask) fail("signal mask changed");
 
-    if (syscall2(SYS_RT_SIGSUSPEND, (uint64_t)copy_page, 4) != -EFAULT) fail("rt_sigsuspend EFAULT");
+    if (syscall2(SYS_RT_SIGSUSPEND, (uint64_t)copy_page, 8) != -EFAULT) fail("rt_sigsuspend EFAULT");
     if (syscall6(SYS_SIGPROCMASK, 2, 0, (uint64_t)&expected_mask, 8, 0, 0) != 0) fail("sigprocmask get after failure");
     if (expected_mask != observed_mask) fail("rt_sigsuspend failed mask");
 
@@ -126,7 +126,7 @@ void _start(void) {
     syscall2(SYS_TKILL, (uint64_t)syscall1(SYS_GETPID, 0), SIGUSR1);
     if (usr1_seen) fail("blocked SIGUSR1 delivered early");
     uint64_t suspend_mask = (uint64_t)1 << 2;
-    if (syscall2(SYS_RT_SIGSUSPEND, (uint64_t)&suspend_mask, 4) != -EINTR) fail("rt_sigsuspend success");
+    if (syscall2(SYS_RT_SIGSUSPEND, (uint64_t)&suspend_mask, 8) != -EINTR) fail("rt_sigsuspend success");
     if (!usr1_seen) fail("rt_sigsuspend did not run the handler");
     if (syscall6(SYS_SIGPROCMASK, 2, 0, (uint64_t)&expected_mask, 8, 0, 0) != 0) fail("sigprocmask get after success");
     if (expected_mask != blocked) fail("rt_sigsuspend mask");

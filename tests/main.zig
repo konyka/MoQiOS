@@ -2099,11 +2099,11 @@ test "signal errnos follow Linux's order of checks, and a NULL siginfo no longer
     const tsig = idx(u8, tb, "if (sig > 64) return -22;").?;
     try std.testing.expect(tid_ok < tid_exists and tid_exists < tsig);
 
-    // rt_sigtimedwait: a NULL or bad set pointer is EFAULT (size 0 stays EINVAL); the info buffer is
+    // rt_sigtimedwait: a NULL or bad set pointer is EFAULT (a size other than 8 is EINVAL first, hello431); the info buffer is
     // checked only when a signal is about to be taken, before it is consumed.
     const tw = idx(u8, src, "pub fn rtSigtimedwait(").?;
     const wb = src[tw..];
-    try std.testing.expect(idx(u8, wb, "if (sigset_size == 0) return -22;\n    if (sigset_ptr == 0 or sigset_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT") != null);
+    try std.testing.expect(idx(u8, wb, "if (!action_policy.sigsetSizeValid(sigset_size)) return -22;\n    if (sigset_ptr == 0 or sigset_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT") != null);
     const taking = idx(u8, wb, "if (info_ptr != 0 and !copy.validateUserBufferWritable(info_ptr, si.SIGINFO_SIZE)) return -14;").?;
     const consume = idx(u8, wb, "_ = @atomicRmw(u64, &cur.pending_signals, .And").?;
     try std.testing.expect(taking < consume);
@@ -16590,4 +16590,32 @@ test "ping socket recvmsg control messages IP_PKTINFO / IP_TTL / IP_TOS and the 
     try std.testing.expect(std.mem.indexOf(u8, kt.icmpv6_source, "pkt[ip_off] = 0x60 | (tclass >> 4);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.icmpv6_source, "ECHO_REQUEST => sendEchoReply(src_ip, dst_ip, data, len, meta6.tclass),") != null);
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello430", true, false).caps.cap_net_raw);
+}
+
+test "rt_sigprocmask / rt_sigsuspend / rt_sigtimedwait need sigsetsize 8 and rt_sigpending takes up to 8 bytes (hello431)" {
+    // Linux kernel/signal.c: sigsetsize != sizeof(sigset_t) is EINVAL before any pointer is touched; rt_sigpending only rejects a
+    // size above 8 and copies exactly sigsetsize bytes. The kernel used to accept 4 as a legacy width and ignored the pending size.
+    const ap = kt.signal_action_policy;
+    try std.testing.expect(ap.sigsetSizeValid(8));
+    try std.testing.expect(!ap.sigsetSizeValid(4) and !ap.sigsetSizeValid(0) and !ap.sigsetSizeValid(16));
+    try std.testing.expect(ap.pendingSizeValid(0) and ap.pendingSizeValid(4) and ap.pendingSizeValid(8));
+    try std.testing.expect(!ap.pendingSizeValid(9) and !ap.pendingSizeValid(16));
+    const src = kt.signal_syscall_source;
+    const idx = std.mem.indexOf;
+    const sp = idx(u8, src, "pub fn sigprocmask(").?;
+    const sp_check = idx(u8, src[sp..], "if (!action_policy.sigsetSizeValid(sigsetsize)) return -22;").?;
+    const sp_read = idx(u8, src[sp..], "if (set_ptr != 0 and !copy.validateUserBuffer(set_ptr, width)) return -14;").?;
+    try std.testing.expect(sp_check < sp_read);
+    try std.testing.expect(idx(u8, src[sp..], "if (sigsetsize >= 8) 8 else 4") == null);
+    const pd = idx(u8, src, "pub fn rtSigpending(").?;
+    const pd_end = idx(u8, src[pd..], "\n}\n").? + pd;
+    try std.testing.expect(idx(u8, src[pd..pd_end], "if (!action_policy.pendingSizeValid(sigsetsize)) return -22;") != null);
+    try std.testing.expect(idx(u8, src[pd..pd_end], "_ = sigsetsize;") == null);
+    try std.testing.expect(idx(u8, src[pd..pd_end], "copy.copyToUser(@ptrFromInt(set_ptr), bytes[0..n], n) != n") != null);
+    const su = idx(u8, src, "pub fn rtSigsuspend(").?;
+    const su_check = idx(u8, src[su..], "if (!action_policy.sigsetSizeValid(sigsetsize)) return -22;").?;
+    const su_ptr = idx(u8, src[su..], "if (mask_ptr == 0 or mask_ptr >= 0x0000_8000_0000_0000) return -14;").?;
+    try std.testing.expect(su_check < su_ptr);
+    const tw = idx(u8, src, "pub fn rtSigtimedwait(").?;
+    try std.testing.expect(idx(u8, src[tw..], "if (!action_policy.sigsetSizeValid(sigset_size)) return -22;\n    if (sigset_ptr == 0") != null);
 }

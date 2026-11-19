@@ -357,15 +357,14 @@ fn discardForProcess(cur: *task_mod.Task, signum: u32) void {
 
 /// sigprocmask(how, set_ptr, oldset_ptr, sigsetsize) → 0 or -errno
 ///
-/// The rt_* ABI advertises a 64-signal sigset_t (8 bytes); legacy callers
-/// used a 4-byte mask. The width is chosen by sigsetsize (r10, as in Linux
-/// rt_sigprocmask): >= 8 selects the 8-byte form, anything else keeps the
-/// legacy 4-byte form so existing 4-byte users are not broken.
+/// The rt_* ABI uses a 64-signal sigset_t (8 bytes). As in Linux rt_sigprocmask, any other sigsetsize (r10) is EINVAL before
+/// either pointer is touched.
 pub fn sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigsetsize: u64) i64 {
+    if (!action_policy.sigsetSizeValid(sigsetsize)) return -22;
     const current = sched.currentTask() orelse return -1;
     const old_mask = current.signal_mask;
 
-    const width: usize = if (sigsetsize >= 8) 8 else 4;
+    const width: usize = 8;
 
     // Linux order: read the new set (EFAULT), then reject an unknown `how` (EINVAL), then write the old mask
     // out (EFAULT). A call that fails with EINVAL therefore leaves the caller's old-mask buffer alone.
@@ -545,22 +544,22 @@ pub fn sigaltstack(ss_ptr: u64, old_ss_ptr: u64) i64 {
 ///
 /// Reports this thread's own pending set plus the process-directed signals every thread blocks (held for the process), so any
 /// thread sees those; a thread-directed signal (tkill/tgkill) shows only on its own thread (Linux do_sigpending merges the
-/// shared set the same way).
+/// shared set the same way). A sigsetsize above 8 is EINVAL; a smaller one copies only that many bytes (0 copies nothing, so a
+/// NULL buffer is then accepted), as Linux copy_to_user(uset, &set, sigsetsize).
 pub fn rtSigpending(set_ptr: u64, sigsetsize: u64) i64 {
-    _ = sigsetsize;
+    if (!action_policy.pendingSizeValid(sigsetsize)) return -22;
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
-    if (set_ptr != 0) {
-        const pending: u64 = @import("shared_pending_policy.zig").visible(
-            @atomicLoad(u64, &cur.pending_signals, .seq_cst),
-            @atomicLoad(u64, &cur.grp().held_signals, .seq_cst),
-        );
-        const bytes: [*]const u8 = @ptrCast(&pending);
-        if (copy.copyToUser(@ptrFromInt(set_ptr), bytes[0..8], 8) != 8) return -14;
-    } else {
-        return -14;
-    }
+    const n: usize = @intCast(sigsetsize);
+    if (n == 0) return 0;
+    if (set_ptr == 0) return -14;
+    const pending: u64 = @import("shared_pending_policy.zig").visible(
+        @atomicLoad(u64, &cur.pending_signals, .seq_cst),
+        @atomicLoad(u64, &cur.grp().held_signals, .seq_cst),
+    );
+    const bytes: [*]const u8 = @ptrCast(&pending);
+    if (copy.copyToUser(@ptrFromInt(set_ptr), bytes[0..n], n) != n) return -14;
     return 0;
 }
 
@@ -569,11 +568,10 @@ pub fn rtSigsuspend(mask_ptr: u64, sigsetsize: u64) i64 {
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
+    if (!action_policy.sigsetSizeValid(sigsetsize)) return -22;
     if (mask_ptr == 0 or mask_ptr >= 0x0000_8000_0000_0000) return -14;
 
-    // Accept the 8-byte rt_* sigset_t when advertised; legacy callers pass
-    // sigsetsize == 4. The task mask is u64 — unread bytes default to 0.
-    const width: usize = @intCast(@min(sigsetsize, @as(u64, 8)));
+    const width: usize = 8;
     var new_mask: u64 = 0;
     const mask_bytes: [*]u8 = @ptrCast(&new_mask);
     if (copy.copyFromUser(mask_bytes[0..width], @ptrFromInt(mask_ptr), width) != width) return -14;
@@ -628,13 +626,11 @@ pub fn pause() i64 {
 pub fn rtSigtimedwait(sigset_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset_size: u64) i64 {
     const si = @import("siginfo_policy.zig");
 
-    if (sigset_size == 0) return -22;
+    if (!action_policy.sigsetSizeValid(sigset_size)) return -22;
     if (sigset_ptr == 0 or sigset_ptr >= 0x0000_8000_0000_0000) return -14; // EFAULT
 
     var mask_buf: [8]u8 = @splat(0);
-    const width: usize = @intCast(@min(sigset_size, @as(u64, 8)));
-    const copied = copy.copyFromUser(mask_buf[0..width], @ptrFromInt(sigset_ptr), width);
-    if (copied == 0) return -14;
+    if (copy.copyFromUser(&mask_buf, @ptrFromInt(sigset_ptr), 8) != 8) return -14;
     const mask: u64 = @bitCast(mask_buf);
 
     const cur_idx = sched.currentTaskIndex() orelse return -3;

@@ -1,6 +1,6 @@
 /// hello189: signal system-call errnos, checked against real Linux (rt_sigaction, rt_sigprocmask, kill,
 /// tkill, rt_sigpending, rt_sigsuspend, rt_sigtimedwait, rt_sigqueueinfo, sigaltstack).
-/// The sigsetsize argument is not probed: this kernel still accepts the legacy 4-byte form.
+/// The sigsetsize argument is probed by hello431 (only 8 is accepted, rt_sigpending takes up to 8).
 
 #include <stdint.h>
 
