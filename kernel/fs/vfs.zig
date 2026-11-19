@@ -80,7 +80,7 @@ pub const FdType = enum(u8) {
 };
 
 pub const PIPE_BUF_SIZE: u32 = 4096;
-/// Pipes open system-wide at once (4 KiB of buffer each).
+/// Pipes open system-wide at once (64 KiB of buffer each by default, PIPE_DEFAULT_SIZE).
 pub const MAX_PIPES: u32 = 64;
 
 pub const PipeBuffer = struct {
@@ -107,6 +107,13 @@ pub const PipeBuffer = struct {
 /// The bytes of `pipe`'s ring (its first page, or the buffer F_SETPIPE_SZ gave it).
 fn ring(pipe: *PipeBuffer) [*]u8 {
     return if (pipe.ext) |e| e else &pipe.buf;
+}
+
+/// POLLOUT (Linux pipe_poll: a free buffer slot, i.e. a page): at least PIPE_BUF bytes of room, or any room in a one-page pipe (which
+/// never has a whole free page while it holds anything).
+fn pipeWritable(pipe: *const PipeBuffer) bool {
+    const room = (pipe.cap - 1) - pipeUsed(pipe);
+    return if (pipe.cap > PIPE_BUF_SIZE) room >= PIPE_BUF_SIZE else room > 0;
 }
 
 /// Bytes queued in `pipe`.
@@ -253,7 +260,7 @@ pub fn pipeState(pipe_idx: u32) ?PipeState {
     return .{
         .readable = readable,
         .capacity = pipe.cap,
-        .writable = (pipe.tail + 1) % pipe.cap != pipe.head,
+        .writable = pipeWritable(pipe),
         .read_open = pipe.read_refs > 0,
         .write_open = pipe.write_refs > 0,
     };
@@ -286,17 +293,31 @@ pub fn pipeMakeSingleEnded(pipe_idx: u32) bool {
     return true;
 }
 
+/// A new pipe gets a 16-page ring like Linux (PIPE_DEF_BUFFERS, F_GETPIPE_SZ 65536); when that much contiguous memory is not to be
+/// had it starts with its own page, as Linux falls back to one buffer for a user over pipe-user-pages-soft.
+pub const PIPE_DEFAULT_SIZE: u32 = 16 * 4096;
+
 pub fn allocPipe() ?u32 {
+    const pmm = @import("../mm/pmm.zig");
+    const hhdm = @import("../mm/hhdm.zig");
+    // Allocate outside pipe_lock; hand the pages back if no slot is free.
+    const ext: ?[*]u8 = if (pmm.allocContiguous(PIPE_DEFAULT_SIZE / 4096)) |phys| @ptrFromInt(hhdm.physToVirt(phys)) else null;
     const flags = pipe_lock.acquire();
-    defer pipe_lock.release(flags);
     for (0..MAX_PIPES) |i| {
         if (pipes[i].ref_count == 0) {
             const generation = pipes[i].generation +% 1;
             pipes[i] = .{ .buf = @splat(0), .head = 0, .tail = 0, .ref_count = 2, .read_refs = 1, .write_refs = 1, .generation = generation };
+            if (ext) |e| {
+                pipes[i].ext = e;
+                pipes[i].cap = PIPE_DEFAULT_SIZE;
+            }
             pipe_count += 1;
+            pipe_lock.release(flags);
             return @intCast(i);
         }
     }
+    pipe_lock.release(flags);
+    if (ext) |e| pmm.freeContiguous(hhdm.virtToPhys(@intFromPtr(e)), PIPE_DEFAULT_SIZE / 4096);
     return null;
 }
 

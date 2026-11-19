@@ -252,6 +252,9 @@ static void phase_a2b(void) {
         syscall3(SYS_WRITE, (u64)p[1], (u64)&x, 1);
         s64 status = 0;
         syscall3(SYS_WAITPID, (u64)-1, (u64)&status, 0);
+        /* The pipe's 64 KiB ring would otherwise count as leaked frames. */
+        syscall1(SYS_CLOSE, (u64)p[0]);
+        syscall1(SYS_CLOSE, (u64)p[1]);
         if ((status >> 8) == 3) fail_exit("A2b COW-shared reservation frame corrupted by munmap");
         if (status != 0) fail_exit("A2b child status");
     }

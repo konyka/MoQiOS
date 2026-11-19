@@ -67,7 +67,7 @@ fn eql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-/// A pipe starts with one buffer page (Linux starts with 16; F_GETPIPE_SZ reports the real size).
+/// The smallest pipe size (one page): F_SETPIPE_SZ rounds a smaller request up to it. A new pipe has 16 pages (vfs.PIPE_DEFAULT_SIZE).
 pub const PIPE_SIZE: u32 = 4096;
 /// /proc/sys/fs/pipe-max-size: the most an unprivileged F_SETPIPE_SZ may grow a pipe to.
 pub const PIPE_MAX_SIZE: u64 = 1 << 20;

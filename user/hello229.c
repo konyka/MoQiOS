@@ -63,6 +63,7 @@ int main(int argc, char **argv, char **envp) {
     /* A: read on an empty pipe */
     install(0);
     pipe(p);
+    syscall3(142 /* fcntl */, p[1], 1031 /* F_SETPIPE_SZ */, 4096); /* one page: the capacity the cases below are built on */
     long kid = spawn_signaller(me, p[1], "hi", 0);
     long r = read(p[0], buf, sizeof buf);
     check(r == -EINTR && hits == 1, "A: without SA_RESTART a blocked read returns -EINTR after the handler ran");
@@ -78,6 +79,7 @@ int main(int argc, char **argv, char **envp) {
 
     install(SA_RESTART_BIT);
     pipe(p);
+    syscall3(142 /* fcntl */, p[1], 1031 /* F_SETPIPE_SZ */, 4096); /* one page: the capacity the cases below are built on */
     kid = spawn_signaller(me, p[1], "hey", 0);
     r = read(p[0], buf, sizeof buf);
     check(r == 3 && buf[0] == 'h' && hits == 1, "A: with SA_RESTART the same read waits through the handler and returns the data (3 bytes, handler ran once)");
@@ -113,6 +115,7 @@ int main(int argc, char **argv, char **envp) {
     /* D: a signal with no handler work to do (ignored) does not disturb a blocked read at all */
     install(SA_RESTART_BIT);
     pipe(p);
+    syscall3(142 /* fcntl */, p[1], 1031 /* F_SETPIPE_SZ */, 4096); /* one page: the capacity the cases below are built on */
     signal(SIGUSR2, SIG_IGN);
     long k2 = fork();
     if (k2 == 0) {
@@ -132,6 +135,7 @@ int main(int argc, char **argv, char **envp) {
     struct iovec_ { void *base; unsigned long len; };
     install(0);
     pipe(p);
+    syscall3(142 /* fcntl */, p[1], 1031 /* F_SETPIPE_SZ */, 4096); /* one page: the capacity the cases below are built on */
     kid = spawn_signaller(me, p[1], "ab", 0);
     struct iovec_ iov = { buf, sizeof buf };
     r = syscall3(19 /* readv */, p[0], (long)&iov, 1);
@@ -142,6 +146,7 @@ int main(int argc, char **argv, char **envp) {
     close(p[1]);
     install(SA_RESTART_BIT);
     pipe(p);
+    syscall3(142 /* fcntl */, p[1], 1031 /* F_SETPIPE_SZ */, 4096); /* one page: the capacity the cases below are built on */
     kid = spawn_signaller(me, p[1], "abc", 0);
     iov.base = buf;
     iov.len = sizeof buf;
@@ -181,7 +186,8 @@ int main(int argc, char **argv, char **envp) {
         close(sv[1]);
     }
 
-    /* F: a blocking write to a full pipe waits for room (pipe capacity is 4095 bytes). */
+    /* F: a blocking write to a full pipe waits for room. A pipe starts with 64 KiB (16 pages, as on Linux); every pipe here is
+     * shrunk to one page with F_SETPIPE_SZ, so it holds 4095 bytes. */
     static char big[10000];
     for (int i = 0; i < 10000; i++) big[i] = (char)(i % 251);
     install(0);
@@ -189,6 +195,7 @@ int main(int argc, char **argv, char **envp) {
 
     /* F1: 10000 bytes through a 4095-byte pipe to a slow reader arrive complete and in order. */
     pipe(p);
+    syscall3(142 /* fcntl */, p[1], 1031 /* F_SETPIPE_SZ */, 4096); /* one page: the capacity the cases below are built on */
     kid = fork();
     if (kid == 0) {
         close(p[1]);
@@ -215,6 +222,7 @@ int main(int argc, char **argv, char **envp) {
     /* F2: a full pipe: a non-blocking write says EAGAIN; a blocking one waits, is interrupted by a handler without SA_RESTART
      * (EINTR), and runs on to completion with SA_RESTART once the reader makes room. */
     pipe(p);
+    syscall3(142 /* fcntl */, p[1], 1031 /* F_SETPIPE_SZ */, 4096); /* one page: the capacity the cases below are built on */
     r = write(p[1], big, 4095);
     check(r == 4095, "F: the pipe takes 4095 bytes");
     long fl = syscall3(142 /* fcntl */, p[1], 3 /* F_GETFL */, 0);
@@ -249,6 +257,7 @@ int main(int argc, char **argv, char **envp) {
     /* F3: the reader goes away while the writer waits: EPIPE (SIGPIPE is ignored here). */
     install(0);
     pipe(p);
+    syscall3(142 /* fcntl */, p[1], 1031 /* F_SETPIPE_SZ */, 4096); /* one page: the capacity the cases below are built on */
     r = write(p[1], big, 4095);
     kid = fork();
     if (kid == 0) {
@@ -266,6 +275,7 @@ int main(int argc, char **argv, char **envp) {
      * room nothing of its data is in the pipe for another writer's bytes to be mixed into. */
     install(0);
     pipe(p);
+    syscall3(142 /* fcntl */, p[1], 1031 /* F_SETPIPE_SZ */, 4096); /* one page: the capacity the cases below are built on */
     memset(big, 'F', 2000);
     r = write(p[1], big, 2000);
     long fl2 = syscall3(142, p[1], 3, 0);
@@ -368,6 +378,7 @@ int main(int argc, char **argv, char **envp) {
     struct iovec_ wv[2] = { { wa, sizeof wa }, { wb, sizeof wb } };
     install(0);
     pipe(p);
+    syscall3(142 /* fcntl */, p[1], 1031 /* F_SETPIPE_SZ */, 4096); /* one page: the capacity the cases below are built on */
     r = write(p[1], big, 4095);
     kid = spawn_signaller(me, -1, (const char *)0, 0);
     r = syscall3(20 /* writev */, p[1], (long)wv, 2);

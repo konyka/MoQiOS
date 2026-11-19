@@ -16966,3 +16966,13 @@ test "clone takes SIGCHLD (or 0) as its exit signal, so clone(SIGCHLD) is fork (
     try std.testing.expect(!cfp.valid(10, true));
     try std.testing.expect(cfp.valid(cfp.CLONE_VM | cfp.CLONE_FILES | cfp.CLONE_THREAD | cfp.CLONE_SETTLS | cfp.CLONE_CHILD_CLEARTID, true));
 }
+
+test "a new pipe gets a 16-page ring like Linux (hello448)" {
+    // Linux fs/pipe.c alloc_pipe_info: PIPE_DEF_BUFFERS (16) pages, F_GETPIPE_SZ 65536. The kernel gave every pipe one page.
+    const v = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, v, "pub const PIPE_DEFAULT_SIZE: u32 = 16 * 4096;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "pmm.allocContiguous(PIPE_DEFAULT_SIZE / 4096)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "pipes[i].cap = PIPE_DEFAULT_SIZE;") != null);
+    // F_SETPIPE_SZ still goes down to one page.
+    try std.testing.expectEqual(@as(u64, 4096), kt.fcntl_policy.roundPipeSize(1).?);
+}
