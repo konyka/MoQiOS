@@ -109,6 +109,8 @@ pub const EpollItem = struct {
     ready_next: ?u8 = null,
     last_reported: u32 = 0,
     in_use: bool = false,
+    /// A signalfd's mask (its readiness is the waiting task's pending signals in it, signalfd_poll).
+    sigmask: u64 = 0,
 };
 
 /// EpollInstance — represents one epoll fd.
@@ -343,6 +345,7 @@ pub fn epollCtl(epfd: u32, op: i32, fd: i32, event_ptr: u64) i64 {
                 .is_et = (ev.events & EPOLLET) != 0,
                 .is_oneshot = (ev.events & EPOLLONESHOT) != 0,
                 .in_use = true,
+                .sigmask = if (desc.fd_type == .signalfd) desc.file_data else 0,
             };
             inst.next_registration_generation +%= 1;
             inst.item_count += 1;
@@ -1025,6 +1028,28 @@ fn removeFromReadyListSlot(inst: *EpollInstance, slot: u8) void {
     }
 }
 
+/// The calling task's pending signals, its own and those held for its process.
+fn callerPendingSignals() u64 {
+    const t = sched.currentTask() orelse return 0;
+    return @atomicLoad(u64, &t.pending_signals, .seq_cst) | @atomicLoad(u64, &t.grp().held_signals, .seq_cst);
+}
+
+/// The signals the signalfds registered in `inst` wait for: a waiter publishes them in sigwait_mask, so a send of one wakes it
+/// (signal.kickIfBlocked) the way Linux's signalfd wait queue does.
+fn signalfdMaskLocked(inst: *const EpollInstance) u64 {
+    var m: u64 = 0;
+    for (0..2) |w| {
+        var bits = inst.in_use_bm[w];
+        while (bits != 0) {
+            const bit = @ctz(bits);
+            bits &= bits - 1;
+            const it = &inst.items[w * 64 + bit];
+            if (it.fd_type == .signalfd and !it.is_disabled) m |= it.sigmask;
+        }
+    }
+    return m;
+}
+
 fn collectEvents(inst: *EpollInstance, waiter_table: *vfs.FdTable, out: []EpollEvent, max_out: u32) u32 {
     const saved = inst.spin.acquire();
 
@@ -1045,9 +1070,23 @@ fn collectEvents(inst: *EpollInstance, waiter_table: *vfs.FdTable, out: []EpollE
         is_et: bool,
         is_oneshot: bool,
         kmsg_cursor: u64,
+        sigmask: u64,
     };
     var snapshots: [MAX_EPOLL_ITEMS]ReadySnapshot = undefined;
     var snapshot_count: usize = 0;
+    // A signalfd has no notifier of its own (a signal names a task, not a descriptor): it is probed on every scan against the waiting
+    // task's pending signals, like signalfd_poll reading current's.
+    const pending_sigs = callerPendingSignals();
+    for (0..2) |w| {
+        var bits = inst.in_use_bm[w];
+        while (bits != 0) {
+            const bit = @ctz(bits);
+            bits &= bits - 1;
+            const i: u8 = @intCast(w * 64 + @as(u32, bit));
+            const it = &inst.items[i];
+            if (it.fd_type == .signalfd and !it.is_disabled and !it.on_ready and it.sigmask & pending_sigs != 0) addToReadyListLocked(inst, i);
+        }
+    }
     const scan_head = inst.ready_head;
     const drained_ready_queue = scan_head != null;
     const drained_slot = epollSlotOf(inst);
@@ -1089,6 +1128,7 @@ fn collectEvents(inst: *EpollInstance, waiter_table: *vfs.FdTable, out: []EpollE
             .is_et = item.is_et,
             .is_oneshot = item.is_oneshot,
             .kmsg_cursor = kmsgCursorForItem(inst, item.probe_fd),
+            .sigmask = item.sigmask,
         };
         snapshot_count += 1;
         cur = next;
@@ -1127,7 +1167,10 @@ fn collectEvents(inst: *EpollInstance, waiter_table: *vfs.FdTable, out: []EpollE
                 continue;
             }
         }
-        const current = computeCurrentEvents(snapshot.fd_type, snapshot.resource_idx, snapshot.kmsg_cursor);
+        const current = if (snapshot.fd_type == .signalfd)
+            (if (snapshot.sigmask & pending_sigs != 0) EPOLLIN else 0)
+        else
+            computeCurrentEvents(snapshot.fd_type, snapshot.resource_idx, snapshot.kmsg_cursor);
         if (child_borrow) |*borrowed| borrowed.release();
         const interest = snapshot.events & ~EPOLLET & ~EPOLLONESHOT;
         const matched = current & interest;
@@ -1214,6 +1257,18 @@ fn blockOnEpoll(inst: *EpollInstance, deadline_ns: ?u64) BlockOutcome {
         inst.spin.release(saved);
         return .event;
     }
+    // A signalfd's signal wakes this wait: publish the masks (kickIfBlocked reads sigwait_mask), then look once more for a signal
+    // that arrived before they were visible.
+    const sigwait = signalfdMaskLocked(inst);
+    if (sigwait != 0) {
+        @atomicStore(u64, &ct.sigwait_mask, sigwait, .seq_cst);
+        if (callerPendingSignals() & sigwait != 0) {
+            @atomicStore(u64, &ct.sigwait_mask, 0, .release);
+            inst.spin.release(saved);
+            return .event;
+        }
+    }
+    defer if (sigwait != 0) @atomicStore(u64, &ct.sigwait_mask, 0, .release);
 
     const generation = @atomicRmw(u64, &wait_generations[my_idx], .Add, 1, .seq_cst) +% 1;
     var node = WaitNode{
@@ -1256,7 +1311,8 @@ fn blockOnEpoll(inst: *EpollInstance, deadline_ns: ?u64) BlockOutcome {
         // Signal kick: sendSignal unblocks the task without granting the
         // wait node. epollDestroy wakes waiters of a dead instance the same way.
         const actionable = sig_mod.pendingActionable(ct);
-        if (!expired and !actionable and @atomicLoad(bool, &inst.valid, .acquire)) {
+        const sig_ready = sigwait != 0 and callerPendingSignals() & sigwait != 0;
+        if (!expired and !actionable and !sig_ready and @atomicLoad(bool, &inst.valid, .acquire)) {
             ct.state = .blocked;
             // A default stop pending now is taken instead of sleeping (the handshake pipeRead uses): the task is .blocked and
             // queued, and the sender sets the pending bit before it looks at the state.

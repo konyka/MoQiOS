@@ -16905,3 +16905,14 @@ test "IP_RECVERR: ICMP errors are queued for recvmsg(MSG_ERRQUEUE) (hello445)" {
     try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "notifyIcmpError(.{") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.epoll_source, "udp_mod.hasQueuedError(") != null);
 }
+
+test "signalfd in epoll: readiness from the waiter's pending signals and a wake on arrival (hello446)" {
+    // Linux signalfd_poll reads current's pending set and a signal wakes the sighand wait queue an epoll waiter sits on. The kernel
+    // used to give epoll no signalfd readiness at all (computeCurrentEvents' `.signalfd => {}`), so epoll_wait slept until its timeout.
+    const es = kt.epoll_source;
+    try std.testing.expect(std.mem.indexOf(u8, es, "if (it.fd_type == .signalfd and !it.is_disabled and !it.on_ready and it.sigmask & pending_sigs != 0) addToReadyListLocked(inst, i);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, es, "@atomicStore(u64, &ct.sigwait_mask, sigwait, .seq_cst);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, es, ".sigmask = if (desc.fd_type == .signalfd) desc.file_data else 0,") != null);
+    // kickIfBlocked wakes a blocked task for a signal in its sigwait_mask even though it blocks it.
+    try std.testing.expect(kt.signal_action_policy.wakesSigwaiter(1 << 9, 1 << 9));
+}

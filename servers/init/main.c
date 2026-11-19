@@ -562,6 +562,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello443"); /* TCP urgent data: MSG_OOB, POLLPRI, exceptfds, SIOCATMARK, SIGURG */
     run_test("hello444"); /* SO_TIMESTAMP(NS) and IP(V6)_RECVORIGDSTADDR control messages */
     run_test("hello445"); /* IP_RECVERR: ICMP errors queued for recvmsg(MSG_ERRQUEUE) */
+    run_test("hello446"); /* a signalfd in epoll reports its signals and wakes epoll_wait */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */
