@@ -16,8 +16,20 @@ pub const CLONE_CHILD_CLEARTID: u64 = 0x200000;
 pub const IMPLEMENTED_FLAGS: u64 = CLONE_VM | CLONE_FILES | CLONE_THREAD | CLONE_SETTLS;
 pub const TID_FLAGS: u64 = CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
 
+/// The low byte of clone's flags is the signal the parent gets when the child exits (Linux CSIGNAL). Only SIGCHLD (the fork
+/// behaviour every waitpid understands) and 0 (no signal, which this kernel still reports like SIGCHLD) are taken: another signal
+/// would need __WCLONE children, which are not modelled, so it stays EINVAL instead of being silently turned into SIGCHLD.
+pub const CSIGNAL: u64 = 0xff;
+pub const SIGCHLD: u64 = 17;
+
+pub fn exitSignalOk(flags: u64) bool {
+    const sig = flags & CSIGNAL;
+    return sig == 0 or sig == SIGCHLD;
+}
+
 pub fn valid(flags: u64, has_mm: bool) bool {
-    if (flags & ~(IMPLEMENTED_FLAGS | TID_FLAGS) != 0) return false;
+    if (!exitSignalOk(flags)) return false;
+    if (flags & ~(IMPLEMENTED_FLAGS | TID_FLAGS | CSIGNAL) != 0) return false;
     if (flags & (TID_FLAGS | CLONE_THREAD) != 0 and flags & CLONE_VM == 0) return false;
     if (flags & CLONE_VM != 0 and !has_mm) return false;
     return true;
@@ -63,4 +75,8 @@ test "clone policy rejects ignored TID flags and incoherent thread combinations"
     try std.testing.expect(valid(CLONE_VM | CLONE_PARENT_SETTID, true));
     try std.testing.expect(valid(CLONE_VM | CLONE_CHILD_CLEARTID, true));
     try std.testing.expect(!valid(CLONE_VM, false));
+    // clone(SIGCHLD) is fork; another exit signal is not modelled.
+    try std.testing.expect(valid(SIGCHLD, true));
+    try std.testing.expect(valid(CLONE_VM | SIGCHLD, true));
+    try std.testing.expect(!valid(10, true));
 }

@@ -16942,3 +16942,22 @@ test "MADV_WIPEONFORK: fork gives the child fresh zero pages for the marked rang
     try std.testing.expect(std.mem.indexOf(u8, fk, "if (!fillWipedPages(parent.page_table_phys, pml4, parent.vma().regions)) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, fk, "paging_mod.setPageEntryRaw(child_pml4_phys, va, phys | flags);") != null);
 }
+
+test "clone without CLONE_VM honours MADV_DONTFORK and MADV_WIPEONFORK like fork (hello447 E)" {
+    // clone(SIGCHLD) copies the address space through arch/x86_64/clone.zig's own page-table walk, which used to copy every page
+    // and keep every region, so DONTFORK / WIPEONFORK only worked for fork().
+    const cs = kt.clone_source;
+    try std.testing.expect(std.mem.indexOf(u8, cs, "if (@import(\"../../mm/filemap.zig\").inDontforkRegion(task_mod.MmapRegion, shared_regions, virt)) continue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cs, "@import(\"../../proc/fork.zig\").fillWipedPages(parent.page_table_phys, pml4, parent.vma().regions)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cs, "@import(\"../../mm/vma_table.zig\").dropDontfork(&vma_snap);") != null);
+}
+
+test "clone takes SIGCHLD (or 0) as its exit signal, so clone(SIGCHLD) is fork (hello447 E)" {
+    // Linux CSIGNAL: the low byte of the flags is the signal the parent gets at exit. clone(SIGCHLD) was EINVAL (17 is outside the
+    // implemented flag set), so a runtime calling clone instead of fork failed. Other exit signals need __WCLONE: still EINVAL.
+    const cfp = kt.clone_flags_policy;
+    try std.testing.expect(cfp.valid(cfp.SIGCHLD, true));
+    try std.testing.expect(cfp.valid(0, true));
+    try std.testing.expect(!cfp.valid(10, true));
+    try std.testing.expect(cfp.valid(cfp.CLONE_VM | cfp.CLONE_FILES | cfp.CLONE_THREAD | cfp.CLONE_SETTLS | cfp.CLONE_CHILD_CLEARTID, true));
+}

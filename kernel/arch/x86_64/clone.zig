@@ -206,6 +206,9 @@ pub fn cloneUserPages(parent_pml4_phys: u64, shared_regions: []const task_mod.Mm
                         (@as(u64, pdpt_idx) << 30) |
                         (@as(u64, pd_idx) << 21) |
                         (@as(u64, pt_idx) << 12);
+                    // MADV_DONTFORK pages are not copied (the region is dropped from the child's table); MADV_WIPEONFORK pages are
+                    // replaced by fork.fillWipedPages with fresh zero pages afterwards — the same rules as fork's cloneUserPagesCow.
+                    if (@import("../../mm/filemap.zig").inDontforkRegion(task_mod.MmapRegion, shared_regions, virt)) continue;
                     const shared_mapping = isSharedMapping(shared_regions, virt);
                     if (isZeroPage(src) and !shared_mapping) continue;
 
@@ -304,8 +307,14 @@ pub fn clone(
             var vm_guard = @import("../../mm/mm.zig").Mm.beginVmMutation(parent.mm, @ptrCast(parent)) catch return -12; // ENOMEM
             defer vm_guard.release();
             const pml4 = cloneUserPages(parent.page_table_phys, parent.vma().regions) orelse return -12; // ENOMEM
-            // The copied address space gets a copy of the mapping table, taken in the same critical section.
+            if (!@import("../../proc/fork.zig").fillWipedPages(parent.page_table_phys, pml4, parent.vma().regions)) {
+                @import("../../mm/user_space.zig").destroyUserSpace(pml4);
+                return -12; // ENOMEM
+            }
+            // The copied address space gets a copy of the mapping table, taken in the same critical section; MADV_DONTFORK
+            // regions are not part of it.
             @import("../../mm/vma_table.zig").snapshot(parent.vma(), &vma_snap);
+            @import("../../mm/vma_table.zig").dropDontfork(&vma_snap);
             break :clone pml4;
         };
 
