@@ -16,15 +16,31 @@ pub const CLONE_CHILD_CLEARTID: u64 = 0x200000;
 pub const IMPLEMENTED_FLAGS: u64 = CLONE_VM | CLONE_FILES | CLONE_THREAD | CLONE_SETTLS;
 pub const TID_FLAGS: u64 = CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
 
-/// The low byte of clone's flags is the signal the parent gets when the child exits (Linux CSIGNAL). Only SIGCHLD (the fork
-/// behaviour every waitpid understands) and 0 (no signal, which this kernel still reports like SIGCHLD) are taken: another signal
-/// would need __WCLONE children, which are not modelled, so it stays EINVAL instead of being silently turned into SIGCHLD.
+/// The low byte of clone's flags is the signal the parent gets when the child exits (Linux CSIGNAL, copy_process exit_signal): any
+/// signal up to 64, or 0 for none. A child whose exit signal is not SIGCHLD is a "clone child": only waitpid with __WCLONE or __WALL
+/// sees it (eligible_child). Above 64 is EINVAL (valid_signal). A thread (CLONE_THREAD) reports to nobody, so its value is unused.
 pub const CSIGNAL: u64 = 0xff;
 pub const SIGCHLD: u64 = 17;
+pub const MAX_SIGNAL: u64 = 64;
 
 pub fn exitSignalOk(flags: u64) bool {
-    const sig = flags & CSIGNAL;
-    return sig == 0 or sig == SIGCHLD;
+    return flags & CSIGNAL <= MAX_SIGNAL;
+}
+
+/// The exit signal a new child records: the CSIGNAL byte for a process, SIGCHLD's value for a thread (never sent).
+pub fn exitSignalOf(flags: u64) u8 {
+    if (flags & CLONE_THREAD != 0) return @intCast(SIGCHLD);
+    return @intCast(flags & CSIGNAL);
+}
+
+/// clone3_args_valid / kernel_clone_args checks on clone_args.exit_signal: the CSIGNAL bits of `flags` must be clear (clone3 has its
+/// own field), the field must be a valid signal with nothing above the low byte, and a thread may not name one. The flags clone()
+/// then runs with: `flags` plus the exit signal in the low byte. Null is EINVAL.
+pub fn clone3Flags(flags: u64, exit_signal: u64) ?u64 {
+    if (flags & CSIGNAL != 0) return null;
+    if (exit_signal & ~CSIGNAL != 0 or exit_signal > MAX_SIGNAL) return null;
+    if (flags & CLONE_THREAD != 0 and exit_signal != 0) return null;
+    return flags | exit_signal;
 }
 
 pub fn valid(flags: u64, has_mm: bool) bool {
@@ -75,8 +91,9 @@ test "clone policy rejects ignored TID flags and incoherent thread combinations"
     try std.testing.expect(valid(CLONE_VM | CLONE_PARENT_SETTID, true));
     try std.testing.expect(valid(CLONE_VM | CLONE_CHILD_CLEARTID, true));
     try std.testing.expect(!valid(CLONE_VM, false));
-    // clone(SIGCHLD) is fork; another exit signal is not modelled.
+    // clone(SIGCHLD) is fork; any other signal up to 64 makes a clone child (hello450), beyond is EINVAL.
     try std.testing.expect(valid(SIGCHLD, true));
     try std.testing.expect(valid(CLONE_VM | SIGCHLD, true));
-    try std.testing.expect(!valid(10, true));
+    try std.testing.expect(valid(10, true));
+    try std.testing.expect(!valid(65, true));
 }

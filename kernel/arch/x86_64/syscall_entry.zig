@@ -2190,11 +2190,12 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
                 if (n != clone3_policy.copySize(clone_args_size)) {
                     frame.rax = @bitCast(@as(i64, -14)); // EFAULT
                 } else {
-                    const flags = bo.readU64Le(buf[clone3_policy.FLAGS_OFFSET..][0..8]);
+                    // clone_args.exit_signal goes into the low byte clone() reads it from (the CSIGNAL bits of flags must be clear).
+                    const flags = clone_flags_policy.clone3Flags(bo.readU64Le(buf[clone3_policy.FLAGS_OFFSET..][0..8]), bo.readU64Le(buf[clone3_policy.EXIT_SIGNAL_OFFSET..][0..8])) orelse 0xffff_ffff_ffff_ffff;
                     if (!clone_flags_policy.valid(flags, true) or
                         !clone3_policy.unsupportedFieldsZero(
                             bo.readU64Le(buf[clone3_policy.PIDFD_OFFSET..][0..8]),
-                            bo.readU64Le(buf[clone3_policy.EXIT_SIGNAL_OFFSET..][0..8]),
+                            0,
                             bo.readU64Le(buf[clone3_policy.STACK_SIZE_OFFSET..][0..8]),
                             bo.readU64Le(buf[clone3_policy.SET_TID_OFFSET..][0..8]),
                             bo.readU64Le(buf[clone3_policy.SET_TID_SIZE_OFFSET..][0..8]),

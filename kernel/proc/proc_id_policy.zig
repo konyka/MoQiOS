@@ -61,6 +61,22 @@ const WNOTHREAD: u32 = 0x2000_0000;
 const WALL: u32 = 0x4000_0000;
 const WCLONE: u32 = 0x8000_0000;
 
+/// Task.exit_signal_x is the exit signal XOR SIGCHLD, so a zeroed task slot reports with SIGCHLD.
+pub fn exitSignalStore(sig: u8) u8 {
+    return sig ^ 17;
+}
+
+pub fn exitSignalLoad(stored: u8) u8 {
+    return stored ^ 17;
+}
+
+/// eligible_child: __WALL waits for every child; otherwise __WCLONE waits only for children whose exit signal is not SIGCHLD ("clone
+/// children", including those with none), and a wait without it only for the others.
+pub fn waitEligible(exit_signal: u8, options: u32) bool {
+    if (options & WALL != 0) return true;
+    return (exit_signal != 17) == (options & WCLONE != 0);
+}
+
 /// wait4/waitpid options: only the defined bits are valid, the rest EINVAL.
 pub fn waitOptionsErrno(options: u32) i64 {
     const valid = WNOHANG | WUNTRACED | WCONTINUED | WNOTHREAD | WALL | WCLONE;

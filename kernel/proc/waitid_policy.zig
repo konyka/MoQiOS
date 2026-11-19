@@ -1,8 +1,8 @@
 //! Pure waitid rules (Linux kernel/exit.c waitid, measured on the host with the raw syscall).
 //!
 //! idtype selects the children: P_ALL any, P_PID one pid, P_PGID one process group. Which is not an idtype, and a zero pid with P_PID or
-//! P_PGID, are EINVAL. options must name at least one of WEXITED, WSTOPPED and WCONTINUED; every other bit but WNOHANG and WNOWAIT is
-//! EINVAL.
+//! P_PGID, are EINVAL. options must name at least one of WEXITED, WSTOPPED and WCONTINUED; every other bit but WNOHANG, WNOWAIT,
+//! __WNOTHREAD, __WALL and __WCLONE is EINVAL.
 //!
 //! A report is a SIGCHLD siginfo: si_code is CLD_EXITED / CLD_KILLED / CLD_STOPPED / CLD_CONTINUED and si_status is the exit code, the
 //! killing signal, the stop signal or SIGCONT. WNOWAIT reports an exit without reaping it, so the same zombie is reported again. A call
@@ -28,7 +28,8 @@ pub const SIGCONT: u32 = 18;
 pub const EINVAL: i64 = -22;
 
 const KINDS: u32 = WEXITED | WSTOPPED | WCONTINUED;
-const KNOWN: u32 = KINDS | WNOHANG | WNOWAIT;
+/// __WNOTHREAD, __WALL and __WCLONE are accepted as for waitpid (kernel_waitid).
+const KNOWN: u32 = KINDS | WNOHANG | WNOWAIT | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
 
 pub const Request = struct {
     /// The pid argument the existing waitpid scan understands: -1 any, >0 one child, < -1 one group.

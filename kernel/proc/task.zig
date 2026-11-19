@@ -330,6 +330,10 @@ pub const Task = struct {
 
     /// Parent death signal (0 = none). Delivered to child when parent exits.
     pdeathsig: u32 = 0,
+    /// The signal the parent gets when this process exits (Linux exit_signal), stored as `exitSignalStored` so that the all-zero slot
+    /// zeroSlot leaves is SIGCHLD (fork, spawn, after exec); clone sets its CSIGNAL byte (0 = none). Read it with exitSignal(): not
+    /// SIGCHLD makes it a clone child that only __WCLONE / __WALL waits see.
+    exit_signal_x: u8 = 0,
     /// PR_SET_NO_NEW_PRIVS: one-way, inherited by fork/clone, kept across exec.
     no_new_privs: bool = false,
 
@@ -365,6 +369,14 @@ pub const Task = struct {
     inheritable_caps: @import("../ipc/capability.zig").SysCap = @import("../ipc/capability.zig").NO_CAPS,
     /// Internal trust marker: only the boot-created init may delegate profiles.
     initial_init: bool = false,
+
+    pub fn exitSignal(self: *const Task) u8 {
+        return @import("proc_id_policy.zig").exitSignalLoad(self.exit_signal_x);
+    }
+
+    pub fn setExitSignal(self: *Task, sig: u8) void {
+        self.exit_signal_x = @import("proc_id_policy.zig").exitSignalStore(sig);
+    }
 
     /// The table of tracked mappings of this task's address space (shared by CLONE_VM threads). A task without an
     /// address space (a kernel thread, or a reaped slot) gets one static empty table that nothing may fill.
@@ -1324,7 +1336,8 @@ pub fn exitTask(requested_code: i32) void {
     // re-take it. Threads report through clear_tid, not SIGCHLD.
     if (notify_parent) {
         const sp = @import("siginfo_policy.zig");
-        _ = @import("signal.zig").sendSignalInfo(sigchld_parent, 17, sp.childInfo(reporter.tid, reporter.uid, exit_code, reporter.exited_via_syscall));
+        // do_notify_parent(tsk, tsk->exit_signal): the signal clone named (none for 0), with the same CLD_* siginfo.
+        if (reporter.exitSignal() != 0) _ = @import("signal.zig").sendSignalInfo(sigchld_parent, reporter.exitSignal(), sp.childInfo(reporter.tid, reporter.uid, exit_code, reporter.exited_via_syscall));
     }
 
     // 作业控制：控制台会话长挂断前台组；因本次退出成为孤儿且含停止成员的
@@ -1715,7 +1728,8 @@ pub fn reapZombies() u32 {
                 .is_thread = t.is_thread,
                 .parent_alive = parent_idx != null,
                 .maps_objects = false, // the table is the address space's, not a thread's copy: nothing here to keep alive
-                .parent_ignores_sigchld = if (parent_idx) |pi| tasks[pi].sigact().handlers[17 - 1] == 1 else false,
+                // do_notify_parent auto-reaps only a child that reports with SIGCHLD.
+                .parent_ignores_sigchld = if (parent_idx) |pi| t.exitSignal() == 17 and tasks[pi].sigact().handlers[17 - 1] == 1 else false,
             };
             if (reap_policy.autoReap(zombieViewLocked(i, t), lineage) != .detach) continue;
             if (deferred) {
@@ -2104,6 +2118,7 @@ pub fn takeWaitReportLocked(parent_idx: u32, pid: i32, options: u32, status: *i3
         const t = &tasks[i];
         if (t.parent_tid != parent.tid or t.is_thread or t.state == .zombie) continue;
         if (!@import("proc_id_policy.zig").waitMatches(pid, t.tid, t.pgid, parent.pgid)) continue;
+        if (!@import("proc_id_policy.zig").waitEligible(t.exitSignal(), options)) continue;
         const st = wrp.report(options, t.wait_report) orelse continue;
         if (consume) t.wait_report = wrp.consume(t.wait_report, st);
         status.* = st;
@@ -2122,7 +2137,7 @@ pub fn takeWaitReport(parent_idx: u32, pid: i32, options: u32, status: *i32) ?u3
 /// waitid(WNOWAIT): a matching zombie whose exit can be reported, without reaping it. Caller MUST hold task_lock.
 /// Returns the child's slot, or null. A zombie that is not yet reportable (still the current task, or not past the
 /// epilogue gate) comes back as `.busy` so the caller waits instead of saying there is no status.
-pub fn peekZombieLocked(parent_idx: u32, pid: i32) union(enum) { none, busy, child: u32 } {
+pub fn peekZombieLocked(parent_idx: u32, pid: i32, options: u32) union(enum) { none, busy, child: u32 } {
     const parent = getTask(parent_idx) orelse return .none;
     var busy_child = false;
     var bits = slot_bitmap;
@@ -2132,6 +2147,7 @@ pub fn peekZombieLocked(parent_idx: u32, pid: i32) union(enum) { none, busy, chi
         const t = &tasks[i];
         if (t.parent_tid != parent.tid or t.is_thread) continue;
         if (!@import("proc_id_policy.zig").waitMatches(pid, t.tid, t.pgid, parent.pgid)) continue;
+        if (!@import("proc_id_policy.zig").waitEligible(t.exitSignal(), options)) continue;
         switch (reap_policy.verdict(zombieViewLocked(i, t))) {
             .skip => continue,
             .busy => {
@@ -2178,7 +2194,7 @@ pub fn unlockTask(flags: u64) void {
 
 /// Single zombie-child scan. Caller MUST hold task_lock (via lockTask).
 /// Lockless body of `waitpid` — see it for the reaping rules.
-pub fn waitpidScanLocked(parent_idx: u32, pid: i32, status: *i32) WaitScan {
+pub fn waitpidScanLocked(parent_idx: u32, pid: i32, options: u32, status: *i32) WaitScan {
     const parent = getTask(parent_idx) orelse return .none;
     const parent_tid_val = parent.tid;
 
@@ -2191,6 +2207,7 @@ pub fn waitpidScanLocked(parent_idx: u32, pid: i32, status: *i32) WaitScan {
         if (t.parent_tid != parent_tid_val) continue;
         if (t.is_thread) continue; // 线程由 pthread_join 汇合，不经 waitpid
         if (!@import("proc_id_policy.zig").waitMatches(pid, t.tid, t.pgid, parent.pgid)) continue;
+        if (!@import("proc_id_policy.zig").waitEligible(t.exitSignal(), options)) continue;
         // A zombie still pinned, still current somewhere, or whose exit-time
         // switch epilogue may still run on its kernel stack (the
         // [switch-out → iretq] window — reaping there freed a live stack, the
@@ -2240,7 +2257,7 @@ pub fn finishReap(r: Reaped) void {
 /// Wait for a child process to exit. Returns the child's TID, or null if no
 /// child has exited yet (WNOHANG behavior). Writes the exit code to *status.
 /// pid == -1 means wait for any child; pid > 0 means wait for specific child.
-pub fn waitpid(parent_idx: u32, pid: i32, status: *i32, usage_out: ?*cpu_time_policy.Usage) ?u32 {
+pub fn waitpid(parent_idx: u32, pid: i32, options: u32, status: *i32, usage_out: ?*cpu_time_policy.Usage) ?u32 {
     // Retry loop: a zombie child may still be "current" on another CPU for up
     // to one timer tick after exit. Reaping in that window frees a kstack the
     // owner CPU is still executing on, so wait (lock released) until it has
@@ -2248,7 +2265,7 @@ pub fn waitpid(parent_idx: u32, pid: i32, status: *i32, usage_out: ?*cpu_time_po
     // the one running — so this never spins on itself.
     while (true) {
         const flags = task_lock.acquire();
-        const r = waitpidScanLocked(parent_idx, pid, status);
+        const r = waitpidScanLocked(parent_idx, pid, options, status);
         task_lock.release(flags);
         switch (r) {
             .reaped => |reaped| {
@@ -2285,9 +2302,15 @@ pub fn hasChildrenLocked(parent_idx: u32) bool {
 
 /// Does `parent_idx` have a child that waitpid(`pid`) could ever select? A pid
 /// that names no child (or an empty group) is ECHILD, not a reason to block.
-pub fn hasMatchingChild(parent_idx: u32, pid: i32) bool {
+pub fn hasMatchingChild(parent_idx: u32, pid: i32, options: u32) bool {
     const flags = task_lock.acquire();
     defer task_lock.release(flags);
+    return hasMatchingChildLocked(parent_idx, pid, options);
+}
+
+/// hasMatchingChild with task_lock held: a child waitpid(`pid`, `options`) could select, its exit signal eligible for the
+/// __WCLONE / __WALL choice in `options`.
+pub fn hasMatchingChildLocked(parent_idx: u32, pid: i32, options: u32) bool {
     const parent = getTask(parent_idx) orelse return false;
     var bits = slot_bitmap;
     while (bits != 0) {
@@ -2295,6 +2318,7 @@ pub fn hasMatchingChild(parent_idx: u32, pid: i32) bool {
         bits &= bits - 1;
         const t = &tasks[i];
         if (t.parent_tid != parent.tid or t.is_thread) continue;
+        if (!@import("proc_id_policy.zig").waitEligible(t.exitSignal(), options)) continue;
         if (@import("proc_id_policy.zig").waitMatches(pid, t.tid, t.pgid, parent.pgid)) return true;
     }
     return false;

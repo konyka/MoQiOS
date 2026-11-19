@@ -11325,7 +11325,7 @@ test "process CPU time wiring: reap folds children and threads, readers use the 
     const wp = kt.waitpid_source;
     // Every reap path reports the usage, including the blocking one.
     try std.testing.expect(std.mem.indexOf(u8, wp, "if (usage_out) |u| u.* = reaped.usage;") != null);
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, wp, "task_mod.waitpid(cur_idx, pid, &exit_code, usage_out)"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, wp, "task_mod.waitpid(cur_idx, pid, options, &exit_code, usage_out)"));
 
     const sc = kt.syscall_entry_source;
     // wait4 fills the rusage only when a child was reaped; RUSAGE_SELF/CHILDREN use the process totals.
@@ -16961,11 +16961,12 @@ test "clone without CLONE_VM honours MADV_DONTFORK and MADV_WIPEONFORK like fork
 
 test "clone takes SIGCHLD (or 0) as its exit signal, so clone(SIGCHLD) is fork (hello447 E)" {
     // Linux CSIGNAL: the low byte of the flags is the signal the parent gets at exit. clone(SIGCHLD) was EINVAL (17 is outside the
-    // implemented flag set), so a runtime calling clone instead of fork failed. Other exit signals need __WCLONE: still EINVAL.
+    // implemented flag set), so a runtime calling clone instead of fork failed. hello450 adds the other exit signals (and __WCLONE).
     const cfp = kt.clone_flags_policy;
     try std.testing.expect(cfp.valid(cfp.SIGCHLD, true));
     try std.testing.expect(cfp.valid(0, true));
-    try std.testing.expect(!cfp.valid(10, true));
+    try std.testing.expect(cfp.valid(10, true));
+    try std.testing.expect(!cfp.valid(65, true));
     try std.testing.expect(cfp.valid(cfp.CLONE_VM | cfp.CLONE_FILES | cfp.CLONE_THREAD | cfp.CLONE_SETTLS | cfp.CLONE_CHILD_CLEARTID, true));
 }
 
@@ -17066,4 +17067,36 @@ test "an established TCP connection with IP_RECVERR takes an ICMP error as its p
     try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "if (takeLiveError(tcb)) |e| return e;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "up.tcpSoftIsHard(tcb.options.ip.recverr or tcb.options.ip.recverr6)") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "cur.fd_table.fds[fd].fd_type == .tcp_socket) return -11;") != null);
+}
+
+test "clone's exit signal: any signal up to 64 or none, __WCLONE / __WALL choose the children, exec resets it (hello450)" {
+    const cfp = kt.clone_flags_policy;
+    try std.testing.expect(cfp.valid(64, true));
+    try std.testing.expect(!cfp.valid(65, true));
+    try std.testing.expect(!cfp.valid(0xff, true));
+    try std.testing.expectEqual(@as(u8, 10), cfp.exitSignalOf(10));
+    try std.testing.expectEqual(@as(u8, 0), cfp.exitSignalOf(cfp.CLONE_VM));
+    try std.testing.expectEqual(@as(u8, 17), cfp.exitSignalOf(cfp.CLONE_VM | cfp.CLONE_THREAD));
+    try std.testing.expectEqual(@as(?u64, 10), cfp.clone3Flags(0, 10));
+    try std.testing.expect(cfp.clone3Flags(10, 0) == null);
+    try std.testing.expect(cfp.clone3Flags(0, 65) == null);
+    try std.testing.expect(cfp.clone3Flags(0, 0x1_0000_0011) == null);
+    try std.testing.expect(cfp.clone3Flags(cfp.CLONE_VM | cfp.CLONE_THREAD, 17) == null);
+    const pp = kt.proc_id_policy;
+    try std.testing.expect(pp.waitEligible(17, 0));
+    try std.testing.expect(!pp.waitEligible(10, 0));
+    try std.testing.expect(!pp.waitEligible(0, 0));
+    try std.testing.expect(pp.waitEligible(10, 0x8000_0000));
+    try std.testing.expect(!pp.waitEligible(17, 0x8000_0000));
+    try std.testing.expect(pp.waitEligible(17, 0x4000_0000));
+    try std.testing.expect(pp.waitEligible(0, 0x4000_0000));
+    try std.testing.expect(kt.waitid_policy.request(1, 5, 4 | 0x8000_0000) != null);
+    // A zeroed task slot (zeroSlot) must read as SIGCHLD.
+    try std.testing.expectEqual(@as(u8, 17), pp.exitSignalLoad(0));
+    try std.testing.expectEqual(@as(u8, 10), pp.exitSignalLoad(pp.exitSignalStore(10)));
+    try std.testing.expectEqual(@as(u8, 0), pp.exitSignalLoad(pp.exitSignalStore(0)));
+    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "if (reporter.exitSignal() != 0) _ = @import(\"signal.zig\").sendSignalInfo(sigchld_parent, reporter.exitSignal(),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "cur.setExitSignal(17);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "child.setExitSignal(clone_flags_policy.exitSignalOf(flags));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "clone_flags_policy.clone3Flags(") != null);
 }

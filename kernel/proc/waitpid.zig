@@ -33,10 +33,10 @@ pub fn waitpidUsage(pid_raw: u64, status_ptr: u64, options: u32, usage_out: ?*cp
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     if (status_ptr != 0 and !copy.validateUserBufferWritable(status_ptr, 4)) return -14;
 
-    if (!task_mod.hasMatchingChild(cur_idx, pid)) return -10; // -ECHILD: nothing waitpid(pid) could select
+    if (!task_mod.hasMatchingChild(cur_idx, pid, options)) return -10; // -ECHILD: nothing waitpid(pid) could select
 
     var exit_code: i32 = 0;
-    if (task_mod.waitpid(cur_idx, pid, &exit_code, usage_out)) |child_tid| {
+    if (task_mod.waitpid(cur_idx, pid, options, &exit_code, usage_out)) |child_tid| {
         if (!writeStatus(status_ptr, exit_code)) return -14;
         return child_tid;
     }
@@ -80,7 +80,7 @@ pub fn waitpidUsage(pid_raw: u64, status_ptr: u64, options: u32, usage_out: ?*cp
             return child_tid;
         }
 
-        switch (task_mod.waitpidScanLocked(cur_idx, pid, &exit_code)) {
+        switch (task_mod.waitpidScanLocked(cur_idx, pid, options, &exit_code)) {
             .reaped => |reaped| {
                 parent.waiting_for_child = false;
                 task_mod.unlockTask(tflags);
@@ -94,14 +94,14 @@ pub fn waitpidUsage(pid_raw: u64, status_ptr: u64, options: u32, usage_out: ?*cp
                 // ran already), so never block: spin-reap outside the lock.
                 parent.waiting_for_child = false;
                 task_mod.unlockTask(tflags);
-                if (task_mod.waitpid(cur_idx, pid, &exit_code, usage_out)) |child_tid| {
+                if (task_mod.waitpid(cur_idx, pid, options, &exit_code, usage_out)) |child_tid| {
                     if (!writeStatus(status_ptr, exit_code)) return -14;
                     return child_tid;
                 }
                 continue;
             },
             .none => {
-                if (!task_mod.hasChildrenLocked(cur_idx)) {
+                if (!task_mod.hasMatchingChildLocked(cur_idx, pid, options)) {
                     parent.waiting_for_child = false;
                     task_mod.unlockTask(tflags);
                     return -10; // -ECHILD
@@ -140,7 +140,7 @@ pub fn waitpidUsage(pid_raw: u64, status_ptr: u64, options: u32, usage_out: ?*cp
         // Woken up — a child may have exited. Reap first: a pending signal
         // only aborts the wait when no child status is available, so an
         // EINTR'd (or killed) waitpid never consumes the child's exit status.
-        if (task_mod.waitpid(cur_idx, pid, &exit_code, usage_out)) |child_tid| {
+        if (task_mod.waitpid(cur_idx, pid, options, &exit_code, usage_out)) |child_tid| {
             if (!writeStatus(status_ptr, exit_code)) return -14;
             return child_tid;
         }
@@ -180,7 +180,7 @@ pub fn waitid(idtype: u32, id: u64, infop: u64, options: u32, ru: u64) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     if (infop != 0 and !copy.validateUserBufferWritable(infop, siginfo.SIGINFO_SIZE)) return -14;
     if (ru != 0 and !copy.validateUserBufferWritable(ru, rusage_policy.RUSAGE_SIZE)) return -14;
-    if (!task_mod.hasMatchingChild(cur_idx, req.pid)) return -10; // -ECHILD
+    if (!task_mod.hasMatchingChild(cur_idx, req.pid, req.options)) return -10; // -ECHILD
 
     if (collectWaitid(cur_idx, req)) |got| {
         return publishWaitid(infop, ru, got);
@@ -209,7 +209,7 @@ pub fn waitid(idtype: u32, id: u64, infop: u64, options: u32, ru: u64) i64 {
             },
             .none => {},
         }
-        if (!task_mod.hasChildrenLocked(cur_idx)) {
+        if (!task_mod.hasMatchingChildLocked(cur_idx, req.pid, req.options)) {
             parent.waiting_for_child = false;
             task_mod.unlockTask(tflags);
             return -10;
@@ -305,7 +305,7 @@ fn collectWaitid(cur_idx: u32, req: wid.Request) ?WaitidGot {
 fn collectWaitidLocked(cur_idx: u32, req: wid.Request) WaitidPass {
     if (req.options & wid.WEXITED != 0) {
         const nowait = req.options & wid.WNOWAIT != 0;
-        switch (task_mod.peekZombieLocked(cur_idx, req.pid)) {
+        switch (task_mod.peekZombieLocked(cur_idx, req.pid, req.options)) {
             .busy => if (!nowait) return .busy,
             .child => |slot| if (task_mod.getTask(slot)) |t| {
                 const tid = t.tid;
@@ -313,7 +313,7 @@ fn collectWaitidLocked(cur_idx: u32, req: wid.Request) WaitidPass {
                 const e = wsp.fromInternal(t.exit_code, t.exited_via_syscall);
                 if (nowait) return .{ .got = .{ .child_tid = tid, .uid = uid, .usage = task_mod.childUsageLocked(tid), .rep = wid.report(req.options, .{ .zombie = true, .exit_value = e.value, .signaled = e.signaled }).? } };
                 var scratch: i32 = 0;
-                switch (task_mod.waitpidScanLocked(cur_idx, req.pid, &scratch)) {
+                switch (task_mod.waitpidScanLocked(cur_idx, req.pid, req.options, &scratch)) {
                     .reaped => |r| return .{ .got = .{
                         .child_tid = r.tid,
                         .uid = uid,
@@ -352,6 +352,7 @@ fn waitidBusyZombie(cur_idx: u32, req: wid.Request) ?WaitidGot {
         const t = task_mod.getTask(i) orelse continue;
         if (t.parent_tid != parent.tid or t.is_thread or t.state != .zombie) continue;
         if (!@import("proc_id_policy.zig").waitMatches(req.pid, t.tid, t.pgid, parent.pgid)) continue;
+        if (!@import("proc_id_policy.zig").waitEligible(t.exitSignal(), req.options)) continue;
         if (task_mod.groupStillRunning(t)) continue; // the process exits with its last thread
         const e = wsp.fromInternal(t.exit_code, t.exited_via_syscall);
         return .{ .child_tid = t.tid, .uid = t.uid, .usage = task_mod.childUsageLocked(t.tid), .rep = wid.report(req.options, .{ .zombie = true, .exit_value = e.value, .signaled = e.signaled }).? };
