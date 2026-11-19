@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello424`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello425`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -419,6 +419,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello422 | IPv6 UDP 接收控制消息：三个选项默认 0、设 1 或 5 读 1、设 0 读 0、2 字节值 EINVAL（V）；都不开时 `msg_controllen` 0（N）；IPV6_RECVPKTINFO 一条 36 字节、地址 ::1、ifindex 1（P）；三项都开时依次 PKTINFO、HOPLIMIT 33、TCLASS 0x28，共 88 字节（A）；48 字节缓冲区只放下 PKTINFO，带 MSG_CTRUNC（T） |
 | hello423 | IPv4 UDP sendmsg 控制消息：`IP_TTL` 7、`IP_TOS` 0x4b（int）和 0x51（1 字节）只改这一个数据报，下一个恢复套接字的 33/0x28（O）；11 种格式错误都是 EINVAL 且不发送（E）；SOL_TCP、SCM_RIGHTS、8 字节缓冲区被跳过（S）；`IP_PKTINFO` 的 `ipi_spec_dst` 决定源地址、`ipi_addr` 不看，ifindex 99 ENODEV，192.0.2.1 ENETUNREACH（P）；没有目的地址时 EDESTADDRREQ 优先（D） |
 | hello424 | IPv6 UDP sendmsg 控制消息：`IPV6_HOPLIMIT` 7/0/-1、RFC 2292 的 8 和 `IPV6_TCLASS` 0x4b/-1（发 0xff）/0 只改这一个数据报，下一个恢复套接字的 33/0x28（O）；11 种格式错误都是 EINVAL 且不发送（E）；`IPV6_DONTFRAG` 1、SOL_IP、`IPV6_FLOWINFO`、`SCM_RIGHTS` 被跳过（S）；`IPV6_PKTINFO` 的 :: 或 ::1 可以发送，接口 99 ENODEV，2001:db8::1、无接口的 fe80::1、ff02::1 EINVAL（P）；没有目的地址时 EDESTADDRREQ 先于控制消息（D） |
+| hello425 | IPv4 ping 套接字 sendmsg 控制消息（用 raw ICMP 套接字观察发出的回显请求）：普通请求带套接字的 `IP_TTL` 33、`IP_TOS` 0x28，`IP_TTL` 7、`IP_TOS` 0x4b（int）和 0x51（1 字节）只改这一个请求（O）；11 种格式错误都是 EINVAL 且不发送（E）；4 字节的 `UDP_SEGMENT`、SOL_TCP、`SCM_RIGHTS`、8 字节缓冲区被跳过（S）；`IP_PKTINFO` 的 127.0.0.5 作为源地址，ifindex 99 ENODEV，192.0.2.1 ENETUNREACH（P）；没有目的地址时 EDESTADDRREQ 先于控制消息（D）。测试自己打开 `ping_group_range`，结束时恢复 |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

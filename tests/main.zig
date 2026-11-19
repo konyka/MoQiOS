@@ -14725,7 +14725,7 @@ test "ICMP errors wiring (hello390): checksummed, sent to connected UDP and ping
     const ss = kt.socket_syscall_source;
     const ps = std.mem.indexOf(u8, ss, "fn pingSend(d: *vfs_mod.FileDescriptor") orelse return error.TestUnexpectedResult;
     const pend = std.mem.indexOfPos(u8, ss, ps, "const pending = udp.takePendingError(d.udpKey());") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(pend < std.mem.indexOfPos(u8, ss, ps, "const sent = @import(\"icmp.zig\").sendFrom(").?);
+    try std.testing.expect(pend < std.mem.indexOfPos(u8, ss, ps, "const sent = @import(\"icmp.zig\").sendFromOv(").?);
 }
 
 test "raw ICMPv6 socket policy (hello391): protocol, filter, destination, lengths, names and shutdown (Linux net/ipv6/raw.c)" {
@@ -16373,4 +16373,51 @@ test "IPv6 UDP sendmsg control messages IPV6_HOPLIMIT / IPV6_TCLASS / IPV6_PKTIN
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "ip_cmsg_policy.parseSend6(control, sendCaps(), ctx6)") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "pub fn sendToV6FromOv(") != null);
+}
+
+test "IPv4 ping socket sendmsg control messages IP_TTL / IP_TOS / IP_PKTINFO (hello425): Linux ping_v4_sendmsg -> ip_cmsg_send" {
+    const c = kt.ip_cmsg_policy;
+    var b: [256]u8 = @splat(0);
+    const W = struct {
+        fn put(buf: []u8, off: usize, level: i32, typ: i32, data: []const u8, len: ?u64) usize {
+            const l: u64 = len orelse 16 + data.len;
+            std.mem.writeInt(u64, buf[off..][0..8], l, .little);
+            std.mem.writeInt(i32, buf[off + 8 ..][0..4], level, .little);
+            std.mem.writeInt(i32, buf[off + 12 ..][0..4], typ, .little);
+            @memcpy(buf[off + 16 ..][0..data.len], data);
+            return off + ((16 + data.len + 7) & ~@as(usize, 7));
+        }
+    };
+    const no_caps: c.SendCaps = .{};
+    try std.testing.expectEqual(c.Send4{}, c.parseSendPing4(b[0..0], no_caps).ok);
+    // A ping socket has no udp_cmsg_send pass: SOL_UDP messages are skipped, a bad UDP_SEGMENT too.
+    var o = W.put(&b, 0, 17, 103, &.{ 1, 2, 3, 4 }, null);
+    o = W.put(&b, o, 17, 1, &.{1}, null);
+    try std.testing.expectEqual(c.Send4{}, c.parseSendPing4(b[0..o], no_caps).ok);
+    try std.testing.expectEqual(@as(i64, -22), c.parseSend4(b[0..o], no_caps).err);
+    // The IP-level rules are those of a UDP socket.
+    o = W.put(&b, 0, 0, 2, &.{ 9, 0, 0, 0 }, null);
+    o = W.put(&b, o, 0, 1, &.{0x60}, null);
+    o = W.put(&b, o, 0, 8, &.{ 1, 0, 0, 0, 127, 0, 0, 5, 0, 0, 0, 0 }, null);
+    const v = c.parseSendPing4(b[0..o], no_caps).ok;
+    try std.testing.expectEqual(@as(?u8, 9), v.ttl);
+    try std.testing.expectEqual(@as(?u8, 0x60), v.tos);
+    try std.testing.expect(v.pktinfo);
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 5 }, v.spec_dst);
+    o = W.put(&b, 0, 0, 2, &.{ 0, 0, 0, 0 }, null);
+    try std.testing.expectEqual(@as(i64, -22), c.parseSendPing4(b[0..o], no_caps).err);
+    o = W.put(&b, 0, 1, 99, &.{ 0, 0, 0, 0 }, null);
+    try std.testing.expectEqual(@as(i64, -22), c.parseSendPing4(b[0..o], no_caps).err);
+    o = W.put(&b, 0, 1, 36, &.{ 1, 0, 0, 0 }, null);
+    try std.testing.expectEqual(@as(i64, -1), c.parseSendPing4(b[0..o], no_caps).err);
+
+    // The echo request carries the socket's IP_TTL / IP_TOS (ipcm_init_sk), overridden per request by the control messages.
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "ip_cmsg_policy.parseSendPing4(control, sendCaps())") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "return pingSend(d, payload, addr_ptr, addr_len, control);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "pub fn sendFromOv(") != null);
+    // The test runs as root (it writes ping_group_range) with CAP_NET_RAW for the raw socket that watches the requests.
+    const prof = kt.capability_profile.profileForLaunch("hello425", true, false);
+    try std.testing.expectEqual(@as(u32, 0), prof.uid);
+    try std.testing.expect(prof.caps.cap_net_raw);
 }

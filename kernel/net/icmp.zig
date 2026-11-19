@@ -80,6 +80,12 @@ pub fn parseFragNeeded(data: [*]const u8, len: u32) ?FragNeededMsg {
 /// for ARP in arp.queueFrame and the send succeeds, as Linux queues it on the neighbour). Returns 0, or -EMSGSIZE past the path
 /// MTU, -ENOBUFS when the device drops it.
 pub fn sendFrom(bound: [4]u8, dst: [4]u8, msg: []const u8, mode: u8) i64 {
+    return sendFromOv(bound, dst, msg, mode, ipo.DEFAULT_TTL, 0);
+}
+
+/// sendFrom with the IP header's TTL and TOS given (a ping socket's IP_TTL / IP_TOS, or the IP_TTL / IP_TOS control messages of
+/// that one request: ip_make_skb takes cork->ttl and cork->tos).
+pub fn sendFromOv(bound: [4]u8, dst: [4]u8, msg: []const u8, mode: u8, ttl: u8, tos: u8) i64 {
     if (msg.len + ipv4.HEADER_LEN > ipv4.getSendMtu(dst)) return -90;
     const our_mac = netif.getMac();
     const via_lo = netif.isLocal4(dst);
@@ -95,6 +101,8 @@ pub fn sendFrom(bound: [4]u8, dst: [4]u8, msg: []const u8, mode: u8) i64 {
     var pkt: [1518]u8 = @splat(0);
     @memcpy(pkt[34..][0..msg.len], msg);
     ipv4.buildHeader(pkt[14..].ptr, src, dst, ipv4.PROTO_ICMP, @intCast(msg.len));
+    pkt[14 + 1] = tos;
+    pkt[14 + 8] = ttl;
     ipv4.setIdent(pkt[14..].ptr, ipid.unowned(dst, src, ipv4.PROTO_ICMP, mode), ipo.datagramDf(mode));
     const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, @intCast(20 + msg.len));
     if (wait_hop) |hop| {

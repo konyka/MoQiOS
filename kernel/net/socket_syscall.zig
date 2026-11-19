@@ -385,8 +385,10 @@ fn pingCreate(is_v6: bool) i64 {
 }
 
 /// sendto/sendmsg on a ping socket: `payload` is an ICMP echo request; the ident and the checksum are filled in
-/// (ping_v4_sendmsg). The destination is `addr_ptr` (a sockaddr_in of at least 16 bytes) or the connected peer.
-fn pingSend(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr_len: u32) i64 {
+/// (ping_v4_sendmsg). The destination is `addr_ptr` (a sockaddr_in of at least 16 bytes) or the connected peer. `control` is
+/// sendmsg's msg_control (empty for sendto): once the destination is known, ip_cmsg_send's IP_TTL / IP_TOS replace the socket's
+/// values for this request and IP_PKTINFO names its source. An IPv6 ping socket does not read it.
+fn pingSend(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr_len: u32, control: []const u8) i64 {
     const pp = @import("ping_policy.zig");
     if (d.udp_is_v6) return pingSend6(d, payload, addr_ptr, addr_len);
     const rc = pp.sendErrno(payload.len, if (payload.len > 0) payload[0] else 0, if (payload.len > 1) payload[1] else 0);
@@ -401,8 +403,20 @@ fn pingSend(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr
     } else if (d.udp_connected) {
         dst = d.udp_dst_ip;
     } else return -89; // EDESTADDRREQ
+    const ov = switch (ip_cmsg_policy.parseSendPing4(control, sendCaps())) {
+        .ok => |v| v,
+        .err => |e| return e,
+    };
+    var src = d.udp_local_ip;
+    if (ov.pktinfo) {
+        src = ov.spec_dst;
+        const src_rc = ip_cmsg_policy.sourceErrno4(src, netif.getOurIp(), nic_mod.isActive());
+        if (src_rc != 0) return src_rc;
+        const oif_rc = ip_cmsg_policy.oifErrno4(ov.oif, nic_mod.isActive());
+        if (oif_rc != 0) return oif_rc;
+    }
     // A socket bound to 127/8 reaches only what lo carries (__mkroute_output).
-    const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(d.udp_local_ip, dst, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
+    const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(src, dst, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
     if (lo_rc != 0) return lo_rc;
     var msg: [pp.MAX_MESSAGE]u8 = undefined;
     @memcpy(msg[0..payload.len], payload);
@@ -413,8 +427,12 @@ fn pingSend(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr
     // An ICMP error a connected socket took fails this send, once (sock_alloc_send_skb → sock_error).
     const pending = udp.takePendingError(d.udpKey());
     if (pending != 0) return -@as(i64, pending);
-    const ping_ip: @import("ip_opt_policy.zig").IpOpts = if (udp.getPortOpts(d.udpKey())) |po| po.ip else .{};
-    const sent = @import("icmp.zig").sendFrom(d.udp_local_ip, dst, msg[0..payload.len], ping_ip.pmtudisc);
+    const ipo = @import("ip_opt_policy.zig");
+    const ping_ip: ipo.IpOpts = if (udp.getPortOpts(d.udpKey())) |po| po.ip else .{};
+    const sock_ttl: u8 = if (dst[0] >= 224 and dst[0] <= 239) ping_ip.mc4_ttl else ipo.effectiveTtl(ping_ip);
+    const ttl: u8 = ov.ttl orelse sock_ttl;
+    const tos: u8 = ov.tos orelse ping_ip.tos;
+    const sent = @import("icmp.zig").sendFromOv(src, dst, msg[0..payload.len], ping_ip.pmtudisc, ttl, tos);
     return if (sent < 0) sent else @intCast(payload.len);
 }
 
@@ -855,7 +873,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         var pbuf: [@import("ping_policy.zig").MAX_MESSAGE]u8 = undefined;
         if (len > pbuf.len) return -90; // EMSGSIZE
         if (len != 0 and copy.copyFromUser(pbuf[0..len], @ptrFromInt(buf), len) != len) return -14;
-        return pingSend(&t.fd_table.fds[fd], pbuf[0..len], addr_ptr, addr_len);
+        return pingSend(&t.fd_table.fds[fd], pbuf[0..len], addr_ptr, addr_len, &.{});
     } else if (t.fd_table.fds[fd].fd_type == .raw_socket) {
         // The destination is the address given or the connected peer; rawSendFrom checks it before the length.
         if (len != 0 and (buf == 0 or buf >= 0x0000_8000_0000_0000)) return -14;
@@ -1788,13 +1806,13 @@ fn isOwnNicAddr6(a: [16]u8) bool {
 
 /// Send `payload` as one datagram on UDP socket `fd` (the sendto UDP path without the user-buffer copy). `control` is sendmsg's
 /// msg_control: it is parsed once the destination is known (udp_sendmsg / udpv6_sendmsg: EDESTADDRREQ comes first), and its
-/// IP_TTL / IP_TOS / IP_PKTINFO (IPv4) or IPV6_HOPLIMIT / IPV6_TCLASS / IPV6_PKTINFO (IPv6) apply to this datagram only. A ping
-/// socket does not read it.
+/// IP_TTL / IP_TOS / IP_PKTINFO (IPv4) or IPV6_HOPLIMIT / IPV6_TCLASS / IPV6_PKTINFO (IPv6) apply to this datagram only. An IPv4 ping
+/// socket reads it in pingSend; an IPv6 one does not.
 fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32, control: []const u8) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const t = task_mod.getTask(cur_idx) orelse return -1;
     const d = &t.fd_table.fds[fd];
-    if (d.udp_ping) return pingSend(d, payload, addr_ptr, addr_len);
+    if (d.udp_ping) return pingSend(d, payload, addr_ptr, addr_len, control);
     const ab = udpAutobind(d);
     if (ab != 0) return ab;
     const src_key = d.udpKey();

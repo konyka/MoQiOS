@@ -133,6 +133,9 @@ pub const Send4 = struct {
     spec_dst: [4]u8 = .{ 0, 0, 0, 0 },
 };
 
+/// The control messages parsed, or the errno that fails the send.
+pub const Send4Result = union(enum) { ok: Send4, err: i64 };
+
 pub const SOL_UDP: i32 = 17;
 pub const UDP_SEGMENT: i32 = 103;
 const IP_RETOPTS: i32 = 7;
@@ -201,7 +204,7 @@ fn sockCmsg(m: Cmsg, caps: SendCaps) i64 {
 /// The control messages of an IPv4 UDP sendmsg (Linux udp_cmsg_send, then ip_cmsg_send with allow_ipv6 false): every SOL_UDP message
 /// is checked first (only a 2-byte UDP_SEGMENT is valid), then the rest in order. Other levels are skipped; at SOL_IP an unknown type
 /// is EINVAL, as is any malformed message. IP options (IP_RETOPTS) are not supported beyond an empty list.
-pub fn parseSend4(control: []const u8, caps: SendCaps) union(enum) { ok: Send4, err: i64 } {
+pub fn parseSend4(control: []const u8, caps: SendCaps) Send4Result {
     var off: usize = 0;
     var need_ip = false;
     while (cmsgAt(control, off) catch return .{ .err = -22 }) |m| : (off = nextOff(off, m.len)) {
@@ -211,9 +214,20 @@ pub fn parseSend4(control: []const u8, caps: SendCaps) union(enum) { ok: Send4, 
         }
         if (m.typ != UDP_SEGMENT or m.data.len != 2) return .{ .err = -22 };
     }
+    if (!need_ip) return .{ .ok = .{} };
+    return ipCmsgSend4(control, caps);
+}
+
+/// The control messages of an IPv4 ping socket's sendmsg (ping_v4_sendmsg calls ip_cmsg_send directly, with no udp_cmsg_send
+/// pass): the rules of parseSend4 at SOL_IP and SOL_SOCKET; SOL_UDP messages are skipped like any other level.
+pub fn parseSendPing4(control: []const u8, caps: SendCaps) Send4Result {
+    return ipCmsgSend4(control, caps);
+}
+
+/// ip_cmsg_send with allow_ipv6 false: every message in order; SOL_SOCKET through __sock_cmsg_send, SOL_IP by type, the rest skipped.
+fn ipCmsgSend4(control: []const u8, caps: SendCaps) Send4Result {
     var out: Send4 = .{};
-    if (!need_ip) return .{ .ok = out };
-    off = 0;
+    var off: usize = 0;
     while (cmsgAt(control, off) catch return .{ .err = -22 }) |m| : (off = nextOff(off, m.len)) {
         if (m.level == scm.SOL_SOCKET) {
             const rc = sockCmsg(m, caps);
