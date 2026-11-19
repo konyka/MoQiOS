@@ -95,11 +95,15 @@ fn readInet6(addr_ptr: u64, addr_len: u32) union(enum) { ok: struct { family: u1
     return .{ .ok = .{ .family = bo.readU16Le(b[0..2]), .port = bo.readU16BeAt(&b, 2), .addr = b[8..24].*, .scope = bo.readU32Le(b[24..28]) } };
 }
 
-/// sendto/send/write on an IPv6 raw socket: the destination is checked first (rawv6_sendmsg), then the length; :: goes to ::1.
-fn rawSendFrom6(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest) i64 {
+/// sendto/send/write/sendmsg on an IPv6 raw socket: the destination is checked first (rawv6_sendmsg), then the control messages
+/// (`control`, sendmsg's msg_control, else empty: ip6_datagram_send_ctl), then the length; :: goes to ::1. IPV6_HOPLIMIT /
+/// IPV6_TCLASS replace the socket's values for this packet, IPV6_PKTINFO names its source and interface. An IPV6_HDRINCL packet
+/// goes out as written.
+fn rawSendFrom6(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest, control: []const u8) i64 {
     const raw = @import("raw_icmp.zig");
     const rp = @import("raw_icmp_policy.zig");
     var dst = raw.peerAddr6(d.raw_idx);
+    var scope: u32 = 0;
     if (to) |a| {
         const parsed = switch (readInet6(a.ptr, a.len)) {
             .ok => |v| v,
@@ -108,10 +112,18 @@ fn rawSendFrom6(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest)
         const rc = rp.sendtoErrno6(true, a.len, parsed.family, parsed.port, false, raw.protocolOf(d.raw_idx));
         if (rc != 0) return rc;
         dst = parsed.addr;
+        scope = parsed.scope;
     } else {
         const rc = rp.sendtoErrno6(false, 0, 0, 0, raw.isConnected(d.raw_idx), raw.protocolOf(d.raw_idx));
         if (rc != 0) return rc;
     }
+    const ip = rawIpOpts(d.raw_idx);
+    const oif6 = bind_addr_policy.sendOif6(dst, scope, 0, ip.mc_if);
+    const ctx6: ip_cmsg_policy.Ctx6 = .{ .pre_oif = oif6, .nic_active = nic_mod.isActive(), .isOwnNic = isOwnNicAddr6 };
+    const ov6 = switch (ip_cmsg_policy.parseSendRaw6(control, sendCaps(), ctx6)) {
+        .ok => |v| v,
+        .err => |e| return e,
+    };
     // IPV6_HDRINCL: `msg` is the whole packet, header first, sent as written once routed (rawv6_send_hdrinc); otherwise the
     // ICMPv6 type and code are read before the route is looked up (rawv6_probe_proto_opt).
     const hdrincl = rawIpOpts(d.raw_idx).hdrincl;
@@ -126,20 +138,21 @@ fn rawSendFrom6(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest)
         const hs = raw.sendHdrincl6(to6, msg);
         return if (hs < 0) hs else @intCast(msg.len);
     }
-    const sent = raw.send6(raw.boundAddr6(d.raw_idx), to6, @truncate(raw.protocolOf(d.raw_idx)), raw.checksumOffset(d.raw_idx), msg, rawIpOpts(d.raw_idx));
+    const src6 = if (ov6.pktinfo and !std.mem.allEqual(u8, &ov6.src, 0)) ov6.src else raw.boundAddr6(d.raw_idx);
+    const sent = raw.send6(src6, to6, @truncate(raw.protocolOf(d.raw_idx)), raw.checksumOffset(d.raw_idx), msg, ip, ov6.hops, ov6.tclass);
     return if (sent < 0) sent else @intCast(msg.len);
 }
 
 pub const RawDest = struct { ptr: u64, len: u32 };
 
 /// sendto/send/write/sendmsg on a raw ICMP socket: `msg` (the ICMP message) to the address at `to` (ptr, len), or to the connected
-/// peer. `control` is sendmsg's msg_control (empty otherwise; an IPv6 socket does not read it): raw_sendmsg parses it with
-/// ip_cmsg_send once the destination is known. IP_TTL / IP_TOS replace the socket's values for this datagram, IP_PKTINFO names its
+/// peer. `control` is sendmsg's msg_control (empty otherwise): raw_sendmsg parses it with ip_cmsg_send once the destination is
+/// known (an IPv6 socket: rawSendFrom6). IP_TTL / IP_TOS replace the socket's values for this datagram, IP_PKTINFO names its
 /// source; an IP_HDRINCL socket's header is left as written (only a zero source is filled) and any IP options are EINVAL there.
 pub fn rawSendFrom(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest, control: []const u8) i64 {
     const raw = @import("raw_icmp.zig");
     const rp = @import("raw_icmp_policy.zig");
-    if (raw.isV6(d.raw_idx)) return rawSendFrom6(d, msg, to);
+    if (raw.isV6(d.raw_idx)) return rawSendFrom6(d, msg, to, control);
     var dst = raw.peerAddr(d.raw_idx);
     if (to) |a| {
         const r = readInet4(a.ptr, a.len);
@@ -1977,7 +1990,7 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
 
 /// sendmsg on a raw ICMP socket (raw_sendmsg / rawv6_sendmsg): msg_control is copied in whole first (a bad pointer is EFAULT, more
 /// than UDP_SEND_CTL_MAX ENOBUFS), the iovecs are gathered into one message, msg_name (or the connected peer) is the destination,
-/// and the rest is the sendto path with the control messages (read by an IPv4 socket only).
+/// and the rest is the sendto path with the control messages.
 fn rawSendmsg(d: *const vfs_mod.FileDescriptor, msghdr: *const [56]u8) i64 {
     const name_ptr: u64 = bo.readU64At(msghdr, 0);
     const name_len: u32 = bo.readU32Le(msghdr[8..12]);

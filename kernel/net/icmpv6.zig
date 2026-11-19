@@ -368,6 +368,12 @@ pub fn sendFrom6(bound: [16]u8, dst: [16]u8, msg: []u8, ip: ipo.IpOpts) i64 {
 /// sendFrom6 for a message of next header `next_header` (an IPv6 raw socket of that protocol): the kernel writes the RFC 2460 checksum at
 /// `csum_off` when there is one (rawv6_push_pending_frames, the two bytes there count as zero), else `msg` goes out as given.
 pub fn sendProto6(bound: [16]u8, dst: [16]u8, next_header: u8, csum_off: ?u32, msg: []u8, ip: ipo.IpOpts) i64 {
+    return sendProto6Ov(bound, dst, next_header, csum_off, msg, ip, null, null);
+}
+
+/// sendProto6 with the hop limit and traffic class of this one packet given (an IPV6_HOPLIMIT / IPV6_TCLASS control message; null
+/// keeps the socket's value). They are written into the IPv6 header after the socket's options.
+pub fn sendProto6Ov(bound: [16]u8, dst: [16]u8, next_header: u8, csum_off: ?u32, msg: []u8, ip: ipo.IpOpts, hops_ov: ?u8, tclass_ov: ?u8) i64 {
     if (msg.len + ipv6.HEADER_LEN > ipv6.getSendMtu(dst)) return -90;
     const our_mac = netif.getMac();
     const via_lo = netif.isLoopbackV6(dst) or ndp.isOwnAddress(dst, our_mac);
@@ -395,6 +401,11 @@ pub fn sendProto6(bound: [16]u8, dst: [16]u8, next_header: u8, csum_off: ?u32, m
     @memcpy(pkt[icmp_off..][0..msg.len], msg);
     ipv6.buildHeader(pkt[14..].ptr, src, dst, next_header, @intCast(msg.len));
     if (ipo.ipv6NeedsPatch(ip)) ipo.patchIpv6(pkt[14..][0..40], ip);
+    if (hops_ov) |h| pkt[14 + 7] = h;
+    if (tclass_ov) |tc| {
+        pkt[14] = (pkt[14] & 0xF0) | (tc >> 4);
+        pkt[15] = (pkt[15] & 0x0F) | (tc << 4);
+    }
     const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, @intCast(ipv6.HEADER_LEN + msg.len));
     if (wait_hop) |hop| {
         @import("ndp_queue.zig").queueFrame(hop, &pkt, frame_len);

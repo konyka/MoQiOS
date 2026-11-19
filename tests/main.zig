@@ -14982,10 +14982,10 @@ test "raw ICMP sockets take SOL_IP / SOL_IPV6 options and their sends carry them
     try std.testing.expect(std.mem.indexOf(u8, so, "if (!ipo.levelApplies(level, fam)) return if (fam == .v4) -95 else -92;") != null);
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send(src, dst, @truncate(protocol), msg, ip)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send6(raw.boundAddr6(d.raw_idx), to6, @truncate(raw.protocolOf(d.raw_idx)), raw.checksumOffset(d.raw_idx), msg, rawIpOpts(d.raw_idx))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send6(src6, to6, @truncate(raw.protocolOf(d.raw_idx)), raw.checksumOffset(d.raw_idx), msg, ip, ov6.hops, ov6.tclass)") != null);
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "if (ipo.ipv4NeedsPatch(ip)) ipo.patchIpv4(pkt[14..][0..20], ip, ipv4.checksum);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rs, "@import(\"icmpv6.zig\").sendProto6(bound, dst, protocol, csum_off, buf[0..msg.len], ip)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "@import(\"icmpv6.zig\").sendProto6Ov(bound, dst, protocol, csum_off, buf[0..msg.len], ip, hops_ov, tclass_ov)") != null);
     const iv = kt.icmpv6_source;
     try std.testing.expect(std.mem.indexOf(u8, iv, "pub fn sendFrom6(bound: [16]u8, dst: [16]u8, msg: []u8, ip: ipo.IpOpts) i64 {") != null);
     try std.testing.expect(std.mem.indexOf(u8, iv, "if (ipo.ipv6NeedsPatch(ip)) ipo.patchIpv6(pkt[14..][0..40], ip);") != null);
@@ -16444,4 +16444,41 @@ test "IPv4 raw socket sendmsg control messages IP_TTL / IP_TOS / IP_PKTINFO / IP
     try std.testing.expect(std.mem.indexOf(u8, ss, "return rawSendFrom(d, data[0..@intCast(got)], if (name_ptr != 0) RawDest{ .ptr = name_ptr, .len = name_len } else null, ctl[0..cl]);") != null);
     // The test opens raw sockets: CAP_NET_RAW.
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello426", true, false).caps.cap_net_raw);
+}
+
+test "IPv6 raw socket sendmsg control messages IPV6_HOPLIMIT / IPV6_TCLASS / IPV6_PKTINFO (hello427): Linux rawv6_sendmsg -> ip6_datagram_send_ctl" {
+    const c = kt.ip_cmsg_policy;
+    var b: [64]u8 = @splat(0);
+    const W = struct {
+        fn put(buf: []u8, off: usize, level: i32, typ: i32, data: []const u8) usize {
+            std.mem.writeInt(u64, buf[off..][0..8], 16 + data.len, .little);
+            std.mem.writeInt(i32, buf[off + 8 ..][0..4], level, .little);
+            std.mem.writeInt(i32, buf[off + 12 ..][0..4], typ, .little);
+            @memcpy(buf[off + 16 ..][0..data.len], data);
+            return off + ((16 + data.len + 7) & ~@as(usize, 7));
+        }
+    };
+    // No udp_cmsg_send pass: a 4-byte UDP_SEGMENT is skipped, where a UDP socket refuses it.
+    var o = W.put(&b, 0, 17, 103, &.{ 1, 2, 3, 4 });
+    try std.testing.expect(c.parseSendRaw6(b[0..o], .{}, .{}) == .ok);
+    try std.testing.expectEqual(@as(i64, -22), c.parseSend6(b[0..o], .{}, .{}).err);
+    // ip6_datagram_send_ctl's rules otherwise: hop limit 0 is a hop limit, tclass -1 sends 0xff, a bad value is EINVAL.
+    o = W.put(&b, 0, 41, 52, &.{ 0, 0, 0, 0 });
+    o = W.put(&b, o, 41, 67, &.{ 0xff, 0xff, 0xff, 0xff });
+    const v = c.parseSendRaw6(b[0..o], .{}, .{}).ok;
+    try std.testing.expectEqual(@as(?u8, 0), v.hops);
+    try std.testing.expectEqual(@as(?u8, 0xff), v.tclass);
+    o = W.put(&b, 0, 41, 52, &.{ 0, 1, 0, 0 });
+    try std.testing.expectEqual(@as(i64, -22), c.parseSendRaw6(b[0..o], .{}, .{}).err);
+
+    // Parsed after the destination checks and before the length check; the per-datagram values reach the IPv6 header.
+    const ss = kt.socket_syscall_source;
+    const fs = std.mem.indexOf(u8, ss, "fn rawSendFrom6(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest, control: []const u8) i64 {") orelse return error.TestUnexpectedResult;
+    const dest = std.mem.indexOfPos(u8, ss, fs, "const rc = rp.sendtoErrno6(false, 0, 0, 0, raw.isConnected(d.raw_idx), raw.protocolOf(d.raw_idx));") orelse return error.TestUnexpectedResult;
+    const parse = std.mem.indexOfPos(u8, ss, fs, "ip_cmsg_policy.parseSendRaw6(control, sendCaps(), ctx6)") orelse return error.TestUnexpectedResult;
+    const len = std.mem.indexOfPos(u8, ss, fs, "const lrc = rp.lengthErrno6(") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(dest < parse and parse < len);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (raw.isV6(d.raw_idx)) return rawSendFrom6(d, msg, to, control);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmpv6_source, "pub fn sendProto6Ov(") != null);
+    try std.testing.expect(kt.capability_profile.profileForLaunch("hello427", true, false).caps.cap_net_raw);
 }

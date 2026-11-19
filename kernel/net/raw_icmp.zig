@@ -407,12 +407,13 @@ pub fn sendHdrincl6(dst: [16]u8, pkt: []const u8) i64 {
 }
 
 /// rawv6_sendmsg: `msg` (what follows the IPv6 header, next header `protocol`) from `bound` to `dst`; the kernel writes the checksum
-/// at `csum_off` when there is one (icmpv6.sendProto6). `msg` passed policy.lengthErrno6. 0 or -errno.
-pub fn send6(bound: [16]u8, dst: [16]u8, protocol: u8, csum_off: ?u32, msg: []const u8, ip: ipo.IpOpts) i64 {
+/// at `csum_off` when there is one (icmpv6.sendProto6Ov). `msg` passed policy.lengthErrno6. `hops_ov` / `tclass_ov` are this
+/// packet's IPV6_HOPLIMIT / IPV6_TCLASS control messages (null: the socket's value). 0 or -errno.
+pub fn send6(bound: [16]u8, dst: [16]u8, protocol: u8, csum_off: ?u32, msg: []const u8, ip: ipo.IpOpts, hops_ov: ?u8, tclass_ov: ?u8) i64 {
     if (msg.len > MAX_MESSAGE6) return -90;
     var buf: [MAX_MESSAGE6]u8 = undefined;
     @memcpy(buf[0..msg.len], msg);
-    const rc = @import("icmpv6.zig").sendProto6(bound, dst, protocol, csum_off, buf[0..msg.len], ip);
+    const rc = @import("icmpv6.zig").sendProto6Ov(bound, dst, protocol, csum_off, buf[0..msg.len], ip, hops_ov, tclass_ov);
     // A frame to this host is delivered before the send returns (as loopback_xmit does), so the copy and the kernel's reply are
     // already queued for the socket.
     if (rc == 0) _ = lo.drain();
