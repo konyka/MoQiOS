@@ -371,6 +371,12 @@ pub fn parseSendRaw6(control: []const u8, caps: SendCaps, ctx: Ctx6) Send6Result
     return datagramSendCtl6(control, caps, ctx);
 }
 
+/// The control messages of an IPv6 ping socket's sendmsg: ping_v6_sendmsg also calls ip6_datagram_send_ctl directly, so the rules
+/// are those of a raw socket. The IPV6_PKTINFO source is checked but not used (the request goes from the socket's own address).
+pub fn parseSendPing6(control: []const u8, caps: SendCaps, ctx: Ctx6) Send6Result {
+    return datagramSendCtl6(control, caps, ctx);
+}
+
 /// ip6_datagram_send_ctl: every message in order; SOL_SOCKET through __sock_cmsg_send, SOL_IPV6 by type, the rest skipped.
 fn datagramSendCtl6(control: []const u8, caps: SendCaps, ctx: Ctx6) Send6Result {
     var out: Send6 = .{ .oif = ctx.pre_oif };

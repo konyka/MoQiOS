@@ -14899,7 +14899,7 @@ test "ICMPv6 errors wiring (hello392): every error type reaches connected IPv6 U
     const ss = kt.socket_syscall_source;
     const ps = std.mem.indexOf(u8, ss, "fn pingSend6(d: *vfs_mod.FileDescriptor") orelse return error.TestUnexpectedResult;
     const pend = std.mem.indexOfPos(u8, ss, ps, "const pending = udp.takePendingError(d.udpKey());") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(pend < std.mem.indexOfPos(u8, ss, ps, "const sent = @import(\"icmpv6.zig\").sendFrom6(").?);
+    try std.testing.expect(pend < std.mem.indexOfPos(u8, ss, ps, "const sent = @import(\"icmpv6.zig\").sendProto6Ov(").?);
 }
 
 test "ICMPv6 error quotes skip extension headers (hello393): hop-by-hop, routing, destination options, AH and a first fragment (Linux ipv6_skip_exthdr)" {
@@ -16515,4 +16515,51 @@ test "raw socket recvmsg control messages IP_PKTINFO / IP_TTL / IP_TOS and the I
     _ = std.mem.indexOfPos(u8, ss, fr, "ip_cmsg_policy.build6(ip_cmsg_policy.Wanted.of6(opts_ip), got_meta.v6, ctl_cap, &ctl_buf)") orelse return error.TestUnexpectedResult;
     _ = std.mem.indexOfPos(u8, ss, fr, "ip_cmsg_policy.build(ip_cmsg_policy.Wanted.of(opts_ip), got_meta.v4, ctl_cap, &ctl_buf)") orelse return error.TestUnexpectedResult;
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello428", true, false).caps.cap_net_raw);
+}
+
+test "IPv6 ping socket sendmsg control messages IPV6_HOPLIMIT / IPV6_TCLASS / IPV6_PKTINFO (hello429): Linux ping_v6_sendmsg -> ip6_datagram_send_ctl" {
+    const c = kt.ip_cmsg_policy;
+    var b: [64]u8 = @splat(0);
+    const W = struct {
+        fn put(buf: []u8, off: usize, level: i32, typ: i32, data: []const u8) usize {
+            std.mem.writeInt(u64, buf[off..][0..8], 16 + data.len, .little);
+            std.mem.writeInt(i32, buf[off + 8 ..][0..4], level, .little);
+            std.mem.writeInt(i32, buf[off + 12 ..][0..4], typ, .little);
+            @memcpy(buf[off + 16 ..][0..data.len], data);
+            return off + ((16 + data.len + 7) & ~@as(usize, 7));
+        }
+    };
+    // ping_v6_sendmsg calls ip6_datagram_send_ctl directly: a 4-byte SOL_UDP UDP_SEGMENT is skipped like any other level.
+    var o = W.put(&b, 0, 17, 103, &.{ 1, 2, 3, 4 });
+    try std.testing.expect(c.parseSendPing6(b[0..o], .{}, .{}) == .ok);
+    o = W.put(&b, 0, 41, 52, &.{ 7, 0, 0, 0 });
+    o = W.put(&b, o, 41, 67, &.{ 0x4b, 0, 0, 0 });
+    const v = c.parseSendPing6(b[0..o], .{}, .{}).ok;
+    try std.testing.expectEqual(@as(?u8, 7), v.hops);
+    try std.testing.expectEqual(@as(?u8, 0x4b), v.tclass);
+    // IPV6_PKTINFO naming interface 99 is ENODEV, an address this host does not have EINVAL.
+    var pk: [20]u8 = @splat(0);
+    std.mem.writeInt(u32, pk[16..20], 99, .little);
+    o = W.put(&b, 0, 41, 50, &pk);
+    try std.testing.expectEqual(@as(i64, -19), c.parseSendPing6(b[0..o], .{}, .{}).err);
+    pk = @splat(0);
+    pk[0] = 0x20;
+    pk[1] = 0x01;
+    pk[2] = 0x0d;
+    pk[3] = 0xb8;
+    pk[15] = 1;
+    o = W.put(&b, 0, 41, 50, &pk);
+    try std.testing.expectEqual(@as(i64, -22), c.parseSendPing6(b[0..o], .{}, .{}).err);
+
+    // Parsed once the destination is routed, before the request is built; the per-request values and the socket's
+    // IPV6_UNICAST_HOPS / IPV6_TCLASS reach the IPv6 header.
+    const ss = kt.socket_syscall_source;
+    const fs = std.mem.indexOf(u8, ss, "fn pingSend6(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr_len: u32, control: []const u8) i64 {") orelse return error.TestUnexpectedResult;
+    const route = std.mem.indexOfPos(u8, ss, fs, "const unreach = bind_addr_policy.routeErrno6(dst, oif);") orelse return error.TestUnexpectedResult;
+    const parse = std.mem.indexOfPos(u8, ss, fs, "ip_cmsg_policy.parseSendPing6(control, sendCaps(), ctx6)") orelse return error.TestUnexpectedResult;
+    const build = std.mem.indexOfPos(u8, ss, fs, "pp.setIdent(msg[0..payload.len], d.udp_port);") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(route < parse and parse < build);
+    _ = std.mem.indexOfPos(u8, ss, fs, "@import(\"icmpv6.zig\").sendProto6Ov(d.udp_local_ip6, dst, 58, 2, msg[0..payload.len], ping_ip6, ov6.hops, ov6.tclass)") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (d.udp_is_v6) return pingSend6(d, payload, addr_ptr, addr_len, control);") != null);
+    try std.testing.expect(kt.capability_profile.profileForLaunch("hello429", true, false).caps.cap_net_raw);
 }

@@ -545,6 +545,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello426"); /* IPv4 raw socket sendmsg control messages */
     run_test("hello427"); /* IPv6 raw socket sendmsg control messages */
     run_test("hello428"); /* raw socket recvmsg control messages */
+    run_test("hello429"); /* IPv6 ping socket sendmsg control messages */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

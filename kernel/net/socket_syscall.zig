@@ -429,10 +429,10 @@ fn pingCreate(is_v6: bool) i64 {
 /// sendto/sendmsg on a ping socket: `payload` is an ICMP echo request; the ident and the checksum are filled in
 /// (ping_v4_sendmsg). The destination is `addr_ptr` (a sockaddr_in of at least 16 bytes) or the connected peer. `control` is
 /// sendmsg's msg_control (empty for sendto): once the destination is known, ip_cmsg_send's IP_TTL / IP_TOS replace the socket's
-/// values for this request and IP_PKTINFO names its source. An IPv6 ping socket does not read it.
+/// values for this request and IP_PKTINFO names its source. An IPv6 ping socket reads it in pingSend6.
 fn pingSend(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr_len: u32, control: []const u8) i64 {
     const pp = @import("ping_policy.zig");
-    if (d.udp_is_v6) return pingSend6(d, payload, addr_ptr, addr_len);
+    if (d.udp_is_v6) return pingSend6(d, payload, addr_ptr, addr_len, control);
     const rc = pp.sendErrno(payload.len, if (payload.len > 0) payload[0] else 0, if (payload.len > 1) payload[1] else 0);
     if (rc != 0) return rc;
     var dst: [4]u8 = .{ 0, 0, 0, 0 };
@@ -480,8 +480,10 @@ fn pingSend(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr
 
 /// sendto/sendmsg on an IPv6 ping socket: `payload` is an ICMPv6 echo request; the ident and the checksum (over the IPv6
 /// pseudo-header) are filled in (ping_v6_sendmsg). The destination is `addr_ptr` (a sockaddr_in6 of at least 28 bytes) or the
-/// connected peer; a link-scoped one needs an interface (sin6_scope_id or the socket's own).
-fn pingSend6(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr_len: u32) i64 {
+/// connected peer; a link-scoped one needs an interface (sin6_scope_id or the socket's own). `control` is sendmsg's msg_control
+/// (empty for sendto), read once the destination is routed (ip6_datagram_send_ctl): IPV6_HOPLIMIT / IPV6_TCLASS replace the
+/// socket's IPV6_UNICAST_HOPS / IPV6_TCLASS for this request; an IPV6_PKTINFO source is checked, not used (fl6.saddr = np->saddr).
+fn pingSend6(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr_len: u32, control: []const u8) i64 {
     const pp = @import("ping_policy.zig");
     const rc = pp.sendErrno6(payload.len, if (payload.len > 0) payload[0] else 0, if (payload.len > 1) payload[1] else 0);
     if (rc != 0) return rc;
@@ -504,6 +506,11 @@ fn pingSend6(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, add
     if (dest_rc != 0) return dest_rc;
     const unreach = bind_addr_policy.routeErrno6(dst, oif);
     if (unreach != 0) return unreach;
+    const ctx6: ip_cmsg_policy.Ctx6 = .{ .pre_oif = oif, .nic_active = nic_mod.isActive(), .isOwnNic = isOwnNicAddr6 };
+    const ov6 = switch (ip_cmsg_policy.parseSendPing6(control, sendCaps(), ctx6)) {
+        .ok => |v| v,
+        .err => |e| return e,
+    };
     var msg: [pp.MAX_MESSAGE]u8 = undefined;
     @memcpy(msg[0..payload.len], payload);
     pp.setIdent(msg[0..payload.len], d.udp_port);
@@ -512,7 +519,8 @@ fn pingSend6(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, add
     // An ICMPv6 error a connected socket took fails this send, once (sock_alloc_send_skb → sock_error).
     const pending = udp.takePendingError(d.udpKey());
     if (pending != 0) return -@as(i64, pending);
-    const sent = @import("icmpv6.zig").sendFrom6(d.udp_local_ip6, dst, msg[0..payload.len], .{});
+    const ping_ip6: @import("ip_opt_policy.zig").IpOpts = if (udp.getPortOpts(d.udpKey())) |po| po.ip else .{};
+    const sent = @import("icmpv6.zig").sendProto6Ov(d.udp_local_ip6, dst, 58, 2, msg[0..payload.len], ping_ip6, ov6.hops, ov6.tclass);
     return if (sent < 0) sent else @intCast(payload.len);
 }
 
