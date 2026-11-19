@@ -1,14 +1,15 @@
 //! Pure policy for the bounded sendmmsg/recvmmsg ABI.
 //!
-//! vlen is clamped (Linux clamps to UIO_MAXIOV; this kernel keeps a smaller
-//! bound), flags are validated per call, MSG_WAITFORONE turns later messages
-//! non-blocking, and an optional timespec timeout ends the batch between
-//! messages.
+//! vlen is clamped to UIO_MAXIOV (1024) as in Linux, flags are validated per
+//! call, MSG_WAITFORONE turns later messages non-blocking, and an optional
+//! timespec timeout ends the batch between messages; recvmmsg writes what is
+//! left of it back.
 
 const std = @import("std");
 const errno = @import("../lib/errno.zig");
 
-pub const MAX_MESSAGES: u64 = 16;
+/// UIO_MAXIOV: the longest batch one call handles (__sys_sendmmsg, do_recvmmsg).
+pub const MAX_MESSAGES: u64 = 1024;
 
 pub const MSG_PEEK: u32 = 0x02;
 pub const MSG_TRUNC: u32 = 0x20;
@@ -54,6 +55,11 @@ pub fn timeoutDeadline(have: bool, sec: i64, nsec: i64, now_ns: u64) union(enum)
     if (sec < 0 or nsec < 0 or nsec >= 1_000_000_000) return .invalid;
     const total = std.math.mul(u64, @intCast(sec), 1_000_000_000) catch return .none;
     return .{ .deadline = now_ns +| (total +| @as(u64, @intCast(nsec))) };
+}
+
+/// What remains of a recvmmsg timeout ending at `deadline_ns` at `now_ns`: 0 once it passed (Linux clamps a negative rest to 0).
+pub fn remainingNs(deadline_ns: u64, now_ns: u64) u64 {
+    return deadline_ns -| now_ns;
 }
 
 pub fn expired(deadline: ?u64, now_ns: u64) bool {

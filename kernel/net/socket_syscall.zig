@@ -2403,18 +2403,39 @@ pub fn recvmmsg(sockfd: u32, msgvec_ptr: u64, vlen_raw: u64, flags: u32, timeout
     }
 
     var count: u64 = 0;
+    var err: i64 = 0;
     for (0..@as(usize, @intCast(vlen))) |i| {
         const entry_ptr = msgvec_ptr + @as(u64, @intCast(i)) * 64;
         const result = recvmsg(sockfd, entry_ptr, mp.messageFlags(flags, count));
-        if (result < 0) return mp.batchResult(count, result);
+        if (result < 0) {
+            err = result;
+            break;
+        }
 
         var len_buf: [4]u8 = undefined;
         bo.writeU32Le(&len_buf, @intCast(result));
-        if (copy.copyToUser(@ptrFromInt(entry_ptr + 56), &len_buf, 4) != 4) return mp.batchResult(count, -14);
+        if (copy.copyToUser(@ptrFromInt(entry_ptr + 56), &len_buf, 4) != 4) {
+            err = -14;
+            break;
+        }
         count += 1;
         if (mp.expired(deadline, tsc.nanos())) break;
     }
+    if (count == 0) return err;
+    // __sys_recvmmsg: once something arrived, the timeout holds the time that is left, however the batch ended.
+    if (deadline) |d| {
+        if (!writeTimeoutLeft(timeout, d, tsc.nanos())) return -14;
+    }
     return @intCast(count);
+}
+
+/// Store the rest of a recvmmsg timeout ending at `deadline` into the user timespec at `ptr`; false when it cannot be written.
+fn writeTimeoutLeft(ptr: u64, deadline: u64, now: u64) bool {
+    const left = message_batch_policy.remainingNs(deadline, now);
+    var raw: [16]u8 = undefined;
+    bo.writeU64Le(raw[0..8], left / 1_000_000_000);
+    bo.writeU64Le(raw[8..16], left % 1_000_000_000);
+    return copy.copyToUser(@ptrFromInt(ptr), &raw, 16) == 16;
 }
 
 /// sendmmsg(sockfd, msgvec, vlen, flags) → count or -errno

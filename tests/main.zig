@@ -16656,3 +16656,24 @@ test "a signal sent to a task asleep in rt_sigtimedwait for it wakes the task at
     const k_end = std.mem.indexOf(u8, sg[k..], "\n}\n").? + k;
     try std.testing.expect(std.mem.indexOf(u8, sg[k..k_end], "action_policy.wakesSigwaiter(") != null);
 }
+
+test "sendmmsg / recvmmsg batch up to UIO_MAXIOV and recvmmsg writes the time left back (hello434)" {
+    // Linux __sys_sendmmsg / do_recvmmsg clamp vlen to UIO_MAXIOV (1024); __sys_recvmmsg writes what remains of the timeout back once
+    // a datagram arrived. The batch used to stop at 16 and the timeout was never written.
+    const mp = kt.message_batch_policy;
+    try std.testing.expectEqual(@as(u64, 1024), mp.MAX_MESSAGES);
+    try std.testing.expectEqual(@as(u64, 1024), mp.clampVlen(2000));
+    try std.testing.expectEqual(@as(u64, 40), mp.clampVlen(40));
+    try std.testing.expectEqual(@as(u64, 0), mp.remainingNs(100, 200));
+    try std.testing.expectEqual(@as(u64, 50), mp.remainingNs(150, 100));
+    const ss = kt.socket_syscall_source;
+    const r = std.mem.indexOf(u8, ss, "pub fn recvmmsg(").?;
+    const r_end = std.mem.indexOf(u8, ss[r..], "\n}\n").? + r;
+    const body = ss[r..r_end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "writeTimeoutLeft(timeout, d, tsc.nanos())") != null);
+    // A batch that ends on an error after some messages (MSG_WAITFORONE's EAGAIN) still writes the timeout back.
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (result < 0) return mp.batchResult(count, result);") == null);
+    const brk = std.mem.indexOf(u8, body, "err = result;\n            break;").?;
+    const wr = std.mem.indexOf(u8, body, "writeTimeoutLeft(").?;
+    try std.testing.expect(brk < wr);
+}
