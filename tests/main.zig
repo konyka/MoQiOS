@@ -15727,7 +15727,7 @@ test "the first RTO comes from the handshake (hello414): Linux tcp_clean_rtx_que
     const p = std.mem.indexOf(u8, ts, "fn noteHandshakeRtt(tcb: *TcpTcb, sampled: bool) void {") orelse return error.TestUnexpectedResult;
     const end = std.mem.indexOfPos(u8, ts, p, "\n}\n") orelse return error.TestUnexpectedResult;
     const body = ts[p..end];
-    try std.testing.expect(std.mem.indexOf(u8, body, "if (tcp_recv_policy.handshakeRttSample(tcb.retransmit_count, tcb.rtx_elapsed_ms)) |m| updateRtt(tcb, m) else tcb.rto = tcp_recv_policy.TIMEOUT_FALLBACK_MS;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (tcp_recv_policy.handshakeRttSample(tcb.retransmit_count, waited)) |m| updateRtt(tcb, m) else tcb.rto = tcp_recv_policy.TIMEOUT_FALLBACK_MS;") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "tcb.retransmit_count = 0;") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "tcb.rtx_elapsed_ms = 0;") != null);
     // Both ends of the handshake take it: the client on the SYN-ACK, the server on the final ACK.
@@ -16744,4 +16744,29 @@ test "madvise MADV_DONTFORK / MADV_DOFORK: a fork child does not get a DONTFORK 
     try std.testing.expect(std.mem.indexOf(u8, fk, "@import(\"../mm/vma_table.zig\").dropDontfork(&vma_snap);") != null);
     const se = kt.syscall_entry_source;
     try std.testing.expect(std.mem.indexOf(u8, se, "mmap_mod_dontfork.setDontfork(cur, addr, length, v)") != null);
+}
+
+test "the zero-window probe timer starts from the connection's RTO and the initial RTO is 1 s (hello439)" {
+    // Linux tcp_probe0_base = max(icsk_rto, TCP_RTO_MIN), doubled per unanswered probe; icsk_rto starts at TCP_TIMEOUT_INIT (1 s).
+    // The persist timer used to start from a fixed 2 s, which was also the initial RTO.
+    const rp = kt.tcp_recv_policy;
+    try std.testing.expectEqual(@as(u32, 1000), rp.TIMEOUT_INIT_MS);
+    try std.testing.expectEqual(@as(u32, 200), rp.probe0BaseMs(150));
+    try std.testing.expectEqual(@as(u32, 230), rp.probe0BaseMs(230));
+    try std.testing.expectEqual(@as(u32, 1000), rp.probe0BaseMs(0));
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const RETRANSMIT_MS: u32 = tcp_recv_policy.TIMEOUT_INIT_MS;") != null);
+    // The window reopening and the persist timer stopping both rearm the first probe from the RTO, not a fixed value.
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, ts, "tcb.persist_rto_ms = tcp_recv_policy.probe0BaseMs(tcb.rto);"));
+    // ... and so does the start of a run of probes.
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (starting) tcb.persist_rto_ms = tcp_recv_policy.probe0BaseMs(tcb.rto);") != null);
+    // The pass that starts a run charges only 1 ms: a full timer pass made the first probe come up to 100 ms early (QEMU: 73 ms).
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const persist_charge: u32 = if (starting) 1 else ms_elapsed;") != null);
+    // The handshake's RTT sample is the time since the SYN went out, not a count of ~100 ms timer passes: in QEMU the pass count
+    // gave samples of 0 to 300 ms and a first probe anywhere from 200 to 520 ms.
+    try std.testing.expectEqual(@as(u64, 3), rp.sentAgoMs(1_000_000_000, 1_003_500_000, 100));
+    try std.testing.expectEqual(@as(u64, 100), rp.sentAgoMs(0, 1_003_500_000, 100));
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const waited = tcp_recv_policy.sentAgoMs(tcb.rtx_start_ns, @import(\"../arch/arch.zig\").tsc.nanos(), tcb.rtx_elapsed_ms);") != null);
+    try std.testing.expect(kt.capability_profile.profileForLaunch("hello439", true, false).caps.cap_net_raw);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "tcb.persist_rto_ms > 0) tcb.persist_rto_ms else tcp_recv_policy.probe0BaseMs(tcb.rto)") != null);
 }

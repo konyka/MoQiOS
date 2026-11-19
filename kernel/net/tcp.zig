@@ -86,7 +86,7 @@ const TCP_IPV4_OVERHEAD: u16 = ipv4.HEADER_LEN + 20;
 const TCP_IPV6_OVERHEAD: u16 = ipv6.HEADER_LEN + 20;
 const SEND_BUF_SIZE: u32 = 65536;
 const RECV_BUF_SIZE: u32 = 65536;
-const RETRANSMIT_MS: u32 = 2000; // initial RTO (ms), overridden by Jacobson/Karels
+const RETRANSMIT_MS: u32 = tcp_recv_policy.TIMEOUT_INIT_MS; // initial RTO (TCP_TIMEOUT_INIT), overridden by Jacobson/Karels
 const TCP_RTO_MIN: u32 = 200; // minimum RTO (ms)
 /// What tcp_write_timeout measures TCP_USER_TIMEOUT against: the time since the oldest unacknowledged data went out.
 fn rtxElapsedMs(tcb: *const TcpTcb) u64 {
@@ -1810,7 +1810,10 @@ fn parseTcpOptions(data: [*]const u8, data_offset: u16) TcpOptions {
 /// starts over for the data.
 fn noteHandshakeRtt(tcb: *TcpTcb, sampled: bool) void {
     if (!sampled) {
-        if (tcp_recv_policy.handshakeRttSample(tcb.retransmit_count, tcb.rtx_elapsed_ms)) |m| updateRtt(tcb, m) else tcb.rto = tcp_recv_policy.TIMEOUT_FALLBACK_MS;
+        // The wait is measured from when the SYN (or SYN-ACK) went out to now, not in timer passes (~100 ms each), so a loopback
+        // handshake samples ~0 ms and the data starts at TCP_RTO_MIN (Linux takes it from tcp_mstamp).
+        const waited = tcp_recv_policy.sentAgoMs(tcb.rtx_start_ns, @import("../arch/arch.zig").tsc.nanos(), tcb.rtx_elapsed_ms);
+        if (tcp_recv_policy.handshakeRttSample(tcb.retransmit_count, waited)) |m| updateRtt(tcb, m) else tcb.rto = tcp_recv_policy.TIMEOUT_FALLBACK_MS;
     }
     tcb.retransmit_timer = 0;
     tcb.retransmit_count = 0;
@@ -2914,7 +2917,7 @@ fn driveTcbStateMachine(
                 // SK-110: window reopen cancels persist and drains queued data.
                 if (window > 0) {
                     tcb.persist_timer_ms = 0;
-                    tcb.persist_rto_ms = RETRANSMIT_MS;
+                    tcb.persist_rto_ms = tcp_recv_policy.probe0BaseMs(tcb.rto);
                     flushSendBuffer(tcb);
                 }
             }
@@ -4467,8 +4470,13 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
     if (tcb.state == .established or tcb.state == .close_wait) {
         const unsent = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
         if (probePersistActive(tcb.snd_wnd, unsent)) {
-            tcb.persist_timer_ms +%= ms_elapsed;
-            tcb.persist_shut_ms +|= ms_elapsed;
+            // The first probe of a run waits the connection's RTO (tcp_check_probe_timer: tcp_probe0_base), then each doubles. The
+            // run starts at this pass: the window may have shut, or the data been queued, only just before it, so it charges nothing.
+            const starting = tcb.persist_shut_ms == 0;
+            if (starting) tcb.persist_rto_ms = tcp_recv_policy.probe0BaseMs(tcb.rto);
+            const persist_charge: u32 = if (starting) 1 else ms_elapsed;
+            tcb.persist_timer_ms +%= persist_charge;
+            tcb.persist_shut_ms +|= persist_charge;
             if (tcp_recv_policy.persistGiveUp(tcb.options.user_timeout_ms, tcb.persist_shut_ms)) {
                 // tcp_probe_timer → tcp_write_err.
                 tcpLog("[tcp] zero window past TCP_USER_TIMEOUT, closing\n");
@@ -4477,7 +4485,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
                 closeTcbRemote(tcb);
                 return;
             }
-            const interval = @min(if (tcb.persist_rto_ms > 0) tcb.persist_rto_ms else RETRANSMIT_MS, tcb.options.rto_max_ms);
+            const interval = @min(if (tcb.persist_rto_ms > 0) tcb.persist_rto_ms else tcp_recv_policy.probe0BaseMs(tcb.rto), tcb.options.rto_max_ms);
             if (tcb.persist_timer_ms >= interval) {
                 tcb.persist_timer_ms = 0;
                 tcb.persist_rto_ms = tcp_recv_policy.backoffRto(interval, tcb.options.rto_max_ms);
@@ -4485,7 +4493,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
             }
         } else {
             tcb.persist_timer_ms = 0;
-            tcb.persist_rto_ms = RETRANSMIT_MS;
+            tcb.persist_rto_ms = tcp_recv_policy.probe0BaseMs(tcb.rto);
             tcb.persist_shut_ms = 0;
         }
     }

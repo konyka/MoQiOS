@@ -381,12 +381,28 @@ pub fn synGiveUp(retransmits: u32, syncnt: u32, elapsed_ms: u64, user_timeout_ms
     return elapsed_ms >= limit;
 }
 
+/// TCP_TIMEOUT_INIT: the RTO before any RTT sample (RFC 6298 2.1).
+pub const TIMEOUT_INIT_MS: u32 = 1000;
+
+/// tcp_probe0_base: the first zero-window probe waits the connection's RTO, at least TCP_RTO_MIN (200 ms); a connection with no
+/// RTO yet uses the initial one.
+pub fn probe0BaseMs(rto_ms: u32) u32 {
+    if (rto_ms == 0) return TIMEOUT_INIT_MS;
+    return @max(rto_ms, 200);
+}
+
 /// TCP_TIMEOUT_FALLBACK: the first RTO when the handshake gave no RTT sample (RFC 6298 5.7, tcp_init_metrics).
 pub const TIMEOUT_FALLBACK_MS: u32 = 3000;
 
 /// The RTT sample the handshake gives without timestamps (tcp_clean_rtx_queue for the SYN, tcp_synack_rtt_meas for the SYN-ACK):
 /// the time since the SYN or SYN-ACK went out, but only if it went out once (Karn: after a retransmission nobody knows which copy
 /// was answered).
+/// How long ago, in ms, a segment sent at `sent_ns` went out at `now_ns`; `fallback_ms` when the send time is not known.
+pub fn sentAgoMs(sent_ns: u64, now_ns: u64, fallback_ms: u64) u64 {
+    if (sent_ns == 0 or now_ns < sent_ns) return fallback_ms;
+    return (now_ns - sent_ns) / 1_000_000;
+}
+
 pub fn handshakeRttSample(retransmits: u32, elapsed_ms: u64) ?u32 {
     if (retransmits != 0) return null;
     return @intCast(@min(elapsed_ms, std.math.maxInt(u32)));
