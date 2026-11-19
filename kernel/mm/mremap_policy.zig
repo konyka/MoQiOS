@@ -65,11 +65,13 @@ pub const Traits = struct {
     no_free: bool,
     locked: bool,
     huge_pages: u32,
+    dontfork: bool = false,
 };
 
 pub fn canCoalesce(a: Traits, b: Traits) bool {
     if (a.file_kind != 0 or b.file_kind != 0) return false;
     if (a.no_free or b.no_free or a.locked or b.locked) return false;
     if (a.huge_pages != 0 or b.huge_pages != 0) return false;
+    if (a.dontfork != b.dontfork) return false;
     return a.prot == b.prot and a.shared == b.shared and a.may_write == b.may_write;
 }

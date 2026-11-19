@@ -52,7 +52,14 @@ pub const MmapRegion = struct {
     /// the PMM; the owner (userdrv) releases DMA frames itself, and MMIO
     /// frames are never freed at all.
     no_free: bool = false,
+    /// madvise(MADV_DONTFORK): a fork child does not get this mapping at all (Linux VM_DONTCOPY, dup_mmap skips it).
+    dontfork: bool = false,
 };
+
+comptime {
+    // 64 regions fill the one page an Mm allocates for its table.
+    if (@sizeOf(MmapRegion) * MAX_REGIONS > 4096) @compileError("the region table must fit in one page");
+}
 
 pub const MAX_REGIONS: usize = 64;
 
@@ -77,6 +84,16 @@ pub fn snapshot(t: *VmaTable, out: *Snapshot) void {
     out.regions = t.regions.*;
     out.count = t.count;
     out.active_bm = t.active_bm;
+}
+
+/// A fork child does not inherit MADV_DONTFORK regions: drop them from its copy of the table.
+pub fn dropDontfork(snap: *Snapshot) void {
+    for (&snap.regions, 0..) |*r, i| {
+        if (!r.active or !r.dontfork) continue;
+        r.* = .{};
+        snap.active_bm &= ~(@as(u64, 1) << @intCast(i));
+        snap.count -|= 1;
+    }
 }
 
 pub fn adopt(t: *VmaTable, snap: *const Snapshot) void {

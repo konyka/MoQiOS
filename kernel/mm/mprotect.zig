@@ -44,6 +44,7 @@ fn insertRegionPiece(cur: *task.Task, base: u64, num_pages: u64, proto: *const t
                 .num_pages = num_pages,
                 .active = true,
                 .locked = proto.locked,
+                .dontfork = proto.dontfork,
                 // L1: a split user-MMIO/DMA piece keeps the no-free accounting.
                 .no_free = proto.no_free,
                 .file_kind = proto.file_kind,
@@ -127,6 +128,7 @@ fn insertAnonPiece(cur: *task.Task, base: u64, num_pages: u64, proto: *const tas
             .num_pages = num_pages,
             .active = true,
             .locked = proto.locked,
+            .dontfork = proto.dontfork,
             .shared = proto.shared,
             .may_write = proto.may_write,
             .prot = prot,

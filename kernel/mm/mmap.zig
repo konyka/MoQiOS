@@ -248,7 +248,7 @@ fn anonMergeSide(r: *const task_mod.MmapRegion, base: u64, num_pages: u64, prot:
     // L1: never merge into a no_free region — the neighbour's frames would
     // inherit the no-free accounting (or vice versa). Prot/sharing must
     // match: the region records one prot for the whole range.
-    if (!r.active or r.huge_pages != 0 or r.no_free or !filemap.canMergeAnon(r.file_kind, 0)) return .none;
+    if (!r.active or r.huge_pages != 0 or r.no_free or r.dontfork or !filemap.canMergeAnon(r.file_kind, 0)) return .none;
     if (r.prot != prot or r.shared != shared) return .none;
     if (r.base + r.num_pages * user_space.PAGE_SIZE == base) return .after;
     if (base + num_pages * user_space.PAGE_SIZE == r.base) return .before;
@@ -466,6 +466,7 @@ fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
                         .num_pages = tail_pages,
                         .active = true,
                         .locked = r.locked,
+                        .dontfork = r.dontfork,
                         .huge_pages = tail_huge,
                         // L1: a split no_free piece stays no_free on both sides.
                         .no_free = r.no_free,
@@ -1697,7 +1698,7 @@ fn regionContaining(task: *task_mod.Task, addr: u64, pages: u64) ?usize {
 }
 
 fn regionTraits(r: *const task_mod.MmapRegion) mremap_policy.Traits {
-    return .{ .prot = r.prot, .shared = r.shared, .may_write = r.may_write, .file_kind = r.file_kind, .no_free = r.no_free, .locked = r.locked, .huge_pages = r.huge_pages };
+    return .{ .prot = r.prot, .shared = r.shared, .may_write = r.may_write, .file_kind = r.file_kind, .no_free = r.no_free, .locked = r.locked, .huge_pages = r.huge_pages, .dontfork = r.dontfork };
 }
 
 /// A new region record cloned from `proto` (anonymous, so there is no file backing to retain) covering [base, +pages).
@@ -1708,7 +1709,7 @@ fn insertAnonPiece(task: *task_mod.Task, proto: *const task_mod.MmapRegion, base
         free_bits &= free_bits - 1;
         const r = &task.vma().regions[i];
         if (r.active) continue;
-        r.* = .{ .base = base, .num_pages = pages, .active = true, .locked = proto.locked, .huge_pages = huge, .no_free = proto.no_free,
+        r.* = .{ .base = base, .num_pages = pages, .active = true, .locked = proto.locked, .dontfork = proto.dontfork, .huge_pages = huge, .no_free = proto.no_free,
                  .shared = proto.shared, .may_write = proto.may_write, .prot = proto.prot };
         task.vma().count += 1;
         task.vma().active_bm |= @as(u64, 1) << i;
@@ -2076,4 +2077,98 @@ fn mremapExact(cur: *task_mod.Task, old_addr: u64, old_pages: u64, new_pages: u6
     // mapped is EFAULT on Linux; anything else (e.g. not a region start) stays EINVAL.
     if (old_addr % PAGE == 0 and old_addr < user_space.USER_ADDR_MAX and !paging_mod.isPageOccupied(cur.page_table_phys, old_addr) and !hasMmapOverlap(cur, old_addr, 1)) return @import("mprotect_policy.zig").remapSourceErrno(1, 0); // EFAULT
     return -22; // EINVAL: old_addr not found
+}
+
+/// A copy of region `r` cut to [base, +pages): the file offset follows the cut, a file backing gets its own reference, and no
+/// huge block count is kept (the page tables drive every huge-page path).
+fn insertClonedPiece(task: *task_mod.Task, r: *const task_mod.MmapRegion, base: u64, pages: u64) void {
+    var free_bits = ~task.vma().active_bm;
+    while (free_bits != 0) {
+        const i: u6 = @truncate(@ctz(free_bits));
+        free_bits &= free_bits - 1;
+        const slot = &task.vma().regions[i];
+        if (slot.active) continue;
+        slot.* = r.*;
+        slot.base = base;
+        slot.num_pages = pages;
+        slot.huge_pages = 0;
+        if (r.file_kind != 0) slot.file_offset = r.file_offset + (base - r.base);
+        if (r.file_kind == @intFromEnum(filemap.FsKind.ext2)) ext2.retainFile(r.file_idx);
+        if (r.file_kind == @intFromEnum(filemap.FsKind.fat32)) fat32.retainFile(r.file_idx);
+        task.vma().count += 1;
+        task.vma().active_bm |= @as(u64, 1) << i;
+        return;
+    }
+    unreachable; // setDontfork checked the free slots first
+}
+
+/// madvise(MADV_DONTFORK / MADV_DOFORK): mark every tracked region of [addr, +length) so that a fork child does (not) get it
+/// (Linux VM_DONTCOPY), splitting a region the range only partly covers. -ENOMEM (nothing changed) when the splits need more
+/// region slots than are free; untracked pages (the image, the stack, brk) are not marked. The caller checked the range.
+pub fn setDontfork(task: *task_mod.Task, addr: u64, length: u64, value: bool) i64 {
+    const page = user_space.PAGE_SIZE;
+    const pages = (length + page - 1) / page;
+    var guard = mm_mod.Mm.beginVmMutation(task.mm, @ptrCast(task)) catch return -35;
+    defer guard.release();
+    var need: u32 = 0;
+    var bits = task.vma().active_bm;
+    while (bits != 0) {
+        const i: usize = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const r = &task.vma().regions[i];
+        if (r.dontfork == value) continue;
+        need += filemap.planProtUpdate(r.base, r.num_pages, addr, pages).slots_needed;
+    }
+    const free: u32 = @intCast(task.vma().regions.len - @popCount(task.vma().active_bm));
+    if (need > free) return -12;
+    bits = task.vma().active_bm;
+    while (bits != 0) {
+        const i: usize = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const r = &task.vma().regions[i];
+        if (!r.active or r.dontfork == value) continue;
+        const plan = filemap.planProtUpdate(r.base, r.num_pages, addr, pages);
+        switch (plan.overlap) {
+            .none => continue,
+            .cover => {},
+            .head => {
+                insertClonedPiece(task, r, r.base + plan.mid_pages * page, plan.tail_pages);
+                r.num_pages = plan.mid_pages;
+            },
+            .tail => {
+                const cut = r.base + plan.head_pages * page;
+                const saved = r.*;
+                r.num_pages = plan.head_pages;
+                insertClonedPiece(task, &saved, cut, plan.mid_pages);
+                // The new piece is the one inside the range: find it and mark it.
+                markAt(task, cut, value);
+                continue;
+            },
+            .middle => {
+                const saved = r.*;
+                insertClonedPiece(task, &saved, addr + plan.mid_pages * page, plan.tail_pages);
+                insertClonedPiece(task, &saved, addr, plan.mid_pages);
+                r.num_pages = plan.head_pages;
+                markAt(task, addr, value);
+                continue;
+            },
+        }
+        r.huge_pages = @intCast(@min(r.huge_pages, r.num_pages / @import("huge_user.zig").HUGE_PAGES));
+        r.dontfork = value;
+    }
+    coalesceAnonymousAround(task, addr, pages);
+    return 0;
+}
+
+fn markAt(task: *task_mod.Task, base: u64, value: bool) void {
+    var bits = task.vma().active_bm;
+    while (bits != 0) {
+        const i: usize = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const r = &task.vma().regions[i];
+        if (r.active and r.base == base) {
+            r.dontfork = value;
+            return;
+        }
+    }
 }

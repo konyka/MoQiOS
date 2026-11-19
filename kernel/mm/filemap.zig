@@ -207,6 +207,15 @@ pub fn sharedPte(phys: u64, prot: u8) u64 {
 /// keep such pages truly shared instead of COW-downgrading them.
 /// Required region fields: `active`, `file_kind`, `shared`, `base`,
 /// `num_pages`.
+/// Whether `addr` lies in a region madvise(MADV_DONTFORK) marked: a fork child does not get it.
+pub fn inDontforkRegion(comptime R: type, regions: []const R, addr: u64) bool {
+    for (regions) |r| {
+        if (!r.active or !r.dontfork) continue;
+        if (addr >= r.base and addr - r.base < r.num_pages * PAGE_SIZE) return true;
+    }
+    return false;
+}
+
 pub fn inSharedFileRegion(comptime R: type, regions: []const R, addr: u64) bool {
     for (regions) |r| {
         if (!r.active or r.file_kind == 0 or !r.shared) continue;

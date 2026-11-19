@@ -38,6 +38,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
         defer vm_guard.release();
         const pml4 = cloneUserPagesCow(parent.page_table_phys, parent.vma().regions) orelse return -1;
         @import("../mm/vma_table.zig").snapshot(parent.vma(), &vma_snap);
+        @import("../mm/vma_table.zig").dropDontfork(&vma_snap);
         break :blk pml4;
     };
 
@@ -297,6 +298,11 @@ fn abortCloneRoot(child_pml4_phys: u64) ?u64 {
 /// pages — the parent is untouched apart from neutral demotions); phase 2
 /// performs every parent downgrade and child fill with zero allocations, so
 /// it cannot fail partway.
+fn dontforkPage(regions: ?[]const @import("task.zig").MmapRegion, virt: u64) bool {
+    const regs = regions orelse return false;
+    return @import("../mm/filemap.zig").inDontforkRegion(@import("task.zig").MmapRegion, regs, virt);
+}
+
 pub fn cloneUserPagesCow(parent_pml4_phys: u64, shared_regions: ?[]const @import("task.zig").MmapRegion) ?u64 {
     const pmm_mod = @import("../mm/pmm.zig");
     const hhdm_mod = @import("../mm/hhdm.zig");
@@ -424,6 +430,7 @@ pub fn cloneUserPagesCow(parent_pml4_phys: u64, shared_regions: ?[]const @import
                 for (0..512) |pt_idx| {
                     const pte = parent_pt[pt_idx];
                     if (pte == 0 or pte & 1 == 0) continue;
+                    if (dontforkPage(shared_regions, (pml4_idx << 39) | (pdpt_idx << 30) | (pd_idx << 21) | (pt_idx << 12))) continue;
                     // L1: frames the PMM does not own (user-MMIO from
                     // dev_map_mmio) are never ref-counted — an addRef would
                     // later let a teardown freePage return a device-register
@@ -450,6 +457,8 @@ pub fn cloneUserPagesCow(parent_pml4_phys: u64, shared_regions: ?[]const @import
 
                     const virt = (pml4_idx << 39) | (pdpt_idx << 30) |
                         (pd_idx << 21) | (pt_idx << 12);
+                    // MADV_DONTFORK: the child gets nothing here and the parent's entry stays as it is (dup_mmap skips VM_DONTCOPY).
+                    if (dontforkPage(shared_regions, virt)) continue;
 
                     // H1: MAP_SHARED file pages stay shared across fork.
                     const keep_shared = if (shared_regions) |regs|

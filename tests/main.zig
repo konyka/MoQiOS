@@ -2141,7 +2141,7 @@ test "memory-management argument rules follow Linux: ranges, rounding, flags, ml
     try std.testing.expectEqual(rp.Span{ .err = E.ENOMEM }, rp.madviseSpan(0xffff800000000000, 4096));
     try std.testing.expectEqual(rp.Span{ .pages = 2 }, rp.madviseSpan(0x1000, 4097));
     for ([_]u32{ 0, 1, 2, 3, 4, 8 }) |a| try std.testing.expect(rp.madviseSupported(a));
-    for ([_]u32{ 5, 9, 10, 11, 12, 14, 100, 9999 }) |a| try std.testing.expect(!rp.madviseSupported(a));
+    for ([_]u32{ 5, 9, 12, 14, 100, 9999 }) |a| try std.testing.expect(!rp.madviseSupported(a)); // 10 / 11 (DONTFORK / DOFORK) since hello438
     // mincore: alignment EINVAL; a wrapping length or a range outside user space is ENOMEM; zero length is empty.
     try std.testing.expectEqual(rp.Span{ .err = E.EINVAL }, rp.mincoreSpan(0x1001, 4096));
     try std.testing.expectEqual(rp.Span{ .err = E.ENOMEM }, rp.mincoreSpan(0x1000, std.math.maxInt(u64)));
@@ -16723,4 +16723,25 @@ test "pidfd_send_signal reads its siginfo and its scope flags (hello437)" {
     const f_end = std.mem.indexOf(u8, se[f..], "\n}\n").? + f;
     try std.testing.expect(std.mem.indexOf(u8, se[f..f_end], "_ = info_ptr;") == null);
     try std.testing.expect(std.mem.indexOf(u8, se[f..f_end], "signal_syscall_mod.pidfdSendSignal(target_tid, sig, info_ptr, flags)") != null);
+}
+
+test "madvise MADV_DONTFORK / MADV_DOFORK: a fork child does not get a DONTFORK mapping (hello438)" {
+    // Linux madvise_behavior sets / clears VM_DONTCOPY; dup_mmap skips such a vma, so the child has no mapping there. Both
+    // advice values used to be EINVAL.
+    const rp = kt.range_policy;
+    try std.testing.expect(rp.madviseSupported(10) and rp.madviseSupported(11));
+    try std.testing.expect(!rp.madviseSupported(99));
+    try std.testing.expectEqual(@as(?bool, true), rp.dontforkValue(10));
+    try std.testing.expectEqual(@as(?bool, false), rp.dontforkValue(11));
+    try std.testing.expectEqual(@as(?bool, null), rp.dontforkValue(4));
+    const mp = kt.mremap_policy;
+    const t: mp.Traits = .{ .prot = 3, .shared = false, .may_write = true, .file_kind = 0, .no_free = false, .locked = false, .huge_pages = 0 };
+    var d = t;
+    d.dontfork = true;
+    try std.testing.expect(!mp.canCoalesce(t, d));
+    const fk = kt.fork_source;
+    try std.testing.expect(std.mem.indexOf(u8, fk, "@import(\"../mm/filemap.zig\").inDontforkRegion(@import(\"task.zig\").MmapRegion, regs, virt)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fk, "@import(\"../mm/vma_table.zig\").dropDontfork(&vma_snap);") != null);
+    const se = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, se, "mmap_mod_dontfork.setDontfork(cur, addr, length, v)") != null);
 }

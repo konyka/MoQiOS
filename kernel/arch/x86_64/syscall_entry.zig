@@ -4064,8 +4064,8 @@ fn syscallRenameFlagsAt(old_dirfd: i64, old_ptr: u64, new_dirfd: i64, new_ptr: u
 
 // ── v32.4: madvise / getrlimit / setrlimit ──────────────────────────
 
-/// madvise(addr, length, advice) — advise on memory usage.
-/// Simplified: accept advice, return 0 for valid mapped regions.
+/// madvise(addr, length, advice) — advise on memory usage: NORMAL/RANDOM are accepted, SEQUENTIAL/WILLNEED warm the cache,
+/// DONTNEED/FREE drop pages, DONTFORK/DOFORK set whether a fork child gets the mapping.
 fn syscallMadvise(addr: u64, length: u64, advice: u32) i64 {
     const rp = @import("../../mm/range_policy.zig");
     // Linux order: advice value, then the range, then the mappings.
@@ -4082,6 +4082,11 @@ fn syscallMadvise(addr: u64, length: u64, advice: u32) i64 {
     const cur_idx = sched.currentTaskIndex() orelse return 0;
     const cur = tm.getTask(cur_idx) orelse return 0;
 
+    // MADV_DONTFORK / MADV_DOFORK: whether a fork child gets the mappings of the range (VM_DONTCOPY).
+    if (rp.dontforkValue(advice)) |v| {
+        const mmap_mod_dontfork = @import("../../mm/mmap.zig");
+        return mmap_mod_dontfork.setDontfork(cur, addr, length, v);
+    }
     // Linux: discarding advice on a VM_LOCKED range is EINVAL, whole call, nothing discarded.
     if ((advice == 4 or advice == 8) and @import("../../mm/mm.zig").Mm.locked(cur.mm, addr, length + (addr & 0xFFF))) return -22;
 
