@@ -4353,7 +4353,7 @@ fn timerTickOne(idx: u32, ms_elapsed: u32) void {
         // SK-128: RACK timer repair before TLP/RTO (no new ACK required).
         _ = maybeRackTimerRepair(tcb, current_rto);
         // SK-117: Tail Loss Probe before RTO (no cwnd cut).
-        const tlp_to = probeTlpTimeoutMs(tcb.srtt, current_rto);
+        const tlp_to = tcp_recv_policy.tlpTimeoutMs(tcb.srtt, current_rto, pipeBytes(tcb) <= mssForTcb(tcb));
         if (tcp_recv_policy.tailLossProbeAllowed(tcb.state) and probeTlpShouldFire(
             tcb.retransmit_timer,
             tlp_to,
@@ -6136,15 +6136,6 @@ fn nextRackLostHole(tcb: *const TcpTcb) ?u32 {
         if (!jumped) seq +%= 1;
     }
     return null;
-}
-
-/// TLP PTO = min(RTO−1, max(2·SRTT, 10ms)) (SK-117).
-pub fn probeTlpTimeoutMs(srtt: u32, rto: u32) u32 {
-    var pto: u32 = if (srtt > 0) srtt *% 2 else RETRANSMIT_MS / 2;
-    if (pto < 10) pto = 10;
-    const limit: u32 = if (rto > 1) rto - 1 else 1;
-    if (pto > limit) pto = limit;
-    return pto;
 }
 
 /// True when a Tail Loss Probe should fire (SK-117).

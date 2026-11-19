@@ -16782,3 +16782,16 @@ test "rt_sigaction requires sigsetsize 8 before anything else (hello440)" {
     try std.testing.expect(size_check < sig_check);
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "signal_syscall_mod.sigaction(@truncate(frame.rdi), frame.rsi, frame.rdx, frame.r10)") != null);
 }
+
+test "the tail loss probe waits 2 SRTT + TCP_RTO_MIN with one segment out, so one lost segment waits for the RTO (hello414 CI)" {
+    // Linux tcp_schedule_loss_probe: timeout = 2 * srtt + (packets_out == 1 ? tcp_rto_min : TCP_TIMEOUT_MIN 2 ms), TCP_TIMEOUT_INIT
+    // without a sample, then min(that, the RTO). With a real handshake RTT sample of ~1 ms the old max(2 * SRTT, 10 ms) fired the
+    // probe at the first timer pass, ~100 ms after the data, before the 200 ms RTO (hello414 F: 142 ms in CI).
+    const rp = kt.tcp_recv_policy;
+    try std.testing.expectEqual(@as(u32, 200), rp.tlpTimeoutMs(1, 200, true)); // 2 + 200 capped by the RTO: no probe before it
+    try std.testing.expectEqual(@as(u32, 4), rp.tlpTimeoutMs(1, 200, false)); // 2 + 2 with more segments out
+    try std.testing.expectEqual(@as(u32, 200), rp.tlpTimeoutMs(0, 200, false)); // no sample: TCP_TIMEOUT_INIT, capped by the RTO
+    try std.testing.expectEqual(@as(u32, 260), rp.tlpTimeoutMs(30, 1000, true));
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const tlp_to = tcp_recv_policy.tlpTimeoutMs(tcb.srtt, current_rto, pipeBytes(tcb) <= mssForTcb(tcb));") != null);
+}

@@ -1,7 +1,7 @@
 //! SK-117 — Tail Loss Probe before RTO (non-x86).
 //!
 //! Lost tail segments often produce no dup ACK / SACK, so recovery waited for
-//! a full RTO. TLP sends one probe at ~2·SRTT without cutting cwnd.
+//! a full RTO. TLP sends one probe at ~2·SRTT (+ TCP_RTO_MIN for a single segment) without cutting cwnd.
 
 const builtin = @import("builtin");
 const arch = @import("../arch/arch.zig");
@@ -19,16 +19,17 @@ pub fn announce() void {
         return;
     }
 
-    // PTO from SRTT, floored at 10ms, capped below RTO.
-    if (tcp.probeTlpTimeoutMs(100, 2000) != 200) {
+    // PTO = 2 * SRTT + TCP_RTO_MIN with one segment out (+ 2 ms otherwise), TCP_TIMEOUT_INIT without a sample, capped by the RTO.
+    const rp = @import("../net/tcp_recv_policy.zig");
+    if (rp.tlpTimeoutMs(100, 2000, false) != 202) {
         fail("pto srtt");
         return;
     }
-    if (tcp.probeTlpTimeoutMs(2, 2000) != 10) {
-        fail("pto floor");
+    if (rp.tlpTimeoutMs(1, 2000, true) != 202) {
+        fail("pto one segment");
         return;
     }
-    if (tcp.probeTlpTimeoutMs(5000, 1000) != 999) {
+    if (rp.tlpTimeoutMs(5000, 1000, false) != 1000) {
         fail("pto cap");
         return;
     }

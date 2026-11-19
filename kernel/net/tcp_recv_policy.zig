@@ -381,6 +381,13 @@ pub fn synGiveUp(retransmits: u32, syncnt: u32, elapsed_ms: u64, user_timeout_ms
     return elapsed_ms >= limit;
 }
 
+/// The tail loss probe timeout (Linux tcp_schedule_loss_probe): 2 * SRTT plus TCP_RTO_MIN when only one segment is out (its ACK
+/// may be delayed) or TCP_TIMEOUT_MIN (2 ms) otherwise; TCP_TIMEOUT_INIT without an RTT sample; never later than the RTO.
+pub fn tlpTimeoutMs(srtt_ms: u32, rto_ms: u32, one_segment_out: bool) u32 {
+    const pto: u32 = if (srtt_ms > 0) srtt_ms *| 2 +| (if (one_segment_out) @as(u32, 200) else 2) else TIMEOUT_INIT_MS;
+    return @min(pto, rto_ms);
+}
+
 /// TCP_TIMEOUT_INIT: the RTO before any RTT sample (RFC 6298 2.1).
 pub const TIMEOUT_INIT_MS: u32 = 1000;
 
