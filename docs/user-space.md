@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello446`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello447`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -441,6 +441,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello444 | 接收控制消息：SO_TIMESTAMP 和 IP_RECVORIGDSTADDR 的设置与读回（A）；SCM_TIMESTAMP 在前、IP_ORIGDSTADDR 在后（B）；SO_TIMESTAMPNS 替换 SO_TIMESTAMP（C）；小缓冲区的 MSG_CTRUNC（D）；IPv6 的 IPV6_ORIGDSTADDR（E） |
 | hello445 | IP_RECVERR：选项读写与空队列 EAGAIN（A）；未连接套接字收到端口不可达后的 POLLERR 与 SO_ERROR（B）；MSG_ERRQUEUE 读出负载、原目的地址和 sock_extended_err，读后队列清空（C）；未开 IP_RECVERR 的套接字收不到（D）；小缓冲区的 MSG_TRUNC 与 MSG_CTRUNC（E） |
 | hello446 | epoll 中的 signalfd：kill 后报 EPOLLIN 和注册的 data，读走前保持就绪（A）；子进程发信号唤醒阻塞的 epoll_wait（B）；EPOLLONESHOT 只报一次（C） |
+| hello447 | MADV_WIPEONFORK：私有匿名页可标记，共享、未映射、未对齐分别为 EINVAL/ENOMEM/EINVAL（A）；子进程和孙进程读到 0，父进程不变（B）；KEEPONFORK 恢复（C）；跨两页的标记（D） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

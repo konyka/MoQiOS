@@ -210,7 +210,8 @@ pub fn sharedPte(phys: u64, prot: u8) u64 {
 /// Whether `addr` lies in a region madvise(MADV_DONTFORK) marked: a fork child does not get it.
 pub fn inDontforkRegion(comptime R: type, regions: []const R, addr: u64) bool {
     for (regions) |r| {
-        if (!r.active or !r.dontfork) continue;
+        // MADV_WIPEONFORK pages are not copied either (the child keeps the mapping, empty).
+        if (!r.active or !(r.fork.dontfork or r.fork.wipeonfork)) continue;
         if (addr >= r.base and addr - r.base < r.num_pages * PAGE_SIZE) return true;
     }
     return false;

@@ -16916,3 +16916,29 @@ test "signalfd in epoll: readiness from the waiter's pending signals and a wake 
     // kickIfBlocked wakes a blocked task for a signal in its sigwait_mask even though it blocks it.
     try std.testing.expect(kt.signal_action_policy.wakesSigwaiter(1 << 9, 1 << 9));
 }
+
+test "madvise MADV_WIPEONFORK / MADV_KEEPONFORK: a fork child gets the private anonymous range empty (hello447)" {
+    // Linux VM_WIPEONFORK: dup_mmap copies the vma without its pages; madvise_vma_behavior refuses a shared or file vma. The kernel
+    // used to reject both advice values with EINVAL.
+    const rp = kt.range_policy;
+    try std.testing.expect(rp.madviseSupported(18) and rp.madviseSupported(19));
+    try std.testing.expectEqual(@as(?bool, true), rp.wipeonforkValue(18));
+    try std.testing.expectEqual(@as(?bool, false), rp.wipeonforkValue(19));
+    try std.testing.expectEqual(@as(?bool, null), rp.wipeonforkValue(10));
+    const mp = kt.mremap_policy;
+    const t: mp.Traits = .{ .prot = 3, .shared = false, .may_write = true, .file_kind = 0, .no_free = false, .locked = false, .huge_pages = 0 };
+    var w = t;
+    w.wipeonfork = true;
+    try std.testing.expect(!mp.canCoalesce(t, w));
+    const se = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, se, "if (v and !mmap_mod_wipe.rangePrivateAnon(cur, addr, length)) return -22;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.filemap_source, "if (!r.active or !(r.fork.dontfork or r.fork.wipeonfork)) continue;") != null);
+}
+
+test "MADV_WIPEONFORK: fork gives the child fresh zero pages for the marked range (hello447 B)" {
+    // Anonymous mappings are populated eagerly and have no demand-fill path: a wiped page left empty faulted to SIGSEGV in the child
+    // (first QEMU run of hello447). fillWipedPages maps a zeroed frame per present parent page instead.
+    const fk = kt.fork_source;
+    try std.testing.expect(std.mem.indexOf(u8, fk, "if (!fillWipedPages(parent.page_table_phys, pml4, parent.vma().regions)) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fk, "paging_mod.setPageEntryRaw(child_pml4_phys, va, phys | flags);") != null);
+}

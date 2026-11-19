@@ -349,6 +349,7 @@ pub const process_mgmt_source = @embedFile("proc/process_mgmt.zig");
 pub const file_io_source = @embedFile("fs/file_io.zig");
 pub const aio_source = @embedFile("fs/aio.zig");
 pub const mmap_source = @embedFile("mm/mmap.zig");
+pub const filemap_source = @embedFile("mm/filemap.zig");
 pub const copy_from_user_source = @embedFile("mm/copy_from_user.zig");
 pub const huge_user_impl_source = @embedFile("mm/huge_user_impl.zig");
 pub const mprotect_source = @embedFile("mm/mprotect.zig");

@@ -4065,7 +4065,8 @@ fn syscallRenameFlagsAt(old_dirfd: i64, old_ptr: u64, new_dirfd: i64, new_ptr: u
 // ── v32.4: madvise / getrlimit / setrlimit ──────────────────────────
 
 /// madvise(addr, length, advice) — advise on memory usage: NORMAL/RANDOM are accepted, SEQUENTIAL/WILLNEED warm the cache,
-/// DONTNEED/FREE drop pages, DONTFORK/DOFORK set whether a fork child gets the mapping.
+/// DONTNEED/FREE drop pages, DONTFORK/DOFORK set whether a fork child gets the mapping, WIPEONFORK/KEEPONFORK whether it gets it
+/// empty.
 fn syscallMadvise(addr: u64, length: u64, advice: u32) i64 {
     const rp = @import("../../mm/range_policy.zig");
     // Linux order: advice value, then the range, then the mappings.
@@ -4086,6 +4087,13 @@ fn syscallMadvise(addr: u64, length: u64, advice: u32) i64 {
     if (rp.dontforkValue(advice)) |v| {
         const mmap_mod_dontfork = @import("../../mm/mmap.zig");
         return mmap_mod_dontfork.setDontfork(cur, addr, length, v);
+    }
+    // MADV_WIPEONFORK / MADV_KEEPONFORK: a fork child gets the private anonymous range empty (VM_WIPEONFORK); a shared or file
+    // mapping is EINVAL.
+    if (rp.wipeonforkValue(advice)) |v| {
+        const mmap_mod_wipe = @import("../../mm/mmap.zig");
+        if (v and !mmap_mod_wipe.rangePrivateAnon(cur, addr, length)) return -22;
+        return mmap_mod_wipe.setWipeonfork(cur, addr, length, v);
     }
     // Linux: discarding advice on a VM_LOCKED range is EINVAL, whole call, nothing discarded.
     if ((advice == 4 or advice == 8) and @import("../../mm/mm.zig").Mm.locked(cur.mm, addr, length + (addr & 0xFFF))) return -22;

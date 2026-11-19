@@ -248,7 +248,7 @@ fn anonMergeSide(r: *const task_mod.MmapRegion, base: u64, num_pages: u64, prot:
     // L1: never merge into a no_free region — the neighbour's frames would
     // inherit the no-free accounting (or vice versa). Prot/sharing must
     // match: the region records one prot for the whole range.
-    if (!r.active or r.huge_pages != 0 or r.no_free or r.dontfork or !filemap.canMergeAnon(r.file_kind, 0)) return .none;
+    if (!r.active or r.huge_pages != 0 or r.no_free or r.fork.dontfork or r.fork.wipeonfork or !filemap.canMergeAnon(r.file_kind, 0)) return .none;
     if (r.prot != prot or r.shared != shared) return .none;
     if (r.base + r.num_pages * user_space.PAGE_SIZE == base) return .after;
     if (base + num_pages * user_space.PAGE_SIZE == r.base) return .before;
@@ -466,7 +466,7 @@ fn untrackMmapRange(task: *task_mod.Task, base: u64, num_pages: u64) void {
                         .num_pages = tail_pages,
                         .active = true,
                         .locked = r.locked,
-                        .dontfork = r.dontfork,
+                        .fork = r.fork,
                         .huge_pages = tail_huge,
                         // L1: a split no_free piece stays no_free on both sides.
                         .no_free = r.no_free,
@@ -1698,7 +1698,7 @@ fn regionContaining(task: *task_mod.Task, addr: u64, pages: u64) ?usize {
 }
 
 fn regionTraits(r: *const task_mod.MmapRegion) mremap_policy.Traits {
-    return .{ .prot = r.prot, .shared = r.shared, .may_write = r.may_write, .file_kind = r.file_kind, .no_free = r.no_free, .locked = r.locked, .huge_pages = r.huge_pages, .dontfork = r.dontfork };
+    return .{ .prot = r.prot, .shared = r.shared, .may_write = r.may_write, .file_kind = r.file_kind, .no_free = r.no_free, .locked = r.locked, .huge_pages = r.huge_pages, .dontfork = r.fork.dontfork, .wipeonfork = r.fork.wipeonfork };
 }
 
 /// A new region record cloned from `proto` (anonymous, so there is no file backing to retain) covering [base, +pages).
@@ -1709,7 +1709,7 @@ fn insertAnonPiece(task: *task_mod.Task, proto: *const task_mod.MmapRegion, base
         free_bits &= free_bits - 1;
         const r = &task.vma().regions[i];
         if (r.active) continue;
-        r.* = .{ .base = base, .num_pages = pages, .active = true, .locked = proto.locked, .dontfork = proto.dontfork, .huge_pages = huge, .no_free = proto.no_free,
+        r.* = .{ .base = base, .num_pages = pages, .active = true, .locked = proto.locked, .fork = proto.fork, .huge_pages = huge, .no_free = proto.no_free,
                  .shared = proto.shared, .may_write = proto.may_write, .prot = proto.prot };
         task.vma().count += 1;
         task.vma().active_bm |= @as(u64, 1) << i;
@@ -2106,6 +2106,27 @@ fn insertClonedPiece(task: *task_mod.Task, r: *const task_mod.MmapRegion, base: 
 /// (Linux VM_DONTCOPY), splitting a region the range only partly covers. -ENOMEM (nothing changed) when the splits need more
 /// region slots than are free; untracked pages (the image, the stack, brk) are not marked. The caller checked the range.
 pub fn setDontfork(task: *task_mod.Task, addr: u64, length: u64, value: bool) i64 {
+    return setForkFlag(task, addr, length, .dontfork, value);
+}
+
+/// The two madvise fork marks a region carries.
+pub const ForkFlag = enum { dontfork, wipeonfork };
+
+fn forkFlag(r: *const task_mod.MmapRegion, which: ForkFlag) bool {
+    return if (which == .dontfork) r.fork.dontfork else r.fork.wipeonfork;
+}
+
+fn setForkFlagOf(r: *task_mod.MmapRegion, which: ForkFlag, value: bool) void {
+    if (which == .dontfork) r.fork.dontfork = value else r.fork.wipeonfork = value;
+}
+
+/// madvise(MADV_WIPEONFORK / MADV_KEEPONFORK): as setDontfork for the wipe mark. WIPEONFORK is only for private anonymous
+/// mappings (Linux madvise_vma_behavior: VM_SHARED or a file vma is EINVAL); the caller checked that.
+pub fn setWipeonfork(task: *task_mod.Task, addr: u64, length: u64, value: bool) i64 {
+    return setForkFlag(task, addr, length, .wipeonfork, value);
+}
+
+fn setForkFlag(task: *task_mod.Task, addr: u64, length: u64, which: ForkFlag, value: bool) i64 {
     const page = user_space.PAGE_SIZE;
     const pages = (length + page - 1) / page;
     var guard = mm_mod.Mm.beginVmMutation(task.mm, @ptrCast(task)) catch return -35;
@@ -2116,7 +2137,7 @@ pub fn setDontfork(task: *task_mod.Task, addr: u64, length: u64, value: bool) i6
         const i: usize = @intCast(@ctz(bits));
         bits &= bits - 1;
         const r = &task.vma().regions[i];
-        if (r.dontfork == value) continue;
+        if (forkFlag(r, which) == value) continue;
         need += filemap.planProtUpdate(r.base, r.num_pages, addr, pages).slots_needed;
     }
     const free: u32 = @intCast(task.vma().regions.len - @popCount(task.vma().active_bm));
@@ -2126,7 +2147,7 @@ pub fn setDontfork(task: *task_mod.Task, addr: u64, length: u64, value: bool) i6
         const i: usize = @intCast(@ctz(bits));
         bits &= bits - 1;
         const r = &task.vma().regions[i];
-        if (!r.active or r.dontfork == value) continue;
+        if (!r.active or forkFlag(r, which) == value) continue;
         const plan = filemap.planProtUpdate(r.base, r.num_pages, addr, pages);
         switch (plan.overlap) {
             .none => continue,
@@ -2141,7 +2162,7 @@ pub fn setDontfork(task: *task_mod.Task, addr: u64, length: u64, value: bool) i6
                 r.num_pages = plan.head_pages;
                 insertClonedPiece(task, &saved, cut, plan.mid_pages);
                 // The new piece is the one inside the range: find it and mark it.
-                markAt(task, cut, value);
+                markAt(task, cut, which, value);
                 continue;
             },
             .middle => {
@@ -2149,25 +2170,47 @@ pub fn setDontfork(task: *task_mod.Task, addr: u64, length: u64, value: bool) i6
                 insertClonedPiece(task, &saved, addr + plan.mid_pages * page, plan.tail_pages);
                 insertClonedPiece(task, &saved, addr, plan.mid_pages);
                 r.num_pages = plan.head_pages;
-                markAt(task, addr, value);
+                markAt(task, addr, which, value);
                 continue;
             },
         }
         r.huge_pages = @intCast(@min(r.huge_pages, r.num_pages / @import("huge_user.zig").HUGE_PAGES));
-        r.dontfork = value;
+        setForkFlagOf(r, which, value);
     }
     coalesceAnonymousAround(task, addr, pages);
     return 0;
 }
 
-fn markAt(task: *task_mod.Task, base: u64, value: bool) void {
+/// [addr, +length) lies wholly in tracked private anonymous regions (MADV_WIPEONFORK's condition): a shared or file mapping is
+/// EINVAL on Linux, and a page no region tracks (the image, the stack, brk) could not carry the mark, so it is refused too.
+pub fn rangePrivateAnon(task: *task_mod.Task, addr: u64, length: u64) bool {
+    const page = user_space.PAGE_SIZE;
+    const pages = (length + page - 1) / page;
+    var p: u64 = 0;
+    page_loop: while (p < pages) : (p += 1) {
+        const va = addr + p * page;
+        var bits = task.vma().active_bm;
+        while (bits != 0) {
+            const i: usize = @intCast(@ctz(bits));
+            bits &= bits - 1;
+            const r = &task.vma().regions[i];
+            if (!r.active or va < r.base or va - r.base >= r.num_pages * page) continue;
+            if (r.shared or r.file_kind != 0 or r.no_free) return false;
+            continue :page_loop;
+        }
+        return false;
+    }
+    return true;
+}
+
+fn markAt(task: *task_mod.Task, base: u64, which: ForkFlag, value: bool) void {
     var bits = task.vma().active_bm;
     while (bits != 0) {
         const i: usize = @intCast(@ctz(bits));
         bits &= bits - 1;
         const r = &task.vma().regions[i];
         if (r.active and r.base == base) {
-            r.dontfork = value;
+            setForkFlagOf(r, which, value);
             return;
         }
     }

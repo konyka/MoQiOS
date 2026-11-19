@@ -43,11 +43,12 @@ pub fn madviseSpan(addr: u64, len: u64) Span {
 }
 
 /// The advice values madvise acts on (or may validly ignore). MADV_FREE is only a hint that the kernel
-/// is free to ignore; MADV_DONTFORK (10) / MADV_DOFORK (11) mark whether a fork child gets the mapping.
+/// is free to ignore; MADV_DONTFORK (10) / MADV_DOFORK (11) mark whether a fork child gets the mapping, MADV_WIPEONFORK (18) /
+/// MADV_KEEPONFORK (19) whether it gets it empty.
 /// The rest are not implemented and stay EINVAL rather than pretending to take effect.
 pub fn madviseSupported(advice: u32) bool {
     return switch (advice) {
-        0, 1, 2, 3, 4, 8, 10, 11 => true,
+        0, 1, 2, 3, 4, 8, 10, 11, 18, 19 => true,
         else => false,
     };
 }
@@ -57,6 +58,15 @@ pub fn dontforkValue(advice: u32) ?bool {
     return switch (advice) {
         10 => true,
         11 => false,
+        else => null,
+    };
+}
+
+/// The WIPEONFORK mark MADV_WIPEONFORK (true) or MADV_KEEPONFORK (false) sets on the range; null for other advice.
+pub fn wipeonforkValue(advice: u32) ?bool {
+    return switch (advice) {
+        18 => true,
+        19 => false,
         else => null,
     };
 }

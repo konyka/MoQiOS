@@ -52,8 +52,17 @@ pub const MmapRegion = struct {
     /// the PMM; the owner (userdrv) releases DMA frames itself, and MMIO
     /// frames are never freed at all.
     no_free: bool = false,
-    /// madvise(MADV_DONTFORK): a fork child does not get this mapping at all (Linux VM_DONTCOPY, dup_mmap skips it).
+    /// What a fork child gets of this mapping (packed so the record stays 64 bytes):
+    ///  - dontfork, madvise(MADV_DONTFORK): nothing at all (Linux VM_DONTCOPY, dup_mmap skips it);
+    ///  - wipeonfork, madvise(MADV_WIPEONFORK): the private anonymous mapping, empty, so its first touch reads zeros (Linux
+    ///    VM_WIPEONFORK: dup_mmap copies the vma but not its pages). The parent keeps its pages either way.
+    fork: ForkMarks = .{},
+};
+
+pub const ForkMarks = packed struct(u8) {
     dontfork: bool = false,
+    wipeonfork: bool = false,
+    _pad: u6 = 0,
 };
 
 comptime {
@@ -89,7 +98,7 @@ pub fn snapshot(t: *VmaTable, out: *Snapshot) void {
 /// A fork child does not inherit MADV_DONTFORK regions: drop them from its copy of the table.
 pub fn dropDontfork(snap: *Snapshot) void {
     for (&snap.regions, 0..) |*r, i| {
-        if (!r.active or !r.dontfork) continue;
+        if (!r.active or !r.fork.dontfork) continue;
         r.* = .{};
         snap.active_bm &= ~(@as(u64, 1) << @intCast(i));
         snap.count -|= 1;

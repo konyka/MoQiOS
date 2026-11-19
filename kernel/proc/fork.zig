@@ -37,6 +37,10 @@ pub fn fork(frame: *SyscallFrame) i64 {
         var vm_guard = @import("../mm/mm.zig").Mm.beginVmMutation(parent.mm, @ptrCast(parent)) catch return -1;
         defer vm_guard.release();
         const pml4 = cloneUserPagesCow(parent.page_table_phys, parent.vma().regions) orelse return -1;
+        if (!fillWipedPages(parent.page_table_phys, pml4, parent.vma().regions)) {
+            @import("../mm/user_space.zig").destroyUserSpace(pml4);
+            return -12; // ENOMEM
+        }
         @import("../mm/vma_table.zig").snapshot(parent.vma(), &vma_snap);
         @import("../mm/vma_table.zig").dropDontfork(&vma_snap);
         break :blk pml4;
@@ -303,6 +307,37 @@ fn dontforkPage(regions: ?[]const @import("task.zig").MmapRegion, virt: u64) boo
     return @import("../mm/filemap.zig").inDontforkRegion(@import("task.zig").MmapRegion, regs, virt);
 }
 
+/// MADV_WIPEONFORK (Linux VM_WIPEONFORK): for every page the parent has in such a region, the child gets a fresh zero page with the
+/// parent's permissions (writable, never COW). Anonymous mappings are populated eagerly here, so leaving the slot empty would fault with
+/// nothing able to fill it. Runs after cloneUserPagesCow (which skipped those pages) and may allocate; false on OOM, and the caller
+/// destroys the child space, which frees what was mapped so far.
+pub fn fillWipedPages(parent_pml4_phys: u64, child_pml4_phys: u64, regions: []const @import("task.zig").MmapRegion) bool {
+    const paging_mod = @import("../arch/arch.zig").paging;
+    const pmm_mod = @import("../mm/pmm.zig");
+    const hhdm_mod = @import("../mm/hhdm.zig");
+    const cow_pte_mod = @import("../mm/cow_pte.zig");
+    for (regions) |r| {
+        if (!r.active or !r.fork.wipeonfork or r.fork.dontfork) continue;
+        var p: u64 = 0;
+        while (p < r.num_pages) : (p += 1) {
+            const va = r.base + p * 4096;
+            const pte = paging_mod.getPageEntryRaw(parent_pml4_phys, va) orelse continue;
+            if (pte & 1 == 0) continue;
+            const phys = pmm_mod.allocPage() orelse return false;
+            const page: [*]u8 = @ptrFromInt(hhdm_mod.physToVirt(phys));
+            @memset(page[0..4096], 0);
+            const flags = (pte & (0xFFF | cow_pte_mod.NO_EXECUTE) & ~cow_pte_mod.COW) | cow_pte_mod.WRITABLE;
+            // cloneUserPagesCow built every table the parent has, so the child's slot exists (and is empty): the raw store suffices.
+            if (paging_mod.getPageEntryRaw(child_pml4_phys, va) == null) {
+                pmm_mod.freePage(phys);
+                return false;
+            }
+            paging_mod.setPageEntryRaw(child_pml4_phys, va, phys | flags);
+        }
+    }
+    return true;
+}
+
 pub fn cloneUserPagesCow(parent_pml4_phys: u64, shared_regions: ?[]const @import("task.zig").MmapRegion) ?u64 {
     const pmm_mod = @import("../mm/pmm.zig");
     const hhdm_mod = @import("../mm/hhdm.zig");
@@ -458,6 +493,7 @@ pub fn cloneUserPagesCow(parent_pml4_phys: u64, shared_regions: ?[]const @import
                     const virt = (pml4_idx << 39) | (pdpt_idx << 30) |
                         (pd_idx << 21) | (pt_idx << 12);
                     // MADV_DONTFORK: the child gets nothing here and the parent's entry stays as it is (dup_mmap skips VM_DONTCOPY).
+                    // MADV_WIPEONFORK pages are skipped here too; fillWipedPages gives the child zero pages afterwards.
                     if (dontforkPage(shared_regions, virt)) continue;
 
                     // H1: MAP_SHARED file pages stay shared across fork.
