@@ -60,6 +60,7 @@ pub fn describe(t: *task_mod.Task, fd_val: u32, text: *[256]u8) Result {
         .timerfd => return wrap(readlink_policy.anonLink("anon_inode:[timerfd]", text)),
         .inotify => return wrap(readlink_policy.anonLink("anon_inode:[inotify]", text)),
         .pidfd => return wrap(readlink_policy.anonLink("anon_inode:[pidfd]", text)),
+        .signalfd => return wrap(readlink_policy.anonLink("anon_inode:[signalfd]", text)),
         // The queue name with its leading '/', as Linux shows an mqueue file (its dentry in the mqueue mount).
         .mqueue => return if (@import("../ipc/posix_mq.zig").nameOf(d.mq_desc_idx, d.mq_desc_gen, text)) |n| .{ .ok = n } else .{ .err = -2 },
         .devfs => {
@@ -133,7 +134,7 @@ pub fn resolveMagicLink(t: *task_mod.Task, name: []const u8, buf: *[256]u8) Reso
         },
         .pipe_read, .pipe_write => return .{ .object = .{ .fd = fdn, .kind = .pipe } },
         .tcp_socket, .udp_socket, .unix_socket, .raw_socket => return .{ .object = .{ .fd = fdn, .kind = .socket } },
-        .eventfd, .epoll, .timerfd, .inotify, .pidfd => return .{ .object = .{ .fd = fdn, .kind = .anon } },
+        .eventfd, .epoll, .timerfd, .inotify, .pidfd, .signalfd => return .{ .object = .{ .fd = fdn, .kind = .anon } },
         else => return .{ .err = -6 },
     }
 }

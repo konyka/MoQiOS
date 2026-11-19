@@ -74,6 +74,9 @@ pub const FdType = enum(u8) {
     /// POSIX message queue descriptor (ipc/posix_mq.zig): mq_desc_idx / mq_desc_gen name the open description, which dup, fork and
     /// SCM_RIGHTS copies share (one reference per descriptor).
     mqueue = 23,
+    /// signalfd (proc/signal_syscall.zig signalfdRead): `file_data` holds the signal mask; a read dequeues the reading task's
+    /// pending signals in it as signalfd_siginfo records.
+    signalfd = 24,
 };
 
 pub const PIPE_BUF_SIZE: u32 = 4096;
@@ -2322,6 +2325,7 @@ pub const FdTable = struct {
                 const eventfd_mod = @import("eventfd.zig");
                 return eventfd_mod.eventfdRead(desc.eventfd_idx, buf, count, desc.status_flags);
             },
+            .signalfd => return @import("../proc/signal_syscall.zig").signalfdRead(desc.file_data, buf, count, (desc.status_flags & 0x800) != 0),
             .unix_socket => {
                 // read() on an AF_UNIX socket drains the socket's ring buffer.
                 const unix_mod = @import("../net/unix_socket.zig");
@@ -2592,6 +2596,7 @@ pub const FdTable = struct {
             },
             .pidfd => return -1,
             .inotify => return -1, // inotify is read-only via special path
+            .signalfd => return -22, // EINVAL: no write (signalfd_fops)
             .mqueue => return -22, // EINVAL: an mq descriptor has no write (Linux mqueue_file_operations)
             // write() on a raw ICMP socket is send() to the connected peer.
             .raw_socket => return @import("../net/socket_syscall.zig").rawSendFrom(desc, buf[0..count], null, &.{}),
@@ -2647,7 +2652,7 @@ pub const FdTable = struct {
             .special => return -29, // ESPIPE - can't seek on stdin/stdout/stderr
             .pipe_read, .pipe_write => return -29, // ESPIPE - pipes don't support offset
             .tcp_socket, .udp_socket, .unix_socket, .raw_socket => return -29, // ESPIPE
-            .epoll, .eventfd, .timerfd, .inotify, .pidfd => return -29, // ESPIPE
+            .epoll, .eventfd, .timerfd, .inotify, .pidfd, .signalfd => return -29, // ESPIPE
             .devfs_ctrl => return -29, // ESPIPE — ctrl fds are sequential streams
             // pread of an mq descriptor reads the status line at that offset (Linux mqueue_read_file through simple_read_from_buffer).
             .mqueue => return @import("../ipc/posix_mq.zig").statusRead(desc.mq_desc_idx, desc.mq_desc_gen, offset, buf, count),
@@ -2731,7 +2736,7 @@ pub const FdTable = struct {
             .special => return -29, // ESPIPE
             .pipe_read, .pipe_write => return -29, // ESPIPE
             .tcp_socket, .udp_socket, .unix_socket, .raw_socket => return -29, // ESPIPE
-            .epoll, .eventfd, .timerfd, .inotify => return -29, // ESPIPE
+            .epoll, .eventfd, .timerfd, .inotify, .signalfd => return -29, // ESPIPE
             .devfs_ctrl => return -29, // ESPIPE
             .mqueue => return -22, // EINVAL: no write operation
             .ramdisk_file => return -1, // ramdisk is read-only
@@ -3367,7 +3372,7 @@ fn retainResource(desc: *const FileDescriptor) bool {
         .timerfd => @import("../ipc/timerfd.zig").timerfdRetain(desc.timerfd_idx),
         .eventfd => @import("eventfd.zig").eventfdRetain(desc.eventfd_idx),
         .mqueue => return @import("../ipc/posix_mq.zig").retainDescription(desc.mq_desc_idx, desc.mq_desc_gen),
-        .ramdisk_file, .special, .devfs, .proc_file, .pidfd, .rofs_file => {},
+        .ramdisk_file, .special, .devfs, .proc_file, .pidfd, .rofs_file, .signalfd => {},
         else => return false,
     }
     return true;

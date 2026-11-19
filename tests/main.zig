@@ -3574,14 +3574,6 @@ test "Linux personality maps exit_group (231) and waitid (247) to the native cal
     try std.testing.expectEqual(@as(?rlimit.Policy.LinuxAlias, null), rlimit.Policy.linuxAlias(true, 1));
 }
 
-test "signalfd closes backing eventfd on later failures" {
-    const create = std.mem.indexOf(u8, kt.signal_syscall_source, "eventfdCreate(0, false)") orelse return error.TestUnexpectedResult;
-    const cleanup = std.mem.indexOfPos(u8, kt.signal_syscall_source, create, "eventfdClose(eventfd_idx)") orelse return error.TestUnexpectedResult;
-    const alloc = std.mem.indexOfPos(u8, kt.signal_syscall_source, cleanup, "fd_table.allocFd()") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(cleanup < alloc);
-    try std.testing.expect(std.mem.indexOf(u8, kt.signal_syscall_source, "defer if (!installed) eventfd_mod.eventfdClose(eventfd_idx)") != null);
-}
-
 test "prlimit re-resolves target after user copies" {
     const snapshot = std.mem.indexOf(u8, kt.syscall_entry_source, "target_tid = if (pid == 0) caller.tid else pid") orelse return error.TestUnexpectedResult;
     const copy_from = std.mem.indexOfPos(u8, kt.syscall_entry_source, snapshot, "copy.copyFromUser(nbuf[0..]") orelse return error.TestUnexpectedResult;
@@ -12726,7 +12718,7 @@ test "statfs names pipefs, sockfs and anon_inode for pipes, sockets and event ob
     const sc = kt.syscall_entry_source;
     try std.testing.expect(std.mem.indexOf(u8, sc, ".pipe_read, .pipe_write => .{ .magic = 0x50495045,") != null);
     try std.testing.expect(std.mem.indexOf(u8, sc, ".tcp_socket, .udp_socket, .unix_socket, .raw_socket => .{ .magic = 0x534f434b,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sc, ".epoll, .eventfd, .timerfd, .inotify, .pidfd => .{ .magic = 0x09041934,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sc, ".epoll, .eventfd, .timerfd, .inotify, .pidfd, .signalfd => .{ .magic = 0x09041934,") != null);
 }
 
 test "procfs: /proc and /proc/<pid> are directories listed from the live task table" {
@@ -16810,4 +16802,29 @@ test "F_SETPIPE_SZ resizes a pipe: rounded to a power-of-two of pages, EPERM pas
     const v = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, v, "pub fn pipeSetSize(") != null);
     try std.testing.expect(std.mem.indexOf(u8, v, "% PIPE_BUF_SIZE") == null); // every ring index uses the pipe's own capacity
+}
+
+test "signalfd: argument checks and the signalfd_siginfo layout (hello442)" {
+    // Linux fs/signalfd.c: sizemask must be 8, flags only SFD_NONBLOCK / SFD_CLOEXEC, SIGKILL / SIGSTOP leave the mask; a read gets
+    // 128-byte signalfd_siginfo records (signalfd_copyinfo). The kernel used to hand out a plain eventfd and ignore all three.
+    const sp = kt.signalfd_policy;
+    try std.testing.expectEqual(@as(i64, -22), sp.argsErrno(4, 0));
+    try std.testing.expectEqual(@as(i64, -22), sp.argsErrno(8, 1));
+    try std.testing.expectEqual(@as(i64, 0), sp.argsErrno(8, 0x800 | 0x80000));
+    try std.testing.expectEqual(@as(u64, 0), sp.cleanMask((1 << 8) | (1 << 18)));
+    try std.testing.expectEqual(@as(u64, 1 << 9), sp.cleanMask((1 << 9) | (1 << 8)));
+    const si = kt.siginfo_policy;
+    // SIGUSR1 from kill: SI_USER, pid and uid.
+    const k = sp.encode(10, .{ .code = si.SI_USER, .a = si.pidUid(42, 1000) });
+    try std.testing.expectEqual(@as(usize, 128), k.len);
+    try std.testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, k[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 42), std.mem.readInt(u32, k[12..16], .little));
+    try std.testing.expectEqual(@as(u32, 1000), std.mem.readInt(u32, k[16..20], .little));
+    // sigqueue: SI_QUEUE with the value in ssi_int (44) and ssi_ptr (48).
+    const q = sp.encode(34, .{ .code = si.SI_QUEUE, .a = si.pidUid(7, 0), .b = 5 });
+    try std.testing.expectEqual(@as(i32, -1), std.mem.readInt(i32, q[8..12], .little));
+    try std.testing.expectEqual(@as(i32, 5), std.mem.readInt(i32, q[44..48], .little));
+    try std.testing.expectEqual(@as(u64, 5), std.mem.readInt(u64, q[48..56], .little));
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "    signalfd = 24,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.signal_syscall_source, "eventfdCreate(0, false)") == null);
 }

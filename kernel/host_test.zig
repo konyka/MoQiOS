@@ -195,6 +195,7 @@ pub const signal_frame_policy = @import("proc/signal_frame_policy.zig");
 pub const signal_delivery_policy = @import("proc/signal_delivery_policy.zig");
 pub const syscall_restart_policy = @import("proc/syscall_restart_policy.zig");
 pub const siginfo_policy = @import("proc/siginfo_policy.zig");
+pub const signalfd_policy = @import("proc/signalfd_policy.zig");
 pub const uts = @import("proc/uts.zig");
 pub const poll_policy = @import("fs/poll_policy.zig");
 pub const poll_wake_policy = @import("fs/poll_wake_policy.zig");

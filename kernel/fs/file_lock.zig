@@ -384,7 +384,7 @@ fn leaseOwnerUid(desc: *const vfs.FileDescriptor) ?u32 {
             var info: @import("stat_info.zig").StatInfo = .{};
             break :blk if (@import("ext2.zig").statInode(desc.ext2_file_idx, &info)) info.uid else null;
         },
-        .ramdisk_file, .fat32_file, .special, .devfs, .devfs_ctrl, .eventfd, .timerfd, .epoll, .inotify, .pidfd => 0,
+        .ramdisk_file, .fat32_file, .special, .devfs, .devfs_ctrl, .eventfd, .timerfd, .epoll, .inotify, .pidfd, .signalfd => 0,
         else => null,
     };
 }

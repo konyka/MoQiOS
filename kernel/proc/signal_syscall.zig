@@ -823,38 +823,86 @@ pub fn pidfdSendSignal(target_tid: u32, sig: u32, info_ptr: u64, flags: u32) i64
     return sig_mod.sendSignalInfoResult(processRecipient(target, target_tid, sig), sig, info);
 }
 
-/// signalfd4(old_fd, mask, sizemask, flags) → fd or -errno
-pub fn signalfd4(old_fd: u64, mask: u64, sizemask: u64, flags: u64) i64 {
-    _ = mask;
-    _ = sizemask;
-    _ = flags;
-
-    // If old_fd is valid, just return it
-    if (old_fd != @as(u64, @bitCast(@as(i64, -1))) and old_fd < 0x0000_8000_0000_0000) {
-        const cur_idx = sched.currentTaskIndex() orelse return -3;
-        const cur = task_mod.getTask(cur_idx) orelse return -3;
-        if (old_fd < vfs_mod.MAX_FDS) {
-            const fd: u32 = @intCast(old_fd);
-            if (cur.fd_table.fds[fd].fd_type == .eventfd) return @bitCast(old_fd);
-        }
-    }
-
-    // Create a new eventfd-backed signalfd
-    const eventfd_mod = @import("../fs/eventfd.zig");
-    const efd_idx = eventfd_mod.eventfdCreate(0, false);
-    if (efd_idx < 0) return @as(i64, efd_idx);
-    const eventfd_idx: u32 = @intCast(efd_idx);
-    var installed = false;
-    defer if (!installed) eventfd_mod.eventfdClose(eventfd_idx);
-
+/// signalfd4(old_fd, mask_ptr, sizemask, flags) → fd or -errno (Linux fs/signalfd.c do_signalfd4). sizemask must be 8 and flags only
+/// SFD_NONBLOCK / SFD_CLOEXEC; SIGKILL and SIGSTOP leave the mask. With old_fd -1 a new signalfd is made; an existing signalfd gets
+/// the new mask (and keeps its flags); any other descriptor is EINVAL.
+pub fn signalfd4(old_fd: u64, mask_ptr: u64, sizemask: u64, flags: u64) i64 {
+    const sp = @import("signalfd_policy.zig");
+    const rc = sp.argsErrno(sizemask, flags);
+    if (rc != 0) return rc;
+    var raw: [8]u8 = undefined;
+    if (mask_ptr == 0 or !copy.validateUserBuffer(mask_ptr, 8) or copy.copyFromUser(&raw, @ptrFromInt(mask_ptr), 8) != 8) return -14;
+    const mask = sp.cleanMask(@bitCast(raw));
     const cur_idx = sched.currentTaskIndex() orelse return -3;
     const cur = task_mod.getTask(cur_idx) orelse return -3;
-
+    const fd_arg: i32 = @bitCast(@as(u32, @truncate(old_fd)));
+    if (fd_arg != -1) {
+        if (fd_arg < 0 or @as(u32, @intCast(fd_arg)) >= vfs_mod.MAX_FDS) return -9;
+        const d = &cur.fd_table.fds[@intCast(fd_arg)];
+        if (d.fd_type == .none) return -9;
+        if (d.fd_type != .signalfd) return -22;
+        d.file_data = mask;
+        return fd_arg;
+    }
     const slot = cur.fd_table.allocFd() orelse return -24;
-    cur.fd_table.fds[slot] = .{ .fd_type = .eventfd, .eventfd_idx = eventfd_idx };
+    cur.fd_table.fds[slot] = .{ .fd_type = .signalfd, .file_data = mask };
+    if (flags & sp.SFD_CLOEXEC != 0) cur.fd_table.fds[slot].fd_flags = 1;
+    if (flags & sp.SFD_NONBLOCK != 0) vfs_mod.setStatusFlags(&cur.fd_table.fds[slot], cur.fd_table.fds[slot].status_flags | 0x800);
     cur.fd_table.publishFd(slot);
-    installed = true;
-    return @bitCast(@as(u64, slot));
+    return @intCast(slot);
+}
+
+/// Take the lowest pending signal of `mask` from `cur` (its own pending set, or a process-directed one held for the process) as
+/// dequeue_signal does: the signal number and its siginfo, or null.
+fn takeSignalIn(cur: *task_mod.Task, mask: u64) ?struct { signo: u32, info: @import("siginfo_policy.zig").Info } {
+    const held_wanted = @atomicLoad(u64, &cur.grp().held_signals, .seq_cst) & mask;
+    if (held_wanted != 0) _ = takeHeldSignal(cur, @as(u32, @ctz(held_wanted)) + 1);
+    const pending = @atomicLoad(u64, &cur.pending_signals, .seq_cst) & mask;
+    if (pending == 0) return null;
+    const bit: u6 = @intCast(@ctz(pending));
+    _ = @atomicRmw(u64, &cur.pending_signals, .And, ~(@as(u64, 1) << bit), .seq_cst);
+    sig_mod.claimInstance(cur, @as(u32, bit) + 1);
+    const taken = sig_mod.finishTimerInfo(cur.sig_info[bit]);
+    cur.sig_info[bit] = .{};
+    return .{ .signo = @as(u32, bit) + 1, .info = taken };
+}
+
+/// read() on a signalfd with mask `mask` (signalfd_read_iter): as many 128-byte signalfd_siginfo records as fit in `count`, one per
+/// pending signal of the mask, dequeuing each. Fewer than 128 bytes is EINVAL. With nothing pending a non-blocking read is EAGAIN and
+/// a blocking one waits, like rt_sigtimedwait, until such a signal arrives (or a handled one, EINTR).
+pub fn signalfdRead(mask: u64, buf: [*]u8, count: usize, nonblock: bool) i64 {
+    const sp = @import("signalfd_policy.zig");
+    if (count < sp.RECORD_SIZE) return -22;
+    const cur_idx = sched.currentTaskIndex() orelse return -3;
+    const cur = task_mod.getTask(cur_idx) orelse return -3;
+    var n: usize = 0;
+    while (n + sp.RECORD_SIZE <= count) {
+        const t = takeSignalIn(cur, mask) orelse {
+            if (n > 0 or nonblock) break;
+            // Nothing yet: wait the way rt_sigtimedwait does (a send of a masked signal wakes us through sigwait_mask).
+            @atomicStore(u64, &cur.sigwait_mask, mask, .release);
+            defer @atomicStore(u64, &cur.sigwait_mask, 0, .release);
+            if (sig_mod.pendingFatal(cur)) |sig| task_mod.exitTask(128 + @as(i32, @intCast(sig)));
+            if (sig_mod.pendingActionable(cur)) return -4;
+            task_mod.blockTask(cur_idx);
+            const arrived = @atomicLoad(u64, &cur.pending_signals, .seq_cst) | @atomicLoad(u64, &cur.grp().held_signals, .seq_cst);
+            if ((arrived & mask) != 0 or sig_mod.pendingActionable(cur) or sig_mod.pendingFatal(cur) != null) task_mod.unblockTask(cur_idx);
+            sched.forceReschedule();
+            sched.repairCurrentAfterBlock();
+            continue;
+        };
+        const rec = sp.encode(t.signo, t.info);
+        @memcpy(buf[n..][0..sp.RECORD_SIZE], &rec);
+        n += sp.RECORD_SIZE;
+    }
+    return if (n == 0) -11 else @intCast(n);
+}
+
+/// poll/select readiness of a signalfd with mask `mask` for the calling task: POLLIN while one of its signals is pending.
+pub fn signalfdEvents(mask: u64) u32 {
+    const cur = sched.currentTask() orelse return 0;
+    const pending = @atomicLoad(u64, &cur.pending_signals, .seq_cst) | @atomicLoad(u64, &cur.grp().held_signals, .seq_cst);
+    return if (pending & mask != 0) 0x001 else 0;
 }
 
 /// rt_tgsigqueueinfo(tgid, tid, sig, uinfo) → 0 or -errno

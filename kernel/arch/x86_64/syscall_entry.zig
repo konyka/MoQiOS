@@ -4912,7 +4912,7 @@ fn writeStatfsFor(kind: vfs_mod.FdType, buf_ptr: u64) i64 {
         // Pipes, sockets and the event objects live on kernel-internal filesystems with no blocks or inodes (pipefs, sockfs, anon_inode).
         .pipe_read, .pipe_write => .{ .magic = 0x50495045, .block_size = 4096, .name_max = 255, .rdonly = false },
         .tcp_socket, .udp_socket, .unix_socket, .raw_socket => .{ .magic = 0x534f434b, .block_size = 4096, .name_max = 255, .rdonly = false },
-        .epoll, .eventfd, .timerfd, .inotify, .pidfd => .{ .magic = 0x09041934, .block_size = 4096, .name_max = 255, .rdonly = false },
+        .epoll, .eventfd, .timerfd, .inotify, .pidfd, .signalfd => .{ .magic = 0x09041934, .block_size = 4096, .name_max = 255, .rdonly = false },
         else => null,
     };
     if (st) |stats| {

@@ -884,6 +884,8 @@ fn kmsgCursorForItem(inst: *const EpollInstance, fd: i32) u64 {
 /// Current readiness of a descriptor in epoll event bits (the poll/select
 /// bit values are identical), shared with fs/poll.zig and fs/select.zig.
 pub fn descriptorEvents(desc: *const vfs.FileDescriptor) u32 {
+    // A signalfd is readable while the polling task has a signal of its mask pending (signalfd_poll looks at current).
+    if (desc.fd_type == .signalfd) return @import("../proc/signal_syscall.zig").signalfdEvents(desc.file_data);
     return computeCurrentEvents(desc.fd_type, resourceIdxFromDesc(desc), desc.offset);
 }
 
@@ -933,6 +935,8 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32, kmsg_cursor: u64
             if (ready) revents |= EPOLLIN;
             revents |= EPOLLOUT;
         },
+        // Handled by descriptorEvents (it needs the mask and the polling task); an epoll registration sees no readiness here.
+        .signalfd => {},
         .eventfd => {
             // Level-triggered: readable only while the counter is non-zero.
             const eventfd_mod = @import("../fs/eventfd.zig");
