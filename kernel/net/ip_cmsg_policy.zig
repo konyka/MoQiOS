@@ -168,6 +168,15 @@ pub fn build6(w: Wanted, info: RecvInfo6, cap_in: usize, out: []u8) Built {
     return .{ .written = used, .truncated = truncated };
 }
 
+/// ip_recv_error's one control message: SOL_IP / IP_RECVERR with struct sock_extended_err and the offender (errqueue_policy).
+pub fn buildRecvErr(ext: [32]u8, cap_in: usize, out: []u8) Built {
+    const cap = @min(cap_in, out.len);
+    var used: usize = 0;
+    var truncated = false;
+    put(out, &used, cap, @intCast(ipo.SOL_IP), @intCast(ipo.IP_RECVERR), &ext, &truncated);
+    return .{ .written = used, .truncated = truncated };
+}
+
 /// Who may use the privileged SOL_SOCKET send messages (SO_MARK, SO_PRIORITY above TC_PRIO_INTERACTIVE).
 pub const SendCaps = struct {
     net_admin: bool = false,

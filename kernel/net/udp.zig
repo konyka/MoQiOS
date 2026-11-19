@@ -71,6 +71,9 @@ var port_opts: [MAX_PORTS]@import("sockopt_policy.zig").Stored = @splat(.{});
 /// Pending asynchronous error per port (ICMP port unreachable → ECONNREFUSED,
 /// positive errno) and the peer port a connect() fixed, 0 when unconnected.
 var port_err: [MAX_PORTS]i32 = @splat(0);
+/// IP_RECVERR error queue of each slot (errqueue_policy.zig); travels with the slot like port_err.
+var port_errq: [MAX_PORTS]errq.Queue = @splat(.{});
+const errq = @import("errqueue_policy.zig");
 /// The IPv4 id of a connected socket's next datagram (inet_id: random at connect, one more per datagram).
 var port_ipid: [MAX_PORTS]u16 = @splat(0);
 var port_peer: [MAX_PORTS]u16 = @splat(0);
@@ -226,6 +229,25 @@ pub fn takePendingError(port: u32) i32 {
     return e;
 }
 
+/// recvmsg(MSG_ERRQUEUE): the oldest queued error of the socket with key `port`, null when there is none. The pending error becomes the
+/// next entry's errno, or 0 (sock_dequeue_err_skb).
+pub fn takeQueuedError(port: u32) ?errq.Entry {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return null;
+    const r = port_errq[i].pop() orelse return null;
+    port_err[i] = r.next_err;
+    return r.entry;
+}
+
+/// Errors are waiting in the IP_RECVERR queue (poll's POLLERR stays up until they are read).
+pub fn hasQueuedError(port: u32) bool {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return false;
+    return port_errq[i].n != 0;
+}
+
 /// Clear the pending error only if it still equals `expected` (SO_ERROR read).
 pub fn clearPendingErrorIfEqual(port: u32, expected: i32) void {
     const saved = udp_lock.acquire();
@@ -234,19 +256,46 @@ pub fn clearPendingErrorIfEqual(port: u32, expected: i32) void {
     if (port_err[i] == expected) port_err[i] = 0;
 }
 
-/// An ICMP error (hard, positive errno `err`) quoted a datagram sent from `local_port` to `peer_port`: every socket connected to
-/// that peer takes it as its pending error (udp_err sets sk_err only on a connected socket without IP_RECVERR).
-pub fn notifyError(local_port: u16, peer_port: u16, err: i32) void {
+/// What an ICMP error about an IPv4 UDP datagram says (__udp4_lib_err's inputs): the errno and hardness, the ICMP type and code, who
+/// sent it, the quoted datagram's ports and destination, and the quoted payload after its UDP header.
+pub const IcmpError = struct {
+    errno: i32,
+    hard: bool,
+    icmp_type: u8,
+    icmp_code: u8,
+    info: u32 = 0,
+    offender: [4]u8,
+    local_port: u16,
+    peer_port: u16,
+    peer_ip: [4]u8,
+    payload: []const u8,
+};
+
+/// An ICMP error quoted a datagram sent from `e.local_port` to `e.peer_port`. A socket with IP_RECVERR on that port queues it and takes
+/// it as its pending error whether connected or not, soft or hard; one without takes only a hard error, and only when connected to that
+/// peer (udp_err / __udp4_lib_err).
+pub fn notifyIcmpError(e: IcmpError) void {
     var hits: [MAX_PORTS]u32 = undefined;
     var n: usize = 0;
     {
         const saved = udp_lock.acquire();
         defer udp_lock.release(saved);
         for (0..num_ports) |i| {
-            if (port_ping[i] or !port_named[i]) continue;
-            if (portNumber(ports[i]) != local_port) continue;
-            if (!@import("icmp_unreach_policy.zig").matchesConnected(.{ .src_port = local_port, .dst_port = peer_port }, local_port, port_peer[i] != 0, port_peer[i])) continue;
-            port_err[i] = err;
+            if (port_ping[i] or port_v6[i] or !port_named[i]) continue;
+            if (portNumber(ports[i]) != e.local_port) continue;
+            const connected = @import("icmp_unreach_policy.zig").matchesConnected(.{ .src_port = e.local_port, .dst_port = e.peer_port }, e.local_port, port_peer[i] != 0, port_peer[i]);
+            // An unconnected socket without IP_RECVERR is not told; a socket connected elsewhere never is.
+            if (port_peer[i] != 0 and !connected) continue;
+            const r = errq.route(port_opts[i].ip.recverr, e.hard, connected);
+            if (r.queue) {
+                var ent: errq.Entry = .{ .errno = e.errno, .icmp_type = e.icmp_type, .icmp_code = e.icmp_code, .info = e.info, .offender = e.offender, .dst = e.peer_ip, .dst_port = e.peer_port };
+                const k = @min(e.payload.len, errq.PAYLOAD_MAX);
+                ent.len = @intCast(k);
+                @memcpy(ent.payload[0..k], e.payload[0..k]);
+                if (!port_errq[i].push(ent)) continue;
+            }
+            if (!r.set_err) continue;
+            port_err[i] = e.errno;
             hits[n] = ports[i];
             n += 1;
         }
@@ -377,6 +426,7 @@ fn newSlotLocked(key: u32, is_v6: bool, uid: u32) u16 {
     port_refs[idx] = 1;
     port_opts[idx] = .{};
     port_err[idx] = 0;
+    port_errq[idx].clear();
     port_ipid[idx] = 0;
     port_peer[idx] = 0;
     port_peer_ip[idx] = @splat(0);
@@ -759,6 +809,8 @@ fn releaseLocked(port: u32) void {
             port_refs[i] = port_refs[num_ports];
             port_opts[i] = port_opts[num_ports];
             port_err[i] = port_err[num_ports];
+            port_errq[i] = port_errq[num_ports];
+            port_errq[num_ports].clear();
             port_ipid[i] = port_ipid[num_ports];
             port_peer[i] = port_peer[num_ports];
             port_peer_ip[i] = port_peer_ip[num_ports];
@@ -1036,8 +1088,9 @@ pub fn handlePacketMeta(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u3
 fn sendPortUnreachable(src_ip: [4]u8, dst_ip: [4]u8, udp: [*]const u8, udp_len: u16) void {
     const lo_dev = @import("lo.zig");
     const icmp_mod = @import("icmp.zig");
-    var pkt: [128]u8 = @splat(0);
-    const quote_udp: u16 = @min(udp_len, 8);
+    // icmp_send quotes as much of the datagram as fits in 576 bytes; 64 bytes of payload here (what the error queue keeps).
+    var pkt: [14 + 20 + 8 + 20 + 8 + 64]u8 = @splat(0);
+    const quote_udp: u16 = @min(udp_len, 8 + 64);
     // ICMP at 34: header (8) + quoted IP header (20) + quoted UDP bytes.
     ipv4.buildHeader(pkt[34 + 8 ..].ptr, src_ip, dst_ip, ipv4.PROTO_UDP, udp_len);
     @memcpy(pkt[34 + 8 + 20 ..][0..quote_udp], udp[0..quote_udp]);

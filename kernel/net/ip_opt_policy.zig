@@ -16,6 +16,8 @@ pub const IP_MTU_DISCOVER: u64 = 10;
 /// Receive flags: recvmsg then carries an IP_TTL / IP_TOS control message (Linux inet IP_CMSG_TTL / IP_CMSG_TOS).
 pub const IP_RECVTTL: u64 = 12;
 pub const IP_RECVTOS: u64 = 13;
+/// ICMP errors about what the socket sent are queued for recvmsg(MSG_ERRQUEUE) (Linux inet RECVERR, errqueue_policy.zig).
+pub const IP_RECVERR: u64 = 11;
 /// recvmsg then brings IP_ORIGDSTADDR, the datagram's destination as a struct sockaddr_in (Linux IP_CMSG_ORIGDSTADDR).
 pub const IP_RECVORIGDSTADDR: u64 = 20;
 /// The same for IPv6: IPV6_ORIGDSTADDR with a struct sockaddr_in6.
@@ -81,6 +83,7 @@ pub const IpOpts = struct {
     recvttl: bool = false,
     recvtos: bool = false,
     origdst: bool = false,
+    recverr: bool = false,
     /// IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVTCLASS: the same for a received IPv6 datagram.
     pktinfo6: bool = false,
     recvhops6: bool = false,
@@ -149,6 +152,7 @@ pub fn applySet(cur: IpOpts, level: u64, optname: u64, val: []const u8) SetResul
             IP_RECVTTL => o.recvttl = v != 0,
             IP_RECVTOS => o.recvtos = v != 0,
             IP_RECVORIGDSTADDR => o.origdst = v != 0,
+            IP_RECVERR => o.recverr = v != 0,
             // ip_sock_set_mtu_discover: DONT..OMIT, anything else EINVAL.
             IP_MTU_DISCOVER => {
                 if (v < PMTUDISC_DONT or v > PMTUDISC_OMIT) return .{ .err = -22 };
@@ -284,6 +288,7 @@ pub fn getValue(o: IpOpts, level: u64, optname: u64) ?i32 {
             IP_RECVTTL => @intFromBool(o.recvttl),
             IP_RECVTOS => @intFromBool(o.recvtos),
             IP_RECVORIGDSTADDR => @intFromBool(o.origdst),
+            IP_RECVERR => @intFromBool(o.recverr),
             IP_MULTICAST_TTL => o.mc4_ttl,
             IP_MULTICAST_LOOP => @intFromBool(o.mc4_loop),
             IP_MULTICAST_ALL => @intFromBool(o.mc4_all),

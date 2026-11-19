@@ -200,12 +200,30 @@ pub fn handlePacketMeta(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u3
         if (unreach.parseTcpQuote(data[0..len])) |tq| @import("tcp.zig").icmpError(tq, unreach.tcpErrno(icmp_type, icmp_code), unreach.tcpReqAborts(icmp_type, icmp_code));
         // A hard error goes to the connected UDP socket that sent the quoted datagram (udp_err), or to the connected ping socket
         // whose echo request it quotes (ping_err).
-        const err = unreach.errnoFor(icmp_type, icmp_code);
-        if (err == 0) return;
         const q = unreach.parseErrorQuote(data[0..len]) orelse return;
         switch (q.kind) {
-            .udp => @import("udp.zig").notifyError(q.src_port, q.dst_port, err),
-            .echo => @import("udp.zig").notifyPingError(q.src_port, err),
+            // udp_err: soft errors too, for a socket with IP_RECVERR (it queues them); the error queue keeps the quoted payload.
+            .udp => {
+                const e = unreach.errorFor(icmp_type, icmp_code) orelse return;
+                const ihl: usize = @as(usize, data[8] & 0x0F) * 4;
+                const quoted = data[0..len][8 + ihl + 8 ..];
+                @import("udp.zig").notifyIcmpError(.{
+                    .errno = e.errno,
+                    .hard = e.hard,
+                    .icmp_type = icmp_type,
+                    .icmp_code = icmp_code,
+                    .info = if (icmp_type == 3 and icmp_code == 4) bo.readU16BeAt(data, 6) else 0,
+                    .offender = src_ip,
+                    .local_port = q.src_port,
+                    .peer_port = q.dst_port,
+                    .peer_ip = data[8 + 16 ..][0..4].*,
+                    .payload = quoted,
+                });
+            },
+            .echo => {
+                const err = unreach.errnoFor(icmp_type, icmp_code);
+                if (err != 0) @import("udp.zig").notifyPingError(q.src_port, err);
+            },
         }
     }
 }

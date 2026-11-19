@@ -4890,7 +4890,8 @@ test "ping sockets: SOCK_DGRAM/IPPROTO_ICMP sends echo requests under the socket
     try std.testing.expect(std.mem.indexOf(u8, us, "pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8, meta: ip_cmsg_policy.RecvInfo) void {") != null);
     // notifyError, enqueue and both group paths skip ping slots; rebind only conflicts with UDP slots; the port count is per space.
     // A socket with no local port yet is skipped the same way (hello385).
-    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, us, "if (port_ping[i] or !port_named[i]) continue;"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, us, "if (port_ping[i] or !port_named[i]) continue;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, us, "if (port_ping[i] or port_v6[i] or !port_named[i]) continue;"));
     try std.testing.expect(std.mem.indexOf(u8, us, "        if (port_ping[j]) continue;\n        if (portNumber(ports[j]) != new_port) continue;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "        used[nu] = @intCast((ports[j] >> 16) & 0x7fff);\n        nu += 1;\n        if (!port_named[j]) continue;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "        if (port_ping[i] != ping) continue;\n        if (!port_named[i]) continue;\n        if (portNumber(ports[i]) == port) n += 1;") != null);
@@ -14491,7 +14492,7 @@ test "udp autobind: an unbound UDP socket has no port until bind, connect or a s
     try std.testing.expect(std.mem.indexOf(u8, us, "pub fn autobind(key: u32, out_port: *u16, out_disc: *u16) i64 {") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "if (!policy.disconnectKeepsPort(port_user_port[i])) port_named[i] = false;") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "pub fn isNamed(key: u32) bool {") != null);
-    try std.testing.expect(std.mem.count(u8, us, "if (port_ping[i] or !port_named[i]) continue;") >= 4);
+    try std.testing.expect(std.mem.count(u8, us, "if (port_ping[i] or !port_named[i]) continue;") + std.mem.count(u8, us, "if (port_ping[i] or port_v6[i] or !port_named[i]) continue;") >= 4);
     // socket_syscall.zig: every UDP send names the socket first (inet_send_prepare), connect names it, getsockname reports 0 for
     // an unnamed socket.
     const ss = kt.socket_syscall_source;
@@ -14703,8 +14704,8 @@ test "ICMP errors wiring (hello390): checksummed, sent to connected UDP and ping
     const is = kt.icmp_source;
     const at = std.mem.indexOf(u8, is, "} else if (unreach.isError(icmp_type)) {") orelse return error.TestUnexpectedResult;
     const ck = std.mem.indexOfPos(u8, is, at, "if (len > 0xffff or ipv4.checksum(data, @intCast(len)) != 0) return;") orelse return error.TestUnexpectedResult;
-    const ue = std.mem.indexOfPos(u8, is, ck, ".udp => @import(\"udp.zig\").notifyError(q.src_port, q.dst_port, err),") orelse return error.TestUnexpectedResult;
-    _ = std.mem.indexOfPos(u8, is, ue, ".echo => @import(\"udp.zig\").notifyPingError(q.src_port, err),") orelse return error.TestUnexpectedResult;
+    const ue = std.mem.indexOfPos(u8, is, ck, "@import(\"udp.zig\").notifyIcmpError(.{") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, is, ue, "if (err != 0) @import(\"udp.zig\").notifyPingError(q.src_port, err);") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, is, "} else if (icmp_type == 3 and icmp_code == 3) {") == null);
     const us = kt.udp_source;
     const pe = std.mem.indexOf(u8, us, "pub fn notifyPingError(ident: u16, err: i32) void {") orelse return error.TestUnexpectedResult;
@@ -16880,4 +16881,27 @@ test "receive timestamps and the original destination as control messages (hello
     try std.testing.expectEqual(@as(u16, 47441), std.mem.readInt(u16, out[50..52], .big));
     const cut = cm.build(w, .{ .stamp_ns = 1 }, 20, &out);
     try std.testing.expect(cut.truncated and cut.written == 20);
+}
+
+test "IP_RECVERR: ICMP errors are queued for recvmsg(MSG_ERRQUEUE) (hello445)" {
+    // Linux __udp4_lib_err queues every ICMP error for a socket with IP_RECVERR (ip_icmp_error), connected or not, and sets sk_err;
+    // ip_recv_error hands out struct sock_extended_err + the offender. The kernel used to refuse IP_RECVERR and keep no queue.
+    const eq = kt.errqueue_policy;
+    try std.testing.expect(eq.route(true, false, false).queue and eq.route(true, false, false).set_err);
+    try std.testing.expect(!eq.route(false, true, false).set_err);
+    const ext = eq.encodeExtErr(.{ .errno = 111, .icmp_type = 3, .icmp_code = 3, .offender = .{ 127, 0, 0, 1 } });
+    try std.testing.expectEqual(@as(u8, eq.SO_EE_ORIGIN_ICMP), ext[4]);
+    const ipo = kt.ip_opt_policy;
+    const set = ipo.applySet(.{}, ipo.SOL_IP, ipo.IP_RECVERR, &.{ 1, 0, 0, 0 });
+    try std.testing.expect(set == .ok and set.ok.recverr);
+    try std.testing.expectEqual(@as(?i32, 1), ipo.getValue(set.ok, ipo.SOL_IP, ipo.IP_RECVERR));
+    const iu = kt.icmp_unreach_policy;
+    try std.testing.expect(!iu.errorFor(11, 0).?.hard); // time exceeded: soft, queued only with IP_RECVERR
+    try std.testing.expect(iu.errorFor(3, 3).?.hard);
+    try std.testing.expect(iu.errorFor(4, 0) == null);
+    var out: [64]u8 = undefined;
+    const b = kt.ip_cmsg_policy.buildRecvErr(ext, 256, &out);
+    try std.testing.expectEqual(@as(usize, 48), b.written);
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "notifyIcmpError(.{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.epoll_source, "udp_mod.hasQueuedError(") != null);
 }

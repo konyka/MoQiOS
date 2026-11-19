@@ -163,6 +163,7 @@ pub const user_stack = @import("proc/user_stack.zig");
 pub const tcp_recv_policy = @import("net/tcp_recv_policy.zig");
 pub const tcp_ready_policy = @import("net/tcp_ready_policy.zig");
 pub const tcp_urg_policy = @import("net/tcp_urg_policy.zig");
+pub const errqueue_policy = @import("net/errqueue_policy.zig");
 pub const ext2_unlink_policy = @import("fs/ext2_unlink_policy.zig");
 pub const ext2_util = @import("fs/ext2_util.zig");
 pub const stat_info = @import("fs/stat_info.zig");
@@ -368,6 +369,7 @@ pub const copy_file_range_source = @embedFile("fs/copy_file_range.zig");
 // arch/x86_64/clone.zig and mm/process_vm.zig.
 test {
     _ = @import("net/tcp_urg_policy.zig");
+    _ = @import("net/errqueue_policy.zig");
     _ = @import("proc/syscall_restart_policy.zig");
     _ = @import("proc/orphan_pgrp_policy.zig");
     _ = @import("proc/wait_report_policy.zig");

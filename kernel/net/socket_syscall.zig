@@ -1934,6 +1934,7 @@ fn udpSendBytes(fd: u32, payload: []const u8, addr_ptr: u64, addr_len: u32, cont
 /// recvmsg on a UDP socket: wait like recvfrom, scatter the datagram over the
 /// iovecs, fill msg_name, and report MSG_TRUNC in msg_flags.
 fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8, flags: u32) i64 {
+    if (flags & errq.MSG_ERRQUEUE != 0) return udpRecvErrqueue(cur.fd_table.fds[fd].udpKey(), cur.fd_table.fds[fd].udp_is_v6, msg_ptr, msghdr);
     const name_ptr: u64 = bo.readU64At(msghdr, 0);
     const name_len: u32 = bo.readU32Le(msghdr[8..12]);
     const iov_ptr: u64 = bo.readU64At(msghdr, 16);
@@ -2009,6 +2010,58 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
     bo.writeU32Le(&fl, (if (truncated) @as(u32, 0x20) else 0) | (if (cm.truncated) @as(u32, 0x08) else 0));
     _ = copy.copyToUser(@ptrFromInt(msg_ptr + 48), &fl, 4);
     return if ((flags & 0x20) != 0) @as(i64, full) else @intCast(done);
+}
+
+const errq = @import("errqueue_policy.zig");
+
+/// recvmsg(MSG_ERRQUEUE) on a UDP socket (ip_recv_error): the oldest queued ICMP error, never blocking (EAGAIN when there is none).
+/// The quoted payload goes to the iovecs (MSG_TRUNC when cut), msg_name is the datagram's destination, the control message
+/// IP_RECVERR carries struct sock_extended_err and the ICMP sender, and msg_flags has MSG_ERRQUEUE.
+fn udpRecvErrqueue(key: u32, is_v6: bool, msg_ptr: u64, msghdr: *const [56]u8) i64 {
+    if (is_v6) return -11; // IPV6_RECVERR is not queued here
+    const e = udp.takeQueuedError(key) orelse return -11;
+    const name_ptr: u64 = bo.readU64At(msghdr, 0);
+    const name_len: u32 = bo.readU32Le(msghdr[8..12]);
+    const iov_ptr: u64 = bo.readU64At(msghdr, 16);
+    const iov_len: u64 = bo.readU64At(msghdr, 24);
+    if (iov_len > 1024) return -90;
+    const data = e.payload[0..e.len];
+    var done: usize = 0;
+    var i: usize = 0;
+    while (i < iov_len and done < data.len) : (i += 1) {
+        var iov_buf: [16]u8 = undefined;
+        if (copy.copyFromUser(&iov_buf, @ptrFromInt(iov_ptr + @as(u64, @intCast(i)) * 16), 16) != 16) return -14;
+        const base = bo.readU64At(&iov_buf, 0);
+        const sz: usize = @intCast(@min(bo.readU64At(&iov_buf, 8), @as(u64, data.len - done)));
+        if (sz == 0) continue;
+        if (base == 0 or base >= 0x0000_8000_0000_0000) return -14;
+        if (copy.copyToUser(@ptrFromInt(base), data[done..][0..sz], sz) != sz) return -14;
+        done += sz;
+    }
+    if (name_ptr != 0 and name_ptr < 0x0000_8000_0000_0000) {
+        var out: [16]u8 = undefined;
+        const alen = sa.writeInet4(&out, e.dst_port, e.dst);
+        const n = @min(name_len, alen);
+        if (n != 0 and copy.copyToUser(@ptrFromInt(name_ptr), out[0..n], n) != n) return -14;
+        var al: [4]u8 = undefined;
+        bo.writeU32Le(&al, alen);
+        _ = copy.copyToUser(@ptrFromInt(msg_ptr + 8), &al, 4);
+    }
+    const ctl_ptr: u64 = bo.readU64At(msghdr, 32);
+    const ctl_cap: usize = if (ctl_ptr == 0) 0 else @intCast(@min(bo.readU64At(msghdr, 40), 1 << 20));
+    var ctl_buf: [64]u8 = undefined;
+    const cm = ip_cmsg_policy.buildRecvErr(errq.encodeExtErr(e), ctl_cap, &ctl_buf);
+    if (cm.written != 0) {
+        if (ctl_ptr >= 0x0000_8000_0000_0000) return -14;
+        if (copy.copyToUser(@ptrFromInt(ctl_ptr), ctl_buf[0..cm.written], cm.written) != cm.written) return -14;
+    }
+    var cl: [8]u8 = undefined;
+    bo.writeU64Le(&cl, cm.written);
+    _ = copy.copyToUser(@ptrFromInt(msg_ptr + 40), &cl, 8);
+    var fl: [4]u8 = undefined;
+    bo.writeU32Le(&fl, errq.MSG_ERRQUEUE | (if (done < data.len) @as(u32, 0x20) else 0) | (if (cm.truncated) @as(u32, 0x08) else 0));
+    _ = copy.copyToUser(@ptrFromInt(msg_ptr + 48), &fl, 4);
+    return @intCast(done);
 }
 
 /// sendmsg on a raw ICMP socket (raw_sendmsg / rawv6_sendmsg): msg_control is copied in whole first (a bad pointer is EFAULT, more

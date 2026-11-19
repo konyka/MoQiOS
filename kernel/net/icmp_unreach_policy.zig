@@ -105,8 +105,19 @@ const unreach_errno = [16]struct { errno: i32, hard: bool }{
 };
 
 /// The errno a connected UDP or ping socket without IP_RECVERR takes from an ICMP error, 0 when it takes none: only hard errors
-/// are reported (soft ones, such as time exceeded or net unreachable, only through the error queue, which MoQiOS does not have).
+/// are reported (soft ones, such as time exceeded or net unreachable, only through the IP_RECVERR error queue: errorFor).
 /// Parameter problem is EPROTO; source quench and redirect are no error.
+/// The errno an ICMP error gives a datagram socket and whether it is hard (__udp4_lib_err), null when it is none: time exceeded is a
+/// soft EHOSTUNREACH, source quench and redirect are nothing, an unknown unreachable code is a soft EHOSTUNREACH.
+pub fn errorFor(icmp_type: u8, code: u8) ?struct { errno: i32, hard: bool } {
+    return switch (icmp_type) {
+        3 => if (code < unreach_errno.len) .{ .errno = unreach_errno[code].errno, .hard = unreach_errno[code].hard } else .{ .errno = 113, .hard = false },
+        11 => .{ .errno = 113, .hard = false },
+        12 => .{ .errno = 71, .hard = true },
+        else => null,
+    };
+}
+
 pub fn errnoFor(icmp_type: u8, code: u8) i32 {
     return switch (icmp_type) {
         3 => if (code < unreach_errno.len and unreach_errno[code].hard) unreach_errno[code].errno else 0,
