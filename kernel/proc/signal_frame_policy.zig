@@ -9,6 +9,12 @@
 
 pub const RED_ZONE: u64 = 128;
 
+/// The user address uc_mcontext.fpregs names: the FXSAVE image at `fpu_offset` inside the frame at `frame_addr` (Linux
+/// sc->fpstate, the FPU state copied onto the signal stack).
+pub fn fpregsAddr(frame_addr: u64, fpu_offset: u64) u64 {
+    return frame_addr + fpu_offset;
+}
+
 /// Handler entry RSP for a frame of `frame_size` bytes pushed below
 /// `user_rsp`, or null when the stack has no room (the arithmetic would
 /// wrap below zero).

@@ -836,7 +836,7 @@ test "pidfd_send_signal validates signal and flags" {
     try std.testing.expect(pidfd_signal_policy.signalValid(64));
     try std.testing.expect(!pidfd_signal_policy.signalValid(65));
     try std.testing.expect(pidfd_signal_policy.flagsValid(0));
-    try std.testing.expect(!pidfd_signal_policy.flagsValid(1));
+    try std.testing.expect(!pidfd_signal_policy.flagsValid(8)); // flag 1 (PIDFD_SIGNAL_THREAD) is valid since hello437
     try std.testing.expect(pidfd_signal_policy.aliasesShareValidation());
 }
 
@@ -12232,10 +12232,11 @@ test "TCP socket-state errnos: accept, listen, shutdown, getpeername, and the AF
 test "descriptor errnos: EBADF for closed/out-of-range fds, ESPIPE for unseekable types, ENOENT for an empty path" {
     // Which descriptor kinds lseek() applies to (by FdType tag).
     const sk = kt.fd_seek_policy;
-    for ([_][]const u8{ "pipe_read", "pipe_write", "tcp_socket", "udp_socket", "unix_socket", "raw_socket", "epoll", "eventfd", "timerfd", "inotify", "pidfd", "devfs_ctrl" }) |t| {
+    for ([_][]const u8{ "pipe_read", "pipe_write", "tcp_socket", "udp_socket", "unix_socket", "raw_socket", "epoll", "eventfd", "timerfd", "inotify", "pidfd", "devfs_ctrl", "special" }) |t| {
         try std.testing.expect(!sk.seekable(t));
     }
-    for ([_][]const u8{ "ramdisk_file", "fat32_file", "ext2_file", "tmpfs_file", "proc_file", "devfs", "rofs_file", "special", "none" }) |t| {
+    // "special" (the terminal) moved to the unseekable list with hello435.
+    for ([_][]const u8{ "ramdisk_file", "fat32_file", "ext2_file", "tmpfs_file", "proc_file", "devfs", "rofs_file", "none" }) |t| {
         try std.testing.expect(sk.seekable(t));
     }
     // The policy's names are real FdType tags: a renamed variant would otherwise silently become seekable.
@@ -12258,7 +12259,7 @@ test "descriptor errnos: EBADF for closed/out-of-range fds, ESPIPE for unseekabl
 
     // lseek on an unseekable descriptor is ESPIPE, decided before the offset is touched.
     const s = kt.syscall_entry_source;
-    try std.testing.expect(std.mem.indexOf(u8, s, "    if (!vfs_mod.fdTypeSeekable(desc.fd_type)) return -29;\n    const locked = vfs_mod.lockOffset(desc);\n    defer vfs_mod.unlockOffset(locked);\n    vfs_mod.syncOffsetIn(desc);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "    if (!vfs_mod.fdTypeSeekable(desc.fd_type)) return -29;\n    if (desc.fd_type == .devfs and !@import(\"../../fs/fd_seek_policy.zig\").devfsSeekable(vfs_mod.isConsoleTty(desc))) return -29;\n    const locked = vfs_mod.lockOffset(desc);\n    defer vfs_mod.unlockOffset(locked);\n    vfs_mod.syncOffsetIn(desc);") != null);
 }
 
 test "the program break belongs to the address space: CLONE_VM threads share it, every other path sets it on the new Mm" {
@@ -16676,4 +16677,50 @@ test "sendmmsg / recvmmsg batch up to UIO_MAXIOV and recvmmsg writes the time le
     const brk = std.mem.indexOf(u8, body, "err = result;\n            break;").?;
     const wr = std.mem.indexOf(u8, body, "writeTimeoutLeft(").?;
     try std.testing.expect(brk < wr);
+}
+
+test "lseek on a terminal is ESPIPE: the standard descriptors and /dev/tty (hello435)" {
+    // Linux opens a tty without a position (tty_open: no_llseek / FMODE_STREAM), so lseek on stdin/stdout/stderr or /dev/tty is
+    // ESPIPE; /dev/null and /dev/zero keep noop_llseek and succeed.
+    const sk = kt.fd_seek_policy;
+    try std.testing.expect(!sk.seekable("special"));
+    try std.testing.expect(sk.seekable("devfs"));
+    try std.testing.expect(!sk.devfsSeekable(true));
+    try std.testing.expect(sk.devfsSeekable(false));
+    const se = kt.syscall_entry_source;
+    const l = std.mem.indexOf(u8, se, "fn syscallLseek(").?;
+    const l_end = std.mem.indexOf(u8, se[l..], "\n}\n").? + l;
+    try std.testing.expect(std.mem.indexOf(u8, se[l..l_end], "if (desc.fd_type == .devfs and !@import(\"../../fs/fd_seek_policy.zig\").devfsSeekable(vfs_mod.isConsoleTty(desc))) return -29;") != null);
+}
+
+test "an SA_SIGINFO handler's ucontext points fpregs at the interrupted FPU image (hello436)" {
+    // Linux __unsafe_setup_sigcontext stores the user address of the FPU image written on the signal stack in sc->fpstate
+    // (uc_mcontext.fpregs). The kernel used to leave it 0 although the FXSAVE image was already in the frame.
+    const sf = kt.signal_frame_policy;
+    try std.testing.expectEqual(@as(u64, 0x7000 + 16), sf.fpregsAddr(0x7000, 16));
+    const sg = kt.signal_source;
+    try std.testing.expect(std.mem.indexOf(u8, sg, "uc.fpregs = @import(\"signal_frame_policy.zig\").fpregsAddr(frame_addr, @offsetOf(SignalFrame, \"fpu\"));") != null);
+}
+
+test "pidfd_send_signal reads its siginfo and its scope flags (hello437)" {
+    // Linux do_pidfd_send_signal: si_signo must equal sig; a non-negative code or SI_TKILL only to the caller's own process; flags
+    // PIDFD_SIGNAL_THREAD / _THREAD_GROUP / _PROCESS_GROUP, at most one. The kernel ignored info and rejected every flag.
+    const pp = kt.pidfd_signal_policy;
+    try std.testing.expect(pp.flagsValid(0) and pp.flagsValid(1) and pp.flagsValid(2) and pp.flagsValid(4));
+    try std.testing.expect(!pp.flagsValid(3) and !pp.flagsValid(8) and !pp.flagsValid(6));
+    try std.testing.expectEqual(pp.Scope.process, pp.scope(0));
+    try std.testing.expectEqual(pp.Scope.thread, pp.scope(1));
+    try std.testing.expectEqual(pp.Scope.process, pp.scope(2));
+    try std.testing.expectEqual(pp.Scope.group, pp.scope(4));
+    try std.testing.expectEqual(@as(i64, 0), pp.infoErrno(10, 10, -1, false, .process));
+    try std.testing.expectEqual(@as(i64, -22), pp.infoErrno(10, 12, -1, false, .process));
+    try std.testing.expectEqual(@as(i64, -1), pp.infoErrno(10, 10, 0, false, .process));
+    try std.testing.expectEqual(@as(i64, -1), pp.infoErrno(10, 10, -6, false, .process));
+    try std.testing.expectEqual(@as(i64, 0), pp.infoErrno(10, 10, 0, true, .process));
+    try std.testing.expectEqual(@as(i64, -1), pp.infoErrno(10, 10, 0, true, .group));
+    const se = kt.syscall_entry_source;
+    const f = std.mem.indexOf(u8, se, "fn syscallPidfdSendSignal(").?;
+    const f_end = std.mem.indexOf(u8, se[f..], "\n}\n").? + f;
+    try std.testing.expect(std.mem.indexOf(u8, se[f..f_end], "_ = info_ptr;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, se[f..f_end], "signal_syscall_mod.pidfdSendSignal(target_tid, sig, info_ptr, flags)") != null);
 }

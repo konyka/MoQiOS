@@ -193,6 +193,11 @@ fn tgidOf(t: *task.Task) u32 {
     return if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid;
 }
 
+/// The process id (thread group leader's tid) of `t`.
+pub fn tgidOfPub(t: *task.Task) u32 {
+    return tgidOf(t);
+}
+
 /// siginfo for a signal sent by the running task (kill): SI_USER with its
 /// pid and uid; SI_KERNEL when no user task is current.
 pub fn senderInfo() siginfo.Info {
@@ -705,6 +710,8 @@ pub fn pushSignalFrame(
     uc.sigmask = if (t.restore_sigmask_pending) t.saved_sigmask else t.signal_mask;
     uc.ss_sp = t.sigaltstack_base;
     uc.ss_size = t.sigaltstack_size;
+    // The FXSAVE image below goes to the user stack with the frame; fpregs names it there.
+    uc.fpregs = @import("signal_frame_policy.zig").fpregsAddr(frame_addr, @offsetOf(SignalFrame, "fpu"));
     uc.gregs[siginfo.REG_RAX] = gprs.rax;
     uc.gregs[siginfo.REG_RBX] = gprs.rbx;
     uc.gregs[siginfo.REG_RCX] = gprs.rcx;

@@ -25,7 +25,8 @@ const RlimitPolicy = @import("../proc/rlimit.zig").Policy;
 /// descriptor array dominates what is left of Task after SK-37/38. Keep a
 /// minimal table there; x86 stays at 64.
 /// Whether lseek() applies: regular files, directories, procfs and device nodes with a position.
-/// Pipes, sockets and eventfd/timerfd/epoll/inotify/pidfd descriptors are ESPIPE.
+/// Pipes, sockets, the standard descriptors (the terminal) and eventfd/timerfd/epoll/inotify/pidfd descriptors are ESPIPE; so is
+/// /dev/tty (syscallLseek checks the devfs node).
 pub fn fdTypeSeekable(t: FdType) bool {
     return @import("fd_seek_policy.zig").seekable(@tagName(t));
 }

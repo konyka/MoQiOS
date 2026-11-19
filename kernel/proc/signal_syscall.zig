@@ -771,22 +771,54 @@ pub fn tkill(tid_arg: i64, sig: u32) i64 {
     return sig_mod.sendSignalInfoResult(tid, sig, info);
 }
 
-/// pidfd_send_signal(pidfd, sig, info_ptr, flags) → 0 or -errno
-pub fn pidfdSendSignal(pidfd: u32, sig: u32, info_ptr: u64, flags: u32) i64 {
-    _ = info_ptr;
-    _ = flags;
-
-    const cur_idx = sched.currentTaskIndex() orelse return -3;
-    const cur = task_mod.getTask(cur_idx) orelse return -3;
-
-    if (pidfd >= vfs_mod.MAX_FDS) return -9;
-    const desc = cur.fd_table.fds[pidfd];
-    if (desc.fd_type != .proc_file) return -9;
-
-    const target_pid: u32 = @intCast(desc.proc_pid);
-    if (!currentMaySignalTask(target_pid)) return -1; // EPERM
-    if (sig_mod.sendSignal(target_pid, sig)) return 0;
-    return -3;
+/// pidfd_send_signal on the process (or thread) `target_tid` a pidfd names, once the descriptor and the signal number were checked
+/// (Linux do_pidfd_send_signal). `flags` picks the scope: the thread, the process (default) or its process group. A siginfo at
+/// `info_ptr` is read and checked (si_signo == sig; a code that is not negative, or SI_TKILL, only to the caller's own process);
+/// without one the receiver sees SI_USER and the sender. Permission is the same as kill's. 0 or -errno.
+pub fn pidfdSendSignal(target_tid: u32, sig: u32, info_ptr: u64, flags: u32) i64 {
+    const si = @import("siginfo_policy.zig");
+    const pp = @import("pidfd_signal_policy.zig");
+    const sc = pp.scope(flags);
+    const cur = sched.currentTask() orelse return -3;
+    var info = sig_mod.senderInfo();
+    if (info_ptr != 0) {
+        var raw: [si.SIGINFO_SIZE]u8 = undefined;
+        if (!copy.validateUserBuffer(info_ptr, raw.len) or copy.copyFromUser(&raw, @ptrFromInt(info_ptr), raw.len) != raw.len) return -14;
+        const signo: i32 = @bitCast(@as(u32, raw[0]) | @as(u32, raw[1]) << 8 | @as(u32, raw[2]) << 16 | @as(u32, raw[3]) << 24);
+        info = si.decode(&raw);
+        const own = sig_mod.tgidOfPub(cur) == target_tid;
+        const rc = pp.infoErrno(sig, signo, info.code, own, sc);
+        if (rc != 0) return rc;
+    }
+    const idx = task_mod.findTaskByTid(target_tid) orelse return -3;
+    const target = task_mod.getTask(idx) orelse return -3;
+    if (target.state == .zombie) return -3;
+    if (sc == .group) {
+        var found = false;
+        var allowed = false;
+        for (0..task_mod.MAX_TASKS) |i| {
+            const t = task_mod.getTask(@intCast(i)) orelse continue;
+            if (t.pgid != target.pgid or t.state == .zombie or !t.is_user) continue;
+            found = true;
+            if (maySignal(cur, t)) allowed = true;
+        }
+        if (!found) return -3;
+        if (!allowed) return -1;
+        if (sig == 0) return 0;
+        _ = sig_mod.sendSignalToPgrpInfo(target.pgid, sig, cur, info);
+        return 0;
+    }
+    if (!maySignal(cur, target)) return -1; // EPERM
+    if (sig == 0) return 0;
+    if (sc == .thread) {
+        if (info_ptr == 0 and info.code == si.SI_USER) info.code = si.SI_TKILL;
+        if (@import("group_stop_policy.zig").actsOnEveryThread(sig, target.sigact().handlers[sig - 1]))
+            return sendToProcessWith(target, target_tid, sig, info);
+        return sig_mod.sendSignalInfoResult(target_tid, sig, info);
+    }
+    if (@import("group_stop_policy.zig").actsOnEveryThread(sig, target.sigact().handlers[sig - 1]))
+        return sendToProcessWith(target, target_tid, sig, info);
+    return sig_mod.sendSignalInfoResult(processRecipient(target, target_tid, sig), sig, info);
 }
 
 /// signalfd4(old_fd, mask, sizemask, flags) → fd or -errno

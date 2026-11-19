@@ -3600,8 +3600,9 @@ fn syscallLseek(fd: u32, offset: u64, whence: u32) i64 {
     if (fd >= vfs_mod.MAX_FDS) return -9; // EBADF
     const desc = &cur.fd_table.fds[fd];
     if (desc.fd_type == .none) return -9;
-    // Pipes, sockets, eventfds and the like are not seekable: ESPIPE.
+    // Pipes, sockets, eventfds, the terminal and the like are not seekable: ESPIPE.
     if (!vfs_mod.fdTypeSeekable(desc.fd_type)) return -29;
+    if (desc.fd_type == .devfs and !@import("../../fs/fd_seek_policy.zig").devfsSeekable(vfs_mod.isConsoleTty(desc))) return -29;
     const locked = vfs_mod.lockOffset(desc);
     defer vfs_mod.unlockOffset(locked);
     vfs_mod.syncOffsetIn(desc);
@@ -6184,15 +6185,13 @@ fn syscallPidfdOpen(pid: u32, flags: u32) i64 {
     return @intCast(fd_slot);
 }
 
-/// pidfd_send_signal(pidfd, sig, info_ptr, flags) — send signal via pidfd.
-/// Simplified: extracts tid from fd inode_id and calls signal.sendSignal.
+/// pidfd_send_signal(pidfd, sig, info_ptr, flags) — send a signal, with an optional siginfo, to the process, thread or process
+/// group a pidfd names (signal_syscall.pidfdSendSignal).
 fn syscallPidfdSendSignal(pidfd: u32, sig: u32, info_ptr: u64, flags: u32) i64 {
-    _ = info_ptr;
     if (!@import("../../proc/pidfd_signal_policy.zig").flagsValid(flags)) return -22;
     if (!@import("../../proc/pidfd_signal_policy.zig").signalValid(sig)) return -22;
     const sched = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
-    const signal = @import("../../proc/signal.zig");
 
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = tm.getTask(cur_idx) orelse return -1;
@@ -6204,10 +6203,8 @@ fn syscallPidfdSendSignal(pidfd: u32, sig: u32, info_ptr: u64, flags: u32) i64 {
     const target_tid: u32 = fd.proc_pid;
     // Verify target exists
     _ = findTaskByPid(target_tid) orelse return -3;
-    // Holding a pidfd grants no signal permission: same gate as kill/tkill.
-    if (!signal_syscall_mod.currentMaySignalTask(target_tid)) return -1; // EPERM
-
-    return if (signal.sendSignal(target_tid, sig)) 0 else -3; // ESRCH
+    // Holding a pidfd grants no signal permission: the same gate as kill/tkill, inside pidfdSendSignal.
+    return signal_syscall_mod.pidfdSendSignal(target_tid, sig, info_ptr, flags);
 }
 
 /// pidfd_getfd(pidfd, targetfd, flags) — get fd from another process.
