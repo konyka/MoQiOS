@@ -22,6 +22,7 @@ pub const TIOCGPGRP = 0x540F; // Get foreground process group
 pub const TIOCSPGRP = 0x5410; // Set foreground process group
 pub const FIONREAD = 0x541B; // Get number of readable bytes
 pub const SIOCOUTQNSD = 0x894B; // Bytes written to a TCP socket that have not been sent yet
+pub const SIOCATMARK = 0x8905; // The next byte a TCP socket reads is the urgent byte
 pub const TIOCSTI = 0x5412; // Insert a byte into the terminal's input queue
 pub const TIOCOUTQ = 0x5411; // Bytes sent on a socket that the peer has not consumed (SIOCOUTQ)
 pub const FIONBIO = 0x5421; // Set/clear non-blocking mode
@@ -358,6 +359,20 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
                 else => return -25, // ENOTTY
             };
             const v: i32 = @intCast(@min(queued, 0x7FFF_FFFF));
+            const v_bytes: [*]const u8 = @ptrCast(&v);
+            if (copy.copyToUser(@ptrFromInt(arg), v_bytes[0..4], 4) != 4) return -14;
+            return 0;
+        },
+        SIOCATMARK => {
+            // TCP answers from its mark, an AF_UNIX stream socket 0 (it keeps no urgent byte here); UDP, raw and every other
+            // descriptor ENOTTY, as on Linux.
+            const desc = &cur0.fd_table.fds[@intCast(fd)];
+            const v: i32 = switch (desc.fd_type) {
+                .tcp_socket => @intFromBool(@import("../net/tcp.zig").tcpAtMark(desc.tcb_idx)),
+                .unix_socket => 0,
+                else => return -25, // ENOTTY
+            };
+            if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;
             const v_bytes: [*]const u8 = @ptrCast(&v);
             if (copy.copyToUser(@ptrFromInt(arg), v_bytes[0..4], 4) != 4) return -14;
             return 0;

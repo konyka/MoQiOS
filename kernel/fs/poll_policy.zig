@@ -9,6 +9,7 @@
 const std = @import("std");
 
 pub const POLLIN: u32 = 0x001;
+pub const POLLPRI: u32 = 0x002;
 pub const POLLOUT: u32 = 0x004;
 pub const POLLERR: u32 = 0x008;
 pub const POLLHUP: u32 = 0x010;
@@ -110,6 +111,11 @@ pub fn selectReadable(current: u32) bool {
 
 pub fn selectWritable(current: u32) bool {
     return current & (POLLOUT | POLLERR) != 0;
+}
+
+/// select(): an exceptional condition is urgent data waiting (Linux POLLEX_SET: EPOLLPRI).
+pub fn selectExceptional(current: u32) bool {
+    return current & POLLPRI != 0;
 }
 
 /// Next sleep slice: never longer than `slice_ms`, never past the deadline.

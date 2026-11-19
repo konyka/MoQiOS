@@ -37,6 +37,7 @@ const TcbSet = @import("tcb_bitset.zig").Bitset(MAX_CONNECTIONS);
 const tcp_port_policy = @import("tcp_port_policy.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 const fcntl_policy = @import("../fs/fcntl_policy.zig");
+const tcp_urg_policy = @import("tcp_urg_policy.zig");
 
 // v53.13: Global TCP lock — protects TCB array, tcb_active_bitmap, and all TCB fields.
 // v53.15: tcb_active_bitmap uses atomic RMW for all accesses (lock-free snapshot in timerTick); it is a TcbSet of u64 words (tcb_bitset.zig).
@@ -352,6 +353,14 @@ const TcpTcb = struct {
     was_established: bool = false,
     /// shutdown(SHUT_RD) happened: reads see EOF, later data is dropped.
     shut_rd: bool = false,
+    /// Urgent data received (Linux urg_data / urg_seq, tcp_urg_policy.zig): the byte at urg_seq stays in the receive ring, reads
+    /// stop in front of it and skip it at the mark; urg_byte is the copy recv(MSG_OOB) returns.
+    urg_state: tcp_urg_policy.State = .none,
+    urg_seq: u32 = 0,
+    urg_byte: u8 = 0,
+    /// Urgent data sent (Linux snd_up): segments starting before snd_up carry URG and the offset to it while urg_send is set.
+    snd_up: u32 = 0,
+    urg_send: bool = false,
     /// A RST answered our SYN: connect() fails with ECONNREFUSED.
     refused: bool = false,
     /// The errno of the last ICMP error about an established connection (Linux sk_err_soft): SO_ERROR reports it once, and a
@@ -1037,6 +1046,11 @@ fn initTcbState(t: *TcpTcb) void {
     t.fin_reset_err = 0;
     t.was_established = false;
     t.shut_rd = false;
+    t.urg_state = .none;
+    t.urg_seq = 0;
+    t.urg_byte = 0;
+    t.snd_up = 0;
+    t.urg_send = false;
     t.refused = false;
     t.soft_err = 0;
     t.async_nospace = false;
@@ -1364,12 +1378,14 @@ fn fillTcpSegment(
         break :blk if (tcb.accecn_ok) probeAcePackAe(tcb.ace_ce_count) else 0;
     };
     pkt[tcp_off + 12] = (data_offset_val << 4) | byte12_lo;
-    pkt[tcp_off + 13] = flags;
+    // The mark is acknowledged: urgent mode ends (tcp_ack clamps snd_up to snd_una), so a wrapped sequence cannot revive it.
+    if (tcb.urg_send and !tcp_util.seqLt(tcb.snd_una, tcb.snd_up)) tcb.urg_send = false;
+    const urg_ptr = if (flags & (SYN | RST) == 0) tcp_urg_policy.sendPointer(tcb.urg_send, tcb.snd_una, tcb.snd_up, seq) else null;
+    pkt[tcp_off + 13] = if (urg_ptr != null) flags | tcp_urg_policy.URG else flags;
     bo.writeU16BeAt(pkt, tcp_off + 14, raw_window);
     pkt[tcp_off + 16] = 0;
     pkt[tcp_off + 17] = 0;
-    pkt[tcp_off + 18] = 0;
-    pkt[tcp_off + 19] = 0;
+    bo.writeU16BeAt(pkt, tcp_off + 18, urg_ptr orelse 0);
 
     if (opt_len > 0) {
         @memcpy(pkt[tcp_off + 20 ..][0..opt_len], opt_buf[0..opt_len]);
@@ -1695,6 +1711,7 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
             epoll.epollNotify(.tcp_socket, pending_idx, pending_events);
         }
         flushFasync();
+        flushUrgent();
     }
 
     const lock_flags = tcp_lock.acquire();
@@ -2926,7 +2943,7 @@ fn driveTcbStateMachine(
             if (payload_len > 0) {
                 // Only bytes that reached the receive ring are readiness: a duplicate or out-of-order segment is answered with an ACK
                 // and must not re-arm an edge-triggered registration that has already reported the data.
-                if (processIncomingData(tcb, data + payload_offset, payload_len, seq_num) > 0) {
+                if (processIncomingData(tcb, data, data + payload_offset, payload_len, seq_num) > 0) {
                     // v53.41: Defer epoll notification outside tcp_lock
                     pending_events.* |= epoll.EPOLLIN;
                     pending_idx.* = tcbIdx(tcb);
@@ -3022,7 +3039,7 @@ fn driveTcbStateMachine(
                 return;
             }
             if (payload_len > 0) {
-                if (processIncomingData(tcb, data + payload_offset, payload_len, seq_num) > 0) {
+                if (processIncomingData(tcb, data, data + payload_offset, payload_len, seq_num) > 0) {
                     pending_events.* |= epoll.EPOLLIN;
                     pending_idx.* = tcbIdx(tcb);
                     noteFasync(tcbIdx(tcb), fcntl_policy.POLL_IN);
@@ -3055,7 +3072,7 @@ fn driveTcbStateMachine(
         },
         .close_wait => {
             if (payload_len > 0) {
-                if (processIncomingData(tcb, data + payload_offset, payload_len, seq_num) > 0) {
+                if (processIncomingData(tcb, data, data + payload_offset, payload_len, seq_num) > 0) {
                     pending_events.* |= epoll.EPOLLIN;
                     pending_idx.* = tcbIdx(tcb);
                     noteFasync(tcbIdx(tcb), fcntl_policy.POLL_IN);
@@ -3114,6 +3131,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, e
             epoll.epollNotify(.tcp_socket, pending_idx, pending_events);
         }
         flushFasync();
+        flushUrgent();
     }
 
     // v53.13: Acquire TCP lock for the entire packet processing
@@ -3220,7 +3238,7 @@ fn sendLoopbackResetV6(src_ip: [16]u8, dst_ip: [16]u8, src_port: u16, dst_port: 
 
 /// Accept an in-order data segment into the receive ring. Returns the number of bytes buffered: 0 for a duplicate, out-of-order or
 /// SHUT_RD-discarded segment, which carries no new readiness.
-fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) u32 {
+fn processIncomingData(tcb: *TcpTcb, hdr: [*]const u8, data: [*]const u8, len: u32, seq: u32) u32 {
     // Check if this is the expected sequence
     if (seq != tcb.rcv_nxt) {
         if (tcb.sack_permitted and len > 0) {
@@ -3250,6 +3268,9 @@ fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) u32 
         return 0;
     }
 
+    // tcp_urg: an urgent pointer names a new mark before the bytes are queued, so the byte can be picked out of this segment.
+    if (hdr[13] & tcp_urg_policy.URG != 0) noteUrgentPointer(tcb, tcp_urg_policy.pointerSeq(seq, bo.readU16BeAt(hdr, 18)));
+
     // Copy to receive ring buffer (batched @memcpy)
     const recv_free = RECV_BUF_SIZE - 1 - ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
     const window_room = tcp_util.acceptableBytes(len, ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE), rcvWindowCap(tcb));
@@ -3257,6 +3278,11 @@ fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) u32 
     ringWrite(&tcb.recv_buf, RECV_BUF_SIZE, tcb.recv_tail, data, to_copy);
     tcb.recv_tail = (tcb.recv_tail + to_copy) % RECV_BUF_SIZE;
     if (to_copy > 0) markRecvWake(tcb);
+    if (tcp_urg_policy.byteOffset(tcb.urg_state, tcb.urg_seq, seq, to_copy)) |off| {
+        tcb.urg_byte = data[off];
+        tcb.urg_state = .valid;
+        urg_ready_pending.set(tcbIdx(tcb));
+    }
 
     // v53.3: only advance rcv_nxt by actually buffered bytes
     // (if recv_buf is full, to_copy < len, so we don't skip unbuffered seq nums)
@@ -3280,6 +3306,108 @@ fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) u32 
         tcb.delayed_ack_ms = 0;
     }
     return to_copy;
+}
+
+/// Sequence number of the next byte a read returns (Linux copied_seq): rcv_nxt less what the ring still holds, and less the FIN
+/// once it was taken (it occupies a sequence number but no ring byte).
+fn copiedSeq(tcb: *const TcpTcb) u32 {
+    const fin_in: u32 = switch (tcb.state) {
+        .close_wait, .closing, .last_ack, .time_wait => 1,
+        else => 0,
+    };
+    return tcb.rcv_nxt -% fin_in -% ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
+}
+
+/// Ring bytes a read can return now: a lone urgent byte at the mark (not inline) does not count (tcp_poll's target + 1).
+fn readableLocked(tcb: *const TcpTcb) u32 {
+    return tcp_urg_policy.readableBytes(tcb.urg_state, tcb.urg_seq, copiedSeq(tcb), ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE), oobInline(tcb));
+}
+
+fn oobInline(tcb: *const TcpTcb) bool {
+    return tcb.options.extra_flags & tcp_urg_policy.OOBINLINE_FLAG != 0;
+}
+
+/// tcp_check_urg: a pointer to urgent byte `ptr_seq`. A new mark signals SIGURG to the socket's owner, drops an unread urgent byte
+/// sitting at the read position (not inline), and waits for its byte. Caller holds tcp_lock.
+fn noteUrgentPointer(tcb: *TcpTcb, ptr_seq: u32) void {
+    const copied = copiedSeq(tcb);
+    switch (tcp_urg_policy.check(ptr_seq, copied, tcb.rcv_nxt, tcb.urg_state, tcb.urg_seq, oobInline(tcb))) {
+        .ignore => return,
+        .new_mark_skip_old => tcb.recv_head = (tcb.recv_head + 1) % RECV_BUF_SIZE,
+        .new_mark => {},
+    }
+    tcb.urg_state = .notyet;
+    tcb.urg_seq = ptr_seq;
+    urg_signal_pending.set(tcbIdx(tcb));
+}
+
+/// The urgent mark limits a read of `available` ring bytes: step over the urgent byte at the mark (not inline), then take at most
+/// up to the next mark. Returns the bytes the read may copy. Caller holds tcp_lock; `consume` moves the read position.
+fn urgReadLimit(tcb: *TcpTcb, available: u32, consume: bool) struct { skip: u32, avail: u32 } {
+    const lim = tcp_urg_policy.readLimit(tcb.urg_state, tcb.urg_seq, copiedSeq(tcb), available, oobInline(tcb));
+    if (consume and lim.skip > 0) {
+        tcb.recv_head = (tcb.recv_head + lim.skip) % RECV_BUF_SIZE;
+        urgPassedCheck(tcb);
+    }
+    return .{ .skip = lim.skip, .avail = lim.avail };
+}
+
+/// A read moved past the mark: urgent mode ends (tcp_recvmsg_locked clears urg_data). Caller holds tcp_lock.
+fn urgPassedCheck(tcb: *TcpTcb) void {
+    if (tcp_urg_policy.passed(tcb.urg_state, tcb.urg_seq, copiedSeq(tcb))) tcb.urg_state = .none;
+}
+
+/// Connections whose new urgent pointer owes the owner a SIGURG, and whose urgent byte arrived (POLLPRI readiness). Set under
+/// tcp_lock, sent after the segment is processed (outside it).
+var urg_signal_pending: TcbSet = .{};
+var urg_ready_pending: TcbSet = .{};
+
+/// Send SIGURG for the marks noted during the last segment and tell pollers the urgent byte is here. Called with tcp_lock released.
+fn flushUrgent() void {
+    if (urg_signal_pending.isEmpty() and urg_ready_pending.isEmpty()) return;
+    var sig: TcbSet = .{};
+    var ready: TcbSet = .{};
+    {
+        const lock_flags = tcp_lock.acquire();
+        defer tcp_lock.release(lock_flags);
+        sig = urg_signal_pending.takeAll();
+        ready = urg_ready_pending.takeAll();
+    }
+    while (sig.next()) |idx| @import("../fs/vfs.zig").tcpSigurg(idx);
+    const epoll = @import("epoll.zig");
+    while (ready.next()) |idx| epoll.epollNotify(.tcp_socket, idx, tcpReadiness(idx));
+}
+
+/// recv(MSG_OOB) (tcp_recv_urg): the urgent byte, or EINVAL when there is none to read (or SO_OOBINLINE), EAGAIN while it is on its
+/// way, 0 after the stream ended; never blocks. MSG_PEEK leaves it readable.
+pub fn tcpRecvOob(tcb_idx: u32, peek: bool) i64 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS) return -22;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.active) return -22;
+    if (tcb.state == .listen) return -107; // ENOTCONN (inet_recvmsg on a listener)
+    const never = tcb.state == .closed and !tcb.was_established;
+    const read_done = tcb.shut_rd or tcb.state == .closed or switch (tcb.state) {
+        .close_wait, .closing, .last_ack, .time_wait => true,
+        else => false,
+    };
+    switch (tcp_urg_policy.recvOob(tcb.urg_state, tcb.urg_byte, oobInline(tcb), never, read_done)) {
+        .byte => |b| {
+            if (!peek) tcb.urg_state = .read;
+            return b;
+        },
+        .err => |e| return e,
+    }
+}
+
+/// SIOCATMARK: the next byte read is the urgent byte.
+pub fn tcpAtMark(tcb_idx: u32) bool {
+    if (tcb_idx >= MAX_CONNECTIONS) return false;
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    const tcb = &tcbs[tcb_idx];
+    return tcb.active and tcp_urg_policy.atMark(tcb.urg_state, tcb.urg_seq, copiedSeq(tcb));
 }
 
 // ─── Public API (called from syscalls) ────────────────────────────────────
@@ -3567,6 +3695,12 @@ const SEND_STAGE_SIZE: u32 = 4096;
 /// stack, then copied into the send ring under the lock.
 /// Returns bytes queued, -14 (EFAULT) on a bad user range, or -1 on error.
 pub fn tcpSendFromUser(tcb_idx: u32, user_addr: u64, len: u32) i64 {
+    return sendFromUser(tcb_idx, user_addr, len, false);
+}
+
+/// tcpSendFromUser for a send with MSG_OOB: the last byte queued becomes the urgent byte (tcp_mark_urg sets snd_up to the write
+/// sequence after the copy), and the segments that leave in front of it carry URG.
+fn sendFromUser(tcb_idx: u32, user_addr: u64, len: u32, oob: bool) i64 {
     const copy = @import("../mm/copy_from_user.zig");
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
 
@@ -3590,6 +3724,10 @@ pub fn tcpSendFromUser(tcb_idx: u32, user_addr: u64, len: u32) i64 {
         ringWrite(&tcb.send_buf, SEND_BUF_SIZE, tcb.send_tail, &stage, to_copy);
         tcb.send_tail = (tcb.send_tail + to_copy) % SEND_BUF_SIZE;
         if (to_copy < chunk) tcb.async_nospace = true;
+        if (oob and to_copy > 0) {
+            tcb.snd_up = tcb.snd_una +% ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE);
+            tcb.urg_send = true;
+        }
         tcp_lock.release(lock_flags);
 
         total += to_copy;
@@ -3651,12 +3789,15 @@ fn flushSendBuffer(tcb: *TcpTcb) void {
             }
         }
 
+        // Urgent mode sends at once, past cork and Nagle (tcp_nagle_test: tcp_urg_mode).
+        const urgent = tcb.urg_send and tcp_util.seqLt(tcb.snd_una, tcb.snd_up);
+
         // TCP_CORK: only send full MSS segments (coalesce small writes)
-        if (tcb.options.tcp_cork and can_send < seg_cap) break;
+        if (!urgent and tcb.options.tcp_cork and can_send < seg_cap) break;
 
         // Nagle algorithm: if TCP_NODELAY is disabled and there is unacknowledged
         // data in flight, only send a full MSS segment (coalesce small writes).
-        if (!tcb.options.tcp_nodelay and !tcb.options.tcp_cork and in_flight > 0 and can_send < seg_cap) {
+        if (!urgent and !tcb.options.tcp_nodelay and !tcb.options.tcp_cork and in_flight > 0 and can_send < seg_cap) {
             tcb.nagle_pending = true;
             break;
         }
@@ -3838,8 +3979,10 @@ pub fn tcpPeek(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
     const available = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
     const decision = tcp_recv_policy.decide(tcb.state, available, tcb.reset_by_peer);
     if (decision != .read_data) return reportRecvResult(tcb, decision);
-    const to_read = @min(available, len);
-    ringRead(&tcb.recv_buf, RECV_BUF_SIZE, tcb.recv_head, buf, to_read);
+    const lim = urgReadLimit(tcb, available, false);
+    if (lim.avail == 0) return reportRecvResult(tcb, tcp_recv_policy.decide(tcb.state, 0, tcb.reset_by_peer));
+    const to_read = @min(lim.avail, len);
+    ringRead(&tcb.recv_buf, RECV_BUF_SIZE, (tcb.recv_head + lim.skip) % RECV_BUF_SIZE, buf, to_read);
     return @intCast(to_read);
 }
 
@@ -3876,8 +4019,7 @@ pub fn tcpWaitReadable(tcb_idx: u32) i64 {
             const tcb = &tcbs[tcb_idx];
             if (!tcb.active) return -9;
             if (tcp_recv_policy.shutRdEof(tcb.shut_rd)) return 0;
-            const available = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
-            const decision = tcp_recv_policy.decide(tcb.state, available, tcb.reset_by_peer);
+            const decision = tcp_recv_policy.decide(tcb.state, readableLocked(tcb), tcb.reset_by_peer);
             if (decision != .would_block) return 0;
         }
         _ = lo_dev.drain();
@@ -3914,8 +4056,7 @@ fn tcpRecvBlockingWait(tcb_idx: u32, buf: [*]u8, len: u32, nonblock: bool) i64 {
             }
 
             if (tcp_recv_policy.shutRdEof(tcb.shut_rd)) return 0;
-            const available = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
-            const decision = tcp_recv_policy.decide(tcb.state, available, tcb.reset_by_peer);
+            const decision = tcp_recv_policy.decide(tcb.state, readableLocked(tcb), tcb.reset_by_peer);
             if (!tcp_recv_policy.shouldBlock(decision, nonblock, tcp_recv_policy.timedOut(deadline, tsc.nanos())))
                 return recvLocked(tcb, buf, len);
 
@@ -4059,6 +4200,15 @@ fn sendFailure(tcb_idx: u32, raw: i64) i64 {
 /// reports the bytes queued; EAGAIN only when nothing was. `is_user` says
 /// whether `addr` is a user address (copied in stages) or a kernel pointer.
 pub fn tcpSendBlocking(tcb_idx: u32, addr: u64, is_user: bool, len: u32, nonblock: bool) i64 {
+    return sendBlocking(tcb_idx, addr, is_user, len, nonblock, false);
+}
+
+/// send(MSG_OOB) of user data: as tcpSendBlocking, with the last byte written marked urgent.
+pub fn tcpSendOobBlocking(tcb_idx: u32, addr: u64, len: u32, nonblock: bool) i64 {
+    return sendBlocking(tcb_idx, addr, true, len, nonblock, true);
+}
+
+fn sendBlocking(tcb_idx: u32, addr: u64, is_user: bool, len: u32, nonblock: bool, oob: bool) i64 {
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const np = @import("../fs/namespace_policy.zig");
     var st: SendWait = .{};
@@ -4066,7 +4216,7 @@ pub fn tcpSendBlocking(tcb_idx: u32, addr: u64, is_user: bool, len: u32, nonbloc
     while (true) {
         const rest = len - done;
         const r = if (is_user)
-            tcpSendFromUser(tcb_idx, addr + done, rest)
+            sendFromUser(tcb_idx, addr + done, rest, oob)
         else
             tcpSendKernel(tcb_idx, @ptrFromInt(addr + done), rest);
         const result: i64 = if (r == 0) -11 else r;
@@ -4130,9 +4280,13 @@ fn recvLocked(tcb: *TcpTcb, buf: [*]u8, len: u32) i64 {
         return reportRecvResult(tcb, decision);
     }
 
-    const to_read = @min(available, len);
+    // The urgent byte at the mark is stepped over (not inline); a read ends in front of the next mark.
+    const lim = urgReadLimit(tcb, available, true);
+    if (lim.avail == 0) return reportRecvResult(tcb, tcp_recv_policy.decide(tcb.state, 0, tcb.reset_by_peer));
+    const to_read = @min(lim.avail, len);
     ringRead(&tcb.recv_buf, RECV_BUF_SIZE, tcb.recv_head, buf, to_read);
     tcb.recv_head = (tcb.recv_head + to_read) % RECV_BUF_SIZE;
+    urgPassedCheck(tcb);
 
     tcb.rcv_wnd = tcp_util.rcvWindowFromBuffered(ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE), rcvWindowCap(tcb));
 
@@ -4897,7 +5051,8 @@ pub fn tcpRecvAvailable(tcb_idx: u32) u32 {
     if (tcb_idx >= MAX_CONNECTIONS) return 0;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return 0;
-    return ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
+    // tcp_inq: up to the mark while it lies ahead (not inline).
+    return tcp_urg_policy.inq(tcb.urg_state, tcb.urg_seq, copiedSeq(tcb), ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE), oobInline(tcb));
 }
 
 /// Payload the send ring may hold: SO_SNDBUF (when set) bounds it.
@@ -5019,7 +5174,8 @@ pub fn tcpReadiness(tcb_idx: u32) u32 {
     return ready.events(.{
         .active = tcb.active,
         .state = tcb.state,
-        .recv_bytes = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE),
+        .recv_bytes = readableLocked(tcb),
+        .urgent = tcb.urg_state == .valid,
         .send_space = if (!tcp_recv_policy.notsentWritable(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat)) 0 else tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb)),
         .reset_by_peer = tcb.reset_by_peer,
         .shut_rd = tcb.shut_rd,

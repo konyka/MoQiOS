@@ -914,9 +914,12 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
 
     if (fd >= vfs_mod.MAX_FDS) return -9; // EBADF
 
+    // UDP, ping and raw sockets have no urgent data (udp_sendmsg / raw_sendmsg: EOPNOTSUPP).
+    if (flags & urg.MSG_OOB != 0 and (t.fd_table.fds[fd].fd_type == .udp_socket or t.fd_table.fds[fd].fd_type == .raw_socket)) return -95;
     if (t.fd_table.fds[fd].fd_type == .tcp_socket) {
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         const tcb_idx = t.fd_table.fds[fd].tcb_idx;
+        if (flags & urg.MSG_OOB != 0) return @import("../fs/namespace_policy.zig").sendResult(net_mod.tcp.tcpSendOobBlocking(tcb_idx, buf, len, net_mod.tcp_recv_policy.nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), flags)), flags);
         return @import("../fs/namespace_policy.zig").sendResult(net_mod.tcp.tcpSendBlocking(tcb_idx, buf, true, len, net_mod.tcp_recv_policy.nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), flags)), flags);
     } else if (t.fd_table.fds[fd].fd_type == .udp_socket and t.fd_table.fds[fd].udp_ping) {
         if (buf >= 0x0000_8000_0000_0000) return -14;
@@ -1157,6 +1160,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         }
         return result;
     } else if (t.fd_table.fds[fd].fd_type == .tcp_socket) {
+        if (flags & urg.MSG_OOB != 0) return tcpRecvOobTo(t.fd_table.fds[fd].tcb_idx, buf, len, flags);
         if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
         var tmp_buf: [4096]u8 = undefined;
         const to_read = @min(len, 4096);
@@ -2117,6 +2121,7 @@ pub fn sendmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
         if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;
         return @import("../fs/namespace_policy.zig").sendResult(unixSendmsg(cur, fd, &hdr), flags);
     }
+    if (fd < vfs_mod.MAX_FDS and flags & urg.MSG_OOB != 0 and (cur.fd_table.fds[fd].fd_type == .udp_socket or cur.fd_table.fds[fd].fd_type == .raw_socket)) return -95;
     if (fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .udp_socket) {
         var hdr: [56]u8 = undefined;
         if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;
@@ -2153,7 +2158,10 @@ pub fn sendmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
         if (iov_base == 0 or iov_base >= 0x0000_8000_0000_0000 or iov_sz == 0) continue;
 
         const to_send: u32 = @intCast(@min(iov_sz, @as(u64, 0xffff_ffff)));
-        const result = net_mod.tcp.tcpSendBlocking(tcb_idx, iov_base, true, to_send, net_mod.tcp_recv_policy.nonblockRequested(vfs_mod.statusFlagsOf(&cur.fd_table.fds[fd]), flags));
+        const nb = net_mod.tcp_recv_policy.nonblockRequested(vfs_mod.statusFlagsOf(&cur.fd_table.fds[fd]), flags);
+        // MSG_OOB marks the last byte of the whole message: every segment but the final one goes out as plain data.
+        const last = i + 1 == @as(usize, @intCast(iov_len));
+        const result = if (flags & urg.MSG_OOB != 0 and last) net_mod.tcp.tcpSendOobBlocking(tcb_idx, iov_base, to_send, nb) else net_mod.tcp.tcpSendBlocking(tcb_idx, iov_base, true, to_send, nb);
         if (result <= 0) {
             if (total == 0) return @import("../fs/namespace_policy.zig").sendResult(result, flags);
             break;
@@ -2187,9 +2195,10 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
         return rawRecvmsg(&cur.fd_table.fds[fd], msg_ptr, &hdr, flags);
     }
     const rf_tcp = @import("recv_flags_policy.zig");
-    // Supported TCP recvmsg flags: MSG_PEEK, MSG_DONTWAIT, MSG_WAITALL.
-    if (flags & ~(rf_tcp.MSG_PEEK | net_mod.tcp_recv_policy.MSG_DONTWAIT | rf_tcp.MSG_WAITALL) != 0) return -22;
+    // Supported TCP recvmsg flags: MSG_OOB, MSG_PEEK, MSG_DONTWAIT, MSG_WAITALL.
+    if (flags & ~(urg.MSG_OOB | rf_tcp.MSG_PEEK | net_mod.tcp_recv_policy.MSG_DONTWAIT | rf_tcp.MSG_WAITALL) != 0) return -22;
     if (fd >= vfs_mod.MAX_FDS or cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
+    if (flags & urg.MSG_OOB != 0) return tcpRecvmsgOob(cur.fd_table.fds[fd].tcb_idx, msg_ptr, flags);
 
     var msghdr_buf: [56]u8 = undefined;
     const hdr_copied = copy.copyFromUser(&msghdr_buf, @ptrFromInt(msg_ptr), 56);
@@ -2268,6 +2277,46 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
         off += n;
     }
     return @intCast(off);
+}
+
+const urg = @import("tcp_urg_policy.zig");
+
+/// recv(MSG_OOB) on TCP: the urgent byte into `buf` (a zero-length buffer still reports it, as Linux does with MSG_TRUNC set in
+/// msg_flags); never blocks.
+fn tcpRecvOobTo(tcb_idx: u32, buf: u64, len: u32, flags: u32) i64 {
+    const rf = @import("recv_flags_policy.zig");
+    if (len != 0 and (buf == 0 or buf >= 0x0000_8000_0000_0000)) return -14;
+    const r = net_mod.tcp.tcpRecvOob(tcb_idx, rf.peek(flags));
+    if (r < 0 or len == 0) return if (r < 0) r else 0;
+    const b: [1]u8 = .{@intCast(r)};
+    if (copy.copyToUser(@ptrFromInt(buf), &b, 1) != 1) return -14;
+    return 1;
+}
+
+/// recvmsg(MSG_OOB) on TCP: the urgent byte into the first non-empty iovec, MSG_OOB in msg_flags.
+fn tcpRecvmsgOob(tcb_idx: u32, msg_ptr: u64, flags: u32) i64 {
+    var hdr: [56]u8 = undefined;
+    if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;
+    const iov_ptr: u64 = bo.readU64At(&hdr, 16);
+    const iov_len: u64 = bo.readU64At(&hdr, 24);
+    if (iov_len > 1024) return -90; // EMSGSIZE (UIO_MAXIOV)
+    var base: u64 = 0;
+    var room: u32 = 0;
+    for (0..@as(usize, @intCast(iov_len))) |i| {
+        var iov: [16]u8 = undefined;
+        if (copy.copyFromUser(&iov, @ptrFromInt(iov_ptr + @as(u64, @intCast(i)) * 16), 16) != 16) return -14;
+        const sz = bo.readU64At(&iov, 8);
+        if (sz == 0) continue;
+        base = bo.readU64At(&iov, 0);
+        room = 1;
+        break;
+    }
+    const r = tcpRecvOobTo(tcb_idx, base, room, flags);
+    if (r < 0) return r;
+    var fl: [4]u8 = undefined;
+    bo.writeU32Le(&fl, urg.MSG_OOB | (if (room == 0) @as(u32, 0x20) else 0)); // MSG_TRUNC when there was no room
+    _ = copy.copyToUser(@ptrFromInt(msg_ptr + 48), &fl, 4);
+    return r;
 }
 
 /// socketpair(domain, type, protocol, sv_ptr) → 0 or -errno

@@ -949,6 +949,33 @@ pub fn tcpFasyncNotify(tcb_idx: u32, reason: i32) void {
     fasyncNotify(.tcp_socket, tcb_idx, reason);
 }
 
+/// Urgent data reached TCP connection `tcb_idx` (Linux sk_send_sigurg → send_sigurg): SIGURG for the owner F_SETOWN gave each open
+/// description of the socket, O_ASYNC or not, sent once per owner. Called with tcp_lock released.
+pub fn tcpSigurg(tcb_idx: u32) void {
+    const task_mod = @import("../proc/task.zig");
+    var owners: [8]Fown = undefined;
+    var n: usize = 0;
+    for (0..task_mod.MAX_TASKS) |i| {
+        const t = task_mod.getTask(@intCast(i)) orelse continue;
+        // The tables live in a static pool (freeFdTable only retires a slot), so an exiting task's table is still memory; it is
+        // skipped like a zombie's because its descriptors are going away.
+        if (t.state == .zombie or @atomicLoad(u32, &t.exiting, .acquire) != 0) continue;
+        for (&t.fd_table.fds) |*d| {
+            if (d.fd_type != .tcp_socket or d.tcb_idx != tcb_idx) continue;
+            const fo = fownOf(d);
+            if (fo.owner == 0) continue;
+            const seen = for (owners[0..n]) |o| {
+                if (o.owner == fo.owner) break true;
+            } else false;
+            if (seen or n == owners.len) continue;
+            owners[n] = fo;
+            n += 1;
+        }
+    }
+    const SIGURG: u32 = 23;
+    for (owners[0..n]) |fo| sendToOwner(fo, SIGURG, .{ .code = @import("../proc/siginfo_policy.zig").SI_KERNEL });
+}
+
 /// The console received input (a key or TIOCSTI): POLL_IN for every O_ASYNC description of /dev/tty. May run in the IRQ1 handler.
 pub fn ttyFasyncNotify() void {
     fasyncNotify(.tty, 0, @import("fcntl_policy.zig").POLL_IN);

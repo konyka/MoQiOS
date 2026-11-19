@@ -12624,13 +12624,13 @@ test "TCP raises EPOLLIN only for bytes that reached the receive ring" {
     // A retransmitted duplicate is ACKed but carries no new readiness; notifying for it re-armed an edge-triggered registration that had
     // already reported the data (hello237 B failed once in CI with counts 1,1,0,1).
     const src = kt.tcp_source;
-    try std.testing.expect(std.mem.indexOf(u8, src, "fn processIncomingData(tcb: *TcpTcb, data: [*]const u8, len: u32, seq: u32) u32 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "fn processIncomingData(tcb: *TcpTcb, hdr: [*]const u8, data: [*]const u8, len: u32, seq: u32) u32 {") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "    return to_copy;\n}") != null);
     var pos: usize = 0;
     var gated: usize = 0;
-    while (std.mem.indexOfPos(u8, src, pos, "if (processIncomingData(tcb, data + payload_offset, payload_len, seq_num) > 0)")) |at| : (pos = at + 1) gated += 1;
+    while (std.mem.indexOfPos(u8, src, pos, "if (processIncomingData(tcb, data, data + payload_offset, payload_len, seq_num) > 0)")) |at| : (pos = at + 1) gated += 1;
     try std.testing.expectEqual(@as(usize, 3), gated);
-    try std.testing.expect(std.mem.indexOf(u8, src, "                processIncomingData(tcb, data + payload_offset") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "                processIncomingData(tcb, data, data + payload_offset") == null);
 }
 
 test "directory listings: ext2 cursor math is block-relative and tmpfs lists dot entries past one batch" {
@@ -14291,7 +14291,7 @@ test "tcp: a send that finds the ring full sets async_nospace in the same tcp_lo
     try std.testing.expect(std.mem.indexOf(u8, ts,
         \\        tcb.send_tail = (tcb.send_tail + to_copy) % SEND_BUF_SIZE;
         \\        if (to_copy < chunk) tcb.async_nospace = true;
-        \\        tcp_lock.release(lock_flags);
+        \\        if (oob and to_copy > 0) {
     ) != null);
 }
 
@@ -16827,4 +16827,28 @@ test "signalfd: argument checks and the signalfd_siginfo layout (hello442)" {
     try std.testing.expectEqual(@as(u64, 5), std.mem.readInt(u64, q[48..56], .little));
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "    signalfd = 24,") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.signal_syscall_source, "eventfdCreate(0, false)") == null);
+}
+
+test "TCP urgent data: the mark, recv(MSG_OOB), POLLPRI and exceptfds (hello443)" {
+    // Linux tcp_check_urg / tcp_urg keep the urgent byte at urg_seq; tcp_recvmsg_locked stops in front of it and skips it,
+    // tcp_recv_urg returns it once, tcp_poll adds EPOLLPRI, select maps that to exceptfds. The kernel used to ignore MSG_OOB on
+    // send, write a zero urgent pointer and always clear exceptfds.
+    const u = kt.tcp_urg_policy;
+    try std.testing.expectEqual(@as(u32, 1002), u.pointerSeq(1000, 3));
+    try std.testing.expectEqual(u.Check.new_mark, u.check(1002, 1000, 1000, .none, 0, false));
+    try std.testing.expectEqual(u.Limit{ .skip = 0, .avail = 2 }, u.readLimit(.valid, 1002, 1000, 3, false));
+    try std.testing.expectEqual(u.Limit{ .skip = 1, .avail = 2 }, u.readLimit(.read, 1002, 1002, 3, false));
+    try std.testing.expectEqual(@as(u32, 2), u.inq(.valid, 1002, 1000, 5, false));
+    try std.testing.expectEqual(u.Oob{ .byte = 'c' }, u.recvOob(.valid, 'c', false, false, false));
+    try std.testing.expectEqual(u.Oob{ .err = -22 }, u.recvOob(.read, 'c', false, false, false));
+    try std.testing.expectEqual(@as(?u16, 3), u.sendPointer(true, 1000, 1003, 1000));
+    const rp = kt.tcp_ready_policy;
+    const ev = rp.events(.{ .active = true, .state = .established, .recv_bytes = 2, .send_space = 1, .reset_by_peer = false, .shut_rd = false, .fin_pending = false, .urgent = true });
+    try std.testing.expect(ev & rp.PRI != 0 and ev & rp.IN != 0);
+    try std.testing.expect(kt.poll_policy.selectExceptional(kt.poll_policy.POLLPRI));
+    try std.testing.expect(!kt.poll_policy.selectExceptional(kt.poll_policy.POLLIN));
+    try std.testing.expect(std.mem.indexOf(u8, kt.select_source, "&zero, SET_BYTES") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "pkt[tcp_off + 18] = 0;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.ioctl_source, "SIOCATMARK => {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "tcpSendOobBlocking(") != null);
 }

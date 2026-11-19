@@ -83,6 +83,7 @@ fn selectWait(nfds_raw: u64, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr:
         const seen = @import("poll_wake.zig").generation();
         var read_out: [SET_BYTES]u8 = @splat(0);
         var write_out: [SET_BYTES]u8 = @splat(0);
+        var except_out: [SET_BYTES]u8 = @splat(0);
         var total_ready: u64 = 0;
 
         for (0..nfds) |fd_i| {
@@ -103,14 +104,17 @@ fn selectWait(nfds_raw: u64, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr:
                 write_out[byte_idx] |= mask;
                 total_ready += 1;
             }
+            if (want_e and pp.selectExceptional(ev)) {
+                except_out[byte_idx] |= mask;
+                total_ready += 1;
+            }
         }
 
         const expired = if (deadline) |d| tsc.nanos() >= d else false;
         if (total_ready > 0 or poll_once or expired) {
-            const zero: [SET_BYTES]u8 = @splat(0);
             if (readfds_ptr != 0 and copy.copyToUser(@ptrFromInt(readfds_ptr), &read_out, SET_BYTES) != SET_BYTES) return -14;
             if (writefds_ptr != 0 and copy.copyToUser(@ptrFromInt(writefds_ptr), &write_out, SET_BYTES) != SET_BYTES) return -14;
-            if (exceptfds_ptr != 0 and copy.copyToUser(@ptrFromInt(exceptfds_ptr), &zero, SET_BYTES) != SET_BYTES) return -14;
+            if (exceptfds_ptr != 0 and copy.copyToUser(@ptrFromInt(exceptfds_ptr), &except_out, SET_BYTES) != SET_BYTES) return -14;
             return @intCast(total_ready);
         }
 

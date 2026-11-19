@@ -5,6 +5,8 @@
 const rp = @import("tcp_recv_policy.zig");
 
 pub const IN: u32 = 0x001;
+/// Urgent data waits for recv(MSG_OOB) (tcp_poll: urg_data & TCP_URG_VALID).
+pub const PRI: u32 = 0x002;
 pub const OUT: u32 = 0x004;
 pub const ERR: u32 = 0x008;
 pub const HUP: u32 = 0x010;
@@ -23,6 +25,8 @@ pub const Snapshot = struct {
     fin_pending: bool,
     /// Pending socket error (a refused or timed-out connect): reported as ERR.
     so_error: i32 = 0,
+    /// An urgent byte has arrived and was not read with MSG_OOB (SO_OOBINLINE too): reported as PRI.
+    urgent: bool = false,
 };
 
 /// Linux tcp_poll semantics:
@@ -58,5 +62,6 @@ pub fn events(s: Snapshot) u32 {
         ev |= OUT;
     }
     if (s.state == .closed or (read_done and we_fin)) ev |= HUP;
+    if (s.urgent) ev |= PRI;
     return ev;
 }
