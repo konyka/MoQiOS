@@ -126,7 +126,24 @@ pub fn handlePacketMeta(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: 
         if (unreach.parseTcpQuote6(data[0..len])) |tq| @import("tcp.zig").icmpError6(tq, unreach.tcpErrno6(icmp_type, icmp_code), unreach.tcpReqAborts6(icmp_type, icmp_code));
         const q = unreach.parseErrorQuote6(data[0..len]) orelse return;
         switch (q.kind) {
-            .udp => @import("udp.zig").notifyError6(q.src_port, q.dst_port, q.dst, unreach.errnoFor6(icmp_type, icmp_code, false)),
+            // __udp6_lib_err: soft errors too, for a socket with IPV6_RECVERR (it queues them with the quoted payload).
+            .udp => {
+                const e = unreach.errorFor6(icmp_type, icmp_code) orelse return;
+                const inner = unreach.skipExtHdr6(data[8..len], 40, data[8 + 6]) orelse return;
+                const quoted = data[0..len][8 + inner.off + 8 ..];
+                @import("udp.zig").notifyIcmpError6(.{
+                    .errno = e.errno,
+                    .hard = e.hard,
+                    .icmp_type = icmp_type,
+                    .icmp_code = icmp_code,
+                    .info = if (icmp_type == PACKET_TOO_BIG) bo.readU32BeAt(data, 4) else 0,
+                    .offender = src_ip,
+                    .local_port = q.src_port,
+                    .peer_port = q.dst_port,
+                    .peer_ip = q.dst,
+                    .payload = quoted,
+                });
+            },
             .echo => @import("udp.zig").notifyPingError6(q.src_port, unreach.errnoFor6(icmp_type, icmp_code, true)),
         }
         return;

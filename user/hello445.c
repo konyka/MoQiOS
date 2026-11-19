@@ -10,7 +10,10 @@
  *   C. recvmsg(MSG_ERRQUEUE) -> 5 "hello", msg_namelen 16 (2, port 47451, 127.0.0.1), flags MSG_ERRQUEUE (0x2000), controllen 48,
  *      SOL_IP/11 len 48: errno 111, origin 2, type 3, code 3, offender family 2 127.0.0.1; then poll 0 and the queue is empty;
  *   D. a socket without IP_RECVERR, not connected: no POLLERR, the queue is empty;
- *   E. a 2-byte buffer and a 20-byte control buffer: 2, flags MSG_ERRQUEUE|MSG_TRUNC|MSG_CTRUNC (0x2028), controllen 20. */
+ *   E. a 2-byte buffer and a 20-byte control buffer: 2, flags MSG_ERRQUEUE|MSG_TRUNC|MSG_CTRUNC (0x2028), controllen 20;
+ *   F. IPv6 (IPV6_RECVERR, SOL_IPV6 25) to [::1]:47452: reads back 1; send -> 5, POLLERR, SO_ERROR 111; the error queue gives 5
+ *      "hello", msg_namelen 28 (10, port 47452, ::1), flags 0x2000, controllen 64, SOL_IPV6/25 len 60: errno 111, origin 3 (ICMP6),
+ *      type 1, code 4, offender family 10 ::1. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -131,6 +134,35 @@ int main(void) {
     long e4 = errq(s, 2, 20);
     snprintf(msg, sizeof msg, "E: small: %ld, flags 0x%x, controllen %lu (2, 0x2028, 20)", e4, m.flags, m.controllen);
     check(e4 == 2 && m.flags == 0x2028 && m.controllen == 20, msg);
+
+    unsigned char a6[28];
+    memset(a6, 0, 28);
+    a6[0] = 10;
+    a6[2] = 47452 >> 8;
+    a6[3] = 47452 & 0xff;
+    a6[23] = 1;
+    long s6 = sock(10, 2, 0);
+    long o6 = setopt(s6, 41, 25, &one, 4);
+    v = -1;
+    l = 4;
+    getopt_(s6, 41, 25, &v, &l);
+    long r6 = sendto_(s6, "hello", 5, a6, 28);
+    pause_ms(50);
+    long ev6 = poll1(s6);
+    se = -1;
+    l = 4;
+    getopt_(s6, 1, 4, &se, &l);
+    long e6 = errq(s6, sizeof buf, sizeof ctl);
+    int port6 = (name[2] << 8) | name[3];
+    snprintf(msg, sizeof msg, "F: set %ld get %d, send %ld, poll 0x%lx, SO_ERROR %d, errqueue %ld hello %d, namelen %u family %d port %d last %d, flags 0x%x, "
+             "controllen %lu, [%ld %d/%d] errno %d origin %d type %d code %d offender %d last %d "
+             "(0 1, 5, 0x8, 111, 5 1, 28 10 47452 1, 0x2000, 64, [60 41/25] 111 3 1 4 10 1)",
+             o6, v, r6, ev6, se, e6, memcmp(buf, "hello", 5) == 0, m.namelen, name[0], port6, name[23], m.flags, m.controllen, rd64(ctl), rd32(ctl + 8),
+             rd32(ctl + 12), rd32(ctl + 16), ctl[20], ctl[21], ctl[22], ctl[32], ctl[32 + 23]);
+    check(o6 == 0 && v == 1 && r6 == 5 && ev6 == 8 && se == 111 && e6 == 5 && memcmp(buf, "hello", 5) == 0 && m.namelen == 28 && name[0] == 10 &&
+              port6 == 47452 && name[23] == 1 && m.flags == 0x2000 && m.controllen == 64 && rd64(ctl) == 60 && rd32(ctl + 8) == 41 &&
+              rd32(ctl + 12) == 25 && rd32(ctl + 16) == 111 && ctl[20] == 3 && ctl[21] == 1 && ctl[22] == 4 && ctl[32] == 10 && ctl[32 + 23] == 1,
+          msg);
 
     print(failures ? "hello445: FAIL\n" : "hello445: PASS\n");
     return failures ? 1 : 0;

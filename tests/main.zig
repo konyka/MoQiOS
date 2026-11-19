@@ -11400,7 +11400,7 @@ test "ICMPv6 port unreachable for UDP over ::1: quote parsing, reply rule and wi
     try std.testing.expect(std.mem.indexOf(u8, us, "eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + icmp_len);\n    _ = lo.sendPacket(&pkt, frame_len);") != null);
     const v6src = kt.icmpv6_source;
     try std.testing.expect(std.mem.indexOf(u8, v6src, "if (unreach.isError6(icmp_type)) {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, v6src, "@import(\"udp.zig\").notifyError6(q.src_port, q.dst_port, q.dst,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v6src, "@import(\"udp.zig\").notifyIcmpError6(.{") != null);
 }
 
 test "ioctl(TIOCOUTQ): socket send-queue reporting and its wiring" {
@@ -14872,17 +14872,19 @@ test "ICMPv6 errors wiring (hello392): every error type reaches connected IPv6 U
     const at = std.mem.indexOf(u8, vs, "if (unreach.isError6(icmp_type)) {") orelse return error.TestUnexpectedResult;
     const pt = std.mem.indexOfPos(u8, vs, at, "if (icmp_type == PACKET_TOO_BIG) handlePacketTooBig(data, len);") orelse return error.TestUnexpectedResult;
     const q = std.mem.indexOfPos(u8, vs, pt, "const q = unreach.parseErrorQuote6(data[0..len]) orelse return;") orelse return error.TestUnexpectedResult;
-    const ue = std.mem.indexOfPos(u8, vs, q, ".udp => @import(\"udp.zig\").notifyError6(q.src_port, q.dst_port, q.dst, unreach.errnoFor6(icmp_type, icmp_code, false)),") orelse return error.TestUnexpectedResult;
+    const ue = std.mem.indexOfPos(u8, vs, q, "@import(\"udp.zig\").notifyIcmpError6(.{") orelse return error.TestUnexpectedResult;
     _ = std.mem.indexOfPos(u8, vs, ue, ".echo => @import(\"udp.zig\").notifyPingError6(q.src_port, unreach.errnoFor6(icmp_type, icmp_code, true)),") orelse return error.TestUnexpectedResult;
     // The error branch runs before the type switch, which no longer handles Destination Unreachable or Packet Too Big itself.
     try std.testing.expect(at < std.mem.indexOf(u8, vs, "switch (icmp_type) {").?);
     try std.testing.expect(std.mem.indexOf(u8, vs, "notifyUnreachable(") == null);
     try std.testing.expect(std.mem.indexOf(u8, vs, "PACKET_TOO_BIG => handlePacketTooBig(data, len),") == null);
     const us = kt.udp_source;
-    const n6 = std.mem.indexOf(u8, us, "pub fn notifyError6(local_port: u16, peer_port: u16, peer_ip: [16]u8, err: i32) void {") orelse return error.TestUnexpectedResult;
-    _ = std.mem.indexOfPos(u8, us, n6, "if (err == 0) return;") orelse return error.TestUnexpectedResult;
+    const n6 = std.mem.indexOf(u8, us, "pub fn notifyIcmpError6(e: IcmpError6) void {") orelse return error.TestUnexpectedResult;
     _ = std.mem.indexOfPos(u8, us, n6, "if (port_ping[i] or !port_named[i] or !port_v6[i]) continue;") orelse return error.TestUnexpectedResult;
-    _ = std.mem.indexOfPos(u8, us, n6, "if (port_peer[i] != peer_port or !std.mem.eql(u8, &port_peer_ip[i], &peer_ip)) continue;") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, us, n6, "const connected = port_peer[i] == e.peer_port and std.mem.eql(u8, &port_peer_ip[i], &e.peer_ip);") orelse return error.TestUnexpectedResult;
+    // Without IPV6_RECVERR only a hard error on a socket connected to that peer is taken (errqueue_policy.route).
+    try std.testing.expect(!kt.errqueue_policy.route(false, false, true).set_err);
+    try std.testing.expect(!kt.errqueue_policy.route(false, true, false).set_err);
     const p6 = std.mem.indexOf(u8, us, "pub fn notifyPingError6(ident: u16, err: i32) void {") orelse return error.TestUnexpectedResult;
     _ = std.mem.indexOfPos(u8, us, p6, "if (!port_ping[i] or !port_v6[i] or portNumber(ports[i]) != ident or port_peer[i] == 0) continue;") orelse return error.TestUnexpectedResult;
     const ss = kt.socket_syscall_source;
@@ -16889,8 +16891,11 @@ test "IP_RECVERR: ICMP errors are queued for recvmsg(MSG_ERRQUEUE) (hello445)" {
     const eq = kt.errqueue_policy;
     try std.testing.expect(eq.route(true, false, false).queue and eq.route(true, false, false).set_err);
     try std.testing.expect(!eq.route(false, true, false).set_err);
-    const ext = eq.encodeExtErr(.{ .errno = 111, .icmp_type = 3, .icmp_code = 3, .offender = .{ 127, 0, 0, 1 } });
-    try std.testing.expectEqual(@as(u8, eq.SO_EE_ORIGIN_ICMP), ext[4]);
+    var off: [16]u8 = @splat(0);
+    off[0] = 127;
+    off[3] = 1;
+    const ext = eq.encodeExtErr(.{ .errno = 111, .icmp_type = 3, .icmp_code = 3, .offender = off });
+    try std.testing.expectEqual(@as(u8, eq.SO_EE_ORIGIN_ICMP), ext.bytes[4]);
     const ipo = kt.ip_opt_policy;
     const set = ipo.applySet(.{}, ipo.SOL_IP, ipo.IP_RECVERR, &.{ 1, 0, 0, 0 });
     try std.testing.expect(set == .ok and set.ok.recverr);
@@ -16900,7 +16905,7 @@ test "IP_RECVERR: ICMP errors are queued for recvmsg(MSG_ERRQUEUE) (hello445)" {
     try std.testing.expect(iu.errorFor(3, 3).?.hard);
     try std.testing.expect(iu.errorFor(4, 0) == null);
     var out: [64]u8 = undefined;
-    const b = kt.ip_cmsg_policy.buildRecvErr(ext, 256, &out);
+    const b = kt.ip_cmsg_policy.buildRecvErr(ext.bytes[0..ext.len], false, 256, &out);
     try std.testing.expectEqual(@as(usize, 48), b.written);
     try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "notifyIcmpError(.{") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.epoll_source, "udp_mod.hasQueuedError(") != null);

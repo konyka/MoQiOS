@@ -288,7 +288,9 @@ pub fn notifyIcmpError(e: IcmpError) void {
             if (port_peer[i] != 0 and !connected) continue;
             const r = errq.route(port_opts[i].ip.recverr, e.hard, connected);
             if (r.queue) {
-                var ent: errq.Entry = .{ .errno = e.errno, .icmp_type = e.icmp_type, .icmp_code = e.icmp_code, .info = e.info, .offender = e.offender, .dst = e.peer_ip, .dst_port = e.peer_port };
+                var ent: errq.Entry = .{ .errno = e.errno, .icmp_type = e.icmp_type, .icmp_code = e.icmp_code, .info = e.info, .dst_port = e.peer_port };
+                @memcpy(ent.offender[0..4], &e.offender);
+                @memcpy(ent.dst[0..4], &e.peer_ip);
                 const k = @min(e.payload.len, errq.PAYLOAD_MAX);
                 ent.len = @intCast(k);
                 @memcpy(ent.payload[0..k], e.payload[0..k]);
@@ -328,11 +330,24 @@ pub fn notifyPingError(ident: u16, err: i32) void {
     }
 }
 
-/// An ICMPv6 error (positive errno `err`, 0 for a soft one, which is dropped) quoted a datagram sent from `local_port` to
-/// [`peer_ip`]:`peer_port`: every IPv6 socket on that port connected to that peer takes it as its pending error (__udp6_lib_err
-/// sets sk_err only on a connected socket without IPV6_RECVERR, and the lookup matches the quoted destination).
-pub fn notifyError6(local_port: u16, peer_port: u16, peer_ip: [16]u8, err: i32) void {
-    if (err == 0) return;
+/// An ICMPv6 error about an IPv6 UDP datagram (__udp6_lib_err's inputs), as IcmpError with 16-byte addresses.
+pub const IcmpError6 = struct {
+    errno: i32,
+    hard: bool,
+    icmp_type: u8,
+    icmp_code: u8,
+    info: u32 = 0,
+    offender: [16]u8,
+    local_port: u16,
+    peer_port: u16,
+    peer_ip: [16]u8,
+    payload: []const u8,
+};
+
+/// An ICMPv6 error quoted a datagram sent from `e.local_port` to [`e.peer_ip`]:`e.peer_port`. As notifyIcmpError: a socket with
+/// IPV6_RECVERR on that port queues it (soft too, connected or not) and takes it as its pending error; one without takes only a hard
+/// error, and only when connected to that peer (__udp6_lib_err: the lookup matches the quoted destination).
+pub fn notifyIcmpError6(e: IcmpError6) void {
     var hits: [MAX_PORTS]u32 = undefined;
     var n: usize = 0;
     {
@@ -340,9 +355,19 @@ pub fn notifyError6(local_port: u16, peer_port: u16, peer_ip: [16]u8, err: i32) 
         defer udp_lock.release(saved);
         for (0..num_ports) |i| {
             if (port_ping[i] or !port_named[i] or !port_v6[i]) continue;
-            if (portNumber(ports[i]) != local_port) continue;
-            if (port_peer[i] != peer_port or !std.mem.eql(u8, &port_peer_ip[i], &peer_ip)) continue;
-            port_err[i] = err;
+            if (portNumber(ports[i]) != e.local_port) continue;
+            const connected = port_peer[i] == e.peer_port and std.mem.eql(u8, &port_peer_ip[i], &e.peer_ip);
+            if (port_peer[i] != 0 and !connected) continue;
+            const r = errq.route(port_opts[i].ip.recverr6, e.hard, connected);
+            if (r.queue) {
+                var ent: errq.Entry = .{ .errno = e.errno, .icmp_type = e.icmp_type, .icmp_code = e.icmp_code, .info = e.info, .offender = e.offender, .dst = e.peer_ip, .dst_port = e.peer_port, .v6 = true };
+                const k = @min(e.payload.len, errq.PAYLOAD_MAX);
+                ent.len = @intCast(k);
+                @memcpy(ent.payload[0..k], e.payload[0..k]);
+                if (!port_errq[i].push(ent)) continue;
+            }
+            if (!r.set_err) continue;
+            port_err[i] = e.errno;
             hits[n] = ports[i];
             n += 1;
         }
@@ -1144,9 +1169,10 @@ pub fn handlePacketV6Meta(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len
 /// ICMPv6 port unreachable (type 1 code 4) for a ::1 datagram nobody receives:
 /// carries the offending IPv6 header and the first 8 bytes of the UDP header.
 fn sendPortUnreachableV6(src_ip: [16]u8, dst_ip: [16]u8, udp: [*]const u8, udp_len: u16) void {
-    var pkt: [160]u8 = @splat(0);
+    // icmp6_send quotes as much as fits in the minimum MTU; 64 bytes of payload here (what the error queue keeps).
+    var pkt: [14 + 40 + 8 + 40 + 8 + 64]u8 = @splat(0);
     const icmp_off: u16 = 14 + ipv6.HEADER_LEN;
-    const quote_udp: u16 = @min(udp_len, 8);
+    const quote_udp: u16 = @min(udp_len, 8 + 64);
     // ICMPv6: type, code, checksum, 4 unused bytes, then the invoking packet.
     pkt[icmp_off] = 1;
     pkt[icmp_off + 1] = 4;

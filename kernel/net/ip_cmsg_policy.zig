@@ -168,12 +168,15 @@ pub fn build6(w: Wanted, info: RecvInfo6, cap_in: usize, out: []u8) Built {
     return .{ .written = used, .truncated = truncated };
 }
 
-/// ip_recv_error's one control message: SOL_IP / IP_RECVERR with struct sock_extended_err and the offender (errqueue_policy).
-pub fn buildRecvErr(ext: [32]u8, cap_in: usize, out: []u8) Built {
+/// ip_recv_error's one control message: SOL_IP / IP_RECVERR with struct sock_extended_err and the offender (errqueue_policy); for
+/// IPv6 (ipv6_recv_error) SOL_IPV6 / IPV6_RECVERR.
+pub fn buildRecvErr(ext: []const u8, v6: bool, cap_in: usize, out: []u8) Built {
     const cap = @min(cap_in, out.len);
     var used: usize = 0;
     var truncated = false;
-    put(out, &used, cap, @intCast(ipo.SOL_IP), @intCast(ipo.IP_RECVERR), &ext, &truncated);
+    if (v6) {
+        put(out, &used, cap, @intCast(ipo.SOL_IPV6), @intCast(ipo.IPV6_RECVERR), ext, &truncated);
+    } else put(out, &used, cap, @intCast(ipo.SOL_IP), @intCast(ipo.IP_RECVERR), ext, &truncated);
     return .{ .written = used, .truncated = truncated };
 }
 

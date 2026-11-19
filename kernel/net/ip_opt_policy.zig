@@ -22,6 +22,8 @@ pub const IP_RECVERR: u64 = 11;
 pub const IP_RECVORIGDSTADDR: u64 = 20;
 /// The same for IPv6: IPV6_ORIGDSTADDR with a struct sockaddr_in6.
 pub const IPV6_RECVORIGDSTADDR: u64 = 74;
+/// ICMPv6 errors about what the socket sent are queued for recvmsg(MSG_ERRQUEUE) (Linux np->recverr).
+pub const IPV6_RECVERR: u64 = 25;
 pub const PMTUDISC_DONT: u8 = 0;
 pub const PMTUDISC_WANT: u8 = 1;
 pub const PMTUDISC_DO: u8 = 2;
@@ -89,6 +91,7 @@ pub const IpOpts = struct {
     recvhops6: bool = false,
     recvtclass6: bool = false,
     origdst6: bool = false,
+    recverr6: bool = false,
 };
 
 pub const Family = enum { v4, v6 };
@@ -203,12 +206,13 @@ pub fn applySet(cur: IpOpts, level: u64, optname: u64, val: []const u8) SetResul
                 o.mc_all = v != 0;
             },
             // do_ipv6_setsockopt: the boolean options need a full int.
-            IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVTCLASS, IPV6_RECVORIGDSTADDR => {
+            IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVTCLASS, IPV6_RECVORIGDSTADDR, IPV6_RECVERR => {
                 if (val.len < 4) return .{ .err = -22 };
                 switch (optname) {
                     IPV6_RECVPKTINFO => o.pktinfo6 = v != 0,
                     IPV6_RECVHOPLIMIT => o.recvhops6 = v != 0,
                     IPV6_RECVORIGDSTADDR => o.origdst6 = v != 0,
+                    IPV6_RECVERR => o.recverr6 = v != 0,
                     else => o.recvtclass6 = v != 0,
                 }
             },
@@ -307,6 +311,7 @@ pub fn getValue(o: IpOpts, level: u64, optname: u64) ?i32 {
             IPV6_RECVHOPLIMIT => @intFromBool(o.recvhops6),
             IPV6_RECVTCLASS => @intFromBool(o.recvtclass6),
             IPV6_RECVORIGDSTADDR => @intFromBool(o.origdst6),
+            IPV6_RECVERR => @intFromBool(o.recverr6),
             else => null,
         },
         else => null,

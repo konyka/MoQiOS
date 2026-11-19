@@ -2014,12 +2014,12 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
 
 const errq = @import("errqueue_policy.zig");
 
-/// recvmsg(MSG_ERRQUEUE) on a UDP socket (ip_recv_error): the oldest queued ICMP error, never blocking (EAGAIN when there is none).
+/// recvmsg(MSG_ERRQUEUE) on a UDP socket (ip_recv_error / ipv6_recv_error): the oldest queued ICMP or ICMPv6 error, never blocking (EAGAIN when there is none).
 /// The quoted payload goes to the iovecs (MSG_TRUNC when cut), msg_name is the datagram's destination, the control message
-/// IP_RECVERR carries struct sock_extended_err and the ICMP sender, and msg_flags has MSG_ERRQUEUE.
+/// IP_RECVERR (IPV6_RECVERR at SOL_IPV6) carries struct sock_extended_err and the ICMP sender, and msg_flags has MSG_ERRQUEUE.
 fn udpRecvErrqueue(key: u32, is_v6: bool, msg_ptr: u64, msghdr: *const [56]u8) i64 {
-    if (is_v6) return -11; // IPV6_RECVERR is not queued here
     const e = udp.takeQueuedError(key) orelse return -11;
+    _ = is_v6;
     const name_ptr: u64 = bo.readU64At(msghdr, 0);
     const name_len: u32 = bo.readU32Le(msghdr[8..12]);
     const iov_ptr: u64 = bo.readU64At(msghdr, 16);
@@ -2039,8 +2039,8 @@ fn udpRecvErrqueue(key: u32, is_v6: bool, msg_ptr: u64, msghdr: *const [56]u8) i
         done += sz;
     }
     if (name_ptr != 0 and name_ptr < 0x0000_8000_0000_0000) {
-        var out: [16]u8 = undefined;
-        const alen = sa.writeInet4(&out, e.dst_port, e.dst);
+        var out: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
+        const alen: u32 = if (e.v6) sa.writeInet6(&out, e.dst_port, e.dst, 0) else sa.writeInet4(&out, e.dst_port, e.dst[0..4].*);
         const n = @min(name_len, alen);
         if (n != 0 and copy.copyToUser(@ptrFromInt(name_ptr), out[0..n], n) != n) return -14;
         var al: [4]u8 = undefined;
@@ -2050,7 +2050,8 @@ fn udpRecvErrqueue(key: u32, is_v6: bool, msg_ptr: u64, msghdr: *const [56]u8) i
     const ctl_ptr: u64 = bo.readU64At(msghdr, 32);
     const ctl_cap: usize = if (ctl_ptr == 0) 0 else @intCast(@min(bo.readU64At(msghdr, 40), 1 << 20));
     var ctl_buf: [64]u8 = undefined;
-    const cm = ip_cmsg_policy.buildRecvErr(errq.encodeExtErr(e), ctl_cap, &ctl_buf);
+    const ext = errq.encodeExtErr(e);
+    const cm = ip_cmsg_policy.buildRecvErr(ext.bytes[0..ext.len], e.v6, ctl_cap, &ctl_buf);
     if (cm.written != 0) {
         if (ctl_ptr >= 0x0000_8000_0000_0000) return -14;
         if (copy.copyToUser(@ptrFromInt(ctl_ptr), ctl_buf[0..cm.written], cm.written) != cm.written) return -14;

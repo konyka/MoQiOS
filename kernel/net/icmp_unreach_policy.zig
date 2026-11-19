@@ -172,6 +172,18 @@ const unreach6_errno = [7]struct { errno: i32, hard: bool }{
 /// The errno a connected IPv6 UDP (`ping` false) or ping socket without IPV6_RECVERR takes from an ICMPv6 error, 0 when it takes
 /// none: only hard errors are reported. Packet too big is EMSGSIZE and hard for a UDP socket doing path MTU discovery (the
 /// default), soft for a ping socket; time exceeded and error types Linux does not know are soft; parameter problem is EPROTO.
+/// The errno an ICMPv6 error gives an IPv6 UDP socket and whether it is hard (__udp6_lib_err via icmpv6_err_convert), null when it is
+/// none of the errors Linux converts. Soft ones only reach a socket with IPV6_RECVERR.
+pub fn errorFor6(icmp_type: u8, code: u8) ?struct { errno: i32, hard: bool } {
+    return switch (icmp_type) {
+        1 => if (code < unreach6_errno.len) .{ .errno = unreach6_errno[code].errno, .hard = unreach6_errno[code].hard } else .{ .errno = 71, .hard = true },
+        2 => .{ .errno = 90, .hard = true },
+        3 => .{ .errno = 113, .hard = false },
+        4 => .{ .errno = 71, .hard = true },
+        else => null,
+    };
+}
+
 pub fn errnoFor6(icmp_type: u8, code: u8, ping: bool) i32 {
     return switch (icmp_type) {
         1 => if (code < unreach6_errno.len) (if (unreach6_errno[code].hard) unreach6_errno[code].errno else 0) else 71,
