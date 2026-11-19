@@ -11553,7 +11553,7 @@ test "TCP buffer limits: SO_SNDBUF / SO_RCVBUF bound the rings only when set" {
     // The send paths and the writer's wait share sendRoom (hello416 adds TCP_NOTSENT_LOWAT there), which bounds the ring by sendLimit.
     try std.testing.expect(std.mem.indexOf(u8, src, "return tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb));") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "const to_copy = @min(chunk, sendRoom(tcb));") != null);
-    try std.testing.expect(std.mem.indexOf(u8, src, "if (sendRoom(tcb) > 0) return 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (sendRoom(tcb) > 0 or tcp_recv_policy.liveErrorPending(tcb.state, tcb.options.so_error)) return 0;") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, " else tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb)),") != null);
     // two window recomputations (data arrival, recv) plus the new acceptance bound in processIncomingData
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, src, "RECV_BUF_SIZE), rcvWindowCap(tcb));"));
@@ -15467,7 +15467,7 @@ test "ICMP errors for TCP (hello406): errno, the sequence window, hard in SYN_SE
     try std.testing.expectEqual(@as(u32, 7), q6.seq);
     try std.testing.expectEqual(@as(u8, 1), q6.dst[15]);
     const ts = kt.tcp_source;
-    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!up.tcpSeqOk(seq, tcb.snd_una, tcb.snd_nxt)) return;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!up.tcpSeqOk(seq, tcb.snd_una, tcb.snd_nxt)) return false;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.options.so_error != 0) return tcb.options.so_error;\n    if (tcb.reset_by_peer) return ECONNRESET;\n    if (tcb.fin_reset_err != 0) return tcb.fin_reset_err;\n    return tcb.soft_err;") != null);
     const ic = kt.icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, ic, "if (unreach.parseTcpQuote(data[0..len])) |tq| @import(\"tcp.zig\").icmpError(tq, unreach.tcpErrno(icmp_type, icmp_code), unreach.tcpReqAborts(icmp_type, icmp_code));") != null);
@@ -17032,4 +17032,38 @@ test "IPv6 UDP: IPV6_MTU_DISCOVER, 1452-byte datagrams and a local IPV6_RECVERR 
     try std.testing.expectEqual(@as(usize, 44), b.len);
     try std.testing.expectEqual(@as(u8, eq.SO_EE_ORIGIN_LOCAL), b.bytes[4]);
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "const MAX_UDP_PAYLOAD_V6 = 1452;") != null);
+}
+
+test "raw sockets hear ICMP errors about what they sent: raw_err's conversion, IP_RECVERR queue, pending error (hello390 X)" {
+    const iu = kt.icmp_unreach_policy;
+    try std.testing.expect(iu.rawErrorFor(4, 0, false) == null);
+    try std.testing.expect(iu.rawErrorFor(5, 0, false) == null);
+    try std.testing.expectEqual(@as(i32, 71), iu.rawErrorFor(12, 0, false).?.errno);
+    try std.testing.expect(iu.rawErrorFor(12, 0, false).?.hard);
+    try std.testing.expectEqual(@as(i32, 113), iu.rawErrorFor(3, 1, false).?.errno);
+    try std.testing.expect(!iu.rawErrorFor(3, 1, false).?.hard);
+    try std.testing.expectEqual(@as(i32, 92), iu.rawErrorFor(3, 2, false).?.errno);
+    try std.testing.expect(iu.rawErrorFor(3, 3, false).?.hard);
+    try std.testing.expectEqual(@as(i32, 90), iu.rawErrorFor(3, 4, false).?.errno);
+    try std.testing.expect(iu.rawErrorFor(3, 4, false).?.hard);
+    try std.testing.expect(!iu.rawErrorFor(3, 4, true).?.hard);
+    try std.testing.expect(!iu.rawErrorFor(3, 16, false).?.hard);
+    try std.testing.expectEqual(@as(i32, 113), iu.rawErrorFor(11, 0, false).?.errno);
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "@import(\"raw_icmp.zig\").notifyIcmpError(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.raw_icmp_source, "pub fn takeQueuedError(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "@import(\"raw_icmp.zig\").takeQueuedError(d.raw_idx)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "raw.takeError(d.raw_idx, true)") != null);
+}
+
+test "an established TCP connection with IP_RECVERR takes an ICMP error as its pending error (hello406 R)" {
+    const iu = kt.icmp_unreach_policy;
+    try std.testing.expect(iu.tcpSoftIsHard(true));
+    try std.testing.expect(!iu.tcpSoftIsHard(false));
+    const rp = kt.tcp_recv_policy;
+    try std.testing.expect(rp.liveErrorPending(.established, 113));
+    try std.testing.expect(!rp.liveErrorPending(.established, 0));
+    try std.testing.expect(!rp.liveErrorPending(.closed, 113));
+    try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "if (takeLiveError(tcb)) |e| return e;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "up.tcpSoftIsHard(tcb.options.ip.recverr or tcb.options.ip.recverr6)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "cur.fd_table.fds[fd].fd_type == .tcp_socket) return -11;") != null);
 }

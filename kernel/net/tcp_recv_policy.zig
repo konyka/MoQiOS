@@ -55,6 +55,13 @@ pub fn decide(state: TcpState, available: u32, reset_by_peer: bool) RecvDecision
     };
 }
 
+/// A connection that is still open has a pending error (only an ICMP error an IP_RECVERR socket took as sk_err leaves one): an empty
+/// recv and a send report it once instead of waiting or queueing. A closed connection's error goes through the EOF / send-failure
+/// paths.
+pub fn liveErrorPending(state: TcpState, so_error: i32) bool {
+    return so_error != 0 and state != .closed;
+}
+
 /// fd status flag (fcntl F_SETFL / SOCK_NONBLOCK / FIONBIO).
 pub const O_NONBLOCK: u32 = 0x800;
 /// Per-call recv flag: this one call does not wait.

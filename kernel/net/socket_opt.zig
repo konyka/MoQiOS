@@ -901,6 +901,7 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
     var facts: sp.Facts = .{ .id = sp.identity(.raw, v6) };
     var tcp_idx: ?u32 = null;
     var udp_clear: ?u32 = null;
+    var raw_clear: ?u32 = null;
     switch (ref) {
         .tcp => |idx| {
             const tcp_mod = @import("tcp.zig");
@@ -923,6 +924,8 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
         .raw => |idx| {
             stored = @import("raw_icmp.zig").getOpts(idx) orelse return -9;
             facts.id.protocol = @import("raw_icmp.zig").protocolOf(idx);
+            facts.so_error = @import("raw_icmp.zig").takeError(idx, false);
+            raw_clear = idx;
         },
     }
 
@@ -936,6 +939,7 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
     if (optname == SO_ERROR) {
         if (tcp_idx) |idx| @import("tcp.zig").tcpClearSoErrorIfEqual(idx, facts.so_error);
         if (udp_clear) |p| @import("udp.zig").clearPendingErrorIfEqual(p, facts.so_error);
+        if (raw_clear) |r| @import("raw_icmp.zig").clearErrorIfEqual(r, facts.so_error);
     }
     return 0;
 }

@@ -65,6 +65,9 @@ const Socket = struct {
     queue: [QUEUE_DEPTH]Entry = @splat(.{}),
     head: u8 = 0,
     count: u8 = 0,
+    /// The pending error (sk_err) an ICMP error left, reported once by SO_ERROR, the next recv or send; and the IP_RECVERR queue.
+    err: i32 = 0,
+    errq: @import("errqueue_policy.zig").Queue = .{},
 };
 
 var sockets: [MAX_SOCKETS]Socket = @splat(.{});
@@ -284,7 +287,76 @@ pub fn pollEvents(idx: u32) u32 {
     defer raw_lock.release(saved);
     if (idx >= MAX_SOCKETS or !sockets[idx].used) return 0x004;
     const s = &sockets[idx];
-    return policy.pollBits(s.count != 0, s.shut_rd, s.shut_wr);
+    // A pending error or a queued one is POLLERR (datagram_poll: sk_err or a non-empty error queue).
+    const err_bit: u32 = if (s.err != 0 or s.errq.n != 0) 0x008 else 0;
+    return policy.pollBits(s.count != 0, s.shut_rd, s.shut_wr) | err_bit;
+}
+
+/// raw_err (Linux net/ipv4/raw.c, via raw_icmp_error) for every IPv4 raw socket of the quoted datagram's protocol whose bound address
+/// and peer match it: one with IP_RECVERR queues the error (payload from the quoted transport header, the quoted IP header too for
+/// IP_HDRINCL) and takes it as its pending error; one without takes only a hard error, and only when connected. Source quench and
+/// redirect are no error for a raw socket.
+pub fn notifyIcmpError(protocol: u8, quoted_src: [4]u8, quoted_dst: [4]u8, icmp_type: u8, icmp_code: u8, base: @import("udp.zig").IcmpError, quoted_ip: []const u8, quoted_l4: []const u8) void {
+    const errq = @import("errqueue_policy.zig");
+    var notify: [MAX_SOCKETS]u32 = undefined;
+    var n: usize = 0;
+    {
+        const saved = raw_lock.acquire();
+        defer raw_lock.release(saved);
+        for (&sockets, 0..) |*s, i| {
+            if (!s.used or s.v6 or s.protocol != protocol) continue;
+            // raw_v4_match on the quoted datagram: it was sent from the socket's bound address to its peer.
+            if (!policy.matches(s.bound, s.peer, quoted_dst, quoted_src)) continue;
+            const recverr = s.opts.ip.recverr;
+            if (!recverr and !s.connected) continue;
+            const conv = @import("icmp_unreach_policy.zig").rawErrorFor(icmp_type, icmp_code, s.opts.ip.pmtudisc == 0) orelse continue;
+            var e = base;
+            e.errno = conv.errno;
+            e.hard = conv.hard;
+            if (recverr) {
+                var ent: errq.Entry = .{ .errno = e.errno, .icmp_type = e.icmp_type, .icmp_code = e.icmp_code, .info = e.info, .dst_port = 0 };
+                @memcpy(ent.offender[0..4], &e.offender);
+                @memcpy(ent.dst[0..4], &quoted_dst);
+                const body = if (s.opts.ip.hdrincl) quoted_ip else quoted_l4;
+                const k = @min(body.len, errq.PAYLOAD_MAX);
+                ent.len = @intCast(k);
+                @memcpy(ent.payload[0..k], body[0..k]);
+                _ = s.errq.push(ent);
+            }
+            if (!(recverr or e.hard)) continue;
+            s.err = e.errno;
+            notify[n] = @intCast(i);
+            n += 1;
+        }
+    }
+    for (notify[0..n]) |idx| @import("epoll.zig").epollNotify(.raw_socket, idx, @import("epoll.zig").EPOLLERR);
+}
+
+/// The pending error, taken (sock_error: a recv or send reports it once) or only looked at (SO_ERROR's getsockopt peeks, then clears).
+pub fn takeError(idx: u32, clear: bool) i32 {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return 0;
+    const e = sockets[idx].err;
+    if (clear) sockets[idx].err = 0;
+    return e;
+}
+
+/// SO_ERROR's clear after the read: only the error it reported, not one that arrived since.
+pub fn clearErrorIfEqual(idx: u32, e: i32) void {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx < MAX_SOCKETS and sockets[idx].used and sockets[idx].err == e) sockets[idx].err = 0;
+}
+
+/// recvmsg(MSG_ERRQUEUE): the oldest queued error; the pending error becomes the next one's (sock_dequeue_err_skb).
+pub fn takeQueuedError(idx: u32) ?@import("errqueue_policy.zig").Entry {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return null;
+    const r = sockets[idx].errq.pop() orelse return null;
+    sockets[idx].err = r.next_err;
+    return r.entry;
 }
 
 pub fn boundAddr(idx: u32) [4]u8 {

@@ -17,6 +17,11 @@
  *   W. an unconnected ping socket with IP_RECVERR (ping_err → ip_icmp_error) queues even soft errors: host unreachable (3/1) gives
  *      SO_ERROR 113 and recvmsg(MSG_ERRQUEUE) returns the 8 quoted echo-request bytes, msg_name 127.0.0.1 port 0, IP_RECVERR with
  *      errno 113, origin 2, type 3, code 1; source quench (4/0), which a ping socket wants to see, is EREMOTEIO (121).
+ *   X. a raw socket of protocol 253 (raw_icmp_error → raw_err): unconnected without IP_RECVERR it takes nothing; connected, a soft
+ *      error (3/1) is nothing, protocol unreachable SO_ERROR 92, parameter problem 71, and port unreachable fails the next recv once
+ *      (ECONNREFUSED) while a send still works; with IP_RECVERR, unconnected, host unreachable is SO_ERROR 113 and POLLERR, and
+ *      MSG_ERRQUEUE returns the 8 bytes after the quoted IP header, msg_name 127.0.0.1 port 0, errno 113 origin 2 type 3 code 1;
+ *      source quench and redirect are nothing; with IP_HDRINCL too the queued payload is the 28 bytes from the quoted IP header.
  * The test sets net.ipv4.ping_group_range to "0 0" and puts the old value back at the end. */
 #ifdef HOST
 #define _GNU_SOURCE
@@ -34,6 +39,7 @@ static long rc(long r) { return r < 0 ? -errno : r; }
 static long rsock(void) { return rc(socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)); }
 static long usock(void) { return rc(socket(AF_INET, SOCK_DGRAM, 0)); }
 static long psock(void) { return rc(socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)); }
+static long rsockp(int p) { return rc(socket(AF_INET, SOCK_RAW, p)); }
 static long bind_(long s, const unsigned char *a) { return rc(bind((int)s, (const void *)a, 16)); }
 static long connect_(long s, const unsigned char *a) { return rc(connect((int)s, (const void *)a, 16)); }
 static long name_(long s, unsigned char *a) { socklen_t l = 16; return rc(getsockname((int)s, (void *)a, &l)); }
@@ -59,6 +65,7 @@ static long recvmsg_(long s, void *m, int fl) { return rc(recvmsg((int)s, m, fl)
 static long rsock(void) { return syscall3(117, 2, 3, 1); }
 static long usock(void) { return syscall3(117, 2, 2, 0); }
 static long psock(void) { return syscall3(117, 2, 2, 1); }
+static long rsockp(int p) { return syscall3(117, 2, 3, p); }
 static long bind_(long s, const unsigned char *a) { return syscall3(118, s, (long)a, 16); }
 static long connect_(long s, const unsigned char *a) { return syscall3(124, s, (long)a, 16); }
 static long name_(long s, unsigned char *a) { int l = 16; return syscall3(126, s, (long)a, (long)&l); }
@@ -266,6 +273,68 @@ int main(void) {
               wm.flags == 0x2000 && wlv == 0 && wty == 11 && werr == 113 && wctl[20] == 2 && wctl[21] == 3 && wctl[22] == 1 && wq == 121,
           msg);
     close_(pw);
+
+    unsigned char xl4[8] = { 0x68, 0x69, 0x21, 0, 0, 0, 0, 0 };
+    long xr = rsockp(253);
+    inject(3, 2, 253, xl4, 0);
+    long x0 = soerr(xr);
+    long xc = connect_(xr, lo);
+    inject(3, 1, 253, xl4, 0);
+    long x1 = soerr(xr);
+    inject(3, 2, 253, xl4, 0);
+    long x2 = soerr(xr);
+    inject(12, 0, 253, xl4, 0);
+    long x3 = soerr(xr);
+    inject(3, 3, 253, xl4, 0);
+    long x4 = recv_(xr, sink, sizeof sink);
+    long x5 = send_(xr, xl4, 8);
+    close_(xr);
+    snprintf(msg, sizeof msg, "X1: raw 253 %ld unconnected %ld; connect %ld, soft %ld, proto unreach %ld, param problem %ld; port unreach recv %ld, send %ld "
+             "(0; 0 0 92 71; -111 8)", xr, x0, xc, x1, x2, x3, x4, x5);
+    check(xr >= 0 && x0 == 0 && xc == 0 && x1 == 0 && x2 == 92 && x3 == 71 && x4 == -111 && x5 == 8, msg);
+
+    long xq = rsockp(253);
+    long xo = setopt_(xq, 0, 11, 1);
+    inject(3, 1, 253, xl4, 0);
+    long xp = revents(xq);
+    long xe = soerr(xq);
+    memset(&wm, 0, sizeof wm);
+    memset(wname, 0xee, sizeof wname);
+    memset(wctl, 0, sizeof wctl);
+    memset(sink, 0, 64);
+    wm.name = wname;
+    wm.nl = sizeof wname;
+    wm.iov = &wio;
+    wm.iovlen = 1;
+    wm.ctl = wctl;
+    wm.ctllen = sizeof wctl;
+    long xm = recvmsg_(xq, &wm, 0x2000 | 0x40);
+    memcpy(&wlv, wctl + 8, 4);
+    memcpy(&wty, wctl + 12, 4);
+    memcpy(&werr, wctl + 16, 4);
+    int xquote = xm == 8 && memcmp(sink, xl4, 8) == 0;
+    inject(4, 0, 253, xl4, 0);
+    long xs = soerr(xq);
+    inject(5, 0, 253, xl4, 0);
+    long xd = soerr(xq);
+    long xn = recvmsg_(xq, &wm, 0x2000 | 0x40);
+    snprintf(msg, sizeof msg, "X2: IP_RECVERR raw set %ld; POLLERR %d SO_ERROR %ld; errqueue %ld quote %d, name %d %d.%d.%d.%d port %d, flags 0x%x, [%d/%d] errno %d "
+             "origin %d type %d code %d; quench %ld redirect %ld, queue then %ld (0; 1 113; 8 1, 2 127.0.0.1 0, 0x2000, [0/11] 113 2 3 1; 0 0 -11)", xo, (xp & 8) != 0, xe, xm,
+             xquote, wname[0], wname[4], wname[5], wname[6], wname[7], (wname[2] << 8) | wname[3], wm.flags, wlv, wty, werr, wctl[20], wctl[21], wctl[22], xs, xd, xn);
+    check(xo == 0 && (xp & 8) != 0 && xe == 113 && xquote && wname[0] == 2 && wname[4] == 127 && wname[7] == 1 && wname[2] == 0 && wname[3] == 0 &&
+              wm.flags == 0x2000 && wlv == 0 && wty == 11 && werr == 113 && wctl[20] == 2 && wctl[21] == 3 && wctl[22] == 1 && xs == 0 && xd == 0 && xn == -11,
+          msg);
+
+    long xh = setopt_(xq, 0, 3, 1);
+    inject(3, 1, 253, xl4, 0);
+    memset(sink, 0, 64);
+    wm.flags = 0;
+    wm.ctllen = sizeof wctl;
+    wm.nl = sizeof wname;
+    long xhm = recvmsg_(xq, &wm, 0x2000 | 0x40);
+    snprintf(msg, sizeof msg, "X3: IP_HDRINCL %ld; errqueue %ld first 0x%02x protocol %d, then %02x%02x (0; 28 0x45 253, 6869)", xh, xhm, sink[0], sink[9], sink[20], sink[21]);
+    check(xh == 0 && xhm == 28 && sink[0] == 0x45 && sink[9] == 253 && sink[20] == 0x68 && sink[21] == 0x69, msg);
+    close_(xq);
     close_(raw);
 
     long back = set_range(saved);

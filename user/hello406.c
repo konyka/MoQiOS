@@ -14,6 +14,9 @@
  *   B. a blocking connect answered with host unreachable returns EHOSTUNREACH;
  *   S. an established connection gets a host unreachable quoting its last segment: SO_ERROR reads 113 once, then 0, and data still
  *      flows both ways;
+ *   R. the same with IP_RECVERR set: the error becomes sk_err at once (tcp_v4_err): POLLERR, the next send fails with EHOSTUNREACH
+ *      and SO_ERROR then reads 0, the send after that goes through; MSG_ERRQUEUE has nothing (EAGAIN); a second error quoting the
+ *      data segment fails the next recv once, then EAGAIN;
  *   V. IPv6, one connect per error, as listed; packet too big and a sequence number past snd_nxt leave it pending. */
 #ifdef HOST
 #define _GNU_SOURCE
@@ -36,6 +39,8 @@ static long connect_(long s, const void *a, int l) { return rc(connect((int)s, a
 static long sendto_(long s, const void *b, long n, const void *a, int al) { return rc(sendto((int)s, b, (size_t)n, 0, a, (socklen_t)al)); }
 static long recvfrom_(long s, void *b, long n, void *a, int *al) { return rc(recvfrom((int)s, b, (size_t)n, MSG_DONTWAIT, a, (socklen_t *)al)); }
 static long getopt_(long s, int lv, int o, void *v, int *l) { return rc(getsockopt((int)s, lv, o, v, (socklen_t *)l)); }
+static long setopt_(long s, int lv, int o, int v) { return rc(setsockopt((int)s, lv, o, &v, 4)); }
+static long recvmsg_(long s, void *m, int fl) { return rc(recvmsg((int)s, m, fl)); }
 static long poll_ev(long s) { struct pollfd p = { (int)s, POLLIN | POLLOUT, 0 }; long r = rc(poll(&p, 1, 0)); return r < 0 ? r : p.revents; }
 static void nap(void) { struct timespec t = { 0, 20000000 }; nanosleep(&t, 0); }
 static void close_(long s) { close((int)s); }
@@ -56,6 +61,8 @@ static long connect_(long s, const void *a, int l) { return syscall3(124, s, (lo
 static long sendto_(long s, const void *b, long n, const void *a, int al) { return syscall6(121, s, (long)b, n, 0, (long)a, al); }
 static long recvfrom_(long s, void *b, long n, void *a, int *al) { return syscall6(122, s, (long)b, n, 0x40, (long)a, (long)al); }
 static long getopt_(long s, int lv, int o, void *v, int *l) { return syscall5(133, s, lv, o, (long)v, (long)l); }
+static long setopt_(long s, int lv, int o, int v) { return syscall5(132, s, lv, o, (long)&v, 4); }
+static long recvmsg_(long s, void *m, int fl) { return syscall3(130, s, (long)m, fl); }
 static long poll_ev(long s) { struct { int fd; short ev, rev; } p = { (int)s, 1 | 4, 0 }; long r = syscall3(162, (long)&p, 1, 0); return r < 0 ? r : (unsigned short)p.rev; }
 static void nap(void) { long t[2] = { 0, 20000000 }; syscall1(104, 0); syscall2(35, (long)t, 0); }
 static void close_(long s) { syscall1(11, s); }
@@ -256,6 +263,47 @@ int main(void) {
              scr, sp >= 0, sh, s1, s2, w, g, w2, g2);
     check(scr == 0 && sp >= 0 && sh > 0 && s1 == 113 && s2 == 0 && w == 4 && g == 4 && w2 == 4 && g2 == 4, msg);
     close_(sc); close_(sp); close_(sl);
+
+    long rl_ = sock(2, 1, 0);
+    mk4(sa, 40409);
+    bind_(rl_, sa, 16);
+    listen_(rl_, 4);
+    drain(rt4);
+    long rc_ = sock(2, 1, 0);
+    long rso = setopt_(rc_, 0, 11, 1);
+    long rcr = connect_(rc_, sa, 16);
+    long rp = accept_(rl_);
+    long rh = -1;
+    for (int k = 0; k < 30 && rh < 0; k++) {
+        long n = grab(rt4, 0, 40409, 0);
+        if (n < 0) break;
+        int off = (seg[0] & 15) * 4;
+        if (!(seg[off + 13] & 2)) rh = n;
+    }
+    icmp4(3, 1, 0);
+    settle();
+    long rpe = poll_ev(rc_);
+    unsigned char rqb[64], rqn[16], rqc[64];
+    struct { void *b; unsigned long n; } rio = { rqb, sizeof rqb };
+    struct { void *name; unsigned int nl; int pad; void *iov; unsigned long iovlen; void *ctl; unsigned long ctllen; int flags; int pad2; } rm;
+    memset(&rm, 0, sizeof rm);
+    rm.name = rqn; rm.nl = sizeof rqn; rm.iov = &rio; rm.iovlen = 1; rm.ctl = rqc; rm.ctllen = sizeof rqc;
+    long rq = recvmsg_(rc_, &rm, 0x2000 | 0x40);
+    long rs1 = sendto_(rc_, "ping", 4, 0, 0);
+    int rse = soerr(rc_);
+    drain(rt4);
+    long rs2 = sendto_(rc_, "ping", 4, 0, 0);
+    settle();
+    long rg = recvfrom_(rp, rb, sizeof rb, 0, &rl);
+    long rd = grab(rt4, 0, 40409, 0);
+    icmp4(3, 1, 4);
+    settle();
+    long rr1 = recvfrom_(rc_, rb, sizeof rb, 0, &rl);
+    long rr2 = recvfrom_(rc_, rb, sizeof rb, 0, &rl);
+    snprintf(msg, sizeof msg, "R: IP_RECVERR %ld connect %ld accept %d (%ld); host unreachable on the established connection: POLLERR %d, errqueue %ld; send %ld, SO_ERROR %d, "
+             "send %ld, peer got %ld; quoting that segment (%ld) recv %ld then %ld (0 0 1; 1 -11; -113 0 4 4; -113 -11)", rso, rcr, rp >= 0, rh, (int)((rpe & 8) != 0), rq, rs1, rse, rs2, rg, rd, rr1, rr2);
+    check(rso == 0 && rcr == 0 && rp >= 0 && rh > 0 && (rpe & 8) != 0 && rq == -11 && rs1 == -113 && rse == 0 && rs2 == 4 && rg == 4 && rd > 0 && rr1 == -113 && rr2 == -11, msg);
+    close_(rc_); close_(rp); close_(rl_);
 
     static const int e6[][4] = { { 1, 4, 0, 111 }, { 1, 0, 0, 101 }, { 1, 3, 0, 113 }, { 1, 1, 0, 13 }, { 3, 0, 0, 113 }, { 4, 0, 0, 71 }, { 1, 7, 0, 71 }, { 2, 0, 0, 0 }, { 1, 4, 1000, 0 } };
     ok = rt6 >= 0 && ri6 >= 0 && L6 >= 0;

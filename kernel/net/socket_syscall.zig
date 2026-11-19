@@ -227,6 +227,9 @@ fn rawRecvIntoMeta(d: *vfs_mod.FileDescriptor, out: []u8, flags: u32, from: ?*[1
     const deadline = urp.deadlineNs(tsc.nanos(), if (raw.getOpts(d.raw_idx)) |o| o.rcv_ms else 0);
     while (true) {
         _ = @import("lo.zig").drain();
+        // __skb_try_recv_datagram: a pending ICMP error is reported, once, before any queued datagram.
+        const pending = raw.takeError(d.raw_idx, true);
+        if (pending != 0) return -@as(i64, pending);
         switch (raw.recv(d.raw_idx, out, (flags & 0x02) != 0)) {
             .ok => |r| {
                 if (from) |f| f.* = r.src;
@@ -2055,8 +2058,12 @@ const errq = @import("errqueue_policy.zig");
 /// The quoted payload goes to the iovecs (MSG_TRUNC when cut), msg_name is the datagram's destination, the control message
 /// IP_RECVERR (IPV6_RECVERR at SOL_IPV6) carries struct sock_extended_err and the ICMP sender, and msg_flags has MSG_ERRQUEUE.
 fn udpRecvErrqueue(key: u32, is_v6: bool, msg_ptr: u64, msghdr: *const [56]u8) i64 {
-    const e = udp.takeQueuedError(key) orelse return -11;
     _ = is_v6;
+    return recvErrqueueEntry(udp.takeQueuedError(key) orelse return -11, msg_ptr, msghdr);
+}
+
+/// recvmsg(MSG_ERRQUEUE)'s copy-out of one taken entry, for any datagram socket.
+fn recvErrqueueEntry(e: errq.Entry, msg_ptr: u64, msghdr: *const [56]u8) i64 {
     const name_ptr: u64 = bo.readU64At(msghdr, 0);
     const name_len: u32 = bo.readU32Le(msghdr[8..12]);
     const iov_ptr: u64 = bo.readU64At(msghdr, 16);
@@ -2134,6 +2141,8 @@ fn rawSendmsg(d: *const vfs_mod.FileDescriptor, msghdr: *const [56]u8) i64 {
 /// MSG_TRUNC when the datagram did not fit, MSG_CTRUNC when a control message did not. The MSG_TRUNC flag returns the datagram's
 /// whole length.
 fn rawRecvmsg(d: *vfs_mod.FileDescriptor, msg_ptr: u64, msghdr: *const [56]u8, flags: u32) i64 {
+    // raw_recvmsg: MSG_ERRQUEUE takes the oldest IP_RECVERR entry instead (ip_recv_error), never blocking.
+    if (flags & errq.MSG_ERRQUEUE != 0) return recvErrqueueEntry(@import("raw_icmp.zig").takeQueuedError(d.raw_idx) orelse return -11, msg_ptr, msghdr);
     const name_ptr: u64 = bo.readU64At(msghdr, 0);
     const name_cap: u32 = bo.readU32Le(msghdr[8..12]);
     const iov_ptr: u64 = bo.readU64At(msghdr, 16);
@@ -2289,6 +2298,9 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
     }
     const rf_tcp = @import("recv_flags_policy.zig");
     // Supported TCP recvmsg flags: MSG_OOB, MSG_PEEK, MSG_DONTWAIT, MSG_WAITALL.
+    // tcp_recvmsg → inet_recv_error: MSG_ERRQUEUE reads the error queue, which only a failed connect with IP_RECVERR fills on Linux
+    // (an established connection takes ICMP errors as sk_err); this stack keeps none for TCP, so it is always empty: EAGAIN.
+    if (flags & errq.MSG_ERRQUEUE != 0 and fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .tcp_socket) return -11;
     if (flags & ~(urg.MSG_OOB | rf_tcp.MSG_PEEK | net_mod.tcp_recv_policy.MSG_DONTWAIT | rf_tcp.MSG_WAITALL) != 0) return -22;
     if (fd >= vfs_mod.MAX_FDS or cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
     if (flags & urg.MSG_OOB != 0) return tcpRecvmsgOob(cur.fd_table.fds[fd].tcb_idx, msg_ptr, flags);

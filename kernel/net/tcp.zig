@@ -1221,43 +1221,63 @@ pub fn tcpPendingSoError(tcb_idx: u32) i32 {
 /// carries the quoted sequence number; `err` is its errno (0: none, as for fragmentation needed, which icmp.zig handles as path
 /// MTU), `req_abort` whether a connection still waiting in a listener's queue is dropped.
 pub fn icmpError(q: @import("icmp_unreach_policy.zig").TcpQuote, err: i32, req_abort: bool) void {
-    const lock_flags = tcp_lock.acquire();
-    defer tcp_lock.release(lock_flags);
-    const tcb = findTcbByTuple(q.src4, q.src_port, q.dst_port, q.dst4) orelse return;
-    applyIcmpError(tcb, q.seq, err, req_abort);
+    const idx = blk: {
+        const lock_flags = tcp_lock.acquire();
+        defer tcp_lock.release(lock_flags);
+        const tcb = findTcbByTuple(q.src4, q.src_port, q.dst_port, q.dst4) orelse return;
+        if (!applyIcmpError(tcb, q.seq, err, req_abort)) return;
+        break :blk tcbIdx(tcb);
+    };
+    @import("epoll.zig").epollNotify(.tcp_socket, idx, tcpReadiness(idx));
 }
 
 /// icmpError for an IPv6 segment (tcp_v6_err).
 pub fn icmpError6(q: @import("icmp_unreach_policy.zig").TcpQuote, err: i32, req_abort: bool) void {
-    const lock_flags = tcp_lock.acquire();
-    defer tcp_lock.release(lock_flags);
-    const tcb = findTcbByTupleV6(q.src, q.src_port, q.dst_port, q.dst) orelse return;
-    applyIcmpError(tcb, q.seq, err, req_abort);
+    const idx = blk: {
+        const lock_flags = tcp_lock.acquire();
+        defer tcp_lock.release(lock_flags);
+        const tcb = findTcbByTupleV6(q.src, q.src_port, q.dst_port, q.dst) orelse return;
+        if (!applyIcmpError(tcb, q.seq, err, req_abort)) return;
+        break :blk tcbIdx(tcb);
+    };
+    @import("epoll.zig").epollNotify(.tcp_socket, idx, tcpReadiness(idx));
 }
 
 /// Caller holds tcp_lock. The error counts only when the quoted sequence number lies in [snd_una, snd_nxt]; a SYN_SENT connection
 /// then fails with `err` (connect returns it, POLLERR), a queued SYN_RECEIVED one is dropped when `req_abort` and its SYN-ACK is
 /// what was quoted, an established one keeps `err` as its soft error. Ending the connection wakes its blocked callers
-/// (closeTcbRemote) and its O_ASYNC owner (POLL_ERR).
-fn applyIcmpError(tcb: *TcpTcb, seq: u32, err: i32, req_abort: bool) void {
+/// (closeTcbRemote) and its O_ASYNC owner (POLL_ERR); so does an error an established connection with IP_RECVERR takes as its
+/// pending error. True when epoll should hear of it (the caller tells it after dropping tcp_lock).
+fn applyIcmpError(tcb: *TcpTcb, seq: u32, err: i32, req_abort: bool) bool {
     const up = @import("icmp_unreach_policy.zig");
     switch (up.tcpErrAction(tcb.state)) {
-        .ignore => {},
+        .ignore => return false,
         // tcp_req_err: only an error quoting the SYN-ACK itself.
-        .request => if (req_abort and seq == tcb.iss) {
-            const idx = tcbIdx(tcb);
-            if (tcbInListenBacklog(idx)) releaseOrphanedBacklogTcb(idx);
+        .request => {
+            if (req_abort and seq == tcb.iss) {
+                const idx = tcbIdx(tcb);
+                if (tcbInListenBacklog(idx)) releaseOrphanedBacklogTcb(idx);
+            }
+            return false;
         },
         .abort, .soft => |act| {
-            if (err == 0) return;
-            if (!up.tcpSeqOk(seq, tcb.snd_una, tcb.snd_nxt)) return;
+            if (err == 0) return false;
+            if (!up.tcpSeqOk(seq, tcb.snd_una, tcb.snd_nxt)) return false;
             if (act == .soft) {
+                // tcp_v4_err: with IP_RECVERR the error is sk_err (the next recv or send reports it, POLLERR), else only sk_err_soft.
+                if (up.tcpSoftIsHard(tcb.options.ip.recverr or tcb.options.ip.recverr6)) {
+                    tcb.options.so_error = err;
+                    noteFasync(tcbIdx(tcb), fcntl_policy.POLL_ERR);
+                    markRecvWake(tcb);
+                    return true;
+                }
                 tcb.soft_err = err;
-                return;
+                return false;
             }
             tcb.options.so_error = err;
             noteFasync(tcbIdx(tcb), fcntl_policy.POLL_ERR);
             closeTcbRemote(tcb);
+            return false;
         },
     }
 }
@@ -3662,6 +3682,7 @@ pub fn tcpSend(tcb_idx: u32, data: [*]const u8, len: u32) i64 {
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active or !tcp_recv_policy.canQueueSend(tcb.state, tcb.fin_pending)) return -1;
+    if (takeLiveError(tcb)) |e| return e;
 
     // Copy data to send ring buffer (batched @memcpy)
     const to_copy = @min(len, sendRoom(tcb));
@@ -3720,6 +3741,10 @@ fn sendFromUser(tcb_idx: u32, user_addr: u64, len: u32, oob: bool) i64 {
             tcp_lock.release(lock_flags);
             return if (total > 0) @intCast(total) else -1;
         }
+        if (total == 0) if (takeLiveError(tcb)) |e| {
+            tcp_lock.release(lock_flags);
+            return e;
+        };
         const to_copy = @min(chunk, sendRoom(tcb));
         ringWrite(&tcb.send_buf, SEND_BUF_SIZE, tcb.send_tail, &stage, to_copy);
         tcb.send_tail = (tcb.send_tail + to_copy) % SEND_BUF_SIZE;
@@ -3936,6 +3961,15 @@ fn absorbDataAckBeforeFin(tcb: *TcpTcb, ack_num: u32, window: u32) void {
     }
 }
 
+/// The pending error of a connection that is still open (an ICMP error an IP_RECVERR socket took as sk_err): a recv with nothing to
+/// read, or a send, reports it once (tcp_recvmsg / tcp_sendmsg: sock_error). tcp_lock held.
+fn takeLiveError(tcb: *TcpTcb) ?i64 {
+    if (!tcp_recv_policy.liveErrorPending(tcb.state, tcb.options.so_error)) return null;
+    const e = tcb.options.so_error;
+    tcb.options.so_error = 0;
+    return -@as(i64, e);
+}
+
 /// The value of a recv that copies no data. A connection reset by the peer reports ECONNRESET to ONE call (the first recv or send to
 /// look at it), exactly as Linux does (sk_err is cleared when read); afterwards the connection reads as ended: recv returns 0 and
 /// send is EPIPE. tcp_lock held.
@@ -3977,6 +4011,7 @@ pub fn tcpPeek(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
     if (!tcb.active) return -1;
     if (tcp_recv_policy.shutRdEof(tcb.shut_rd)) return 0;
     const available = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
+    if (available == 0) if (takeLiveError(tcb)) |e| return e;
     const decision = tcp_recv_policy.decide(tcb.state, available, tcb.reset_by_peer);
     if (decision != .read_data) return reportRecvResult(tcb, decision);
     const lim = urgReadLimit(tcb, available, false);
@@ -4020,7 +4055,7 @@ pub fn tcpWaitReadable(tcb_idx: u32) i64 {
             if (!tcb.active) return -9;
             if (tcp_recv_policy.shutRdEof(tcb.shut_rd)) return 0;
             const decision = tcp_recv_policy.decide(tcb.state, readableLocked(tcb), tcb.reset_by_peer);
-            if (decision != .would_block) return 0;
+            if (decision != .would_block or tcp_recv_policy.liveErrorPending(tcb.state, tcb.options.so_error)) return 0;
         }
         _ = lo_dev.drain();
         const w = @import("../fs/poll.zig").waitSlice(null);
@@ -4057,7 +4092,7 @@ fn tcpRecvBlockingWait(tcb_idx: u32, buf: [*]u8, len: u32, nonblock: bool) i64 {
 
             if (tcp_recv_policy.shutRdEof(tcb.shut_rd)) return 0;
             const decision = tcp_recv_policy.decide(tcb.state, readableLocked(tcb), tcb.reset_by_peer);
-            if (!tcp_recv_policy.shouldBlock(decision, nonblock, tcp_recv_policy.timedOut(deadline, tsc.nanos())))
+            if (tcp_recv_policy.liveErrorPending(tcb.state, tcb.options.so_error) or !tcp_recv_policy.shouldBlock(decision, nonblock, tcp_recv_policy.timedOut(deadline, tsc.nanos())))
                 return recvLocked(tcb, buf, len);
 
             // Commit to waiting: link the node, mark ourselves blocked, and
@@ -4130,7 +4165,7 @@ fn waitSendSpace(tcb_idx: u32, st: *SendWait) i64 {
         // A connection that can no longer send, or a ring with room: retry
         // now, the send reports the real error / progress.
         if (!tcp_recv_policy.canQueueSend(tcb.state, tcb.fin_pending)) return 0;
-        if (sendRoom(tcb) > 0) return 0;
+        if (sendRoom(tcb) > 0 or tcp_recv_policy.liveErrorPending(tcb.state, tcb.options.so_error)) return 0;
         if (tcp_recv_policy.timedOut(st.deadline, tsc.nanos())) return -11;
 
         node.task_idx = cur_idx;
@@ -4274,6 +4309,7 @@ pub fn recvTimerTick(now_ns: u64) void {
 fn recvLocked(tcb: *TcpTcb, buf: [*]u8, len: u32) i64 {
     if (tcp_recv_policy.shutRdEof(tcb.shut_rd)) return 0;
     const available = ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE);
+    if (available == 0) if (takeLiveError(tcb)) |e| return e;
     const decision = tcp_recv_policy.decide(tcb.state, available, tcb.reset_by_peer);
     if (decision != .read_data) {
         if (decision == .eof and tcp_recv_policy.recvNeverConnected(tcb.state, tcb.was_established)) return -107; // ENOTCONN

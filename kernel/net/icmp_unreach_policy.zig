@@ -127,6 +127,18 @@ pub fn pingErrorFor(icmp_type: u8, code: u8) struct { errno: i32, hard: bool } {
     };
 }
 
+/// raw_err's conversion for a raw socket: source quench and redirect are none; parameter problem a hard EPROTO; an unreachable code
+/// 0..15 from icmp_err_convert, except fragmentation needed, EMSGSIZE and hard only when the socket does not have IP_PMTUDISC_DONT;
+/// time exceeded, an unknown unreachable code and any other type a soft EHOSTUNREACH.
+pub fn rawErrorFor(icmp_type: u8, code: u8, pmtudisc_dont: bool) ?struct { errno: i32, hard: bool } {
+    return switch (icmp_type) {
+        4, 5 => null,
+        12 => .{ .errno = 71, .hard = true },
+        3 => if (code == 4) .{ .errno = 90, .hard = !pmtudisc_dont } else if (code < unreach_errno.len) .{ .errno = unreach_errno[code].errno, .hard = unreach_errno[code].hard } else .{ .errno = 113, .hard = false },
+        else => .{ .errno = 113, .hard = false },
+    };
+}
+
 pub fn errnoFor(icmp_type: u8, code: u8) i32 {
     return switch (icmp_type) {
         3 => if (code < unreach_errno.len and unreach_errno[code].hard) unreach_errno[code].errno else 0,
@@ -317,6 +329,13 @@ pub fn tcpErrAction(state: @import("tcp_recv_policy.zig").TcpState) TcpErrAction
         .closed, .listen, .time_wait => .ignore,
         else => .soft,
     };
+}
+
+/// tcp_v4_err / tcp_v6_err for an established connection: a socket with IP_RECVERR (IPV6_RECVERR) takes the error as sk_err at once,
+/// which the next recv or send reports and poll shows as POLLERR; one without keeps it as sk_err_soft (SO_ERROR, or the timeout's
+/// errno).
+pub fn tcpSoftIsHard(recverr: bool) bool {
+    return recverr;
 }
 
 /// tcp_req_err: a connection still in the listener's queue is dropped (no error reaches anyone: accept() must not report network

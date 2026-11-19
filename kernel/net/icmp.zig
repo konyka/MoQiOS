@@ -196,6 +196,22 @@ pub fn handlePacketMeta(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u3
             }
             ipv4.updatePathMtu(msg.dst, reported);
         }
+        // raw_icmp_error: every raw socket of the quoted datagram's protocol that sent it hears of the error, whatever the protocol.
+        if (len >= 8 + 20 and (data[8] & 0x0F) >= 5 and @as(usize, data[8] & 0x0F) * 4 + 8 <= len) {
+            const qihl: usize = @as(usize, data[8] & 0x0F) * 4;
+            @import("raw_icmp.zig").notifyIcmpError(data[8 + 9], data[8 + 12 ..][0..4].*, data[8 + 16 ..][0..4].*, icmp_type, icmp_code, .{
+                .errno = 0,
+                .hard = false,
+                .icmp_type = icmp_type,
+                .icmp_code = icmp_code,
+                .info = if (icmp_type == 3 and icmp_code == 4) bo.readU16BeAt(data, 6) else 0,
+                .offender = src_ip,
+                .local_port = 0,
+                .peer_port = 0,
+                .peer_ip = data[8 + 16 ..][0..4].*,
+                .payload = &.{},
+            }, data[8..len], data[8 + qihl .. len]);
+        }
         // An error quoting a TCP segment goes to its connection (tcp_v4_err).
         if (unreach.parseTcpQuote(data[0..len])) |tq| @import("tcp.zig").icmpError(tq, unreach.tcpErrno(icmp_type, icmp_code), unreach.tcpReqAborts(icmp_type, icmp_code));
         // A hard error goes to the connected UDP socket that sent the quoted datagram (udp_err), or to the connected ping socket
