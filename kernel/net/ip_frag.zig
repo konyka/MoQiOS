@@ -104,3 +104,85 @@ pub fn receive6(frame: [*]const u8, len: u32, pkt6: []const u8, frag_off: usize,
     q.busy = false;
     q.used = false;
 }
+
+/// ip_fragment for a locally built IPv4 datagram: `hdr` is its 20-byte header (protocol, addresses, id, TTL, TOS, DF as it should go
+/// out), `payload` what follows it. Each piece carries the header with its offset, MF and length, re-checksummed, and leaves as an
+/// Ethernet frame to `dst_mac`: through lo (delivered at once) when `via_lo`, queued on the neighbour when `wait_hop`, else out the
+/// NIC. False when the device refused a piece.
+pub fn send4(hdr: [20]u8, payload: []const u8, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, via_lo: bool, wait_hop: ?[4]u8) bool {
+    const ipv4 = @import("ipv4.zig");
+    const eth = @import("eth.zig");
+    const lo = @import("lo.zig");
+    const piece = policy.pieceLen(mtu, ipv4.HEADER_LEN);
+    var off: usize = 0;
+    var all_ok = true;
+    while (off < payload.len) {
+        const n: usize = @min(piece, payload.len - off);
+        const last = off + n == payload.len;
+        var pkt: [1518]u8 = undefined;
+        @memcpy(pkt[14..34], &hdr);
+        const ip = pkt[14..].ptr;
+        bo.writeU16BeAt(ip, 2, @intCast(20 + n));
+        const fo: u16 = @as(u16, @intCast(off / 8)) | (if (last) @as(u16, 0) else policy.MF);
+        bo.writeU16BeAt(ip, 6, fo | (bo.readU16BeAt(&hdr, 6) & policy.DF));
+        ip[10] = 0;
+        ip[11] = 0;
+        bo.writeU16BeAt(ip, 10, ipv4.checksum(ip, 20));
+        @memcpy(pkt[34..][0..n], payload[off..][0..n]);
+        const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, @intCast(20 + n));
+        if (wait_hop) |hop| {
+            @import("arp.zig").queueFrame(hop, &pkt, frame_len);
+        } else {
+            const ok = if (via_lo) lo.sendNow(&pkt, frame_len) or lo.dropIsLoss(frame_len) else @import("nic.zig").sendPacket(&pkt, frame_len);
+            if (!ok) all_ok = false;
+        }
+        off += n;
+    }
+    return all_ok;
+}
+
+/// The id of the next fragmented IPv6 datagram this host sends, never 0 (ipv6_select_ident hashes the addresses; one counter, shared
+/// by UDP and ICMPv6, keeps ids from repeating here).
+var frag6_id: u32 = 0x5a5a0001;
+
+pub fn nextId6() u32 {
+    const saved = lock.acquire();
+    defer lock.release(saved);
+    frag6_id +%= 1;
+    if (frag6_id == 0) frag6_id = 1;
+    return frag6_id;
+}
+
+/// ip6_fragment for a locally built IPv6 packet: `hdr` is its 40-byte header (addresses, hop limit, traffic class; the next header
+/// is `nh`, the protocol of `payload`). Each piece is the header (next header 44, its payload length), a Fragment header (next header
+/// `nh`, the offset, M on all but the last, one id) and up to (mtu - 48) & ~7 bytes; it leaves as send4's pieces do.
+pub fn send6(hdr: [40]u8, nh: u8, payload: []const u8, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, via_lo: bool, wait_hop: ?[16]u8) bool {
+    const eth = @import("eth.zig");
+    const lo = @import("lo.zig");
+    const id = nextId6();
+    const piece: usize = (@as(usize, mtu) - 40 - 8) & ~@as(usize, 7);
+    var off: usize = 0;
+    var all_ok = true;
+    while (off < payload.len) {
+        const n: usize = @min(piece, payload.len - off);
+        const last = off + n == payload.len;
+        var pkt: [1518]u8 = undefined;
+        @memcpy(pkt[14..54], &hdr);
+        pkt[14 + 6] = 44;
+        bo.writeU16BeAt(&pkt, 14 + 4, @intCast(8 + n));
+        pkt[54] = nh;
+        pkt[55] = 0;
+        bo.writeU16BeAt(&pkt, 56, @as(u16, @intCast(off)) | (if (last) @as(u16, 0) else 1));
+        bo.writeU32BeAt(&pkt, 58, id);
+        @memcpy(pkt[62..][0..n], payload[off..][0..n]);
+        const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, @intCast(40 + 8 + n));
+        if (wait_hop) |hop| {
+            @import("ndp_queue.zig").queueFrame(hop, &pkt, frame_len);
+        } else {
+            const ok = if (via_lo) lo.sendNow(&pkt, frame_len) or lo.dropIsLoss(frame_len) else @import("nic.zig").sendPacket(&pkt, frame_len);
+            if (!ok) all_ok = false;
+        }
+        off += n;
+    }
+    return all_ok;
+}

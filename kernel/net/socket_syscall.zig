@@ -463,7 +463,9 @@ fn pingSend(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr
     // A socket bound to 127/8 reaches only what lo carries (__mkroute_output).
     const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(src, dst, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
     if (lo_rc != 0) return lo_rc;
-    var msg: [pp.MAX_MESSAGE]u8 = undefined;
+    var small: [pp.MAX_MESSAGE]u8 = undefined;
+    const msg: []u8 = if (payload.len > small.len) bigStage(payload.len) orelse return -105 else small[0..payload.len];
+    defer if (payload.len > small.len) @import("../mm/slab.zig").kfree(msg.ptr);
     @memcpy(msg[0..payload.len], payload);
     pp.finishRequest(msg[0..payload.len], d.udp_port);
     // The first send gives the socket its ident for good (ping_v4_sendmsg autobinds through inet_autobind) and hashes it.
@@ -514,7 +516,9 @@ fn pingSend6(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, add
         .ok => |v| v,
         .err => |e| return e,
     };
-    var msg: [pp.MAX_MESSAGE]u8 = undefined;
+    var small: [pp.MAX_MESSAGE]u8 = undefined;
+    const msg: []u8 = if (payload.len > small.len) bigStage(payload.len) orelse return -105 else small[0..payload.len];
+    defer if (payload.len > small.len) @import("../mm/slab.zig").kfree(msg.ptr);
     @memcpy(msg[0..payload.len], payload);
     pp.setIdent(msg[0..payload.len], d.udp_port);
     if (!d.udp_ping_bound) udp.pingRehash(d.udpKey());
@@ -926,15 +930,22 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         return @import("../fs/namespace_policy.zig").sendResult(net_mod.tcp.tcpSendBlocking(tcb_idx, buf, true, len, net_mod.tcp_recv_policy.nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), flags)), flags);
     } else if (t.fd_table.fds[fd].fd_type == .udp_socket and t.fd_table.fds[fd].udp_ping) {
         if (buf >= 0x0000_8000_0000_0000) return -14;
-        var pbuf: [@import("ping_policy.zig").MAX_MESSAGE]u8 = undefined;
-        if (len > pbuf.len) return -90; // EMSGSIZE
+        const pp = @import("ping_policy.zig");
+        var small: [pp.MAX_MESSAGE]u8 = undefined;
+        if (len > pp.MAX_MESSAGE4) return -90; // EMSGSIZE
+        // An echo request longer than one frame (fragmented when it goes) is staged in kmalloc.
+        const pbuf: []u8 = if (len > small.len) bigStage(len) orelse return -105 else small[0..len];
+        defer if (len > small.len) @import("../mm/slab.zig").kfree(pbuf.ptr);
         if (len != 0 and copy.copyFromUser(pbuf[0..len], @ptrFromInt(buf), len) != len) return -14;
         return pingSend(&t.fd_table.fds[fd], pbuf[0..len], addr_ptr, addr_len, &.{});
     } else if (t.fd_table.fds[fd].fd_type == .raw_socket) {
         // The destination is the address given or the connected peer; rawSendFrom checks it before the length.
         if (len != 0 and (buf == 0 or buf >= 0x0000_8000_0000_0000)) return -14;
-        var pbuf: [@import("raw_icmp.zig").MAX_HDRINCL]u8 = undefined;
-        if (len > pbuf.len) return -90; // EMSGSIZE
+        // raw_sendmsg: past 0xFFFF is EMSGSIZE; a message longer than one frame (fragmented when it goes) is staged in kmalloc.
+        var small: [@import("raw_icmp.zig").MAX_HDRINCL]u8 = undefined;
+        if (len > 0xFFFF) return -90; // EMSGSIZE
+        const pbuf: []u8 = if (len > small.len) bigStage(len) orelse return -105 else small[0..len];
+        defer if (len > small.len) @import("../mm/slab.zig").kfree(pbuf.ptr);
         if (len != 0 and copy.copyFromUser(pbuf[0..len], @ptrFromInt(buf), len) != len) return -14;
         if (addr_ptr == 0) return rawSendFrom(&t.fd_table.fds[fd], pbuf[0..len], null, &.{});
         return rawSendFrom(&t.fd_table.fds[fd], pbuf[0..len], .{ .ptr = addr_ptr, .len = addr_len }, &.{});
@@ -1097,10 +1108,14 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
     if (fd >= vfs_mod.MAX_FDS) return -9;
 
     if (t.fd_table.fds[fd].fd_type == .raw_socket) {
-        var pbuf: [@import("raw_icmp.zig").RAW_QUEUE_LEN]u8 = undefined;
-        const want = @min(@as(usize, len), pbuf.len);
+        const raw = @import("raw_icmp.zig");
+        var small: [raw.RAW_QUEUE_LEN]u8 = undefined;
+        const want = @min(@as(usize, len), raw.RAW_BIG_LEN);
         if (buf == 0 or buf >= 0x0000_8000_0000_0000) return -14;
         if (len != 0 and !copy.validateUserBufferWritable(buf, want)) return -14;
+        // A reassembled datagram may be longer than one frame: a request past the stack buffer stages in kmalloc.
+        const pbuf: []u8 = if (want > small.len) bigStage(want) orelse return -105 else small[0..want];
+        defer if (want > small.len) @import("../mm/slab.zig").kfree(pbuf.ptr);
         var src: [16]u8 = @splat(0);
         const got = rawRecvInto(&t.fd_table.fds[fd], pbuf[0..want], flags, &src);
         if (got < 0) return got;
@@ -1858,12 +1873,12 @@ fn bigStage(n: usize) ?[]u8 {
 }
 
 /// Whether a sendmsg on this UDP socket may carry a datagram of `total` bytes longer than one frame (it is fragmented on the way out):
-/// a UDP socket, up to 65507 bytes for IPv4 and 65527 for IPv6; ping sockets refuse it.
+/// a UDP socket, up to 65507 bytes for IPv4 and 65527 for IPv6; a ping socket up to 0xFFFF (pingSend / pingSend6 check the rest).
 fn udpSendmsgFragmentable(fd: u32, total: usize) bool {
     const cur_idx = sched_mod.currentTaskIndex() orelse return false;
     const t = task_mod.getTask(cur_idx) orelse return false;
     const d = &t.fd_table.fds[fd];
-    if (d.udp_ping) return false;
+    if (d.udp_ping) return total <= @import("ping_policy.zig").MAX_MESSAGE4;
     const limit: usize = if (d.udp_is_v6) udp.MAX_UDP_PAYLOAD_BIG6 else udp.MAX_UDP_PAYLOAD_BIG;
     return total <= limit;
 }
@@ -2193,8 +2208,14 @@ fn rawSendmsg(d: *const vfs_mod.FileDescriptor, msghdr: *const [56]u8) i64 {
         if (ctl_ptr == 0 or ctl_ptr >= 0x0000_8000_0000_0000) return -14;
         if (copy.copyFromUser(ctl[0..cl], @ptrFromInt(ctl_ptr), cl) != cl) return -14;
     }
-    var data: [@import("raw_icmp.zig").MAX_HDRINCL]u8 = undefined;
-    const got = gatherIov(iov_ptr, iov_len, &data);
+    var small: [@import("raw_icmp.zig").MAX_HDRINCL]u8 = undefined;
+    const total = iovTotal(iov_ptr, iov_len);
+    if (total < 0) return total;
+    if (total > 0xFFFF) return -90; // EMSGSIZE (raw_sendmsg)
+    const tl: usize = @intCast(total);
+    const data: []u8 = if (tl > small.len) bigStage(tl) orelse return -105 else small[0..];
+    defer if (tl > small.len) @import("../mm/slab.zig").kfree(data.ptr);
+    const got = gatherIov(iov_ptr, iov_len, data);
     if (got < 0) return got;
     return rawSendFrom(d, data[0..@intCast(got)], if (name_ptr != 0) RawDest{ .ptr = name_ptr, .len = name_len } else null, ctl[0..cl]);
 }
@@ -2213,14 +2234,17 @@ fn rawRecvmsg(d: *vfs_mod.FileDescriptor, msg_ptr: u64, msghdr: *const [56]u8, f
     const iov_len: u64 = bo.readU64At(msghdr, 24);
     if (iov_len > 1024) return -22;
     if (iov_len != 0 and (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000)) return -14;
-    var data: [@import("raw_icmp.zig").RAW_QUEUE_LEN]u8 = undefined;
+    const raw = @import("raw_icmp.zig");
     var room: usize = 0;
     var i: usize = 0;
-    while (i < iov_len and room < data.len) : (i += 1) {
+    while (i < iov_len and room < raw.RAW_BIG_LEN) : (i += 1) {
         var iov_buf: [16]u8 = undefined;
         if (copy.copyFromUser(&iov_buf, @ptrFromInt(iov_ptr + @as(u64, @intCast(i)) * 16), 16) != 16) return -14;
-        room += @intCast(@min(bo.readU64At(&iov_buf, 8), data.len - room));
+        room += @intCast(@min(bo.readU64At(&iov_buf, 8), @as(u64, raw.RAW_BIG_LEN - room)));
     }
+    var small: [raw.RAW_QUEUE_LEN]u8 = undefined;
+    const data: []u8 = if (room > small.len) bigStage(room) orelse return -105 else small[0..room];
+    defer if (room > small.len) @import("../mm/slab.zig").kfree(data.ptr);
     var src: [16]u8 = @splat(0);
     var got_meta: RawMeta = .{};
     const got = rawRecvIntoMeta(d, data[0..room], flags | 0x20, &src, &got_meta);

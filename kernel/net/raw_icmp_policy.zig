@@ -97,6 +97,30 @@ pub fn sendLengthErrno(protocol: u32, len: usize) i64 {
     return 0;
 }
 
+/// The largest payload an IPv4 raw (not IP_HDRINCL) or ping send carries: a 65535-byte datagram less its 20-byte header.
+pub const MAX_PAYLOAD4: usize = 65535 - 20;
+
+/// __ip_append_data's size check for a raw or ping send of `len` payload bytes against a path MTU of `mtu`: past MAX_PAYLOAD4 is
+/// EMSGSIZE; past the MTU only a socket that refuses fragmentation (IP_PMTUDISC_DO, PROBE, INTERFACE: ip_sk_ignore_df is false) is
+/// EMSGSIZE, the others are fragmented.
+pub fn oversizeErrno4(len: usize, mtu: u16, pmtudisc: u8) i64 {
+    if (len > MAX_PAYLOAD4) return -90;
+    if (len + 20 <= mtu) return 0;
+    return if (pmtudisc < 2 or pmtudisc == 5) 0 else -90;
+}
+
+/// The largest payload an IPv6 raw (not IPV6_HDRINCL) or ping send carries (IPV6_MAXPLEN).
+pub const MAX_PAYLOAD6: usize = 65535;
+
+/// __ip6_append_data's size check for a raw or ping send of `len` bytes after the IPv6 header against a path MTU of `mtu`: past
+/// IPV6_MAXPLEN is EMSGSIZE; past the MTU only IPV6_PMTUDISC_DO, PROBE and INTERFACE refuse (ip6_sk_ignore_df is false), the others
+/// are fragmented behind Fragment headers.
+pub fn oversizeErrno6(len: usize, mtu: u16, pmtudisc: u8) i64 {
+    if (len > MAX_PAYLOAD6) return -90;
+    if (len + 40 <= mtu) return 0;
+    return if (pmtudisc < 2 or pmtudisc == 5) 0 else -90;
+}
+
 /// ip_protocol_deliver_rcu: a datagram for this host whose protocol has no handler (MoQiOS handles ICMP, TCP and UDP) and that no
 /// raw socket took is answered with an ICMP protocol unreachable.
 pub fn protoUnreachable(protocol: u8, raw_took: bool) bool {

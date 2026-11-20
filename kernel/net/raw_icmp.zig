@@ -16,10 +16,17 @@ const route4 = @import("route4_policy.zig");
 const ipo = @import("ip_opt_policy.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
-/// Raw ICMP sockets at once (each queues up to QUEUE_DEPTH datagrams of RAW_QUEUE_LEN bytes: about 200 KiB in all).
+/// Raw sockets at once (each queues up to QUEUE_DEPTH datagrams of RAW_QUEUE_LEN bytes inline, longer ones in the shared big buffers).
 pub const MAX_SOCKETS = 16;
 const QUEUE_DEPTH = policy.QUEUE_DEPTH;
 pub const RAW_QUEUE_LEN = 1500;
+/// Largest datagram a raw socket keeps whole: a reassembled IPv4 datagram (total length) or IPv6 payload.
+pub const RAW_BIG_LEN = 65535;
+/// Shared buffers for queued datagrams longer than RAW_QUEUE_LEN (only reassembly makes them); with none free one is kept cut to
+/// RAW_QUEUE_LEN bytes, its length then that.
+const BIG_SLOTS = 4;
+var big_bufs: [BIG_SLOTS][RAW_BIG_LEN]u8 = undefined;
+var big_used: [BIG_SLOTS]bool = @splat(false);
 /// Largest ICMP message a send carries (1472-byte UDP payload and ICMP header: the same bound the ping sockets use).
 pub const MAX_MESSAGE = 1480;
 /// Largest datagram an IP_HDRINCL send writes whole (header included): one Ethernet MTU.
@@ -29,7 +36,9 @@ const FRAME_BUF_LEN = 14 + 20 + MAX_MESSAGE;
 
 const Entry = struct {
     dgram: [RAW_QUEUE_LEN]u8 = @splat(0),
+    /// The datagram's whole length; past RAW_QUEUE_LEN the bytes are in big_bufs[big - 1].
     len: u16 = 0,
+    big: u8 = 0,
     /// The sender: an IPv4 address in the first 4 bytes, or an IPv6 one.
     src: [16]u8 = @splat(0),
     /// What the datagram arrived with, for recvmsg's IP_PKTINFO / IP_TTL / IP_TOS (an IPv4 socket) or IPV6_PKTINFO /
@@ -73,6 +82,37 @@ const Socket = struct {
 var sockets: [MAX_SOCKETS]Socket = @splat(.{});
 var raw_lock: IrqSpinlock = .{};
 
+/// Store `bytes` in queue entry `e` (raw_lock held): inline when it fits, else in a free big buffer, else cut to RAW_QUEUE_LEN.
+fn store(e: *Entry, bytes: []const u8) void {
+    const n = @min(bytes.len, RAW_BIG_LEN);
+    e.big = 0;
+    if (n > RAW_QUEUE_LEN) {
+        if (for (big_used, 0..) |u, k| {
+            if (!u) break k;
+        } else null) |slot| {
+            big_used[slot] = true;
+            e.big = @intCast(slot + 1);
+            @memcpy(big_bufs[slot][0..n], bytes[0..n]);
+            e.len = @intCast(n);
+            return;
+        }
+    }
+    const k = @min(n, RAW_QUEUE_LEN);
+    @memcpy(e.dgram[0..k], bytes[0..k]);
+    e.len = @intCast(k);
+}
+
+fn bytesOf(e: *const Entry) []const u8 {
+    if (e.big != 0) return big_bufs[e.big - 1][0..e.len];
+    return e.dgram[0..e.len];
+}
+
+/// Give back an entry's big buffer (raw_lock held): it was read, or its socket is going away.
+fn dropEntry(e: *Entry) void {
+    if (e.big != 0) big_used[e.big - 1] = false;
+    e.big = 0;
+}
+
 /// A new socket of `protocol` (an IPv6 one when `v6`) on the first free slot, or null (ENOBUFS). Nothing is shared with a UDP
 /// socket. IPPROTO_RAW starts with IP_HDRINCL / IPV6_HDRINCL set (inet_create, inet6_create: one HDRINCL bit for both).
 pub fn open(v6: bool, protocol: u32) ?u32 {
@@ -112,6 +152,9 @@ pub fn release(idx: u32) void {
         sockets[idx].refs -= 1;
         return;
     }
+    const s = &sockets[idx];
+    var k: usize = 0;
+    while (k < s.count) : (k += 1) dropEntry(&s.queue[(@as(usize, s.head) + k) % QUEUE_DEPTH]);
     sockets[idx] = .{};
 }
 
@@ -154,9 +197,11 @@ pub fn recv(idx: u32, out: []u8, peek: bool) RecvResult {
     const s = &sockets[idx];
     if (s.count == 0) return .eagain;
     const e = &s.queue[s.head];
-    const copy_len = @min(@as(usize, e.len), out.len);
-    @memcpy(out[0..copy_len], e.dgram[0..copy_len]);
+    const bytes = bytesOf(e);
+    const copy_len = @min(bytes.len, out.len);
+    @memcpy(out[0..copy_len], bytes[0..copy_len]);
     const result: RecvResult = .{ .ok = .{ .n = copy_len, .src = e.src, .trunc = e.len, .meta = e.meta, .meta6 = e.meta6 } };
+    if (!peek) dropEntry(e);
     const next = policy.afterRecv(s.head, s.count, peek);
     s.head = next.head;
     s.count = next.count;
@@ -431,9 +476,7 @@ pub fn deliver(protocol: u8, dgram: []const u8, src: [4]u8, dst: [4]u8, ifindex:
             if (protocol == policy.IPPROTO_ICMP) if (policy.icmpTypeOf(dgram)) |ty| if (policy.icmpFilterBlocks(s.icmp_filter, ty)) continue;
             const at = policy.enqueueSlot(s.head, s.count) orelse continue;
             const e = &s.queue[at];
-            const copy_len = @min(dgram.len, RAW_QUEUE_LEN);
-            @memcpy(e.dgram[0..copy_len], dgram[0..copy_len]);
-            e.len = @intCast(copy_len);
+            store(e, dgram);
             e.src = @splat(0);
             @memcpy(e.src[0..4], &src);
             e.meta = .{ .ifindex = ifindex, .dst = dst, .ttl = if (dgram.len > 8) dgram[8] else 0, .tos = if (dgram.len > 1) dgram[1] else 0 };
@@ -470,9 +513,7 @@ pub fn deliver6(protocol: u8, msg: []const u8, src: [16]u8, dst: [16]u8, ifindex
             if (s.csum_off != null and policy.sum6(src, dst, s.protocol, msg) != 0) continue;
             const at = policy.enqueueSlot(s.head, s.count) orelse continue;
             const e = &s.queue[at];
-            const copy_len = @min(msg.len, RAW_QUEUE_LEN);
-            @memcpy(e.dgram[0..copy_len], msg[0..copy_len]);
-            e.len = @intCast(copy_len);
+            store(e, msg);
             e.src = src;
             e.meta6 = .{ .ifindex = ifindex, .dst = dst, .hops = hops, .tclass = tclass };
             s.count += 1;
@@ -521,8 +562,13 @@ pub fn sendHdrincl6(dst: [16]u8, pkt: []const u8) i64 {
 /// at `csum_off` when there is one (icmpv6.sendProto6Ov). `msg` passed policy.lengthErrno6. `hops_ov` / `tclass_ov` are this
 /// packet's IPV6_HOPLIMIT / IPV6_TCLASS control messages (null: the socket's value). 0 or -errno.
 pub fn send6(bound: [16]u8, dst: [16]u8, protocol: u8, csum_off: ?u32, msg: []const u8, ip: ipo.IpOpts, hops_ov: ?u8, tclass_ov: ?u8) i64 {
-    if (msg.len > MAX_MESSAGE6) return -90;
-    var buf: [MAX_MESSAGE6]u8 = undefined;
+    if (msg.len > policy.MAX_PAYLOAD6) return -90;
+    // The checksum is written into the copy; one longer than a frame (fragmented when it goes) is staged in kmalloc.
+    var small: [MAX_MESSAGE6]u8 = undefined;
+    const slab = @import("../mm/slab.zig");
+    const big = msg.len > small.len;
+    const buf: []u8 = if (big) @as([*]u8, @ptrCast(slab.kmalloc(msg.len) orelse return -105))[0..msg.len] else small[0..msg.len];
+    defer if (big) slab.kfree(buf.ptr);
     @memcpy(buf[0..msg.len], msg);
     const rc = @import("icmpv6.zig").sendProto6Ov(bound, dst, protocol, csum_off, buf[0..msg.len], ip, hops_ov, tclass_ov);
     // A frame to this host is delivered before the send returns (as loopback_xmit does), so the copy and the kernel's reply are
@@ -532,11 +578,13 @@ pub fn send6(bound: [16]u8, dst: [16]u8, protocol: u8, csum_off: ?u32, msg: []co
 }
 
 /// raw_sendmsg: `msg` is the payload of protocol `protocol` (for ICMP the message, header and data). The kernel supplies the IP
-/// header; a frame that has to wait for ARP is queued on the neighbour and the send succeeds, exactly like Linux. 0, or -EMSGSIZE
-/// past the path MTU, -ENOBUFS when the device drops it.
+/// header; a frame that has to wait for ARP is queued on the neighbour and the send succeeds, exactly like Linux. A datagram past the
+/// path MTU is fragmented (ip_append_data) unless IP_MTU_DISCOVER refuses it (policy.oversizeErrno4). 0, or -EMSGSIZE, -ENOBUFS
+/// when the device drops it.
 pub fn send(bound: [4]u8, dst: [4]u8, protocol: u8, msg: []const u8, ip: ipo.IpOpts) i64 {
-    if (msg.len > MAX_MESSAGE) return -90;
-    if (msg.len + ipv4.HEADER_LEN > ipv4.getSendMtu(dst)) return -90;
+    const mtu = ipv4.getSendMtu(dst);
+    const orc = policy.oversizeErrno4(msg.len, mtu, ip.pmtudisc);
+    if (orc != 0) return orc;
     const our_mac = netif.getMac();
     const via_lo = netif.isLocal4(dst);
     var wait_hop: ?[4]u8 = null;
@@ -548,6 +596,16 @@ pub fn send(bound: [4]u8, dst: [4]u8, protocol: u8, msg: []const u8, ip: ipo.IpO
         };
     };
     const src = @import("tcp_port_policy.zig").sourceAddr(bound, dst, netif.getOurIp());
+    if (msg.len + ipv4.HEADER_LEN > mtu) {
+        // ip_append_data → ip_fragment: the datagram leaves in pieces, without DF (it is only set on a datagram within the MTU) and
+        // with an id from the shared generator (ip_select_ident: a datagram that may be fragmented always gets one).
+        var hdr: [20]u8 = undefined;
+        ipv4.buildHeader(&hdr, src, dst, protocol, 0);
+        ipv4.setIdent(&hdr, ipid.global(dst, src, protocol), false);
+        if (ipo.ipv4NeedsPatch(ip)) ipo.patchIpv4(&hdr, ip, ipv4.checksum);
+        const ok = @import("ip_frag.zig").send4(hdr, msg, mtu, dst_mac, our_mac, via_lo, wait_hop);
+        return if (ok) 0 else -105;
+    }
     var pkt: [FRAME_BUF_LEN]u8 = @splat(0);
     @memcpy(pkt[34..][0..msg.len], msg);
     ipv4.buildHeader(pkt[14..].ptr, src, dst, protocol, @intCast(msg.len));

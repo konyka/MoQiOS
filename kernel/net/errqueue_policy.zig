@@ -65,7 +65,7 @@ pub const SO_EE_ORIGIN_LOCAL: u8 = 1;
 
 /// A UDP datagram of `payload` bytes against a path MTU of `mtu`: null when it can be sent (it fits, or it is fragmented: IP_PMTUDISC_WANT,
 /// DONT and OMIT let ip_fragment cut it), else the local error __ip_append_data raises, EMSGSIZE with ee_info = the MTU, for a socket
-/// that refuses to fragment (IP_PMTUDISC_DO, PROBE, and INTERFACE, which Linux answers with EAGAIN here) or a payload over 65507 bytes
+/// that refuses to fragment (IP_PMTUDISC_DO, PROBE and INTERFACE) or a payload over 65507 bytes
 /// (ee_info 0xffff - 20 there). `queue` is whether ip_local_error reaches the error queue: only under DO / PROBE with IP_RECVERR.
 pub fn oversize(payload: usize, mtu: u16, pmtudisc: u8, recverr: bool) ?struct { info: u32, queue: bool } {
     if (payload > 65507) return .{ .info = 0xffff - 20, .queue = recverr and (pmtudisc == 2 or pmtudisc == 3) };

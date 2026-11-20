@@ -33,7 +33,9 @@ pub const MAX_UDP_PAYLOAD_BIG6 = 65527;
 /// Buffers for queued datagrams longer than one frame holds (they only come from IPv4 reassembly); a datagram that finds none free
 /// is dropped, as a full receive buffer drops it in Linux.
 const BIG_SLOTS = 4;
-var big_bufs: [BIG_SLOTS][MAX_UDP_PAYLOAD_BIG6]u8 = undefined;
+/// A big buffer holds the largest IPv6 payload: an IPv6 ping socket's echo reply may be 65535 bytes, ICMPv6 header included.
+const BIG_BUF_LEN = 65535;
+var big_bufs: [BIG_SLOTS][BIG_BUF_LEN]u8 = undefined;
 var big_used: [BIG_SLOTS]bool = @splat(false);
 
 const UdpEntry = struct {
@@ -87,7 +89,7 @@ fn fillEntryLocked(e: *UdpEntry, payload: []const u8) bool {
         e.big = 0;
         @memcpy(e.data[0..payload.len], payload);
     } else {
-        if (payload.len > MAX_UDP_PAYLOAD_BIG6) return false;
+        if (payload.len > BIG_BUF_LEN) return false;
         const slot = for (big_used, 0..) |u, k| {
             if (!u) break k;
         } else return false;
@@ -674,16 +676,16 @@ pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8, me
         const pick = pp.pickReceiver(holders[0..n], src_ip, dst_ip) orelse break :blk;
         {
             const i = slots[pick];
-            const actual = @min(msg.len, MAX_UDP_PAYLOAD);
             for (0..QUEUE_DEPTH) |j| {
                 const e = &queues[i][j];
                 if (e.valid) continue;
+                // A reply to a fragmented request is reassembled before it gets here: one longer than a frame takes a big buffer
+                // (none free: it is dropped, as a full queue drops it).
+                if (!fillEntryLocked(e, msg)) break;
                 e.src_ip = @splat(0);
                 @memcpy(e.src_ip[0..4], &src_ip);
                 e.src_port = 0;
                 e.dst_port = ident;
-                e.data_len = @intCast(actual);
-                @memcpy(e.data[0..actual], msg[0..actual]);
                 e.is_v6 = false;
                 e.meta = meta;
                 e.meta6 = .{};
@@ -718,15 +720,14 @@ pub fn deliverPing6(ident: u16, src_ip: [16]u8, dst_ip: [16]u8, msg: []const u8,
         }
         const pick = pp.pickReceiver6(holders[0..n], dst_ip) orelse break :blk;
         const i = slots[pick];
-        const actual = @min(msg.len, MAX_UDP_PAYLOAD_V6);
         for (0..QUEUE_DEPTH) |j| {
             const e = &queues[i][j];
             if (e.valid) continue;
+            // A reply longer than a frame (reassembled) takes a big buffer, or is dropped when none is free.
+            if (!fillEntryLocked(e, msg)) break;
             e.src_ip = src_ip;
             e.src_port = 0;
             e.dst_port = ident;
-            e.data_len = @intCast(actual);
-            @memcpy(e.data[0..actual], msg[0..actual]);
             e.is_v6 = true;
             e.meta = .{};
             e.meta6 = meta6;
@@ -1544,9 +1545,6 @@ pub fn sendToFromOv(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, da
     return ok;
 }
 
-/// The id of the next fragmented IPv6 datagram (ipv6_select_ident hashes the addresses; one counter keeps ids from repeating here).
-var frag6_id: u32 = 0x5a5a0001;
-
 /// ip6_fragment for a UDP datagram over `mtu`: the UDP datagram (header and checksum included) is cut into pieces of (mtu - 40 - 8)
 /// rounded down to 8 bytes, each behind the IPv6 header (next header 44) and a Fragment header (next header UDP, the offset, M on all
 /// but the last, one id for the whole datagram). The datagram is staged in a kmalloc buffer.
@@ -1564,13 +1562,7 @@ fn sendFragmented6(our_ip: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, 
     whole[7] = 0;
     @memcpy(whole[8..total], payload);
     bo.writeU16BeAt(whole, 6, udp_util.checksumV6(our_ip, dst_ip, whole, @intCast(total)));
-    const id = blk: {
-        const saved = udp_lock.acquire();
-        defer udp_lock.release(saved);
-        frag6_id +%= 1;
-        if (frag6_id == 0) frag6_id = 1;
-        break :blk frag6_id;
-    };
+    const id = @import("ip_frag.zig").nextId6();
     const opts: ip_opt_policy.IpOpts = if (getPortOpts(src_key)) |po| po.ip else .{};
     const group = mcast.isMulticast(dst_ip);
     const piece: usize = (@as(usize, mtu) - ipv6.HEADER_LEN - 8) & ~@as(usize, 7);

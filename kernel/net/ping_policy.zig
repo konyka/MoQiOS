@@ -14,12 +14,15 @@ pub const ICMP_EXT_ECHOREPLY: u8 = 43;
 pub const HEADER_LEN: usize = 8;
 /// SO_REUSEADDR in sockopt_policy.Stored.flags.
 const REUSEADDR_FLAG: u16 = 1;
-/// The largest message one datagram carries here (the UDP payload limit; Linux allows up to 0xffff with fragmentation).
+/// The longest message a ping send stages on the stack (one frame's UDP payload); a longer one goes to a kmalloc buffer.
 pub const MAX_MESSAGE: usize = 1472;
+/// ping_common_sendmsg: a message over 0xFFFF bytes is EMSGSIZE; a shorter one past the MTU is fragmented, and one that does not fit
+/// the largest datagram is refused by __ip_append_data / __ip6_append_data (raw_icmp_policy.oversizeErrno4 / oversizeErrno6).
+pub const MAX_MESSAGE4: usize = 0xFFFF;
 
 /// ping_common_sendmsg: the message must hold a whole ICMP header and be an echo request (or an extended one) with code 0.
 pub fn sendErrno(len: usize, icmp_type: u8, code: u8) i64 {
-    if (len > MAX_MESSAGE) return EMSGSIZE;
+    if (len > MAX_MESSAGE4) return EMSGSIZE;
     if (len < HEADER_LEN) return EINVAL;
     if ((icmp_type != ICMP_ECHO and icmp_type != ICMP_EXT_ECHO) or code != 0) return EINVAL;
     return 0;
@@ -95,7 +98,7 @@ const ENODEV: i64 = -19;
 
 /// ping_common_sendmsg for AF_INET6: a whole ICMPv6 header, an echo request (or an extended one) with code 0.
 pub fn sendErrno6(len: usize, icmp_type: u8, code: u8) i64 {
-    if (len > MAX_MESSAGE) return EMSGSIZE;
+    if (len > MAX_MESSAGE4) return EMSGSIZE;
     if (len < HEADER_LEN) return EINVAL;
     if ((icmp_type != ICMPV6_ECHO_REQUEST and icmp_type != ICMPV6_EXT_ECHO_REQUEST) or code != 0) return EINVAL;
     return 0;

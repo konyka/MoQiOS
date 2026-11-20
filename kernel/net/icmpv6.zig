@@ -384,7 +384,7 @@ pub fn sendEchoReply(
     len: u16,
     tclass: u8,
 ) void {
-    if (len < 8 or len > 1280) return;
+    if (len < 8) return;
 
     const our_mac = netif.getMac();
     // A requester on this host (::1 or one of its own addresses) is answered over lo, like any datagram to it; elsewhere the reply
@@ -392,8 +392,12 @@ pub fn sendEchoReply(
     const via_lo = netif.isLoopbackV6(requester_ip) or ndp.isOwnAddress(requester_ip, our_mac);
     const dst_mac = if (via_lo) our_mac else ndp.lookup(requester_ip) orelse return;
     const our_ip = our_ip_in; // reply from the address we received it on
+    // A reassembled request longer than one frame is echoed whole, in fragments (icmpv6_echo_reply → ip6_append_data).
+    const mtu = ipv6.getSendMtu(requester_ip);
+    if (@as(usize, len) + ipv6.HEADER_LEN > mtu) return sendBigEchoReply6(requester_ip, our_ip, data[0..len], tclass, mtu, dst_mac, our_mac, via_lo);
 
-    var pkt: [1500]u8 = undefined;
+    // A whole frame: the request may fill the MTU now that the 1280-byte cut is gone.
+    var pkt: [1518]u8 = undefined;
     const eth_len: u16 = 14;
     const ip_off: u16 = eth_len;
     const icmp_off: u16 = eth_len + ipv6.HEADER_LEN;
@@ -417,6 +421,25 @@ pub fn sendEchoReply(
     if (via_lo) _ = @import("lo.zig").sendPacket(&pkt, frame_len) else _ = nic.sendPacket(&pkt, frame_len);
 }
 
+/// sendEchoReply for a request longer than the MTU: the reply is built in a kmalloc buffer and fragmented behind Fragment headers.
+fn sendBigEchoReply6(requester_ip: [16]u8, our_ip: [16]u8, req: []const u8, tclass: u8, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, via_lo: bool) void {
+    const slab = @import("../mm/slab.zig");
+    const raw = slab.kmalloc(req.len) orelse return;
+    defer slab.kfree(raw);
+    const msg = @as([*]u8, @ptrCast(raw))[0..req.len];
+    @memcpy(msg, req);
+    msg[0] = ECHO_REPLY;
+    msg[1] = 0;
+    msg[2] = 0;
+    msg[3] = 0;
+    bo.writeU16BeAt(msg.ptr, 2, checksum(our_ip, requester_ip, msg.ptr, @intCast(msg.len)));
+    var hdr: [40]u8 = undefined;
+    ipv6.buildHeader(&hdr, our_ip, requester_ip, ipv6.PROTO_ICMPV6, 0);
+    hdr[0] = 0x60 | (tclass >> 4);
+    hdr[1] = (hdr[1] & 0x0F) | (tclass << 4);
+    _ = @import("ip_frag.zig").send6(hdr, ipv6.PROTO_ICMPV6, msg, mtu, dst_mac, our_mac, via_lo, null);
+}
+
 /// Send the ICMPv6 message `msg` (header and data; the checksum is computed here over the pseudo-header) from an IPv6 ping socket
 /// bound to `bound` (:: when unbound) to `dst`: routed like an IPv6 UDP datagram (lo for ::1 and this host's addresses, else the
 /// next hop's MAC; while that is being solicited the frame waits in ndp_queue and the send succeeds, as Linux queues it on the
@@ -434,7 +457,9 @@ pub fn sendProto6(bound: [16]u8, dst: [16]u8, next_header: u8, csum_off: ?u32, m
 /// sendProto6 with the hop limit and traffic class of this one packet given (an IPV6_HOPLIMIT / IPV6_TCLASS control message; null
 /// keeps the socket's value). They are written into the IPv6 header after the socket's options.
 pub fn sendProto6Ov(bound: [16]u8, dst: [16]u8, next_header: u8, csum_off: ?u32, msg: []u8, ip: ipo.IpOpts, hops_ov: ?u8, tclass_ov: ?u8) i64 {
-    if (msg.len + ipv6.HEADER_LEN > ipv6.getSendMtu(dst)) return -90;
+    const mtu = ipv6.getSendMtu(dst);
+    const orc = @import("raw_icmp_policy.zig").oversizeErrno6(msg.len, mtu, ip.pmtudisc6);
+    if (orc != 0) return orc;
     const our_mac = netif.getMac();
     const via_lo = netif.isLoopbackV6(dst) or ndp.isOwnAddress(dst, our_mac);
     var wait_hop: ?[16]u8 = null;
@@ -455,6 +480,18 @@ pub fn sendProto6Ov(bound: [16]u8, dst: [16]u8, next_header: u8, csum_off: ?u32,
         const csum = rp.finishSum6(rp.sum6(src, dst, next_header, msg), next_header);
         msg[off] = @truncate(csum >> 8);
         msg[off + 1] = @truncate(csum);
+    }
+    if (msg.len + ipv6.HEADER_LEN > mtu) {
+        // ip6_append_data → ip6_fragment: the packet leaves in pieces behind Fragment headers.
+        var hdr: [40]u8 = undefined;
+        ipv6.buildHeader(&hdr, src, dst, next_header, 0);
+        if (ipo.ipv6NeedsPatch(ip)) ipo.patchIpv6(&hdr, ip);
+        if (hops_ov) |h| hdr[7] = h;
+        if (tclass_ov) |tc| {
+            hdr[0] = (hdr[0] & 0xF0) | (tc >> 4);
+            hdr[1] = (hdr[1] & 0x0F) | (tc << 4);
+        }
+        return if (@import("ip_frag.zig").send6(hdr, next_header, msg, mtu, dst_mac, our_mac, via_lo, wait_hop)) 0 else -105;
     }
     var pkt: [1518]u8 = @splat(0);
     const icmp_off: usize = 14 + ipv6.HEADER_LEN;

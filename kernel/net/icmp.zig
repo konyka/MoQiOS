@@ -61,6 +61,26 @@ pub fn buildEchoReplyMtu(
     return eth.buildFrame(o, reply_dst_mac, reply_src_mac, eth.ETHERTYPE_IPV4, 20 + icmp_total);
 }
 
+/// icmp_reply to a reassembled echo request longer than the MTU: the whole request is echoed back (type 0, checksum redone), in
+/// fragments (ip_push_pending_frames → ip_fragment), from `src` to `dst`.
+fn sendBigEchoReply(req: []const u8, src: [4]u8, dst: [4]u8, our_mac: [6]u8, dst_mac: [6]u8, via_lo: bool, tos: u8, mtu: u16) void {
+    const slab = @import("../mm/slab.zig");
+    const raw = slab.kmalloc(req.len) orelse return;
+    defer slab.kfree(raw);
+    const msg = @as([*]u8, @ptrCast(raw))[0..req.len];
+    @memcpy(msg, req);
+    msg[0] = 0;
+    msg[1] = 0;
+    msg[2] = 0;
+    msg[3] = 0;
+    bo.writeU16BeAt(msg.ptr, 2, ipv4.checksum(msg.ptr, @intCast(msg.len)));
+    var hdr: [20]u8 = undefined;
+    ipv4.buildHeader(&hdr, src, dst, ipv4.PROTO_ICMP, 0);
+    hdr[1] = tos;
+    ipv4.setIdent(&hdr, ipid.global(dst, src, ipv4.PROTO_ICMP), false);
+    _ = @import("ip_frag.zig").send4(hdr, msg, mtu, dst_mac, our_mac, via_lo, null);
+}
+
 /// Parsed ICMP Destination Unreachable / Fragmentation Needed (SK-101).
 pub const FragNeededMsg = struct {
     next_hop_mtu: u16 = 0,
@@ -80,8 +100,8 @@ pub fn parseFragNeeded(data: [*]const u8, len: u32) ?FragNeededMsg {
 
 /// Send the ICMP message `msg` (header and data, checksum already set) from a ping socket bound to `bound` (0.0.0.0 when unbound) to
 /// `dst`: routed like a UDP datagram (lo for this host's addresses, else the next hop's MAC; while that is unknown the frame waits
-/// for ARP in arp.queueFrame and the send succeeds, as Linux queues it on the neighbour). Returns 0, or -EMSGSIZE past the path
-/// MTU, -ENOBUFS when the device drops it.
+/// for ARP in arp.queueFrame and the send succeeds, as Linux queues it on the neighbour). A message past the path MTU is fragmented
+/// unless `mode` refuses it (raw_icmp_policy.oversizeErrno4). Returns 0, or -EMSGSIZE, -ENOBUFS when the device drops it.
 pub fn sendFrom(bound: [4]u8, dst: [4]u8, msg: []const u8, mode: u8) i64 {
     return sendFromOv(bound, dst, msg, mode, ipo.DEFAULT_TTL, 0);
 }
@@ -89,7 +109,9 @@ pub fn sendFrom(bound: [4]u8, dst: [4]u8, msg: []const u8, mode: u8) i64 {
 /// sendFrom with the IP header's TTL and TOS given (a ping socket's IP_TTL / IP_TOS, or the IP_TTL / IP_TOS control messages of
 /// that one request: ip_make_skb takes cork->ttl and cork->tos).
 pub fn sendFromOv(bound: [4]u8, dst: [4]u8, msg: []const u8, mode: u8, ttl: u8, tos: u8) i64 {
-    if (msg.len + ipv4.HEADER_LEN > ipv4.getSendMtu(dst)) return -90;
+    const mtu = ipv4.getSendMtu(dst);
+    const orc = @import("raw_icmp_policy.zig").oversizeErrno4(msg.len, mtu, mode);
+    if (orc != 0) return orc;
     const our_mac = netif.getMac();
     const via_lo = netif.isLocal4(dst);
     var wait_hop: ?[4]u8 = null;
@@ -101,6 +123,15 @@ pub fn sendFromOv(bound: [4]u8, dst: [4]u8, msg: []const u8, mode: u8, ttl: u8, 
         };
     };
     const src = @import("tcp_port_policy.zig").sourceAddr(bound, dst, netif.getOurIp());
+    if (msg.len + ipv4.HEADER_LEN > mtu) {
+        // ip_append_data → ip_fragment: pieces without DF, numbered from the shared generator.
+        var hdr: [20]u8 = undefined;
+        ipv4.buildHeader(&hdr, src, dst, ipv4.PROTO_ICMP, 0);
+        hdr[1] = tos;
+        hdr[8] = ttl;
+        ipv4.setIdent(&hdr, ipid.global(dst, src, ipv4.PROTO_ICMP), false);
+        return if (@import("ip_frag.zig").send4(hdr, msg, mtu, dst_mac, our_mac, via_lo, wait_hop)) 0 else -105;
+    }
     var pkt: [1518]u8 = @splat(0);
     @memcpy(pkt[34..][0..msg.len], msg);
     ipv4.buildHeader(pkt[14..].ptr, src, dst, ipv4.PROTO_ICMP, @intCast(msg.len));
@@ -178,8 +209,13 @@ pub fn handlePacketMeta(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u3
             };
         };
 
+        const mtu = netif.getMtu();
+        if (len + ipv4.HEADER_LEN > mtu and len <= 0xFFFF - ipv4.HEADER_LEN) {
+            sendBigEchoReply(data[0..len], dst_ip, src_ip, our_mac, dst_mac, via_lo, meta.tos, mtu);
+            return;
+        }
         var pkt: [echo_policy.FRAME_BUF_LEN]u8 = undefined;
-        const frame_len = buildEchoReplyMtu(&pkt, data, len, netif.getMtu(), dst_ip, src_ip, our_mac, dst_mac, meta.tos);
+        const frame_len = buildEchoReplyMtu(&pkt, data, len, mtu, dst_ip, src_ip, our_mac, dst_mac, meta.tos);
         if (via_lo) _ = lo.sendPacket(&pkt, frame_len) else _ = nic.sendPacket(&pkt, frame_len);
     } else if (unreach.isError(icmp_type)) {
         // An error about a datagram this host sent (icmp_unreach): a bad checksum drops it (icmp_rcv).
