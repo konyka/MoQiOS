@@ -17415,6 +17415,8 @@ test "IPV6_RECVPATHMTU: a DONTFRAG refusal leaves one IPV6_PATHMTU message for r
     try std.testing.expectEqual(@as(u32, 1500), std.mem.readInt(u32, buf[44..48], .little));
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (is_v6) if (udp.getPortOpts(port)) |po| if (po.ip.rxpmtu6) if (udp.takeRxPmtu(port)) |n| return recvRxPmtu(msg_ptr, msghdr, n);") != null);
+    // hello461 J: raw sockets keep their own notice.
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (rawIpOpts(d.raw_idx).rxpmtu6) if (@import(\"raw_icmp.zig\").takeRxPmtu(d.raw_idx)) |n| return recvRxPmtu(msg_ptr, msghdr, n);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "udp.queueLocalError(d.udpKey(), errq.localEntry6(90, @import(\"ipv6.zig\").getSendMtu(dst), dst, 0));") != null);
 }
 
@@ -17423,4 +17425,7 @@ test "getsockopt(IPV6_PATHMTU) answers a connected socket with only the MTU fill
     try std.testing.expect(std.mem.indexOf(u8, so, "if (level == ipo.SOL_IPV6 and optname == ipo.IPV6_PATHMTU) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, "if (bo.readU32Le(&lb) < 32) return -22;") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, ".udp => |port| @import(\"udp.zig\").connectedPeer6(port) orelse return -107,") != null);
+    // hello461 I: TCP connections and connected raw sockets answer too.
+    try std.testing.expect(std.mem.indexOf(u8, so, ".tcp => |idx| @import(\"tcp.zig\").tcpPeer6(idx) orelse return -107,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, ".raw => |idx| if (@import(\"raw_icmp.zig\").isConnected(idx)) @import(\"raw_icmp.zig\").peerAddr6(idx) else return -107,") != null);
 }

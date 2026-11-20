@@ -144,8 +144,13 @@ fn rawSendFrom6(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest,
     const sent = raw.send6(src6, to6, @truncate(raw.protocolOf(d.raw_idx)), raw.checksumOffset(d.raw_idx), msg, ip6, ov6.hops, ov6.tclass);
     // __ip6_append_data → ipv6_local_error: an IPV6_DONTFRAG refusal reaches the error queue of an IPV6_RECVERR socket, with the
     // path MTU as ee_info.
-    if (sent == -90 and ip6.dontfrag6 and ip6.recverr6 and msg.len <= rp.MAX_PAYLOAD6)
-        raw.queueLocalError(d.raw_idx, errq.localEntry6(90, @import("ipv6.zig").getSendMtu(to6), to6, 0));
+    if (sent == -90 and ip6.dontfrag6 and msg.len <= rp.MAX_PAYLOAD6) {
+        const mtu6 = @import("ipv6.zig").getSendMtu(to6);
+        if (msg.len + 40 > mtu6) {
+            if (ip6.rxpmtu6) raw.setRxPmtu(d.raw_idx, .{ .valid = true, .dst = to6, .mtu = mtu6 });
+            if (ip6.recverr6) raw.queueLocalError(d.raw_idx, errq.localEntry6(90, mtu6, to6, 0));
+        }
+    }
     return if (sent < 0) sent else @intCast(msg.len);
 }
 
@@ -2305,6 +2310,8 @@ fn rawSendmsg(d: *const vfs_mod.FileDescriptor, msghdr: *const [56]u8) i64 {
 fn rawRecvmsg(d: *vfs_mod.FileDescriptor, msg_ptr: u64, msghdr: *const [56]u8, flags: u32) i64 {
     // raw_recvmsg: MSG_ERRQUEUE takes the oldest IP_RECVERR entry instead (ip_recv_error), never blocking.
     if (flags & errq.MSG_ERRQUEUE != 0) return recvErrqueueEntry(@import("raw_icmp.zig").takeQueuedError(d.raw_idx) orelse return -11, msg_ptr, msghdr);
+    // rawv6_recvmsg: a pending IPV6_RECVPATHMTU notice comes first (ipv6_recv_rxpmtu).
+    if (rawIpOpts(d.raw_idx).rxpmtu6) if (@import("raw_icmp.zig").takeRxPmtu(d.raw_idx)) |n| return recvRxPmtu(msg_ptr, msghdr, n);
     const name_ptr: u64 = bo.readU64At(msghdr, 0);
     const name_cap: u32 = bo.readU32Le(msghdr[8..12]);
     const iov_ptr: u64 = bo.readU64At(msghdr, 16);

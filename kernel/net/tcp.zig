@@ -1178,6 +1178,16 @@ pub fn tcpIsV6(tcb_idx: u32) bool {
     return tcbs[tcb_idx].is_v6;
 }
 
+/// The peer of a connected IPv6 TCP socket (one past SYN_SENT that has a route), or null (IPV6_PATHMTU: no dst is ENOTCONN).
+pub fn tcpPeer6(tcb_idx: u32) ?[16]u8 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return null;
+    const t = &tcbs[tcb_idx];
+    if (!t.is_v6 or t.state == .listen or t.state == .closed) return null;
+    return t.remote_ip6;
+}
+
 /// True when the socket is in the LISTEN state (SO_ACCEPTCONN).
 pub fn tcpIsListening(tcb_idx: u32) bool {
     const lock_flags = tcp_lock.acquire();

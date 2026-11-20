@@ -77,6 +77,8 @@ const Socket = struct {
     /// The pending error (sk_err) an ICMP error left, reported once by SO_ERROR, the next recv or send; and the IP_RECVERR queue.
     err: i32 = 0,
     errq: @import("errqueue_policy.zig").Queue = .{},
+    /// np->rxpmtu: the last IPV6_DONTFRAG refusal of an IPV6_RECVPATHMTU socket, for one recvmsg.
+    rxpmtu: @import("udp.zig").RxPmtu = .{},
 };
 
 var sockets: [MAX_SOCKETS]Socket = @splat(.{});
@@ -417,6 +419,23 @@ pub fn takeError(idx: u32, clear: bool) i32 {
     const e = sockets[idx].err;
     if (clear) sockets[idx].err = 0;
     return e;
+}
+
+/// ipv6_local_rxpmtu for a raw socket.
+pub fn setRxPmtu(idx: u32, n: @import("udp.zig").RxPmtu) void {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx < MAX_SOCKETS and sockets[idx].used) sockets[idx].rxpmtu = n;
+}
+
+/// ipv6_recv_rxpmtu for a raw socket: take the pending notice, or null.
+pub fn takeRxPmtu(idx: u32) ?@import("udp.zig").RxPmtu {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used or !sockets[idx].rxpmtu.valid) return null;
+    const n = sockets[idx].rxpmtu;
+    sockets[idx].rxpmtu = .{};
+    return n;
 }
 
 /// ipv6_local_error / ip_local_error: queue a locally raised error (EMSGSIZE) for an IP_RECVERR / IPV6_RECVERR socket.

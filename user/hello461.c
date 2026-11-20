@@ -16,7 +16,11 @@
  *      returns 0 bytes with msg_name [::1] port 0 and one 48-byte control message, SOL_IPV6 / IPV6_PATHMTU, holding a sockaddr_in6
  *      of ::1 and the MTU (at most 1500); the next recvmsg is EAGAIN; two refused sends leave only one notice;
  *   H. getsockopt(IPV6_PATHMTU): unconnected ENOTCONN; connected to [::1] it gives 32 bytes, the address left zero and the MTU (at
- *      most 1500); an optlen of 8 is EINVAL; an unconnected TCP socket ENOTCONN. */
+ *      most 1500); an optlen of 8 is EINVAL; an unconnected TCP socket ENOTCONN;
+ *   I. IPV6_PATHMTU on TCP: a connected client and the accepted socket give the MTU, the listener ENOTCONN; a raw ICMPv6 socket is
+ *      ENOTCONN until it connects to [::1], then gives the MTU;
+ *   J. a raw ICMPv6 socket with IPV6_DONTFRAG and IPV6_RECVPATHMTU: after a refused 3000-byte send, recvmsg returns 0 with one
+ *      48-byte IPV6_PATHMTU control message. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -36,6 +40,8 @@ static long setopt_(long s, int lv, int o, const void *v, int l) { return rc(set
 static long getint(long s, int lv, int o) { int v = -1; socklen_t l = 4; long r = rc(getsockopt((int)s, lv, o, &v, &l)); return r < 0 ? r : v; }
 static long getopt_(long s, int lv, int o, void *v, int *l) { socklen_t sl = (socklen_t)*l; long r = rc(getsockopt((int)s, lv, o, v, &sl)); *l = (int)sl; return r; }
 static long connect_(long s, const void *a, int l) { return rc(connect((int)s, a, (socklen_t)l)); }
+static long listen_(long s) { return rc(listen((int)s, 4)); }
+static long accept_(long s) { return rc(accept((int)s, 0, 0)); }
 static long sendmsg_(long s, void *m, int f) { return rc(sendmsg((int)s, m, f)); }
 static long recvmsg_(long s, void *m, int f) { return rc(recvmsg((int)s, m, f)); }
 static long open_(const char *p, int wr) { return rc(open(p, wr ? O_WRONLY : O_RDONLY)); }
@@ -54,6 +60,8 @@ static long setopt_(long s, int lv, int o, const void *v, int l) { return syscal
 static long getint(long s, int lv, int o) { int v = -1; int l = 4; long r = syscall5(133, s, lv, o, (long)&v, (long)&l); return r < 0 ? r : v; }
 static long getopt_(long s, int lv, int o, void *v, int *l) { return syscall5(133, s, lv, o, (long)v, (long)l); }
 static long connect_(long s, const void *a, int l) { return syscall3(124, s, (long)a, l); }
+static long listen_(long s) { return syscall2(119, s, 4); }
+static long accept_(long s) { return syscall3(120, s, 0, 0); }
 static long sendmsg_(long s, void *m, int f) { return syscall3(129, s, (long)m, f); }
 static long recvmsg_(long s, void *m, int f) { return syscall3(130, s, (long)m, f); }
 static long open_(const char *p, int wr) { return syscall3(9, (long)p, wr ? 1 : 0, 0); }
@@ -245,6 +253,40 @@ int main(void) {
     snprintf(msg, sizeof msg, "H: IPV6_PATHMTU unconnected %ld; connected %ld len %d address zero %d mtu %u; optlen 8 %ld; TCP %ld (-107; 0 32 1 <=1500; -22; -107)", h1, h2, h2len, zero_addr, hm, h3,
              h4);
     check(h1 == -107 && h2 == 0 && h2len == 32 && zero_addr && hm >= 1280 && hm <= 1500 && h3 == -22 && h4 == -107, msg);
+
+    unsigned char ta[28];
+    memcpy(ta, a, 28);
+    ta[2] = 4612 >> 8; ta[3] = 4612 & 0xff;
+    long tl = sock(10, 1, 0);
+    setopt_(tl, 1, 2, &one, 4);
+    bind_(tl, ta, 28);
+    listen_(tl);
+    long tc = sock(10, 1, 0);
+    long tcn = connect_(tc, ta, 28);
+    long tsv = accept_(tl);
+    unsigned int m1 = 0, m2 = 0, m3 = 0;
+    pl = 32; long i1 = getopt_(tc, 41, 61, pm, &pl); memcpy(&m1, pm + 28, 4);
+    pl = 32; long i2 = getopt_(tsv, 41, 61, pm, &pl); memcpy(&m2, pm + 28, 4);
+    pl = 32; long i3 = getopt_(tl, 41, 61, pm, &pl);
+    long rr = sock(10, 3, 58);
+    pl = 32; long i4 = getopt_(rr, 41, 61, pm, &pl);
+    connect_(rr, b, 28);
+    pl = 32; long i5 = getopt_(rr, 41, 61, pm, &pl); memcpy(&m3, pm + 28, 4);
+    snprintf(msg, sizeof msg, "I: TCP connect %ld accept %d; client %ld mtu %u, accepted %ld mtu %u, listener %ld; raw %ld, connected %ld mtu %u (0 1; 0 <=1500 0 <=1500 -107; -107 0 <=1500)",
+             tcn, tsv >= 0, i1, m1, i2, m2, i3, i4, i5, m3);
+    check(tcn == 0 && tsv >= 0 && i1 == 0 && m1 >= 1280 && m1 <= 1500 && i2 == 0 && m2 >= 1280 && m2 <= 1500 && i3 == -107 && i4 == -107 && i5 == 0 && m3 >= 1280 && m3 <= 1500, msg);
+
+    long jr = sock(10, 3, 58);
+    setopt_(jr, 41, 62, &one, 4);
+    setopt_(jr, 41, 60, &one, 4);
+    sendto_(jr, out, 3000, b, 28);
+    memset(gctl, 0, sizeof gctl);
+    memcpy(gh + 40, &gcl, 8);
+    long j1 = recvmsg_(jr, gh, 0x40);
+    long jcl; memcpy(&jcl, gh + 40, 8);
+    int jty; memcpy(&jty, gctl + 12, 4);
+    snprintf(msg, sizeof msg, "J: raw IPV6_RECVPATHMTU: recvmsg %ld controllen %ld type %d (0 48 61)", j1, jcl, jty);
+    check(j1 == 0 && jcl == 48 && jty == 61, msg);
 
     print(failures ? "hello461: FAIL\n" : "hello461: PASS\n");
     return failures ? 1 : 0;

@@ -666,6 +666,8 @@ fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
         if (bo.readU32Le(&lb) < 32) return -22;
         const peer: [16]u8 = switch (ref) {
             .udp => |port| @import("udp.zig").connectedPeer6(port) orelse return -107,
+            .tcp => |idx| @import("tcp.zig").tcpPeer6(idx) orelse return -107,
+            .raw => |idx| if (@import("raw_icmp.zig").isConnected(idx)) @import("raw_icmp.zig").peerAddr6(idx) else return -107,
             else => return -107,
         };
         var info: [32]u8 = @splat(0);
