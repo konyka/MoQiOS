@@ -15470,9 +15470,9 @@ test "ICMP errors for TCP (hello406): errno, the sequence window, hard in SYN_SE
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (!up.tcpSeqOk(seq, tcb.snd_una, tcb.snd_nxt)) return false;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.options.so_error != 0) return tcb.options.so_error;\n    if (tcb.reset_by_peer) return ECONNRESET;\n    if (tcb.fin_reset_err != 0) return tcb.fin_reset_err;\n    return tcb.soft_err;") != null);
     const ic = kt.icmp_source;
-    try std.testing.expect(std.mem.indexOf(u8, ic, "if (unreach.parseTcpQuote(data[0..len])) |tq| @import(\"tcp.zig\").icmpError(tq, unreach.tcpErrno(icmp_type, icmp_code), unreach.tcpReqAborts(icmp_type, icmp_code));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ic, "@import(\"tcp.zig\").icmpError(tq, unreach.tcpErrno(icmp_type, icmp_code), unreach.tcpReqAborts(icmp_type, icmp_code), .{") != null);
     const iv = kt.icmpv6_source;
-    try std.testing.expect(std.mem.indexOf(u8, iv, "if (unreach.parseTcpQuote6(data[0..len])) |tq| @import(\"tcp.zig\").icmpError6(tq, unreach.tcpErrno6(icmp_type, icmp_code), unreach.tcpReqAborts6(icmp_type, icmp_code));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, iv, "@import(\"tcp.zig\").icmpError6(tq, unreach.tcpErrno6(icmp_type, icmp_code), unreach.tcpReqAborts6(icmp_type, icmp_code), .{") != null);
 }
 
 test "listen backlog (hello406): the accept queue holds backlog + 1, clamped to somaxconn and the ring (Linux sk_acceptq_is_full)" {
@@ -17066,7 +17066,6 @@ test "an established TCP connection with IP_RECVERR takes an ICMP error as its p
     try std.testing.expect(!rp.liveErrorPending(.closed, 113));
     try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "if (takeLiveError(tcb)) |e| return e;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "up.tcpSoftIsHard(tcb.options.ip.recverr or tcb.options.ip.recverr6)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "cur.fd_table.fds[fd].fd_type == .tcp_socket) return -11;") != null);
 }
 
 test "clone's exit signal: any signal up to 64 or none, __WCLONE / __WALL choose the children, exec resets it (hello450)" {
@@ -17099,4 +17098,27 @@ test "clone's exit signal: any signal up to 64 or none, __WCLONE / __WALL choose
     try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "cur.setExitSignal(17);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "child.setExitSignal(clone_flags_policy.exitSignalOf(flags));") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "clone_flags_policy.clone3Flags(") != null);
+}
+
+test "IPv6 raw sockets hear ICMPv6 errors about what they sent: rawv6_err's conversion and IPV6_RECVERR (hello392 X)" {
+    const iu = kt.icmp_unreach_policy;
+    try std.testing.expect(!iu.rawErrorFor6(2, 0, false).hard);
+    try std.testing.expect(iu.rawErrorFor6(2, 0, true).hard);
+    try std.testing.expectEqual(@as(i32, 90), iu.rawErrorFor6(2, 0, false).errno);
+    try std.testing.expectEqual(@as(i32, 13), iu.rawErrorFor6(1, 1, false).errno);
+    try std.testing.expect(iu.rawErrorFor6(1, 4, false).hard);
+    try std.testing.expect(!iu.rawErrorFor6(1, 3, false).hard);
+    try std.testing.expect(!iu.rawErrorFor6(3, 0, false).hard);
+    try std.testing.expect(iu.rawErrorFor6(4, 1, false).hard);
+    try std.testing.expect(!iu.rawErrorFor6(100, 0, false).hard);
+    try std.testing.expect(std.mem.indexOf(u8, kt.raw_icmp_source, "pub fn notifyIcmpError6(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmpv6_source, "@import(\"raw_icmp.zig\").notifyIcmpError6(inner.nh,") != null);
+}
+
+test "a TCP connect an ICMP error ends with IP_RECVERR queues it for MSG_ERRQUEUE (hello406 Q)" {
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "pub fn tcpTakeQueuedError(tcb_idx: u32) ?@import(\"errqueue_policy.zig\").Entry {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (if (tcb.is_v6) tcb.options.ip.recverr6 else tcb.options.ip.recverr) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "t.errq_full = false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "net_mod.tcp.tcpTakeQueuedError(cur.fd_table.fds[fd].tcb_idx)") != null);
 }

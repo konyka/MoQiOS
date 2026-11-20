@@ -18,6 +18,11 @@
  *   W. an unconnected IPv6 ping socket with IPV6_RECVERR (SOL_IPV6 25) queues even soft errors (ping_err → ipv6_icmp_error): address
  *      unreachable (1/3) gives SO_ERROR 113 and recvmsg(MSG_ERRQUEUE) returns the 8 quoted echo-request bytes, msg_name [::1] port 0
  *      (28 bytes), IPV6_RECVERR (SOL_IPV6/25) with errno 113, origin 3, type 1, code 3; packet too big (soft for ping) gives 90.
+ *   X. a raw IPv6 socket of protocol 253 (raw6_icmp_error → rawv6_err): unconnected without IPV6_RECVERR it takes nothing; connected
+ *      it takes only hard errors (the U list without packet too big, which is hard only under IPV6_PMTUDISC_DO), port unreachable
+ *      fails the next recv once while send still works; with IPV6_RECVERR, unconnected, address unreachable is SO_ERROR 113 and
+ *      POLLERR, MSG_ERRQUEUE returns the 8 bytes after the quoted IPv6 header, msg_name [::1] port 0, errno 113 origin 3 type 1
+ *      code 3; packet too big is queued too (SO_ERROR 90).
  * The test sets net.ipv4.ping_group_range to "0 0" and puts the old value back at the end. */
 #ifdef HOST
 #define _GNU_SOURCE
@@ -35,6 +40,7 @@ static long rc(long r) { return r < 0 ? -errno : r; }
 static long rsock(void) { return rc(socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6)); }
 static long usock(void) { return rc(socket(AF_INET6, SOCK_DGRAM, 0)); }
 static long psock(void) { return rc(socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6)); }
+static long rsockp(int p) { return rc(socket(AF_INET6, SOCK_RAW, p)); }
 static long bind_(long s, const unsigned char *a) { return rc(bind((int)s, (const void *)a, 28)); }
 static long connect_(long s, const unsigned char *a) { return rc(connect((int)s, (const void *)a, 28)); }
 static long name_(long s, unsigned char *a) { socklen_t l = 28; return rc(getsockname((int)s, (void *)a, &l)); }
@@ -60,6 +66,7 @@ static long recvmsg_(long s, void *m, int fl) { return rc(recvmsg((int)s, m, fl)
 static long rsock(void) { return syscall3(117, 10, 3, 58); }
 static long usock(void) { return syscall3(117, 10, 2, 0); }
 static long psock(void) { return syscall3(117, 10, 2, 58); }
+static long rsockp(int p) { return syscall3(117, 10, 3, p); }
 static long bind_(long s, const unsigned char *a) { return syscall3(118, s, (long)a, 28); }
 static long connect_(long s, const unsigned char *a) { return syscall3(124, s, (long)a, 28); }
 static long name_(long s, unsigned char *a) { int l = 28; return syscall3(126, s, (long)a, (long)&l); }
@@ -117,6 +124,8 @@ static void inject(int type, int code, int proto, const unsigned char *l4, int d
 #define NK 15
 static const int kinds[NK][2] = { {1,0},{1,1},{1,2},{1,3},{1,4},{1,5},{1,6},{1,7},{2,0},{3,0},{4,0},{4,1},{4,2},{5,0},{100,0} };
 static const long want_udp[NK] = { 0, 13, 0, 0, 111, 13, 13, 71, 90, 0, 71, 71, 71, 0, 0 };
+/* rawv6_err on a connected raw socket: only hard errors (icmpv6_err_convert), packet too big hard only under IPV6_PMTUDISC_DO. */
+static const long want_raw[NK] = { 0, 13, 0, 0, 111, 13, 13, 71, 0, 0, 71, 71, 71, 0, 0 };
 static const long want_ping[NK] = { 0, 13, 0, 0, 111, 13, 13, 71, 0, 0, 71, 71, 71, 0, 0 };
 /* Every kind quoting `l4`; the SO_ERROR each leaves on `s` goes to `got`; returns how many matched `want` (or 0 when it is null). */
 static int sweep(long s, int proto, const unsigned char *l4, const long *want, long *got) {
@@ -270,6 +279,57 @@ int main(void) {
               wm.flags == 0x2000 && wlv == 41 && wty == 25 && werr == 113 && wctl[20] == 3 && wctl[21] == 1 && wctl[22] == 3 && wq == 90,
           msg);
     close_(pw);
+
+    unsigned char xl4[8] = { 0x68, 0x69, 0x21, 0, 0, 0, 0, 0 };
+    long xr = rsockp(253);
+    long xn[NK], xc_[NK];
+    int xnok = sweep(xr, 253, xl4, 0, xn);
+    long xc = connect_(xr, lo);
+    int xcok = sweep(xr, 253, xl4, want_raw, xc_);
+    char l3[200], l4[200];
+    list(l3, xn);
+    list(l4, xc_);
+    inject(1, 4, 253, xl4, 1);
+    long xrv = recv_(xr, sink, sizeof sink);
+    long xsd = send_(xr, xl4, 8);
+    snprintf(msg, sizeof msg, "X1: raw IPv6 253 %ld unconnected %s (%d of %d zero); connect %ld: %s (%d of %d); port unreachable recv %ld, send %ld (-111 8)", xr, l3,
+             xnok, NK, xc, l4, xcok, NK, xrv, xsd);
+    check(xr >= 0 && xnok == NK && xc == 0 && xcok == NK && xrv == -111 && xsd == 8, msg);
+    close_(xr);
+
+    long xq = rsockp(253);
+    long xo = setopt_(xq, 41, 25, 1);
+    inject(1, 3, 253, xl4, 1);
+    long xp = revents(xq);
+    long xe = soerr(xq);
+    memset(&wm, 0, sizeof wm);
+    memset(wname, 0xee, sizeof wname);
+    memset(wctl, 0, sizeof wctl);
+    memset(sink, 0, 64);
+    wm.name = wname;
+    wm.nl = sizeof wname;
+    wm.iov = &wio;
+    wm.iovlen = 1;
+    wm.ctl = wctl;
+    wm.ctllen = sizeof wctl;
+    long xm = recvmsg_(xq, &wm, 0x2000 | 0x40);
+    memcpy(&wlv, wctl + 8, 4);
+    memcpy(&wty, wctl + 12, 4);
+    memcpy(&werr, wctl + 16, 4);
+    int xquote = xm == 8 && memcmp(sink, xl4, 8) == 0;
+    int xo0 = wctl[20], xo1 = wctl[21], xo2 = wctl[22];
+    unsigned int xnl = wm.nl;
+    int xfl = wm.flags;
+    inject(2, 0, 253, xl4, 1);
+    long xt = soerr(xq);
+    long xtm = recvmsg_(xq, &wm, 0x2000 | 0x40);
+    snprintf(msg, sizeof msg, "X2: IPV6_RECVERR raw set %ld; POLLERR %d SO_ERROR %ld; errqueue %ld quote %d, namelen %u family %d last %d port %d, flags 0x%x, "
+             "[%d/%d] errno %d origin %d type %d code %d; packet too big SO_ERROR %ld, queued %ld (0; 1 113; 8 1, 28 10 1 0, 0x2000, [41/25] 113 3 1 3; 90 8)", xo,
+             (xp & 8) != 0, xe, xm, xquote, xnl, wname[0], wname[23], (wname[2] << 8) | wname[3], xfl, wlv, wty, werr, xo0, xo1, xo2, xt, xtm);
+    check(xo == 0 && (xp & 8) != 0 && xe == 113 && xquote && xnl == 28 && wname[0] == 10 && wname[23] == 1 && wname[2] == 0 && wname[3] == 0 &&
+              xfl == 0x2000 && wlv == 41 && wty == 25 && werr == 113 && xo0 == 3 && xo1 == 1 && xo2 == 3 && xt == 90 && xtm == 8,
+          msg);
+    close_(xq);
     close_(raw);
 
     long back = set_range(saved);

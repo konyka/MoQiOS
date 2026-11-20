@@ -122,8 +122,25 @@ pub fn handlePacketMeta(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: 
     const unreach = @import("icmp_unreach_policy.zig");
     if (unreach.isError6(icmp_type)) {
         if (icmp_type == PACKET_TOO_BIG) handlePacketTooBig(data, len);
+        // raw6_icmp_error: every raw socket of the quoted packet's next header (after its extension headers) that sent it. A redirect
+        // never gets here (it is type 137, informational).
+        if (len >= 8 + 40) {
+            const nh0 = data[8 + 6];
+            if (unreach.skipExtHdr6(data[8..len], 40, nh0)) |inner| {
+                if (8 + inner.off + 8 <= len) @import("raw_icmp.zig").notifyIcmpError6(inner.nh, data[8 + 8 ..][0..16].*, data[8 + 24 ..][0..16].*, icmp_type, icmp_code, bo.readU32BeAt(data, 4), src_ip, data[8..len], data[8 + inner.off .. len]);
+            }
+        }
         // An error quoting a TCP segment goes to its connection (tcp_v6_err).
-        if (unreach.parseTcpQuote6(data[0..len])) |tq| @import("tcp.zig").icmpError6(tq, unreach.tcpErrno6(icmp_type, icmp_code), unreach.tcpReqAborts6(icmp_type, icmp_code));
+        if (unreach.parseTcpQuote6(data[0..len])) |tq| {
+            const inner = unreach.skipExtHdr6(data[8..len], 40, data[8 + 6]).?;
+            @import("tcp.zig").icmpError6(tq, unreach.tcpErrno6(icmp_type, icmp_code), unreach.tcpReqAborts6(icmp_type, icmp_code), .{
+                .icmp_type = icmp_type,
+                .icmp_code = icmp_code,
+                .info = if (icmp_type == PACKET_TOO_BIG) bo.readU32BeAt(data, 4) else 0,
+                .offender = src_ip,
+                .l4 = data[8 + inner.off ..][0..8].*,
+            });
+        }
         const q = unreach.parseErrorQuote6(data[0..len]) orelse return;
         switch (q.kind) {
             // __udp6_lib_err: soft errors too, for a socket with IPV6_RECVERR (it queues them with the quoted payload).

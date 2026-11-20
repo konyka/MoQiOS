@@ -332,6 +332,38 @@ pub fn notifyIcmpError(protocol: u8, quoted_src: [4]u8, quoted_dst: [4]u8, icmp_
     for (notify[0..n]) |idx| @import("epoll.zig").epollNotify(.raw_socket, idx, @import("epoll.zig").EPOLLERR);
 }
 
+/// raw6_icmp_error → rawv6_err: as notifyIcmpError, for the IPv6 raw sockets of next header `nexthdr` that match the quoted packet
+/// (raw_v6_match). `quoted_ip` starts at the quoted IPv6 header, `quoted_l4` after its extension headers.
+pub fn notifyIcmpError6(nexthdr: u8, quoted_src: [16]u8, quoted_dst: [16]u8, icmp_type: u8, icmp_code: u8, info: u32, offender: [16]u8, quoted_ip: []const u8, quoted_l4: []const u8) void {
+    const errq = @import("errqueue_policy.zig");
+    var notify: [MAX_SOCKETS]u32 = undefined;
+    var n: usize = 0;
+    {
+        const saved = raw_lock.acquire();
+        defer raw_lock.release(saved);
+        for (&sockets, 0..) |*s, i| {
+            if (!s.used or !s.v6 or s.protocol != nexthdr) continue;
+            if (!policy.matches6(s.bound6, s.peer6, quoted_dst, quoted_src)) continue;
+            const recverr = s.opts.ip.recverr6;
+            if (!recverr and !s.connected) continue;
+            const conv = @import("icmp_unreach_policy.zig").rawErrorFor6(icmp_type, icmp_code, s.opts.ip.pmtudisc6 == 2);
+            if (recverr) {
+                var ent: errq.Entry = .{ .errno = conv.errno, .icmp_type = icmp_type, .icmp_code = icmp_code, .info = info, .offender = offender, .dst = quoted_dst, .dst_port = 0, .v6 = true };
+                const body = if (s.opts.ip.hdrincl) quoted_ip else quoted_l4;
+                const k = @min(body.len, errq.PAYLOAD_MAX);
+                ent.len = @intCast(k);
+                @memcpy(ent.payload[0..k], body[0..k]);
+                _ = s.errq.push(ent);
+            }
+            if (!(recverr or conv.hard)) continue;
+            s.err = conv.errno;
+            notify[n] = @intCast(i);
+            n += 1;
+        }
+    }
+    for (notify[0..n]) |idx| @import("epoll.zig").epollNotify(.raw_socket, idx, @import("epoll.zig").EPOLLERR);
+}
+
 /// The pending error, taken (sock_error: a recv or send reports it once) or only looked at (SO_ERROR's getsockopt peeks, then clears).
 pub fn takeError(idx: u32, clear: bool) i32 {
     const saved = raw_lock.acquire();

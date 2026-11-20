@@ -2298,9 +2298,13 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
     }
     const rf_tcp = @import("recv_flags_policy.zig");
     // Supported TCP recvmsg flags: MSG_OOB, MSG_PEEK, MSG_DONTWAIT, MSG_WAITALL.
-    // tcp_recvmsg → inet_recv_error: MSG_ERRQUEUE reads the error queue, which only a failed connect with IP_RECVERR fills on Linux
-    // (an established connection takes ICMP errors as sk_err); this stack keeps none for TCP, so it is always empty: EAGAIN.
-    if (flags & errq.MSG_ERRQUEUE != 0 and fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .tcp_socket) return -11;
+    // tcp_recvmsg → inet_recv_error: MSG_ERRQUEUE reads the error queue, which only a connect an ICMP error ended with IP_RECVERR
+    // fills (an established connection takes ICMP errors as sk_err); never blocking, EAGAIN when empty.
+    if (flags & errq.MSG_ERRQUEUE != 0 and fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .tcp_socket) {
+        var hdr: [56]u8 = undefined;
+        if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;
+        return recvErrqueueEntry(net_mod.tcp.tcpTakeQueuedError(cur.fd_table.fds[fd].tcb_idx) orelse return -11, msg_ptr, &hdr);
+    }
     if (flags & ~(urg.MSG_OOB | rf_tcp.MSG_PEEK | net_mod.tcp_recv_policy.MSG_DONTWAIT | rf_tcp.MSG_WAITALL) != 0) return -22;
     if (fd >= vfs_mod.MAX_FDS or cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
     if (flags & urg.MSG_OOB != 0) return tcpRecvmsgOob(cur.fd_table.fds[fd].tcb_idx, msg_ptr, flags);

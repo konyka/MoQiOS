@@ -213,7 +213,18 @@ pub fn handlePacketMeta(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u3
             }, data[8..len], data[8 + qihl .. len]);
         }
         // An error quoting a TCP segment goes to its connection (tcp_v4_err).
-        if (unreach.parseTcpQuote(data[0..len])) |tq| @import("tcp.zig").icmpError(tq, unreach.tcpErrno(icmp_type, icmp_code), unreach.tcpReqAborts(icmp_type, icmp_code));
+        if (unreach.parseTcpQuote(data[0..len])) |tq| {
+            var off: [16]u8 = @splat(0);
+            @memcpy(off[0..4], &src_ip);
+            const ihl: usize = @as(usize, data[8] & 0x0F) * 4;
+            @import("tcp.zig").icmpError(tq, unreach.tcpErrno(icmp_type, icmp_code), unreach.tcpReqAborts(icmp_type, icmp_code), .{
+                .icmp_type = icmp_type,
+                .icmp_code = icmp_code,
+                .info = if (icmp_type == 3 and icmp_code == 4) bo.readU16BeAt(data, 6) else 0,
+                .offender = off,
+                .l4 = data[8 + ihl ..][0..8].*,
+            });
+        }
         // A hard error goes to the connected UDP socket that sent the quoted datagram (udp_err), or to the connected ping socket
         // whose echo request it quotes (ping_err).
         const q = unreach.parseErrorQuote(data[0..len]) orelse return;

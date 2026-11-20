@@ -366,6 +366,10 @@ const TcpTcb = struct {
     /// The errno of the last ICMP error about an established connection (Linux sk_err_soft): SO_ERROR reports it once, and a
     /// retransmission timeout ends the connection with it instead of ETIMEDOUT (tcp_write_err).
     soft_err: i32 = 0,
+    /// The IP_RECVERR entry a connect ended by an ICMP error left (tcp_v4_err in SYN_SENT → ip_icmp_error): one at most, since a
+    /// connection fails once; recvmsg(MSG_ERRQUEUE) takes it.
+    errq_entry: @import("errqueue_policy.zig").Entry = .{},
+    errq_full: bool = false,
     /// A send found the ring full (Linux SOCK_NOSPACE): the ACK that frees enough of it sends O_ASYNC owners POLL_OUT once. Set under
     /// the same tcp_lock hold that found the ring full, so an ACK cannot slip in between and miss it.
     async_nospace: bool = false,
@@ -1053,6 +1057,7 @@ fn initTcbState(t: *TcpTcb) void {
     t.urg_send = false;
     t.refused = false;
     t.soft_err = 0;
+    t.errq_full = false;
     t.async_nospace = false;
     t.bound_explicitly = false;
     t.bound_dev6 = 0;
@@ -1220,24 +1225,28 @@ pub fn tcpPendingSoError(tcb_idx: u32) i32 {
 /// An ICMP error quoting an IPv4 segment this host sent (tcp_v4_err): `q` names the connection by its ports and addresses and
 /// carries the quoted sequence number; `err` is its errno (0: none, as for fragmentation needed, which icmp.zig handles as path
 /// MTU), `req_abort` whether a connection still waiting in a listener's queue is dropped.
-pub fn icmpError(q: @import("icmp_unreach_policy.zig").TcpQuote, err: i32, req_abort: bool) void {
+/// What an ICMP error carried, for the error-queue entry a failed connect with IP_RECVERR keeps: the ICMP type, code and info, its
+/// sender, and the quoted TCP header (8 bytes).
+pub const IcmpErrCtx = struct { icmp_type: u8, icmp_code: u8, info: u32 = 0, offender: [16]u8, l4: [8]u8 };
+
+pub fn icmpError(q: @import("icmp_unreach_policy.zig").TcpQuote, err: i32, req_abort: bool, ctx: IcmpErrCtx) void {
     const idx = blk: {
         const lock_flags = tcp_lock.acquire();
         defer tcp_lock.release(lock_flags);
         const tcb = findTcbByTuple(q.src4, q.src_port, q.dst_port, q.dst4) orelse return;
-        if (!applyIcmpError(tcb, q.seq, err, req_abort)) return;
+        if (!applyIcmpError(tcb, q.seq, err, req_abort, ctx)) return;
         break :blk tcbIdx(tcb);
     };
     @import("epoll.zig").epollNotify(.tcp_socket, idx, tcpReadiness(idx));
 }
 
 /// icmpError for an IPv6 segment (tcp_v6_err).
-pub fn icmpError6(q: @import("icmp_unreach_policy.zig").TcpQuote, err: i32, req_abort: bool) void {
+pub fn icmpError6(q: @import("icmp_unreach_policy.zig").TcpQuote, err: i32, req_abort: bool, ctx: IcmpErrCtx) void {
     const idx = blk: {
         const lock_flags = tcp_lock.acquire();
         defer tcp_lock.release(lock_flags);
         const tcb = findTcbByTupleV6(q.src, q.src_port, q.dst_port, q.dst) orelse return;
-        if (!applyIcmpError(tcb, q.seq, err, req_abort)) return;
+        if (!applyIcmpError(tcb, q.seq, err, req_abort, ctx)) return;
         break :blk tcbIdx(tcb);
     };
     @import("epoll.zig").epollNotify(.tcp_socket, idx, tcpReadiness(idx));
@@ -1248,7 +1257,7 @@ pub fn icmpError6(q: @import("icmp_unreach_policy.zig").TcpQuote, err: i32, req_
 /// what was quoted, an established one keeps `err` as its soft error. Ending the connection wakes its blocked callers
 /// (closeTcbRemote) and its O_ASYNC owner (POLL_ERR); so does an error an established connection with IP_RECVERR takes as its
 /// pending error. True when epoll should hear of it (the caller tells it after dropping tcp_lock).
-fn applyIcmpError(tcb: *TcpTcb, seq: u32, err: i32, req_abort: bool) bool {
+fn applyIcmpError(tcb: *TcpTcb, seq: u32, err: i32, req_abort: bool, ctx: IcmpErrCtx) bool {
     const up = @import("icmp_unreach_policy.zig");
     switch (up.tcpErrAction(tcb.state)) {
         .ignore => return false,
@@ -1275,6 +1284,16 @@ fn applyIcmpError(tcb: *TcpTcb, seq: u32, err: i32, req_abort: bool) bool {
                 return false;
             }
             tcb.options.so_error = err;
+            // ip_icmp_error / ipv6_icmp_error: with IP_RECVERR (IPV6_RECVERR) the failure is also queued, quoting the TCP header,
+            // msg_name the peer and its port.
+            if (if (tcb.is_v6) tcb.options.ip.recverr6 else tcb.options.ip.recverr) {
+                const errq = @import("errqueue_policy.zig");
+                var ent: errq.Entry = .{ .errno = err, .icmp_type = ctx.icmp_type, .icmp_code = ctx.icmp_code, .info = ctx.info, .offender = ctx.offender, .dst_port = tcb.remote_port, .v6 = tcb.is_v6, .len = 8 };
+                if (tcb.is_v6) ent.dst = tcb.remote_ip6 else @memcpy(ent.dst[0..4], &tcb.remote_ip);
+                @memcpy(ent.payload[0..8], &ctx.l4);
+                tcb.errq_entry = ent;
+                tcb.errq_full = true;
+            }
             noteFasync(tcbIdx(tcb), fcntl_policy.POLL_ERR);
             closeTcbRemote(tcb);
             return false;
@@ -3959,6 +3978,19 @@ fn absorbDataAckBeforeFin(tcb: *TcpTcb, ack_num: u32, window: u32) void {
         flushSendBufferForFin(tcb);
         resendFinIfRewound(tcb);
     }
+}
+
+/// recvmsg(MSG_ERRQUEUE) on a TCP socket: the entry a failed connect queued, once (sock_dequeue_err_skb then leaves sk_err 0: the
+/// connect failure was reported through it).
+pub fn tcpTakeQueuedError(tcb_idx: u32) ?@import("errqueue_policy.zig").Entry {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return null;
+    const tcb = &tcbs[tcb_idx];
+    if (!tcb.errq_full) return null;
+    tcb.errq_full = false;
+    if (tcb.options.so_error == tcb.errq_entry.errno) tcb.options.so_error = 0;
+    return tcb.errq_entry;
 }
 
 /// The pending error of a connection that is still open (an ICMP error an IP_RECVERR socket took as sk_err): a recv with nothing to

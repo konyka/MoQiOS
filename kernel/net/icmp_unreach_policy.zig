@@ -212,6 +212,13 @@ pub fn pingErrorFor6(icmp_type: u8, code: u8) struct { errno: i32, hard: bool } 
     return if (errorFor6(icmp_type, code)) |e| .{ .errno = e.errno, .hard = e.hard } else .{ .errno = 71, .hard = false };
 }
 
+/// rawv6_err's conversion (icmpv6_err_convert): as errorFor6 for the known types, except packet too big, hard only for a socket with
+/// IPV6_PMTUDISC_DO, and an unknown error type, a soft EPROTO.
+pub fn rawErrorFor6(icmp_type: u8, code: u8, pmtudisc_do: bool) struct { errno: i32, hard: bool } {
+    if (icmp_type == 2) return .{ .errno = 90, .hard = pmtudisc_do };
+    return if (errorFor6(icmp_type, code)) |e| .{ .errno = e.errno, .hard = e.hard } else .{ .errno = 71, .hard = false };
+}
+
 pub fn errnoFor6(icmp_type: u8, code: u8, ping: bool) i32 {
     return switch (icmp_type) {
         1 => if (code < unreach6_errno.len) (if (unreach6_errno[code].hard) unreach6_errno[code].errno else 0) else 71,

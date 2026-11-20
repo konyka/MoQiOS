@@ -14,8 +14,12 @@
  *   B. a blocking connect answered with host unreachable returns EHOSTUNREACH;
  *   S. an established connection gets a host unreachable quoting its last segment: SO_ERROR reads 113 once, then 0, and data still
  *      flows both ways;
+ *   Q. a connect with IP_RECVERR that host unreachable ends queues the error (tcp_v4_err → ip_icmp_error): POLLERR, MSG_ERRQUEUE
+ *      returns the 8 quoted TCP header bytes (the ports), msg_name the peer's port, IP_RECVERR errno 113 origin 2 type 3 code 1;
+ *      SO_ERROR then reads 0 (taking the entry cleared it), and the queue is empty after (EAGAIN);
  *   R. the same with IP_RECVERR set: the error becomes sk_err at once (tcp_v4_err): POLLERR, the next send fails with EHOSTUNREACH
- *      and SO_ERROR then reads 0, the send after that goes through; MSG_ERRQUEUE has nothing (EAGAIN); a second error quoting the
+ *      and SO_ERROR then reads 0, the send after that goes through; MSG_ERRQUEUE has nothing (EAGAIN: an established connection
+ *      queues nothing); a second error quoting the
  *      data segment fails the next recv once, then EAGAIN;
  *   V. IPv6, one connect per error, as listed; packet too big and a sequence number past snd_nxt leave it pending. */
 #ifdef HOST
@@ -304,6 +308,41 @@ int main(void) {
              "send %ld, peer got %ld; quoting that segment (%ld) recv %ld then %ld (0 0 1; 1 -11; -113 0 4 4; -113 -11)", rso, rcr, rp >= 0, rh, (int)((rpe & 8) != 0), rq, rs1, rse, rs2, rg, rd, rr1, rr2);
     check(rso == 0 && rcr == 0 && rp >= 0 && rh > 0 && (rpe & 8) != 0 && rq == -11 && rs1 == -113 && rse == 0 && rs2 == 4 && rg == 4 && rd > 0 && rr1 == -113 && rr2 == -11, msg);
     close_(rc_); close_(rp); close_(rl_);
+
+    long qs = sock(2, 1 | NONBLOCK, 0);
+    long qo = setopt_(qs, 0, 11, 1);
+    unsigned char qa[16];
+    mk4(qa, 40406);
+    drain(rt4);
+    connect_(qs, qa, 16);
+    long qn = grab(rt4, 0, 40406, 1);
+    int qsport = qn > 0 ? (seg[(seg[0] & 15) * 4] << 8 | seg[(seg[0] & 15) * 4 + 1]) : -1;
+    icmp4(3, 1, 1);
+    settle();
+    long qpe = poll_ev(qs);
+    unsigned char qb[64], qnm[16], qc[64];
+    memset(qb, 0, sizeof qb);
+    memset(qnm, 0xee, sizeof qnm);
+    memset(qc, 0, sizeof qc);
+    struct { void *b; unsigned long n; } qio = { qb, sizeof qb };
+    struct { void *name; unsigned int nl; int pad; void *iov; unsigned long iovlen; void *ctl; unsigned long ctllen; int flags; int pad2; } qm;
+    memset(&qm, 0, sizeof qm);
+    qm.name = qnm; qm.nl = sizeof qnm; qm.iov = &qio; qm.iovlen = 1; qm.ctl = qc; qm.ctllen = sizeof qc;
+    long qr = recvmsg_(qs, &qm, 0x2000 | 0x40);
+    int qerr, qlv, qty;
+    memcpy(&qlv, qc + 8, 4);
+    memcpy(&qty, qc + 12, 4);
+    memcpy(&qerr, qc + 16, 4);
+    int qport_ok = qr == 8 && (qb[0] << 8 | qb[1]) == qsport && (qb[2] << 8 | qb[3]) == 40406;
+    int qse = soerr(qs);
+    long qr2 = recvmsg_(qs, &qm, 0x2000 | 0x40);
+    snprintf(msg, sizeof msg, "Q: IP_RECVERR %ld; a connect ended by host unreachable: POLLERR %d; errqueue %ld (the quoted TCP header %d), name port %d, flags 0x%x, "
+             "[%d/%d] errno %d origin %d type %d code %d; SO_ERROR %d; errqueue again %ld (0 1; 8 1, 40406, 0x2000, [0/11] 113 2 3 1; 0; -11)",
+             qo, (int)((qpe & 8) != 0), qr, qport_ok, (qnm[2] << 8) | qnm[3], qm.flags, qlv, qty, qerr, qc[20], qc[21], qc[22], qse, qr2);
+    check(qo == 0 && (qpe & 8) != 0 && qr == 8 && qport_ok && ((qnm[2] << 8) | qnm[3]) == 40406 && qm.flags == 0x2000 && qlv == 0 && qty == 11 && qerr == 113 &&
+              qc[20] == 2 && qc[21] == 3 && qc[22] == 1 && qse == 0 && qr2 == -11,
+          msg);
+    close_(qs);
 
     static const int e6[][4] = { { 1, 4, 0, 111 }, { 1, 0, 0, 101 }, { 1, 3, 0, 113 }, { 1, 1, 0, 13 }, { 3, 0, 0, 113 }, { 4, 0, 0, 71 }, { 1, 7, 0, 71 }, { 2, 0, 0, 0 }, { 1, 4, 1000, 0 } };
     ok = rt6 >= 0 && ri6 >= 0 && L6 >= 0;
