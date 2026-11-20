@@ -5251,8 +5251,8 @@ test "an IPv6 UDP datagram leaves from its socket's bound address; NDP is sent a
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "    const our_ip = @import(\"tcp_port_policy.zig\").sourceAddr6(bound, dst_ip, if (is_loop) dst_ip else ndp.selectSourceAddress(dst_ip, our_mac));\n") != null);
     const ss = kt.socket_syscall_source;
-    try std.testing.expect(std.mem.indexOf(u8, ss, "if (udp.sendToV6From(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, oif6, &tmp6, @intCast(n6))) {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ss, "return if (udp.sendToV6FromOv(src6, dst6, dst_port6, src_key, oif6, payload.ptr, @intCast(n6), ov6.hops, ov6.tclass)) @intCast(n6) else -1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (udp.sendToV6FromOv(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, oif6, &tmp6, @intCast(n6), null, null, sndFlow6(src_key, flow6))) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "return if (udp.sendToV6FromOv(src6, dst6, dst_port6, src_key, oif6, payload.ptr, @intCast(n6), ov6.hops, ov6.tclass, flow)) @intCast(n6) else -1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "udp.sendToV6(dst6") == null);
     const iv = kt.icmpv6_source;
     try std.testing.expect(std.mem.indexOf(u8, iv, "pub const NDP_HOP_LIMIT: u8 = 255;\n") != null);
@@ -16161,8 +16161,8 @@ test "IPv6 UDP receive control messages IPV6_RECVPKTINFO / IPV6_RECVHOPLIMIT / I
     try std.testing.expect(cut.truncated);
     try std.testing.expectEqual(c.Wanted{ .pktinfo = true, .recvttl = false, .recvtos = true }, c.Wanted.of6(o));
 
-    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "pub fn handlePacketV6Meta(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32, ifindex: u8, hops: u8, tclass: u8) void {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketV6Meta(info6.src_ip, info6.dst_ip, data + up_start, up_len, ifindex, info6.hop_limit, info6.tclass);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "pub fn handlePacketV6Meta(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32, ifindex: u8, hops: u8, tclass: u8, flowinfo: u32) void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketV6Meta(info6.src_ip, info6.dst_ip, data + up_start, up_len, ifindex, info6.hop_limit, info6.tclass, info6.flowinfo);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "ip_cmsg_policy.build6(ip_cmsg_policy.Wanted.of6(opts_ip).withStamp(sol_flags), meta6, ctl_cap, &ctl_buf)") != null);
 }
 
@@ -16315,7 +16315,8 @@ test "IPv6 UDP sendmsg control messages IPV6_HOPLIMIT / IPV6_TCLASS / IPV6_PKTIN
     o = W.put(&b, o, 41, 11, &W.int(1), null);
     o = W.put(&b, o, 0, 2, &W.int(3), null);
     o = W.put(&b, o, 1, 1, &W.int(3), null);
-    try std.testing.expectEqual(c.Send6{ .dontfrag = true }, c.parseSend6(b[0..o], caps, ctx).ok);
+    // hello462: IPV6_FLOWINFO's label (here an int 1, so label 0x1000000 & 0xFFFFF = 0) is recorded too.
+    try std.testing.expectEqual(c.Send6{ .dontfrag = true, .flowlabel = 0 }, c.parseSend6(b[0..o], caps, ctx).ok);
     // EINVAL.
     const bad = [_]struct { ty: i32, d: []const u8 }{
         .{ .ty = 52, .d = &W.int(256) }, .{ .ty = 52, .d = &W.int(-2) }, .{ .ty = 52, .d = &.{5} },
@@ -17428,4 +17429,27 @@ test "getsockopt(IPV6_PATHMTU) answers a connected socket with only the MTU fill
     // hello461 I: TCP connections and connected raw sockets answer too.
     try std.testing.expect(std.mem.indexOf(u8, so, ".tcp => |idx| @import(\"tcp.zig\").tcpPeer6(idx) orelse return -107,") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, ".raw => |idx| if (@import(\"raw_icmp.zig\").isConnected(idx)) @import(\"raw_icmp.zig\").peerAddr6(idx) else return -107,") != null);
+}
+
+test "IPv6 flow labels: IPV6_FLOWINFO control message, IPV6_FLOWINFO_SEND with sin6_flowinfo, IPV6_FLOWINFO on receive (hello462)" {
+    const ipo = kt.ip_opt_policy;
+    const one = [4]u8{ 1, 0, 0, 0 };
+    try std.testing.expect(ipo.applySet(.{}, ipo.SOL_IPV6, ipo.IPV6_FLOWINFO_SEND, &one).ok.sndflow6);
+    try std.testing.expect(ipo.applySet(.{}, ipo.SOL_IPV6, ipo.IPV6_FLOWINFO, &one).ok.rxflow6);
+    var hdr: [40]u8 = @splat(0);
+    hdr[0] = 0x6a;
+    hdr[1] = 0xb0;
+    ipo.setFlowLabel6(&hdr, 0x12345);
+    try std.testing.expectEqual(@as(u8, 0x6a), hdr[0]);
+    try std.testing.expectEqual(@as(u8, 0xb1), hdr[1]);
+    try std.testing.expectEqual(@as(u8, 0x23), hdr[2]);
+    try std.testing.expectEqual(@as(u8, 0x45), hdr[3]);
+    var out: [64]u8 = undefined;
+    const c = kt.ip_cmsg_policy;
+    const b = c.build6(.{ .flowinfo = true }, .{ .flowinfo = 0xabcde }, 64, &out);
+    try std.testing.expectEqual(@as(usize, 24), b.written);
+    try std.testing.expectEqual(@as(i32, 11), std.mem.readInt(i32, out[12..16], .little));
+    try std.testing.expectEqual(@as(u32, 0xabcde), std.mem.readInt(u32, out[16..20], .big));
+    try std.testing.expectEqual(@as(usize, 0), c.build6(.{ .flowinfo = true }, .{}, 64, &out).written);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "const flow: ?u32 = ov6.flowlabel orelse sndFlow6(src_key, sin6_flow);") != null);
 }

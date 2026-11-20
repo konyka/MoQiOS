@@ -40,6 +40,8 @@ pub const Ipv6Info = struct {
     ecn_ce: bool = false,
     /// The whole Traffic Class byte, ECN bits included (IPV6_RECVTCLASS reports it as received).
     tclass: u8 = 0,
+    /// The first 4 bytes of the header less the version: traffic class and flow label (ip6_flowinfo, for IPV6_FLOWINFO).
+    flowinfo: u32 = 0,
 };
 
 /// Build a fixed 40-byte IPv6 header at `buf`.
@@ -88,6 +90,7 @@ pub fn parseHeader(data: [*]const u8) ?Ipv6Info {
         .payload_len = bo.readU16BeAt(data, 4),
         .ecn_ce = (tc & 0x03) == 0x03,
         .tclass = tc,
+        .flowinfo = bo.readU32BeAt(data, 0) & 0x0FFF_FFFF,
     };
 
     inline for (0..16) |i| info.src_ip[i] = data[8 + i];

@@ -110,7 +110,7 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
                     tcp.handlePacketV6(info6.src_ip, info6.dst_ip, data + up_start, up_len, info6.ecn_ce);
                 },
                 ipv6.PROTO_UDP => {
-                    udp.handlePacketV6Meta(info6.src_ip, info6.dst_ip, data + up_start, up_len, ifindex, info6.hop_limit, info6.tclass);
+                    udp.handlePacketV6Meta(info6.src_ip, info6.dst_ip, data + up_start, up_len, ifindex, info6.hop_limit, info6.tclass, info6.flowinfo);
                 },
                 // ip6_protocol_deliver_rcu: a next header with no handler that no raw socket took gets a parameter problem pointing at
                 // the next-header field that named it (the IPv6 header's, or the last extension header's).

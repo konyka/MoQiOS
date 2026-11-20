@@ -977,6 +977,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         if (is_v6) {
             var tmp6: [1452]u8 = undefined;
             const to_copy6 = @min(len, tmp6.len);
+            var flow6: u32 = 0;
             var dst6: [16]u8 = @splat(0);
             var dst_port6: u16 = 0;
             var scope6: u32 = 0;
@@ -989,6 +990,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
                 dst6 = parsed.addr;
                 dst_port6 = parsed.port;
                 scope6 = parsed.scope_id;
+                flow6 = parsed.flowinfo & 0xFFFFF;
             } else if (t.fd_table.fds[fd].udp_connected) {
                 dst6 = t.fd_table.fds[fd].udp_dst_ip6;
                 dst_port6 = t.fd_table.fds[fd].udp_dst_port;
@@ -1003,11 +1005,11 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
                 const big = bigStage(len) orelse return -105; // ENOBUFS
                 defer @import("../mm/slab.zig").kfree(big.ptr);
                 if (copy.copyFromUser(big, @ptrFromInt(buf), len) != len) return -14;
-                return if (udp.sendToV6From(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, oif6, big.ptr, @intCast(len))) @intCast(len) else -1;
+                return if (udp.sendToV6FromOv(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, oif6, big.ptr, @intCast(len), null, null, sndFlow6(src_key, flow6))) @intCast(len) else -1;
             }
             const n6 = copy.copyFromUser(&tmp6, @ptrFromInt(buf), to_copy6);
             if (n6 == 0) return -1;
-            if (udp.sendToV6From(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, oif6, &tmp6, @intCast(n6))) {
+            if (udp.sendToV6FromOv(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, oif6, &tmp6, @intCast(n6), null, null, sndFlow6(src_key, flow6))) {
                 return @intCast(n6);
             } else {
                 return -1;
@@ -1999,6 +2001,7 @@ fn udpSendBytesFull(fd: u32, payload: []const u8, full_len: usize, addr_ptr: u64
         var dst6: [16]u8 = @splat(0);
         var dst_port6: u16 = 0;
         var scope6: u32 = 0;
+        var sin6_flow: u32 = 0;
         if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
             if (addr_len < sa.SOCKADDR_IN6_LEN) return -22;
             var sa6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
@@ -2007,6 +2010,7 @@ fn udpSendBytesFull(fd: u32, payload: []const u8, full_len: usize, addr_ptr: u64
             dst6 = parsed.addr;
             dst_port6 = parsed.port;
             scope6 = parsed.scope_id;
+            sin6_flow = parsed.flowinfo & 0xFFFFF;
         } else if (d.udp_connected) {
             dst6 = d.udp_dst_ip6;
             dst_port6 = d.udp_dst_port;
@@ -2025,7 +2029,10 @@ fn udpSendBytesFull(fd: u32, payload: []const u8, full_len: usize, addr_ptr: u64
         const src6 = if (ov6.pktinfo and !std.mem.allEqual(u8, &ov6.src, 0)) ov6.src else d.udp_local_ip6;
         const unreach6 = bind_addr_policy.routeErrno6(dst6, oif6);
         if (unreach6 != 0) return unreach6;
-        return if (udp.sendToV6FromOv(src6, dst6, dst_port6, src_key, oif6, payload.ptr, @intCast(n6), ov6.hops, ov6.tclass)) @intCast(n6) else -1;
+        // udpv6_sendmsg: with IPV6_FLOWINFO_SEND sin6_flowinfo gives the flow label; an IPV6_FLOWINFO control message replaces it
+        // (ip6_datagram_send_ctl). Without either the label stays 0 (auto_flowlabels is off for an unconnected socket here).
+        const flow: ?u32 = ov6.flowlabel orelse sndFlow6(src_key, sin6_flow);
+        return if (udp.sendToV6FromOv(src6, dst6, dst_port6, src_key, oif6, payload.ptr, @intCast(n6), ov6.hops, ov6.tclass, flow)) @intCast(n6) else -1;
     }
     var dst_ip: [4]u8 = .{ 0, 0, 0, 0 };
     var dst_port: u16 = 0;
@@ -2062,6 +2069,12 @@ fn udpSendBytesFull(fd: u32, payload: []const u8, full_len: usize, addr_ptr: u64
 /// under IPV6_PMTUDISC_DO or PROBE.
 fn udpOversize6(key: u32, dst: [16]u8, dst_port: u16, len: usize) ?i64 {
     return udpOversize6Df(key, dst, dst_port, len, null);
+}
+
+/// The flow label a send's sin6_flowinfo gives (`label`, its low 20 bits) when the socket has IPV6_FLOWINFO_SEND, else null.
+fn sndFlow6(key: u32, label: u32) ?u32 {
+    const on = if (udp.getPortOpts(key)) |po| po.ip.sndflow6 else false;
+    return if (on and label != 0) label else null;
 }
 
 /// ipv6_recv_rxpmtu: no data, msg_name the destination (port 0), one IPV6_PATHMTU control message, msg_flags 0.

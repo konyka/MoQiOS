@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello461`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello462`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -456,6 +456,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello459 | 随机数生成器从中断时间重新播种：`/proc/randstats` 有 reseeds 和 pool_samples（A）；8 秒内熵池在变化（B）；开机两分钟内 8 秒内 reseeds 增加，之后要求开机以来已大于 0（C）；两次 getrandom 结果不同（D）。只在 MoQiOS 上运行（Linux 没有这个文件） |
 | hello460 | pidfd：PIDFD_NONBLOCK、PIDFD_THREAD 能打开，F_GETFL 为 0x802、0x82（A）；PIDFD_SELF_THREAD、PIDFD_SELF_THREAD_GROUP 把信号送给自己（B）；子进程运行时 poll 不就绪，退出后 POLLIN，waitid(P_PIDFD) 回收，回收后 POLLIN|POLLHUP（C）；不是 pidfd 为 EBADF（D）；NONBLOCK pidfd 上 waitid 在子进程运行时为 EAGAIN（E）；pidfd_getfd 复制子进程的管道读端（close-on-exec）并读到数据，flags 非 0、目标 fd 不存在、不是 pidfd、进程已回收分别为 EINVAL、EBADF、EBADF、ESRCH（F） |
 | hello461 | IPV6_DONTFRAG：开启后 3000 字节发送为 EMSGSIZE，开 IPV6_RECVERR 时错误队列有一条本地 EMSGSIZE、ee_info 为路径 MTU，1232 字节的数据报照发（A）；关闭后照常分片，值 2 读回 1，2 字节的 optval 设为 0（B）；IPV6_DONTFRAG 控制消息只作用于这一次发送（C）；raw ICMPv6 套接字同样拒绝（D）；IPv4 UDP 为 ENOPROTOOPT，IPv6 TCP 可以设置（E）；ping 套接字的拒绝也进错误队列（F）；IPV6_RECVPATHMTU 时拒绝后 recvmsg 返回 0 字节和一条 IPV6_PATHMTU 控制消息，只留一条（G）；getsockopt(IPV6_PATHMTU) 未连接为 ENOTCONN，已连接返回 32 字节、只填 MTU，optlen 不足 32 为 EINVAL（H）；TCP 客户端和 accept 得到的套接字返回 MTU、监听套接字 ENOTCONN，raw 套接字连接后返回 MTU（I）；raw ICMPv6 套接字的 IPV6_RECVPATHMTU 通知（J） |
+| hello462 | IPv6 流标签：接收端开 IPV6_FLOWINFO 后，无标签的数据报不带控制消息（A）；sendmsg 的 IPV6_FLOWINFO 控制消息 0xabcde 被接收端读到（B）；没开 IPV6_FLOWINFO_SEND 时 sin6_flowinfo 不生效，开了之后标签为 0x54321，带流量类别位也只取低 20 位（C）；两者都有时控制消息优先（D） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

@@ -30,6 +30,8 @@ pub const Wanted = struct {
     recvtos: bool = false,
     origdst: bool = false,
     stamp: Stamp = .none,
+    /// IPV6_FLOWINFO (rxflow): the received flowinfo, when it is not 0.
+    flowinfo: bool = false,
 
     pub fn of(o: ipo.IpOpts) Wanted {
         return .{ .pktinfo = o.pktinfo, .recvttl = o.recvttl, .recvtos = o.recvtos, .origdst = o.origdst };
@@ -37,7 +39,7 @@ pub const Wanted = struct {
 
     /// The IPv6 flags in the same slots: IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVTCLASS, IPV6_RECVORIGDSTADDR.
     pub fn of6(o: ipo.IpOpts) Wanted {
-        return .{ .pktinfo = o.pktinfo6, .recvttl = o.recvhops6, .recvtos = o.recvtclass6, .origdst = o.origdst6 };
+        return .{ .pktinfo = o.pktinfo6, .recvttl = o.recvhops6, .recvtos = o.recvtclass6, .origdst = o.origdst6, .flowinfo = o.rxflow6 };
     }
 
     /// `of` / `of6` plus the SOL_SOCKET timestamp flags (sockopt_policy.TS_FLAG / TSNS_FLAG in Stored.flags).
@@ -70,6 +72,8 @@ pub const RecvInfo6 = struct {
     tclass: u8 = 0,
     dst_port: u16 = 0,
     stamp_ns: u64 = 0,
+    /// Traffic class and flow label of the IPv6 header (ip6_flowinfo), for IPV6_FLOWINFO.
+    flowinfo: u32 = 0,
 };
 
 pub const Built = struct {
@@ -171,6 +175,11 @@ pub fn build6(w: Wanted, info: RecvInfo6, cap_in: usize, out: []u8) Built {
         var t: [4]u8 = undefined;
         std.mem.writeInt(i32, &t, info.tclass, .little);
         put(out, &used, cap, lv, @intCast(ipo.IPV6_TCLASS), &t, &truncated);
+    }
+    if (w.flowinfo and info.flowinfo != 0) {
+        var f: [4]u8 = undefined;
+        std.mem.writeInt(u32, &f, info.flowinfo, .big);
+        put(out, &used, cap, lv, IPV6_FLOWINFO, &f, &truncated);
     }
     if (w.origdst) {
         // A struct sockaddr_in6 (family, port, flowinfo 0, address, scope 0), after the other IPv6 messages.
@@ -386,6 +395,8 @@ pub const Ctx6 = struct {
 pub const Send6 = struct {
     /// IPV6_DONTFRAG of this datagram (null: the socket's).
     dontfrag: ?bool = null,
+    /// The flow label of an IPV6_FLOWINFO control message (its network-order value, host order here; null: none).
+    flowlabel: ?u32 = null,
     hops: ?u8 = null,
     tclass: ?u8 = null,
     pktinfo: bool = false,
@@ -492,7 +503,11 @@ fn datagramSendCtl6(control: []const u8, caps: SendCaps, ctx: Ctx6) Send6Result 
                     out.src = addr;
                 }
             },
-            IPV6_FLOWINFO => if (m.data.len < 4) return .{ .err = -22 },
+            IPV6_FLOWINFO => {
+                if (m.data.len < 4) return .{ .err = -22 };
+                // The value is a __be32 flowinfo; the label is its low 20 bits (ip6_datagram_send_ctl, ip6_make_flowlabel).
+                out.flowlabel = (@as(u32, m.data[0]) << 24 | @as(u32, m.data[1]) << 16 | @as(u32, m.data[2]) << 8 | m.data[3]) & 0xFFFFF;
+            },
             IPV6_2292HOPLIMIT, @as(i32, @intCast(ipo.IPV6_HOPLIMIT)) => {
                 const v = int6(m) orelse return .{ .err = -22 };
                 out.hops = if (v < 0) null else @intCast(v);

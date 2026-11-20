@@ -1276,13 +1276,13 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
 
 /// handlePacketV6 for a datagram that arrived on interface `ifindex` (1 lo, 2 the NIC).
 pub fn handlePacketV6On(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32, ifindex: u8) void {
-    handlePacketV6Meta(src_ip, dst_ip, data, len, ifindex, ipv6.DEFAULT_HOP_LIMIT, 0);
+    handlePacketV6Meta(src_ip, dst_ip, data, len, ifindex, ipv6.DEFAULT_HOP_LIMIT, 0, 0);
 }
 
 /// handlePacketV6On with the IPv6 header's hop limit and traffic class, kept with the datagram for IPV6_RECVHOPLIMIT /
 /// IPV6_RECVTCLASS (and the destination and interface for IPV6_RECVPKTINFO).
-pub fn handlePacketV6Meta(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32, ifindex: u8, hops: u8, tclass: u8) void {
-    const meta6: ip_cmsg_policy.RecvInfo6 = .{ .ifindex = ifindex, .dst = dst_ip, .hops = hops, .tclass = tclass };
+pub fn handlePacketV6Meta(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32, ifindex: u8, hops: u8, tclass: u8, flowinfo: u32) void {
+    const meta6: ip_cmsg_policy.RecvInfo6 = .{ .ifindex = ifindex, .dst = dst_ip, .hops = hops, .tclass = tclass, .flowinfo = flowinfo };
     const hdr = udp_util.parseHeader(data, len) orelse return;
     if (hdr.udp_len < udp_util.HEADER_LEN or hdr.udp_len > len) return;
 
@@ -1591,7 +1591,7 @@ pub fn sendToFromOv(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, da
 /// ip6_fragment for a UDP datagram over `mtu`: the UDP datagram (header and checksum included) is cut into pieces of (mtu - 40 - 8)
 /// rounded down to 8 bytes, each behind the IPv6 header (next header 44) and a Fragment header (next header UDP, the offset, M on all
 /// but the last, one id for the whole datagram). The datagram is staged in a kmalloc buffer.
-fn sendFragmented6(our_ip: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, oif: u8, payload: []const u8, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, is_loop: bool, wait_hop6: ?[16]u8, hops_ov: ?u8, tclass_ov: ?u8) bool {
+fn sendFragmented6(our_ip: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, oif: u8, payload: []const u8, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, is_loop: bool, wait_hop6: ?[16]u8, hops_ov: ?u8, tclass_ov: ?u8, flow_ov: ?u32) bool {
     _ = oif;
     const slab = @import("../mm/slab.zig");
     const total: usize = 8 + payload.len;
@@ -1623,6 +1623,7 @@ fn sendFragmented6(our_ip: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, 
             pkt[14] = (pkt[14] & 0xF0) | (tc >> 4);
             pkt[15] = (pkt[15] & 0x0F) | (tc << 4);
         }
+        if (flow_ov) |fl| ip_opt_policy.setFlowLabel6(pkt[14..][0..40], fl);
         const fh = 14 + ipv6.HEADER_LEN;
         pkt[fh] = PROTO_UDP6;
         pkt[fh + 1] = 0;
@@ -1703,12 +1704,12 @@ pub fn sendToV6(dst_ip: [16]u8, dst_port: u16, src_port: u16, data: [*]const u8,
 /// are that socket's own, also when other sockets share its port. `oif` is the interface it leaves through (sendOif6, 0 for the
 /// default route); a group copy looped back to this host arrives on it.
 pub fn sendToV6From(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, oif: u8, data: [*]const u8, data_len: u16) bool {
-    return sendToV6FromOv(bound, dst_ip, dst_port, src_key, oif, data, data_len, null, null);
+    return sendToV6FromOv(bound, dst_ip, dst_port, src_key, oif, data, data_len, null, null, null);
 }
 
 /// sendToV6From with sendmsg's IPV6_HOPLIMIT / IPV6_TCLASS control messages: `hops_ov` replaces the hop limit (the multicast one
 /// too; 0 is a hop limit) and `tclass_ov` the whole traffic class byte, ECN bits included, for this datagram only.
-pub fn sendToV6FromOv(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, oif: u8, data: [*]const u8, data_len: u16, hops_ov: ?u8, tclass_ov: ?u8) bool {
+pub fn sendToV6FromOv(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, oif: u8, data: [*]const u8, data_len: u16, hops_ov: ?u8, tclass_ov: ?u8, flow_ov: ?u32) bool {
     if (data_len > MAX_UDP_PAYLOAD_BIG6) return false;
     const src_port = portNumber(src_key);
 
@@ -1733,7 +1734,7 @@ pub fn sendToV6FromOv(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32
     // (ip6_fragment); the caller already refused it under IPV6_PMTUDISC_DO / PROBE.
     const mtu6 = ipv6.getSendMtu(dst_ip);
     if (ipv6.HEADER_LEN + @as(u32, udp_total) > mtu6) {
-        return sendFragmented6(our_ip, dst_ip, dst_port, src_key, oif, data[0..data_len], mtu6, dst_mac, our_mac, is_loop, wait_hop6, hops_ov, tclass_ov);
+        return sendFragmented6(our_ip, dst_ip, dst_port, src_key, oif, data[0..data_len], mtu6, dst_mac, our_mac, is_loop, wait_hop6, hops_ov, tclass_ov, flow_ov);
     }
 
     // Stack-local frame buffer: concurrent sends on other CPUs must not tear it.
@@ -1762,6 +1763,8 @@ pub fn sendToV6FromOv(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32
         send_pkt[14] = (send_pkt[14] & 0xF0) | (tc >> 4);
         send_pkt[15] = (send_pkt[15] & 0x0F) | (tc << 4);
     }
+    // The flow label an IPV6_FLOWINFO control message or (with IPV6_FLOWINFO_SEND) sin6_flowinfo gives (ip6_make_flowlabel).
+    if (flow_ov) |fl| ip_opt_policy.setFlowLabel6(send_pkt[14..][0..40], fl);
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + udp_total);
     // IPV6_MULTICAST_LOOP: when this host is a member of the group on the outgoing interface a copy is delivered locally too,
     // arriving on that interface (Linux ip6_finish_output2 checks ipv6_chk_mcast_addr on the device).

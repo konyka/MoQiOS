@@ -45,6 +45,9 @@ pub const IPV6_DONTFRAG: u64 = 62;
 /// connected socket) reads the path MTU.
 pub const IPV6_RECVPATHMTU: u64 = 60;
 pub const IPV6_PATHMTU: u64 = 61;
+/// IPV6_FLOWINFO_SEND: a send's sin6_flowinfo gives the packet's flow label (np->sndflow).
+pub const IPV6_FLOWINFO_SEND: u64 = 33;
+pub const IPV6_FLOWINFO: u64 = 11;
 pub const IPV6_MULTICAST_IF: u64 = 17;
 pub const IPV6_MULTICAST_HOPS: u64 = 18;
 pub const IPV6_MULTICAST_LOOP: u64 = 19;
@@ -103,6 +106,9 @@ pub const IpOpts = struct {
     pmtudisc6: u8 = PMTUDISC_WANT,
     dontfrag6: bool = false,
     rxpmtu6: bool = false,
+    sndflow6: bool = false,
+    /// IPV6_FLOWINFO (rxflow): received datagrams bring their flowinfo as a control message.
+    rxflow6: bool = false,
 };
 
 pub const Family = enum { v4, v6 };
@@ -229,6 +235,8 @@ pub fn applySet(cur: IpOpts, level: u64, optname: u64, val: []const u8) SetResul
                 o.pmtudisc6 = @intCast(v);
             },
             IPV6_RECVPATHMTU => o.rxpmtu6 = v != 0,
+            IPV6_FLOWINFO_SEND => o.sndflow6 = v != 0,
+            IPV6_FLOWINFO => o.rxflow6 = v != 0,
             IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVTCLASS, IPV6_RECVORIGDSTADDR, IPV6_RECVERR => {
                 if (val.len < 4) return .{ .err = -22 };
                 switch (optname) {
@@ -338,6 +346,8 @@ pub fn getValue(o: IpOpts, level: u64, optname: u64) ?i32 {
             IPV6_MTU_DISCOVER => o.pmtudisc6,
             IPV6_DONTFRAG => @intFromBool(o.dontfrag6),
             IPV6_RECVPATHMTU => @intFromBool(o.rxpmtu6),
+            IPV6_FLOWINFO_SEND => @intFromBool(o.sndflow6),
+            IPV6_FLOWINFO => @intFromBool(o.rxflow6),
             else => null,
         },
         else => null,
@@ -387,6 +397,14 @@ pub fn patchIpv4(hdr: *[20]u8, o: IpOpts, csum: *const fn ([*]const u8, u16) u16
     hdr[10] = 0;
     hdr[11] = 0;
     std.mem.writeInt(u16, hdr[10..12], csum(hdr, 20), .big);
+}
+
+/// Write the 20-bit flow label (the low bits of `label`, network order already decoded) into an IPv6 header.
+pub fn setFlowLabel6(hdr: *[40]u8, label: u32) void {
+    const l = label & 0xFFFFF;
+    hdr[1] = (hdr[1] & 0xF0) | @as(u8, @intCast(l >> 16));
+    hdr[2] = @truncate(l >> 8);
+    hdr[3] = @truncate(l);
 }
 
 /// Set an IPv4 header's TTL (byte 8) and recompute its checksum.

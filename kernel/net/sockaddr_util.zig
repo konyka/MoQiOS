@@ -22,6 +22,8 @@ pub const Inet6 = struct {
     port: u16,
     addr: [16]u8,
     scope_id: u32 = 0,
+    /// sin6_flowinfo, host order (it is stored big-endian).
+    flowinfo: u32 = 0,
 };
 
 fn readFamilyLe(buf: []const u8) u16 {
@@ -57,6 +59,7 @@ pub fn parseInet6(buf: []const u8) ?Inet6 {
         .port = bo.readU16BeAt(buf.ptr, 2),
         .addr = addr,
         .scope_id = scope,
+        .flowinfo = @as(u32, buf[4]) << 24 | @as(u32, buf[5]) << 16 | @as(u32, buf[6]) << 8 | buf[7],
     };
 }
 
