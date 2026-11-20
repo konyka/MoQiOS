@@ -12,6 +12,8 @@
 pub const P_ALL: u32 = 0;
 pub const P_PID: u32 = 1;
 pub const P_PGID: u32 = 2;
+/// The id is a pidfd: the child it names (kernel_waitid_prepare → pidfd_get_pid).
+pub const P_PIDFD: u32 = 3;
 
 pub const WNOHANG: u32 = 0x1;
 pub const WSTOPPED: u32 = 0x2;

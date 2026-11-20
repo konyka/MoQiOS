@@ -828,9 +828,10 @@ test "clone accepts pthread-style CLONE_THREAD only inside a shared address spac
     try std.testing.expect(!p.valid(p.CLONE_VM | p.CLONE_FS | p.CLONE_FILES | p.CLONE_THREAD, true));
 }
 
-test "pidfd_open accepts only zero flags" {
+test "pidfd_open accepts only PIDFD_NONBLOCK and PIDFD_THREAD (hello460 A; zero flags only before it)" {
     try std.testing.expect(pidfd_policy.flagsValid(0));
     try std.testing.expect(!pidfd_policy.flagsValid(1));
+    try std.testing.expect(pidfd_policy.flagsValid(pidfd_policy.PIDFD_NONBLOCK | pidfd_policy.PIDFD_THREAD));
 }
 
 test "pidfd_send_signal validates signal and flags" {
@@ -16720,7 +16721,8 @@ test "pidfd_send_signal reads its siginfo and its scope flags (hello437)" {
     const f = std.mem.indexOf(u8, se, "fn syscallPidfdSendSignal(").?;
     const f_end = std.mem.indexOf(u8, se[f..], "\n}\n").? + f;
     try std.testing.expect(std.mem.indexOf(u8, se[f..f_end], "_ = info_ptr;") == null);
-    try std.testing.expect(std.mem.indexOf(u8, se[f..f_end], "signal_syscall_mod.pidfdSendSignal(target_tid, sig, info_ptr, flags)") != null);
+    // hello460: the flags passed on are eff_flags (a PIDFD_THREAD descriptor defaults to the thread scope).
+    try std.testing.expect(std.mem.indexOf(u8, se[f..f_end], "signal_syscall_mod.pidfdSendSignal(target_tid, sig, info_ptr, eff_flags)") != null);
 }
 
 test "madvise MADV_DONTFORK / MADV_DOFORK: a fork child does not get a DONTFORK mapping (hello438)" {
@@ -17357,4 +17359,22 @@ test "/proc/randstats reports the generator's reseeds and pool samples (hello459
     try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, "\"irqwindow\", \"lostats\", \"tcpstats\", \"randstats\" };") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".randstats => generateRandStats(buf, max_len),") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "} else if (str.eql(rest, \"randstats\")) {") != null);
+}
+
+test "pidfd: PIDFD_SELF values, a thread pidfd's scope, pidfd_poll and waitid(P_PIDFD) (hello460)" {
+    const se = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, se, "switch (pp.selfValue(@bitCast(pidfd))) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, ".status_flags = pp.statusFlags(flags),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "if (flags & pp.PIDFD_THREAD == 0 and target.is_thread) return -2;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.epoll_source, "revents |= @import(\"../proc/pidfd_policy.zig\").pollEvents(st != .gone, st == .zombie);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.waitpid_source, "const req = if (idtype == wid.P_PIDFD) blk: {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.waitpid_source, "if (pidfd_nonblock and res == 0 and !found) return -11;") != null);
+}
+
+test "pidfd_getfd copies the target's descriptor close-on-exec after a ptrace-access check (hello460 F)" {
+    const se = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, se, "return -95; // EOPNOTSUPP\n}\n\n/// swapon") == null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "const copy = vfs.snapshotForPassing(target.fd_table, targetfd) orelse return -9;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "if (vfs.installPassed(cur.fd_table, copy, true)) |slot| return @intCast(slot);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "!pvp.mayAccess(ids.of(cur), ids.of(target), cur.effective_caps.cap_sys_ptrace)) return -1;") != null);
 }

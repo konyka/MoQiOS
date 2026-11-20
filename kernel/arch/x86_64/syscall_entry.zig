@@ -1234,6 +1234,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         224 => { // pidfd_send_signal(pidfd, sig, info, flags)
             frame.rax = @bitCast(syscallPidfdSendSignal(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, @truncate(frame.r10)));
+            // A signal to the caller itself (PIDFD_SELF_*, its own pidfd) is delivered before the call returns, as kill's is.
+            checkSignalsOnSyscallReturn(frame);
         },
         225 => { // signalfd4(old_fd, mask, sizemask, flags)
             frame.rax = @bitCast(signal_syscall_mod.signalfd4(frame.rdi, frame.rsi, frame.rdx, frame.r10));
@@ -1649,6 +1651,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         316 => { // pidfd_send_signal(pidfd, sig, info, flags) — signal via pidfd
             frame.rax = @bitCast(syscallPidfdSendSignal(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, @truncate(frame.r10)));
+            // A signal to the caller itself (PIDFD_SELF_*, its own pidfd) is delivered before the call returns, as kill's is.
+            checkSignalsOnSyscallReturn(frame);
         },
         317 => { // pidfd_getfd(pidfd, targetfd, flags) — steal fd from another process
             frame.rax = @bitCast(syscallPidfdGetfd(@truncate(frame.rdi), @truncate(frame.rsi), @truncate(frame.rdx)));
@@ -2136,9 +2140,13 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         },
         334 => { // pidfd_send_signal(pidfd, sig, info, flags) — alias of #316
             frame.rax = @bitCast(syscallPidfdSendSignal(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, @truncate(frame.r10)));
+            // A signal to the caller itself (PIDFD_SELF_*, its own pidfd) is delivered before the call returns, as kill's is.
+            checkSignalsOnSyscallReturn(frame);
         },
         424 => { // pidfd_send_signal(pidfd, sig, info, flags) — Linux standard #424
             frame.rax = @bitCast(syscallPidfdSendSignal(@truncate(frame.rdi), @truncate(frame.rsi), frame.rdx, @truncate(frame.r10)));
+            // A signal to the caller itself (PIDFD_SELF_*, its own pidfd) is delivered before the call returns, as kill's is.
+            checkSignalsOnSyscallReturn(frame);
         },
         425 => { // io_uring_setup(entries, params) — Linux standard #425 (ENOSYS)
             frame.rax = @bitCast(@as(i64, -38)); // ENOSYS: io_uring not yet supported
@@ -6185,12 +6193,15 @@ fn syscallCloseRange(first: u32, last: u32, flags: u32) i64 {
 /// pidfd_open(pid, flags) — open a pid file descriptor.
 /// Simplified: allocates a proc_file fd that references the target task's tid.
 fn syscallPidfdOpen(pid: u32, flags: u32) i64 {
-    if (!@import("../../proc/pidfd_policy.zig").flagsValid(flags)) return -22; // EINVAL
+    const pp = @import("../../proc/pidfd_policy.zig");
+    if (!pp.flagsValid(flags)) return -22; // EINVAL
     const sched = @import("../../proc/sched.zig");
     const tm = @import("../../proc/task.zig");
 
     // Verify target exists
     const target = findTaskByPid(pid) orelse return -3; // ESRCH
+    // pidfd_open: without PIDFD_THREAD the pid must lead its thread group (a thread's own tid is ENOENT).
+    if (flags & pp.PIDFD_THREAD == 0 and target.is_thread) return -2;
 
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = tm.getTask(cur_idx) orelse return -1;
@@ -6200,6 +6211,8 @@ fn syscallPidfdOpen(pid: u32, flags: u32) i64 {
     cur.fd_table.fds[fd_slot] = .{
         .fd_type = .pidfd,
         .proc_pid = target.tid,
+        // F_GETFL reads O_RDWR plus PIDFD_NONBLOCK / PIDFD_THREAD; the thread bit scopes pidfd_send_signal, the other waitid.
+        .status_flags = pp.statusFlags(flags),
     };
     cur.fd_table.publishFd(fd_slot);
     return @intCast(fd_slot);
@@ -6216,6 +6229,14 @@ fn syscallPidfdSendSignal(pidfd: u32, sig: u32, info_ptr: u64, flags: u32) i64 {
     const cur_idx = sched.currentTaskIndex() orelse return -1;
     const cur = tm.getTask(cur_idx) orelse return -1;
 
+    const pp = @import("../../proc/pidfd_policy.zig");
+    const sp = @import("../../proc/pidfd_signal_policy.zig");
+    // PIDFD_SELF_THREAD / PIDFD_SELF_THREAD_GROUP name the caller without a descriptor; the scope follows unless flags give one.
+    switch (pp.selfValue(@bitCast(pidfd))) {
+        .thread => return signal_syscall_mod.pidfdSendSignal(cur.tid, sig, info_ptr, if (flags == 0) sp.PIDFD_SIGNAL_THREAD else flags),
+        .group => return signal_syscall_mod.pidfdSendSignal(if (cur.is_thread and cur.parent_tid != 0) cur.parent_tid else cur.tid, sig, info_ptr, flags),
+        .none => {},
+    }
     if (pidfd >= cur.fd_table.fds.len) return -9; // EBADF
     const fd = &cur.fd_table.fds[pidfd];
     if (fd.fd_type != .pidfd) return -9;
@@ -6223,17 +6244,38 @@ fn syscallPidfdSendSignal(pidfd: u32, sig: u32, info_ptr: u64, flags: u32) i64 {
     const target_tid: u32 = fd.proc_pid;
     // Verify target exists
     _ = findTaskByPid(target_tid) orelse return -3;
+    // A PIDFD_THREAD descriptor signals its thread by default (the scope inferred from f_flags).
+    const eff_flags = if (flags == 0 and fd.status_flags & pp.PIDFD_THREAD != 0) sp.PIDFD_SIGNAL_THREAD else flags;
     // Holding a pidfd grants no signal permission: the same gate as kill/tkill, inside pidfdSendSignal.
-    return signal_syscall_mod.pidfdSendSignal(target_tid, sig, info_ptr, flags);
+    return signal_syscall_mod.pidfdSendSignal(target_tid, sig, info_ptr, eff_flags);
 }
 
-/// pidfd_getfd(pidfd, targetfd, flags) — get fd from another process.
-/// Simplified: not supported (requires fd table sharing).
+/// pidfd_getfd(pidfd, targetfd, flags) — a copy of another process's descriptor `targetfd`, installed close-on-exec in the caller
+/// (kernel/pid.c pidfd_getfd → __pidfd_fget, receive_fd). flags must be 0; the caller needs ptrace access to the target (the
+/// same check as process_vm_readv: matching real ids, or CAP_SYS_PTRACE); a closed target descriptor is EBADF, a gone process ESRCH.
 fn syscallPidfdGetfd(pidfd: u32, targetfd: u32, flags: u32) i64 {
-    _ = pidfd;
-    _ = targetfd;
-    _ = flags;
-    return -95; // EOPNOTSUPP
+    if (flags != 0) return -22;
+    const sched = @import("../../proc/sched.zig");
+    const tm = @import("../../proc/task.zig");
+    const vfs = @import("../../fs/vfs.zig");
+    const pvp = @import("../../mm/process_vm_policy.zig");
+    const cur_idx = sched.currentTaskIndex() orelse return -1;
+    const cur = tm.getTask(cur_idx) orelse return -1;
+    if (pidfd >= cur.fd_table.fds.len) return -9;
+    const pd = &cur.fd_table.fds[pidfd];
+    if (pd.fd_type != .pidfd) return -9;
+    const target = findTaskByPid(pd.proc_pid) orelse return -3; // ESRCH
+    const ids = struct {
+        fn of(t: *const tm.Task) pvp.Ids {
+            return .{ .uid = t.uid, .euid = t.euid, .suid = t.suid, .gid = t.gid, .egid = t.egid, .sgid = t.sgid };
+        }
+    };
+    if (target != cur and !pvp.mayAccess(ids.of(cur), ids.of(target), cur.effective_caps.cap_sys_ptrace)) return -1; // EPERM
+    if (targetfd >= vfs.MAX_FDS) return -9;
+    const copy = vfs.snapshotForPassing(target.fd_table, targetfd) orelse return -9;
+    if (vfs.installPassed(cur.fd_table, copy, true)) |slot| return @intCast(slot);
+    vfs.releaseDescriptor(&copy);
+    return -24; // EMFILE
 }
 
 /// swapon(path, flags) — enable swap on an explicitly named block device.

@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello459`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello460`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -454,6 +454,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello457 | `/dev/random`、`/dev/urandom` 的读写：一次读 5000 字节和 100000 字节都整段返回且不全为 0（R）；O_RDWR 打开后写 5000 字节返回 5000、写 0 字节返回 0，只读描述符上写为 EBADF（W）；写过之后照常读（S） |
 | hello458 | recvmmsg 中途出错：第二条的缓冲区未映射时返回已收到的 1 条，SO_ERROR 读到 EFAULT 一次（A）；之后的 recv 先报 EFAULT，再收到剩下的数据报（B）；第一条就出错时返回 EFAULT，不留待处理错误（C）；AF_UNIX 数据报套接字上同样保存待处理错误，recvmsg 到坏缓冲返回 EFAULT 并丢掉那条数据报（D）；AF_UNIX 流套接字上 recvmsg 到坏缓冲返回 EFAULT，数据留在队列（E）；TCP 连接上 recvmmsg 返回 1、SO_ERROR 读到 EFAULT 一次，之后的 recv 读到剩下的 6 字节（F） |
 | hello459 | 随机数生成器从中断时间重新播种：`/proc/randstats` 有 reseeds 和 pool_samples（A）；8 秒内熵池在变化（B）；开机两分钟内 8 秒内 reseeds 增加，之后要求开机以来已大于 0（C）；两次 getrandom 结果不同（D）。只在 MoQiOS 上运行（Linux 没有这个文件） |
+| hello460 | pidfd：PIDFD_NONBLOCK、PIDFD_THREAD 能打开，F_GETFL 为 0x802、0x82（A）；PIDFD_SELF_THREAD、PIDFD_SELF_THREAD_GROUP 把信号送给自己（B）；子进程运行时 poll 不就绪，退出后 POLLIN，waitid(P_PIDFD) 回收，回收后 POLLIN|POLLHUP（C）；不是 pidfd 为 EBADF（D）；NONBLOCK pidfd 上 waitid 在子进程运行时为 EAGAIN（E）；pidfd_getfd 复制子进程的管道读端（close-on-exec）并读到数据，flags 非 0、目标 fd 不存在、不是 pidfd、进程已回收分别为 EINVAL、EBADF、EBADF、ESRCH（F） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

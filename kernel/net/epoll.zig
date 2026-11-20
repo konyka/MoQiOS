@@ -860,6 +860,7 @@ fn resourceIdxFromDesc(desc: *const vfs.FileDescriptor) u32 {
         .devfs => desc.devfs_idx,
         .devfs_ctrl => desc.devfs_ctrl_idx,
         .mqueue => desc.mq_desc_idx,
+        .pidfd => desc.proc_pid,
         else => 0,
     };
 }
@@ -911,8 +912,13 @@ fn computeCurrentEvents(fd_type: vfs.FdType, resource_idx: u32, kmsg_cursor: u64
         .special => {
             revents |= EPOLLIN | EPOLLOUT;
         },
-        .ramdisk_file, .fat32_file, .ext2_file, .proc_file, .pidfd => {
+        .ramdisk_file, .fat32_file, .ext2_file, .proc_file => {
             revents |= EPOLLIN | EPOLLOUT;
+        },
+        // pidfd_poll: readable once the process has exited; hung up as well once it is reaped.
+        .pidfd => {
+            const st = @import("../proc/task.zig").tidState(resource_idx);
+            revents |= @import("../proc/pidfd_policy.zig").pollEvents(st != .gone, st == .zombie);
         },
         // Read-only volume files are always readable and never writable.
         .rofs_file => revents |= EPOLLIN,

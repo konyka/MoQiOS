@@ -175,9 +175,33 @@ const wsp = @import("wait_status_policy.zig");
 /// status go into the caller's siginfo. A null infop is allowed and still reaps. WNOHANG with nothing to report returns 0 and
 /// clears the siginfo (si_signo 0). `ru`, when non-null, receives the child's CPU time, but only when a child was actually
 /// reported — a WNOHANG that found nothing leaves the buffer untouched.
-pub fn waitid(idtype: u32, id: u64, infop: u64, options: u32, ru: u64) i64 {
-    const req = wid.request(idtype, id, options) orelse return wid.EINVAL;
+pub fn waitid(idtype: u32, id: u64, infop: u64, options_in: u32, ru: u64) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
+    var options = options_in;
+    var pidfd_nonblock = false;
+    // P_PIDFD: the descriptor names the child (EBADF when it is not a pidfd); a PIDFD_NONBLOCK one waits like WNOHANG and says
+    // EAGAIN when the child has not changed state (kernel_waitid).
+    const req = if (idtype == wid.P_PIDFD) blk: {
+        if (id > 0x7fffffff) break :blk null;
+        const cur = task_mod.getTask(cur_idx) orelse return -1;
+        if (id >= cur.fd_table.fds.len) return -9;
+        const d = &cur.fd_table.fds[@intCast(id)];
+        if (d.fd_type != .pidfd) return -9;
+        if (d.status_flags & 0x800 != 0 and options & wid.WNOHANG == 0) {
+            pidfd_nonblock = true;
+            options |= wid.WNOHANG;
+        }
+        break :blk wid.request(wid.P_PID, d.proc_pid, options);
+    } else wid.request(idtype, id, options);
+    const r = req orelse return wid.EINVAL;
+    var found = true;
+    const res = waitidRequest(cur_idx, r, infop, options, ru, &found);
+    if (pidfd_nonblock and res == 0 and !found) return -11;
+    return res;
+}
+
+/// `found` is cleared when a WNOHANG wait reported nothing.
+fn waitidRequest(cur_idx: u32, req: wid.Request, infop: u64, options: u32, ru: u64, found: *bool) i64 {
     if (infop != 0 and !copy.validateUserBufferWritable(infop, siginfo.SIGINFO_SIZE)) return -14;
     if (ru != 0 and !copy.validateUserBufferWritable(ru, rusage_policy.RUSAGE_SIZE)) return -14;
     if (!task_mod.hasMatchingChild(cur_idx, req.pid, req.options)) return -10; // -ECHILD
@@ -185,7 +209,10 @@ pub fn waitid(idtype: u32, id: u64, infop: u64, options: u32, ru: u64) i64 {
     if (collectWaitid(cur_idx, req)) |got| {
         return publishWaitid(infop, ru, got);
     }
-    if (options & wid.WNOHANG != 0) return publishWaitid(infop, ru, null);
+    if (options & wid.WNOHANG != 0) {
+        found.* = false;
+        return publishWaitid(infop, ru, null);
+    }
 
     const parent = task_mod.getTask(cur_idx) orelse return -1;
     const sig_mod = @import("signal.zig");

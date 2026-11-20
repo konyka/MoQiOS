@@ -1773,6 +1773,25 @@ pub fn findTaskByTidLocked(tid: u32) ?u32 {
 
 /// Find a task by its TID. Returns the task slot index or null.
 /// Public version — acquires task_lock.
+pub const TidState = enum { gone, zombie, live };
+
+/// Whether `tid` names a live task, a zombie waiting to be reaped, or nothing (pidfd_poll).
+pub fn tidState(tid: u32) TidState {
+    const flags = task_lock.acquire();
+    defer task_lock.release(flags);
+    var bits = slot_bitmap;
+    var zombie = false;
+    while (bits != 0) {
+        const i: u32 = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const t = &tasks[i];
+        if (t.tid != tid) continue;
+        if (t.state != .zombie) return .live;
+        zombie = true;
+    }
+    return if (zombie) .zombie else .gone;
+}
+
 pub fn findTaskByTid(tid: u32) ?u32 {
     const flags = task_lock.acquire();
     defer task_lock.release(flags);
