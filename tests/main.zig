@@ -11900,7 +11900,7 @@ test "IP socket options: dispatch and send-path wiring" {
     // The send paths patch the finished header before ECN marking (TCP) / before framing (UDP).
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (ip_opt_policy.ipv4NeedsPatch(tcb.options.ip)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], tcb.options.ip, ipv4.checksum);\n    // SK-131/143: ECT(1) for AccECN/L4S, else ECT(0) for classic ECN.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ts, "if (ip_opt_policy.ipv6NeedsPatch(tcb.options.ip)) ip_opt_policy.patchIpv6(send_pkt[14..][0..40], tcb.options.ip);\n    // SK-131/143: ECT(1) for AccECN/L4S, else ECT(0) for classic ECN.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (ip_opt_policy.ipv6NeedsPatch(tcb.options.ip)) ip_opt_policy.patchIpv6(send_pkt[14..][0..40], tcb.options.ip);\n    // ip6_make_flowlabel") != null);
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "if (ip_opt_policy.ipv4NeedsPatch(opts4)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], opts4, ipv4.checksum);") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "if (ip_opt_policy.ipv6NeedsPatch(opts)) ip_opt_policy.patchIpv6(send_pkt[14..][0..40], opts);") != null);
@@ -17478,4 +17478,8 @@ test "ping and raw IPv6 sends carry flow labels too (explicit or automatic), and
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (ov6.flowlabel) |fl| ip6.flow_ov6 = fl;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (ov6.flowlabel) |fl| ping_ip6.flow_ov6 = fl;") != null);
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello462", true, false).caps.cap_net_raw);
+}
+
+test "IPv6 TCP segments carry their connection's automatic flow label unless IPV6_AUTOFLOWLABEL is off (hello462 G)" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "if (tcb.options.ip.autoflow6) ip_opt_policy.setFlowLabel6(send_pkt[14..][0..40], @import(\"udp.zig\").autoFlowLabel(our_ip, tcb.remote_ip6, tcb.local_port, tcb.remote_port, ipv6.PROTO_TCP));") != null);
 }

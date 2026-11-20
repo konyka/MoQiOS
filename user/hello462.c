@@ -13,7 +13,9 @@
  *      1 back on (the same label as before);
  *   F. raw and ping ICMPv6 sockets: a raw ICMPV6 socket sees its own echo request (loopback) with a non-zero automatic label that
  *      repeats on the next request; an IPV6_FLOWINFO control message 0x12345 on a sendmsg gives that label; the IPv6 header is read
- *      back through a raw IPPROTO_ICMPV6 socket's IPV6_FLOWINFO control message on receive. */
+ *      back through a raw IPPROTO_ICMPV6 socket's IPV6_FLOWINFO control message on receive;
+ *   G. TCP over ::1, watched by a raw IPPROTO_TCP socket with IPV6_FLOWINFO: the client's segments share one non-zero label, the
+ *      server's another (also non-zero); a client with IPV6_AUTOFLOWLABEL 0 sends label 0. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -33,6 +35,9 @@ static long getint(long s, int lv, int o) { int v = -1; socklen_t l = 4; long r 
 static long sendmsg_(long s, void *m, int f) { return rc(sendmsg((int)s, m, f)); }
 static long recvmsg_(long s, void *m, int f) { return rc(recvmsg((int)s, m, f)); }
 static void nap(void) { usleep(20000); }
+static long listen_(long s) { return rc(listen((int)s, 4)); }
+static long connect_(long s, const void *a, int l) { return rc(connect((int)s, a, (socklen_t)l)); }
+static long accept_(long s) { return rc(accept((int)s, 0, 0)); }
 #else
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
 #include "../lib/moqi_libc/include/stdio.h"
@@ -46,6 +51,9 @@ static long getint(long s, int lv, int o) { int v = -1; int l = 4; long r = sysc
 static long sendmsg_(long s, void *m, int f) { return syscall3(129, s, (long)m, f); }
 static long recvmsg_(long s, void *m, int f) { return syscall3(130, s, (long)m, f); }
 static void nap(void) { long t[2] = { 0, 20000000 }; syscall1(104, 0); syscall2(35, (long)t, 0); }
+static long listen_(long s) { return syscall2(119, s, 4); }
+static long connect_(long s, const void *a, int l) { return syscall3(124, s, (long)a, l); }
+static long accept_(long s) { return syscall3(120, s, 0, 0); }
 #endif
 static int failures;
 static char msg[300];
@@ -193,6 +201,65 @@ int main(void) {
     rcv = saved_rcv;
     snprintf(msg, sizeof msg, "F: raw ICMPv6 automatic label %lx then %lx; control message 0x12345: send %ld, label %lx (x x; 16 12345)", f1, f2, fs, f3);
     check(rawf >= 0 && f1 > 0 && f1 == f2 && fs == 16 && f3 == 0x12345, msg);
+
+    /* G: the segments of TCP connections to [::1]:4621 as a raw IPPROTO_TCP socket sees them. */
+    long rt = sock(10, 3, 6);
+    setopt_(rt, 41, 11, &one, 4);
+    unsigned char ta[28];
+    memcpy(ta, a, 28);
+    memset(ta + 4, 0, 4);
+    ta[2] = 4621 >> 8; ta[3] = 4621 & 0xff;
+    long tl = sock(10, 1, 0);
+    setopt_(tl, 1, 2, &one, 4);
+    bind_(tl, ta, 28);
+    listen_(tl);
+    long tc = sock(10, 1, 0);
+    connect_(tc, ta, 28);
+    long tsv = accept_(tl);
+    long tc2 = sock(10, 1, 0);
+    setopt_(tc2, 41, 70, &zero, 4);
+    connect_(tc2, ta, 28);
+    long tsv2 = accept_(tl);
+    nap();
+    /* Each segment is keyed by (direction, client port); every key must keep one label. */
+    int keys[8][2];
+    long labels[8];
+    int n_keys = 0, n_seg = 0, steady = 1;
+    for (int k = 0; k < 16; k++) {
+        static unsigned char ctl2[128];
+        unsigned char seg[64];
+        unsigned char mh[56];
+        memset(mh, 0, sizeof mh);
+        memset(ctl2, 0, sizeof ctl2);
+        long iov2[2] = { (long)seg, 64 };
+        long ip2 = (long)iov2, o2 = 1, cp2 = (long)ctl2, cl2 = sizeof ctl2;
+        memcpy(mh + 16, &ip2, 8); memcpy(mh + 24, &o2, 8); memcpy(mh + 32, &cp2, 8); memcpy(mh + 40, &cl2, 8);
+        long n = recvmsg_(rt, mh, 0x40);
+        if (n < 20) break;
+        n_seg++;
+        long used; memcpy(&used, mh + 40, 8);
+        long fl = 0;
+        if (used >= 20 && ctl2[8] == 41 && ctl2[12] == 11) fl = (ctl2[17] & 0x0f) << 16 | ctl2[18] << 8 | ctl2[19];
+        int sport = seg[0] << 8 | seg[1], dport = seg[2] << 8 | seg[3];
+        int from_server = sport == 4621, cport = from_server ? dport : sport;
+        int j = 0;
+        while (j < n_keys && !(keys[j][0] == from_server && keys[j][1] == cport)) j++;
+        if (j == n_keys && n_keys < 8) { keys[j][0] = from_server; keys[j][1] = cport; labels[j] = fl; n_keys++; }
+        else if (j < n_keys && labels[j] != fl) steady = 0;
+    }
+    /* The connections in order of their client port: the first client (labelled) and the second (IPV6_AUTOFLOWLABEL 0). */
+    long cflow = -1, sflow = -1, c2flow = -1, s2flow = -1;
+    int p1 = -1, p2 = -1;
+    for (int j = 0; j < n_keys; j++) if (!keys[j][0]) { if (p1 < 0) p1 = keys[j][1]; else if (keys[j][1] != p1) p2 = keys[j][1]; }
+    for (int j = 0; j < n_keys; j++) {
+        if (keys[j][1] == p1) { if (keys[j][0]) sflow = labels[j]; else cflow = labels[j]; }
+        if (keys[j][1] == p2) { if (keys[j][0]) s2flow = labels[j]; else c2flow = labels[j]; }
+    }
+    int cmix = !steady, smix = !steady;
+    (void)s2flow;
+    rcv = saved_rcv;
+    snprintf(msg, sizeof msg, "G: %d segments; client label %lx steady %d; server label %lx steady %d; no-autolabel client %lx (>0 x 1 y 1 0)", n_seg, cflow, !cmix, sflow, !smix, c2flow);
+    check(tsv >= 0 && tsv2 >= 0 && n_seg >= 4 && cflow > 0 && !cmix && sflow > 0 && !smix && c2flow == 0, msg);
 
     print(failures ? "hello462: FAIL\n" : "hello462: PASS\n");
     return failures ? 1 : 0;
