@@ -419,6 +419,13 @@ pub fn takeError(idx: u32, clear: bool) i32 {
     return e;
 }
 
+/// Make `e` the socket's pending error (do_recvmmsg's sk_err after a batch that failed part-way).
+pub fn setError(idx: u32, e: i32) void {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx < MAX_SOCKETS and sockets[idx].used) sockets[idx].err = e;
+}
+
 /// SO_ERROR's clear after the read: only the error it reported, not one that arrived since.
 pub fn clearErrorIfEqual(idx: u32, e: i32) void {
     const saved = raw_lock.acquire();

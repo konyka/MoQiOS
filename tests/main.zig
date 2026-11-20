@@ -17279,3 +17279,15 @@ test "a pipe holds its whole capacity: 65536 bytes in a 16-page pipe, 4096 in on
     try std.testing.expect(std.mem.indexOf(u8, v, "while (n < count and pipe.len < pipe.cap) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, v, "if (pipe.ref_count == 0 or used > size or pipe.read_reservation != 0) {") != null);
 }
+
+test "a recvmmsg batch that fails part-way keeps its count and leaves the error pending (do_recvmmsg sk_err; hello458)" {
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (err != 0 and err != -11) leavePendingError(sockfd, @intCast(-err));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, ".udp_socket => udp.setPendingError(d.udpKey(), e),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, ".raw_socket => @import(\"raw_icmp.zig\").setError(d.raw_idx, e),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (!copy.validateUserBufferWritable(base, n)) return -14;") == null);
+    const at = std.mem.indexOf(u8, ss, "fn udpRecvmsg(") orelse return error.TestUnexpectedResult;
+    const body = ss[at..][0..2000];
+    try std.testing.expect(std.mem.indexOf(u8, body, "const pending = udp.takePendingError(port);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "pub fn setPendingError(port: u32, e: i32) void {") != null);
+}

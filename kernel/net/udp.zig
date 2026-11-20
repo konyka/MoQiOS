@@ -310,6 +310,15 @@ pub fn hasQueuedError(port: u32) bool {
     return port_errq[i].n != 0;
 }
 
+/// Make `e` (positive errno) the pending error of the socket with key `port` (do_recvmmsg's sk_err after a batch that failed
+/// part-way): the next receive or SO_ERROR reports it once.
+pub fn setPendingError(port: u32, e: i32) void {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return;
+    port_err[i] = e;
+}
+
 /// Clear the pending error only if it still equals `expected` (SO_ERROR read).
 pub fn clearPendingErrorIfEqual(port: u32, expected: i32) void {
     const saved = udp_lock.acquire();

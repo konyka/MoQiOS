@@ -2052,6 +2052,9 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
     const d = &cur.fd_table.fds[fd];
     const is_v6 = d.udp_is_v6;
     const port = d.udpKey();
+    // __skb_try_recv_datagram: a pending error is reported once, before any queued datagram (as recvfrom does).
+    const pending = udp.takePendingError(port);
+    if (pending != 0) return -@as(i64, pending);
     const wait_rc = udpWaitForDatagram(port, is_v6, @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(d), flags));
     if (wait_rc != 0) return wait_rc;
 
@@ -2591,8 +2594,8 @@ pub fn netPoll() i64 {
     return @intCast(count);
 }
 
-/// Validate one mmsghdr of a batch: the header and its iovec array must be
-/// readable; for receives the buffers must be writable, for sends readable.
+/// Validate one mmsghdr of a batch: the header and its iovec array must be readable; for sends the buffers must be readable too
+/// (a receive buffer is only checked when a datagram is copied into it).
 fn batchEntryOk(entry_ptr: u64, receiving: bool) i64 {
     if (!copy.validateUserBuffer(entry_ptr, 56)) return -14;
     if (receiving and !copy.validateUserBufferWritable(entry_ptr + 56, 4)) return -14;
@@ -2610,11 +2613,12 @@ fn batchEntryOk(entry_ptr: u64, receiving: bool) i64 {
         const base = bo.readU64At(&iov, 0);
         const len = bo.readU64At(&iov, 8);
         if (len == 0) continue;
-        if (base == 0 or base >= 0x0000_8000_0000_0000 or len > 0x0000_8000_0000_0000 - base) return if (receiving) -14 else -22;
+        if (receiving) continue;
+        if (base == 0 or base >= 0x0000_8000_0000_0000 or len > 0x0000_8000_0000_0000 - base) return -22;
         const n: usize = @intCast(@min(len, 0xFFFF_FFFF));
-        if (receiving) {
-            if (!copy.validateUserBufferWritable(base, n)) return -14;
-        } else if (!copy.validateUserBuffer(base, n)) return -14;
+        // A receive buffer that turns out unmapped fails that message when it is copied (do_recvmmsg has no preflight: what
+        // arrived before it is kept, and the error becomes the socket's pending error).
+        if (!receiving and !copy.validateUserBuffer(base, n)) return -14;
     }
     return 0;
 }
@@ -2668,11 +2672,27 @@ pub fn recvmmsg(sockfd: u32, msgvec_ptr: u64, vlen_raw: u64, flags: u32, timeout
         if (mp.expired(deadline, tsc.nanos())) break;
     }
     if (count == 0) return err;
+    // do_recvmmsg: an error after some datagrams arrived (not EAGAIN) becomes the socket's pending error, for the next call or
+    // SO_ERROR to report.
+    if (err != 0 and err != -11) leavePendingError(sockfd, @intCast(-err));
     // __sys_recvmmsg: once something arrived, the timeout holds the time that is left, however the batch ended.
     if (deadline) |d| {
         if (!writeTimeoutLeft(timeout, d, tsc.nanos())) return -14;
     }
     return @intCast(count);
+}
+
+/// recvmmsg's sk_err for the socket `fd` names: UDP (and ping) and raw sockets keep a pending error; others have none to set here.
+fn leavePendingError(fd: u32, e: i32) void {
+    const cur_idx = sched_mod.currentTaskIndex() orelse return;
+    const t = task_mod.getTask(cur_idx) orelse return;
+    if (fd >= vfs_mod.MAX_FDS) return;
+    const d = &t.fd_table.fds[fd];
+    switch (d.fd_type) {
+        .udp_socket => udp.setPendingError(d.udpKey(), e),
+        .raw_socket => @import("raw_icmp.zig").setError(d.raw_idx, e),
+        else => {},
+    }
 }
 
 /// Store the rest of a recvmmsg timeout ending at `deadline` into the user timespec at `ptr`; false when it cannot be written.

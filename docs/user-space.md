@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello457`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello458`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -452,6 +452,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello455 | IPv6 ICMPv6 超过 MTU 时分片：raw IPPROTO_ICMPV6 套接字发 3000 字节回显请求，收到完整的请求和应答各 3000 字节（R）；65535 字节同样完整往返，65536 字节 EMSGSIZE（M）；IPV6_MTU_DISCOVER 为 DO、PROBE、INTERFACE 时 3000 字节 EMSGSIZE，DONT、WANT、OMIT 能发（D）；ping 套接字发 1453、3000、65535 字节都收到完整应答，65536 字节和 DO 下 3000 字节 EMSGSIZE（P） |
 | hello456 | 父进程 execve 后 clone 子进程的退出信号：clone(SIGUSR1) 的子进程在父进程 exec 之后退出，父进程收到 SIGCHLD 而不是 SIGUSR1，子进程仍只能用 __WCLONE 回收（状态 0x500，普通 waitpid 为 ECHILD）（A）；exec 之后新建的 clone(SIGUSR1) 子进程照常发 SIGUSR1（B） |
 | hello457 | `/dev/random`、`/dev/urandom` 的读写：一次读 5000 字节和 100000 字节都整段返回且不全为 0（R）；O_RDWR 打开后写 5000 字节返回 5000、写 0 字节返回 0，只读描述符上写为 EBADF（W）；写过之后照常读（S） |
+| hello458 | recvmmsg 中途出错：第二条的缓冲区未映射时返回已收到的 1 条，SO_ERROR 读到 EFAULT 一次（A）；之后的 recv 先报 EFAULT，再收到剩下的数据报（B）；第一条就出错时返回 EFAULT，不留待处理错误（C） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
