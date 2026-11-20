@@ -26,12 +26,22 @@ const MAX_UDP_PAYLOAD = 1472;
 /// The largest IPv6 UDP payload one 1500-byte frame carries (1500 - 40 - 8), what the queue keeps and a send may hold.
 const MAX_UDP_PAYLOAD_V6 = 1452;
 
+/// The largest UDP payload (65535 - 20 - 8), what a reassembled IPv4 datagram may carry.
+pub const MAX_UDP_PAYLOAD_BIG = 65507;
+/// Buffers for queued datagrams longer than one frame holds (they only come from IPv4 reassembly); a datagram that finds none free
+/// is dropped, as a full receive buffer drops it in Linux.
+const BIG_SLOTS = 4;
+var big_bufs: [BIG_SLOTS][MAX_UDP_PAYLOAD_BIG]u8 = undefined;
+var big_used: [BIG_SLOTS]bool = @splat(false);
+
 const UdpEntry = struct {
     src_ip: [16]u8,
     src_port: u16,
     dst_port: u16,
     data_len: u16,
     data: [MAX_UDP_PAYLOAD]u8,
+    /// Not 0: the datagram is in big_bufs[big - 1] instead of `data` (udp_lock).
+    big: u8 = 0,
     valid: bool,
     is_v6: bool,
     /// Interface, header destination, TTL and TOS of an IPv4 datagram (IP_PKTINFO / IP_RECVTTL / IP_RECVTOS).
@@ -67,6 +77,44 @@ var queues: [MAX_PORTS][QUEUE_DEPTH]UdpEntry = @splat(@splat(.{
 }));
 var num_ports: u16 = 0;
 var udp_lock: IrqSpinlock = .{};
+
+/// Store `payload` in queue entry `e` (udp_lock held): in `data` when it fits, else in a free big buffer. False when it does not fit
+/// anywhere (no big buffer free).
+fn fillEntryLocked(e: *UdpEntry, payload: []const u8) bool {
+    if (payload.len <= MAX_UDP_PAYLOAD) {
+        e.big = 0;
+        @memcpy(e.data[0..payload.len], payload);
+    } else {
+        if (payload.len > MAX_UDP_PAYLOAD_BIG) return false;
+        const slot = for (big_used, 0..) |u, k| {
+            if (!u) break k;
+        } else return false;
+        big_used[slot] = true;
+        e.big = @intCast(slot + 1);
+        @memcpy(big_bufs[slot][0..payload.len], payload);
+    }
+    e.data_len = @intCast(payload.len);
+    return true;
+}
+
+/// The bytes of a queued entry (udp_lock held).
+fn entryBytes(e: *const UdpEntry) []const u8 {
+    if (e.big != 0) return big_bufs[e.big - 1][0..e.data_len];
+    return e.data[0..e.data_len];
+}
+
+/// A peek is copying big_bufs[k] out (outside udp_lock): an entry dropped meanwhile leaves the buffer to releaseBig (big_orphan).
+var big_pinned: [BIG_SLOTS]u8 = @splat(0);
+var big_orphan: [BIG_SLOTS]bool = @splat(false);
+
+/// Drop a queued entry, giving back its big buffer (udp_lock held).
+fn dropEntryLocked(e: *UdpEntry) void {
+    if (e.big != 0) {
+        if (big_pinned[e.big - 1] != 0) big_orphan[e.big - 1] = true else big_used[e.big - 1] = false;
+    }
+    e.big = 0;
+    e.valid = false;
+}
 /// SOL_SOCKET options per registered port (travels with the port slot).
 var port_opts: [MAX_PORTS]@import("sockopt_policy.zig").Stored = @splat(.{});
 /// Pending asynchronous error per port (ICMP port unreachable → ECONNREFUSED,
@@ -512,7 +560,7 @@ fn newSlotLocked(key: u32, is_v6: bool, uid: u32) u16 {
     port_dev6[idx] = 0;
     port_named[idx] = true;
     port_user_port[idx] = false;
-    for (0..QUEUE_DEPTH) |j| queues[idx][j].valid = false;
+    for (0..QUEUE_DEPTH) |j| dropEntryLocked(&queues[idx][j]);
     num_ports += 1;
     return @intCast(idx);
 }
@@ -874,6 +922,7 @@ fn releaseLocked(port: u32) void {
                 port_refs[i] -= 1;
                 return;
             }
+            for (0..QUEUE_DEPTH) |j| dropEntryLocked(&queues[i][j]);
             num_ports -= 1;
             ports[i] = ports[num_ports];
             port_refs[i] = port_refs[num_ports];
@@ -908,7 +957,10 @@ fn releaseLocked(port: u32) void {
             port_refs[num_ports] = 0;
             // Invalidate the vacated tail so a future registration on that
             // slot never delivers stale datagrams to a new owner.
-            for (0..QUEUE_DEPTH) |j| queues[num_ports][j].valid = false;
+            for (0..QUEUE_DEPTH) |j| {
+                queues[num_ports][j].valid = false;
+                queues[num_ports][j].big = 0;
+            }
             return;
         }
     }
@@ -1005,14 +1057,12 @@ fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, dst_ip: [4]u
         // A connected socket whose peer is not this sender has no claim; one connected to it wins (see pickReceiverConnected).
         const pick = policy.pickReceiverConnected(info[0..n], src_ip, src_port) orelse break :blk false;
         const port_idx = cand[pick];
-        const actual = @min(payload.len, MAX_UDP_PAYLOAD);
         for (0..QUEUE_DEPTH) |i| {
             if (!queues[port_idx][i].valid) {
+                if (!fillEntryLocked(&queues[port_idx][i], payload)) break :blk false;
                 queues[port_idx][i].src_ip = src_ip;
                 queues[port_idx][i].src_port = src_port;
                 queues[port_idx][i].dst_port = dst_port;
-                queues[port_idx][i].data_len = @intCast(actual);
-                @memcpy(queues[port_idx][i].data[0..actual], payload[0..actual]);
                 queues[port_idx][i].is_v6 = is_v6;
                 queues[port_idx][i].meta = stamped(meta, dst_port);
                 queues[port_idx][i].meta6 = stamped6(meta6, dst_port);
@@ -1087,7 +1137,6 @@ fn enqueueMcast4(port: u16, src_ip: [16]u8, src_port: u16, group: [4]u8, payload
         const saved = udp_lock.acquire();
         defer udp_lock.release(saved);
         if (!mcast.alwaysJoined4(group) and !hostJoined4Locked(group, ifindex)) return;
-        const actual = @min(payload.len, MAX_UDP_PAYLOAD);
         for (0..num_ports) |i| {
             if (port_ping[i] or !port_named[i]) continue;
             if (portNumber(ports[i]) != port or port_v6[i]) continue;
@@ -1097,10 +1146,9 @@ fn enqueueMcast4(port: u16, src_ip: [16]u8, src_port: u16, group: [4]u8, payload
                 const e = &queues[i][j];
                 if (e.valid) continue;
                 e.src_ip = src_ip;
+                if (!fillEntryLocked(e, payload)) break;
                 e.src_port = src_port;
                 e.dst_port = port;
-                e.data_len = @intCast(actual);
-                @memcpy(e.data[0..actual], payload[0..actual]);
                 e.is_v6 = false;
                 e.meta = stamped(meta, port);
                 e.valid = true;
@@ -1138,8 +1186,9 @@ pub fn handlePacketMeta(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u3
         if (wire_csum != expect) return;
     }
 
-    const actual_payload = @min(hdr.payload_len, @as(u16, MAX_UDP_PAYLOAD));
-    if (8 + actual_payload > len) return;
+    // A datagram longer than one frame only comes from reassembly; the queue keeps it in a big buffer.
+    const actual_payload = hdr.payload_len;
+    if (8 + @as(u32, actual_payload) > len) return;
     var ip16: [16]u8 = @splat(0);
     @memcpy(ip16[0..4], &src_ip);
     if (mcast.isMulticast4(dst_ip)) {
@@ -1258,16 +1307,64 @@ pub fn recvFromMeta(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8,
         const entry = &queues[port_idx][i];
         if (entry.valid and !entry.is_v6) {
             const n = @min(entry.data_len, out_len);
-            @memcpy(out_buf[0..n], entry.data[0..n]);
+            @memcpy(out_buf[0..n], entryBytes(entry)[0..n]);
             out_src_ip.* = entry.src_ip[0..4].*;
             out_src_port.* = entry.src_port;
             out_full_len.* = entry.data_len;
             out_meta.* = entry.meta;
-            if (!peek) entry.valid = false;
+            if (!peek) dropEntryLocked(entry);
             return n;
         }
     }
     return 0;
+}
+
+/// A big datagram taken off the queue for copy-out: its buffer stays reserved (big_used) until releaseBig, so recvfrom / recvmsg can
+/// copy it to the user in pieces without holding udp_lock and without a 64 KiB stack buffer.
+pub const BigTake = struct { slot: u8, len: u16 };
+
+/// The next IPv4 datagram on `port` when it is a big one (recvFromMeta's contract otherwise: src, full length, meta): taken off the
+/// queue unless `peek`; the buffer is pinned for `bigBytes` until releaseBig. Null when the next datagram is not big (or none).
+pub fn takeBig(port: u32, out_src_ip: *[4]u8, out_src_port: *u16, peek: bool, out_meta: *ip_cmsg_policy.RecvInfo) ?BigTake {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const port_idx = findPortIdxLocked(port) orelse return null;
+    for (0..QUEUE_DEPTH) |i| {
+        const entry = &queues[port_idx][i];
+        if (!(entry.valid and !entry.is_v6)) continue;
+        if (entry.big == 0) return null;
+        out_src_ip.* = entry.src_ip[0..4].*;
+        out_src_port.* = entry.src_port;
+        out_meta.* = entry.meta;
+        const t: BigTake = .{ .slot = entry.big - 1, .len = entry.data_len };
+        if (peek) {
+            big_pinned[t.slot] += 1;
+        } else {
+            // The buffer leaves the entry but stays in use until releaseBig.
+            entry.big = 0;
+            entry.valid = false;
+        }
+        return t;
+    }
+    return null;
+}
+
+/// The bytes of a taken big datagram (stable until releaseBig).
+pub fn bigBytes(t: BigTake) []const u8 {
+    return big_bufs[t.slot][0..t.len];
+}
+
+/// End a takeBig: a consumed datagram's buffer becomes free; a peeked one stays with its entry.
+pub fn releaseBig(t: BigTake, peek: bool) void {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    if (peek) {
+        big_pinned[t.slot] -= 1;
+        if (big_pinned[t.slot] == 0 and big_orphan[t.slot]) {
+            big_orphan[t.slot] = false;
+            big_used[t.slot] = false;
+        }
+    } else big_used[t.slot] = false;
 }
 
 /// Drain one IPv6 datagram for `port` (SK-70).
@@ -1298,7 +1395,7 @@ pub fn recvFromV6Meta(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[16]
             out_src_port.* = entry.src_port;
             out_full_len.* = entry.data_len;
             out_meta6.* = entry.meta6;
-            if (!peek) entry.valid = false;
+            if (!peek) dropEntryLocked(entry);
             return n;
         }
     }
@@ -1339,7 +1436,7 @@ pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, data
 /// sendToFrom with sendmsg's IP_TTL / IP_TOS control messages: `ttl_ov` and `tos_ov` replace the socket's values for this datagram
 /// (Linux cork->ttl / cork->tos; the TTL replaces IP_MULTICAST_TTL too, and the TOS is the whole byte, ECN bits included).
 pub fn sendToFromOv(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, data: [*]const u8, data_len: u16, ttl_ov: ?u8, tos_ov: ?u8) bool {
-    if (data_len > MAX_UDP_PAYLOAD) return false;
+    if (data_len > MAX_UDP_PAYLOAD_BIG) return false;
     const src_port = portNumber(src_key);
     var opts4: ip_opt_policy.IpOpts = if (getPortOpts(src_key)) |po| po.ip else .{};
     if (ttl_ov) |v| opts4.ttl = v;
@@ -1379,8 +1476,12 @@ pub fn sendToFromOv(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, da
     // inet->mc_addr).
     const our_ip = if (mcast.multicastSource4(group, bound, opts4.mc4_addr)) |a| a else @import("tcp_port_policy.zig").sourceAddr(bound, dst_ip, netif.getOurIp());
     const udp_total: u16 = 8 + data_len;
-    // SK-101/105: honor Path MTU (or armed oversized raise probe).
-    if (ipv4.HEADER_LEN + udp_total > ipv4.getSendMtu(dst_ip)) return false;
+    // SK-101/105: honor Path MTU (or armed oversized raise probe). A datagram over it leaves in fragments (ip_fragment); the caller
+    // already refused it under IP_PMTUDISC_DO / PROBE.
+    const mtu = ipv4.getSendMtu(dst_ip);
+    if (ipv4.HEADER_LEN + @as(u32, udp_total) > mtu) {
+        return sendFragmented4(our_ip, dst_ip, dst_port, src_key, data[0..data_len], opts4, ttl_ov, group, mtu, dst_mac, our_mac, via_lo, wait_hop);
+    }
 
     // Stack-local frame buffer: concurrent sends on other CPUs must not tear it.
     var send_pkt: [1518]u8 = @splat(0);
@@ -1416,6 +1517,56 @@ pub fn sendToFromOv(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, da
     // SK-104: full-MTU TX success can raise the Path MTU early.
     if (ok) ipv4.noteFullSizeSend(dst_ip, ipv4.HEADER_LEN + udp_total);
     return ok;
+}
+
+/// ip_fragment for a UDP datagram over `mtu`: the UDP header (with its checksum, which spans the whole datagram) and the payload are
+/// cut into pieces of ip_frag_policy.pieceLen bytes, each behind its own IPv4 header with the datagram's id, MF on all but the last,
+/// the offset in 8-byte units, DF clear. Each piece is sent as sendToFromOv sends a frame. The whole datagram is staged in a kmalloc
+/// buffer (up to 65515 bytes), not on the kernel stack.
+fn sendFragmented4(our_ip: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, payload: []const u8, opts4: ip_opt_policy.IpOpts, ttl_ov: ?u8, group: bool, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, via_lo: bool, wait_hop: ?[4]u8) bool {
+    const frag = @import("ip_frag_policy.zig");
+    const slab = @import("../mm/slab.zig");
+    const total: usize = 8 + payload.len;
+    const raw = slab.kmalloc(total) orelse return false;
+    defer slab.kfree(raw);
+    const whole: [*]u8 = @ptrCast(raw);
+    bo.writeU16BeAt(whole, 0, portNumber(src_key));
+    bo.writeU16BeAt(whole, 2, dst_port);
+    bo.writeU16BeAt(whole, 4, @intCast(total));
+    whole[6] = 0;
+    whole[7] = 0;
+    @memcpy(whole[8..total], payload);
+    var c = udp_util.checksumV4(our_ip, dst_ip, whole, @intCast(total));
+    if (c == 0) c = 0xffff;
+    bo.writeU16BeAt(whole, 6, c);
+    const id = takePortIpid(src_key, dst_ip, our_ip, opts4.pmtudisc);
+    const piece = frag.pieceLen(mtu, ipv4.HEADER_LEN);
+    var off: usize = 0;
+    var all_ok = true;
+    while (off < total) {
+        const n: usize = @min(piece, total - off);
+        const last = off + n == total;
+        var pkt: [1518]u8 = @splat(0);
+        ipv4.buildHeader(pkt[14..].ptr, our_ip, dst_ip, ipv4.PROTO_UDP, @intCast(n));
+        ipv4.setIdent(pkt[14..].ptr, id, false);
+        if (ip_opt_policy.ipv4NeedsPatch(opts4)) ip_opt_policy.patchIpv4(pkt[14..][0..20], opts4, ipv4.checksum);
+        if (group) ip_opt_policy.setTtl4(pkt[14..][0..20], ttl_ov orelse opts4.mc4_ttl, ipv4.checksum);
+        const fo: u16 = @as(u16, @intCast(off / 8)) | (if (last) @as(u16, 0) else frag.MF);
+        bo.writeU16BeAt(pkt[14..].ptr, 6, fo | (bo.readU16BeAt(pkt[14..].ptr, 6) & frag.DF));
+        pkt[24] = 0;
+        pkt[25] = 0;
+        bo.writeU16BeAt(pkt[14..].ptr, 10, ipv4.checksum(pkt[14..].ptr, 20));
+        @memcpy(pkt[34..][0..n], whole[off..][0..n]);
+        const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, @intCast(20 + n));
+        if (wait_hop) |hop| {
+            arp.queueFrame(hop, &pkt, frame_len);
+        } else {
+            const ok = if (via_lo) lo.sendNow(&pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt, frame_len);
+            if (!ok) all_ok = false;
+        }
+        off += n;
+    }
+    return all_ok;
 }
 
 /// Send a UDP datagram over IPv6 (SK-70/87). On-link via NDP; off-link via default router.

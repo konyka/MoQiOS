@@ -43,6 +43,11 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
         },
         eth.ETHERTYPE_IPV4 => {
             if (len < 34) return;
+            // ip_defrag: a fragment joins its reassembly queue; a completed datagram comes back through here whole.
+            if (@import("ip_frag.zig").isFragment(data + 14, len - 14)) {
+                @import("ip_frag.zig").receive(data, len, ifindex);
+                return;
+            }
             const info = ipv4.parseHeader(data + 14, len - 14) orelse return;
             const payload_start: u32 = 14 + @as(u32, info.payload_offset);
             if (payload_start + @as(u32, info.payload_len) > len) return;

@@ -1001,6 +1001,13 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(t.fd_table.fds[fd].udp_local_ip, dst_ip, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
         if (lo_rc != 0) return lo_rc;
         if (udpOversize4(src_key, dst_ip, dst_port, len)) |e| return e;
+        // A datagram longer than one frame (it will be fragmented): staged in a kmalloc buffer, not on the stack.
+        if (len > tmp_buf2.len) {
+            const big = bigStage(len) orelse return -105; // ENOBUFS
+            defer @import("../mm/slab.zig").kfree(big.ptr);
+            if (copy.copyFromUser(big, @ptrFromInt(buf), len) != len) return -14;
+            return if (udp.sendToFrom(t.fd_table.fds[fd].udp_local_ip, dst_ip, dst_port, src_key, big.ptr, @intCast(len))) @intCast(len) else -1;
+        }
         const n2 = copy.copyFromUser(&tmp_buf2, @ptrFromInt(buf), to_copy2);
         if (n2 == 0) return -1;
         if (udp.sendToFrom(t.fd_table.fds[fd].udp_local_ip, dst_ip, dst_port, src_key, &tmp_buf2, @intCast(n2))) {
@@ -1258,10 +1265,18 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         var src_ip: [4]u8 = .{ 0, 0, 0, 0 };
         var src_port_out: u16 = 0;
         var full_len: u16 = 0;
-        const result2 = udp.recvFromEx(sock_key, &tmp_buf2, @intCast(tmp_buf2.len), &src_ip, &src_port_out, &full_len, msg_peek);
+        var big_meta: ip_cmsg_policy.RecvInfo = .{};
+        // A reassembled datagram longer than one frame: copied straight from its pinned buffer.
+        const big = udp.takeBig(sock_key, &src_ip, &src_port_out, msg_peek, &big_meta);
+        defer if (big) |bt| udp.releaseBig(bt, msg_peek);
+        const result2: i64 = if (big) |bt| bt.len else udp.recvFromEx(sock_key, &tmp_buf2, @intCast(tmp_buf2.len), &src_ip, &src_port_out, &full_len, msg_peek);
+        if (big) |bt| full_len = bt.len;
         if (result2 > 0) {
-            const to_write = @min(@as(u32, @intCast(result2)), to_read2);
-            if (copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf2))[0..to_write], to_write) != to_write) return -14;
+            const to_write: u32 = if (big != null) @intCast(@min(@as(u64, full_len), len)) else @min(@as(u32, @intCast(result2)), to_read2);
+            if (big) |bt| {
+                if (!copy.validateUserBufferWritable(buf, to_write)) return -14;
+                if (copy.copyToUser(@ptrFromInt(buf), udp.bigBytes(bt)[0..to_write], to_write) != to_write) return -14;
+            } else if (copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf2))[0..to_write], to_write) != to_write) return -14;
             if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
                 // A whole sockaddr_in (16 bytes, sin_zero cleared), cut to the caller's length; the reported length is 16 (Linux
                 // udp_recvmsg / ping_recvmsg set msg_namelen to sizeof(struct sockaddr_in)).
@@ -1823,6 +1838,21 @@ fn unixRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8
     return n;
 }
 
+/// A kmalloc staging buffer of `n` bytes for a datagram that will be fragmented (freed by the caller with slab.kfree(ptr)).
+fn bigStage(n: usize) ?[]u8 {
+    const p = @import("../mm/slab.zig").kmalloc(n) orelse return null;
+    return @as([*]u8, @ptrCast(p))[0..n];
+}
+
+/// Whether a sendmsg on this UDP socket may carry a datagram longer than one frame: an IPv4 UDP socket (fragmented on the way out);
+/// IPv6 and ping sockets still refuse it.
+fn udpSendmsgFragmentable(fd: u32) bool {
+    const cur_idx = sched_mod.currentTaskIndex() orelse return false;
+    const t = task_mod.getTask(cur_idx) orelse return false;
+    const d = &t.fd_table.fds[fd];
+    return !d.udp_is_v6 and !d.udp_ping;
+}
+
 /// sendmsg on a UDP socket: gather the iovecs into one datagram and send it
 /// through sendto (destination from msg_name, or the connected peer).
 fn udpSendmsg(fd: u32, msghdr: *const [56]u8) i64 {
@@ -1843,9 +1873,17 @@ fn udpSendmsg(fd: u32, msghdr: *const [56]u8) i64 {
         if (copy.copyFromUser(ctl[0..cl], @ptrFromInt(ctl_ptr), cl) != cl) return -14;
     }
     var data: [1472]u8 = undefined;
-    // The datagram is the whole iovec: one longer than the buffer cannot be sent whole (EMSGSIZE in udpSendBytesFull, never a cut copy).
+    // The datagram is the whole iovec. One longer than the stack buffer is gathered into a kmalloc buffer when it may be sent
+    // (fragmented: an IPv4 socket); otherwise udpSendBytesFull refuses it (EMSGSIZE), never a cut copy.
     const total = iovTotal(iov_ptr, iov_len);
     if (total < 0) return total;
+    if (total > data.len and total <= udp.MAX_UDP_PAYLOAD_BIG and udpSendmsgFragmentable(fd)) {
+        const big = bigStage(@intCast(total)) orelse return -105;
+        defer @import("../mm/slab.zig").kfree(big.ptr);
+        const g = gatherIov(iov_ptr, iov_len, big);
+        if (g < 0) return g;
+        return udpSendBytesFull(fd, big[0..@intCast(g)], @intCast(total), name_ptr, name_len, ctl[0..cl]);
+    }
     const got = gatherIov(iov_ptr, iov_len, &data);
     if (got < 0) return got;
     if (total == 0) return 0;
@@ -1996,12 +2034,19 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
     const peek = (flags & 0x02) != 0;
     var meta: ip_cmsg_policy.RecvInfo = .{};
     var meta6: ip_cmsg_policy.RecvInfo6 = .{};
+    var big: ?udp.BigTake = null;
     if (is_v6) {
         got = udp.recvFromV6Meta(port, &data, @intCast(data.len), &src6, &src_port, &full, peek, &meta6);
     } else {
-        got = udp.recvFromMeta(port, &data, @intCast(data.len), &src4, &src_port, &full, peek, &meta);
+        big = udp.takeBig(port, &src4, &src_port, peek, &meta);
+        if (big) |bt| {
+            got = bt.len;
+            full = bt.len;
+        } else got = udp.recvFromMeta(port, &data, @intCast(data.len), &src4, &src_port, &full, peek, &meta);
     }
+    defer if (big) |bt| udp.releaseBig(bt, peek);
     if (got < 0) return got;
+    const src_bytes: []const u8 = if (big) |bt| udp.bigBytes(bt) else data[0..@intCast(@max(got, 0))];
 
     // Scatter.
     var done: usize = 0;
@@ -2013,7 +2058,7 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
         const sz: usize = @intCast(@min(bo.readU64At(&iov_buf, 8), @as(u64, @intCast(got)) - done));
         if (sz == 0) continue;
         if (base == 0 or base >= 0x0000_8000_0000_0000) return -14;
-        if (copy.copyToUser(@ptrFromInt(base), data[done..][0..sz], sz) != sz) return -14;
+        if (copy.copyToUser(@ptrFromInt(base), src_bytes[done..][0..sz], sz) != sz) return -14;
         done += sz;
     }
 

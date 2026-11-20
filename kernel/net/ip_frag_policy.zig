@@ -40,8 +40,14 @@ pub const Key = struct {
 
 const Range = struct { start: u32, end: u32 };
 
+/// Where a queue's payload starts in `Queue.buf`: room for an Ethernet header and the longest IPv4 header in front of it, so the whole
+/// datagram can be handed on as one frame.
+pub const PAYLOAD_OFF: usize = 14 + 60;
+
 pub const Queue = struct {
     used: bool = false,
+    /// The completed datagram is being delivered (outside the queue lock): nobody may reuse the queue until it is released.
+    busy: bool = false,
     key: Key = .{ .src = @splat(0), .dst = @splat(0), .id = 0, .protocol = 0 },
     started_ns: u64 = 0,
     /// The datagram's payload length once known (`last_in`), else the furthest end seen.
@@ -55,8 +61,41 @@ pub const Queue = struct {
     /// The first fragment's IP header (the reassembled datagram takes it, minus the fragment fields).
     header: [60]u8 = @splat(0),
     header_len: u8 = 0,
-    data: [MAX_PAYLOAD]u8 = undefined,
+    buf: [PAYLOAD_OFF + MAX_PAYLOAD]u8 = undefined,
+
+    pub fn data(q: *Queue) []u8 {
+        return q.buf[PAYLOAD_OFF..][0..q.len];
+    }
+
+    /// The completed datagram as an Ethernet frame (`eth` its 14-byte header): the first fragment's IP header with the fragment
+    /// fields cleared, the total length set and the checksum redone (ip_frag_reasm), then the payload.
+    pub fn frame(q: *Queue, eth: []const u8) []u8 {
+        const hl: usize = q.header_len;
+        const start = PAYLOAD_OFF - hl - 14;
+        @memcpy(q.buf[start..][0..14], eth[0..14]);
+        const h = q.buf[start + 14 ..][0..hl];
+        @memcpy(h, q.header[0..hl]);
+        const total: u16 = @intCast(hl + q.len);
+        h[2] = @intCast(total >> 8);
+        h[3] = @truncate(total);
+        h[6] = 0;
+        h[7] = 0;
+        h[10] = 0;
+        h[11] = 0;
+        const c = headerChecksum(h);
+        h[10] = @intCast(c >> 8);
+        h[11] = @truncate(c);
+        return q.buf[start .. PAYLOAD_OFF + q.len];
+    }
 };
+
+pub fn headerChecksum(h: []const u8) u16 {
+    var sum: u32 = 0;
+    var i: usize = 0;
+    while (i + 1 < h.len) : (i += 2) sum += @as(u32, h[i]) << 8 | h[i + 1];
+    while (sum >> 16 != 0) sum = (sum & 0xffff) + (sum >> 16);
+    return @truncate(~sum);
+}
 
 /// The fragment fields of an IPv4 header: whether it is a fragment at all, its offset in bytes, and MF.
 pub fn fragInfo(flags_offset: u16) struct { is_fragment: bool, offset: u32, more: bool } {
@@ -102,7 +141,7 @@ pub fn insert(q: *Queue, offset: u32, more: bool, payload: []const u8, header: [
     if (q.n == MAX_RANGES) return discard(q);
     q.ranges[q.n] = .{ .start = offset, .end = end };
     q.n += 1;
-    @memcpy(q.data[offset..end], payload[0 .. end - offset]);
+    @memcpy(q.buf[PAYLOAD_OFF + offset ..][0 .. end - offset], payload[0 .. end - offset]);
     q.meat += end - offset;
     if (offset == 0) {
         q.first_in = true;
@@ -118,28 +157,34 @@ pub fn insert(q: *Queue, offset: u32, more: bool, payload: []const u8, header: [
     return .pending;
 }
 
-fn discard(q: *Queue) Verdict {
+pub fn discard(q: *Queue) Verdict {
     q.used = false;
     return .discarded;
 }
 
-/// The queue for `key` among `qs`: an existing one, else a free one or the oldest (evicted), started at `now_ns`. Queues older than
-/// TIMEOUT_NS are dropped first (ip_expire).
-pub fn find(qs: []Queue, key: Key, now_ns: u64) *Queue {
+/// The queue for `key` among `qs`: an existing one, else a free one or the oldest (evicted), started at `now_ns`; null when every
+/// queue is delivering a datagram. Queues older than TIMEOUT_NS are dropped first (ip_expire).
+pub fn find(qs: []Queue, key: Key, now_ns: u64) ?*Queue {
     for (qs) |*q| {
-        if (q.used and now_ns -| q.started_ns >= TIMEOUT_NS) q.used = false;
+        if (q.used and !q.busy and now_ns -| q.started_ns >= TIMEOUT_NS) q.used = false;
     }
     for (qs) |*q| {
-        if (q.used and q.key.eql(key)) return q;
+        if (q.used and !q.busy and q.key.eql(key)) return q;
     }
-    var pick: *Queue = &qs[0];
+    var pick: ?*Queue = null;
     for (qs) |*q| {
+        if (q.busy) continue;
         if (!q.used) {
             pick = q;
             break;
         }
-        if (q.started_ns < pick.started_ns) pick = q;
+        if (pick == null or q.started_ns < pick.?.started_ns) pick = q;
     }
+    const p = pick orelse return null;
+    return reset(p, key, now_ns);
+}
+
+fn reset(pick: *Queue, key: Key, now_ns: u64) *Queue {
     // Field by field: a whole-struct store would build the 64 KiB value on the (kernel) stack first.
     pick.used = true;
     pick.key = key;
@@ -178,15 +223,23 @@ test "three in-order pieces reassemble; out of order too" {
     var src: [4000]u8 = undefined;
     for (&src, 0..) |*b, i| b.* = @truncate(i);
     const hdr = [_]u8{0x45} ++ [_]u8{0} ** 19;
-    const q = find(&qs, key, 0);
+    const q = find(&qs, key, 0).?;
     try std.testing.expectEqual(Verdict.pending, insert(q, 0, true, src[0..1480], &hdr));
     try std.testing.expectEqual(Verdict.pending, insert(q, 1480, true, src[1480..2960], &hdr));
     try std.testing.expectEqual(Verdict.complete, insert(q, 2960, false, src[2960..4000], &hdr));
     try std.testing.expectEqual(@as(u32, 4000), q.len);
-    try std.testing.expect(std.mem.eql(u8, q.data[0..4000], &src));
+    try std.testing.expect(std.mem.eql(u8, q.data(), &src));
+    const eth = [_]u8{0xee} ** 14;
+    const f = q.frame(&eth);
+    try std.testing.expectEqual(@as(usize, 14 + 20 + 4000), f.len);
+    try std.testing.expectEqual(@as(u8, 0xee), f[0]);
+    try std.testing.expectEqual(@as(u16, 4020), @as(u16, f[16]) << 8 | f[17]);
+    try std.testing.expectEqual(@as(u8, 0), f[20]);
+    try std.testing.expectEqual(@as(u16, 0), headerChecksum(f[14..34]));
+    try std.testing.expect(std.mem.eql(u8, f[34..], &src));
 
     const key2: Key = .{ .src = key.src, .dst = key.dst, .id = 8, .protocol = 17 };
-    const q2 = find(&qs, key2, 0);
+    const q2 = find(&qs, key2, 0).?;
     try std.testing.expect(q2 != q);
     try std.testing.expectEqual(Verdict.pending, insert(q2, 2960, false, src[2960..4000], &hdr));
     try std.testing.expectEqual(Verdict.pending, insert(q2, 0, true, src[0..1480], &hdr));
@@ -200,17 +253,17 @@ test "overlaps, a second last fragment and data past the end discard the queue" 
     const key: Key = .{ .src = .{ 1, 2, 3, 4 }, .dst = .{ 5, 6, 7, 8 }, .id = 1, .protocol = 17 };
     const hdr = [_]u8{0x45} ++ [_]u8{0} ** 19;
     var buf: [2000]u8 = @splat(0xaa);
-    var q = find(&qs, key, 0);
+    var q = find(&qs, key, 0).?;
     _ = insert(q, 0, true, buf[0..1000], &hdr);
     try std.testing.expectEqual(Verdict.discarded, insert(q, 496, true, buf[0..1000], &hdr));
     try std.testing.expect(!q.used);
-    q = find(&qs, key, 0);
+    q = find(&qs, key, 0).?;
     _ = insert(q, 1000, false, buf[0..100], &hdr);
     try std.testing.expectEqual(Verdict.discarded, insert(q, 1200, false, buf[0..100], &hdr));
-    q = find(&qs, key, 0);
+    q = find(&qs, key, 0).?;
     _ = insert(q, 1000, false, buf[0..100], &hdr);
     try std.testing.expectEqual(Verdict.discarded, insert(q, 1096, true, buf[0..16], &hdr));
-    q = find(&qs, key, 0);
+    q = find(&qs, key, 0).?;
     try std.testing.expectEqual(Verdict.discarded, insert(q, 8, true, buf[0..4], &hdr));
 }
 
@@ -219,11 +272,11 @@ test "a datagram over 65535 bytes is dropped, and so is a stale queue" {
     const key: Key = .{ .src = .{ 1, 2, 3, 4 }, .dst = .{ 5, 6, 7, 8 }, .id = 1, .protocol = 17 };
     const hdr = [_]u8{0x45} ++ [_]u8{0} ** 19;
     var big: [MAX_PAYLOAD]u8 = undefined;
-    var q = find(&qs, key, 0);
+    var q = find(&qs, key, 0).?;
     try std.testing.expectEqual(Verdict.discarded, insert(q, 8, false, big[0 .. MAX_PAYLOAD - 7], &hdr));
-    q = find(&qs, key, 0);
+    q = find(&qs, key, 0).?;
     try std.testing.expectEqual(Verdict.pending, insert(q, 0, true, big[0..8], &hdr));
-    const again = find(&qs, key, TIMEOUT_NS);
+    const again = find(&qs, key, TIMEOUT_NS).?;
     try std.testing.expectEqual(@as(u8, 0), again.n);
 }
 
@@ -232,4 +285,13 @@ test "piece length is the MTU less the header, a multiple of 8" {
     try std.testing.expectEqual(@as(u32, 1472), pieceLen(1500, 24));
     try std.testing.expect(needsFragment(1501, 1500));
     try std.testing.expect(!needsFragment(1500, 1500));
+}
+
+test "a delivering queue is never reused" {
+    var qs: [1]Queue = @splat(.{});
+    const key: Key = .{ .src = .{ 1, 2, 3, 4 }, .dst = .{ 5, 6, 7, 8 }, .id = 1, .protocol = 17 };
+    const q = find(&qs, key, 0).?;
+    q.busy = true;
+    try std.testing.expect(find(&qs, .{ .src = key.src, .dst = key.dst, .id = 2, .protocol = 17 }, 0) == null);
+    try std.testing.expect(find(&qs, key, TIMEOUT_NS * 2) == null);
 }

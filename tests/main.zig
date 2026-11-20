@@ -5418,7 +5418,8 @@ test "a UDP socket keeps its bound IPv4 address: getsockname and the datagram so
     try std.testing.expect(std.mem.indexOf(u8, ss, "        return udpRebind(t, fd, new_port, .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] }, @splat(0), 0);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "    if (rc != 0) return rc;\n    d.udp_local_ip = addr;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "const our4 = net_mod.tcp_port_policy.nameAddr(desc.udp_local_ip, desc.udp_connected, desc.udp_dst_ip, netif.getOurIp());") != null);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "udp.sendToFrom("));
+    // Two calls since hello452: the frame-sized copy and the kmalloc-staged datagram that will be fragmented.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "udp.sendToFrom("));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "udp.sendToFromOv("));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ss, "udp.sendTo("));
     const p = kt.tcp_port_policy;
@@ -17011,7 +17012,14 @@ test "an oversized UDP datagram is EMSGSIZE, never a cut copy, and a local IP_RE
     // ee_info = MTU. This stack never fragments: the send path used to copy the first 1472 bytes and send those.
     const eq = kt.errqueue_policy;
     try std.testing.expect(eq.oversize(1472, 1500, 1, false) == null);
-    try std.testing.expect(eq.oversize(1473, 1500, 1, false) != null);
+    // hello452: over the MTU, WANT / DONT / OMIT fragment; DO / PROBE refuse; 65508 is always too long.
+    try std.testing.expect(eq.oversize(1473, 1500, 1, false) == null);
+    try std.testing.expect(eq.oversize(1473, 1500, 0, false) == null);
+    try std.testing.expect(eq.oversize(1473, 1500, 5, false) == null);
+    try std.testing.expect(eq.oversize(1473, 1500, 2, false) != null);
+    try std.testing.expect(eq.oversize(1473, 1500, 3, false) != null);
+    try std.testing.expect(eq.oversize(65507, 1500, 1, false) == null);
+    try std.testing.expect(eq.oversize(65508, 1500, 1, false) != null);
     try std.testing.expect(eq.oversize(1600, 1500, 2, true).?.queue);
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (udpOversize4(src_key, dst_ip, dst_port, len)) |e| return e;") != null);
@@ -17121,4 +17129,24 @@ test "a TCP connect an ICMP error ends with IP_RECVERR queues it for MSG_ERRQUEU
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (if (tcb.is_v6) tcb.options.ip.recverr6 else tcb.options.ip.recverr) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "t.errq_full = false;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "net_mod.tcp.tcpTakeQueuedError(cur.fd_table.fds[fd].tcb_idx)") != null);
+}
+
+test "IPv4 reassembly is wired in: fragments go to ip_frag, big datagrams to a UDP big buffer (hello451)" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "if (@import(\"ip_frag.zig\").isFragment(data + 14, len - 14)) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "pub fn takeBig(port: u32,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "if (!fillEntryLocked(&queues[port_idx][i], payload)) break :blk false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "const big = udp.takeBig(sock_key, &src_ip, &src_port_out, msg_peek, &big_meta);") != null);
+}
+
+test "IPv4 UDP datagrams over the MTU leave in fragments (hello452)" {
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "fn sendFragmented4(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "return sendFragmented4(our_ip, dst_ip, dst_port, src_key, data[0..data_len], opts4, ttl_ov, group, mtu, dst_mac, our_mac, via_lo, wait_hop);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "const piece = frag.pieceLen(mtu, ipv4.HEADER_LEN);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "const big = bigStage(len) orelse return -105;") != null);
+}
+
+test "the fragmentation tests get CAP_NET_RAW for their raw sockets (hello451, hello452)" {
+    try std.testing.expect(kt.capability_profile.profileForLaunch("hello451", true, false).caps.cap_net_raw);
+    try std.testing.expect(kt.capability_profile.profileForLaunch("hello452", true, false).caps.cap_net_raw);
 }
