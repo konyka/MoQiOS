@@ -116,8 +116,14 @@ pub const MAX_PAYLOAD6: usize = 65535;
 /// IPV6_MAXPLEN is EMSGSIZE; past the MTU only IPV6_PMTUDISC_DO, PROBE and INTERFACE refuse (ip6_sk_ignore_df is false), the others
 /// are fragmented behind Fragment headers.
 pub fn oversizeErrno6(len: usize, mtu: u16, pmtudisc: u8) i64 {
+    return oversizeErrno6Df(len, mtu, pmtudisc, false);
+}
+
+/// oversizeErrno6 with IPV6_DONTFRAG: past the MTU is EMSGSIZE whatever IPV6_MTU_DISCOVER says.
+pub fn oversizeErrno6Df(len: usize, mtu: u16, pmtudisc: u8, dontfrag: bool) i64 {
     if (len > MAX_PAYLOAD6) return -90;
     if (len + 40 <= mtu) return 0;
+    if (dontfrag) return -90;
     return if (pmtudisc < 2 or pmtudisc == 5) 0 else -90;
 }
 

@@ -14980,7 +14980,8 @@ test "raw ICMP sockets take SOL_IP / SOL_IPV6 options and their sends carry them
     try std.testing.expect(std.mem.indexOf(u8, so, "if (!ipo.levelApplies(level, fam)) return if (fam == .v4) -95 else -92;") != null);
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send(src, dst, @truncate(protocol), msg, ip)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send6(src6, to6, @truncate(raw.protocolOf(d.raw_idx)), raw.checksumOffset(d.raw_idx), msg, ip, ov6.hops, ov6.tclass)") != null);
+    // hello461: the options go through ip6 (the socket's, with this send's IPV6_DONTFRAG).
+    try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send6(src6, to6, @truncate(raw.protocolOf(d.raw_idx)), raw.checksumOffset(d.raw_idx), msg, ip6, ov6.hops, ov6.tclass)") != null);
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "if (ipo.ipv4NeedsPatch(ip)) ipo.patchIpv4(pkt[14..][0..20], ip, ipv4.checksum);") != null);
     try std.testing.expect(std.mem.indexOf(u8, rs, "@import(\"icmpv6.zig\").sendProto6Ov(bound, dst, protocol, csum_off, buf[0..msg.len], ip, hops_ov, tclass_ov)") != null);
@@ -16309,12 +16310,12 @@ test "IPv6 UDP sendmsg control messages IPV6_HOPLIMIT / IPV6_TCLASS / IPV6_PKTIN
     try std.testing.expectEqual(@as(?u8, null), c.parseSend6(b[0..o], caps, ctx).ok.hops);
     o = W.put(&b, 0, 41, 67, &W.int(-1), null);
     try std.testing.expectEqual(@as(?u8, 0xff), c.parseSend6(b[0..o], caps, ctx).ok.tclass);
-    // Skipped: IPV6_DONTFRAG 1, IPV6_FLOWINFO, SOL_IP, SCM_RIGHTS.
+    // Skipped: IPV6_FLOWINFO, SOL_IP, SCM_RIGHTS. IPV6_DONTFRAG 1 is recorded for the send (hello461; it was only checked before).
     o = W.put(&b, 0, 41, 62, &W.int(1), null);
     o = W.put(&b, o, 41, 11, &W.int(1), null);
     o = W.put(&b, o, 0, 2, &W.int(3), null);
     o = W.put(&b, o, 1, 1, &W.int(3), null);
-    try std.testing.expectEqual(c.Send6{}, c.parseSend6(b[0..o], caps, ctx).ok);
+    try std.testing.expectEqual(c.Send6{ .dontfrag = true }, c.parseSend6(b[0..o], caps, ctx).ok);
     // EINVAL.
     const bad = [_]struct { ty: i32, d: []const u8 }{
         .{ .ty = 52, .d = &W.int(256) }, .{ .ty = 52, .d = &W.int(-2) }, .{ .ty = 52, .d = &.{5} },
@@ -17377,4 +17378,22 @@ test "pidfd_getfd copies the target's descriptor close-on-exec after a ptrace-ac
     try std.testing.expect(std.mem.indexOf(u8, se, "const copy = vfs.snapshotForPassing(target.fd_table, targetfd) orelse return -9;") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "if (vfs.installPassed(cur.fd_table, copy, true)) |slot| return @intCast(slot);") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "!pvp.mayAccess(ids.of(cur), ids.of(target), cur.effective_caps.cap_sys_ptrace)) return -1;") != null);
+}
+
+test "IPV6_DONTFRAG refuses datagrams over the path MTU instead of fragmenting them (socket option and control message; hello461)" {
+    const ipo = kt.ip_opt_policy;
+    const one = [4]u8{ 1, 0, 0, 0 };
+    const set = ipo.applySet(.{}, ipo.SOL_IPV6, ipo.IPV6_DONTFRAG, &one).ok;
+    try std.testing.expect(set.dontfrag6);
+    try std.testing.expectEqual(@as(?i32, 1), ipo.getValue(set, ipo.SOL_IPV6, ipo.IPV6_DONTFRAG));
+    // A value shorter than an int reads as 0 (do_ipv6_setsockopt), so it clears the option.
+    try std.testing.expect(!ipo.applySet(set, ipo.SOL_IPV6, ipo.IPV6_DONTFRAG, one[0..2]).ok.dontfrag6);
+    const eq = kt.errqueue_policy;
+    try std.testing.expect(eq.oversize6Df(3000, 1500, 1, false, true) != null);
+    try std.testing.expect(eq.oversize6Df(3000, 1500, 1, false, false) == null);
+    try std.testing.expect(eq.oversize6Df(1452, 1500, 1, false, true) == null);
+    try std.testing.expect(eq.oversize6Df(3000, 1500, 1, true, true).?.queue);
+    try std.testing.expectEqual(@as(i64, -90), kt.raw_icmp_policy.oversizeErrno6Df(3000, 1500, 1, true));
+    try std.testing.expectEqual(@as(i64, 0), kt.raw_icmp_policy.oversizeErrno6Df(3000, 1500, 1, false));
+    try std.testing.expect(kt.capability_profile.profileForLaunch("hello461", true, false).caps.cap_net_raw);
 }

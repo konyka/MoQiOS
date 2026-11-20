@@ -39,6 +39,8 @@ pub const IP_MULTICAST_ALL: u64 = 49;
 pub const IPV6_UNICAST_HOPS: u64 = 16;
 /// IPv6 path MTU discovery mode (Linux np->pmtudisc), the same values as IP_MTU_DISCOVER; IPV6_PMTUDISC_WANT unless set.
 pub const IPV6_MTU_DISCOVER: u64 = 23;
+/// IPV6_DONTFRAG: datagrams over the path MTU are refused (EMSGSIZE) instead of fragmented.
+pub const IPV6_DONTFRAG: u64 = 62;
 pub const IPV6_MULTICAST_IF: u64 = 17;
 pub const IPV6_MULTICAST_HOPS: u64 = 18;
 pub const IPV6_MULTICAST_LOOP: u64 = 19;
@@ -95,6 +97,7 @@ pub const IpOpts = struct {
     origdst6: bool = false,
     recverr6: bool = false,
     pmtudisc6: u8 = PMTUDISC_WANT,
+    dontfrag6: bool = false,
 };
 
 pub const Family = enum { v4, v6 };
@@ -133,8 +136,13 @@ pub const SetResult = union(enum) { ok: IpOpts, err: i64 };
 
 /// Apply setsockopt(level, optname, val) to `cur`.
 pub fn applySet(cur: IpOpts, level: u64, optname: u64, val: []const u8) SetResult {
-    const v = readInt(val) orelse return .{ .err = -22 };
     var o = cur;
+    // do_ipv6_setsockopt reads an int only when optlen >= sizeof(int) (val is 0 otherwise); IPV6_DONTFRAG takes any length.
+    if (level == SOL_IPV6 and optname == IPV6_DONTFRAG) {
+        o.dontfrag6 = val.len >= 4 and std.mem.readInt(i32, val[0..4], .little) != 0;
+        return .{ .ok = o };
+    }
+    const v = readInt(val) orelse return .{ .err = -22 };
     switch (level) {
         SOL_IP => switch (optname) {
             // 1..255 sets, -1 restores the default; 0 and anything else is invalid.
@@ -322,6 +330,7 @@ pub fn getValue(o: IpOpts, level: u64, optname: u64) ?i32 {
             IPV6_RECVORIGDSTADDR => @intFromBool(o.origdst6),
             IPV6_RECVERR => @intFromBool(o.recverr6),
             IPV6_MTU_DISCOVER => o.pmtudisc6,
+            IPV6_DONTFRAG => @intFromBool(o.dontfrag6),
             else => null,
         },
         else => null,

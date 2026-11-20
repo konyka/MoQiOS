@@ -77,9 +77,18 @@ pub fn oversize(payload: usize, mtu: u16, pmtudisc: u8, recverr: bool) ?struct {
 /// oversize for IPv6 (__ip6_append_data): 40 + 8 header bytes; ee_info is the MTU too.
 /// As for IPv4, a datagram over the MTU is fragmented (ip6_fragment, a Fragment header) unless the socket refuses (DO, PROBE,
 /// INTERFACE); a payload over 65527 bytes never fits the 16-bit payload length.
-pub fn oversize6(payload: usize, mtu: u16, pmtudisc: u8, recverr: bool) ?struct { info: u32, queue: bool } {
+pub const Oversize = struct { info: u32, queue: bool };
+
+pub fn oversize6(payload: usize, mtu: u16, pmtudisc: u8, recverr: bool) ?Oversize {
+    return oversize6Df(payload, mtu, pmtudisc, recverr, false);
+}
+
+/// oversize6 with IPV6_DONTFRAG (`dontfrag`): a datagram over the MTU is refused whatever IPV6_MTU_DISCOVER says (__ip6_append_data
+/// checks v6_cork->dontfrag first, then goes to the same ipv6_local_error: queued whenever IPV6_RECVERR is on).
+pub fn oversize6Df(payload: usize, mtu: u16, pmtudisc: u8, recverr: bool, dontfrag: bool) ?Oversize {
     if (payload > 65527) return .{ .info = mtu, .queue = recverr and (pmtudisc == 2 or pmtudisc == 3) };
     if (40 + 8 + payload <= mtu) return null;
+    if (dontfrag) return .{ .info = mtu, .queue = recverr };
     if (pmtudisc == 0 or pmtudisc == 1 or pmtudisc == 5) return null;
     return .{ .info = mtu, .queue = recverr and (pmtudisc == 2 or pmtudisc == 3) };
 }

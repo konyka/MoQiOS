@@ -458,7 +458,7 @@ pub fn sendProto6(bound: [16]u8, dst: [16]u8, next_header: u8, csum_off: ?u32, m
 /// keeps the socket's value). They are written into the IPv6 header after the socket's options.
 pub fn sendProto6Ov(bound: [16]u8, dst: [16]u8, next_header: u8, csum_off: ?u32, msg: []u8, ip: ipo.IpOpts, hops_ov: ?u8, tclass_ov: ?u8) i64 {
     const mtu = ipv6.getSendMtu(dst);
-    const orc = @import("raw_icmp_policy.zig").oversizeErrno6(msg.len, mtu, ip.pmtudisc6);
+    const orc = @import("raw_icmp_policy.zig").oversizeErrno6Df(msg.len, mtu, ip.pmtudisc6, ip.dontfrag6);
     if (orc != 0) return orc;
     const our_mac = netif.getMac();
     const via_lo = netif.isLoopbackV6(dst) or ndp.isOwnAddress(dst, our_mac);

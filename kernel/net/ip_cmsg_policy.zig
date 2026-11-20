@@ -369,6 +369,8 @@ pub const Ctx6 = struct {
 /// ip6_datagram_send_ctl fills): IPV6_HOPLIMIT and IPV6_TCLASS replace the socket's values (a hop limit of -1 keeps it, null here);
 /// IPV6_PKTINFO names the source address (:: lets the stack choose) and the outgoing interface (`oif`, 0 for none).
 pub const Send6 = struct {
+    /// IPV6_DONTFRAG of this datagram (null: the socket's).
+    dontfrag: ?bool = null,
     hops: ?u8 = null,
     tclass: ?u8 = null,
     pktinfo: bool = false,
@@ -488,6 +490,7 @@ fn datagramSendCtl6(control: []const u8, caps: SendCaps, ctx: Ctx6) Send6Result 
                 if (m.data.len != 4) return .{ .err = -22 };
                 const v: i32 = @bitCast(readU32(m.data));
                 if (v < 0 or v > 1) return .{ .err = -22 };
+                out.dontfrag = v == 1;
             },
             IPV6_2292HOPOPTS, IPV6_HOPOPTS, IPV6_2292DSTOPTS, IPV6_DSTOPTS, IPV6_RTHDRDSTOPTS => {
                 if (m.data.len < 2) return .{ .err = -22 };

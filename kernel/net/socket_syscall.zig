@@ -139,7 +139,13 @@ fn rawSendFrom6(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest,
         return if (hs < 0) hs else @intCast(msg.len);
     }
     const src6 = if (ov6.pktinfo and !std.mem.allEqual(u8, &ov6.src, 0)) ov6.src else raw.boundAddr6(d.raw_idx);
-    const sent = raw.send6(src6, to6, @truncate(raw.protocolOf(d.raw_idx)), raw.checksumOffset(d.raw_idx), msg, ip, ov6.hops, ov6.tclass);
+    var ip6 = ip;
+    if (ov6.dontfrag) |df| ip6.dontfrag6 = df;
+    const sent = raw.send6(src6, to6, @truncate(raw.protocolOf(d.raw_idx)), raw.checksumOffset(d.raw_idx), msg, ip6, ov6.hops, ov6.tclass);
+    // __ip6_append_data → ipv6_local_error: an IPV6_DONTFRAG refusal reaches the error queue of an IPV6_RECVERR socket, with the
+    // path MTU as ee_info.
+    if (sent == -90 and ip6.dontfrag6 and ip6.recverr6 and msg.len <= rp.MAX_PAYLOAD6)
+        raw.queueLocalError(d.raw_idx, errq.localEntry6(90, @import("ipv6.zig").getSendMtu(to6), to6, 0));
     return if (sent < 0) sent else @intCast(msg.len);
 }
 
@@ -526,7 +532,8 @@ fn pingSend6(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, add
     // An ICMPv6 error a connected socket took fails this send, once (sock_alloc_send_skb → sock_error).
     const pending = udp.takePendingError(d.udpKey());
     if (pending != 0) return -@as(i64, pending);
-    const ping_ip6: @import("ip_opt_policy.zig").IpOpts = if (udp.getPortOpts(d.udpKey())) |po| po.ip else .{};
+    var ping_ip6: @import("ip_opt_policy.zig").IpOpts = if (udp.getPortOpts(d.udpKey())) |po| po.ip else .{};
+    if (ov6.dontfrag) |df| ping_ip6.dontfrag6 = df;
     const sent = @import("icmpv6.zig").sendProto6Ov(d.udp_local_ip6, dst, 58, 2, msg[0..payload.len], ping_ip6, ov6.hops, ov6.tclass);
     return if (sent < 0) sent else @intCast(payload.len);
 }
@@ -1996,7 +2003,6 @@ fn udpSendBytesFull(fd: u32, payload: []const u8, full_len: usize, addr_ptr: u64
             dst6 = d.udp_dst_ip6;
             dst_port6 = d.udp_dst_port;
         } else return -89;
-        if (udpOversize6(src_key, dst6, dst_port6, full_len)) |e| return e;
         const n6 = payload.len;
         var oif6 = udp.sendOif6(src_key, dst6, scope6);
         // ip6_datagram_send_ctl runs once the destination is known; IPV6_PKTINFO may name the interface and the source.
@@ -2005,6 +2011,8 @@ fn udpSendBytesFull(fd: u32, payload: []const u8, full_len: usize, addr_ptr: u64
             .ok => |v| v,
             .err => |e| return e,
         };
+        // __ip6_append_data: an IPV6_DONTFRAG control message overrides the socket's for this datagram.
+        if (udpOversize6Df(src_key, dst6, dst_port6, full_len, ov6.dontfrag)) |e| return e;
         if (ov6.pktinfo and ov6.oif != 0) oif6 = @intCast(@min(ov6.oif, 255));
         const src6 = if (ov6.pktinfo and !std.mem.allEqual(u8, &ov6.src, 0)) ov6.src else d.udp_local_ip6;
         const unreach6 = bind_addr_policy.routeErrno6(dst6, oif6);
@@ -2045,8 +2053,14 @@ fn udpSendBytesFull(fd: u32, payload: []const u8, full_len: usize, addr_ptr: u64
 /// udpOversize4 for IPv6 (__ip6_append_data → ipv6_local_error): EMSGSIZE for a datagram over the path MTU, queued with IPV6_RECVERR
 /// under IPV6_PMTUDISC_DO or PROBE.
 fn udpOversize6(key: u32, dst: [16]u8, dst_port: u16, len: usize) ?i64 {
+    return udpOversize6Df(key, dst, dst_port, len, null);
+}
+
+/// udpOversize6 with this datagram's IPV6_DONTFRAG (null: the socket's IPV6_DONTFRAG).
+fn udpOversize6Df(key: u32, dst: [16]u8, dst_port: u16, len: usize, dontfrag_ov: ?bool) ?i64 {
     const ipo = (udp.getPortOpts(key) orelse return null).ip;
-    const o = errq.oversize6(len, @import("ipv6.zig").getSendMtu(dst), ipo.pmtudisc6, ipo.recverr6) orelse return null;
+    const df = dontfrag_ov orelse ipo.dontfrag6;
+    const o = errq.oversize6Df(len, @import("ipv6.zig").getSendMtu(dst), ipo.pmtudisc6, ipo.recverr6, df) orelse return null;
     if (o.queue) udp.queueLocalError(key, errq.localEntry6(90, o.info, dst, dst_port));
     return -90; // EMSGSIZE
 }

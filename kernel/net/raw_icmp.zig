@@ -419,6 +419,13 @@ pub fn takeError(idx: u32, clear: bool) i32 {
     return e;
 }
 
+/// ipv6_local_error / ip_local_error: queue a locally raised error (EMSGSIZE) for an IP_RECVERR / IPV6_RECVERR socket.
+pub fn queueLocalError(idx: u32, e: @import("errqueue_policy.zig").Entry) void {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx < MAX_SOCKETS and sockets[idx].used) _ = sockets[idx].errq.push(e);
+}
+
 /// Make `e` the socket's pending error (do_recvmmsg's sk_err after a batch that failed part-way).
 pub fn setError(idx: u32, e: i32) void {
     const saved = raw_lock.acquire();
