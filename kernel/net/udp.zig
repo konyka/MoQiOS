@@ -1653,6 +1653,11 @@ var flow_secret_lock: IrqSpinlock = .{};
 fn flowLabelFor(explicit: ?u32, opts: ip_opt_policy.IpOpts, src: [16]u8, dst: [16]u8, sport: u16, dport: u16) ?u32 {
     if (explicit) |l| return l;
     if (!opts.autoflow6) return null;
+    return autoFlowLabel(src, dst, sport, dport, PROTO_UDP6);
+}
+
+/// The automatic label of a flow under this boot's secret (flowlabel_policy.autoLabel).
+pub fn autoFlowLabel(src: [16]u8, dst: [16]u8, sport: u16, dport: u16, proto: u8) u32 {
     if (!@atomicLoad(bool, &flow_secret_set, .acquire)) {
         const held = flow_secret_lock.acquire();
         defer flow_secret_lock.release(held);
@@ -1661,7 +1666,7 @@ fn flowLabelFor(explicit: ?u32, opts: ip_opt_policy.IpOpts, src: [16]u8, dst: [1
             @atomicStore(bool, &flow_secret_set, true, .release);
         }
     }
-    return @import("flowlabel_policy.zig").autoLabel(src, dst, sport, dport, PROTO_UDP6, flow_secret);
+    return @import("flowlabel_policy.zig").autoLabel(src, dst, sport, dport, proto, flow_secret);
 }
 
 /// ip_fragment for a UDP datagram over `mtu`: the UDP header (with its checksum, which spans the whole datagram) and the payload are

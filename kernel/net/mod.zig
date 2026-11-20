@@ -82,7 +82,7 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
             // Hop-by-hop and destination options are stepped over (ipv6_parse_hopopts, ipv6_destopt_rcv); raw sockets of each header
             // passed see the packet from that header on (ip6_protocol_deliver_rcu hands every header to raw6_local_deliver).
             const ext = rp6.walkExt6(info6.next_header, data[payload_start6 .. payload_start6 + info6.payload_len]);
-            if (info6.next_header != ext.nh) _ = raw6.deliver6(info6.next_header, data[payload_start6 .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass);
+            if (info6.next_header != ext.nh) _ = raw6.deliver6Flow(info6.next_header, data[payload_start6 .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass, info6.flowinfo);
             switch (ext.kind) {
                 .deliver => {},
                 .drop => return,
@@ -101,7 +101,7 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
             const up_start: u32 = payload_start6 + @as(u32, @intCast(ext.off));
             const up_len: u16 = info6.payload_len - @as(u16, @intCast(ext.off));
             // raw6_local_deliver: each IPv6 raw socket of the upper-layer header gets it, before the protocol handler.
-            const raw_took6 = raw6.deliver6(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass);
+            const raw_took6 = raw6.deliver6Flow(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass, info6.flowinfo);
             switch (ext.nh) {
                 ipv6.PROTO_ICMPV6 => {
                     icmpv6.handlePacketMeta(info6.src_ip, info6.dst_ip, data + up_start, up_len, .{ .ifindex = ifindex, .dst = info6.dst_ip, .hops = info6.hop_limit, .tclass = info6.tclass });

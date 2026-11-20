@@ -141,6 +141,7 @@ fn rawSendFrom6(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest,
     const src6 = if (ov6.pktinfo and !std.mem.allEqual(u8, &ov6.src, 0)) ov6.src else raw.boundAddr6(d.raw_idx);
     var ip6 = ip;
     if (ov6.dontfrag) |df| ip6.dontfrag6 = df;
+    if (ov6.flowlabel) |fl| ip6.flow_ov6 = fl;
     const sent = raw.send6(src6, to6, @truncate(raw.protocolOf(d.raw_idx)), raw.checksumOffset(d.raw_idx), msg, ip6, ov6.hops, ov6.tclass);
     // __ip6_append_data → ipv6_local_error: an IPV6_DONTFRAG refusal reaches the error queue of an IPV6_RECVERR socket, with the
     // path MTU as ee_info.
@@ -539,6 +540,7 @@ fn pingSend6(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, add
     if (pending != 0) return -@as(i64, pending);
     var ping_ip6: @import("ip_opt_policy.zig").IpOpts = if (udp.getPortOpts(d.udpKey())) |po| po.ip else .{};
     if (ov6.dontfrag) |df| ping_ip6.dontfrag6 = df;
+    if (ov6.flowlabel) |fl| ping_ip6.flow_ov6 = fl;
     const sent = @import("icmpv6.zig").sendProto6Ov(d.udp_local_ip6, dst, 58, 2, msg[0..payload.len], ping_ip6, ov6.hops, ov6.tclass);
     // ipv6_local_error: an IPV6_DONTFRAG refusal reaches an IPV6_RECVERR ping socket's error queue too.
     if (sent == -90 and ping_ip6.dontfrag6 and ping_ip6.recverr6 and payload.len <= 0xFFFF)

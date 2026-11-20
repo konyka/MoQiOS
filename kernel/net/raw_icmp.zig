@@ -531,6 +531,11 @@ pub fn deliver(protocol: u8, dgram: []const u8, src: [4]u8, dst: [4]u8, ifindex:
 /// Whether any socket matched (ipv6_raw_deliver's `delivered`). `ifindex`, `hops` and `tclass` are the interface it arrived on and
 /// its IPv6 header's hop limit and traffic class.
 pub fn deliver6(protocol: u8, msg: []const u8, src: [16]u8, dst: [16]u8, ifindex: u8, hops: u8, tclass: u8) bool {
+    return deliver6Flow(protocol, msg, src, dst, ifindex, hops, tclass, 0);
+}
+
+/// deliver6 with the packet's flowinfo (traffic class and flow label), for IPV6_FLOWINFO on receive.
+pub fn deliver6Flow(protocol: u8, msg: []const u8, src: [16]u8, dst: [16]u8, ifindex: u8, hops: u8, tclass: u8, flowinfo: u32) bool {
     var notify: [MAX_SOCKETS]u32 = undefined;
     var n_notify: usize = 0;
     var took = false;
@@ -548,7 +553,7 @@ pub fn deliver6(protocol: u8, msg: []const u8, src: [16]u8, dst: [16]u8, ifindex
             const e = &s.queue[at];
             store(e, msg);
             e.src = src;
-            e.meta6 = .{ .ifindex = ifindex, .dst = dst, .hops = hops, .tclass = tclass };
+            e.meta6 = .{ .ifindex = ifindex, .dst = dst, .hops = hops, .tclass = tclass, .flowinfo = flowinfo };
             s.count += 1;
             notify[n_notify] = @intCast(i);
             n_notify += 1;

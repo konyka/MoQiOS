@@ -454,6 +454,14 @@ pub fn sendProto6(bound: [16]u8, dst: [16]u8, next_header: u8, csum_off: ?u32, m
     return sendProto6Ov(bound, dst, next_header, csum_off, msg, ip, null, null);
 }
 
+/// The flow label of a ping / raw IPv6 send: the IPV6_FLOWINFO control message's, else an automatic one unless IPV6_AUTOFLOWLABEL
+/// is off (ip6_make_flowlabel; the flow has no ports here).
+fn flowLabel6(ip: ipo.IpOpts, src: [16]u8, dst: [16]u8, nh: u8) ?u32 {
+    if (ip.flow_ov6 != 0) return ip.flow_ov6;
+    if (!ip.autoflow6) return null;
+    return @import("udp.zig").autoFlowLabel(src, dst, 0, 0, nh);
+}
+
 /// sendProto6 with the hop limit and traffic class of this one packet given (an IPV6_HOPLIMIT / IPV6_TCLASS control message; null
 /// keeps the socket's value). They are written into the IPv6 header after the socket's options.
 pub fn sendProto6Ov(bound: [16]u8, dst: [16]u8, next_header: u8, csum_off: ?u32, msg: []u8, ip: ipo.IpOpts, hops_ov: ?u8, tclass_ov: ?u8) i64 {
@@ -491,6 +499,7 @@ pub fn sendProto6Ov(bound: [16]u8, dst: [16]u8, next_header: u8, csum_off: ?u32,
             hdr[0] = (hdr[0] & 0xF0) | (tc >> 4);
             hdr[1] = (hdr[1] & 0x0F) | (tc << 4);
         }
+        if (flowLabel6(ip, src, dst, next_header)) |fl| ipo.setFlowLabel6(&hdr, fl);
         return if (@import("ip_frag.zig").send6(hdr, next_header, msg, mtu, dst_mac, our_mac, via_lo, wait_hop)) 0 else -105;
     }
     var pkt: [1518]u8 = @splat(0);
@@ -503,6 +512,7 @@ pub fn sendProto6Ov(bound: [16]u8, dst: [16]u8, next_header: u8, csum_off: ?u32,
         pkt[14] = (pkt[14] & 0xF0) | (tc >> 4);
         pkt[15] = (pkt[15] & 0x0F) | (tc << 4);
     }
+    if (flowLabel6(ip, src, dst, next_header)) |fl| ipo.setFlowLabel6(pkt[14..][0..40], fl);
     const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, @intCast(ipv6.HEADER_LEN + msg.len));
     if (wait_hop) |hop| {
         @import("ndp_queue.zig").queueFrame(hop, &pkt, frame_len);

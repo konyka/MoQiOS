@@ -112,6 +112,9 @@ pub const IpOpts = struct {
     rxflow6: bool = false,
     /// IPV6_AUTOFLOWLABEL: packets without an explicit label get an automatic one (on by default, auto_flowlabels OPTOUT).
     autoflow6: bool = true,
+    /// One send's explicit IPv6 flow label (an IPV6_FLOWINFO control message), 0 for none: carried here so the shared ICMPv6 / raw
+    /// send path sees it without another parameter. Never stored with the socket's options.
+    flow_ov6: u32 = 0,
 };
 
 pub const Family = enum { v4, v6 };

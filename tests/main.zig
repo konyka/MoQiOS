@@ -14809,7 +14809,7 @@ test "raw ICMPv6 socket wiring (hello391): checksummed ICMPv6 reaches raw socket
     // ICMPv6 included; each ICMPv6 socket checks the checksum itself (rawv6_rcv with rp->checksum set).
     const m = kt.net_mod_source;
     // hello410: after the extension headers, at the upper-layer header.
-    const dl = std.mem.indexOf(u8, m, "const raw_took6 = raw6.deliver6(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass);") orelse return error.TestUnexpectedResult;
+    const dl = std.mem.indexOf(u8, m, "const raw_took6 = raw6.deliver6Flow(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass, info6.flowinfo);") orelse return error.TestUnexpectedResult;
     const pr = std.mem.indexOf(u8, m, "icmpv6.handlePacketMeta(info6.src_ip, info6.dst_ip, data + up_start, up_len, .{") orelse return error.TestUnexpectedResult;
     try std.testing.expect(dl < pr);
     try std.testing.expect(std.mem.indexOf(u8, kt.icmpv6_source, "raw_icmp.zig\").deliver6(") == null);
@@ -15323,7 +15323,7 @@ test "IPV6_HDRINCL, IPPROTO_RAW and the ICMPv6 parameter problem (hello404): Lin
     try std.testing.expectEqual(@as(usize, 1240), rp.PARAM_PROBLEM_MAX);
     const m = kt.net_mod_source;
     // hello410: the next header after any extension headers decides, and the pointer names the field that named it.
-    try std.testing.expect(std.mem.indexOf(u8, m, "const raw_took6 = raw6.deliver6(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "const raw_took6 = raw6.deliver6Flow(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass, info6.flowinfo);") != null);
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "if (policy.startsHdrincl(protocol)) s.opts.ip.hdrincl = true;") != null);
     const ss = kt.socket_syscall_source;
@@ -16511,7 +16511,7 @@ test "raw socket recvmsg control messages IP_PKTINFO / IP_TTL / IP_TOS and the I
     try std.testing.expect(std.mem.indexOf(u8, rs, "meta: @import(\"ip_cmsg_policy.zig\").RecvInfo = .{},") != null);
     try std.testing.expect(std.mem.indexOf(u8, rs, "meta6: @import(\"ip_cmsg_policy.zig\").RecvInfo6 = .{},") != null);
     try std.testing.expect(std.mem.indexOf(u8, rs, "e.meta = .{ .ifindex = ifindex, .dst = dst, .ttl = if (dgram.len > 8) dgram[8] else 0, .tos = if (dgram.len > 1) dgram[1] else 0 };") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rs, "e.meta6 = .{ .ifindex = ifindex, .dst = dst, .hops = hops, .tclass = tclass };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "e.meta6 = .{ .ifindex = ifindex, .dst = dst, .hops = hops, .tclass = tclass, .flowinfo = flowinfo };") != null);
     const ss = kt.socket_syscall_source;
     const fr = std.mem.indexOf(u8, ss, "fn rawRecvmsg(") orelse return error.TestUnexpectedResult;
     _ = std.mem.indexOfPos(u8, ss, fr, "ip_cmsg_policy.build6(ip_cmsg_policy.Wanted.of6(opts_ip), got_meta.v6, ctl_cap, &ctl_buf)") orelse return error.TestUnexpectedResult;
@@ -17469,4 +17469,13 @@ test "automatic IPv6 flow labels: one per flow under a boot secret, off with IPV
     const zero = [4]u8{ 0, 0, 0, 0 };
     try std.testing.expect(!ipo.applySet(o, ipo.SOL_IPV6, ipo.IPV6_AUTOFLOWLABEL, &zero).ok.autoflow6);
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "if (flowLabelFor(flow_ov, opts, our_ip, dst_ip, src_port, dst_port)) |fl| ip_opt_policy.setFlowLabel6(send_pkt[14..][0..40], fl);") != null);
+}
+
+test "ping and raw IPv6 sends carry flow labels too (explicit or automatic), and raw sockets report IPV6_FLOWINFO (hello462 F)" {
+    const ic = kt.icmpv6_source;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ic, "if (flowLabel6(ip, src, dst, next_header)) |fl| ipo.setFlowLabel6("));
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (ov6.flowlabel) |fl| ip6.flow_ov6 = fl;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (ov6.flowlabel) |fl| ping_ip6.flow_ov6 = fl;") != null);
+    try std.testing.expect(kt.capability_profile.profileForLaunch("hello462", true, false).caps.cap_net_raw);
 }

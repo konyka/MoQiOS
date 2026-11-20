@@ -10,10 +10,14 @@
  *   D. IPV6_FLOWINFO_SEND set and a control message: the control message's label wins;
  *   E. automatic labels: IPV6_AUTOFLOWLABEL reads 1 on a new socket; its plain datagrams carry a non-zero label, the same for two
  *      sends of one flow; another socket (another source port) gets another label; IPV6_AUTOFLOWLABEL 0 turns it off (label 0),
- *      1 back on (the same label as before). */
+ *      1 back on (the same label as before);
+ *   F. raw and ping ICMPv6 sockets: a raw ICMPV6 socket sees its own echo request (loopback) with a non-zero automatic label that
+ *      repeats on the next request; an IPV6_FLOWINFO control message 0x12345 on a sendmsg gives that label; the IPv6 header is read
+ *      back through a raw IPPROTO_ICMPV6 socket's IPV6_FLOWINFO control message on receive. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
@@ -157,6 +161,38 @@ int main(void) {
     long e5 = next_flow();
     snprintf(msg, sizeof msg, "E: IPV6_AUTOFLOWLABEL %ld; label %lx then %lx; another socket %lx; off (%ld) %lx; on again %lx (1; x x; y; 0 0; x)", eg, e1, e1b, e3, eoff, e4, e5);
     check(eg == 1 && e1 > 0 && e1 <= 0xFFFFF && e1b == e1 && e3 > 0 && e3 != e1 && eoff == 0 && e4 == 0 && e5 == e1, msg);
+
+    /* F: a raw ICMPv6 socket reads the flowinfo of the echo requests it sends to ::1 (each is looped back to it). */
+    long rawf = sock(10, 3, 58);
+    setopt_(rawf, 41, 11, &one, 4);
+    unsigned char ra[28];
+    memcpy(ra, a, 28);
+    ra[2] = 0; ra[3] = 0;
+    unsigned char echo[16] = { 128, 0 };
+    long saved_rcv = rcv;
+    rcv = rawf;
+    sendto_(rawf, echo, 16, ra, 28);
+    long f1 = next_flow();
+    while (next_flow() >= 0) {}
+    sendto_(rawf, echo, 16, ra, 28);
+    long f2 = next_flow();
+    while (next_flow() >= 0) {}
+    unsigned char ctl[24];
+    memset(ctl, 0, sizeof ctl);
+    long clen = 20;
+    int lv = 41, ty = 11;
+    memcpy(ctl, &clen, 8); memcpy(ctl + 8, &lv, 4); memcpy(ctl + 12, &ty, 4);
+    ctl[17] = 0x01; ctl[18] = 0x23; ctl[19] = 0x45;
+    unsigned char mh[56];
+    memset(mh, 0, sizeof mh);
+    long iov[2] = { (long)echo, 16 };
+    long np = (long)ra, nl = 28, ip = (long)iov, onel = 1, cp = (long)ctl, cl = sizeof ctl;
+    memcpy(mh, &np, 8); memcpy(mh + 8, &nl, 4); memcpy(mh + 16, &ip, 8); memcpy(mh + 24, &onel, 8); memcpy(mh + 32, &cp, 8); memcpy(mh + 40, &cl, 8);
+    long fs = sendmsg_(rawf, mh, 0);
+    long f3 = next_flow();
+    rcv = saved_rcv;
+    snprintf(msg, sizeof msg, "F: raw ICMPv6 automatic label %lx then %lx; control message 0x12345: send %ld, label %lx (x x; 16 12345)", f1, f2, fs, f3);
+    check(rawf >= 0 && f1 > 0 && f1 == f2 && fs == 16 && f3 == 0x12345, msg);
 
     print(failures ? "hello462: FAIL\n" : "hello462: PASS\n");
     return failures ? 1 : 0;
