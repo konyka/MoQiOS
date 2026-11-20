@@ -3,7 +3,8 @@
 /// state and output cannot be predicted without the key.
 ///
 /// Seeding: 256 timer samples with the jitter between them hashed through BLAKE2s, plus RDSEED / RDRAND words on an x86 CPU that has
-/// them (random_seed_policy decides which instructions CPUID allows). Writes to /dev/random mix into the key (addEntropy).
+/// them (random_seed_policy decides which instructions CPUID allows). Interrupts feed a timing pool, and the key is replaced from it
+/// every 60 s (5 s during the first two minutes), as Linux crng_reseed does. Writes to /dev/random mix into the key (addEntropy).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -89,11 +90,68 @@ pub fn init() void {
     @atomicStore(bool, &initialized, true, .release);
 }
 
+/// Interrupt-timing pool (Linux add_interrupt_randomness → fast_mix): every timer and device interrupt folds its cycle count and
+/// source into it; a reseed hashes it into the key. Only the pool lock is taken in the interrupt, and only with tryAcquire, so a
+/// sample that would have to wait is just skipped.
+var pool: [4]u64 = .{ 0x243F6A8885A308D3, 0x13198A2E03707344, 0xA4093822299F31D0, 0x082EFA98EC4E6C89 };
+var pool_samples: u32 = 0;
+var pool_lock: IrqSpinlock = .{};
+var last_reseed_ns: u64 = 0;
+var reseeds: u64 = 0;
+
+/// One interrupt sample: `source` names what took it (an IRQ line, a timer).
+pub fn addInterruptSample(source: u64) void {
+    const held = pool_lock.tryAcquire() orelse return;
+    defer pool_lock.release(held);
+    @import("random_seed_policy.zig").foldSample(&pool, arch.tsc.read(), source);
+    pool_samples +|= 1;
+}
+
+/// crng_reseed: once the interval passed and the pool has samples, a new key is BLAKE2s(old output, pool, RDSEED/RDRAND) and the
+/// pool starts over. Called with rng_lock held, from getRandomBytes (never from an interrupt).
+fn maybeReseedLocked() void {
+    const policy = @import("random_seed_policy.zig");
+    const now = arch.tsc.nanos();
+    var snap: [4]u64 = undefined;
+    {
+        const held = pool_lock.acquire();
+        defer pool_lock.release(held);
+        if (!policy.reseedDue(now, last_reseed_ns, pool_samples)) return;
+        snap = pool;
+        pool_samples = 0;
+    }
+    var h = std.crypto.hash.blake2.Blake2s256.init(.{});
+    var old: [32]u8 = undefined;
+    rng.fill(&old);
+    h.update(&old);
+    h.update(std.mem.asBytes(&snap));
+    h.update(std.mem.asBytes(&now));
+    if (hwWord()) |w| h.update(std.mem.asBytes(&w));
+    var key: [std.Random.ChaCha.secret_seed_length]u8 = undefined;
+    h.final(&key);
+    rng = std.Random.ChaCha.init(key);
+    @memset(&key, 0);
+    @memset(&old, 0);
+    last_reseed_ns = now;
+    reseeds += 1;
+}
+
+/// Interrupt samples gathered since the last reseed.
+pub fn poolSamples() u32 {
+    return @atomicLoad(u32, &pool_samples, .monotonic);
+}
+
+/// How many times the generator took a fresh key since boot.
+pub fn reseedCount() u64 {
+    return @atomicLoad(u64, &reseeds, .monotonic);
+}
+
 /// Fill a kernel buffer with random bytes.
 pub fn getRandomBytes(buf: [*]u8, len: u32) void {
     if (!@atomicLoad(bool, &initialized, .acquire)) init();
     const state_held = rng_lock.acquire();
     defer rng_lock.release(state_held);
+    maybeReseedLocked();
     rng.fill(buf[0..len]);
 }
 

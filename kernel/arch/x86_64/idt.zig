@@ -1519,6 +1519,9 @@ fn handleLapicTimer(frame: *InterruptFrame) void {
         incrementTick();
     }
 
+    // add_interrupt_randomness: the cycle count at each tick feeds the generator's reseed pool.
+    @import("../../drivers/random.zig").addInterruptSample(0x100);
+
     const sched = @import("../../proc/sched.zig");
     sched.timerTick(frame);
 }
@@ -1526,6 +1529,7 @@ fn handleLapicTimer(frame: *InterruptFrame) void {
 /// Handle legacy PIC IRQ (IRQ 0-15).
 fn handleIrq(frame: *InterruptFrame, irq: u8) void {
     _ = frame;
+    @import("../../drivers/random.zig").addInterruptSample(irq);
     // L1: a user-owned line (dev_irq_register) gets its edge counted and an
     // EOI — the kernel driver handlers below must NOT run for it.
     {

@@ -135,6 +135,7 @@ export fn trapHandler(frame: *TrapFrame) callconv(.c) *TrapFrame {
     const interrupt = (frame.scause >> 63) != 0;
     const code = frame.scause & 0xff;
 
+    if (interrupt) @import("../../drivers/random.zig").addInterruptSample(code);
     if (interrupt and code == Cause.supervisor_timer) {
         const timer = @import("timer.zig");
         timer.onInterrupt();

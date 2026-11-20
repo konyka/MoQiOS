@@ -28,6 +28,8 @@ pub const ProcFile = enum(u8) {
     lostats,
     /// TCB table snapshot: connections per state, unreferenced leftovers, SYNs dropped for lack of a slot, TIME_WAIT slots given away.
     tcpstats,
+    /// Kernel random generator counters: key replacements from the interrupt pool since boot and samples waiting in the pool.
+    randstats,
     /// /proc/sys/net/ipv4/ping_group_range: the groups that may create ping sockets (two gids); root may write it (mode 0644).
     ping_group_range,
     /// /proc/sys/net/ipv4/conf/<dev>/{proxy_arp,route_localnet}: a device's setting, an int (arp.confRead); the device and the
@@ -138,7 +140,7 @@ const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
 
 /// The files /proc lists besides the per-process directories, in listing order.
-const root_files = [_][]const u8{ "meminfo", "cpuinfo", "uptime", "version", "loadavg", "filesystems", "stat", "sched_stats", "vma_stats", "irqtime", "irqwindow", "lostats", "tcpstats" };
+const root_files = [_][]const u8{ "meminfo", "cpuinfo", "uptime", "version", "loadavg", "filesystems", "stat", "sched_stats", "vma_stats", "irqtime", "irqwindow", "lostats", "tcpstats", "randstats" };
 /// The fixed directories /proc lists after its files.
 const root_dirs = [_][]const u8{ "net", "sys" };
 /// What a /proc/<pid> directory lists.
@@ -249,6 +251,7 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
         .irqwindow => generateIrqWindow(buf, max_len),
         .lostats => generateLoStats(buf, max_len),
         .tcpstats => generateTcpStats(buf, max_len),
+        .randstats => generateRandStats(buf, max_len),
         .ping_group_range => @intCast(@import("../net/udp.zig").pingGroupRead(buf[0..@min(max_len, 32)])),
         .conf_file => @intCast(@import("../net/arp.zig").confRead(@import("../net/devconf_policy.zig").decode(pid), buf[0..@min(max_len, 16)])),
         .net_arp => @intCast(@import("../net/arp.zig").formatProc(buf[0..max_len])),
@@ -685,6 +688,18 @@ fn generateIrqWindow(buf: [*]u8, max_len: u32) u32 {
 fn generateTcpStats(buf: [*]u8, max_len: u32) u32 {
     const tcp = @import("../net/tcp.zig");
     return @intCast(@import("../net/tcp_stats.zig").format(tcp.tcpStatsSnapshot(), buf[0..max_len]));
+}
+
+/// "reseeds=N pool_samples=N\n".
+fn generateRandStats(buf: [*]u8, max_len: u32) u32 {
+    const random = @import("../drivers/random.zig");
+    var pos: u32 = 0;
+    pos = appendStr(buf, pos, max_len, "reseeds=");
+    pos = appendDec(buf, pos, max_len, random.reseedCount());
+    pos = appendStr(buf, pos, max_len, " pool_samples=");
+    pos = appendDec(buf, pos, max_len, random.poolSamples());
+    pos = appendStr(buf, pos, max_len, "\n");
+    return pos;
 }
 
 fn generateLoStats(buf: [*]u8, max_len: u32) u32 {

@@ -95,6 +95,7 @@ export fn trapHandleSyncEl0(frame: *anyopaque) callconv(.c) u64 {
 export fn trapHandleIrq(frame: *anyopaque) callconv(.c) usize {
     const gic = @import("gic.zig");
     const intid = gic.handleIrq();
+    @import("../../drivers/random.zig").addInterruptSample(intid);
     if (intid == gic.TIMER_PPI) {
         @import("timer.zig").onInterrupt();
         @import("../../ipc/ipc.zig").timeoutTick(@import("timer.zig").getFirings());

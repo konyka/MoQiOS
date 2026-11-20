@@ -1904,6 +1904,8 @@ pub const FdTable = struct {
                 pfile = .lostats;
             } else if (rest.len == 8 and str.eql(rest, "tcpstats")) {
                 pfile = .tcpstats;
+            } else if (str.eql(rest, "randstats")) {
+                pfile = .randstats;
             } else if (str.eql(rest, "sys/net/ipv4/ping_group_range")) {
                 // Mode 0644 owned by root: opening it for writing needs fsuid 0 or CAP_NET_ADMIN, which net_ctl_permissions gives
                 // the owner's bits.

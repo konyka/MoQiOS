@@ -575,6 +575,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello456"); /* a clone child reports with SIGCHLD once its parent has exec'd (parent_exec_id) */
     run_test("hello457"); /* /dev/random and /dev/urandom: whole reads, writes mixed into the generator */
     run_test("hello458"); /* a recvmmsg batch that fails part-way leaves the error pending */
+    run_test("hello459"); /* the random generator reseeds from interrupt timing (/proc/randstats) */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

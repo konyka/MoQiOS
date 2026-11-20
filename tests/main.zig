@@ -17339,3 +17339,22 @@ test "the kernel generator is ChaCha8 with fast key erasure, seeded from timer j
     try std.testing.expect(!std.mem.eql(u8, &x, &y));
     try std.testing.expect(std.mem.eql(u8, &x, &z));
 }
+
+test "interrupts feed the generator's reseed pool and the key is replaced on the crng_reseed schedule" {
+    const sp = kt.random_seed_policy;
+    try std.testing.expect(!sp.reseedDue(10 * std.time.ns_per_s, 0, 0));
+    try std.testing.expect(sp.reseedDue(10 * std.time.ns_per_s, 0, sp.MIN_SAMPLES));
+    try std.testing.expect(!sp.reseedDue(200 * std.time.ns_per_s, 150 * std.time.ns_per_s, 1000));
+    try std.testing.expect(sp.reseedDue(211 * std.time.ns_per_s, 150 * std.time.ns_per_s, 1000));
+    const rs = kt.random_source;
+    try std.testing.expect(std.mem.indexOf(u8, rs, "const held = pool_lock.tryAcquire() orelse return;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "    maybeReseedLocked();\n    rng.fill(buf[0..len]);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.idt_source, "@import(\"../../drivers/random.zig\").addInterruptSample(0x100);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.idt_source, "@import(\"../../drivers/random.zig\").addInterruptSample(irq);") != null);
+}
+
+test "/proc/randstats reports the generator's reseeds and pool samples (hello459)" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, "\"irqwindow\", \"lostats\", \"tcpstats\", \"randstats\" };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".randstats => generateRandStats(buf, max_len),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "} else if (str.eql(rest, \"randstats\")) {") != null);
+}
