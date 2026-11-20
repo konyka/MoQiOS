@@ -20,23 +20,56 @@ pub const OFFSET_MASK: u16 = 0x1fff;
 pub const TIMEOUT_NS: u64 = 30 * std.time.ns_per_s;
 /// The largest IPv4 datagram, header included.
 pub const MAX_DATAGRAM: usize = 65535;
-/// Payload room of a reassembly queue (the largest payload behind a 20-byte header).
-pub const MAX_PAYLOAD: usize = MAX_DATAGRAM - 20;
+/// Payload room of a reassembly queue: an IPv6 payload may be 65535 bytes (IPV6_MAXPLEN); an IPv4 one stops at 65535 less its header.
+pub const MAX_PAYLOAD: usize = 65535;
 /// Distinct byte ranges a queue tracks; a datagram cut into more pieces than this is dropped.
 pub const MAX_RANGES: usize = 64;
 /// Queues kept at once (Linux bounds them by memory, ipfrag_high_thresh); a new datagram when all are busy takes the oldest.
 pub const QUEUES: usize = 4;
 
+/// A reassembly queue's identity: (source, destination, id, protocol) for IPv4 (the addresses in the first 4 bytes, a 16-bit id);
+/// (source, destination, id) for IPv6, whose 32-bit id names the datagram on its own (ip6_frag_find, `protocol` 0).
 pub const Key = struct {
-    src: [4]u8,
-    dst: [4]u8,
-    id: u16,
-    protocol: u8,
+    src: [4]u8 = @splat(0),
+    dst: [4]u8 = @splat(0),
+    id: u32 = 0,
+    protocol: u8 = 0,
+    v6: bool = false,
+    src6: [16]u8 = @splat(0),
+    dst6: [16]u8 = @splat(0),
 
     pub fn eql(a: Key, b: Key) bool {
-        return std.mem.eql(u8, &a.src, &b.src) and std.mem.eql(u8, &a.dst, &b.dst) and a.id == b.id and a.protocol == b.protocol;
+        if (a.v6 != b.v6 or a.id != b.id or a.protocol != b.protocol) return false;
+        if (a.v6) return std.mem.eql(u8, &a.src6, &b.src6) and std.mem.eql(u8, &a.dst6, &b.dst6);
+        return std.mem.eql(u8, &a.src, &b.src) and std.mem.eql(u8, &a.dst, &b.dst);
+    }
+
+    /// IP_FRAG_TIME (30 s) for IPv4, IPV6_FRAG_TIMEOUT (60 s) for IPv6.
+    pub fn timeoutNs(k: Key) u64 {
+        return if (k.v6) TIMEOUT6_NS else TIMEOUT_NS;
     }
 };
+
+pub const TIMEOUT6_NS: u64 = 60 * std.time.ns_per_s;
+
+/// The fields of an IPv6 Fragment header (8 bytes: next header, reserved, offset and M flag, id).
+pub fn fragHeader6(h: []const u8) struct { nh: u8, offset: u32, more: bool, id: u32 } {
+    const fo: u16 = @as(u16, h[2]) << 8 | h[3];
+    return .{ .nh = h[0], .offset = fo & 0xfff8, .more = fo & 1 != 0, .id = std.mem.readInt(u32, h[4..8], .big) };
+}
+
+/// ipv6_frag_rcv / ip6_frag_queue checks a fragment of `payload_len` bytes (after the Fragment header) at `offset` must pass: an
+/// atomic fragment (offset 0, no M) is the datagram itself; a non-last fragment whose length is not a multiple of 8 is a parameter
+/// problem pointing at the payload length field (4); past 65535 bytes is a parameter problem at the offset field (`frag_field`).
+pub const Check6 = union(enum) { atomic, queue, param_problem: u32 };
+
+pub fn check6(offset: u32, more: bool, payload_len: usize, frag_field: u32) Check6 {
+    if (offset == 0 and !more) return .atomic;
+    const end = offset + payload_len;
+    if (end > 65535) return .{ .param_problem = frag_field };
+    if (more and end & 7 != 0) return .{ .param_problem = 4 };
+    return .queue;
+}
 
 const Range = struct { start: u32, end: u32 };
 
@@ -48,7 +81,7 @@ pub const Queue = struct {
     used: bool = false,
     /// The completed datagram is being delivered (outside the queue lock): nobody may reuse the queue until it is released.
     busy: bool = false,
-    key: Key = .{ .src = @splat(0), .dst = @splat(0), .id = 0, .protocol = 0 },
+    key: Key = .{},
     started_ns: u64 = 0,
     /// The datagram's payload length once known (`last_in`), else the furthest end seen.
     len: u32 = 0,
@@ -85,6 +118,18 @@ pub const Queue = struct {
         const c = headerChecksum(h);
         h[10] = @intCast(c >> 8);
         h[11] = @truncate(c);
+        return q.buf[start .. PAYLOAD_OFF + q.len];
+    }
+
+    /// frame for an IPv6 datagram: the first fragment's 40-byte header (its next header already the Fragment header's) with the payload
+    /// length set (ip6_frag_reasm), then the payload. A payload over 65535 bytes is never complete (insert drops it).
+    pub fn frame6(q: *Queue, eth: []const u8) []u8 {
+        const start = PAYLOAD_OFF - 40 - 14;
+        @memcpy(q.buf[start..][0..14], eth[0..14]);
+        const h = q.buf[start + 14 ..][0..40];
+        @memcpy(h, q.header[0..40]);
+        h[4] = @intCast(q.len >> 8);
+        h[5] = @truncate(q.len);
         return q.buf[start .. PAYLOAD_OFF + q.len];
     }
 };
@@ -150,8 +195,8 @@ pub fn insert(q: *Queue, offset: u32, more: bool, payload: []const u8, header: [
         q.header_len = @intCast(hl);
     }
     if (q.first_in and q.last_in and q.meat == q.len) {
-        // ip_frag_reasm: the whole datagram, header included, must fit 65535 bytes.
-        if (@as(usize, q.len) + q.header_len > MAX_DATAGRAM) return discard(q);
+        // ip_frag_reasm: the whole IPv4 datagram, header included, must fit 65535 bytes; ip6_frag_reasm bounds the payload alone.
+        if (!q.key.v6 and @as(usize, q.len) + q.header_len > MAX_DATAGRAM) return discard(q);
         return .complete;
     }
     return .pending;
@@ -166,7 +211,7 @@ pub fn discard(q: *Queue) Verdict {
 /// queue is delivering a datagram. Queues older than TIMEOUT_NS are dropped first (ip_expire).
 pub fn find(qs: []Queue, key: Key, now_ns: u64) ?*Queue {
     for (qs) |*q| {
-        if (q.used and !q.busy and now_ns -| q.started_ns >= TIMEOUT_NS) q.used = false;
+        if (q.used and !q.busy and now_ns -| q.started_ns >= q.key.timeoutNs()) q.used = false;
     }
     for (qs) |*q| {
         if (q.used and !q.busy and q.key.eql(key)) return q;
@@ -294,4 +339,27 @@ test "a delivering queue is never reused" {
     q.busy = true;
     try std.testing.expect(find(&qs, .{ .src = key.src, .dst = key.dst, .id = 2, .protocol = 17 }, 0) == null);
     try std.testing.expect(find(&qs, key, TIMEOUT_NS * 2) == null);
+}
+
+test "IPv6 keys, fragment header and the checks before queueing" {
+    var a: Key = .{ .v6 = true, .id = 0x1001 };
+    a.src6[15] = 1;
+    a.dst6[15] = 1;
+    var b = a;
+    try std.testing.expect(a.eql(b));
+    b.id = 0x1002;
+    try std.testing.expect(!a.eql(b));
+    const v4: Key = .{ .id = 0x1001 };
+    try std.testing.expect(!a.eql(v4));
+    try std.testing.expectEqual(TIMEOUT6_NS, a.timeoutNs());
+    const h = fragHeader6(&.{ 17, 0, 0x05, 0xa9, 0, 0, 0x10, 0x01 });
+    try std.testing.expectEqual(@as(u8, 17), h.nh);
+    try std.testing.expectEqual(@as(u32, 1448), h.offset);
+    try std.testing.expect(h.more);
+    try std.testing.expectEqual(@as(u32, 0x1001), h.id);
+    try std.testing.expect(check6(0, false, 12, 42) == .atomic);
+    try std.testing.expect(check6(0, true, 1448, 42) == .queue);
+    try std.testing.expectEqual(@as(u32, 4), check6(0, true, 1444, 42).param_problem);
+    try std.testing.expectEqual(@as(u32, 42), check6(65528, false, 16, 42).param_problem);
+    try std.testing.expect(check6(2896, false, 112, 42) == .queue);
 }

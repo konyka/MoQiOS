@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello452`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello453`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -447,6 +447,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello450 | clone 的退出信号：clone(SIGUSR1) 的子进程退出时父进程收到 SIGUSR1（CLD_EXITED、si_pid、si_status 3），普通 waitpid 为 ECHILD，`__WCLONE` 回收（A）；clone(0) 不发信号，`__WALL` 回收（B）；clone(SIGCHLD) 同 fork，`__WCLONE` 为 ECHILD（C）；clone(65) 为 EINVAL，64 可用（D）；waitid 同样按 `__WCLONE` 区分（E）；`waitpid(-1, __WCLONE)` 只取 clone 子进程（F）；停止的 clone 子进程只有 WUNTRACED\|__WCLONE 能看到（G）；忽略 SIGCHLD 时 clone 子进程不被自动回收（H）；exec 之后变回普通子进程（I） |
 | hello451 | IPv4 分片重组（经 IPPROTO_RAW 手工发送 127.0.0.1:4510 的 UDP 分片）：1480+1480+48 字节三片按顺序（A）、乱序（B）、带重复片（C）都收到完整的 3000 字节；与第一片重叠的中间片使数据报被丢弃（D）；两个 id 交错都收到（E）；缺最后一片收不到（F）；之后普通数据报照常（G） |
 | hello452 | IPv4 UDP 数据报超过 MTU 时分片：1473、3000、8000、30000、65507 字节都完整收发（A）；65508 字节 EMSGSIZE（B）；IP_PMTUDISC_DONT、OMIT 能发，PROBE、DO 为 EMSGSIZE（C）；raw IPPROTO_UDP 套接字看到重组后的一个数据报，头部总长 3028、无分片位（D） |
+| hello453 | IPv6 分片：1453、3000、30000、65527 字节完整收发（A）；65528 字节 EMSGSIZE（B）；IPV6_MTU_DISCOVER DO 为 EMSGSIZE、DONT 能发（C）；经 raw IPPROTO_FRAGMENT 套接字手工发的三片按顺序、乱序都重组成 3000 字节，原子分片直接交付（D）；重叠片使数据报被丢弃（E）；1228 字节的非末片收到参数问题，指针 4（F）；之后普通数据报照常（G） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

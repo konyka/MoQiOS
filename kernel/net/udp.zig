@@ -28,10 +28,12 @@ const MAX_UDP_PAYLOAD_V6 = 1452;
 
 /// The largest UDP payload (65535 - 20 - 8), what a reassembled IPv4 datagram may carry.
 pub const MAX_UDP_PAYLOAD_BIG = 65507;
+/// The IPv6 one (65535 - 8): the payload length field does not count the 40-byte header.
+pub const MAX_UDP_PAYLOAD_BIG6 = 65527;
 /// Buffers for queued datagrams longer than one frame holds (they only come from IPv4 reassembly); a datagram that finds none free
 /// is dropped, as a full receive buffer drops it in Linux.
 const BIG_SLOTS = 4;
-var big_bufs: [BIG_SLOTS][MAX_UDP_PAYLOAD_BIG]u8 = undefined;
+var big_bufs: [BIG_SLOTS][MAX_UDP_PAYLOAD_BIG6]u8 = undefined;
 var big_used: [BIG_SLOTS]bool = @splat(false);
 
 const UdpEntry = struct {
@@ -85,7 +87,7 @@ fn fillEntryLocked(e: *UdpEntry, payload: []const u8) bool {
         e.big = 0;
         @memcpy(e.data[0..payload.len], payload);
     } else {
-        if (payload.len > MAX_UDP_PAYLOAD_BIG) return false;
+        if (payload.len > MAX_UDP_PAYLOAD_BIG6) return false;
         const slot = for (big_used, 0..) |u, k| {
             if (!u) break k;
         } else return false;
@@ -1097,7 +1099,6 @@ fn enqueueMcast(port: u16, src_ip: [16]u8, src_port: u16, group: [16]u8, payload
         const saved = udp_lock.acquire();
         defer udp_lock.release(saved);
         if (!mcast.alwaysJoined(group) and !hostJoinedLocked(group, ifindex)) return;
-        const actual = @min(payload.len, MAX_UDP_PAYLOAD);
         for (0..num_ports) |i| {
             if (port_ping[i] or !port_named[i]) continue;
             if (portNumber(ports[i]) != port or !port_v6[i]) continue;
@@ -1106,11 +1107,10 @@ fn enqueueMcast(port: u16, src_ip: [16]u8, src_port: u16, group: [16]u8, payload
             for (0..QUEUE_DEPTH) |j| {
                 const e = &queues[i][j];
                 if (e.valid) continue;
+                if (!fillEntryLocked(e, payload)) break;
                 e.src_ip = src_ip;
                 e.src_port = src_port;
                 e.dst_port = port;
-                e.data_len = @intCast(actual);
-                @memcpy(e.data[0..actual], payload[0..actual]);
                 e.is_v6 = true;
                 e.meta = .{};
                 e.meta6 = stamped6(meta6, port);
@@ -1248,8 +1248,9 @@ pub fn handlePacketV6Meta(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len
     const expect = udp_util.checksumV6(src_ip, dst_ip, data, hdr.udp_len);
     if (wire_csum != expect) return;
 
-    const actual_payload = @min(hdr.payload_len, @as(u16, MAX_UDP_PAYLOAD_V6));
-    if (8 + actual_payload > len) return;
+    // A datagram longer than one frame only comes from reassembly; the queue keeps it in a big buffer.
+    const actual_payload = hdr.payload_len;
+    if (8 + @as(u32, actual_payload) > len) return;
     if (mcast.isMulticast(dst_ip)) {
         enqueueMcast(hdr.dst_port, src_ip, hdr.src_port, dst_ip, data[8..][0..actual_payload], ifindex, meta6);
         return;
@@ -1341,6 +1342,30 @@ pub fn takeBig(port: u32, out_src_ip: *[4]u8, out_src_port: *u16, peek: bool, ou
             big_pinned[t.slot] += 1;
         } else {
             // The buffer leaves the entry but stays in use until releaseBig.
+            entry.big = 0;
+            entry.valid = false;
+        }
+        return t;
+    }
+    return null;
+}
+
+/// takeBig for the next IPv6 datagram on `port`.
+pub fn takeBig6(port: u32, out_src_ip: *[16]u8, out_src_port: *u16, peek: bool, out_meta6: *ip_cmsg_policy.RecvInfo6) ?BigTake {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const port_idx = findPortIdxLocked(port) orelse return null;
+    for (0..QUEUE_DEPTH) |i| {
+        const entry = &queues[port_idx][i];
+        if (!(entry.valid and entry.is_v6)) continue;
+        if (entry.big == 0) return null;
+        out_src_ip.* = entry.src_ip;
+        out_src_port.* = entry.src_port;
+        out_meta6.* = entry.meta6;
+        const t: BigTake = .{ .slot = entry.big - 1, .len = entry.data_len };
+        if (peek) {
+            big_pinned[t.slot] += 1;
+        } else {
             entry.big = 0;
             entry.valid = false;
         }
@@ -1519,6 +1544,70 @@ pub fn sendToFromOv(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, da
     return ok;
 }
 
+/// The id of the next fragmented IPv6 datagram (ipv6_select_ident hashes the addresses; one counter keeps ids from repeating here).
+var frag6_id: u32 = 0x5a5a0001;
+
+/// ip6_fragment for a UDP datagram over `mtu`: the UDP datagram (header and checksum included) is cut into pieces of (mtu - 40 - 8)
+/// rounded down to 8 bytes, each behind the IPv6 header (next header 44) and a Fragment header (next header UDP, the offset, M on all
+/// but the last, one id for the whole datagram). The datagram is staged in a kmalloc buffer.
+fn sendFragmented6(our_ip: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, oif: u8, payload: []const u8, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, is_loop: bool, wait_hop6: ?[16]u8, hops_ov: ?u8, tclass_ov: ?u8) bool {
+    _ = oif;
+    const slab = @import("../mm/slab.zig");
+    const total: usize = 8 + payload.len;
+    const raw = slab.kmalloc(total) orelse return false;
+    defer slab.kfree(raw);
+    const whole: [*]u8 = @ptrCast(raw);
+    bo.writeU16BeAt(whole, 0, portNumber(src_key));
+    bo.writeU16BeAt(whole, 2, dst_port);
+    bo.writeU16BeAt(whole, 4, @intCast(total));
+    whole[6] = 0;
+    whole[7] = 0;
+    @memcpy(whole[8..total], payload);
+    bo.writeU16BeAt(whole, 6, udp_util.checksumV6(our_ip, dst_ip, whole, @intCast(total)));
+    const id = blk: {
+        const saved = udp_lock.acquire();
+        defer udp_lock.release(saved);
+        frag6_id +%= 1;
+        if (frag6_id == 0) frag6_id = 1;
+        break :blk frag6_id;
+    };
+    const opts: ip_opt_policy.IpOpts = if (getPortOpts(src_key)) |po| po.ip else .{};
+    const group = mcast.isMulticast(dst_ip);
+    const piece: usize = (@as(usize, mtu) - ipv6.HEADER_LEN - 8) & ~@as(usize, 7);
+    var off: usize = 0;
+    var all_ok = true;
+    while (off < total) {
+        const n: usize = @min(piece, total - off);
+        const last = off + n == total;
+        var pkt: [1518]u8 = @splat(0);
+        ipv6.buildHeader(pkt[14..].ptr, our_ip, dst_ip, 44, @intCast(8 + n));
+        if (ip_opt_policy.ipv6NeedsPatch(opts)) ip_opt_policy.patchIpv6(pkt[14..][0..40], opts);
+        if (group) pkt[14 + 7] = opts.mc_hops;
+        if (hops_ov) |v| pkt[14 + 7] = v;
+        if (tclass_ov) |tc| {
+            pkt[14] = (pkt[14] & 0xF0) | (tc >> 4);
+            pkt[15] = (pkt[15] & 0x0F) | (tc << 4);
+        }
+        const fh = 14 + ipv6.HEADER_LEN;
+        pkt[fh] = PROTO_UDP6;
+        pkt[fh + 1] = 0;
+        bo.writeU16BeAt(&pkt, fh + 2, @as(u16, @intCast(off)) | (if (last) @as(u16, 0) else 1));
+        bo.writeU32BeAt(&pkt, fh + 4, id);
+        @memcpy(pkt[fh + 8 ..][0..n], whole[off..][0..n]);
+        const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, @intCast(ipv6.HEADER_LEN + 8 + n));
+        if (wait_hop6) |hop| {
+            @import("ndp_queue.zig").queueFrame(hop, &pkt, frame_len);
+        } else {
+            const ok = if (is_loop) lo.sendNow(&pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt, frame_len);
+            if (!ok) all_ok = false;
+        }
+        off += n;
+    }
+    return all_ok;
+}
+
+const PROTO_UDP6: u8 = 17;
+
 /// ip_fragment for a UDP datagram over `mtu`: the UDP header (with its checksum, which spans the whole datagram) and the payload are
 /// cut into pieces of ip_frag_policy.pieceLen bytes, each behind its own IPv4 header with the datagram's id, MF on all but the last,
 /// the offset in 8-byte units, DF clear. Each piece is sent as sendToFromOv sends a frame. The whole datagram is staged in a kmalloc
@@ -1585,7 +1674,7 @@ pub fn sendToV6From(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, 
 /// sendToV6From with sendmsg's IPV6_HOPLIMIT / IPV6_TCLASS control messages: `hops_ov` replaces the hop limit (the multicast one
 /// too; 0 is a hop limit) and `tclass_ov` the whole traffic class byte, ECN bits included, for this datagram only.
 pub fn sendToV6FromOv(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, oif: u8, data: [*]const u8, data_len: u16, hops_ov: ?u8, tclass_ov: ?u8) bool {
-    if (data_len > MAX_UDP_PAYLOAD) return false;
+    if (data_len > MAX_UDP_PAYLOAD_BIG6) return false;
     const src_port = portNumber(src_key);
 
     const nh = ndp.resolveNextHop(dst_ip);
@@ -1605,8 +1694,12 @@ pub fn sendToV6FromOv(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32
     // An unbound socket sends to ::1 from ::1 (mirrors the IPv4 lo choice), elsewhere from the selected source address.
     const our_ip = @import("tcp_port_policy.zig").sourceAddr6(bound, dst_ip, if (is_loop) dst_ip else ndp.selectSourceAddress(dst_ip, our_mac));
     const udp_total: u16 = 8 + data_len;
-    // SK-97/105: honor Path MTU (or armed oversized raise probe).
-    if (ipv6.HEADER_LEN + udp_total > ipv6.getSendMtu(dst_ip)) return false;
+    // SK-97/105: honor Path MTU (or armed oversized raise probe). A datagram over it leaves in fragments behind a Fragment header
+    // (ip6_fragment); the caller already refused it under IPV6_PMTUDISC_DO / PROBE.
+    const mtu6 = ipv6.getSendMtu(dst_ip);
+    if (ipv6.HEADER_LEN + @as(u32, udp_total) > mtu6) {
+        return sendFragmented6(our_ip, dst_ip, dst_port, src_key, oif, data[0..data_len], mtu6, dst_mac, our_mac, is_loop, wait_hop6, hops_ov, tclass_ov);
+    }
 
     // Stack-local frame buffer: concurrent sends on other CPUs must not tear it.
     var send_pkt: [1518]u8 = @splat(0);

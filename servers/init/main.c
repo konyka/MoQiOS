@@ -569,6 +569,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello450"); /* clone's exit signal, __WCLONE and __WALL */
     run_test("hello451"); /* IPv4 fragment reassembly */
     run_test("hello452"); /* IPv4 UDP datagrams over the MTU are fragmented */
+    run_test("hello453"); /* IPv6 fragments: Fragment headers out, reassembly in */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

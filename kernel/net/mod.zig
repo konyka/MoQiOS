@@ -89,6 +89,12 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
                 .bad_option => return icmpv6.sendParamProblemAt(pkt6, 2, @intCast(ipv6.HEADER_LEN + ext.off), info6.src_ip, info6.dst_ip),
                 .bad_header => return icmpv6.sendParamProblemAt(pkt6, 1, @intCast(ipv6.HEADER_LEN + ext.off), info6.src_ip, info6.dst_ip),
             }
+            // ipv6_frag_rcv: a Fragment header after the options joins its reassembly queue (an atomic fragment is delivered with
+            // the header taken out); the completed datagram comes back through here.
+            if (ext.nh == 44) {
+                @import("ip_frag.zig").receive6(data, len, pkt6, ext.off, ifindex);
+                return;
+            }
             const up_start: u32 = payload_start6 + @as(u32, @intCast(ext.off));
             const up_len: u16 = info6.payload_len - @as(u16, @intCast(ext.off));
             // raw6_local_deliver: each IPv6 raw socket of the upper-layer header gets it, before the protocol handler.

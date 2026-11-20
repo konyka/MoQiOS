@@ -17036,6 +17036,10 @@ test "IPv6 UDP: IPV6_MTU_DISCOVER, 1452-byte datagrams and a local IPV6_RECVERR 
     try std.testing.expect(ipo.applySet(.{}, ipo.SOL_IPV6, ipo.IPV6_MTU_DISCOVER, &.{ 6, 0, 0, 0 }) == .err);
     const eq = kt.errqueue_policy;
     try std.testing.expect(eq.oversize6(1452, 1500, 1, false) == null);
+    // hello453: WANT fragments an IPv6 datagram too; 65528 is always too long.
+    try std.testing.expect(eq.oversize6(1453, 1500, 1, false) == null);
+    try std.testing.expect(eq.oversize6(65527, 1500, 0, false) == null);
+    try std.testing.expect(eq.oversize6(65528, 1500, 1, false) != null);
     try std.testing.expect(eq.oversize6(1453, 1500, 2, true).?.queue);
     const b = eq.encodeExtErr(eq.localEntry6(90, 1500, @splat(0), 1));
     try std.testing.expectEqual(@as(usize, 44), b.len);
@@ -17149,4 +17153,12 @@ test "IPv4 UDP datagrams over the MTU leave in fragments (hello452)" {
 test "the fragmentation tests get CAP_NET_RAW for their raw sockets (hello451, hello452)" {
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello451", true, false).caps.cap_net_raw);
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello452", true, false).caps.cap_net_raw);
+}
+
+test "IPv6 fragments: a Fragment header after the options goes to reassembly, big datagrams leave in pieces (hello453)" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "@import(\"ip_frag.zig\").receive6(data, len, pkt6, ext.off, ifindex);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "fn sendFragmented6(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "pub fn takeBig6(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "const big6 = udp.takeBig6(sock_key, &src6, &src_port_out6, msg_peek, &big_meta6);") != null);
+    try std.testing.expect(kt.capability_profile.profileForLaunch("hello453", true, false).caps.cap_net_raw);
 }

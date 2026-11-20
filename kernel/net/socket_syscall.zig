@@ -973,6 +973,12 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
             const unreach6 = bind_addr_policy.routeErrno6(dst6, oif6);
             if (unreach6 != 0) return unreach6;
             if (udpOversize6(src_key, dst6, dst_port6, len)) |e| return e;
+            if (len > tmp6.len) {
+                const big = bigStage(len) orelse return -105; // ENOBUFS
+                defer @import("../mm/slab.zig").kfree(big.ptr);
+                if (copy.copyFromUser(big, @ptrFromInt(buf), len) != len) return -14;
+                return if (udp.sendToV6From(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, oif6, big.ptr, @intCast(len))) @intCast(len) else -1;
+            }
             const n6 = copy.copyFromUser(&tmp6, @ptrFromInt(buf), to_copy6);
             if (n6 == 0) return -1;
             if (udp.sendToV6From(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, oif6, &tmp6, @intCast(n6))) {
@@ -1224,7 +1230,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
             user_addr_len = @bitCast(len_bytes);
         }
         if (is_v6) {
-            var tmp6: [1452]u8 = undefined;
+            var tmp6: [1472]u8 = undefined;
             const to_read6 = @min(len, tmp6.len);
             if (!copy.validateUserBufferWritable(buf, to_read6)) return -14; // EFAULT
             if (addr_ptr != 0) {
@@ -1234,10 +1240,17 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
             var src6: [16]u8 = @splat(0);
             var src_port_out6: u16 = 0;
             var full_len6: u16 = 0;
-            const result6 = udp.recvFromV6Ex(sock_key, &tmp6, @intCast(tmp6.len), &src6, &src_port_out6, &full_len6, msg_peek);
+            var big_meta6: ip_cmsg_policy.RecvInfo6 = .{};
+            const big6 = udp.takeBig6(sock_key, &src6, &src_port_out6, msg_peek, &big_meta6);
+            defer if (big6) |bt| udp.releaseBig(bt, msg_peek);
+            const result6: i64 = if (big6) |bt| bt.len else udp.recvFromV6Ex(sock_key, &tmp6, @intCast(tmp6.len), &src6, &src_port_out6, &full_len6, msg_peek);
+            if (big6) |bt| full_len6 = bt.len;
             if (result6 > 0) {
-                const to_write6 = @min(@as(u32, @intCast(result6)), to_read6);
-                if (copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp6))[0..to_write6], to_write6) != to_write6) return -14;
+                const to_write6: u32 = if (big6 != null) @intCast(@min(@as(u64, full_len6), len)) else @min(@as(u32, @intCast(result6)), to_read6);
+                if (big6) |bt| {
+                    if (!copy.validateUserBufferWritable(buf, to_write6)) return -14;
+                    if (copy.copyToUser(@ptrFromInt(buf), udp.bigBytes(bt)[0..to_write6], to_write6) != to_write6) return -14;
+                } else if (copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp6))[0..to_write6], to_write6) != to_write6) return -14;
                 if (addr_ptr != 0 and addr_ptr < 0x0000_8000_0000_0000) {
                     var sa_out6: [sa.SOCKADDR_IN6_LEN]u8 = undefined;
                     const alen = sa.writeInet6(&sa_out6, src_port_out6, src6, sa.nameScope6(src6));
@@ -1844,13 +1857,15 @@ fn bigStage(n: usize) ?[]u8 {
     return @as([*]u8, @ptrCast(p))[0..n];
 }
 
-/// Whether a sendmsg on this UDP socket may carry a datagram longer than one frame: an IPv4 UDP socket (fragmented on the way out);
-/// IPv6 and ping sockets still refuse it.
-fn udpSendmsgFragmentable(fd: u32) bool {
+/// Whether a sendmsg on this UDP socket may carry a datagram of `total` bytes longer than one frame (it is fragmented on the way out):
+/// a UDP socket, up to 65507 bytes for IPv4 and 65527 for IPv6; ping sockets refuse it.
+fn udpSendmsgFragmentable(fd: u32, total: usize) bool {
     const cur_idx = sched_mod.currentTaskIndex() orelse return false;
     const t = task_mod.getTask(cur_idx) orelse return false;
     const d = &t.fd_table.fds[fd];
-    return !d.udp_is_v6 and !d.udp_ping;
+    if (d.udp_ping) return false;
+    const limit: usize = if (d.udp_is_v6) udp.MAX_UDP_PAYLOAD_BIG6 else udp.MAX_UDP_PAYLOAD_BIG;
+    return total <= limit;
 }
 
 /// sendmsg on a UDP socket: gather the iovecs into one datagram and send it
@@ -1877,7 +1892,7 @@ fn udpSendmsg(fd: u32, msghdr: *const [56]u8) i64 {
     // (fragmented: an IPv4 socket); otherwise udpSendBytesFull refuses it (EMSGSIZE), never a cut copy.
     const total = iovTotal(iov_ptr, iov_len);
     if (total < 0) return total;
-    if (total > data.len and total <= udp.MAX_UDP_PAYLOAD_BIG and udpSendmsgFragmentable(fd)) {
+    if (total > data.len and udpSendmsgFragmentable(fd, @intCast(total))) {
         const big = bigStage(@intCast(total)) orelse return -105;
         defer @import("../mm/slab.zig").kfree(big.ptr);
         const g = gatherIov(iov_ptr, iov_len, big);
@@ -2036,7 +2051,11 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
     var meta6: ip_cmsg_policy.RecvInfo6 = .{};
     var big: ?udp.BigTake = null;
     if (is_v6) {
-        got = udp.recvFromV6Meta(port, &data, @intCast(data.len), &src6, &src_port, &full, peek, &meta6);
+        big = udp.takeBig6(port, &src6, &src_port, peek, &meta6);
+        if (big) |bt| {
+            got = bt.len;
+            full = bt.len;
+        } else got = udp.recvFromV6Meta(port, &data, @intCast(data.len), &src6, &src_port, &full, peek, &meta6);
     } else {
         big = udp.takeBig(port, &src4, &src_port, peek, &meta);
         if (big) |bt| {
