@@ -17316,3 +17316,26 @@ test "IPv6 fragment ids are random and non-zero (__ipv6_select_ident: get_random
 test "an IPPROTO_FRAGMENT raw socket sees each IPv6 piece before reassembly (raw6_local_deliver for every header; hello453 I)" {
     try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "_ = raw6.deliver6(44, data[fo .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass);\n                @import(\"ip_frag.zig\").receive6(") != null);
 }
+
+test "the kernel generator is ChaCha8 with fast key erasure, seeded from timer jitter through BLAKE2s and RDSEED/RDRAND" {
+    const rs = kt.random_source;
+    try std.testing.expect(std.mem.indexOf(u8, rs, "xoshiro") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "var rng: std.Random.ChaCha = undefined;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "rng = std.Random.ChaCha.init(seed);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "if (initialized) rng.addEntropy(bytes);") != null);
+    const sp = kt.random_seed_policy;
+    try std.testing.expectEqual(sp.HwSource.rdseed, sp.hwSource(0, sp.RDSEED_BIT));
+    try std.testing.expectEqual(sp.HwSource.rdrand, sp.hwSource(sp.RDRAND_BIT, 0));
+    // The construction itself: two generators from different seeds differ, and the same seed repeats (deterministic given the key).
+    var a = std.Random.ChaCha.init(@splat(1));
+    var b = std.Random.ChaCha.init(@splat(2));
+    var c = std.Random.ChaCha.init(@splat(1));
+    var x: [64]u8 = undefined;
+    var y: [64]u8 = undefined;
+    var z: [64]u8 = undefined;
+    a.fill(&x);
+    b.fill(&y);
+    c.fill(&z);
+    try std.testing.expect(!std.mem.eql(u8, &x, &y));
+    try std.testing.expect(std.mem.eql(u8, &x, &z));
+}

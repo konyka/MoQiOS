@@ -968,7 +968,7 @@ LAPIC Timer 中断
 | 239 | umask | 设置文件创建掩码 |
 | 240 | sysinfo | 系统信息 |
 | 241 | prctl | 进程控制 (PR_SET/GET_NAME) |
-| 242 | getrandom | 获取随机数 (xoshiro256**) |
+| 242 | getrandom | 获取随机数（ChaCha8 生成器） |
 | 243 | clone | 克隆进程/线程 (CLONE_VM/FILES/SETTLS) |
 | 244 | fsync | 同步文件到磁盘 |
 | 245 | fdatasync | 同步文件数据到磁盘 |

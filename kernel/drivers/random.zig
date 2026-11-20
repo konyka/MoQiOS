@@ -1,82 +1,108 @@
-/// /dev/urandom-style high-performance PRNG using xoshiro256**.
-/// Entropy seed via `arch.tsc.read` (SK-34) — portable across x86/riscv/aarch64.
+/// The kernel's random generator (/dev/random, /dev/urandom, getrandom, and the network's ids and secrets): ChaCha8 with fast key
+/// erasure (std.Random.ChaCha, the construction Linux's crng uses with ChaCha20), so earlier output cannot be recovered from the
+/// state and output cannot be predicted without the key.
+///
+/// Seeding: 256 timer samples with the jitter between them hashed through BLAKE2s, plus RDSEED / RDRAND words on an x86 CPU that has
+/// them (random_seed_policy decides which instructions CPUID allows). Writes to /dev/random mix into the key (addEntropy).
 
+const std = @import("std");
+const builtin = @import("builtin");
 const arch = @import("../arch/arch.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
-// xoshiro256** state (256 bit)
-var state: [4]u64 = undefined;
+var rng: std.Random.ChaCha = undefined;
 var initialized: bool = false;
 var rng_lock: IrqSpinlock = .{};
 
-pub fn init() void {
-    // Idempotent: subsystem_boot / main / SK-34 may all call this.
-    if (initialized) return;
-
-    // Collect entropy seeds from the arch monotonic counter.
-    state[0] = arch.tsc.read() ^ 0x9E3779B97F4A7C15;
-    state[1] = arch.tsc.read() ^ 0x6A09E667F3BCC908;
-    state[2] = arch.tsc.read() ^ 0xBB67AE8584CAA73B;
-    state[3] = arch.tsc.read() ^ 0x3C6EF372FE94F82B;
-
-    // Warm-up: skip first 16 outputs
-    for (0..16) |_| {
-        _ = next();
+/// One 64-bit word from RDSEED (preferred) or RDRAND, or null when the CPU has neither or it ran dry.
+fn hwWord() ?u64 {
+    if (comptime builtin.cpu.arch != .x86_64) return null;
+    const policy = @import("random_seed_policy.zig");
+    const leaf1 = cpuid(1, 0);
+    const leaf7 = cpuid(7, 0);
+    const src = policy.hwSource(leaf1.ecx, leaf7.ebx);
+    var tries: u32 = 0;
+    while (tries < 10) : (tries += 1) {
+        var v: u64 = 0;
+        var ok: u8 = 0;
+        switch (src) {
+            .none => return null,
+            .rdseed => asm volatile ("rdseed %[v]; setc %[ok]"
+                : [v] "=r" (v),
+                  [ok] "=r" (ok),
+                :
+                : .{ .cc = true }),
+            .rdrand => asm volatile ("rdrand %[v]; setc %[ok]"
+                : [v] "=r" (v),
+                  [ok] "=r" (ok),
+                :
+                : .{ .cc = true }),
+        }
+        if (ok != 0) return v;
     }
-    initialized = true;
+    return null;
 }
 
-fn next() u64 {
-    // xoshiro256** algorithm
-    const val = state[1] *% 5;
-    const result = ((val << 7) | (val >> 57)) *% 9;
-    const t = state[1] << 17;
-    state[2] ^= state[0];
-    state[3] ^= state[1];
-    state[1] ^= state[2];
-    state[0] ^= state[3];
-    state[2] ^= t;
-    state[3] = (state[3] << 45) | (state[3] >> 19);
-    return result;
+fn cpuid(leaf: u32, subleaf: u32) struct { ecx: u32, ebx: u32 } {
+    if (comptime builtin.cpu.arch != .x86_64) return .{ .ecx = 0, .ebx = 0 };
+    var eax: u32 = undefined;
+    var ebx: u32 = undefined;
+    var ecx: u32 = undefined;
+    var edx: u32 = undefined;
+    asm volatile ("cpuid"
+        : [eax] "={eax}" (eax),
+          [ebx] "={ebx}" (ebx),
+          [ecx] "={ecx}" (ecx),
+          [edx] "={edx}" (edx),
+        : [leaf] "{eax}" (leaf),
+          [subleaf] "{ecx}" (subleaf),
+    );
+    return .{ .ecx = ecx, .ebx = ebx };
+}
+
+var init_lock: IrqSpinlock = .{};
+
+pub fn init() void {
+    // Idempotent: subsystem_boot / main / SK-34 may all call this, and a first getRandomBytes on another CPU may race it.
+    if (@atomicLoad(bool, &initialized, .acquire)) return;
+    const held = init_lock.acquire();
+    defer init_lock.release(held);
+    if (initialized) return;
+    var h = std.crypto.hash.blake2.Blake2s256.init(.{});
+    // Timer samples: the low bits of back-to-back reads vary with caches, interrupts and the host, which is what gives a seed here.
+    var prev: u64 = arch.tsc.read();
+    var i: u32 = 0;
+    while (i < 256) : (i += 1) {
+        var spin: u32 = 0;
+        while (spin < (prev & 63)) : (spin += 1) std.mem.doNotOptimizeAway(spin);
+        const now = arch.tsc.read();
+        const sample = [2]u64{ now, now -% prev };
+        h.update(std.mem.asBytes(&sample));
+        prev = now;
+    }
+    var k: u32 = 0;
+    while (k < 8) : (k += 1) if (hwWord()) |w| h.update(std.mem.asBytes(&w));
+    var seed: [std.Random.ChaCha.secret_seed_length]u8 = undefined;
+    h.final(&seed);
+    rng = std.Random.ChaCha.init(seed);
+    @memset(&seed, 0);
+    @atomicStore(bool, &initialized, true, .release);
 }
 
 /// Fill a kernel buffer with random bytes.
 pub fn getRandomBytes(buf: [*]u8, len: u32) void {
+    if (!@atomicLoad(bool, &initialized, .acquire)) init();
     const state_held = rng_lock.acquire();
     defer rng_lock.release(state_held);
-
-    var i: u32 = 0;
-    while (i < len) {
-        const val = next();
-        const remaining = len - i;
-        const chunk = if (remaining >= 8) 8 else remaining;
-        const bytes = @as(*const [8]u8, @ptrCast(&val));
-        for (0..chunk) |j| {
-            buf[i] = bytes[j];
-            i += 1;
-        }
-    }
+    rng.fill(buf[0..len]);
 }
 
-/// Mix caller-supplied bytes into the generator state (a write to /dev/random or /dev/urandom: Linux mix_pool_bytes). Each 8-byte
-/// word is folded into one state word and the generator is stepped, so the stream after the write depends on what was written.
+/// Mix caller-supplied bytes into the generator (a write to /dev/random or /dev/urandom: Linux mix_pool_bytes). The key is replaced
+/// by itself XOR ChaCha of the bytes and the buffer refilled, so the stream after the write depends on what was written.
 pub fn mixBytes(bytes: []const u8) void {
     const state_held = rng_lock.acquire();
     defer rng_lock.release(state_held);
-    var i: usize = 0;
-    var k: usize = 0;
-    while (i < bytes.len) : (k += 1) {
-        var w: u64 = 0;
-        var j: usize = 0;
-        while (j < 8 and i < bytes.len) : ({
-            j += 1;
-            i += 1;
-        }) w |= @as(u64, bytes[i]) << @intCast(j * 8);
-        state[k % 4] ^= w;
-        _ = next();
-    }
-    // xoshiro256** must never reach the all-zero state.
-    if (state[0] | state[1] | state[2] | state[3] == 0) state[0] = 0x9E3779B97F4A7C15;
+    if (initialized) rng.addEntropy(bytes);
 }
 
 /// getrandom system call (#318).
