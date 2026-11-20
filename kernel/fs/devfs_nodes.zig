@@ -5,7 +5,7 @@
 ///   null    — read: EOF, write: discard (pure, devfs.zig)
 ///   zero    — read: zero-filled buffer, write: discard (pure, devfs.zig)
 ///   full    — read: EOF, write: -ENOSPC (pure, devfs.zig)
-///   random  — PRNG stream (drivers/random.zig), read-only, no pread
+///   random  — PRNG stream (drivers/random.zig); a write mixes its bytes into the state; no pread
 ///   urandom — same ops as random
 ///   kmsg    — kernel log ring (klog.zig); read blocks until a log append
 ///             unless O_NONBLOCK, cursor lives in the fd offset (J3)
@@ -82,14 +82,20 @@ pub fn kmsgNodeIdx() u32 {
 
 // ---- random / urandom ----
 
+/// urandom_read_iter: the whole request is filled (the vfs hands it over in kernel-buffer pieces).
 fn randomRead(ctx: *devfs.IoCtx, buf: [*]u8, count: usize) i64 {
     _ = ctx;
     const random_mod = @import("../drivers/random.zig");
-    const to_read: u32 = @intCast(@min(count, 256));
-    var kbuf: [256]u8 = undefined;
-    random_mod.getRandomBytes(&kbuf, to_read);
-    @memcpy(buf[0..to_read], kbuf[0..to_read]);
-    return @intCast(to_read);
+    const n: u32 = @intCast(@min(count, 0x7FFF_FFFF));
+    random_mod.getRandomBytes(buf, n);
+    return @intCast(n);
+}
+
+/// random_write_iter → write_pool_user: every byte written is mixed into the generator; the write takes all of it.
+fn randomWrite(ctx: *devfs.IoCtx, buf: [*]const u8, count: usize) i64 {
+    _ = ctx;
+    @import("../drivers/random.zig").mixBytes(buf[0..count]);
+    return @intCast(count);
 }
 
 fn pollReadable(ctx: *const devfs.IoCtx) u32 {
@@ -99,8 +105,9 @@ fn pollReadable(ctx: *const devfs.IoCtx) u32 {
 
 const random_node_ops: devfs.NodeOps = .{
     .read = randomRead,
+    .write = randomWrite,
     .poll = pollReadable,
-    .flags = .{ .no_pread = true },
+    .flags = .{ .no_pread = true, .noop_seek = true },
 };
 
 // ---- kmsg ----

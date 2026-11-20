@@ -187,13 +187,13 @@ int main(int argc, char **argv, char **envp) {
     }
 
     /* F: a blocking write to a full pipe waits for room. A pipe starts with 64 KiB (16 pages, as on Linux); every pipe here is
-     * shrunk to one page with F_SETPIPE_SZ, so it holds 4095 bytes. */
+     * shrunk to one page with F_SETPIPE_SZ, so it holds 4096 bytes. */
     static char big[10000];
     for (int i = 0; i < 10000; i++) big[i] = (char)(i % 251);
     install(0);
     signal(SIGPIPE, SIG_IGN);
 
-    /* F1: 10000 bytes through a 4095-byte pipe to a slow reader arrive complete and in order. */
+    /* F1: 10000 bytes through a 4096-byte pipe to a slow reader arrive complete and in order. */
     pipe(p);
     syscall3(142 /* fcntl */, p[1], 1031 /* F_SETPIPE_SZ */, 4096); /* one page: the capacity the cases below are built on */
     kid = fork();
@@ -216,15 +216,15 @@ int main(int argc, char **argv, char **envp) {
     close(p[1]);
     st = -1;
     waitpid(kid, &st, 0);
-    check(r == 10000, "F: a blocking write of 10000 bytes to a pipe that holds 4095 returns 10000");
+    check(r == 10000, "F: a blocking write of 10000 bytes to a pipe that holds 4096 returns 10000");
     check(((st >> 8) & 0xff) == 0 && (st & 0x7f) == 0, "F: and the slow reader got all 10000 bytes in order");
 
     /* F2: a full pipe: a non-blocking write says EAGAIN; a blocking one waits, is interrupted by a handler without SA_RESTART
      * (EINTR), and runs on to completion with SA_RESTART once the reader makes room. */
     pipe(p);
     syscall3(142 /* fcntl */, p[1], 1031 /* F_SETPIPE_SZ */, 4096); /* one page: the capacity the cases below are built on */
-    r = write(p[1], big, 4095);
-    check(r == 4095, "F: the pipe takes 4095 bytes");
+    r = write(p[1], big, 4096);
+    check(r == 4096, "F: the pipe takes 4096 bytes");
     long fl = syscall3(142 /* fcntl */, p[1], 3 /* F_GETFL */, 0);
     syscall3(142, p[1], 4 /* F_SETFL */, fl | 0x800 /* O_NONBLOCK */);
     r = write(p[1], big, 10);
@@ -244,13 +244,13 @@ int main(int argc, char **argv, char **envp) {
         pause_ms(60);
         char rb[5000];
         long n = read(p[0], rb, sizeof rb);
-        _exit(n == 4095 ? 0 : 1);
+        _exit(n == 4096 ? 0 : 1);
     }
     r = write(p[1], big, 10);
     check(r == 10 && hits == 1, "F: with SA_RESTART the blocked write waits through the handler and completes when the reader makes room");
     st = -1;
     waitpid(kid, &st, 0);
-    check(((st >> 8) & 0xff) == 0, "F: and the reader saw the 4095 bytes first");
+    check(((st >> 8) & 0xff) == 0, "F: and the reader saw the 4096 bytes first");
     close(p[0]);
     close(p[1]);
 
@@ -258,7 +258,7 @@ int main(int argc, char **argv, char **envp) {
     install(0);
     pipe(p);
     syscall3(142 /* fcntl */, p[1], 1031 /* F_SETPIPE_SZ */, 4096); /* one page: the capacity the cases below are built on */
-    r = write(p[1], big, 4095);
+    r = write(p[1], big, 4096);
     kid = fork();
     if (kid == 0) {
         pause_ms(80);
@@ -271,7 +271,7 @@ int main(int argc, char **argv, char **envp) {
     waitpid(kid, (int *)0, 0);
     close(p[1]);
 
-    /* G: a write of up to the pipe's capacity (4095 bytes) is atomic: it goes in whole or not at all, and while a writer waits for
+    /* G: a write of up to PIPE_BUF (4096 bytes) is atomic: it goes in whole or not at all, and while a writer waits for
      * room nothing of its data is in the pipe for another writer's bytes to be mixed into. */
     install(0);
     pipe(p);
@@ -379,7 +379,7 @@ int main(int argc, char **argv, char **envp) {
     install(0);
     pipe(p);
     syscall3(142 /* fcntl */, p[1], 1031 /* F_SETPIPE_SZ */, 4096); /* one page: the capacity the cases below are built on */
-    r = write(p[1], big, 4095);
+    r = write(p[1], big, 4096);
     kid = spawn_signaller(me, -1, (const char *)0, 0);
     r = syscall3(20 /* writev */, p[1], (long)wv, 2);
     check(r == -EINTR && hits == 1, "H: without SA_RESTART a blocked writev returns -EINTR");
@@ -393,18 +393,18 @@ int main(int argc, char **argv, char **envp) {
         char rb[4096];
         long n = read(p[0], rb, sizeof rb);
         long tot = n;
-        while (tot < 4095 + 4095 && n > 0) {
+        while (tot < 4096 + 4095 && n > 0) {
             n = read(p[0], rb, sizeof rb);
             if (n > 0) tot += n;
         }
-        _exit(tot == 4095 + 4095 ? 0 : 1);
+        _exit(tot == 4096 + 4095 ? 0 : 1);
     }
     r = syscall3(20, p[1], (long)wv, 2);
     check(r == 4095 && hits == 1, "H: with SA_RESTART writev waits through the handler and writes all 4095 bytes");
     close(p[1]);
     st = -1;
     waitpid(kid, &st, 0);
-    check(((st >> 8) & 0xff) == 0, "H: and the reader received the 4095 filler bytes plus the 4095 writev bytes");
+    check(((st >> 8) & 0xff) == 0, "H: and the reader received the 4096 filler bytes plus the 4095 writev bytes");
     close(p[0]);
 
     print(failures == 0 ? "hello229: PASS\n" : "hello229: FAIL\n");

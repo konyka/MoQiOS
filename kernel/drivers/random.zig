@@ -58,6 +58,27 @@ pub fn getRandomBytes(buf: [*]u8, len: u32) void {
     }
 }
 
+/// Mix caller-supplied bytes into the generator state (a write to /dev/random or /dev/urandom: Linux mix_pool_bytes). Each 8-byte
+/// word is folded into one state word and the generator is stepped, so the stream after the write depends on what was written.
+pub fn mixBytes(bytes: []const u8) void {
+    const state_held = rng_lock.acquire();
+    defer rng_lock.release(state_held);
+    var i: usize = 0;
+    var k: usize = 0;
+    while (i < bytes.len) : (k += 1) {
+        var w: u64 = 0;
+        var j: usize = 0;
+        while (j < 8 and i < bytes.len) : ({
+            j += 1;
+            i += 1;
+        }) w |= @as(u64, bytes[i]) << @intCast(j * 8);
+        state[k % 4] ^= w;
+        _ = next();
+    }
+    // xoshiro256** must never reach the all-zero state.
+    if (state[0] | state[1] | state[2] | state[3] == 0) state[0] = 0x9E3779B97F4A7C15;
+}
+
 /// getrandom system call (#318).
 /// buf  = user-space buffer pointer
 /// buflen = number of bytes requested

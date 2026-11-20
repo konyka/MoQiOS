@@ -728,7 +728,8 @@ test "tcp close: a non-zero linger with nothing unread is a FIN, with unread dat
 
 test "a pipe write that fits an empty pipe is written whole or not at all" {
     const source = kt.vfs_source;
-    try std.testing.expect(std.mem.indexOf(u8, source, "const atomic = count <= PIPE_BUF_SIZE - 1;") != null);
+    // The ring now fills to its capacity, so a write of exactly PIPE_BUF (4096) bytes is atomic, as POSIX and Linux have it.
+    try std.testing.expect(std.mem.indexOf(u8, source, "const atomic = count <= PIPE_BUF_SIZE;") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "if (!atomic or room >= count) {") != null);
 }
 
@@ -12248,7 +12249,9 @@ test "descriptor errnos: EBADF for closed/out-of-range fds, ESPIPE for unseekabl
 
     // lseek on an unseekable descriptor is ESPIPE, decided before the offset is touched.
     const s = kt.syscall_entry_source;
-    try std.testing.expect(std.mem.indexOf(u8, s, "    if (!vfs_mod.fdTypeSeekable(desc.fd_type)) return -29;\n    if (desc.fd_type == .devfs and !@import(\"../../fs/fd_seek_policy.zig\").devfsSeekable(vfs_mod.isConsoleTty(desc))) return -29;\n    const locked = vfs_mod.lockOffset(desc);\n    defer vfs_mod.unlockOffset(locked);\n    vfs_mod.syncOffsetIn(desc);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "    if (!vfs_mod.fdTypeSeekable(desc.fd_type)) return -29;\n    if (desc.fd_type == .devfs and !@import(\"../../fs/fd_seek_policy.zig\").devfsSeekable(vfs_mod.isConsoleTty(desc))) return -29;\n") != null);
+    // hello435 D: the noop-seek devices answer between the ESPIPE checks and the offset lock.
+    try std.testing.expect(std.mem.indexOf(u8, s, "    const locked = vfs_mod.lockOffset(desc);\n    defer vfs_mod.unlockOffset(locked);\n    vfs_mod.syncOffsetIn(desc);") != null);
 }
 
 test "the program break belongs to the address space: CLONE_VM threads share it, every other path sets it on the new Mm" {
@@ -17108,7 +17111,8 @@ test "clone's exit signal: any signal up to 64 or none, __WCLONE / __WALL choose
     try std.testing.expectEqual(@as(u8, 17), pp.exitSignalLoad(0));
     try std.testing.expectEqual(@as(u8, 10), pp.exitSignalLoad(pp.exitSignalStore(10)));
     try std.testing.expectEqual(@as(u8, 0), pp.exitSignalLoad(pp.exitSignalStore(0)));
-    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "if (reporter.exitSignal() != 0) _ = @import(\"signal.zig\").sendSignalInfo(sigchld_parent, reporter.exitSignal(),") != null);
+    // hello456: the signal goes through proc_id_policy.notifySignal (SIGCHLD once the parent has exec'd).
+    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "break :blk @import(\"proc_id_policy.zig\").notifySignal(reporter.exitSignal(), reporter.parent_exec_id, parent_self_exec);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "cur.setExitSignal(17);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "child.setExitSignal(clone_flags_policy.exitSignalOf(flags));") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "clone_flags_policy.clone3Flags(") != null);
@@ -17222,4 +17226,56 @@ test "IPv6 raw and ping sends past the MTU leave behind Fragment headers; big ec
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "var frag6_id") == null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.udp_source, "if (!fillEntryLocked(e, msg)) break;"));
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello455", true, false).caps.cap_net_raw);
+}
+
+test "a reassembled IPv6 packet whose fragmentable part starts with Destination Options reaches UDP (hello453 H)" {
+    var payload: [16]u8 = @splat(0);
+    payload[0] = 17;
+    payload[2] = 1;
+    payload[3] = 4;
+    const ext = kt.raw_icmp_policy.walkExt6(60, &payload);
+    try std.testing.expect(ext.kind == .deliver);
+    try std.testing.expectEqual(@as(u8, 17), ext.nh);
+    try std.testing.expectEqual(@as(usize, 8), ext.off);
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "@import(\"ip_frag.zig\").receive6(data, len, pkt6, ext.off, ifindex);") != null);
+}
+
+test "a clone child whose parent exec'd since reports with SIGCHLD (do_notify_parent parent_exec_id, hello456)" {
+    const pi = kt.proc_id_policy;
+    try std.testing.expectEqual(@as(u8, 10), pi.notifySignal(10, 3, 3));
+    try std.testing.expectEqual(@as(u8, 17), pi.notifySignal(10, 3, 4));
+    try std.testing.expectEqual(@as(u8, 17), pi.notifySignal(17, 3, 4));
+    try std.testing.expectEqual(@as(u8, 0), pi.notifySignal(0, 3, 4));
+    try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "cur.self_exec_id +%= 1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.fork_source, "child.parent_exec_id = parent.self_exec_id;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "child.parent_exec_id = if (flags & CLONE_THREAD != 0) parent.parent_exec_id else parent.self_exec_id;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.task_source, "if (notify_sig != 0) _ = @import(\"signal.zig\").sendSignalInfo(sigchld_parent, notify_sig, ") != null);
+}
+
+test "lseek on /dev/null, zero, full, random and urandom keeps the position at 0 and returns 0 (null_lseek, noop_llseek; hello435 C/D)" {
+    const d = kt.devfs;
+    try std.testing.expect(d.null_node_ops.flags.noop_seek);
+    try std.testing.expect(d.zero_node_ops.flags.noop_seek);
+    try std.testing.expect(d.full_node_ops.flags.noop_seek);
+    try std.testing.expect(std.mem.indexOf(u8, kt.devfs_nodes_source, ".flags = .{ .no_pread = true, .noop_seek = true },") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "if (desc.fd_type == .devfs and whence <= 4) if (@import(\"../../fs/devfs.zig\").opsAt(desc.devfs_idx)) |ops| if (ops.flags.noop_seek) {") != null);
+}
+
+test "/dev/random and /dev/urandom fill whole reads and take writes into the generator (random_read_iter, write_pool_user; hello457)" {
+    const dn = kt.devfs_nodes_source;
+    try std.testing.expect(std.mem.indexOf(u8, dn, "const to_read: u32 = @intCast(@min(count, 256));") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dn, "    random_mod.getRandomBytes(buf, n);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dn, "    .read = randomRead,\n    .write = randomWrite,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dn, "@import(\"../drivers/random.zig\").mixBytes(buf[0..count]);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.random_source, "pub fn mixBytes(bytes: []const u8) void {") != null);
+}
+
+test "a pipe holds its whole capacity: 65536 bytes in a 16-page pipe, 4096 in one page (Linux pipe_bufs; hello448 C/D)" {
+    const v = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, v, "    tail: u32,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "    len: u32 = 0,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "cap - 1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.splice_source, "state.capacity - 1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "while (n < count and pipe.len < pipe.cap) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "if (pipe.ref_count == 0 or used > size or pipe.read_reservation != 0) {") != null);
 }

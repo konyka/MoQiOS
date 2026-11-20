@@ -89,6 +89,9 @@ pub const Flags = packed struct {
     /// pread/pwrite with an explicit offset is meaningless for this node
     /// (pure streams like /dev/urandom) — the vfs answers -ESPIPE.
     no_pread: bool = false,
+    /// lseek leaves the position at 0 and returns 0, whatever it asks (Linux null_lseek, noop_llseek: /dev/null, zero, full, random,
+    /// urandom).
+    noop_seek: bool = false,
 };
 
 pub const NodeOps = struct {
@@ -295,16 +298,19 @@ pub const null_node_ops: NodeOps = .{
     .read = nullRead,
     .write = nullWrite,
     .poll = pollReadWrite,
+    .flags = .{ .noop_seek = true },
 };
 
 pub const zero_node_ops: NodeOps = .{
     .read = zeroRead,
     .write = nullWrite,
     .poll = pollReadWrite,
+    .flags = .{ .noop_seek = true },
 };
 
 pub const full_node_ops: NodeOps = .{
     .read = nullRead,
     .write = fullWrite,
     .poll = pollReadWrite,
+    .flags = .{ .noop_seek = true },
 };

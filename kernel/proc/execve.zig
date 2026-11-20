@@ -276,6 +276,8 @@ fn commitSignalStateForExec(cur: *@import("task.zig").Task, new_pml4: u64, old_m
     cur.sigact().flags = @splat(0);
     // de_thread: a new program reports its exit with SIGCHLD again, whatever clone named.
     cur.setExitSignal(17);
+    // begin_new_exec: children made before this exec report to the new program with SIGCHLD (do_notify_parent).
+    cur.self_exec_id +%= 1;
     cur.sigaltstack_base = 0;
     cur.sigaltstack_size = 0;
     // CLONE_CHILD_CLEARTID address is meaningless in the new image (Linux

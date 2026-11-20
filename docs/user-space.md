@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello455`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello457`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -183,7 +183,7 @@ main():
 3. fork cmd2：`dup2(fds[0], 0)`，关闭 `fds[1]`
 4. 父进程关闭两端，`waitpid` 双方
 
-管道缓冲 4095 字节。阻塞模式的 `write` 遇到满管道会睡到读者腾出空间（大于缓冲的写会分段完成）；非阻塞返回 `EAGAIN`；被处理函数打断时已写部分的字节数优先，一个字节没写返回 `EINTR`（`SA_RESTART` 则重启）；读者全部关闭返回 `EPIPE` 并发 `SIGPIPE`。不超过管道容量（4095 字节）的写是原子的：整块放得下才写（阻塞则等到够用，非阻塞返回 `EAGAIN`），不会和别的写者的数据交错；更大的写分段放入，段间可能夹入别的写者的数据。Linux 的 `PIPE_BUF` 是 4096，这里的原子范围是 ≤4095。
+新管道缓冲 65536 字节（F_SETPIPE_SZ 可调，能装满整个容量）。阻塞模式的 `write` 遇到满管道会睡到读者腾出空间（大于缓冲的写会分段完成）；非阻塞返回 `EAGAIN`；被处理函数打断时已写部分的字节数优先，一个字节没写返回 `EINTR`（`SA_RESTART` 则重启）；读者全部关闭返回 `EPIPE` 并发 `SIGPIPE`。不超过 `PIPE_BUF`（4096 字节）的写是原子的：整块放得下才写（阻塞则等到够用，非阻塞返回 `EAGAIN`），不会和别的写者的数据交错；更大的写分段放入，段间可能夹入别的写者的数据。
 
 ### 3.4 重定向
 
@@ -429,7 +429,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello432 | 阻塞 TCP connect 的 SO_SNDTIMEO：`listen(0)` 的监听者接受第一个连接（A）；第二个套接字设 SO_SNDTIMEO 300 ms，SYN 被丢弃，`connect` 约 300 ms 后返回 EINPROGRESS，SO_ERROR 为 0，再次 `connect` 返回 EALREADY（B）；SO_SNDTIMEO 为 0 时正常连接（C） |
 | hello433 | rt_sigtimedwait 立即唤醒：父子进程阻塞 SIGUSR1/SIGUSR2，用 kill 与 rt_sigtimedwait 来回交接 50 次，每次都取到对方的信号且 si_pid 正确，总耗时低于 300 ms（A）；子进程退出码 0（B） |
 | hello434 | sendmmsg/recvmmsg 批次与超时：AF_UNIX 数据报对上一次发收 40 条（A）；vlen 2000 的 sendmmsg 返回 1024（B）；带 MSG_WAITFORONE 和 5 s 超时的 recvmmsg 收到 2 条后 timeout 变为剩余时间（C）；没有数据时返回 EAGAIN，timeout 不变（D） |
-| hello435 | 终端上的 lseek：`lseek(stdout)` 返回 ESPIPE（A）；`/dev/tty` 及其 dup 的 lseek 返回 ESPIPE（B）；`/dev/null`、`/dev/zero` 仍可 lseek（C） |
+| hello435 | 终端上的 lseek：`lseek(stdout)` 返回 ESPIPE（A）；`/dev/tty` 及其 dup 的 lseek 返回 ESPIPE（B）；`/dev/null`、`/dev/zero` 的 lseek 返回 0（C）；null、zero、full、urandom 上 SEEK_CUR、SEEK_END、负的 SEEK_SET 都返回 0，读过之后位置仍为 0，whence 7 为 EINVAL（D） |
 | hello436 | ucontext 的 fpregs：设 MXCSR 舍入位和 xmm0 后 raise SIGUSR1，SA_SIGINFO 处理函数从 `uc_mcontext.fpregs` 读到相同的 MXCSR 和 xmm0（A）；返回后 MXCSR 不变（B） |
 | hello437 | pidfd_send_signal 的 siginfo 和 flags：对自己发 SI_QUEUE、值 1234 并取回（A）；si_signo 不符、未知 flag、两个范围都是 EINVAL（B）；对子进程发 SI_QUEUE 成功，伪造 SI_USER 是 EPERM（C）；不带 siginfo 时子进程看到 SI_USER 和父进程 pid（D）；进程组范围送达子进程（E） |
 | hello438 | madvise DONTFORK/DOFORK：对 4 页映射的第 1–2 页设 DONTFORK、第 2 页再设 DOFORK，未知 advice 是 EINVAL（A）；fork 后子进程的第 1 页不存在（mincore ENOMEM），其余页内容不变，父进程不受影响（B）；未映射的范围是 ENOMEM（C） |
@@ -442,14 +442,16 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello445 | IP_RECVERR：选项读写与空队列 EAGAIN（A）；未连接套接字收到端口不可达后的 POLLERR 与 SO_ERROR（B）；MSG_ERRQUEUE 读出负载、原目的地址和 sock_extended_err，读后队列清空（C）；未开 IP_RECVERR 的套接字收不到（D）；小缓冲区的 MSG_TRUNC 与 MSG_CTRUNC（E）；IPv6 的 IPV6_RECVERR（F） |
 | hello446 | epoll 中的 signalfd：kill 后报 EPOLLIN 和注册的 data，读走前保持就绪（A）；子进程发信号唤醒阻塞的 epoll_wait（B）；EPOLLONESHOT 只报一次（C）；经 SCM_RIGHTS 传递后仍可读信号（D） |
 | hello447 | MADV_WIPEONFORK：私有匿名页可标记，共享、未映射、未对齐分别为 EINVAL/ENOMEM/EINVAL（A）；子进程和孙进程读到 0，父进程不变（B）；KEEPONFORK 恢复（C）；跨两页的标记（D）；clone(SIGCHLD) 的子进程同样看到零页，DONTFORK 页在其中不存在（E） |
-| hello448 | 新管道 64 KiB：F_GETPIPE_SZ 65536（A）；非阻塞写满 64000 字节后 EAGAIN、读回一致（B）；65537 字节的写（C）；F_SETPIPE_SZ 仍可缩小（D） |
+| hello448 | 新管道 64 KiB：F_GETPIPE_SZ 65536（A）；非阻塞写满 64000 字节后 EAGAIN、读回一致（B）；65537 字节的非阻塞写写进 65536（C）；F_SETPIPE_SZ 缩到 4096 后一次 4096 字节的写整段写入（D） |
 | hello449 | 超长 UDP 数据报：DO 模式下发 1600 字节为 EMSGSIZE、POLLERR、SO_ERROR 0（A）；错误队列中 origin LOCAL、ee_info 1500 的条目（B）；不开 IP_RECVERR 时不入队（C）；1472 字节照常发出（D）；IPv6：IPV6_MTU_DISCOVER、1452 字节发出、1453 字节 EMSGSIZE 与本地差错（E） |
 | hello450 | clone 的退出信号：clone(SIGUSR1) 的子进程退出时父进程收到 SIGUSR1（CLD_EXITED、si_pid、si_status 3），普通 waitpid 为 ECHILD，`__WCLONE` 回收（A）；clone(0) 不发信号，`__WALL` 回收（B）；clone(SIGCHLD) 同 fork，`__WCLONE` 为 ECHILD（C）；clone(65) 为 EINVAL，64 可用（D）；waitid 同样按 `__WCLONE` 区分（E）；`waitpid(-1, __WCLONE)` 只取 clone 子进程（F）；停止的 clone 子进程只有 WUNTRACED\|__WCLONE 能看到（G）；忽略 SIGCHLD 时 clone 子进程不被自动回收（H）；exec 之后变回普通子进程（I） |
 | hello451 | IPv4 分片重组（经 IPPROTO_RAW 手工发送 127.0.0.1:4510 的 UDP 分片）：1480+1480+48 字节三片按顺序（A）、乱序（B）、带重复片（C）都收到完整的 3000 字节；与第一片重叠的中间片使数据报被丢弃（D）；两个 id 交错都收到（E）；缺最后一片收不到（F）；之后普通数据报照常（G） |
 | hello452 | IPv4 UDP 数据报超过 MTU 时分片：1473、3000、8000、30000、65507 字节都完整收发（A）；65508 字节 EMSGSIZE（B）；IP_PMTUDISC_DONT、OMIT 能发，PROBE、DO 为 EMSGSIZE（C）；raw IPPROTO_UDP 套接字收到重组后完整的 3028 字节，头部总长 3028、无分片位（D）；MSG_PEEK|MSG_TRUNC 读 100 字节返回 3028，再读 1500 字节返回 1500 并取走该数据报（E） |
-| hello453 | IPv6 分片：1453、3000、30000、65527 字节完整收发（A）；65528 字节 EMSGSIZE（B）；IPV6_MTU_DISCOVER DO 为 EMSGSIZE、DONT 能发（C）；经 raw IPPROTO_FRAGMENT 套接字手工发的三片按顺序、乱序都重组成 3000 字节，原子分片直接交付（D）；重叠片使数据报被丢弃（E）；1228 字节的非末片收到参数问题，指针 4（F）；之后普通数据报照常（G） |
+| hello453 | IPv6 分片：1453、3000、30000、65527 字节完整收发（A）；65528 字节 EMSGSIZE（B）；IPV6_MTU_DISCOVER DO 为 EMSGSIZE、DONT 能发（C）；经 raw IPPROTO_FRAGMENT 套接字手工发的三片按顺序、乱序都重组成 3000 字节，原子分片直接交付（D）；重叠片使数据报被丢弃（E）；1228 字节的非末片收到参数问题，指针 4（F）；之后普通数据报照常（G）；Fragment 头之后是目的选项头的三片也能重组，收到 3000 字节（H） |
 | hello454 | IPv4 ICMP 超过 MTU 时分片：raw IPPROTO_ICMP 套接字发 3000 字节回显请求，收到完整的请求和回显应答各 3020 字节（R）；65515 字节同样完整往返，65516 字节 EMSGSIZE（M）；IP_PMTUDISC_DO 下 3000 字节 EMSGSIZE，DONT 下能发（D）；ping 套接字发 1481、3000、65515 字节都收到完整应答，65516 字节和 DO 下 3000 字节都是 EMSGSIZE（P） |
 | hello455 | IPv6 ICMPv6 超过 MTU 时分片：raw IPPROTO_ICMPV6 套接字发 3000 字节回显请求，收到完整的请求和应答各 3000 字节（R）；65535 字节同样完整往返，65536 字节 EMSGSIZE（M）；IPV6_MTU_DISCOVER 为 DO、PROBE、INTERFACE 时 3000 字节 EMSGSIZE，DONT、WANT、OMIT 能发（D）；ping 套接字发 1453、3000、65535 字节都收到完整应答，65536 字节和 DO 下 3000 字节 EMSGSIZE（P） |
+| hello456 | 父进程 execve 后 clone 子进程的退出信号：clone(SIGUSR1) 的子进程在父进程 exec 之后退出，父进程收到 SIGCHLD 而不是 SIGUSR1，子进程仍只能用 __WCLONE 回收（状态 0x500，普通 waitpid 为 ECHILD）（A）；exec 之后新建的 clone(SIGUSR1) 子进程照常发 SIGUSR1（B） |
+| hello457 | `/dev/random`、`/dev/urandom` 的读写：一次读 5000 字节和 100000 字节都整段返回且不全为 0（R）；O_RDWR 打开后写 5000 字节返回 5000、写 0 字节返回 0，只读描述符上写为 EBADF（W）；写过之后照常读（S） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

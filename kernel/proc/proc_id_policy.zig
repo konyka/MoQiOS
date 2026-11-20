@@ -70,6 +70,13 @@ pub fn exitSignalLoad(stored: u8) u8 {
     return stored ^ 17;
 }
 
+/// do_notify_parent: an exit signal other than SIGCHLD becomes SIGCHLD when the parent has exec'd since the child was made (its
+/// self_exec_id moved past the child's parent_exec_id: it may run a program of another security domain now).
+pub fn notifySignal(exit_signal: u8, parent_exec_id: u32, parent_self_exec_id: u32) u8 {
+    if (exit_signal != 17 and exit_signal != 0 and parent_exec_id != parent_self_exec_id) return 17;
+    return exit_signal;
+}
+
 /// eligible_child: __WALL waits for every child; otherwise __WCLONE waits only for children whose exit signal is not SIGCHLD ("clone
 /// children", including those with none), and a wait without it only for the others.
 pub fn waitEligible(exit_signal: u8, options: u32) bool {

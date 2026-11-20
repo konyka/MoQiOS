@@ -334,6 +334,11 @@ pub const Task = struct {
     /// zeroSlot leaves is SIGCHLD (fork, spawn, after exec); clone sets its CSIGNAL byte (0 = none). Read it with exitSignal(): not
     /// SIGCHLD makes it a clone child that only __WCLONE / __WALL waits see.
     exit_signal_x: u8 = 0,
+    /// Linux self_exec_id: bumped by every execve of this task.
+    self_exec_id: u32 = 0,
+    /// Linux parent_exec_id: the parent's self_exec_id when this task was made (fork, clone); a parent that has exec'd since gets
+    /// SIGCHLD instead of a clone exit signal (proc_id_policy.notifySignal).
+    parent_exec_id: u32 = 0,
     /// PR_SET_NO_NEW_PRIVS: one-way, inherited by fork/clone, kept across exec.
     no_new_privs: bool = false,
 
@@ -1308,6 +1313,11 @@ pub fn exitTask(requested_code: i32) void {
     const reporter: *Task = finishes_group orelse t;
     const sigchld_parent = reporter.parent_tid;
     const notify_parent = (finishes_group != null or (t.is_user and !t.is_thread and !group_running)) and sigchld_parent != 0;
+    // do_notify_parent's parent_exec_id check, read while task_lock still holds the parent in place.
+    const notify_sig: u8 = blk: {
+        const parent_self_exec = if (findTaskByTidLocked(sigchld_parent)) |pi| tasks[pi].self_exec_id else reporter.parent_exec_id;
+        break :blk @import("proc_id_policy.zig").notifySignal(reporter.exitSignal(), reporter.parent_exec_id, parent_self_exec);
+    };
     // prctl(PR_SET_PDEATHSIG): children that asked to be told about this
     // task's death. Collected under task_lock, signalled after it.
     var death_tids: [MAX_TASKS]u32 = undefined;
@@ -1336,8 +1346,9 @@ pub fn exitTask(requested_code: i32) void {
     // re-take it. Threads report through clear_tid, not SIGCHLD.
     if (notify_parent) {
         const sp = @import("siginfo_policy.zig");
-        // do_notify_parent(tsk, tsk->exit_signal): the signal clone named (none for 0), with the same CLD_* siginfo.
-        if (reporter.exitSignal() != 0) _ = @import("signal.zig").sendSignalInfo(sigchld_parent, reporter.exitSignal(), sp.childInfo(reporter.tid, reporter.uid, exit_code, reporter.exited_via_syscall));
+        // do_notify_parent(tsk, tsk->exit_signal): the signal clone named (none for 0; SIGCHLD once the parent has exec'd), with the
+        // same CLD_* siginfo.
+        if (notify_sig != 0) _ = @import("signal.zig").sendSignalInfo(sigchld_parent, notify_sig, sp.childInfo(reporter.tid, reporter.uid, exit_code, reporter.exited_via_syscall));
     }
 
     // 作业控制：控制台会话长挂断前台组；因本次退出成为孤儿且含停止成员的

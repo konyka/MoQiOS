@@ -132,6 +132,8 @@ pub fn fork(frame: *SyscallFrame) i64 {
     // no_new_privs is inherited.
     child.pdeathsig = 0;
     child.no_new_privs = parent.no_new_privs;
+    child.parent_exec_id = parent.self_exec_id;
+    child.self_exec_id = parent.self_exec_id;
 
     // Task #8: inherit POSIX capability sets verbatim.
     child.effective_caps = parent.effective_caps;

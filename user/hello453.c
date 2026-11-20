@@ -9,7 +9,9 @@
  *      order and last-first; an atomic fragment (offset 0, no M flag) is delivered as it is;
  *   E. a middle piece overlapping the first discards the datagram;
  *   F. a non-last piece whose length is not a multiple of 8 (1228 bytes) draws a parameter problem (code 0) and is dropped;
- *   G. an ordinary datagram afterwards still arrives. */
+ *   G. an ordinary datagram afterwards still arrives;
+ *   H. the fragmentable part may begin with another extension header: pieces whose Fragment header names a Destination Options
+ *      header (8 bytes of PadN) in front of the UDP datagram are reassembled, the options stepped over, and the 3000 bytes arrive. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -171,6 +173,27 @@ int main(void) {
     long g = recv_(u, in, sizeof in);
     snprintf(msg, sizeof msg, "G: an ordinary datagram: sent %ld, got %ld (5 5)", g1, g);
     check(g1 == 5 && g == 5 && memcmp(in, "whole", 5) == 0, msg);
+
+    /* H: Destination Options (next header UDP, length 0, a 6-byte PadN) then the datagram, cut into 1232 + 1232 + 552 bytes. */
+    build(5);
+    static unsigned char opt[3016];
+    opt[0] = 17; opt[1] = 0; opt[2] = 1; opt[3] = 4; opt[4] = 0; opt[5] = 0; opt[6] = 0; opt[7] = 0;
+    memcpy(opt + 8, dgram, 3008);
+    static const int hoff[3] = { 0, 1232, 2464 }, hlen[3] = { 1232, 1232, 552 };
+    for (int k = 0; k < 3; k++) {
+        unsigned char p[1600];
+        p[0] = 60; p[1] = 0;
+        int fo = hoff[k] | (k < 2 ? 1 : 0);
+        p[2] = (unsigned char)(fo >> 8); p[3] = (unsigned char)fo;
+        p[4] = 0; p[5] = 0; p[6] = 0x10; p[7] = 0x06;
+        memcpy(p + 8, opt + hoff[k], (unsigned long)hlen[k]);
+        sendto_(fr, p, 8 + hlen[k], dst, 28);
+    }
+    nap();
+    long h = recv_(u, in, sizeof in);
+    int hs = h == 3000 && memcmp(in, dgram + 8, 3000) == 0;
+    snprintf(msg, sizeof msg, "H: Destination Options after the Fragment header: got %ld same %d (3000 1)", h, hs);
+    check(h == 3000 && hs, msg);
 
     print(failures ? "hello453: FAIL\n" : "hello453: PASS\n");
     return failures ? 1 : 0;

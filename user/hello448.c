@@ -4,12 +4,12 @@
  * used to give every pipe one page (4096, holding 4095 bytes), so a producer stalled after 4 KiB.
  * Measured on the host (build with -DHOST):
  *   A. F_GETPIPE_SZ 65536;
- *   B. 1000-byte non-blocking writes: 64000 accepted, then EAGAIN (this kernel's ring keeps one byte free, so 65 writes fit and
- *      the count is 65000: both are accepted); POLLOUT is off while less than a page is free (Linux pipe_poll wants a free buffer);
- *      what was written reads back in order;
- *   C. one non-blocking write of 65537 bytes -> 65536 (65535 here, for the same reason);
- *   D. F_SETPIPE_SZ 4096 still shrinks an empty pipe: then 4096 -> 4095 accepted (one slot of this kernel's ring stays empty; Linux
- *      takes 4096), so only "at most 4096" is checked. */
+ *   B. 1000-byte non-blocking writes: 64000 accepted, then EAGAIN (Linux puts four 1000-byte writes in each page buffer and starts
+ *      a new page for a write that does not fit the last one's remainder; this kernel's byte ring takes 65 of them, 65000: both are
+ *      accepted); POLLOUT is off while less than a page is free (Linux pipe_poll wants a free buffer); what was written reads back
+ *      in order;
+ *   C. one non-blocking write of 65537 bytes -> 65536;
+ *   D. F_SETPIPE_SZ 4096 still shrinks an empty pipe: then a 4096-byte write is taken whole. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -69,15 +69,15 @@ int main(void) {
     int q[2];
     pipe_nb(q);
     long w1 = wr(q[1], big, 65537);
-    snprintf(msg, sizeof msg, "C: a 65537-byte write takes %ld (65535..65536)", w1);
-    check(w1 == 65535 || w1 == 65536, msg);
+    snprintf(msg, sizeof msg, "C: a 65537-byte write takes %ld (65536)", w1);
+    check(w1 == 65536, msg);
 
     int s[2];
     pipe_nb(s);
     long sh = fcntl_(s[1], F_SETPIPE_SZ, 4096);
     long w2 = wr(s[1], big, 4096);
-    snprintf(msg, sizeof msg, "D: shrink to %ld, a 4096-byte write takes %ld (4096, 4095..4096)", sh, w2);
-    check(sh == 4096 && (w2 == 4095 || w2 == 4096), msg);
+    snprintf(msg, sizeof msg, "D: shrink to %ld, a 4096-byte write takes %ld (4096, 4096)", sh, w2);
+    check(sh == 4096 && w2 == 4096, msg);
 
     print(failures ? "hello448: FAIL\n" : "hello448: PASS\n");
     return failures ? 1 : 0;

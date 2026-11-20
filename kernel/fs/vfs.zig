@@ -87,10 +87,11 @@ pub const PipeBuffer = struct {
     buf: [PIPE_BUF_SIZE]u8,
     /// F_SETPIPE_SZ: a bigger ring in contiguous PMM pages (HHDM address) replaces `buf`; null while the pipe has its first page.
     ext: ?[*]u8 = null,
-    /// Ring size in bytes (`buf`'s, or `ext`'s); the pipe holds cap - 1 bytes (one slot stays empty to tell full from empty).
+    /// Ring size in bytes (`buf`'s, or `ext`'s); the pipe holds up to cap bytes (Linux: 65536 in a 16-page pipe).
     cap: u32 = PIPE_BUF_SIZE,
+    /// Where the oldest queued byte is, and how many are queued (the next byte goes at (head + len) % cap).
     head: u32,
-    tail: u32,
+    len: u32 = 0,
     /// Total references (slot occupied when > 0). Kept as the sum of the
     /// per-end refcounts below.
     ref_count: u32,
@@ -112,13 +113,13 @@ fn ring(pipe: *PipeBuffer) [*]u8 {
 /// POLLOUT (Linux pipe_poll: a free buffer slot, i.e. a page): at least PIPE_BUF bytes of room, or any room in a one-page pipe (which
 /// never has a whole free page while it holds anything).
 fn pipeWritable(pipe: *const PipeBuffer) bool {
-    const room = (pipe.cap - 1) - pipeUsed(pipe);
+    const room = pipe.cap - pipeUsed(pipe);
     return if (pipe.cap > PIPE_BUF_SIZE) room >= PIPE_BUF_SIZE else room > 0;
 }
 
 /// Bytes queued in `pipe`.
 fn pipeUsed(pipe: *const PipeBuffer) u32 {
-    return if (pipe.tail >= pipe.head) pipe.tail - pipe.head else pipe.cap - pipe.head + pipe.tail;
+    return pipe.len;
 }
 
 fn freePipeExt(pipe: *PipeBuffer) void {
@@ -145,7 +146,7 @@ pub fn pipeSetSize(pipe_idx: u32, size: u32) i64 {
     const flags = pipe_lock.acquire();
     const pipe = &pipes[pipe_idx];
     const used = pipeUsed(pipe);
-    if (pipe.ref_count == 0 or used >= size or pipe.read_reservation != 0) {
+    if (pipe.ref_count == 0 or used > size or pipe.read_reservation != 0) {
         pipe_lock.release(flags);
         if (fresh) |f| pmm.freeContiguous(hhdm.virtToPhys(@intFromPtr(f)), pages);
         return if (pipe.ref_count == 0) -9 else -16; // EBUSY
@@ -167,7 +168,7 @@ pub fn pipeSetSize(pipe_idx: u32, size: u32) i64 {
     pipe.ext = fresh;
     pipe.cap = size;
     pipe.head = 0;
-    pipe.tail = used;
+    pipe.len = used;
     if (size > old_cap) @import("../proc/sched.zig").wakeAll(&pipe_write_waiters[pipe_idx]);
     pipe_lock.release(flags);
     if (old_ext) |e| pmm.freeContiguous(hhdm.virtToPhys(@intFromPtr(e)), old_cap / 4096);
@@ -188,7 +189,6 @@ pub const PipeReadToken = struct {
 var pipes: [MAX_PIPES]PipeBuffer = @splat(.{
     .buf = @splat(0),
     .head = 0,
-    .tail = 0,
     .ref_count = 0,
 });
 var pipe_count: u32 = 0;
@@ -243,7 +243,7 @@ fn unlinkPipeReadWaiterLocked(pipe_idx: u32, node: *@import("../proc/task.zig").
 
 pub const PipeState = struct {
     readable: u32,
-    /// Ring size in bytes (F_GETPIPE_SZ); cap - 1 bytes fit.
+    /// Ring size in bytes (F_GETPIPE_SZ); that many bytes fit.
     capacity: u32 = PIPE_BUF_SIZE,
     writable: bool,
     read_open: bool,
@@ -306,7 +306,7 @@ pub fn allocPipe() ?u32 {
     for (0..MAX_PIPES) |i| {
         if (pipes[i].ref_count == 0) {
             const generation = pipes[i].generation +% 1;
-            pipes[i] = .{ .buf = @splat(0), .head = 0, .tail = 0, .ref_count = 2, .read_refs = 1, .write_refs = 1, .generation = generation };
+            pipes[i] = .{ .buf = @splat(0), .head = 0, .ref_count = 2, .read_refs = 1, .write_refs = 1, .generation = generation };
             if (ext) |e| {
                 pipes[i].ext = e;
                 pipes[i].cap = PIPE_DEFAULT_SIZE;
@@ -399,6 +399,7 @@ fn pipeReadInner(pipe_idx: u32, buf: [*]u8, count: usize, status_flags: u32) i64
         while (n < count and n < readable) {
             buf[n] = ring(pipe)[pipe.head];
             pipe.head = (pipe.head + 1) % pipe.cap;
+            pipe.len -= 1;
             n += 1;
         }
         if (n > 0) sched.wakeAll(&pipe_write_waiters[pipe_idx]);
@@ -525,6 +526,7 @@ pub fn pipeCommitRead(token: PipeReadToken, count: usize) i64 {
     }
     const n: u32 = @intCast(@min(count, @as(usize, pipe.read_reservation)));
     pipe.head = (pipe.head + n) % pipe.cap;
+    pipe.len -= n;
     pipe.read_reservation -= n;
     if (n > 0) @import("../proc/sched.zig").wakeAll(&pipe_write_waiters[token.pipe_idx]);
     pipe_lock.release(flags);
@@ -576,12 +578,14 @@ pub fn pipeTransfer(src_idx: u32, dst_idx: u32, count: usize) i64 {
     }
     const readable: u32 = pipeUsed(src);
     const dst_readable: u32 = pipeUsed(dst);
-    const writable = (dst.cap - 1) - dst_readable;
+    const writable = dst.cap - dst_readable;
     const n: u32 = @intCast(@min(count, @as(usize, @min(readable, writable))));
     var i: u32 = 0;
-    while (i < n) : (i += 1) ring(dst)[(dst.tail + i) % dst.cap] = ring(src)[(src.head + i) % src.cap];
+    const dst_tail = (dst.head + dst.len) % dst.cap;
+    while (i < n) : (i += 1) ring(dst)[(dst_tail + i) % dst.cap] = ring(src)[(src.head + i) % src.cap];
     src.head = (src.head + n) % src.cap;
-    dst.tail = (dst.tail + n) % dst.cap;
+    src.len -= n;
+    dst.len += n;
     if (n > 0) {
         const sched = @import("../proc/sched.zig");
         _ = sched.wakeOne(&pipe_read_waiters[dst_idx]);
@@ -630,7 +634,7 @@ pub fn pipeTransferWait(src_idx: u32, dst_idx: u32, count: usize, nonblocking: b
             return 0;
         }
         const dst_readable: u32 = pipeUsed(dst);
-        const writable = (dst.cap - 1) - dst_readable;
+        const writable = dst.cap - dst_readable;
         if (readable > 0 and writable > 0) {
             pipe_lock.release(flags);
             const moved = pipeTransfer(src_idx, dst_idx, count);
@@ -689,7 +693,7 @@ pub fn pipeWaitWritable(pipe_idx: u32, nonblocking: bool) i64 {
             return -1;
         }
         const used: u32 = pipeUsed(pipe);
-        if (pipe.read_refs == 0 or used < pipe.cap - 1) {
+        if (pipe.read_refs == 0 or used < pipe.cap) {
             pipe_lock.release(flags);
             return 0;
         }
@@ -757,16 +761,14 @@ fn pipeWriteInner(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u
         }
         const before = n;
         const used: usize = pipeUsed(pipe);
-        const room: usize = (pipe.cap - 1) - used;
+        const room: usize = pipe.cap - used;
         // A write that can fit in an empty pipe is atomic (POSIX PIPE_BUF): it goes in whole or not at all, so another writer's
         // bytes are never mixed into it. Only a bigger write is let in piecemeal.
-        const atomic = count <= PIPE_BUF_SIZE - 1; // PIPE_BUF: atomic up to one page whatever the size
+        const atomic = count <= PIPE_BUF_SIZE; // PIPE_BUF: atomic up to one page whatever the size
         if (!atomic or room >= count) {
-            while (n < count) {
-                const next = (pipe.tail + 1) % pipe.cap;
-                if (next == pipe.head) break;
-                ring(pipe)[pipe.tail] = buf[n];
-                pipe.tail = next;
+            while (n < count and pipe.len < pipe.cap) {
+                ring(pipe)[(pipe.head + pipe.len) % pipe.cap] = buf[n];
+                pipe.len += 1;
                 n += 1;
             }
         }
@@ -842,7 +844,7 @@ pub fn pipeClose(pipe_idx: u32, write_end: bool) void {
         if (pipe.ref_count == 0) {
             const generation = pipe.generation;
             freePipeExt(pipe);
-            pipe.* = .{ .buf = @splat(0), .head = 0, .tail = 0, .ref_count = 0, .generation = generation };
+            pipe.* = .{ .buf = @splat(0), .head = 0, .ref_count = 0, .generation = generation };
             pipe_count -|= 1;
         }
     }

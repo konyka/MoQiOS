@@ -3604,6 +3604,12 @@ fn syscallLseek(fd: u32, offset: u64, whence: u32) i64 {
     // Pipes, sockets, eventfds, the terminal and the like are not seekable: ESPIPE.
     if (!vfs_mod.fdTypeSeekable(desc.fd_type)) return -29;
     if (desc.fd_type == .devfs and !@import("../../fs/fd_seek_policy.zig").devfsSeekable(vfs_mod.isConsoleTty(desc))) return -29;
+    // null_lseek / noop_llseek: the position stays 0 and the answer is 0, even for an offset another file would refuse; a whence past
+    // SEEK_MAX (4) is EINVAL first (ksys_lseek).
+    if (desc.fd_type == .devfs and whence <= 4) if (@import("../../fs/devfs.zig").opsAt(desc.devfs_idx)) |ops| if (ops.flags.noop_seek) {
+        desc.offset = 0;
+        return 0;
+    };
     const locked = vfs_mod.lockOffset(desc);
     defer vfs_mod.unlockOffset(locked);
     vfs_mod.syncOffsetIn(desc);

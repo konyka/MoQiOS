@@ -426,6 +426,9 @@ pub fn clone(
     child.permitted_caps = parent.permitted_caps;
     child.inheritable_caps = parent.inheritable_caps;
     child.no_new_privs = parent.no_new_privs;
+    // copy_process: parent_exec_id from the parent's self_exec_id (a thread's from its group's: CLONE_THREAD shares the parent).
+    child.parent_exec_id = if (flags & CLONE_THREAD != 0) parent.parent_exec_id else parent.self_exec_id;
+    child.self_exec_id = parent.self_exec_id;
     child.comm = parent.comm;
     child.initial_init = false;
 
