@@ -656,6 +656,22 @@ fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
     const fam = socketFamily(ref, v6_hint) orelse return unknownLevel(ref, v6_hint, true);
     // ip_getsockopt answers a level other than SOL_IP with EOPNOTSUPP; an IPv6 socket's ipv6_getsockopt with ENOPROTOOPT.
     if (!ipo.levelApplies(level, fam)) return if (fam == .v4) -95 else -92;
+    // IPV6_PATHMTU: struct ip6_mtuinfo with only the MTU of a connected socket's route filled in (the address stays zero, as
+    // ipv6_getsockopt memsets it); an optlen under 32 bytes is EINVAL, no route (not connected) ENOTCONN.
+    if (level == ipo.SOL_IPV6 and optname == ipo.IPV6_PATHMTU) {
+        const copy_mod = @import("../mm/copy_from_user.zig");
+        if (optlen_ptr == 0 or optlen_ptr >= 0x0000_8000_0000_0000) return -14;
+        var lb: [4]u8 = undefined;
+        if (copy_mod.copyFromUser(&lb, @ptrFromInt(optlen_ptr), 4) != 4) return -14;
+        if (bo.readU32Le(&lb) < 32) return -22;
+        const peer: [16]u8 = switch (ref) {
+            .udp => |port| @import("udp.zig").connectedPeer6(port) orelse return -107,
+            else => return -107,
+        };
+        var info: [32]u8 = @splat(0);
+        bo.writeU32Le(info[28..32], @import("ipv6.zig").getPathMtu(peer));
+        return copyOptOut(optval_ptr, optlen_ptr, &info);
+    }
     const cur: ipo.IpOpts = switch (ref) {
         .tcp => |idx| (@import("tcp.zig").tcpGetOptions(idx) orelse return -9).ip,
         .udp => |port| (@import("udp.zig").getPortOpts(port) orelse return -9).ip,
@@ -674,6 +690,21 @@ fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
     bo.writeU32Le(&out, @bitCast(v));
     const n: u32 = @min(user_len, 4);
     if (n > 0 and copy_mod.copyToUser(@ptrFromInt(optval_ptr), out[0..n], n) != n) return -14;
+    var len_out: [4]u8 = undefined;
+    bo.writeU32Le(&len_out, n);
+    if (copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &len_out, 4) != 4) return -14;
+    return 0;
+}
+
+/// Copy `val` out as a getsockopt answer: at most the caller's optlen bytes, then the length written.
+fn copyOptOut(optval_ptr: u64, optlen_ptr: u64, val: []const u8) i64 {
+    const copy_mod = @import("../mm/copy_from_user.zig");
+    if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;
+    if (optlen_ptr == 0 or optlen_ptr >= 0x0000_8000_0000_0000) return -14;
+    var len_buf: [4]u8 = undefined;
+    if (copy_mod.copyFromUser(&len_buf, @ptrFromInt(optlen_ptr), 4) != 4) return -14;
+    const n: u32 = @min(bo.readU32Le(&len_buf), @as(u32, @intCast(val.len)));
+    if (n > 0 and copy_mod.copyToUser(@ptrFromInt(optval_ptr), val[0..n], n) != n) return -14;
     var len_out: [4]u8 = undefined;
     bo.writeU32Le(&len_out, n);
     if (copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &len_out, 4) != 4) return -14;

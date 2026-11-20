@@ -126,6 +126,37 @@ var port_opts: [MAX_PORTS]@import("sockopt_policy.zig").Stored = @splat(.{});
 var port_err: [MAX_PORTS]i32 = @splat(0);
 /// IP_RECVERR error queue of each slot (errqueue_policy.zig); travels with the slot like port_err.
 var port_errq: [MAX_PORTS]errq.Queue = @splat(.{});
+/// np->rxpmtu: the last IPV6_DONTFRAG refusal of an IPV6_RECVPATHMTU socket (destination and MTU), for one recvmsg.
+pub const RxPmtu = struct { valid: bool = false, dst: [16]u8 = @splat(0), scope: u32 = 0, mtu: u32 = 0 };
+var port_rxpmtu: [MAX_PORTS]RxPmtu = @splat(.{});
+
+/// The connected peer address of the socket with key `port`, or null when it is not connected (port_peer is 0).
+pub fn connectedPeer6(port: u32) ?[16]u8 {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return null;
+    if (port_peer[i] == 0) return null;
+    return port_peer_ip[i];
+}
+
+/// ipv6_local_rxpmtu: replace the socket's pending path-MTU notice.
+pub fn setRxPmtu(port: u32, n: RxPmtu) void {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return;
+    port_rxpmtu[i] = n;
+}
+
+/// ipv6_recv_rxpmtu: take the pending notice (xchg with NULL), or null.
+pub fn takeRxPmtu(port: u32) ?RxPmtu {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return null;
+    if (!port_rxpmtu[i].valid) return null;
+    const n = port_rxpmtu[i];
+    port_rxpmtu[i] = .{};
+    return n;
+}
 const errq = @import("errqueue_policy.zig");
 /// The IPv4 id of a connected socket's next datagram (inet_id: random at connect, one more per datagram).
 var port_ipid: [MAX_PORTS]u16 = @splat(0);
@@ -558,6 +589,7 @@ fn newSlotLocked(key: u32, is_v6: bool, uid: u32) u16 {
     port_opts[idx] = .{};
     port_err[idx] = 0;
     port_errq[idx].clear();
+    port_rxpmtu[idx] = .{};
     port_ipid[idx] = 0;
     port_peer[idx] = 0;
     port_peer_ip[idx] = @splat(0);
@@ -942,6 +974,8 @@ fn releaseLocked(port: u32) void {
             port_err[i] = port_err[num_ports];
             port_errq[i] = port_errq[num_ports];
             port_errq[num_ports].clear();
+            port_rxpmtu[i] = port_rxpmtu[num_ports];
+            port_rxpmtu[num_ports] = .{};
             port_ipid[i] = port_ipid[num_ports];
             port_peer[i] = port_peer[num_ports];
             port_peer_ip[i] = port_peer_ip[num_ports];

@@ -17397,3 +17397,30 @@ test "IPV6_DONTFRAG refuses datagrams over the path MTU instead of fragmenting t
     try std.testing.expectEqual(@as(i64, 0), kt.raw_icmp_policy.oversizeErrno6Df(3000, 1500, 1, false));
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello461", true, false).caps.cap_net_raw);
 }
+
+test "IPV6_RECVPATHMTU: a DONTFRAG refusal leaves one IPV6_PATHMTU message for recvmsg (ipv6_local_rxpmtu / ipv6_recv_rxpmtu; hello461 F/G)" {
+    const ipo = kt.ip_opt_policy;
+    const one = [4]u8{ 1, 0, 0, 0 };
+    const o = ipo.applySet(.{}, ipo.SOL_IPV6, ipo.IPV6_RECVPATHMTU, &one).ok;
+    try std.testing.expect(o.rxpmtu6);
+    try std.testing.expectEqual(@as(?i32, 1), ipo.getValue(o, ipo.SOL_IPV6, ipo.IPV6_RECVPATHMTU));
+    var buf: [64]u8 = undefined;
+    var dst: [16]u8 = @splat(0);
+    dst[15] = 1;
+    const b = kt.ip_cmsg_policy.buildPathMtu(dst, 0, 1500, 64, &buf);
+    try std.testing.expectEqual(@as(usize, 48), b.written);
+    try std.testing.expectEqual(@as(u64, 48), std.mem.readInt(u64, buf[0..8], .little));
+    try std.testing.expectEqual(@as(i32, 61), std.mem.readInt(i32, buf[12..16], .little));
+    try std.testing.expectEqual(@as(u8, 10), buf[16]);
+    try std.testing.expectEqual(@as(u32, 1500), std.mem.readInt(u32, buf[44..48], .little));
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (is_v6) if (udp.getPortOpts(port)) |po| if (po.ip.rxpmtu6) if (udp.takeRxPmtu(port)) |n| return recvRxPmtu(msg_ptr, msghdr, n);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "udp.queueLocalError(d.udpKey(), errq.localEntry6(90, @import(\"ipv6.zig\").getSendMtu(dst), dst, 0));") != null);
+}
+
+test "getsockopt(IPV6_PATHMTU) answers a connected socket with only the MTU filled in (hello461 H)" {
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (level == ipo.SOL_IPV6 and optname == ipo.IPV6_PATHMTU) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (bo.readU32Le(&lb) < 32) return -22;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, ".udp => |port| @import(\"udp.zig\").connectedPeer6(port) orelse return -107,") != null);
+}

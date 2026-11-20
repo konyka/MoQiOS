@@ -9,10 +9,18 @@
  *   C. sendmsg with an IPV6_DONTFRAG 1 control message on a socket without the option: 3000 bytes EMSGSIZE; with 0: sent;
  *   D. a raw ICMPv6 socket with IPV6_DONTFRAG: a 3000-byte echo request is EMSGSIZE; with IPV6_RECVERR the refusal is queued too
  *      (ee_errno 90, ee_info the path MTU, at most 1500);
- *   E. an IPv4 UDP socket: SOL_IPV6 IPV6_DONTFRAG is ENOPROTOOPT; a TCP IPv6 socket takes it (0). */
+ *   E. an IPv4 UDP socket: SOL_IPV6 IPV6_DONTFRAG is ENOPROTOOPT; a TCP IPv6 socket takes it (0);
+ *   F. an IPv6 ping socket (net.ipv4.ping_group_range opened to group 0 for the test) with IPV6_DONTFRAG and IPV6_RECVERR: a 3000-byte
+ *      echo request is EMSGSIZE and the error queue holds ee_errno 90, ee_origin 1;
+ *   G. IPV6_RECVPATHMTU on a UDP socket with IPV6_DONTFRAG: set 0, getsockopt reads 1; after a refused 3000-byte send, recvmsg
+ *      returns 0 bytes with msg_name [::1] port 0 and one 48-byte control message, SOL_IPV6 / IPV6_PATHMTU, holding a sockaddr_in6
+ *      of ::1 and the MTU (at most 1500); the next recvmsg is EAGAIN; two refused sends leave only one notice;
+ *   H. getsockopt(IPV6_PATHMTU): unconnected ENOTCONN; connected to [::1] it gives 32 bytes, the address left zero and the MTU (at
+ *      most 1500); an optlen of 8 is EINVAL; an unconnected TCP socket ENOTCONN. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,8 +34,13 @@ static long sendto_(long s, const void *b, long n, const void *a, int al) { retu
 static long recv_(long s, void *b, long n) { return rc(recv((int)s, b, (size_t)n, MSG_DONTWAIT)); }
 static long setopt_(long s, int lv, int o, const void *v, int l) { return rc(setsockopt((int)s, lv, o, v, (socklen_t)l)); }
 static long getint(long s, int lv, int o) { int v = -1; socklen_t l = 4; long r = rc(getsockopt((int)s, lv, o, &v, &l)); return r < 0 ? r : v; }
+static long getopt_(long s, int lv, int o, void *v, int *l) { socklen_t sl = (socklen_t)*l; long r = rc(getsockopt((int)s, lv, o, v, &sl)); *l = (int)sl; return r; }
+static long connect_(long s, const void *a, int l) { return rc(connect((int)s, a, (socklen_t)l)); }
 static long sendmsg_(long s, void *m, int f) { return rc(sendmsg((int)s, m, f)); }
 static long recvmsg_(long s, void *m, int f) { return rc(recvmsg((int)s, m, f)); }
+static long open_(const char *p, int wr) { return rc(open(p, wr ? O_WRONLY : O_RDONLY)); }
+static long io_(long fd, char *b, int n, int wr) { return rc(wr ? write((int)fd, b, n) : read((int)fd, b, n)); }
+static void close_(long s) { close((int)s); }
 #else
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
 #include "../lib/moqi_libc/include/stdio.h"
@@ -39,11 +52,16 @@ static long sendto_(long s, const void *b, long n, const void *a, int al) { retu
 static long recv_(long s, void *b, long n) { return syscall6(122, s, (long)b, n, 0x40, 0, 0); }
 static long setopt_(long s, int lv, int o, const void *v, int l) { return syscall5(132, s, lv, o, (long)v, l); }
 static long getint(long s, int lv, int o) { int v = -1; int l = 4; long r = syscall5(133, s, lv, o, (long)&v, (long)&l); return r < 0 ? r : v; }
+static long getopt_(long s, int lv, int o, void *v, int *l) { return syscall5(133, s, lv, o, (long)v, (long)l); }
+static long connect_(long s, const void *a, int l) { return syscall3(124, s, (long)a, l); }
 static long sendmsg_(long s, void *m, int f) { return syscall3(129, s, (long)m, f); }
 static long recvmsg_(long s, void *m, int f) { return syscall3(130, s, (long)m, f); }
+static long open_(const char *p, int wr) { return syscall3(9, (long)p, wr ? 1 : 0, 0); }
+static long io_(long fd, char *b, int n, int wr) { return syscall3(wr ? 1 : 10, fd, (long)b, n); }
+static void close_(long s) { syscall1(11, s); }
 #endif
 static int failures;
-static char msg[500];
+static char msg[600];
 static void check(int ok, const char *w) {
     print(ok ? "hello461:   ok   " : "hello461:   FAIL ");
     print(w);
@@ -148,6 +166,85 @@ int main(void) {
     long e1 = setopt_(v4, 41, 62, &one, 4), e2 = setopt_(t6, 41, 62, &one, 4);
     snprintf(msg, sizeof msg, "E: IPv4 UDP %ld; IPv6 TCP %ld (-92 0)", e1, e2);
     check(e1 == -92 && e2 == 0, msg);
+
+    char saved[48];
+    long rf = open_("/proc/sys/net/ipv4/ping_group_range", 0);
+    long rn = rf >= 0 ? io_(rf, saved, sizeof saved - 1, 0) : -1;
+    if (rf >= 0) close_(rf);
+    long wf = open_("/proc/sys/net/ipv4/ping_group_range", 1);
+    char zz[] = "0 0";
+    if (wf >= 0) { io_(wf, zz, 3, 1); close_(wf); }
+    long p = sock(10, 2, 58);
+    setopt_(p, 41, 62, &one, 4);
+    setopt_(p, 41, 25, &one, 4);
+    long f1 = sendto_(p, out, 3000, b, 28);
+    memset(ec, 0, sizeof ec);
+    memcpy(eh + 32, &ecp, 8); memcpy(eh + 40, &ecl, 8);
+    long fq = recvmsg_(p, eh, 0x2000 | 0x40);
+    unsigned int fe;
+    memcpy(&fe, ec + 16, 4);
+    unsigned char fo = ec[16 + 4];
+    if (rn > 0) {
+        int k = 0;
+        while (k < rn && saved[k] != '\n') k++;
+        wf = open_("/proc/sys/net/ipv4/ping_group_range", 1);
+        if (wf >= 0) { io_(wf, saved, k, 1); close_(wf); }
+    }
+    snprintf(msg, sizeof msg, "F: ping socket %d; 3000 bytes %ld; error queue %ld errno %u origin %u (1 -90 0 90 1)", p >= 0, f1, fq, fe, fo);
+    check(p >= 0 && f1 == -90 && fq == 0 && fe == 90 && fo == 1, msg);
+
+    long gs = sock(10, 2, 0);
+    setopt_(gs, 41, 62, &one, 4);
+    long g1 = setopt_(gs, 41, 60, &one, 4);
+    long g2 = getint(gs, 41, 60);
+    sendto_(gs, out, 3000, a, 28);
+    static unsigned char gname[28], gctl[128];
+    memset(gname, 0x55, sizeof gname);
+    memset(gctl, 0, sizeof gctl);
+    unsigned char gh[56];
+    memset(gh, 0, sizeof gh);
+    long gnp = (long)gname, gnl = 28, gcp = (long)gctl, gcl = sizeof gctl;
+    long giov[2] = { (long)in, 16 };
+    long gip = (long)giov, gone = 1;
+    memcpy(gh, &gnp, 8); memcpy(gh + 8, &gnl, 4); memcpy(gh + 16, &gip, 8); memcpy(gh + 24, &gone, 8); memcpy(gh + 32, &gcp, 8); memcpy(gh + 40, &gcl, 8);
+    long gr = recvmsg_(gs, gh, 0x40);
+    long gclen; memcpy(&gclen, gh + 40, 8);
+    long cml; memcpy(&cml, gctl, 8);
+    int cmlv, cmty; memcpy(&cmlv, gctl + 8, 4); memcpy(&cmty, gctl + 12, 4);
+    unsigned int gmtu; memcpy(&gmtu, gctl + 16 + 28, 4);
+    int addr_ok = gctl[16] == 10 && gctl[16 + 23] == 1 && gname[0] == 10 && gname[2] == 0 && gname[3] == 0 && gname[23] == 1;
+    memcpy(gh + 40, &gcl, 8);
+    long gr2 = recvmsg_(gs, gh, 0x40);
+    sendto_(gs, out, 3000, a, 28);
+    sendto_(gs, out, 3000, a, 28);
+    memcpy(gh + 40, &gcl, 8);
+    long gr3 = recvmsg_(gs, gh, 0x40);
+    memcpy(gh + 40, &gcl, 8);
+    long gr4 = recvmsg_(gs, gh, 0x40);
+    snprintf(msg, sizeof msg, "G: set %ld get %ld; recvmsg %ld controllen %ld cmsg len %ld %d/%d mtu %u addr %d; again %ld; after two refusals %ld then %ld (0 1; 0 48 48 41/61 <=1500 1; -11; 0 -11)",
+             g1, g2, gr, gclen, cml, cmlv, cmty, gmtu, addr_ok, gr2, gr3, gr4);
+    check(g1 == 0 && g2 == 1 && gr == 0 && gclen == 48 && cml == 48 && cmlv == 41 && cmty == 61 && gmtu >= 1280 && gmtu <= 1500 && addr_ok && gr2 == -11 && gr3 == 0 && gr4 == -11, msg);
+
+    long hs = sock(10, 2, 0);
+    unsigned char pm[40];
+    int pl = 40;
+    long h1 = getopt_(hs, 41, 61, pm, &pl);
+    connect_(hs, a, 28);
+    memset(pm, 0x55, sizeof pm);
+    pl = 40;
+    long h2 = getopt_(hs, 41, 61, pm, &pl);
+    int h2len = pl;
+    unsigned int hm; memcpy(&hm, pm + 28, 4);
+    int zero_addr = 1;
+    for (int k = 0; k < 28; k++) if (pm[k] != 0) zero_addr = 0;
+    pl = 8;
+    long h3 = getopt_(hs, 41, 61, pm, &pl);
+    long ht = sock(10, 1, 0);
+    pl = 40;
+    long h4 = getopt_(ht, 41, 61, pm, &pl);
+    snprintf(msg, sizeof msg, "H: IPV6_PATHMTU unconnected %ld; connected %ld len %d address zero %d mtu %u; optlen 8 %ld; TCP %ld (-107; 0 32 1 <=1500; -22; -107)", h1, h2, h2len, zero_addr, hm, h3,
+             h4);
+    check(h1 == -107 && h2 == 0 && h2len == 32 && zero_addr && hm >= 1280 && hm <= 1500 && h3 == -22 && h4 == -107, msg);
 
     print(failures ? "hello461: FAIL\n" : "hello461: PASS\n");
     return failures ? 1 : 0;

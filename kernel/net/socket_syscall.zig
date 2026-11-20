@@ -535,6 +535,9 @@ fn pingSend6(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, add
     var ping_ip6: @import("ip_opt_policy.zig").IpOpts = if (udp.getPortOpts(d.udpKey())) |po| po.ip else .{};
     if (ov6.dontfrag) |df| ping_ip6.dontfrag6 = df;
     const sent = @import("icmpv6.zig").sendProto6Ov(d.udp_local_ip6, dst, 58, 2, msg[0..payload.len], ping_ip6, ov6.hops, ov6.tclass);
+    // ipv6_local_error: an IPV6_DONTFRAG refusal reaches an IPV6_RECVERR ping socket's error queue too.
+    if (sent == -90 and ping_ip6.dontfrag6 and ping_ip6.recverr6 and payload.len <= 0xFFFF)
+        udp.queueLocalError(d.udpKey(), errq.localEntry6(90, @import("ipv6.zig").getSendMtu(dst), dst, 0));
     return if (sent < 0) sent else @intCast(payload.len);
 }
 
@@ -2056,11 +2059,44 @@ fn udpOversize6(key: u32, dst: [16]u8, dst_port: u16, len: usize) ?i64 {
     return udpOversize6Df(key, dst, dst_port, len, null);
 }
 
+/// ipv6_recv_rxpmtu: no data, msg_name the destination (port 0), one IPV6_PATHMTU control message, msg_flags 0.
+fn recvRxPmtu(msg_ptr: u64, msghdr: *const [56]u8, n: udp.RxPmtu) i64 {
+    const name_ptr: u64 = bo.readU64At(msghdr, 0);
+    const name_cap: u32 = bo.readU32Le(msghdr[8..12]);
+    if (name_ptr != 0 and name_ptr < 0x0000_8000_0000_0000) {
+        var sa6: [sa.SOCKADDR_IN6_LEN]u8 = @splat(0);
+        const alen = sa.writeInet6(&sa6, 0, n.dst, n.scope);
+        const k = @min(name_cap, alen);
+        if (k != 0 and copy.copyToUser(@ptrFromInt(name_ptr), sa6[0..k], k) != k) return -14;
+        var al: [4]u8 = undefined;
+        bo.writeU32Le(&al, alen);
+        _ = copy.copyToUser(@ptrFromInt(msg_ptr + 8), &al, 4);
+    }
+    const ctl_ptr: u64 = bo.readU64At(msghdr, 32);
+    const ctl_cap: usize = if (ctl_ptr == 0) 0 else @intCast(@min(bo.readU64At(msghdr, 40), 1 << 20));
+    var ctl: [64]u8 = undefined;
+    const cm = ip_cmsg_policy.buildPathMtu(n.dst, n.scope, n.mtu, ctl_cap, &ctl);
+    if (cm.written != 0) {
+        if (ctl_ptr >= 0x0000_8000_0000_0000) return -14;
+        if (copy.copyToUser(@ptrFromInt(ctl_ptr), ctl[0..cm.written], cm.written) != cm.written) return -14;
+    }
+    var cl: [8]u8 = undefined;
+    bo.writeU64Le(&cl, cm.written);
+    _ = copy.copyToUser(@ptrFromInt(msg_ptr + 40), &cl, 8);
+    var fl: [4]u8 = undefined;
+    bo.writeU32Le(&fl, if (cm.truncated) @as(u32, 0x08) else 0);
+    _ = copy.copyToUser(@ptrFromInt(msg_ptr + 48), &fl, 4);
+    return 0;
+}
+
 /// udpOversize6 with this datagram's IPV6_DONTFRAG (null: the socket's IPV6_DONTFRAG).
 fn udpOversize6Df(key: u32, dst: [16]u8, dst_port: u16, len: usize, dontfrag_ov: ?bool) ?i64 {
     const ipo = (udp.getPortOpts(key) orelse return null).ip;
     const df = dontfrag_ov orelse ipo.dontfrag6;
-    const o = errq.oversize6Df(len, @import("ipv6.zig").getSendMtu(dst), ipo.pmtudisc6, ipo.recverr6, df) orelse return null;
+    const mtu = @import("ipv6.zig").getSendMtu(dst);
+    const o = errq.oversize6Df(len, mtu, ipo.pmtudisc6, ipo.recverr6, df) orelse return null;
+    // __ip6_append_data: a DONTFRAG refusal first leaves an IPV6_PATHMTU notice for an IPV6_RECVPATHMTU socket (ipv6_local_rxpmtu).
+    if (df and ipo.rxpmtu6 and len <= 65527 and 48 + len > mtu) udp.setRxPmtu(key, .{ .valid = true, .dst = dst, .mtu = mtu });
     if (o.queue) udp.queueLocalError(key, errq.localEntry6(90, o.info, dst, dst_port));
     return -90; // EMSGSIZE
 }
@@ -2087,6 +2123,9 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
     const d = &cur.fd_table.fds[fd];
     const is_v6 = d.udp_is_v6;
     const port = d.udpKey();
+    // udpv6_recvmsg: an IPV6_RECVPATHMTU socket's pending path-MTU notice comes first, as a 0-byte message from the destination with
+    // one IPV6_PATHMTU control message (ipv6_recv_rxpmtu).
+    if (is_v6) if (udp.getPortOpts(port)) |po| if (po.ip.rxpmtu6) if (udp.takeRxPmtu(port)) |n| return recvRxPmtu(msg_ptr, msghdr, n);
     // __skb_try_recv_datagram: a pending error is reported once, before any queued datagram (as recvfrom does).
     const pending = udp.takePendingError(port);
     if (pending != 0) return -@as(i64, pending);

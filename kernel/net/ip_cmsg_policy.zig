@@ -135,6 +135,21 @@ pub fn build(w: Wanted, info: RecvInfo, cap_in: usize, out: []u8) Built {
 
 /// ip6_datagram_recv_common_ctl then _specific_ctl: IPV6_PKTINFO (struct in6_pktinfo: in6_addr, then int ifindex), IPV6_HOPLIMIT
 /// (int), IPV6_TCLASS (int), then IPV6_ORIGDSTADDR, after the timestamp (`out` holds at least min(cap, 160) bytes).
+/// ipv6_recv_rxpmtu's message: one IPV6_PATHMTU control message holding struct ip6_mtuinfo (a sockaddr_in6 with the destination,
+/// then the MTU: 32 bytes), cut like put_cmsg when `cap` is short.
+pub fn buildPathMtu(dst: [16]u8, scope: u32, mtu: u32, cap_in: usize, out: []u8) Built {
+    const cap = @min(cap_in, out.len);
+    var data: [32]u8 = @splat(0);
+    data[0] = 10;
+    @memcpy(data[8..24], &dst);
+    std.mem.writeInt(u32, data[24..28], scope, .little);
+    std.mem.writeInt(u32, data[28..32], mtu, .little);
+    var used: usize = 0;
+    var truncated = false;
+    put(out, &used, cap, @intCast(ipo.SOL_IPV6), @intCast(ipo.IPV6_PATHMTU), &data, &truncated);
+    return .{ .written = used, .truncated = truncated };
+}
+
 pub fn build6(w: Wanted, info: RecvInfo6, cap_in: usize, out: []u8) Built {
     const cap = @min(cap_in, out.len);
     var used: usize = 0;

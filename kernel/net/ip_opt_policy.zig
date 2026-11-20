@@ -41,6 +41,10 @@ pub const IPV6_UNICAST_HOPS: u64 = 16;
 pub const IPV6_MTU_DISCOVER: u64 = 23;
 /// IPV6_DONTFRAG: datagrams over the path MTU are refused (EMSGSIZE) instead of fragmented.
 pub const IPV6_DONTFRAG: u64 = 62;
+/// IPV6_RECVPATHMTU: a send IPV6_DONTFRAG refused leaves an IPV6_PATHMTU message for the next recvmsg; IPV6_PATHMTU (getsockopt on a
+/// connected socket) reads the path MTU.
+pub const IPV6_RECVPATHMTU: u64 = 60;
+pub const IPV6_PATHMTU: u64 = 61;
 pub const IPV6_MULTICAST_IF: u64 = 17;
 pub const IPV6_MULTICAST_HOPS: u64 = 18;
 pub const IPV6_MULTICAST_LOOP: u64 = 19;
@@ -98,6 +102,7 @@ pub const IpOpts = struct {
     recverr6: bool = false,
     pmtudisc6: u8 = PMTUDISC_WANT,
     dontfrag6: bool = false,
+    rxpmtu6: bool = false,
 };
 
 pub const Family = enum { v4, v6 };
@@ -223,6 +228,7 @@ pub fn applySet(cur: IpOpts, level: u64, optname: u64, val: []const u8) SetResul
                 if (v < PMTUDISC_DONT or v > PMTUDISC_OMIT) return .{ .err = -22 };
                 o.pmtudisc6 = @intCast(v);
             },
+            IPV6_RECVPATHMTU => o.rxpmtu6 = v != 0,
             IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVTCLASS, IPV6_RECVORIGDSTADDR, IPV6_RECVERR => {
                 if (val.len < 4) return .{ .err = -22 };
                 switch (optname) {
@@ -331,6 +337,7 @@ pub fn getValue(o: IpOpts, level: u64, optname: u64) ?i32 {
             IPV6_RECVERR => @intFromBool(o.recverr6),
             IPV6_MTU_DISCOVER => o.pmtudisc6,
             IPV6_DONTFRAG => @intFromBool(o.dontfrag6),
+            IPV6_RECVPATHMTU => @intFromBool(o.rxpmtu6),
             else => null,
         },
         else => null,
