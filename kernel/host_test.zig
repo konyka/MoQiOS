@@ -177,6 +177,7 @@ pub const rwf_policy = @import("fs/rwf_policy.zig");
 pub const append_lock_policy = @import("fs/append_lock_policy.zig");
 pub const icmp_echo_policy = @import("net/icmp_echo_policy.zig");
 pub const icmp_unreach_policy = @import("net/icmp_unreach_policy.zig");
+pub const ip_frag_policy = @import("net/ip_frag_policy.zig");
 pub const udp_source = @embedFile("net/udp.zig");
 pub const net_mod_source = @embedFile("net/mod.zig");
 pub const ndp_source = @embedFile("net/ndp.zig");
@@ -370,6 +371,7 @@ pub const copy_file_range_source = @embedFile("fs/copy_file_range.zig");
 // arch/x86_64/clone.zig and mm/process_vm.zig.
 test {
     _ = @import("net/tcp_urg_policy.zig");
+    _ = @import("net/ip_frag_policy.zig");
     _ = @import("net/errqueue_policy.zig");
     _ = @import("proc/syscall_restart_policy.zig");
     _ = @import("proc/orphan_pgrp_policy.zig");
