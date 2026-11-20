@@ -17453,3 +17453,20 @@ test "IPv6 flow labels: IPV6_FLOWINFO control message, IPV6_FLOWINFO_SEND with s
     try std.testing.expectEqual(@as(usize, 0), c.build6(.{ .flowinfo = true }, .{}, 64, &out).written);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "const flow: ?u32 = ov6.flowlabel orelse sndFlow6(src_key, sin6_flow);") != null);
 }
+
+test "automatic IPv6 flow labels: one per flow under a boot secret, off with IPV6_AUTOFLOWLABEL 0 (ip6_make_flowlabel; hello462 E)" {
+    const fl = kt.flowlabel_policy;
+    var a: [16]u8 = @splat(0);
+    a[15] = 1;
+    const k: [16]u8 = @splat(3);
+    const l = fl.autoLabel(a, a, 5000, 4620, 17, k);
+    try std.testing.expect(l != 0 and l <= 0xFFFFF);
+    try std.testing.expectEqual(l, fl.autoLabel(a, a, 5000, 4620, 17, k));
+    try std.testing.expect(l != fl.autoLabel(a, a, 5001, 4620, 17, k));
+    const ipo = kt.ip_opt_policy;
+    const o: ipo.IpOpts = .{};
+    try std.testing.expect(o.autoflow6);
+    const zero = [4]u8{ 0, 0, 0, 0 };
+    try std.testing.expect(!ipo.applySet(o, ipo.SOL_IPV6, ipo.IPV6_AUTOFLOWLABEL, &zero).ok.autoflow6);
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "if (flowLabelFor(flow_ov, opts, our_ip, dst_ip, src_port, dst_port)) |fl| ip_opt_policy.setFlowLabel6(send_pkt[14..][0..40], fl);") != null);
+}

@@ -1,13 +1,16 @@
 /* hello462: IPv6 flow labels on UDP (Linux ip6_datagram_send_ctl IPV6_FLOWINFO, udpv6_sendmsg with np->sndflow, ip6_make_flowlabel,
  * ip6_datagram_recv_specific_ctl rxflow). The receiver turns on IPV6_FLOWINFO (SOL_IPV6 11) and reads the label of each datagram
- * from its control message. Measured on the host (build with -DHOST, run in `unshare -n` with lo up and
- * net.ipv6.auto_flowlabels set to 0, so an unlabelled datagram carries label 0 as on this kernel):
- *   A. setsockopt(IPV6_FLOWINFO, 1) on the receiver: 0, getsockopt reads 1; a plain datagram brings no IPV6_FLOWINFO message (its
- *      flowinfo is 0);
+ * from its control message. Measured on the host (build with -DHOST, run in `unshare -n` with lo up and the default
+ * net.ipv6.auto_flowlabels = 1):
+ *   A. setsockopt(IPV6_FLOWINFO, 1) on the receiver: 0, getsockopt reads 1; a sender with IPV6_AUTOFLOWLABEL 0 sends a datagram with
+ *      no label, which brings no IPV6_FLOWINFO message (its flowinfo is 0);
  *   B. sendmsg with an IPV6_FLOWINFO control message 0x000abcde: the receiver sees flowinfo 0x000abcde;
  *   C. sin6_flowinfo 0x54321 without IPV6_FLOWINFO_SEND: no label; with IPV6_FLOWINFO_SEND (33) set (getsockopt reads 1): label
  *      0x54321; a sin6_flowinfo with traffic-class bits (0x12354321) still gives label 0x54321;
- *   D. IPV6_FLOWINFO_SEND set and a control message: the control message's label wins. */
+ *   D. IPV6_FLOWINFO_SEND set and a control message: the control message's label wins;
+ *   E. automatic labels: IPV6_AUTOFLOWLABEL reads 1 on a new socket; its plain datagrams carry a non-zero label, the same for two
+ *      sends of one flow; another socket (another source port) gets another label; IPV6_AUTOFLOWLABEL 0 turns it off (label 0),
+ *      1 back on (the same label as before). */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -103,6 +106,8 @@ int main(void) {
     long u = sock(10, 2, 0);
     int one = 1;
 
+    int zero = 0;
+    setopt_(u, 41, 70, &zero, 4);
     long so = setopt_(rcv, 41, 11, &one, 4);
     long g = getint(rcv, 41, 11);
     sendto_(u, "x", 1, a, 28);
@@ -133,6 +138,25 @@ int main(void) {
     long d1 = next_flow();
     snprintf(msg, sizeof msg, "D: IPV6_FLOWINFO_SEND and a control message 0xfedcb: %lx (fedcb)", d1);
     check(d1 == 0xfedcb, msg);
+
+    memset(a + 4, 0, 4);
+    long e = sock(10, 2, 0), e2 = sock(10, 2, 0);
+    long eg = getint(e, 41, 70);
+    sendto_(e, "x", 1, a, 28);
+    long e1 = next_flow();
+    sendto_(e, "x", 1, a, 28);
+    long e1b = next_flow();
+    sendto_(e2, "x", 1, a, 28);
+    long e3 = next_flow();
+    setopt_(e, 41, 70, &zero, 4);
+    long eoff = getint(e, 41, 70);
+    sendto_(e, "x", 1, a, 28);
+    long e4 = next_flow();
+    setopt_(e, 41, 70, &one, 4);
+    sendto_(e, "x", 1, a, 28);
+    long e5 = next_flow();
+    snprintf(msg, sizeof msg, "E: IPV6_AUTOFLOWLABEL %ld; label %lx then %lx; another socket %lx; off (%ld) %lx; on again %lx (1; x x; y; 0 0; x)", eg, e1, e1b, e3, eoff, e4, e5);
+    check(eg == 1 && e1 > 0 && e1 <= 0xFFFFF && e1b == e1 && e3 > 0 && e3 != e1 && eoff == 0 && e4 == 0 && e5 == e1, msg);
 
     print(failures ? "hello462: FAIL\n" : "hello462: PASS\n");
     return failures ? 1 : 0;

@@ -222,6 +222,7 @@ pub const tcp_info_policy = @import("net/tcp_info_policy.zig");
 pub const ip_opt_policy = @import("net/ip_opt_policy.zig");
 pub const scm_policy = @import("net/scm_policy.zig");
 pub const ip_cmsg_policy = @import("net/ip_cmsg_policy.zig");
+pub const flowlabel_policy = @import("net/flowlabel_policy.zig");
 pub const sockopt_policy = @import("net/sockopt_policy.zig");
 pub const udp_recv_policy = @import("net/udp_recv_policy.zig");
 pub const ext2_dirpath = @import("fs/ext2_dirpath.zig");
@@ -376,6 +377,7 @@ pub const copy_file_range_source = @embedFile("fs/copy_file_range.zig");
 test {
     _ = @import("net/tcp_urg_policy.zig");
     _ = @import("drivers/random_seed_policy.zig");
+    _ = @import("net/flowlabel_policy.zig");
     _ = @import("net/ip_frag_policy.zig");
     _ = @import("net/errqueue_policy.zig");
     _ = @import("proc/syscall_restart_policy.zig");

@@ -1623,7 +1623,7 @@ fn sendFragmented6(our_ip: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, 
             pkt[14] = (pkt[14] & 0xF0) | (tc >> 4);
             pkt[15] = (pkt[15] & 0x0F) | (tc << 4);
         }
-        if (flow_ov) |fl| ip_opt_policy.setFlowLabel6(pkt[14..][0..40], fl);
+        if (flowLabelFor(flow_ov, opts, our_ip, dst_ip, portNumber(src_key), dst_port)) |fl| ip_opt_policy.setFlowLabel6(pkt[14..][0..40], fl);
         const fh = 14 + ipv6.HEADER_LEN;
         pkt[fh] = PROTO_UDP6;
         pkt[fh + 1] = 0;
@@ -1643,6 +1643,26 @@ fn sendFragmented6(our_ip: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, 
 }
 
 const PROTO_UDP6: u8 = 17;
+
+/// The per-boot key of automatic flow labels (drawn on first use).
+var flow_secret: [16]u8 = @splat(0);
+var flow_secret_set: bool = false;
+var flow_secret_lock: IrqSpinlock = .{};
+
+/// The label a UDP packet carries: the explicit one, else the flow's automatic one (IPV6_AUTOFLOWLABEL on), else none.
+fn flowLabelFor(explicit: ?u32, opts: ip_opt_policy.IpOpts, src: [16]u8, dst: [16]u8, sport: u16, dport: u16) ?u32 {
+    if (explicit) |l| return l;
+    if (!opts.autoflow6) return null;
+    if (!@atomicLoad(bool, &flow_secret_set, .acquire)) {
+        const held = flow_secret_lock.acquire();
+        defer flow_secret_lock.release(held);
+        if (!flow_secret_set) {
+            @import("../drivers/random.zig").getRandomBytes(&flow_secret, 16);
+            @atomicStore(bool, &flow_secret_set, true, .release);
+        }
+    }
+    return @import("flowlabel_policy.zig").autoLabel(src, dst, sport, dport, PROTO_UDP6, flow_secret);
+}
 
 /// ip_fragment for a UDP datagram over `mtu`: the UDP header (with its checksum, which spans the whole datagram) and the payload are
 /// cut into pieces of ip_frag_policy.pieceLen bytes, each behind its own IPv4 header with the datagram's id, MF on all but the last,
@@ -1763,8 +1783,9 @@ pub fn sendToV6FromOv(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32
         send_pkt[14] = (send_pkt[14] & 0xF0) | (tc >> 4);
         send_pkt[15] = (send_pkt[15] & 0x0F) | (tc << 4);
     }
-    // The flow label an IPV6_FLOWINFO control message or (with IPV6_FLOWINFO_SEND) sin6_flowinfo gives (ip6_make_flowlabel).
-    if (flow_ov) |fl| ip_opt_policy.setFlowLabel6(send_pkt[14..][0..40], fl);
+    // The flow label an IPV6_FLOWINFO control message or (with IPV6_FLOWINFO_SEND) sin6_flowinfo gives; without one, an automatic
+    // label from the flow unless IPV6_AUTOFLOWLABEL is off (ip6_make_flowlabel, auto_flowlabels OPTOUT).
+    if (flowLabelFor(flow_ov, opts, our_ip, dst_ip, src_port, dst_port)) |fl| ip_opt_policy.setFlowLabel6(send_pkt[14..][0..40], fl);
     const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV6, ipv6.HEADER_LEN + udp_total);
     // IPV6_MULTICAST_LOOP: when this host is a member of the group on the outgoing interface a copy is delivered locally too,
     // arriving on that interface (Linux ip6_finish_output2 checks ipv6_chk_mcast_addr on the device).

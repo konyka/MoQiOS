@@ -48,6 +48,7 @@ pub const IPV6_PATHMTU: u64 = 61;
 /// IPV6_FLOWINFO_SEND: a send's sin6_flowinfo gives the packet's flow label (np->sndflow).
 pub const IPV6_FLOWINFO_SEND: u64 = 33;
 pub const IPV6_FLOWINFO: u64 = 11;
+pub const IPV6_AUTOFLOWLABEL: u64 = 70;
 pub const IPV6_MULTICAST_IF: u64 = 17;
 pub const IPV6_MULTICAST_HOPS: u64 = 18;
 pub const IPV6_MULTICAST_LOOP: u64 = 19;
@@ -109,6 +110,8 @@ pub const IpOpts = struct {
     sndflow6: bool = false,
     /// IPV6_FLOWINFO (rxflow): received datagrams bring their flowinfo as a control message.
     rxflow6: bool = false,
+    /// IPV6_AUTOFLOWLABEL: packets without an explicit label get an automatic one (on by default, auto_flowlabels OPTOUT).
+    autoflow6: bool = true,
 };
 
 pub const Family = enum { v4, v6 };
@@ -237,6 +240,7 @@ pub fn applySet(cur: IpOpts, level: u64, optname: u64, val: []const u8) SetResul
             IPV6_RECVPATHMTU => o.rxpmtu6 = v != 0,
             IPV6_FLOWINFO_SEND => o.sndflow6 = v != 0,
             IPV6_FLOWINFO => o.rxflow6 = v != 0,
+            IPV6_AUTOFLOWLABEL => o.autoflow6 = v != 0,
             IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVTCLASS, IPV6_RECVORIGDSTADDR, IPV6_RECVERR => {
                 if (val.len < 4) return .{ .err = -22 };
                 switch (optname) {
@@ -348,6 +352,7 @@ pub fn getValue(o: IpOpts, level: u64, optname: u64) ?i32 {
             IPV6_RECVPATHMTU => @intFromBool(o.rxpmtu6),
             IPV6_FLOWINFO_SEND => @intFromBool(o.sndflow6),
             IPV6_FLOWINFO => @intFromBool(o.rxflow6),
+            IPV6_AUTOFLOWLABEL => @intFromBool(o.autoflow6),
             else => null,
         },
         else => null,
