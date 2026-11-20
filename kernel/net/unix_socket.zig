@@ -133,6 +133,9 @@ pub const UnixSocket = struct {
     /// shutdown(SHUT_RD) / shutdown(SHUT_WR) happened on this end.
     shut_rd: bool = false,
     shut_wr: bool = false,
+    /// The pending error (sk_err), positive: left by a recvmmsg batch that failed part-way, reported once by the next receive or
+    /// SO_ERROR.
+    so_error: i32 = 0,
     // Wait queues
     read_waiters: ?*WaitNode = null,
     write_waiters: ?*WaitNode = null,
@@ -514,6 +517,33 @@ pub const OptView = struct {
 };
 
 /// Snapshot of the option-relevant state of socket `idx`.
+/// Set the socket's pending error (do_recvmmsg's sk_err).
+pub fn unixSetError(idx: u32, e: i32) void {
+    if (idx >= MAX_UNIX_SOCKETS) return;
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    if (unix_sockets[idx].active) unix_sockets[idx].so_error = e;
+}
+
+/// The pending error, taken (a receive reports it once) or only looked at (SO_ERROR reads, then clears with unixClearErrorIfEqual).
+pub fn unixTakeError(idx: u32, clear: bool) i32 {
+    if (idx >= MAX_UNIX_SOCKETS) return 0;
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    const sock = &unix_sockets[idx];
+    if (!sock.active) return 0;
+    const e = sock.so_error;
+    if (clear) sock.so_error = 0;
+    return e;
+}
+
+pub fn unixClearErrorIfEqual(idx: u32, e: i32) void {
+    if (idx >= MAX_UNIX_SOCKETS) return;
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    if (unix_sockets[idx].active and unix_sockets[idx].so_error == e) unix_sockets[idx].so_error = 0;
+}
+
 pub fn unixOptView(idx: u32) ?OptView {
     if (idx >= MAX_UNIX_SOCKETS) return null;
     const saved = unix_lock.acquire();

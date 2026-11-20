@@ -902,6 +902,7 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
     var tcp_idx: ?u32 = null;
     var udp_clear: ?u32 = null;
     var raw_clear: ?u32 = null;
+    var unix_clear: ?u32 = null;
     switch (ref) {
         .tcp => |idx| {
             const tcp_mod = @import("tcp.zig");
@@ -919,7 +920,8 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
         .unix => |idx| {
             const view = @import("unix_socket.zig").unixOptView(idx) orelse return -9;
             stored = view.opts;
-            facts = .{ .id = sp.identity(if (view.sock_type == 5) .unix_seqpacket else if (view.stream) .unix_stream else .unix_dgram, false), .accepting = view.listening, .cred = view.peer_cred };
+            facts = .{ .id = sp.identity(if (view.sock_type == 5) .unix_seqpacket else if (view.stream) .unix_stream else .unix_dgram, false), .accepting = view.listening, .cred = view.peer_cred, .so_error = @import("unix_socket.zig").unixTakeError(idx, false) };
+            unix_clear = idx;
         },
         .raw => |idx| {
             stored = @import("raw_icmp.zig").getOpts(idx) orelse return -9;
@@ -940,6 +942,7 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
         if (tcp_idx) |idx| @import("tcp.zig").tcpClearSoErrorIfEqual(idx, facts.so_error);
         if (udp_clear) |p| @import("udp.zig").clearPendingErrorIfEqual(p, facts.so_error);
         if (raw_clear) |r| @import("raw_icmp.zig").clearErrorIfEqual(r, facts.so_error);
+        if (unix_clear) |u| @import("unix_socket.zig").unixClearErrorIfEqual(u, facts.so_error);
     }
     return 0;
 }

@@ -11,7 +11,9 @@
  *   F. a non-last piece whose length is not a multiple of 8 (1228 bytes) draws a parameter problem (code 0) and is dropped;
  *   G. an ordinary datagram afterwards still arrives;
  *   H. the fragmentable part may begin with another extension header: pieces whose Fragment header names a Destination Options
- *      header (8 bytes of PadN) in front of the UDP datagram are reassembled, the options stepped over, and the 3000 bytes arrive. */
+ *      header (8 bytes of PadN) in front of the UDP datagram are reassembled, the options stepped over, and the 3000 bytes arrive;
+ *   I. a raw IPPROTO_FRAGMENT socket sees the pieces of three 3000-byte UDP datagrams the host sends: three per datagram, one id
+ *      each, the ids non-zero and not consecutive (__ipv6_select_ident draws a random id for every datagram). */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -194,6 +196,27 @@ int main(void) {
     int hs = h == 3000 && memcmp(in, dgram + 8, 3000) == 0;
     snprintf(msg, sizeof msg, "H: Destination Options after the Fragment header: got %ld same %d (3000 1)", h, hs);
     check(h == 3000 && hs, msg);
+
+    while (recv_(fr, in, sizeof in) >= 0) {}
+    while (recv_(u, in, sizeof in) >= 0) {}
+    unsigned int ids[9];
+    int n_frag = 0, same_ok = 1;
+    /* One datagram at a time: its three pieces are read before the next is sent. */
+    for (int k = 0; k < 3; k++) {
+        sendto_(s, out, 3000, a, 28);
+        nap();
+        for (int j = 0; j < 3; j++) {
+            long n = recv_(fr, in, sizeof in);
+            if (n < 8) break;
+            ids[n_frag++] = (unsigned int)in[4] << 24 | (unsigned int)in[5] << 16 | (unsigned int)in[6] << 8 | in[7];
+        }
+    }
+    for (int k = 0; k + 2 < n_frag; k += 3) if (ids[k] != ids[k + 1] || ids[k] != ids[k + 2] || ids[k] == 0) same_ok = 0;
+    int spread = n_frag == 9 && ids[3] != ids[0] + 1 && ids[6] != ids[3] + 1 && ids[0] != ids[3] && ids[3] != ids[6];
+    while (recv_(u, in, sizeof in) >= 0) {}
+    snprintf(msg, sizeof msg, "I: %d pieces; one non-zero id per datagram %d; ids not consecutive %d (%08x %08x %08x) (9 1 1)", n_frag, same_ok, spread, n_frag > 0 ? ids[0] : 0,
+             n_frag > 3 ? ids[3] : 0, n_frag > 6 ? ids[6] : 0);
+    check(n_frag == 9 && same_ok && spread, msg);
 
     print(failures ? "hello453: FAIL\n" : "hello453: PASS\n");
     return failures ? 1 : 0;

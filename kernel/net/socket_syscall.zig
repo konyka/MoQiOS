@@ -1145,6 +1145,8 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         const to_read = @min(len, 8192);
         if (!copy.validateUserBufferWritable(buf, to_read)) return -14; // EFAULT
         const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
+        const pending_u = net_mod.unix_socket.unixTakeError(unix_idx, true);
+        if (pending_u != 0) return -@as(i64, pending_u);
         const rf = @import("recv_flags_policy.zig");
         const nonblock_u = @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), flags);
         var full_len_u: usize = 0;
@@ -1713,12 +1715,24 @@ fn unixRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8
     if (iov_len != 0 and (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000)) return -14;
     const want_ctl = ctl_ptr != 0 and ctl_len >= sp.HDR;
 
-    // Total room across the iovecs.
+    // A pending error (a recvmmsg batch that failed part-way) is reported once, before any data.
+    const pending_u = net_mod.unix_socket.unixTakeError(cur.fd_table.fds[fd].unix_sock_idx, true);
+    if (pending_u != 0) return -@as(i64, pending_u);
+
+    // Total room across the iovecs. On a stream socket a buffer that cannot take the bytes is EFAULT before anything is read
+    // (unix_stream_read_generic leaves the data queued when the copy faults); a datagram is taken off the queue and the copy fails
+    // afterwards, as unix_dgram_recvmsg drops the skb it dequeued.
+    const stream_u = net_mod.unix_socket.unixIsStream(cur.fd_table.fds[fd].unix_sock_idx);
     var room: usize = 0;
     var i: usize = 0;
     while (i < iov_len) : (i += 1) {
         var iov_buf: [16]u8 = undefined;
         if (copy.copyFromUser(&iov_buf, @ptrFromInt(iov_ptr + @as(u64, @intCast(i)) * 16), 16) != 16) return -14;
+        const want: usize = @intCast(@min(bo.readU64At(&iov_buf, 8), 8192 - room));
+        if (stream_u and want != 0) {
+            const base = bo.readU64At(&iov_buf, 0);
+            if (base == 0 or base >= 0x0000_8000_0000_0000 or !copy.validateUserBufferWritable(base, want)) return -14;
+        }
         room += @intCast(@min(bo.readU64At(&iov_buf, 8), 8192));
         if (room >= 8192) {
             room = 8192;
@@ -1782,7 +1796,14 @@ fn unixRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8
         const base = bo.readU64At(&iov_buf, 0);
         const sz: usize = @intCast(@min(bo.readU64At(&iov_buf, 8), @as(u64, @intCast(n)) - done));
         if (sz == 0) continue;
-        if (copy.copyToUser(@ptrFromInt(base), data[done..][0..sz], sz) != sz) break;
+        if (copy.copyToUser(@ptrFromInt(base), data[done..][0..sz], sz) != sz) {
+            // skb_copy_datagram_msg failed: the datagram is gone and the call is EFAULT (what was copied before is not reported).
+            if (!stream_u) {
+                for (out.descs[0..out.count]) |*d| vfs_mod.releaseDescriptor(d);
+                return -14;
+            }
+            break;
+        }
         done += sz;
     }
 
@@ -2682,7 +2703,7 @@ pub fn recvmmsg(sockfd: u32, msgvec_ptr: u64, vlen_raw: u64, flags: u32, timeout
     return @intCast(count);
 }
 
-/// recvmmsg's sk_err for the socket `fd` names: UDP (and ping) and raw sockets keep a pending error; others have none to set here.
+/// recvmmsg's sk_err for the socket `fd` names (UDP and ping, raw, AF_UNIX, TCP).
 fn leavePendingError(fd: u32, e: i32) void {
     const cur_idx = sched_mod.currentTaskIndex() orelse return;
     const t = task_mod.getTask(cur_idx) orelse return;
@@ -2691,6 +2712,8 @@ fn leavePendingError(fd: u32, e: i32) void {
     switch (d.fd_type) {
         .udp_socket => udp.setPendingError(d.udpKey(), e),
         .raw_socket => @import("raw_icmp.zig").setError(d.raw_idx, e),
+        .unix_socket => net_mod.unix_socket.unixSetError(d.unix_sock_idx, e),
+        .tcp_socket => net_mod.tcp.tcpSetSoError(d.tcb_idx, e),
         else => {},
     }
 }

@@ -1211,6 +1211,15 @@ const ECONNRESET: i32 = 104;
 /// The SO_ERROR value getsockopt should report: the stored connect failure, or ECONNRESET while a reset from the peer is still
 /// unreported (Linux keeps both in sk_err), else the soft error an ICMP error left (sk_err_soft). Reading does not consume;
 /// tcpClearSoErrorIfEqual does that after the copy-out.
+/// Set the connection's pending error (do_recvmmsg's sk_err after a batch that failed part-way). TCP's receive keeps returning
+/// queued data first (tcp_recvmsg only looks at sk_err once the queue is empty); SO_ERROR reads and clears it.
+pub fn tcpSetSoError(tcb_idx: u32, e: i32) void {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return;
+    tcbs[tcb_idx].options.so_error = e;
+}
+
 pub fn tcpPendingSoError(tcb_idx: u32) i32 {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);

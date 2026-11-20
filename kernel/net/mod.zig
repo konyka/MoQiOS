@@ -92,6 +92,9 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
             // ipv6_frag_rcv: a Fragment header after the options joins its reassembly queue (an atomic fragment is delivered with
             // the header taken out); the completed datagram comes back through here.
             if (ext.nh == 44) {
+                // raw6_local_deliver sees the Fragment header too: an IPPROTO_FRAGMENT raw socket gets each piece as it arrived.
+                const fo: u32 = payload_start6 + @as(u32, @intCast(ext.off));
+                _ = raw6.deliver6(44, data[fo .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass);
                 @import("ip_frag.zig").receive6(data, len, pkt6, ext.off, ifindex);
                 return;
             }

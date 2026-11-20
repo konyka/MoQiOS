@@ -141,16 +141,14 @@ pub fn send4(hdr: [20]u8, payload: []const u8, mtu: u16, dst_mac: [6]u8, our_mac
     return all_ok;
 }
 
-/// The id of the next fragmented IPv6 datagram this host sends, never 0 (ipv6_select_ident hashes the addresses; one counter, shared
-/// by UDP and ICMPv6, keeps ids from repeating here).
-var frag6_id: u32 = 0x5a5a0001;
-
+/// The id of the next fragmented IPv6 datagram this host sends: a random non-zero 32-bit value (__ipv6_select_ident:
+/// get_random_u32_above(0)), so ids cannot be predicted from one another.
 pub fn nextId6() u32 {
-    const saved = lock.acquire();
-    defer lock.release(saved);
-    frag6_id +%= 1;
-    if (frag6_id == 0) frag6_id = 1;
-    return frag6_id;
+    while (true) {
+        var id: u32 = 0;
+        @import("../drivers/random.zig").getRandomBytes(@ptrCast(&id), 4);
+        if (id != 0) return id;
+    }
 }
 
 /// ip6_fragment for a locally built IPv6 packet: `hdr` is its 40-byte header (addresses, hop limit, traffic class; the next header

@@ -17291,3 +17291,28 @@ test "a recvmmsg batch that fails part-way keeps its count and leaves the error 
     try std.testing.expect(std.mem.indexOf(u8, body, "const pending = udp.takePendingError(port);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "pub fn setPendingError(port: u32, e: i32) void {") != null);
 }
+
+test "AF_UNIX sockets keep a pending error from a part-failed recvmmsg; a bad receive buffer faults like Linux (hello458 D/E)" {
+    const us = kt.unix_socket_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "    so_error: i32 = 0,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "pub fn unixSetError(idx: u32, e: i32) void {") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, ".unix_socket => net_mod.unix_socket.unixSetError(d.unix_sock_idx, e),") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "const pending_u = net_mod.unix_socket.unixTakeError("));
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (stream_u and want != 0) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_opt_source, "if (unix_clear) |u| @import(\"unix_socket.zig\").unixClearErrorIfEqual(u, facts.so_error);") != null);
+    // hello458 F: a TCP connection keeps it as sk_err (read by SO_ERROR; a recv returns queued data first).
+    try std.testing.expect(std.mem.indexOf(u8, ss, ".tcp_socket => net_mod.tcp.tcpSetSoError(d.tcb_idx, e),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "pub fn tcpSetSoError(tcb_idx: u32, e: i32) void {") != null);
+}
+
+test "IPv6 fragment ids are random and non-zero (__ipv6_select_ident: get_random_u32_above(0); hello453 I)" {
+    const fs = kt.ip_frag_source;
+    try std.testing.expect(std.mem.indexOf(u8, fs, "var frag6_id") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fs, "@import(\"../drivers/random.zig\").getRandomBytes(@ptrCast(&id), 4);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fs, "if (id != 0) return id;") != null);
+}
+
+test "an IPPROTO_FRAGMENT raw socket sees each IPv6 piece before reassembly (raw6_local_deliver for every header; hello453 I)" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "_ = raw6.deliver6(44, data[fo .. payload_start6 + info6.payload_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass);\n                @import(\"ip_frag.zig\").receive6(") != null);
+}
