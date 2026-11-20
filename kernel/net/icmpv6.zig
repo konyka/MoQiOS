@@ -458,7 +458,8 @@ pub fn sendProto6(bound: [16]u8, dst: [16]u8, next_header: u8, csum_off: ?u32, m
 /// is off (ip6_make_flowlabel; the flow has no ports here).
 fn flowLabel6(ip: ipo.IpOpts, src: [16]u8, dst: [16]u8, nh: u8) ?u32 {
     if (ip.flow_ov6 != 0) return ip.flow_ov6;
-    if (!ip.autoflow6) return null;
+    const fp = @import("flowlabel_policy.zig");
+    if (!fp.labels(ip.autoflow6, fp.mode())) return null;
     return @import("udp.zig").autoFlowLabel(src, dst, 0, 0, nh);
 }
 

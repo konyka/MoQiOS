@@ -167,6 +167,10 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // Proxy ARP test: CAP_NET_ADMIN to set and remove proxy entries.
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_net_admin = true }, .initial_init = false };
     }
+    if (std.mem.eql(u8, name, "hello463")) {
+        // net.ipv6.auto_flowlabels: uid 1000 with CAP_NET_ADMIN opens the sysctl for writing (net_ctl_permissions).
+        return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_net_admin = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello387")) {
         // net.ipv4.conf.<dev>.route_localnet: uid 1000 with CAP_NET_ADMIN writes the sysctls (net_ctl_permissions).
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_net_admin = true }, .initial_init = false };

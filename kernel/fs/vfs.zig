@@ -1119,9 +1119,21 @@ fn sysctlWrite(desc: *FileDescriptor, buf: [*]const u8, count: usize, offset: u6
     const text = buf[0..count];
     return switch (desc.proc_file_type) {
         .ping_group_range => @import("../net/udp.zig").pingGroupWrite(text),
+        .auto_flowlabels => autoFlowlabelsWrite(text),
         .conf_file => @import("../net/arp.zig").confWrite(@import("../net/devconf_policy.zig").decode(desc.proc_pid), text),
         else => -1,
     };
+}
+
+/// net.ipv6.auto_flowlabels (proc_dou8vec_minmax, 0..3): a number in range is taken, anything else is EINVAL and changes nothing.
+fn autoFlowlabelsWrite(text: []const u8) i64 {
+    const fp = @import("../net/flowlabel_policy.zig");
+    const w = @import("../net/devconf_policy.zig").writeInt(text);
+    if (w.value) |v| {
+        if (v < 0 or v > fp.MAX) return -22;
+        fp.setMode(@intCast(v));
+    }
+    return w.ret;
 }
 
 /// `uid`/`euid` are the credentials of whoever set the owner (Linux sigio_perm checks them against each target).
@@ -1906,6 +1918,13 @@ pub const FdTable = struct {
                 pfile = .tcpstats;
             } else if (str.eql(rest, "randstats")) {
                 pfile = .randstats;
+            } else if (str.eql(rest, "sys/net/ipv6/auto_flowlabels")) {
+                // Mode 0644 owned by root, like ping_group_range.
+                if (is_writable and euid != 0 and !effective_caps.cap_net_admin) {
+                    self.freeFd(slot);
+                    return -13; // EACCES
+                }
+                pfile = .auto_flowlabels;
             } else if (str.eql(rest, "sys/net/ipv4/ping_group_range")) {
                 // Mode 0644 owned by root: opening it for writing needs fsuid 0 or CAP_NET_ADMIN, which net_ctl_permissions gives
                 // the owner's bits.

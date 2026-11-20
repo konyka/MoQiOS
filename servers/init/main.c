@@ -579,6 +579,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello460"); /* pidfd flags, PIDFD_SELF, poll readiness and waitid(P_PIDFD) */
     run_test("hello461"); /* IPV6_DONTFRAG refuses datagrams over the path MTU */
     run_test("hello462"); /* IPv6 flow labels: IPV6_FLOWINFO, IPV6_FLOWINFO_SEND */
+    run_test("hello463"); /* net.ipv6.auto_flowlabels */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

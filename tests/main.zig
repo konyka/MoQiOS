@@ -14278,7 +14278,7 @@ test "procfs: /proc/net, /proc/sys, /proc/sys/net and /proc/sys/net/ipv4 are dir
     try std.testing.expect(std.mem.indexOf(u8, pf, "const root_dirs = [_][]const u8{ \"net\", \"sys\" };") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".net_dir => &.{.{ .name = \"arp\", .dtype = DT_REG }},") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_dir => &.{.{ .name = \"net\", .dtype = DT_DIR }},") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_net_dir => &.{.{ .name = \"ipv4\", .dtype = DT_DIR }},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_net_dir => &.{ .{ .name = \"ipv4\", .dtype = DT_DIR }, .{ .name = \"ipv6\", .dtype = DT_DIR } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "return file == .root_dir or file == .pid_dir or file == .mount_dir or file == .fd_dir or isSubdir(file);") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "if (std.mem.eql(u8, body, \"sys/net/ipv4\")) return .sys_ipv4_dir;") != null);
@@ -17465,9 +17465,9 @@ test "automatic IPv6 flow labels: one per flow under a boot secret, off with IPV
     try std.testing.expect(l != fl.autoLabel(a, a, 5001, 4620, 17, k));
     const ipo = kt.ip_opt_policy;
     const o: ipo.IpOpts = .{};
-    try std.testing.expect(o.autoflow6);
+    try std.testing.expect(o.autoflow6 == null); // not set: net.ipv6.auto_flowlabels decides (hello463)
     const zero = [4]u8{ 0, 0, 0, 0 };
-    try std.testing.expect(!ipo.applySet(o, ipo.SOL_IPV6, ipo.IPV6_AUTOFLOWLABEL, &zero).ok.autoflow6);
+    try std.testing.expect(ipo.applySet(o, ipo.SOL_IPV6, ipo.IPV6_AUTOFLOWLABEL, &zero).ok.autoflow6 == false);
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "if (flowLabelFor(flow_ov, opts, our_ip, dst_ip, src_port, dst_port)) |fl| ip_opt_policy.setFlowLabel6(send_pkt[14..][0..40], fl);") != null);
 }
 
@@ -17481,5 +17481,18 @@ test "ping and raw IPv6 sends carry flow labels too (explicit or automatic), and
 }
 
 test "IPv6 TCP segments carry their connection's automatic flow label unless IPV6_AUTOFLOWLABEL is off (hello462 G)" {
-    try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "if (tcb.options.ip.autoflow6) ip_opt_policy.setFlowLabel6(send_pkt[14..][0..40], @import(\"udp.zig\").autoFlowLabel(our_ip, tcb.remote_ip6, tcb.local_port, tcb.remote_port, ipv6.PROTO_TCP));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "if (@import(\"flowlabel_policy.zig\").labels(tcb.options.ip.autoflow6, @import(\"flowlabel_policy.zig\").mode())) ip_opt_policy.setFlowLabel6(send_pkt[14..][0..40], @import(\"udp.zig\").autoFlowLabel(our_ip, tcb.remote_ip6, tcb.local_port, tcb.remote_port, ipv6.PROTO_TCP));") != null);
+}
+
+test "net.ipv6.auto_flowlabels: /proc/sys/net/ipv6/auto_flowlabels takes 0..3, and the mode decides with the socket's setting (hello463)" {
+    const fp = kt.flowlabel_policy;
+    try std.testing.expect(fp.labels(null, fp.OPTOUT));
+    try std.testing.expect(!fp.labels(null, fp.OPTIN));
+    try std.testing.expect(fp.labels(true, fp.OPTIN));
+    try std.testing.expect(fp.labels(false, fp.FORCED));
+    try std.testing.expect(!fp.labels(true, fp.OFF));
+    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".sys_ipv6_dir => &.{.{ .name = \"auto_flowlabels\", .dtype = DT_REG }},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "if (v < 0 or v > fp.MAX) return -22;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "} else if (str.eql(rest, \"sys/net/ipv6/auto_flowlabels\")) {") != null);
+    try std.testing.expect(kt.capability_profile.profileForLaunch("hello463", true, false).caps.cap_net_admin);
 }

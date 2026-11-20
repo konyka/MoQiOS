@@ -110,8 +110,8 @@ pub const IpOpts = struct {
     sndflow6: bool = false,
     /// IPV6_FLOWINFO (rxflow): received datagrams bring their flowinfo as a control message.
     rxflow6: bool = false,
-    /// IPV6_AUTOFLOWLABEL: packets without an explicit label get an automatic one (on by default, auto_flowlabels OPTOUT).
-    autoflow6: bool = true,
+    /// IPV6_AUTOFLOWLABEL as the socket set it, null while it has not (net.ipv6.auto_flowlabels decides: flowlabel_policy).
+    autoflow6: ?bool = null,
     /// One send's explicit IPv6 flow label (an IPV6_FLOWINFO control message), 0 for none: carried here so the shared ICMPv6 / raw
     /// send path sees it without another parameter. Never stored with the socket's options.
     flow_ov6: u32 = 0,
@@ -355,7 +355,7 @@ pub fn getValue(o: IpOpts, level: u64, optname: u64) ?i32 {
             IPV6_RECVPATHMTU => @intFromBool(o.rxpmtu6),
             IPV6_FLOWINFO_SEND => @intFromBool(o.sndflow6),
             IPV6_FLOWINFO => @intFromBool(o.rxflow6),
-            IPV6_AUTOFLOWLABEL => @intFromBool(o.autoflow6),
+            IPV6_AUTOFLOWLABEL => @intFromBool(@import("flowlabel_policy.zig").socketWants(o.autoflow6, @import("flowlabel_policy.zig").mode())),
             else => null,
         },
         else => null,

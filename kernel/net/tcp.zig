@@ -1662,7 +1662,7 @@ fn sendSegmentV6Seq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16
     // IPV6_UNICAST_HOPS / IPV6_TCLASS (applied before ECN, which owns the low two bits).
     if (ip_opt_policy.ipv6NeedsPatch(tcb.options.ip)) ip_opt_policy.patchIpv6(send_pkt[14..][0..40], tcb.options.ip);
     // ip6_make_flowlabel: every segment of the connection carries its flow's automatic label unless IPV6_AUTOFLOWLABEL is off.
-    if (tcb.options.ip.autoflow6) ip_opt_policy.setFlowLabel6(send_pkt[14..][0..40], @import("udp.zig").autoFlowLabel(our_ip, tcb.remote_ip6, tcb.local_port, tcb.remote_port, ipv6.PROTO_TCP));
+    if (@import("flowlabel_policy.zig").labels(tcb.options.ip.autoflow6, @import("flowlabel_policy.zig").mode())) ip_opt_policy.setFlowLabel6(send_pkt[14..][0..40], @import("udp.zig").autoFlowLabel(our_ip, tcb.remote_ip6, tcb.local_port, tcb.remote_port, ipv6.PROTO_TCP));
     // SK-131/143: ECT(1) for AccECN/L4S, else ECT(0) for classic ECN.
     if (tcb.ecn_ok and (flags & SYN) == 0) {
         if (tcb.accecn_ok) ipv6.setEct1(send_pkt[14..].ptr) else ipv6.setEct0(send_pkt[14..].ptr);

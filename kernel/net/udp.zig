@@ -1652,7 +1652,8 @@ var flow_secret_lock: IrqSpinlock = .{};
 /// The label a UDP packet carries: the explicit one, else the flow's automatic one (IPV6_AUTOFLOWLABEL on), else none.
 fn flowLabelFor(explicit: ?u32, opts: ip_opt_policy.IpOpts, src: [16]u8, dst: [16]u8, sport: u16, dport: u16) ?u32 {
     if (explicit) |l| return l;
-    if (!opts.autoflow6) return null;
+    const fp = @import("flowlabel_policy.zig");
+    if (!fp.labels(opts.autoflow6, fp.mode())) return null;
     return autoFlowLabel(src, dst, sport, dport, PROTO_UDP6);
 }
 

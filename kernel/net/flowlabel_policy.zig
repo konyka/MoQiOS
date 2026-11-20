@@ -7,6 +7,36 @@ const std = @import("std");
 
 pub const IPV6_AUTOFLOWLABEL: u64 = 70;
 
+/// net.ipv6.auto_flowlabels: 0 off, 1 opt-out (on unless a socket turns it off; the default), 2 opt-in (off unless a socket turns
+/// it on), 3 forced (on whatever the socket says).
+pub const OFF: u8 = 0;
+pub const OPTOUT: u8 = 1;
+pub const OPTIN: u8 = 2;
+pub const FORCED: u8 = 3;
+pub const MAX: u8 = FORCED;
+
+/// ip6_autoflowlabel: the socket's IPV6_AUTOFLOWLABEL when it set one, else the sysctl's default (on for OPTOUT and FORCED).
+/// The current net.ipv6.auto_flowlabels (written through /proc/sys/net/ipv6/auto_flowlabels).
+var auto_mode: u8 = OPTOUT;
+
+pub fn mode() u8 {
+    return @atomicLoad(u8, &auto_mode, .monotonic);
+}
+
+pub fn setMode(m: u8) void {
+    @atomicStore(u8, &auto_mode, m, .monotonic);
+}
+
+pub fn socketWants(sock: ?bool, m: u8) bool {
+    return sock orelse (m == OPTOUT or m == FORCED);
+}
+
+/// ip6_make_flowlabel: whether a packet without an explicit label gets an automatic one.
+pub fn labels(sock: ?bool, m: u8) bool {
+    if (m == OFF) return false;
+    return m == FORCED or socketWants(sock, m);
+}
+
 /// The 20-bit label of the flow `src` → `dst`, ports `sport` / `dport`, protocol `proto`, under `secret` (never 0 — a 0 label
 /// means "none").
 pub fn autoLabel(src: [16]u8, dst: [16]u8, sport: u16, dport: u16, proto: u8, secret: [16]u8) u32 {
@@ -23,6 +53,17 @@ pub fn autoLabel(src: [16]u8, dst: [16]u8, sport: u16, dport: u16, proto: u8, se
     const folded: u32 = @truncate(v ^ (v >> 32));
     const l = std.math.rotl(u32, folded, 16) & 0xFFFFF;
     return if (l == 0) 1 else l;
+}
+
+test "auto_flowlabels modes against the socket's IPV6_AUTOFLOWLABEL" {
+    try std.testing.expect(labels(null, OPTOUT));
+    try std.testing.expect(!labels(false, OPTOUT));
+    try std.testing.expect(!labels(null, OPTIN));
+    try std.testing.expect(labels(true, OPTIN));
+    try std.testing.expect(labels(false, FORCED));
+    try std.testing.expect(!labels(true, OFF));
+    try std.testing.expect(!socketWants(null, OPTIN));
+    try std.testing.expect(socketWants(null, FORCED));
 }
 
 test "a flow keeps its label; another flow gets another; never 0" {
