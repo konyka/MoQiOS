@@ -1061,6 +1061,8 @@ fn releaseLocked(port: u32) void {
                 port_refs[i] -= 1;
                 return;
             }
+            // fl6_free_socklist: the socket's flow label leases start lingering.
+            @import("flowlabel_mgr.zig").dropHolder(.{ .kind = .udp, .key = port });
             dropAllLocked(i);
             port_errq[i].clearWith(errq_alloc);
             num_ports -= 1;

@@ -4511,6 +4511,8 @@ pub fn tcpClose(tcb_idx: u32) i64 {
         return 0;
     }
     tcb.ref_count = 0;
+    // fl6_free_socklist (tcp_v6_destroy_sock via inet6_destroy_sock): the socket's flow label leases start lingering.
+    @import("flowlabel_mgr.zig").dropHolder(.{ .kind = .tcp, .key = tcb_idx });
 
     // Abortive close -- send RST, discard unsent data: SO_LINGER with linger=0, and also a connection that still holds received data
     // nobody read (Linux tcp_close, RFC 2525 2.17): the peer is told with a reset instead of an orderly FIN. Only a synchronised

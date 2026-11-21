@@ -343,6 +343,7 @@ pub const vfs_source = @embedFile("fs/vfs.zig");
 pub const fcntl_source = @embedFile("fs/fcntl.zig");
 pub const fcntl_policy = @import("fs/fcntl_policy.zig");
 pub const pipe_user_policy = @import("fs/pipe_user_policy.zig");
+pub const flowlabel_mgr = @import("net/flowlabel_mgr.zig");
 pub const random_policy = @import("drivers/random_policy.zig");
 pub const random_seed_policy = @import("drivers/random_seed_policy.zig");
 pub const random_source = @embedFile("drivers/random.zig");
@@ -384,6 +385,7 @@ test {
     _ = @import("fs/pipe_slot_policy.zig");
     _ = @import("fs/fcntl_policy.zig");
     _ = @import("fs/pipe_user_policy.zig");
+    _ = @import("net/flowlabel_mgr.zig");
     _ = @import("mm/fork_mark_policy.zig");
     _ = @import("net/udp_rmem_policy.zig");
     _ = @import("drivers/random_seed_policy.zig");

@@ -548,6 +548,72 @@ fn unknownLevel(ref: SockRef, v6: bool, get: bool) i64 {
     return ipo.unknownLevelErrno(kind, get);
 }
 
+fn flowHolder(ref: SockRef) @import("flowlabel_mgr.zig").Holder {
+    return switch (ref) {
+        .udp => |k| .{ .kind = .udp, .key = k },
+        .raw => |i| .{ .kind = .raw, .key = i },
+        .tcp => |i| .{ .kind = .tcp, .key = i },
+        .unix => .{},
+    };
+}
+
+/// setsockopt(IPV6_FLOWLABEL_MGR) (ipv6_flowlabel_opt): a struct in6_flowlabel_req; a GET that picked a label writes it back into
+/// flr_label (a fault there is ignored, as in Linux).
+fn setFlowlabelMgr(ref: SockRef, optval_ptr: u64, optlen: u64) i64 {
+    const flm = @import("flowlabel_mgr.zig");
+    if (optlen < flm.REQ_LEN) return -22;
+    if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;
+    const copy_mod = @import("../mm/copy_from_user.zig");
+    var b: [flm.REQ_LEN]u8 = undefined;
+    if (copy_mod.copyFromUser(&b, @ptrFromInt(optval_ptr), flm.REQ_LEN) != flm.REQ_LEN) return -14;
+    var r = flm.Req.parse(&b);
+    const asked = r.label;
+    const rc = flm.opt(flowHolder(ref), &r, ref == .tcp);
+    if (rc == 0 and r.action == flm.A_GET and asked == 0 and r.label != 0) {
+        var lb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &lb, r.label, .big);
+        _ = copy_mod.copyToUser(@ptrFromInt(optval_ptr + 16), &lb, 4);
+    }
+    return rc;
+}
+
+/// getsockopt(IPV6_FLOWLABEL_MGR): only action GET; the label the socket's connect took (np->flow_label) if the socket holds it,
+/// else ENOENT; optlen becomes 32.
+fn getFlowlabelMgr(ref: SockRef, optval_ptr: u64, optlen_ptr: u64) i64 {
+    const flm = @import("flowlabel_mgr.zig");
+    const copy_mod = @import("../mm/copy_from_user.zig");
+    if (optlen_ptr == 0 or optlen_ptr >= 0x0000_8000_0000_0000) return -14;
+    var lb: [4]u8 = undefined;
+    if (copy_mod.copyFromUser(&lb, @ptrFromInt(optlen_ptr), 4) != 4) return -14;
+    if (bo.readU32Le(&lb) < flm.REQ_LEN) return -22;
+    if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;
+    var b: [flm.REQ_LEN]u8 = undefined;
+    if (copy_mod.copyFromUser(&b, @ptrFromInt(optval_ptr), flm.REQ_LEN) != flm.REQ_LEN) return -14;
+    const q = flm.Req.parse(&b);
+    if (q.action != flm.A_GET) return -22;
+    if (q.flags & flm.F_REMOTE != 0) return -2;
+    const flow = if (ref == .udp) currentUdpFlow6(ref.udp) else 0;
+    switch (flm.optGet(flowHolder(ref), flow)) {
+        .err => |e| return e,
+        .ok => |out| {
+            out.write(&b);
+            bo.writeU32Le(&lb, flm.REQ_LEN);
+            if (copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &lb, 4) != 4) return -14;
+            if (copy_mod.copyToUser(@ptrFromInt(optval_ptr), &b, flm.REQ_LEN) != flm.REQ_LEN) return -14;
+            return 0;
+        },
+    }
+}
+
+/// The flow label a UDP socket with key `key` connected with (FileDescriptor.udp_flow6), looked up in the caller's descriptors.
+fn currentUdpFlow6(key: u32) u32 {
+    const t = @import("../proc/sched.zig").currentTask() orelse return 0;
+    for (&t.fd_table.fds) |*d| {
+        if (d.fd_type == .udp_socket and d.udpKey() == key) return d.udp_flow6;
+    }
+    return 0;
+}
+
 /// setsockopt at SOL_IP / SOL_IPV6: only IP sockets, and only the level that matches their family.
 fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u64, optlen: u64) i64 {
     const fam = socketFamily(ref, v6_hint) orelse return unknownLevel(ref, v6_hint, false);
@@ -581,6 +647,7 @@ fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
             .unix => unreachable,
         };
     }
+    if (level == ipo.SOL_IPV6 and optname == @import("flowlabel_mgr.zig").IPV6_FLOWLABEL_MGR) return setFlowlabelMgr(ref, optval_ptr, optlen);
     var raw: [16]u8 = undefined;
     const n = readOptval(optval_ptr, optlen, &raw);
     if (n < 0) return n;
@@ -702,6 +769,7 @@ fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
         const b = cmp.buildPktOptions(cmp.Wanted.of(po.ip), po.addr, po.ifindex, po.ttl, po.tos, bo.readU32Le(&lb), &buf);
         return copyOptOut(optval_ptr, optlen_ptr, buf[0..b.written]);
     }
+    if (level == ipo.SOL_IPV6 and optname == @import("flowlabel_mgr.zig").IPV6_FLOWLABEL_MGR) return getFlowlabelMgr(ref, optval_ptr, optlen_ptr);
     // IPV6_PATHMTU: struct ip6_mtuinfo with only the MTU of a connected socket's route filled in (the address stays zero, as
     // ipv6_getsockopt memsets it); an optlen under 32 bytes is EINVAL, no route (not connected) ENOTCONN.
     if (level == ipo.SOL_IPV6 and optname == ipo.IPV6_PATHMTU) {

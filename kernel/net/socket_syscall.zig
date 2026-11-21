@@ -1019,8 +1019,14 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
             } else if (t.fd_table.fds[fd].udp_connected) {
                 dst6 = t.fd_table.fds[fd].udp_dst_ip6;
                 dst_port6 = t.fd_table.fds[fd].udp_dst_port;
+                flow6 = t.fd_table.fds[fd].udp_flow6;
             } else {
                 return -89; // EDESTADDRREQ
+            }
+            // fl6_sock_lookup: once some label is exclusive, the label a send names must be one this socket holds (EINVAL).
+            if (sndFlow6(src_key, flow6)) |fl| {
+                const fl_rc = flowCheck6(src_key, fl);
+                if (fl_rc != 0) return fl_rc;
             }
             const oif6 = udp.sendOif6(src_key, dst6, scope6);
             const unreach6 = bind_addr_policy.routeErrno6(dst6, oif6);
@@ -1427,6 +1433,7 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
                 t.fd_table.fds[fd].udp_dst_ip = @splat(0);
                 t.fd_table.fds[fd].udp_dst_ip6 = @splat(0);
                 t.fd_table.fds[fd].udp_dst_port = 0;
+                t.fd_table.fds[fd].udp_flow6 = 0;
                 udp.disconnect(t.fd_table.fds[fd].udpKey());
                 return 0;
             },
@@ -1443,9 +1450,15 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
             if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN)
                 return -22;
             const parsed = sa.parseInet6(&sa6) orelse return -97;
+            // ip6_datagram_connect: with IPV6_FLOWINFO_SEND, sin6_flowinfo's label must be one the socket holds once some label is
+            // exclusive (fl6_sock_lookup, EINVAL); it becomes the socket's flow label (np->flow_label).
+            const cflow: u32 = if (sndFlow6(t.fd_table.fds[fd].udpKey(), parsed.flowinfo & 0xFFFFF)) |l| l else 0;
+            const fl_rc = flowCheck6(t.fd_table.fds[fd].udpKey(), cflow);
+            if (fl_rc != 0) return fl_rc;
             // A scoped peer ties the socket to its interface; the route is checked before the socket counts as connected.
             const dev_rc = udp.connectDev6(t.fd_table.fds[fd].udpKey(), parsed.addr, parsed.scope_id);
             if (dev_rc != 0) return dev_rc;
+            t.fd_table.fds[fd].udp_flow6 = cflow;
             t.fd_table.fds[fd].udp_connected = true;
             t.fd_table.fds[fd].udp_dst_ip6 = parsed.addr;
             t.fd_table.fds[fd].udp_dst_port = parsed.port;
@@ -2064,9 +2077,14 @@ fn udpSendBytesFull(fd: u32, payload: []const u8, full_len: usize, addr_ptr: u64
         const src6 = if (ov6.pktinfo and !std.mem.allEqual(u8, &ov6.src, 0)) ov6.src else d.udp_local_ip6;
         const unreach6 = bind_addr_policy.routeErrno6(dst6, oif6);
         if (unreach6 != 0) return unreach6;
-        // udpv6_sendmsg: with IPV6_FLOWINFO_SEND sin6_flowinfo gives the flow label; an IPV6_FLOWINFO control message replaces it
-        // (ip6_datagram_send_ctl). Without either the label stays 0 (auto_flowlabels is off for an unconnected socket here).
-        const flow: ?u32 = ov6.flowlabel orelse sndFlow6(src_key, sin6_flow);
+        // udpv6_sendmsg: with IPV6_FLOWINFO_SEND sin6_flowinfo gives the flow label (a connected socket's own, np->flow_label,
+        // without an address); an IPV6_FLOWINFO control message replaces it (ip6_datagram_send_ctl). Either must be a label the
+        // socket holds once some label is exclusive (fl6_sock_lookup, EINVAL). Without either the label stays 0.
+        const flow: ?u32 = ov6.flowlabel orelse (if (addr_ptr == 0 and d.udp_connected and d.udp_flow6 != 0) d.udp_flow6 else sndFlow6(src_key, sin6_flow));
+        if (flow) |fl| {
+            const fl_rc = flowCheck6(src_key, fl);
+            if (fl_rc != 0) return fl_rc;
+        }
         return if (udp.sendToV6FromSkb(src6, dst6, dst_port6, src_key, oif6, payload.ptr, @intCast(n6), ov6.hops, ov6.tclass, flow, .{ .mark = ov6.mark, .priority = ov6.priority })) @intCast(n6) else -1;
     }
     var dst_ip: [4]u8 = .{ 0, 0, 0, 0 };
@@ -2104,6 +2122,12 @@ fn udpSendBytesFull(fd: u32, payload: []const u8, full_len: usize, addr_ptr: u64
 /// under IPV6_PMTUDISC_DO or PROBE.
 fn udpOversize6(key: u32, dst: [16]u8, dst_port: u16, len: usize) ?i64 {
     return udpOversize6Df(key, dst, dst_port, len, null);
+}
+
+/// fl6_sock_lookup for UDP socket `key` and flow label `label`: 0, or EINVAL when some label is exclusive and the socket holds
+/// none such.
+fn flowCheck6(key: u32, label: u32) i64 {
+    return @import("flowlabel_mgr.zig").checkSend(.{ .kind = .udp, .key = key }, label);
 }
 
 /// The flow label a send's sin6_flowinfo gives (`label`, its low 20 bits) when the socket has IPV6_FLOWINFO_SEND, else null.

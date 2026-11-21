@@ -197,6 +197,7 @@ pub fn release(idx: u32) void {
     const s = &sockets[idx];
     while (s.head != null) popEntry(s);
     s.errq.clearWith(@import("udp.zig").errq_alloc);
+    @import("flowlabel_mgr.zig").dropHolder(.{ .kind = .raw, .key = idx });
     sockets[idx] = .{};
 }
 

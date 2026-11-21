@@ -1080,11 +1080,15 @@ pub fn asyncTag(desc: *const FileDescriptor) []const u8 {
 
 /// bind() moved a UDP socket from key `old` to key `new`: its O_ASYNC registrations follow it.
 pub fn udpFasyncRekey(old: u32, new: u32) void {
-    const f = fasync_lock.acquire();
-    defer fasync_lock.release(f);
-    for (&fasync_table) |*e| {
-        if (e.used and e.kind == .udp_socket and e.idx == old) e.idx = new;
+    {
+        const f = fasync_lock.acquire();
+        defer fasync_lock.release(f);
+        for (&fasync_table) |*e| {
+            if (e.used and e.kind == .udp_socket and e.idx == old) e.idx = new;
+        }
     }
+    // Its IPV6_FLOWLABEL_MGR leases follow it too.
+    @import("../net/flowlabel_mgr.zig").rekey(.{ .kind = .udp, .key = old }, .{ .kind = .udp, .key = new });
 }
 
 
@@ -1492,6 +1496,9 @@ pub const FileDescriptor = struct {
     /// The IPv6 address bind() gave the socket (Linux sk_v6_rcv_saddr), :: when unbound; IPv4 sockets leave it at the wildcard.
     udp_local_ip6: [16]u8 = @splat(0),
     udp_dst_port: u16 = 0,
+    /// The flow label connect() took from sin6_flowinfo with IPV6_FLOWINFO_SEND set (np->flow_label), 0 for none; a send on the
+    /// connected socket without an address uses it, and getsockopt(IPV6_FLOWLABEL_MGR) reports the label it names.
+    udp_flow6: u32 = 0,
     writable: bool = false,
     fd_flags: u32 = 0,
     status_flags: u32 = 0,

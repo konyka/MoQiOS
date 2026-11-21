@@ -17475,7 +17475,7 @@ test "IPv6 flow labels: IPV6_FLOWINFO control message, IPV6_FLOWINFO_SEND with s
     try std.testing.expectEqual(@as(i32, 11), std.mem.readInt(i32, out[12..16], .little));
     try std.testing.expectEqual(@as(u32, 0xabcde), std.mem.readInt(u32, out[16..20], .big));
     try std.testing.expectEqual(@as(usize, 0), c.build6(.{ .flowinfo = true }, .{}, 64, &out).written);
-    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "const flow: ?u32 = ov6.flowlabel orelse sndFlow6(src_key, sin6_flow);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "const flow: ?u32 = ov6.flowlabel orelse (if (addr_ptr == 0 and d.udp_connected and d.udp_flow6 != 0) d.udp_flow6 else sndFlow6(src_key, sin6_flow));") != null);
 }
 
 test "automatic IPv6 flow labels: one per flow under a boot secret, off with IPV6_AUTOFLOWLABEL 0 (ip6_make_flowlabel; hello462 E)" {
@@ -17865,4 +17865,26 @@ test "AF_UNIX records keep their own arrival time, stamped only when the receive
     try std.testing.expect(std.mem.indexOf(u8, us, "pushPendingStampsLocked(nsock, &dead.pending, n);") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "STAMP_RING") == null);
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, us, "freeStampsLocked(&unix_sockets[") + std.mem.count(u8, us, "freeStampsLocked(sock);"));
+}
+
+test "IPV6_FLOWLABEL_MGR: leases, share modes, and sends limited to held labels once one is exclusive (hello484)" {
+    // Linux net/ipv6/ip6_flowlabel.c: ipv6_flowlabel_get / put / renew, fl6_sock_lookup, fl6_free_socklist.
+    const flm = kt.flowlabel_mgr;
+    try std.testing.expectEqual(@as(u64, 32), flm.IPV6_FLOWLABEL_MGR);
+    try std.testing.expectEqual(@as(usize, 32), flm.REQ_LEN);
+    var s: flm.State = .{};
+    const a: flm.Holder = .{ .kind = .udp, .key = 7 };
+    var r: flm.Req = .{ .dst = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, .label = 0x22222, .action = flm.A_GET, .share = flm.S_EXCL, .flags = flm.F_CREATE, .linger = 6, .expires = 6 };
+    try std.testing.expectEqual(@as(i64, 0), s.opt(a, &r, .{}, false));
+    try std.testing.expectEqual(@as(i64, -22), s.checkSend(.{ .kind = .udp, .key = 8 }, 0x22222, 0));
+    try std.testing.expectEqual(@as(i64, 0), s.checkSend(a, 0x22222, 0));
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (level == ipo.SOL_IPV6 and optname == @import(\"flowlabel_mgr.zig\").IPV6_FLOWLABEL_MGR) return setFlowlabelMgr(ref, optval_ptr, optlen);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (level == ipo.SOL_IPV6 and optname == @import(\"flowlabel_mgr.zig\").IPV6_FLOWLABEL_MGR) return getFlowlabelMgr(ref, optval_ptr, optlen_ptr);") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const fl_rc = flowCheck6(t.fd_table.fds[fd].udpKey(), cflow);") != null);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, ss, "const fl_rc = flowCheck6("));
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "@import(\"flowlabel_mgr.zig\").dropHolder(.{ .kind = .udp, .key = port });") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "@import(\"flowlabel_mgr.zig\").dropHolder(.{ .kind = .tcp, .key = tcb_idx });") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "@import(\"../net/flowlabel_mgr.zig\").rekey(.{ .kind = .udp, .key = old }, .{ .kind = .udp, .key = new });") != null);
 }
