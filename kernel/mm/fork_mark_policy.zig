@@ -4,7 +4,8 @@
 //! ones zero-filled. Ranges with the same marks are merged; setting a mark on part of a range splits it.
 const std = @import("std");
 
-pub const MAX_RANGES: usize = 4;
+/// Separate runs one address space may mark (Linux bounds the vmas instead, vm.max_map_count); past it madvise is ENOMEM.
+pub const MAX_RANGES: usize = 32;
 pub const PAGE: u64 = 4096;
 
 pub const Marks = packed struct(u8) {

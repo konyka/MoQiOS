@@ -17841,3 +17841,15 @@ test "pipe-user-pages-soft/hard: pipes charge their pages to the creator's real 
     try std.testing.expect(std.mem.indexOf(u8, kt.fcntl_source, "if (vfs.pipeGrowRefused(t.fd_table.fds[fd].pipe_idx, @intCast(size), unprivileged)) return -1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "cur.fd_table.createPipe(.{ .uid = cur.uid, .cap_sys_resource = cur.effective_caps.cap_sys_resource, .cap_sys_admin = cur.effective_caps.cap_sys_admin });") != null);
 }
+
+test "MADV_DONTFORK / MADV_WIPEONFORK outside mmap regions hold 32 separate runs; GroupState still fits its page" {
+    // Linux bounds the vmas (vm.max_map_count, ENOMEM past it), not four runs. The table lives in GroupState, one page per Mm.
+    const fm = kt.fork_mark_policy;
+    try std.testing.expectEqual(@as(usize, 32), fm.MAX_RANGES);
+    var t: fm.Table = .{};
+    var i: u64 = 0;
+    while (i < 32) : (i += 1) try std.testing.expect(t.set(i * 2 * fm.PAGE, i * 2 * fm.PAGE + fm.PAGE, .dontfork, true));
+    try std.testing.expect(!t.set(64 * fm.PAGE, 65 * fm.PAGE, .dontfork, true));
+    try std.testing.expect(t.at(62 * fm.PAGE).dontfork);
+    try std.testing.expect(@sizeOf(kt.group_state.GroupState) <= 4096);
+}
