@@ -19,7 +19,9 @@ const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 /// UDP and ping sockets at once, named or not (Linux has no fixed limit; 256 sockets x 8 queued datagrams of 1.5 KiB is about 3 MiB).
 const MAX_PORTS = 256;
-const QUEUE_DEPTH = 8;
+/// Datagrams one socket may hold at once whatever their size: SO_RCVBUF (udp_rmem_policy) is the real bound, this only keeps a
+/// socket whose SO_RCVBUF was raised from taking all kernel memory with 1-byte datagrams.
+const QUEUE_MAX = 4096;
 /// IPv4 Ethernet MTU 1500 − 20 − 8.
 const MAX_UDP_PAYLOAD = 1472;
 /// IPv6 minimum MTU 1280 − 40 − 8.
@@ -69,6 +71,8 @@ const UdpEntry = struct {
     order: u64 = 0,
     valid: bool,
     is_v6: bool,
+    /// The next datagram of the same socket (its queue is a list of kmalloc'd entries, oldest first).
+    next: ?*UdpEntry = null,
     /// Interface, header destination, TTL and TOS of an IPv4 datagram (IP_PKTINFO / IP_RECVTTL / IP_RECVTOS).
     meta: ip_cmsg_policy.RecvInfo = .{},
     /// The same for an IPv6 datagram (IPV6_RECVPKTINFO / IPV6_RECVHOPLIMIT / IPV6_RECVTCLASS).
@@ -91,15 +95,14 @@ var port_ping: [MAX_PORTS]bool = @splat(false);
 /// Cross-process references per registered port (fork/clone fd-table copy) —
 /// releasePort frees the slot only when the count reaches 0.
 var port_refs: [MAX_PORTS]u16 = @splat(0);
-var queues: [MAX_PORTS][QUEUE_DEPTH]UdpEntry = @splat(@splat(.{
-    .src_ip = @splat(0),
-    .src_port = 0,
-    .dst_port = 0,
-    .data_len = 0,
-    .data = @splat(0),
-    .valid = false,
-    .is_v6 = false,
-}));
+/// Each socket's receive queue (sk_receive_queue): kmalloc'd entries, oldest first, and how many and how much (rmem) they hold.
+const Queue = struct {
+    head: ?*UdpEntry = null,
+    tail: ?*UdpEntry = null,
+    count: u32 = 0,
+    rmem: u32 = 0,
+};
+var queues: [MAX_PORTS]Queue = @splat(.{});
 var num_ports: u16 = 0;
 var udp_lock: IrqSpinlock = .{};
 
@@ -112,43 +115,48 @@ var rx_seq: u64 = 0;
 /// Which queued datagrams a reader looks at.
 const Fam = enum { any, v4, v6 };
 
-/// The oldest valid entry of slot `port_idx` of family `fam` (udp_lock held), or null.
+/// The oldest queued datagram of slot `port_idx` of family `fam` (udp_lock held), or null.
 fn oldestLocked(port_idx: usize, fam: Fam) ?*UdpEntry {
-    var best: ?*UdpEntry = null;
-    for (&queues[port_idx]) |*e| {
-        if (!e.valid) continue;
+    var it = queues[port_idx].head;
+    while (it) |e| : (it = e.next) {
         if (fam == .v4 and e.is_v6) continue;
         if (fam == .v6 and !e.is_v6) continue;
-        if (best == null or e.order < best.?.order) best = e;
+        return e;
     }
-    return best;
+    return null;
 }
 
-fn fillEntryLocked(port_idx: usize, e: *UdpEntry, payload: []const u8) bool {
+/// A new entry at the tail of slot `port_idx`'s queue holding `payload` (udp_lock held): in `data` when it fits, else in a big buffer
+/// of its own. Null when the socket's receive buffer has no room for it (__udp_enqueue_schedule_skb: rmem + truesize past SO_RCVBUF,
+/// unless the queue is empty) or no memory is to be had: the datagram is dropped, as Linux drops it. The caller fills in the rest.
+fn newEntryLocked(port_idx: usize, payload: []const u8) ?*UdpEntry {
     const rp = @import("udp_rmem_policy.zig");
-    if (!rp.admits(queueRmemLocked(port_idx), rp.truesize(payload.len), port_opts[port_idx].rcvbuf)) return false;
+    const q = &queues[port_idx];
+    const size = rp.truesize(payload.len);
+    if (!rp.admits(q.rmem, size, port_opts[port_idx].rcvbuf) or q.count >= QUEUE_MAX) return null;
+    if (payload.len > BIG_BUF_LEN) return null;
+    const slab = @import("../mm/slab.zig");
+    const raw = slab.kmalloc(@sizeOf(UdpEntry)) orelse return null;
+    const e: *UdpEntry = @ptrCast(@alignCast(raw));
+    e.* = .{ .src_ip = @splat(0), .src_port = 0, .dst_port = 0, .data_len = 0, .data = undefined, .valid = true, .is_v6 = false };
     if (payload.len <= MAX_UDP_PAYLOAD) {
-        e.big = null;
         @memcpy(e.data[0..payload.len], payload);
     } else {
-        if (payload.len > BIG_BUF_LEN) return false;
-        const b = allocBig(payload.len) orelse return false;
+        const b = allocBig(payload.len) orelse {
+            slab.kfree(e);
+            return null;
+        };
         e.big = b;
         @memcpy(b.bytes()[0..payload.len], payload);
     }
     e.data_len = @intCast(payload.len);
     rx_seq += 1;
     e.order = rx_seq;
-    return true;
-}
-
-/// sk_rmem_alloc of the socket in slot `port_idx`: what its queued datagrams cost (udp_lock held).
-fn queueRmemLocked(port_idx: usize) u32 {
-    var sum: u32 = 0;
-    for (&queues[port_idx]) |*q| {
-        if (q.valid) sum +|= @import("udp_rmem_policy.zig").truesize(q.data_len);
-    }
-    return sum;
+    if (q.tail) |t| t.next = e else q.head = e;
+    q.tail = e;
+    q.count += 1;
+    q.rmem +|= size;
+    return e;
 }
 
 /// The bytes of a queued entry (udp_lock held).
@@ -157,13 +165,36 @@ fn entryBytes(e: *const UdpEntry) []const u8 {
     return e.data[0..e.data_len];
 }
 
-/// Drop a queued entry, giving back its big buffer (udp_lock held).
-fn dropEntryLocked(e: *UdpEntry) void {
+/// Take entry `e` off slot `port_idx`'s queue and free it with its big buffer (udp_lock held). A big buffer a peek is copying out
+/// is left to releaseBig.
+fn dropEntryLocked(port_idx: usize, e: *UdpEntry) void {
+    unlinkLocked(port_idx, e);
     if (e.big) |b| {
         if (b.pinned != 0) b.orphan = true else freeBig(b);
     }
-    e.big = null;
-    e.valid = false;
+    @import("../mm/slab.zig").kfree(e);
+}
+
+/// Unlink `e` from slot `port_idx`'s queue (udp_lock held), uncharging it.
+fn unlinkLocked(port_idx: usize, e: *UdpEntry) void {
+    const q = &queues[port_idx];
+    var prev: ?*UdpEntry = null;
+    var it = q.head;
+    while (it) |x| : (it = x.next) {
+        if (x == e) break;
+        prev = x;
+    } else return;
+    if (prev) |p| p.next = e.next else q.head = e.next;
+    if (q.tail == e) q.tail = prev;
+    e.next = null;
+    q.count -= 1;
+    q.rmem -|= @import("udp_rmem_policy.zig").truesize(e.data_len);
+}
+
+/// Drop every datagram queued on slot `port_idx` (udp_lock held).
+fn dropAllLocked(port_idx: usize) void {
+    while (queues[port_idx].head) |e| dropEntryLocked(port_idx, e);
+    queues[port_idx] = .{};
 }
 /// SOL_SOCKET options per registered port (travels with the port slot).
 var port_opts: [MAX_PORTS]@import("sockopt_policy.zig").Stored = @splat(.{});
@@ -670,7 +701,7 @@ fn newSlotLocked(key: u32, is_v6: bool, uid: u32) u16 {
     port_dev6[idx] = 0;
     port_named[idx] = true;
     port_user_port[idx] = false;
-    for (0..QUEUE_DEPTH) |j| dropEntryLocked(&queues[idx][j]);
+    dropAllLocked(idx);
     num_ports += 1;
     return @intCast(idx);
 }
@@ -782,22 +813,12 @@ pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8, me
         const pick = pp.pickReceiver(holders[0..n], src_ip, dst_ip) orelse break :blk;
         {
             const i = slots[pick];
-            for (0..QUEUE_DEPTH) |j| {
-                const e = &queues[i][j];
-                if (e.valid) continue;
-                // A reply to a fragmented request is reassembled before it gets here: one longer than a frame takes a big buffer
-                // (none free: it is dropped, as a full queue drops it).
-                if (!fillEntryLocked(i, e, msg)) break;
-                e.src_ip = @splat(0);
+            // A reply to a fragmented request is reassembled before it gets here: one longer than a frame takes a big buffer.
+            if (newEntryLocked(i, msg)) |e| {
                 @memcpy(e.src_ip[0..4], &src_ip);
-                e.src_port = 0;
                 e.dst_port = ident;
-                e.is_v6 = false;
                 e.meta = meta;
-                e.meta6 = .{};
-                e.valid = true;
                 notify_key = ports[i];
-                break;
             }
         }
     }
@@ -826,20 +847,13 @@ pub fn deliverPing6(ident: u16, src_ip: [16]u8, dst_ip: [16]u8, msg: []const u8,
         }
         const pick = pp.pickReceiver6(holders[0..n], dst_ip) orelse break :blk;
         const i = slots[pick];
-        for (0..QUEUE_DEPTH) |j| {
-            const e = &queues[i][j];
-            if (e.valid) continue;
-            // A reply longer than a frame (reassembled) takes a big buffer, or is dropped when none is free.
-            if (!fillEntryLocked(i, e, msg)) break;
+        // A reply longer than a frame (reassembled) takes a big buffer.
+        if (newEntryLocked(i, msg)) |e| {
             e.src_ip = src_ip;
-            e.src_port = 0;
             e.dst_port = ident;
             e.is_v6 = true;
-            e.meta = .{};
             e.meta6 = meta6;
-            e.valid = true;
             notify_key = ports[i];
-            break;
         }
     }
     if (notify_key == 0) return;
@@ -1031,7 +1045,7 @@ fn releaseLocked(port: u32) void {
                 port_refs[i] -= 1;
                 return;
             }
-            for (0..QUEUE_DEPTH) |j| dropEntryLocked(&queues[i][j]);
+            dropAllLocked(i);
             num_ports -= 1;
             ports[i] = ports[num_ports];
             port_refs[i] = port_refs[num_ports];
@@ -1068,12 +1082,8 @@ fn releaseLocked(port: u32) void {
             queues[i] = queues[num_ports];
             ports[num_ports] = 0;
             port_refs[num_ports] = 0;
-            // Invalidate the vacated tail so a future registration on that
-            // slot never delivers stale datagrams to a new owner.
-            for (0..QUEUE_DEPTH) |j| {
-                queues[num_ports][j].valid = false;
-                queues[num_ports][j].big = null;
-            }
+            // The vacated tail's queue moved with it: a future registration on that slot starts empty.
+            queues[num_ports] = .{};
             return;
         }
     }
@@ -1092,10 +1102,7 @@ pub fn hasQueuedDatagram(port: u32) bool {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const port_idx = findPortIdxLocked(port) orelse return false;
-    for (0..QUEUE_DEPTH) |i| {
-        if (queues[port_idx][i].valid) return true;
-    }
-    return false;
+    return queues[port_idx].head != null;
 }
 
 /// Length of the datagram the next recvFromEx/recvFromV6Ex on `port` would
@@ -1164,22 +1171,16 @@ fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, dst_ip: [4]u
         // A connected socket whose peer is not this sender has no claim; one connected to it wins (see pickReceiverConnected).
         const pick = policy.pickReceiverConnected(info[0..n], src_ip, src_port) orelse break :blk false;
         const port_idx = cand[pick];
-        for (0..QUEUE_DEPTH) |i| {
-            if (!queues[port_idx][i].valid) {
-                if (!fillEntryLocked(port_idx, &queues[port_idx][i], payload)) break :blk false;
-                queues[port_idx][i].src_ip = src_ip;
-                queues[port_idx][i].src_port = src_port;
-                queues[port_idx][i].dst_port = dst_port;
-                queues[port_idx][i].is_v6 = is_v6;
-                queues[port_idx][i].meta = stamped(meta, dst_port);
-                queues[port_idx][i].meta6 = stamped6(meta6, dst_port);
-                queues[port_idx][i].valid = true;
-                notify_key = ports[port_idx];
-                break :blk true;
-            }
-        }
-        // Queue full - packet dropped (no accounting yet)
-        break :blk false;
+        // No room under SO_RCVBUF (or no memory): the datagram is dropped.
+        const e = newEntryLocked(port_idx, payload) orelse break :blk false;
+        e.src_ip = src_ip;
+        e.src_port = src_port;
+        e.dst_port = dst_port;
+        e.is_v6 = is_v6;
+        e.meta = stamped(meta, dst_port);
+        e.meta6 = stamped6(meta6, dst_port);
+        notify_key = ports[port_idx];
+        break :blk true;
     };
     if (!was_inserted) return claimed;
     // The datagram arrival is the readiness edge: without this notify, an
@@ -1209,20 +1210,14 @@ fn enqueueMcast(port: u16, src_ip: [16]u8, src_port: u16, group: [16]u8, payload
             if (portNumber(ports[i]) != port or !port_v6[i]) continue;
             if (!mcast.socketMatches(port_local_ip6[i], group, port_peer[i], port_peer_ip[i], src_ip, src_port, port_dev6[i], ifindex)) continue;
             if (!mcast.socketAccepts(&port_mc[i], port_opts[i].ip.mc_all, group)) continue;
-            for (0..QUEUE_DEPTH) |j| {
-                const e = &queues[i][j];
-                if (e.valid) continue;
-                if (!fillEntryLocked(i, e, payload)) break;
+            if (newEntryLocked(i, payload)) |e| {
                 e.src_ip = src_ip;
                 e.src_port = src_port;
                 e.dst_port = port;
                 e.is_v6 = true;
-                e.meta = .{};
                 e.meta6 = stamped6(meta6, port);
-                e.valid = true;
                 keys[n] = ports[i];
                 n += 1;
-                break;
             }
         }
     }
@@ -1247,19 +1242,13 @@ fn enqueueMcast4(port: u16, src_ip: [16]u8, src_port: u16, group: [4]u8, payload
             if (portNumber(ports[i]) != port or port_v6[i]) continue;
             if (!mcast.socketMatches4(port_local_ip[i], group, port_peer[i], port_peer_ip[i], src_ip[0..4].*, src_port)) continue;
             if (!mcast.socketAccepts4(&port_mc4[i], port_opts[i].ip.mc4_all, group, ifindex)) continue;
-            for (0..QUEUE_DEPTH) |j| {
-                const e = &queues[i][j];
-                if (e.valid) continue;
+            if (newEntryLocked(i, payload)) |e| {
                 e.src_ip = src_ip;
-                if (!fillEntryLocked(i, e, payload)) break;
                 e.src_port = src_port;
                 e.dst_port = port;
-                e.is_v6 = false;
                 e.meta = stamped(meta, port);
-                e.valid = true;
                 keys[n] = ports[i];
                 n += 1;
-                break;
             }
         }
     }
@@ -1425,7 +1414,7 @@ pub fn recvFromMeta(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8,
     out_src_port.* = entry.src_port;
     out_full_len.* = entry.data_len;
     out_meta.* = entry.meta;
-    if (!peek) dropEntryLocked(entry);
+    if (!peek) dropEntryLocked(port_idx, entry);
     return n;
 }
 
@@ -1451,11 +1440,10 @@ pub fn takeBig(port: u32, out_src_ip: *[4]u8, out_src_port: *u16, peek: bool, ou
         } else {
             // The buffer leaves the entry; releaseBig frees it.
             entry.big = null;
-            entry.valid = false;
+            dropEntryLocked(port_idx, entry);
         }
         return t;
     }
-    return null;
 }
 
 /// takeBig for the next IPv6 datagram on `port`.
@@ -1474,11 +1462,10 @@ pub fn takeBig6(port: u32, out_src_ip: *[16]u8, out_src_port: *u16, peek: bool, 
             b.pinned += 1;
         } else {
             entry.big = null;
-            entry.valid = false;
+            dropEntryLocked(port_idx, entry);
         }
         return t;
     }
-    return null;
 }
 
 /// The bytes of a taken big datagram (stable until releaseBig).
@@ -1522,7 +1509,7 @@ pub fn recvFromV6Meta(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[16]
         out_src_port.* = entry.src_port;
         out_full_len.* = entry.data_len;
         out_meta6.* = entry.meta6;
-        if (!peek) dropEntryLocked(entry);
+        if (!peek) dropEntryLocked(port_idx, entry);
         return n;
     }
     return 0;

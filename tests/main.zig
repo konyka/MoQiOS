@@ -17162,7 +17162,7 @@ test "a TCP connect an ICMP error ends with IP_RECVERR queues it for MSG_ERRQUEU
 test "IPv4 reassembly is wired in: fragments go to ip_frag, big datagrams to a UDP big buffer (hello451)" {
     try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "if (@import(\"ip_frag.zig\").isFragment(data + 14, len - 14)) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "pub fn takeBig(port: u32,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "if (!fillEntryLocked(port_idx, &queues[port_idx][i], payload)) break :blk false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "const e = newEntryLocked(port_idx, payload) orelse break :blk false;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "const big = udp.takeBig(sock_key, &src_ip, &src_port_out, msg_peek, &big_meta);") != null);
 }
 
@@ -17217,7 +17217,7 @@ test "IPv4 raw and ping sends past the MTU are fragmented unless IP_MTU_DISCOVER
     try std.testing.expect(std.mem.indexOf(u8, kt.raw_icmp_source, "const ok = @import(\"ip_frag.zig\").send4(hdr, built[0..optlen], msg, mtu, dst_mac, our_mac, via_lo, wait_hop);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "return if (@import(\"ip_frag.zig\").send4(hdr, built[0..optlen], msg, mtu, dst_mac, our_mac, via_lo, wait_hop)) 0 else -105;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "sendBigEchoReply(data[0..len], dst_ip, src_ip, our_mac, dst_mac, via_lo, meta.tos, mtu, &.{});") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "if (!fillEntryLocked(i, e, msg)) break;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "if (newEntryLocked(i, msg)) |e| {") != null);
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello454", true, false).caps.cap_net_raw);
 }
 
@@ -17242,7 +17242,7 @@ test "IPv6 raw and ping sends past the MTU leave behind Fragment headers; big ec
     try std.testing.expect(std.mem.indexOf(u8, kt.icmpv6_source, "    var pkt: [1500]u8 = undefined;\n    const eth_len: u16 = 14;") == null);
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "const id = @import(\"ip_frag.zig\").nextId6();") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "var frag6_id") == null);
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.udp_source, "if (!fillEntryLocked(i, e, msg)) break;"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.udp_source, "if (newEntryLocked(i, msg)) |e| {"));
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello455", true, false).caps.cap_net_raw);
 }
 
@@ -17688,7 +17688,7 @@ test "big UDP and raw datagrams take kmalloc buffers bounded by SO_RCVBUF; reass
     try std.testing.expect(!rp.admits(rp.truesize(60000), rp.truesize(60000), 212992 - rp.truesize(60000) + 1));
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "var big_bufs") == null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "if (!rp.admits(queueRmemLocked(port_idx), rp.truesize(payload.len), port_opts[port_idx].rcvbuf)) return false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (!rp.admits(q.rmem, size, port_opts[port_idx].rcvbuf) or q.count >= QUEUE_MAX) return null;") != null);
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "var big_bufs") == null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, rs, "if (!@import(\"udp_rmem_policy.zig\").rawAdmits(queueRmem(s), s.opts.rcvbuf)) continue;"));
@@ -17727,6 +17727,19 @@ test "SO_RCVMARK and SO_RCVPRIORITY: recvmsg reports the datagram's mark and pri
 test "a UDP socket's datagrams come out in arrival order whichever queue slot each took (hello473)" {
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "fn oldestLocked(port_idx: usize, fam: Fam) ?*UdpEntry {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "    rx_seq += 1;\n    e.order = rx_seq;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    if (q.tail) |t| t.next = e else q.head = e;\n    q.tail = e;\n") != null);
     try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, us, "oldestLocked(port_idx, "));
+}
+
+test "a UDP socket queues as many datagrams as SO_RCVBUF holds, not a fixed 8 (hello474)" {
+    const rp = kt.udp_rmem_policy;
+    var rmem: u32 = 0;
+    var n: usize = 0;
+    while (rp.admits(rmem, rp.truesize(1), 212992)) : (n += 1) rmem += rp.truesize(1);
+    try std.testing.expectEqual(@as(usize, 221), n);
+    rmem = 0;
+    n = 0;
+    while (rp.admits(rmem, rp.truesize(1472), 212992)) : (n += 1) rmem += rp.truesize(1472);
+    try std.testing.expectEqual(@as(usize, 92), n);
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "const QUEUE_DEPTH") == null);
 }

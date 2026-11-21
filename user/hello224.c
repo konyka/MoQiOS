@@ -135,6 +135,13 @@ void _start(void) {
     read_stats(&s2, raw, sizeof raw);
     check(s2.queued - s1.queued == 5 && s2.delivered - s1.delivered == 5 && s2.dropped == s1.dropped, "B: five sends, each pumped: queued +5, delivered +5, dropped +0");
 
+    /* B's five datagrams are still queued on the receiver (a UDP socket keeps as many as SO_RCVBUF holds): read them first, so C
+     * counts only its own. */
+    {
+        char tmp[16];
+        for (int i = 0; i < 16; i++)
+            if (syscall6(SYS_RECVFROM, (uint64_t)rx, (uint64_t)tmp, sizeof tmp, 0x40 /* MSG_DONTWAIT */, 0, 0) <= 0) break;
+    }
     /* C: more sends than the queue has slots without pumping in between: the queue fills and refuses frames */
     syscall1(SYS_NETPOLL, 0);
     read_stats(&s1, raw, sizeof raw);
