@@ -34,6 +34,9 @@ pub const ProcFile = enum(u8) {
     ping_group_range,
     /// /proc/sys/net/ipv6/auto_flowlabels: 0..3 (flowlabel_policy), root may write it (mode 0644).
     auto_flowlabels,
+    /// /proc/sys/fs/pipe-max-size: the largest pipe an unprivileged F_SETPIPE_SZ may ask for (fcntl_policy), root may write it.
+    pipe_max_size,
+    sys_fs_dir,
     /// /proc/sys/net/ipv6 (a directory).
     sys_ipv6_dir,
     /// /proc/sys/net/ipv4/conf/<dev>/{proxy_arp,route_localnet}: a device's setting, an int (arp.confRead); the device and the
@@ -68,12 +71,12 @@ pub fn isDir(file: ProcFile) bool {
 
 /// One of the fixed directories below /proc (net, sys and the sys tree).
 pub fn isSubdir(file: ProcFile) bool {
-    return file == .net_dir or file == .sys_dir or file == .sys_net_dir or file == .sys_ipv4_dir or file == .sys_ipv6_dir or file == .sys_conf_dir or file == .conf_dev_dir;
+    return file == .net_dir or file == .sys_dir or file == .sys_net_dir or file == .sys_ipv4_dir or file == .sys_ipv6_dir or file == .sys_conf_dir or file == .conf_dev_dir or file == .sys_fs_dir;
 }
 
 /// A /proc/sys file (proc_sys_call_handler): a read past offset 0 returns nothing, and so does a write there (sysctl_writes_strict).
 pub fn isSysctl(file: ProcFile) bool {
-    return file == .ping_group_range or file == .conf_file or file == .auto_flowlabels;
+    return file == .ping_group_range or file == .conf_file or file == .auto_flowlabels or file == .pipe_max_size;
 }
 
 /// The fixed directory a path below /proc names ("net", "sys/net/", ...), or null.
@@ -85,6 +88,7 @@ pub fn subdirByPath(rest: []const u8) ?ProcFile {
     if (std.mem.eql(u8, body, "sys/net")) return .sys_net_dir;
     if (std.mem.eql(u8, body, "sys/net/ipv4")) return .sys_ipv4_dir;
     if (std.mem.eql(u8, body, "sys/net/ipv6")) return .sys_ipv6_dir;
+    if (std.mem.eql(u8, body, "sys/fs")) return .sys_fs_dir;
     return null;
 }
 
@@ -101,7 +105,8 @@ const conf_devs = [_]SubEntry{
 fn subdirChildren(dir: ProcFile) []const SubEntry {
     return switch (dir) {
         .net_dir => &.{.{ .name = "arp", .dtype = DT_REG }},
-        .sys_dir => &.{.{ .name = "net", .dtype = DT_DIR }},
+        .sys_dir => &.{ .{ .name = "fs", .dtype = DT_DIR }, .{ .name = "net", .dtype = DT_DIR } },
+        .sys_fs_dir => &.{.{ .name = "pipe-max-size", .dtype = DT_REG }},
         .sys_net_dir => &.{ .{ .name = "ipv4", .dtype = DT_DIR }, .{ .name = "ipv6", .dtype = DT_DIR } },
         .sys_ipv6_dir => &.{.{ .name = "auto_flowlabels", .dtype = DT_REG }},
         .sys_ipv4_dir => &.{ .{ .name = "conf", .dtype = DT_DIR }, .{ .name = "ping_group_range", .dtype = DT_REG } },
@@ -261,7 +266,11 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
         .ping_group_range => @intCast(@import("../net/udp.zig").pingGroupRead(buf[0..@min(max_len, 32)])),
         .conf_file => @intCast(@import("../net/arp.zig").confRead(@import("../net/devconf_policy.zig").decode(pid), buf[0..@min(max_len, 16)])),
         .net_arp => @intCast(@import("../net/arp.zig").formatProc(buf[0..max_len])),
-        .root_dir, .pid_dir, .mount_dir, .fd_dir, .net_dir, .sys_dir, .sys_net_dir, .sys_ipv4_dir, .sys_ipv6_dir, .sys_conf_dir, .conf_dev_dir => 0,
+        .root_dir, .pid_dir, .mount_dir, .fd_dir, .net_dir, .sys_dir, .sys_net_dir, .sys_ipv4_dir, .sys_ipv6_dir, .sys_conf_dir, .conf_dev_dir, .sys_fs_dir => 0,
+        .pipe_max_size => blk: {
+            const st = std.fmt.bufPrint(buf[0..@min(max_len, 16)], "{d}\n", .{@import("fcntl_policy.zig").pipeMaxSize()}) catch break :blk 0;
+            break :blk @intCast(st.len);
+        },
         .auto_flowlabels => @intCast(@import("../net/devconf_policy.zig").formatInt(buf[0..@min(max_len, 16)], @import("../net/flowlabel_policy.zig").mode())),
     };
 }

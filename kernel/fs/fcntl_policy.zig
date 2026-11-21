@@ -69,8 +69,91 @@ fn eql(a: []const u8, b: []const u8) bool {
 
 /// The smallest pipe size (one page): F_SETPIPE_SZ rounds a smaller request up to it. A new pipe has 16 pages (vfs.PIPE_DEFAULT_SIZE).
 pub const PIPE_SIZE: u32 = 4096;
-/// /proc/sys/fs/pipe-max-size: the most an unprivileged F_SETPIPE_SZ may grow a pipe to.
+/// /proc/sys/fs/pipe-max-size: the most an unprivileged F_SETPIPE_SZ may grow a pipe to (1 MiB at boot); `pipeMaxSize` reads
+/// the current value, `parsePipeMaxSize` checks a sysctl write and `setPipeMaxSize` stores it.
 pub const PIPE_MAX_SIZE: u64 = 1 << 20;
+var pipe_max_size: u64 = PIPE_MAX_SIZE;
+
+pub fn pipeMaxSize() u64 {
+    return @atomicLoad(u64, &pipe_max_size, .acquire);
+}
+
+/// A write of fs.pipe-max-size (proc_dopipe_max_size: proc_douintvec with round_pipe_size and a minimum of 1): leading blanks, a
+/// base-0 unsigned number up to UINT_MAX, then a blank or the end. The value is rounded like F_SETPIPE_SZ's argument; one over 2^31
+/// rounds to 0, which is below the minimum (ERANGE). A negative number or bad text is EINVAL. Returns the bytes taken and the value.
+pub const MaxSizeWrite = struct { ret: i64, value: ?u64 = null };
+
+pub fn parsePipeMaxSize(text: []const u8) MaxSizeWrite {
+    if (text.len == 0) return .{ .ret = 0 };
+    var i: usize = 0;
+    while (i < text.len and isBlank(text[i])) i += 1;
+    if (i >= text.len) return .{ .ret = -22 };
+    if (text[i] == '-') return .{ .ret = -22 };
+    var base: u64 = 10;
+    if (text[i] == '0' and i + 1 < text.len and (text[i + 1] == 'x' or text[i + 1] == 'X')) {
+        base = 16;
+        i += 2;
+    } else if (text[i] == '0' and i + 1 < text.len and std.ascii.isDigit(text[i + 1])) {
+        base = 8;
+        i += 1;
+    }
+    const start = i;
+    var v: u64 = 0;
+    while (i < text.len) : (i += 1) {
+        const d: u64 = switch (text[i]) {
+            '0'...'9' => text[i] - '0',
+            'a'...'f' => text[i] - 'a' + 10,
+            'A'...'F' => text[i] - 'A' + 10,
+            else => break,
+        };
+        if (d >= base) break;
+        v = v * base + d;
+        if (v > std.math.maxInt(u32)) return .{ .ret = -22 };
+    }
+    if (i == start and base != 8) return .{ .ret = -22 };
+    if (i < text.len and !isBlank(text[i])) return .{ .ret = -22 };
+    while (i < text.len and isBlank(text[i])) i += 1;
+    const rounded = roundPipeSize(v) orelse 0;
+    if (rounded < 1) return .{ .ret = -34 }; // ERANGE
+    return .{ .ret = @intCast(i), .value = rounded };
+}
+
+pub fn setPipeMaxSize(v: u64) void {
+    @atomicStore(u64, &pipe_max_size, v, .release);
+}
+
+/// alloc_pipe_info: a new pipe gets `default_size` bytes, or pipe-max-size's worth of pages when that is smaller and the caller lacks
+/// CAP_SYS_RESOURCE.
+pub fn newPipeSize(default_size: u32, cap_sys_resource: bool) u32 {
+    const max = pipeMaxSize();
+    if (default_size > max and !cap_sys_resource) return @intCast(max);
+    return default_size;
+}
+
+fn isBlank(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n';
+}
+
+test "pipe-max-size writes round like F_SETPIPE_SZ; past 2^31 is ERANGE, negatives and junk EINVAL" {
+    try std.testing.expectEqual(@as(?u64, 131072), parsePipeMaxSize("100000\n").value);
+    try std.testing.expectEqual(@as(?u64, 4096), parsePipeMaxSize("1").value);
+    try std.testing.expectEqual(@as(?u64, 4096), parsePipeMaxSize("0").value);
+    try std.testing.expectEqual(@as(i64, -34), parsePipeMaxSize("2147483649").ret);
+    try std.testing.expectEqual(@as(?u64, 1 << 31), parsePipeMaxSize("2147483648").value);
+    try std.testing.expectEqual(@as(i64, -22), parsePipeMaxSize("-5").ret);
+    try std.testing.expectEqual(@as(i64, -22), parsePipeMaxSize("abc").ret);
+    try std.testing.expectEqual(@as(?u64, 65536), parsePipeMaxSize("0x10000").value);
+}
+
+test "a new pipe shrinks to pipe-max-size unless the caller has CAP_SYS_RESOURCE" {
+    defer setPipeMaxSize(PIPE_MAX_SIZE);
+    try std.testing.expectEqual(@as(u32, 65536), newPipeSize(65536, false));
+    setPipeMaxSize(16384);
+    try std.testing.expectEqual(@as(u32, 16384), newPipeSize(65536, false));
+    try std.testing.expectEqual(@as(u32, 65536), newPipeSize(65536, true));
+    setPipeMaxSize(4096);
+    try std.testing.expectEqual(@as(u32, 4096), newPipeSize(65536, false));
+}
 /// The largest buffer this kernel gives one pipe, even with CAP_SYS_RESOURCE (ENOMEM above).
 pub const PIPE_HARD_MAX: u64 = 4 << 20;
 pub const F_UNLCK: i64 = 2;
@@ -85,7 +168,7 @@ pub fn roundPipeSize(requested: u64) ?u64 {
 /// pipe_set_size's checks for growing a pipe of `current` bytes to `size` (already rounded) with `queued` bytes in it: past
 /// pipe-max-size needs CAP_SYS_RESOURCE (EPERM), past what this kernel can allocate is ENOMEM, a size below the queued bytes EBUSY.
 pub fn setPipeSizeErrno(size: u64, current: u64, queued: u64, cap_sys_resource: bool) i64 {
-    if (size > current and size > PIPE_MAX_SIZE and !cap_sys_resource) return -1;
+    if (size > current and size > pipeMaxSize() and !cap_sys_resource) return -1;
     if (size > PIPE_HARD_MAX) return -12;
     if (size < queued) return -16;
     return 0;

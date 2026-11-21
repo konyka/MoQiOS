@@ -381,6 +381,7 @@ pub const copy_file_range_source = @embedFile("fs/copy_file_range.zig");
 test {
     _ = @import("net/tcp_urg_policy.zig");
     _ = @import("fs/pipe_slot_policy.zig");
+    _ = @import("fs/fcntl_policy.zig");
     _ = @import("mm/fork_mark_policy.zig");
     _ = @import("net/udp_rmem_policy.zig");
     _ = @import("drivers/random_seed_policy.zig");

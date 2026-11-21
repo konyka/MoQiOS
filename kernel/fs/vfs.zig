@@ -303,11 +303,13 @@ pub fn pipeMakeSingleEnded(pipe_idx: u32) bool {
 /// had it starts with its own page, as Linux falls back to one buffer for a user over pipe-user-pages-soft.
 pub const PIPE_DEFAULT_SIZE: u32 = 16 * 4096;
 
-pub fn allocPipe() ?u32 {
+pub fn allocPipe(cap_sys_resource: bool) ?u32 {
     const pmm = @import("../mm/pmm.zig");
     const hhdm = @import("../mm/hhdm.zig");
+    // pipe-max-size below 64 KiB shrinks an unprivileged caller's new pipe (alloc_pipe_info); one page lives in `buf`.
+    const size = @import("fcntl_policy.zig").newPipeSize(PIPE_DEFAULT_SIZE, cap_sys_resource);
     // Allocate outside pipe_lock; hand the pages back if no slot is free.
-    const ext: ?[*]u8 = if (pmm.allocContiguous(PIPE_DEFAULT_SIZE / 4096)) |phys| @ptrFromInt(hhdm.physToVirt(phys)) else null;
+    const ext: ?[*]u8 = if (size <= PIPE_BUF_SIZE) null else if (pmm.allocContiguous(size / 4096)) |phys| @ptrFromInt(hhdm.physToVirt(phys)) else null;
     const flags = pipe_lock.acquire();
     for (0..MAX_PIPES) |i| {
         if (pipes[i].ref_count == 0) {
@@ -315,7 +317,7 @@ pub fn allocPipe() ?u32 {
             pipes[i] = .{ .buf = @splat(0), .head = 0, .ref_count = 2, .read_refs = 1, .write_refs = 1, .generation = generation };
             if (ext) |e| {
                 pipes[i].ext = e;
-                pipes[i].cap = PIPE_DEFAULT_SIZE;
+                pipes[i].cap = size;
             }
             pipe_count += 1;
             pipe_lock.release(flags);
@@ -323,7 +325,7 @@ pub fn allocPipe() ?u32 {
         }
     }
     pipe_lock.release(flags);
-    if (ext) |e| pmm.freeContiguous(hhdm.virtToPhys(@intFromPtr(e)), PIPE_DEFAULT_SIZE / 4096);
+    if (ext) |e| pmm.freeContiguous(hhdm.virtToPhys(@intFromPtr(e)), size / 4096);
     return null;
 }
 
@@ -1130,6 +1132,11 @@ fn sysctlWrite(desc: *FileDescriptor, buf: [*]const u8, count: usize, offset: u6
     return switch (desc.proc_file_type) {
         .ping_group_range => @import("../net/udp.zig").pingGroupWrite(text),
         .auto_flowlabels => autoFlowlabelsWrite(text),
+        .pipe_max_size => blk: {
+            const w = @import("fcntl_policy.zig").parsePipeMaxSize(text);
+            if (w.value) |v| @import("fcntl_policy.zig").setPipeMaxSize(v);
+            break :blk w.ret;
+        },
         .conf_file => @import("../net/arp.zig").confWrite(@import("../net/devconf_policy.zig").decode(desc.proc_pid), text),
         else => -1,
     };
@@ -1928,6 +1935,13 @@ pub const FdTable = struct {
                 pfile = .tcpstats;
             } else if (str.eql(rest, "randstats")) {
                 pfile = .randstats;
+            } else if (str.eql(rest, "sys/fs/pipe-max-size")) {
+                // Mode 0644 owned by root: writing needs fsuid 0 (the fs sysctls have no CAP_NET_ADMIN escape).
+                if (is_writable and euid != 0) {
+                    self.freeFd(slot);
+                    return -13; // EACCES
+                }
+                pfile = .pipe_max_size;
             } else if (str.eql(rest, "sys/net/ipv6/auto_flowlabels")) {
                 // Mode 0644 owned by root, like ping_group_range.
                 if (is_writable and euid != 0 and !effective_caps.cap_net_admin) {
@@ -3100,8 +3114,8 @@ pub const FdTable = struct {
     }
 
     /// Create a pipe. Returns read_fd in low 16 bits, write_fd in high 16 bits, or -errno.
-    pub fn createPipe(self: *FdTable) i64 {
-        const pipe_idx = allocPipe() orelse return -1;
+    pub fn createPipe(self: *FdTable, cap_sys_resource: bool) i64 {
+        const pipe_idx = allocPipe(cap_sys_resource) orelse return -1;
 
         const read_fd = self.allocFd() orelse {
             pipeClose(pipe_idx, false);

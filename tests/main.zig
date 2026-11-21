@@ -14288,7 +14288,7 @@ test "procfs: /proc/net, /proc/sys, /proc/sys/net and /proc/sys/net/ipv4 are dir
     const pf = kt.procfs_source;
     try std.testing.expect(std.mem.indexOf(u8, pf, "const root_dirs = [_][]const u8{ \"net\", \"sys\" };") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".net_dir => &.{.{ .name = \"arp\", .dtype = DT_REG }},") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_dir => &.{.{ .name = \"net\", .dtype = DT_DIR }},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_dir => &.{ .{ .name = \"fs\", .dtype = DT_DIR }, .{ .name = \"net\", .dtype = DT_DIR } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_net_dir => &.{ .{ .name = \"ipv4\", .dtype = DT_DIR }, .{ .name = \"ipv6\", .dtype = DT_DIR } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "return file == .root_dir or file == .pid_dir or file == .mount_dir or file == .fd_dir or isSubdir(file);") != null);
@@ -16999,8 +16999,9 @@ test "a new pipe gets a 16-page ring like Linux (hello448)" {
     // Linux fs/pipe.c alloc_pipe_info: PIPE_DEF_BUFFERS (16) pages, F_GETPIPE_SZ 65536. The kernel gave every pipe one page.
     const v = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, v, "pub const PIPE_DEFAULT_SIZE: u32 = 16 * 4096;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, v, "pmm.allocContiguous(PIPE_DEFAULT_SIZE / 4096)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, v, "pipes[i].cap = PIPE_DEFAULT_SIZE;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "const size = @import(\"fcntl_policy.zig\").newPipeSize(PIPE_DEFAULT_SIZE, cap_sys_resource);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "pmm.allocContiguous(size / 4096)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "pipes[i].cap = size;") != null);
     // F_SETPIPE_SZ still goes down to one page.
     try std.testing.expectEqual(@as(u64, 4096), kt.fcntl_policy.roundPipeSize(1).?);
 }
@@ -17798,4 +17799,24 @@ test "sigreturn loads the FPU image uc_mcontext.fpregs points at; null resets, m
     try std.testing.expect(std.mem.indexOf(u8, ss, "switch (sigreturn_policy.fpRestore(sig_frame.uc.fpregs)) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "var fpu: [512]u8 align(16) = sig_frame.fpu;") == null);
     try std.testing.expectEqual(kt.sigreturn_policy.FpRestore.bad, kt.sigreturn_policy.fpRestore(0x1008));
+}
+
+test "/proc/sys/fs/pipe-max-size: readable, root-writable, rounds like F_SETPIPE_SZ and bounds new pipes and F_SETPIPE_SZ (hello481)" {
+    // Linux fs/pipe.c: proc_dopipe_max_size (round_pipe_size, minimum 1), pipe_set_size's EPERM past it, alloc_pipe_info's shrink.
+    const fp = kt.fcntl_policy;
+    defer fp.setPipeMaxSize(fp.PIPE_MAX_SIZE);
+    try std.testing.expectEqual(@as(u64, 1 << 20), fp.pipeMaxSize());
+    const w = fp.parsePipeMaxSize("100000\n");
+    try std.testing.expectEqual(@as(i64, 7), w.ret);
+    fp.setPipeMaxSize(w.value.?);
+    try std.testing.expectEqual(@as(i64, -1), fp.setPipeSizeErrno(262144, 65536, 0, false));
+    try std.testing.expectEqual(@as(i64, 0), fp.setPipeSizeErrno(131072, 65536, 0, false));
+    try std.testing.expectEqual(@as(i64, 0), fp.setPipeSizeErrno(262144, 65536, 0, true));
+    try std.testing.expectEqual(@as(i64, -34), fp.parsePipeMaxSize("2147483649").ret);
+    try std.testing.expectEqual(@as(i64, -22), fp.parsePipeMaxSize("-5").ret);
+    const pf = kt.procfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_fs_dir => &.{.{ .name = \"pipe-max-size\", .dtype = DT_REG }},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, "if (std.mem.eql(u8, body, \"sys/fs\")) return .sys_fs_dir;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "} else if (str.eql(rest, \"sys/fs/pipe-max-size\")) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "pub fn createPipe(self: *FdTable, cap_sys_resource: bool) i64 {") != null);
 }

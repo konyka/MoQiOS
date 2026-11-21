@@ -167,6 +167,10 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // Proxy ARP test: CAP_NET_ADMIN to set and remove proxy entries.
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_net_admin = true }, .initial_init = false };
     }
+    if (std.mem.eql(u8, name, "hello481")) {
+        // fs.pipe-max-size: root opens the sysctl for writing (mode 0644), without CAP_SYS_RESOURCE so the limit applies to it.
+        return .{ .uid = 0, .gid = 0, .caps = NO_CAPS, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello476")) {
         // Raw sockets (CAP_NET_RAW), SO_MARK (CAP_NET_ADMIN) and root to open net.ipv4.ping_group_range for its ping socket.
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_raw = true, .cap_net_admin = true }, .initial_init = false };
