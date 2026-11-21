@@ -411,6 +411,10 @@ const TcpTcb = struct {
     /// Cross-process references (fork/clone) — tcpClose tears down at 0 only.
     ref_count: u32 = 1,
     options: socket_opt.SocketOptions,
+    /// IP_OPTIONS (inet->inet_opt): every IPv4 segment carries them (ip_queue_xmit → ip_options_build) and the MSS leaves room for
+    /// them (icsk_ext_hdr_len). An accepted connection starts with the SYN's options echoed (tcp_v4_save_options), not the
+    /// listener's.
+    ipopts: @import("ip_options_policy.zig").SendOpts = .{},
 };
 
 var tcbs: [MAX_CONNECTIONS]TcpTcb = undefined;
@@ -954,6 +958,7 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].is_v6 = false;
     tcbs[i].remote_ip6 = @splat(0);
     tcbs[i].remote_ip = .{ 0, 0, 0, 0 };
+    tcbs[i].ipopts = .{};
     return &tcbs[i];
 }
 
@@ -1168,6 +1173,23 @@ pub fn tcpSetOptions(tcb_idx: u32, opts: socket_opt.SocketOptions) bool {
     if (!tcbs[tcb_idx].active) return false;
     tcbs[tcb_idx].options = opts;
     return true;
+}
+
+/// setsockopt(IP_OPTIONS) on a TCP socket: the next segments carry them.
+pub fn tcpSetIpOptions(tcb_idx: u32, so: @import("ip_options_policy.zig").SendOpts) bool {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return false;
+    tcbs[tcb_idx].ipopts = so;
+    return true;
+}
+
+/// The IP_OPTIONS of a TCP socket (len 0: none).
+pub fn tcpGetIpOptions(tcb_idx: u32) ?@import("ip_options_policy.zig").SendOpts {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return null;
+    return tcbs[tcb_idx].ipopts;
 }
 
 /// True when the socket is an IPv6 (dual-stack) endpoint (SO_DOMAIN).
@@ -1479,7 +1501,8 @@ fn localMssForTcb(tcb: *const TcpTcb) u16 {
 
 /// Sender MSS for this TCB (SK-98/100): min(local SMSS, peer MSS, TCP_MAXSEG).
 fn mssForTcb(tcb: *const TcpTcb) u16 {
-    const local = localMssForTcb(tcb);
+    // tcp_mtu_to_mss: IP options come off the path MTU before the peer's MSS clamps it.
+    const local = if (tcb.is_v6) localMssForTcb(tcb) else @max(1, localMssForTcb(tcb) -| tcb.ipopts.len);
     const path: u16 = if (tcb.peer_mss != 0 and tcb.peer_mss < local) tcb.peer_mss else local;
     return @intCast(tcp_info_policy.effectiveMss(path, tcb.options.user_mss));
 }
@@ -1580,13 +1603,16 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16, 
     // Only the header region needs zeroing — fillTcpSegment/buildHeader/
     // buildFrame overwrite it, and the payload is memcpy'd over the rest.
     var send_pkt: [1518]u8 = undefined;
-    const tcp_off: u16 = 34;
+    const ol: u16 = tcb.ipopts.len;
+    const tcp_off: u16 = 34 + ol;
     @memset(send_pkt[0 .. tcp_off + 20], 0);
+    // A source route sends to its first hop; the final destination rides in the option and in the TCP pseudo-header.
+    const hdr_dst = if (ol != 0 and tcb.ipopts.o.srr != null) tcb.ipopts.faddr else tcb.remote_ip;
     // F2: 127.0.0.0/8 goes to the loopback device — no ARP, no hardware NIC.
-    const loopback = netif.isLocal4(tcb.remote_ip);
+    const loopback = netif.isLocal4(hdr_dst);
     const our_mac = netif.getMac();
     // An off-link peer is reached through the gateway; a missing entry asks for it, and the retransmit timer sends again.
-    const hop = netif.nextHop4(tcb.remote_ip);
+    const hop = netif.nextHop4(hdr_dst);
     const dst_mac = if (loopback) our_mac else (arp.resolve(hop) orelse {
         arp.sendArpRequest(hop);
         tcpLog("[tcp] ARP resolution failed\n");
@@ -1600,11 +1626,11 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16, 
     // runs BEFORE fillTcpSegment, which consumes SACK state
     // (sack_block_count) a PMTU bail would otherwise lose.
     const opt_len = tcp_util.segmentOptLen((flags & SYN) != 0, tcb.ts_enabled, tcb.sack_permitted, tcb.sack_block_count, (flags & ACK) != 0);
-    if (ipv4.HEADER_LEN + 20 + @as(u16, opt_len) + data_len > ipv4.getSendMtu(tcb.remote_ip)) return false;
+    if (ipv4.HEADER_LEN + ol + 20 + @as(u16, opt_len) + data_len > ipv4.getSendMtu(tcb.remote_ip)) return false;
     const tcp_total = fillTcpSegment(tcb, flags, data, data_len, &send_pkt, tcp_off, seq_override);
     const csum = tcpChecksum(our_ip, tcb.remote_ip, send_pkt[tcp_off..].ptr, tcp_total);
     bo.writeU16BeAt(&send_pkt, tcp_off + 16, csum);
-    ipv4.buildHeader(send_pkt[14..].ptr, our_ip, tcb.remote_ip, ipv4.PROTO_TCP, tcp_total);
+    ipv4.buildHeader(send_pkt[14..].ptr, our_ip, hdr_dst, ipv4.PROTO_TCP, tcp_total);
     if (ipid_policy.tcpUsesSocketId(flags)) ipv4.setIdent(send_pkt[14..].ptr, ipid_policy.take(&tcb.ip_id), ip_opt_policy.streamDf(tcb.options.ip.pmtudisc));
     // IP_TTL / IP_TOS (applied before ECN, which owns the low two TOS bits).
     if (ip_opt_policy.ipv4NeedsPatch(tcb.options.ip)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], tcb.options.ip, ipv4.checksum);
@@ -1612,11 +1638,24 @@ fn sendSegmentSeq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16, 
     if (tcb.ecn_ok and (flags & SYN) == 0) {
         if (tcb.accecn_ok) ipv4.setEct1(send_pkt[14..].ptr) else ipv4.setEct0(send_pkt[14..].ptr);
     }
-    const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, 20 + tcp_total);
+    if (ol != 0) {
+        // ip_options_build: the options follow the 20-byte header, built for this segment (record route and timestamps get this
+        // host and the time); the header length, total length and checksum cover them.
+        const iop = @import("ip_options_policy.zig");
+        var built: [40]u8 = undefined;
+        iop.build(tcb.ipopts, our_ip, tcb.remote_ip, iop.msSinceMidnight(@import("../proc/time_syscall.zig").wallClockNanos()), &built);
+        @memcpy(send_pkt[34..][0..ol], built[0..ol]);
+        send_pkt[14] = 0x40 | @as(u8, @intCast((20 + ol) / 4));
+        bo.writeU16BeAt(&send_pkt, 16, 20 + ol + tcp_total);
+        send_pkt[24] = 0;
+        send_pkt[25] = 0;
+        bo.writeU16BeAt(&send_pkt, 24, ipv4.checksum(send_pkt[14..].ptr, 20 + ol));
+    }
+    const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, 20 + ol + tcp_total);
     const ok = if (loopback) lo_dev.sendPacket(&send_pkt, frame_len) else nic.sendPacket(&send_pkt, frame_len);
     if (!ok) return false; // TX failed: do not advance snd_nxt (segment never sent)
     // SK-104: full-MTU TX success can raise the Path MTU early.
-    ipv4.noteFullSizeSend(tcb.remote_ip, ipv4.HEADER_LEN + tcp_total);
+    ipv4.noteFullSizeSend(tcb.remote_ip, ipv4.HEADER_LEN + ol + tcp_total);
     noteEcnCwrSent(tcb, flags);
     noteRackXmit(tcb, seq_override orelse tcb.snd_nxt, data_len);
     advanceSndNxt(tcb, flags, data_len);
@@ -2337,7 +2376,7 @@ fn sendSynAck(tcb: *TcpTcb, peer_ecn: bool) void {
 /// Handle an incoming SYN for a listening socket.
 /// Creates a new TCB in SYN_RECEIVED state, sends SYN-ACK,
 /// and queues it in the listen backlog.
-fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions, flags: u8) void {
+fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions, flags: u8, rx_opts: ?@import("ip_options_policy.zig").SendOpts) void {
     _ = _w;
     const peer_ecn = probeEcnPeerSetup(flags);
     // The listener bound to the SYN's destination address, else a wildcard one.
@@ -2360,6 +2399,7 @@ fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16,
             tcb_generations[i] +%= 1; // a new connection on this slot
             initTcbState(reuse_tcb);
             reuse_tcb.options = listenerOptions(ls);
+            reuse_tcb.ipopts = rx_opts orelse .{};
             reuse_tcb.iss = generateIss();
             reuse_tcb.ip_id = ipid.initial();
             reuse_tcb.snd_una = reuse_tcb.iss;
@@ -2413,6 +2453,7 @@ fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16,
     new_tcb.owner_task = ls.owner_task;
     new_tcb.sock_uid = listenerSockUid(ls);
     new_tcb.options = listenerOptions(ls);
+    new_tcb.ipopts = rx_opts orelse .{};
     new_tcb.iss = generateIss();
     new_tcb.ip_id = ipid.initial();
     new_tcb.snd_una = new_tcb.iss;
@@ -3169,6 +3210,12 @@ fn driveTcbStateMachine(
 }
 
 pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, ecn_ce: bool) void {
+    handlePacketOpts(src_ip, dst_ip, data, len, ecn_ce, null);
+}
+
+/// handlePacket for a segment that arrived with IPv4 options: `rx_opts` are what a reply to it would carry (ip_options_echo, as
+/// ip_options_policy.compileForSend takes them), which a connection accepted from this SYN keeps (tcp_v4_save_options).
+pub fn handlePacketOpts(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, ecn_ce: bool, rx_opts: ?@import("ip_options_policy.zig").SendOpts) void {
     if (len < 20) return;
 
     // Verify the TCP checksum (mandatory, RFC 793) before touching any state —
@@ -3223,7 +3270,7 @@ pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, e
         // No matching connection — check if any socket is listening on this port
         if (flags & SYN != 0) {
             const before = pendingBacklogCount();
-            handleIncomingSyn(src_ip, dst_ip, src_port, dst_port, seq_num, raw_window, opts, flags);
+            handleIncomingSyn(src_ip, dst_ip, src_port, dst_port, seq_num, raw_window, opts, flags, rx_opts);
             // Nobody listens on the port: a loopback peer is told at once
             // (RFC 9293 §3.10.7.1) instead of retransmitting its SYN.
             if (pendingBacklogCount() == before and !hasListener(dst_port, false, dst_ip, @splat(0))) {

@@ -5091,7 +5091,7 @@ test "IPv4 traffic to our own address goes over lo like 127/8 (hello370)" {
 
     const ts = kt.tcp_source;
     // TX: segments to our own address are queued on lo; the SYN that lo dropped is resent like any loopback one.
-    try std.testing.expect(std.mem.indexOf(u8, ts, "    const loopback = netif.isLocal4(tcb.remote_ip);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "    const loopback = netif.isLocal4(hdr_dst);\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (!synLostOnLoopback(tcb, netif.isLocal4(remote_ip))) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "loop_dst = tcb.active and !tcb.is_v6 and netif.isLocal4(tcb.remote_ip);") != null);
     // RX: the checksum covers the address the segment was sent to, and a segment no connection takes is answered with a RST.
@@ -5141,7 +5141,7 @@ test "IPv4 next hop: an off-link address goes through the gateway, and a SYN wai
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "break :resolve arp.resolve(hop) orelse blk: {\n            wait_hop = hop;") != null);
     const ts = kt.tcp_source;
-    try std.testing.expect(std.mem.indexOf(u8, ts, "const hop = netif.nextHop4(tcb.remote_ip);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const hop = netif.nextHop4(hdr_dst);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "arp.resolve(hop) orelse {\n        arp.sendArpRequest(hop);") != null);
     // An echo reply goes back the way any other datagram would: through the gateway to an off-link requester, over lo to a loopback one.
     const is = kt.icmp_source;
@@ -15174,7 +15174,7 @@ test "IPv4 raw sockets of any protocol (hello401): creation, delivery and protoc
     const m = kt.net_mod_source;
     // Every IPv4 datagram reaches the raw sockets of its protocol before the protocol handler (raw_local_deliver first).
     const at_raw = std.mem.indexOf(u8, m, "@import(\"raw_icmp.zig\").deliver(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip, ifindex)\n            else\n                @import(\"raw_icmp.zig\").deliverHdr(") orelse return error.TestUnexpectedResult;
-    const at_tcp = std.mem.indexOf(u8, m, "tcp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, info.ecn_ce);").?;
+    const at_tcp = std.mem.indexOf(u8, m, "tcp.handlePacketOpts(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, info.ecn_ce, rx_opts);").?;
     try std.testing.expect(at_raw < at_tcp);
     try std.testing.expect(std.mem.indexOf(u8, m, "else => if (rp.protoUnreachable(info.protocol, raw_took)) icmp.sendProtoUnreachable(data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip),") != null);
     const rs = kt.raw_icmp_source;
@@ -17536,7 +17536,7 @@ test "a UDP sender's IPv4 options: IP_OPTIONS and a non-empty IP_RETOPTS control
     b[16..20].* = .{ 7, 2, 0, 0 };
     try std.testing.expectEqual(@as(i64, -22), c.parseSend4(b[0..24], .{}).err);
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "iop.build(so, our_ip, dst_ip_in, iop.msSinceMidnight(") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.socket_opt_source, "if (level == ipo.SOL_IP and optname == ipo.IP_OPTIONS and (ref == .udp or ref == .raw)) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_opt_source, "if (level == ipo.SOL_IP and optname == ipo.IP_OPTIONS and ref != .unix) {") != null);
 }
 
 test "IPv4 options on raw and ping sockets: IP_OPTIONS, IP_RECVOPTS / IP_RETOPTS on receive, echo replies echo them (hello466)" {
@@ -17573,4 +17573,24 @@ test "IPv4 options on raw and ping sockets: IP_OPTIONS, IP_RECVOPTS / IP_RETOPTS
     try std.testing.expect(std.mem.indexOf(u8, kt.ip_frag_source, "pub fn send4(hdr: [20]u8, opts: []const u8, payload: []const u8, mtu: u16,") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.ip_frag_source, "if (off == 0 and ol != 0) @import(\"ip_options_policy.zig\").fragmentOpts(o[0..ol]);") != null);
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello466", true, false).caps.cap_net_raw);
+}
+
+test "IPv4 options on TCP sockets: every segment carries IP_OPTIONS, the MSS makes room, an accepted connection keeps the SYN's (hello467)" {
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "pub fn tcpSetIpOptions(tcb_idx: u32, so: @import(\"ip_options_policy.zig\").SendOpts) bool {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const local = if (tcb.is_v6) localMssForTcb(tcb) else @max(1, localMssForTcb(tcb) -| tcb.ipopts.len);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "iop.build(tcb.ipopts, our_ip, tcb.remote_ip, iop.msSinceMidnight(") != null);
+    try std.testing.expect(std.mem.count(u8, ts, ".ipopts = rx_opts orelse .{};") == 2);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "    tcbs[i].ipopts = .{};\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "tcp.handlePacketOpts(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, info.ecn_ce, rx_opts);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_opt_source, ".tcp => |idx| if (@import(\"tcp.zig\").tcpSetIpOptions(idx, so)) 0 else -9,") != null);
+    // A SYN's record route, echoed and built for the reply, records this host once more.
+    const iop = kt.ip_options_policy;
+    const so = iop.compileForSend(&.{ 7, 7, 8, 127, 0, 0, 1, 0 }, true).?;
+    var out: [40]u8 = undefined;
+    try std.testing.expectEqual(@as(u8, 8), so.len);
+    try std.testing.expect(!so.o.rr_needaddr);
+    iop.build(so, .{ 127, 0, 0, 1 }, .{ 127, 0, 0, 1 }, 0, &out);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 7, 8, 127, 0, 0, 1, 0 }, out[0..8]);
+    try std.testing.expect(kt.capability_profile.profileForLaunch("hello467", true, false).caps.cap_net_raw);
 }

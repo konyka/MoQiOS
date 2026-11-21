@@ -562,9 +562,9 @@ fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
     if (ref == .tcp and level == ipo.SOL_IP) {
         if (ipo.streamSetErrno4(optname)) |e| return e;
     }
-    // IP_OPTIONS (do_ip_setsockopt → ip_options_get): up to 40 bytes of options a UDP, ping or raw socket's datagrams carry; 0 bytes clears
+    // IP_OPTIONS (do_ip_setsockopt → ip_options_get): up to 40 bytes of options a UDP, ping, raw or TCP socket's datagrams carry; 0 bytes clears
     // them; malformed ones (or, without CAP_NET_RAW, unknown ones) are EINVAL.
-    if (level == ipo.SOL_IP and optname == ipo.IP_OPTIONS and (ref == .udp or ref == .raw)) {
+    if (level == ipo.SOL_IP and optname == ipo.IP_OPTIONS and ref != .unix) {
         if (optlen > 40) return -22;
         var ob: [40]u8 = undefined;
         const k: usize = @intCast(optlen);
@@ -577,7 +577,8 @@ fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
         return switch (ref) {
             .udp => |port| if (@import("udp.zig").setIpOptions(port, so)) 0 else -9,
             .raw => |idx| if (@import("raw_icmp.zig").setIpOptions(idx, so)) 0 else -9,
-            else => unreachable,
+            .tcp => |idx| if (@import("tcp.zig").tcpSetIpOptions(idx, so)) 0 else -9,
+            .unix => unreachable,
         };
     }
     var raw: [16]u8 = undefined;
@@ -675,11 +676,12 @@ fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
     // ip_getsockopt answers a level other than SOL_IP with EOPNOTSUPP; an IPv6 socket's ipv6_getsockopt with ENOPROTOOPT.
     if (!ipo.levelApplies(level, fam)) return if (fam == .v4) -95 else -92;
     // IP_OPTIONS: the socket's options as it gave them (ip_options_undo), at most optlen bytes.
-    if (level == ipo.SOL_IP and optname == ipo.IP_OPTIONS and (ref == .udp or ref == .raw)) {
+    if (level == ipo.SOL_IP and optname == ipo.IP_OPTIONS and ref != .unix) {
         const so = switch (ref) {
             .udp => |port| @import("udp.zig").getIpOptions(port) orelse return -9,
             .raw => |idx| (@import("raw_icmp.zig").getIpOptions(idx) orelse return -9).so,
-            else => unreachable,
+            .tcp => |idx| @import("tcp.zig").tcpGetIpOptions(idx) orelse return -9,
+            .unix => unreachable,
         };
         var ob: [40]u8 = undefined;
         const k = @import("ip_options_policy.zig").userView(so, &ob);
