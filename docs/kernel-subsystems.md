@@ -1123,6 +1123,7 @@ const SchedStats = struct {
 - **SO_RCVMARK、SO_RCVPRIORITY（hello472）**：UDP 数据报的 mark、priority（sendmsg 控制消息，否则套接字的 SO_MARK、SO_PRIORITY，`udp.skbMeta`）随回环帧（`lo.Meta`）带到接收端，`ip_cmsg_policy.putMarkPrio` 在时间戳之后加 SOL_SOCKET/SO_MARK、SO_PRIORITY。
 - **UDP 接收队列先进先出（hello473）**：入队时 `UdpEntry.order` 记全局序号，所有读取经 `udp.oldestLocked` 取最早的有效项，读走中间的槽不会让后到的数据报插队。
 - **UDP 接收队列只按 SO_RCVBUF 计数（hello474）**：每个数据报一个 `kmalloc` 的 `UdpEntry`，链在套接字的 `Queue` 尾部；`newEntryLocked` 按 `Queue.rmem` 与 SO_RCVBUF 判断收不收（上限另有 `QUEUE_MAX` 4096 个）。
+- **raw 接收队列只按 SO_RCVBUF 计数（hello475）**：raw 套接字的数据报同样各自 `kmalloc` 成 `Entry`、链在 `Socket.head` 之后，`newEntry` 在 `rmem` 低于 SO_RCVBUF 时收（`__sock_queue_rcv_skb`）。
 - **超长 UDP 数据报（hello449）**：协议栈不分片，IPv4 UDP 超过路径 MTU 的数据报返回 EMSGSIZE（以前被截成 1472 字节发出）；IP_PMTUDISC_DO/PROBE 下开了 IP_RECVERR 时，错误队列得到一条 SO_EE_ORIGIN_LOCAL 的条目（ee_info 为 MTU，msg_name 为目的地址）。sendmsg 按整个 iovec 的长度判断。
 - **clone 的退出信号（hello450）**：`Task.exitSignal()` 记录（字段 `exit_signal_x` 存“信号 XOR SIGCHLD”，使 `zeroSlot` 清零后的槽位读作 SIGCHLD）子进程退出时发给父进程的信号（fork、spawn、exec 后为 SIGCHLD，clone 取 flags 低字节，clone3 取 `exit_signal` 字段，0 为不发）。不是 SIGCHLD 的子进程只有带 `__WCLONE` 或 `__WALL` 的 waitpid/waitid 能看到（`proc_id_policy.waitEligible`，即 Linux `eligible_child`）。
 - **父进程 exec 后的退出信号（hello456）**：`Task` 新增 `self_exec_id`（每次 execve 加 1）和 `parent_exec_id`（fork、clone 时取父进程的 `self_exec_id`；CLONE_THREAD 取父进程自己的 `parent_exec_id`）。退出时按 `proc_id_policy.notifySignal` 决定发给父进程的信号：退出信号不是 SIGCHLD 也不是 0，而父进程的 `self_exec_id` 已经变了（父进程 exec 过），就改发 SIGCHLD（Linux `do_notify_parent`）。子进程的退出信号本身不变，仍只被 __WCLONE 等待看到。

@@ -17,9 +17,10 @@ const ipo = @import("ip_opt_policy.zig");
 const iop = @import("ip_options_policy.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
-/// Raw sockets at once (each queues up to QUEUE_DEPTH datagrams of RAW_QUEUE_LEN bytes inline, longer ones in the shared big buffers).
+/// Raw sockets at once. Each queues its datagrams in kmalloc'd entries (RAW_QUEUE_LEN bytes inline, longer ones in a buffer of
+/// their own), as many as its SO_RCVBUF holds (udp_rmem_policy.rawAdmits), at most QUEUE_MAX.
 pub const MAX_SOCKETS = 16;
-const QUEUE_DEPTH = policy.QUEUE_DEPTH;
+const QUEUE_MAX = 4096;
 pub const RAW_QUEUE_LEN = 1500;
 /// Largest datagram a raw socket keeps whole: a reassembled IPv4 datagram (total length) or IPv6 payload.
 pub const RAW_BIG_LEN = 65535;
@@ -43,6 +44,8 @@ const Entry = struct {
     /// IPV6_HOPLIMIT / IPV6_TCLASS (an IPv6 one).
     meta: @import("ip_cmsg_policy.zig").RecvInfo = .{},
     meta6: @import("ip_cmsg_policy.zig").RecvInfo6 = .{},
+    /// The next datagram of the same socket (oldest first).
+    next: ?*Entry = null,
 };
 
 const Socket = struct {
@@ -68,10 +71,11 @@ const Socket = struct {
     shut_wr: bool = false,
     /// SOL_SOCKET options (SO_RCVTIMEO, SO_RCVBUF, ...): one copy per socket, so every descriptor naming it sees the same set.
     opts: @import("sockopt_policy.zig").Stored = .{},
-    /// A ring, oldest first: `count` datagrams from slot `head` (policy.enqueueSlot, policy.afterRecv).
-    queue: [QUEUE_DEPTH]Entry = @splat(.{}),
-    head: u8 = 0,
-    count: u8 = 0,
+    /// The receive queue (sk_receive_queue), oldest first: `count` entries costing `rmem` (sk_rmem_alloc).
+    head: ?*Entry = null,
+    tail: ?*Entry = null,
+    count: u32 = 0,
+    rmem: u32 = 0,
     /// The pending error (sk_err) an ICMP error left, reported once by SO_ERROR, the next recv or send; and the IP_RECVERR queue.
     err: i32 = 0,
     errq: @import("errqueue_policy.zig").Queue = .{},
@@ -111,12 +115,33 @@ fn store2(e: *Entry, head: []const u8, tail: []const u8) void {
     e.len = @intCast(dst.len);
 }
 
-/// sk_rmem_alloc of raw socket `s`: what its queued datagrams cost (raw_lock held).
-fn queueRmem(s: *const Socket) u32 {
-    var sum: u32 = 0;
-    var k: u8 = 0;
-    while (k < s.count) : (k += 1) sum +|= @import("udp_rmem_policy.zig").rawTruesize(s.queue[(@as(usize, s.head) + k) % QUEUE_DEPTH].len);
-    return sum;
+/// A new entry at the tail of `s`'s queue (raw_lock held), or null when SO_RCVBUF is reached (__sock_queue_rcv_skb), the queue holds
+/// QUEUE_MAX datagrams or no memory is to be had. The caller stores the datagram and charges it with `charge`.
+fn newEntry(s: *Socket) ?*Entry {
+    if (!@import("udp_rmem_policy.zig").rawAdmits(s.rmem, s.opts.rcvbuf) or s.count >= QUEUE_MAX) return null;
+    const raw = @import("../mm/slab.zig").kmalloc(@sizeOf(Entry)) orelse return null;
+    const e: *Entry = @ptrCast(@alignCast(raw));
+    e.* = .{};
+    if (s.tail) |t| t.next = e else s.head = e;
+    s.tail = e;
+    s.count += 1;
+    return e;
+}
+
+/// Count a stored entry's cost against its socket (raw_lock held).
+fn charge(s: *Socket, e: *const Entry) void {
+    s.rmem +|= @import("udp_rmem_policy.zig").rawTruesize(e.len);
+}
+
+/// Take the oldest entry off `s`'s queue and free it (raw_lock held).
+fn popEntry(s: *Socket) void {
+    const e = s.head orelse return;
+    s.head = e.next;
+    if (s.tail == e) s.tail = null;
+    s.count -= 1;
+    s.rmem -|= @import("udp_rmem_policy.zig").rawTruesize(e.len);
+    dropEntry(e);
+    @import("../mm/slab.zig").kfree(e);
 }
 
 fn bytesOf(e: *const Entry) []const u8 {
@@ -170,8 +195,7 @@ pub fn release(idx: u32) void {
         return;
     }
     const s = &sockets[idx];
-    var k: usize = 0;
-    while (k < s.count) : (k += 1) dropEntry(&s.queue[(@as(usize, s.head) + k) % QUEUE_DEPTH]);
+    while (s.head != null) popEntry(s);
     sockets[idx] = .{};
 }
 
@@ -232,16 +256,12 @@ pub fn recv(idx: u32, out: []u8, peek: bool) RecvResult {
     defer raw_lock.release(saved);
     if (idx >= MAX_SOCKETS or !sockets[idx].used) return .eagain;
     const s = &sockets[idx];
-    if (s.count == 0) return .eagain;
-    const e = &s.queue[s.head];
+    const e = s.head orelse return .eagain;
     const bytes = bytesOf(e);
     const copy_len = @min(bytes.len, out.len);
     @memcpy(out[0..copy_len], bytes[0..copy_len]);
     const result: RecvResult = .{ .ok = .{ .n = copy_len, .src = e.src, .trunc = e.len, .meta = e.meta, .meta6 = e.meta6 } };
-    if (!peek) dropEntry(e);
-    const next = policy.afterRecv(s.head, s.count, peek);
-    s.head = next.head;
-    s.count = next.count;
+    if (!peek) popEntry(s);
     return result;
 }
 
@@ -553,14 +573,12 @@ pub fn deliverHdr(protocol: u8, hdr: []const u8, payload: []const u8, src: [4]u8
             if (!policy.matches(s.bound, s.peer, src, dst)) continue;
             took = true;
             if (protocol == policy.IPPROTO_ICMP) if (icmpType(hdr, payload)) |ty| if (policy.icmpFilterBlocks(s.icmp_filter, ty)) continue;
-            if (!@import("udp_rmem_policy.zig").rawAdmits(queueRmem(s), s.opts.rcvbuf)) continue;
-            const at = policy.enqueueSlot(s.head, s.count) orelse continue;
-            const e = &s.queue[at];
+            const e = newEntry(s) orelse continue;
             store2(e, hdr, payload);
+            charge(s, e);
             e.src = @splat(0);
             @memcpy(e.src[0..4], &src);
             e.meta = meta;
-            s.count += 1;
             notify[n_notify] = @intCast(i);
             n_notify += 1;
         }
@@ -603,13 +621,11 @@ pub fn deliver6Flow(protocol: u8, msg: []const u8, src: [16]u8, dst: [16]u8, ifi
             took = true;
             if (protocol == policy.IPPROTO_ICMPV6 and (msg.len < 4 or policy.filterBlocks(s.filter, msg[0]))) continue;
             if (s.csum_off != null and policy.sum6(src, dst, s.protocol, msg) != 0) continue;
-            if (!@import("udp_rmem_policy.zig").rawAdmits(queueRmem(s), s.opts.rcvbuf)) continue;
-            const at = policy.enqueueSlot(s.head, s.count) orelse continue;
-            const e = &s.queue[at];
+            const e = newEntry(s) orelse continue;
             store(e, msg);
+            charge(s, e);
             e.src = src;
             e.meta6 = .{ .ifindex = ifindex, .dst = dst, .hops = hops, .tclass = tclass, .flowinfo = flowinfo };
-            s.count += 1;
             notify[n_notify] = @intCast(i);
             n_notify += 1;
         }

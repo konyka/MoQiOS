@@ -32,10 +32,11 @@ pub fn rawAdmits(rmem: u32, rcvbuf: u32) bool {
     return rmem < rcvbuf;
 }
 
-/// What a raw socket's queued IPv4 datagram of `len` bytes (IP header included) or IPv6 packet (without it) costs: the same skbs
-/// as a UDP datagram of that many bytes less the 8-byte UDP header.
+/// What a raw socket's queued IPv4 datagram of `len` bytes (IP header included) or IPv6 packet costs: the skbs of the frames that
+/// carried it, as for a UDP datagram of that many bytes less the 20-byte IP and 8-byte UDP headers (a 1500-byte datagram is one
+/// full frame).
 pub fn rawTruesize(len: usize) u32 {
-    return truesize(len -| 8);
+    return truesize(len -| 28);
 }
 
 test "a raw socket with the default buffer queues three 60000-byte datagrams (measured on Linux)" {
@@ -46,6 +47,15 @@ test "a raw socket with the default buffer queues three 60000-byte datagrams (me
         n += 1;
     };
     try std.testing.expectEqual(@as(usize, 3), n);
+}
+
+test "a raw socket's default buffer holds 222 small datagrams, 93 full frames, 15 under SO_RCVBUF 16384 (measured on Linux)" {
+    for ([_][3]u32{ .{ 21, 212992, 222 }, .{ 1020, 212992, 93 }, .{ 1500, 212992, 93 }, .{ 1020, 32768, 15 } }) |c| {
+        var rmem: u32 = 0;
+        var n: u32 = 0;
+        while (rawAdmits(rmem, c[1])) : (n += 1) rmem += rawTruesize(c[0]);
+        try std.testing.expectEqual(c[2], n);
+    }
 }
 
 test "the default 212992-byte buffer queues two 60000-byte datagrams; 524288 five; an empty queue takes one whatever its size" {

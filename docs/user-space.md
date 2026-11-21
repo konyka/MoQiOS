@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello474`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello475`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -469,6 +469,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello472 | SO_RCVMARK 和 SO_RCVPRIORITY：不开时 UDP 数据报不带控制消息（A）；开 SO_RCVMARK 后普通数据报带 SO_MARK 0，发送端 SO_MARK 9 时为 9，SO_MARK 控制消息 7 时为 7（B）；开 SO_RCVPRIORITY 后同样得到 0、发送端 SO_PRIORITY 4、控制消息 6（C）；关掉后 SO_RCVMARK 读回 0、SO_RCVPRIORITY 读回 1，TCP 套接字也能设 SO_RCVMARK（D） |
 | hello473 | UDP 数据报按到达顺序读出：发 1 2 3、读一个（1）、再发 4，之后读到 2 3 4（A）；发 a–e、读两个、再发 f g，之后读到 c d e f g（B）；绑定 [::1] 的 IPv6 套接字收两个发送端交错发来的 1 2 3、读一个后再收 4，之后读到 2 3 4（C） |
 | hello474 | UDP 接收队列只按 SO_RCVBUF 计数：向不读的套接字发 400 个数据报，默认 SO_RCVBUF 下 1 字节和 100 字节的各收下 221 个且有序（A）；1000 和 1472 字节的收下 92 个（B）；SO_RCVBUF 设 16384 后 1472 字节的收下 14 个（C） |
+| hello475 | raw 套接字接收队列只按 SO_RCVBUF 计数：向不读的协议 253 raw 套接字发 400 个数据报，默认 SO_RCVBUF 下 1 字节和 100 字节载荷的各收下 222 个且有序（A）；1000 和 1480 字节的收下 93 个（B）；SO_RCVBUF 设 16384 后 1000 字节的收下 15 个（C） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

@@ -591,6 +591,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello472"); /* SO_RCVMARK and SO_RCVPRIORITY */
     run_test("hello473"); /* UDP datagrams come out in arrival order */
     run_test("hello474"); /* SO_RCVBUF, not a fixed count, bounds a UDP socket queue */
+    run_test("hello475"); /* SO_RCVBUF, not a fixed count, bounds a raw socket queue */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

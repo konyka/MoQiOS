@@ -15096,8 +15096,9 @@ test "raw ICMP queue is a ring and MSG_PEEK leaves the head (hello398)" {
     try std.testing.expectEqual(@as(u8, 1), head);
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "pub fn recv(idx: u32, out: []u8, peek: bool) RecvResult {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rs, "const at = policy.enqueueSlot(s.head, s.count) orelse continue;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rs, "const next = policy.afterRecv(s.head, s.count, peek);") != null);
+    // hello475: the ring became a kmalloc'd list, oldest first; MSG_PEEK still leaves the head.
+    try std.testing.expect(std.mem.indexOf(u8, rs, "const e = newEntry(s) orelse continue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "    if (!peek) popEntry(s);") != null);
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "switch (raw.recv(d.raw_idx, out, (flags & 0x02) != 0)) {") != null);
 }
@@ -17192,8 +17193,8 @@ test "raw sockets keep a reassembled datagram whole in a shared big buffer, give
     try std.testing.expect(std.mem.indexOf(u8, rs, "pub const RAW_BIG_LEN = 65535;") != null);
     try std.testing.expect(std.mem.indexOf(u8, rs, "            store2(e, hdr, payload);") != null);
     try std.testing.expect(std.mem.indexOf(u8, rs, "            store(e, msg);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rs, "    if (!peek) dropEntry(e);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rs, "while (k < s.count) : (k += 1) dropEntry(&s.queue[(@as(usize, s.head) + k) % QUEUE_DEPTH]);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "    dropEntry(e);\n    @import(\"../mm/slab.zig\").kfree(e);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "    while (s.head != null) popEntry(s);") != null);
     try std.testing.expect(std.mem.indexOf(u8, rs, "const copy_len = @min(dgram.len, RAW_QUEUE_LEN);") == null);
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "const pbuf: []u8 = if (want > small.len) bigStage(want) orelse return -105 else small[0..want];") != null);
@@ -17691,7 +17692,8 @@ test "big UDP and raw datagrams take kmalloc buffers bounded by SO_RCVBUF; reass
     try std.testing.expect(std.mem.indexOf(u8, us, "if (!rp.admits(q.rmem, size, port_opts[port_idx].rcvbuf) or q.count >= QUEUE_MAX) return null;") != null);
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "var big_bufs") == null);
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, rs, "if (!@import(\"udp_rmem_policy.zig\").rawAdmits(queueRmem(s), s.opts.rcvbuf)) continue;"));
+    try std.testing.expect(std.mem.indexOf(u8, rs, "if (!@import(\"udp_rmem_policy.zig\").rawAdmits(s.rmem, s.opts.rcvbuf) or s.count >= QUEUE_MAX) return null;") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, rs, "const e = newEntry(s) orelse continue;"));
     try std.testing.expectEqual(@as(usize, 64), kt.ip_frag_policy.QUEUES);
     try std.testing.expect(std.mem.indexOf(u8, kt.ip_frag_source, "fn releaseIdle() void {") != null);
 }
