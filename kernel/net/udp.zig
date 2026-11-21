@@ -818,6 +818,8 @@ pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8, me
                 @memcpy(e.src_ip[0..4], &src_ip);
                 e.dst_port = ident;
                 e.meta = meta;
+                // ping_recvmsg calls sock_recv_timestamp: the reply's arrival time for SO_TIMESTAMP / SO_TIMESTAMPNS.
+                e.meta.stamp_ns = @import("../proc/time_syscall.zig").wallClockNanos();
                 notify_key = ports[i];
             }
         }
@@ -853,6 +855,7 @@ pub fn deliverPing6(ident: u16, src_ip: [16]u8, dst_ip: [16]u8, msg: []const u8,
             e.dst_port = ident;
             e.is_v6 = true;
             e.meta6 = meta6;
+            e.meta6.stamp_ns = @import("../proc/time_syscall.zig").wallClockNanos();
             notify_key = ports[i];
         }
     }

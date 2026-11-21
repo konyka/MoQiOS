@@ -17753,3 +17753,8 @@ test "raw sockets report SO_RCVMARK / SO_RCVPRIORITY and receive timestamps; raw
     try std.testing.expect(std.mem.indexOf(u8, kt.raw_icmp_source, "e.meta.stamp_ns = @import(\"../proc/time_syscall.zig\").wallClockNanos();") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.icmpv6_source, "lo.sendPacketMeta(&pkt, frame_len, lo.IFINDEX, .{ .mark = ip.skb_mark, .priority = ip.skb_prio })") != null);
 }
+
+test "ping socket replies carry their arrival time for SO_TIMESTAMP / SO_TIMESTAMPNS (ping_recvmsg sock_recv_timestamp, hello476 F)" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "e.meta.stamp_ns = @import(\"../proc/time_syscall.zig\").wallClockNanos();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "e.meta6.stamp_ns = @import(\"../proc/time_syscall.zig\").wallClockNanos();") != null);
+}

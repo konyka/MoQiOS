@@ -9,7 +9,9 @@
  *   C. a ping socket's own recvmsg with both options on: the reply brings no control message (ping_recvmsg does not call
  *      sock_recv_cmsgs);
  *   D. an IPv6 protocol-253 raw receiver with SO_RCVMARK: a packet from a sender with SO_MARK 5 brings 5;
- *   E. SO_TIMESTAMP on a raw receiver: SCM_TIMESTAMP (29) with a non-zero time. */
+ *   E. SO_TIMESTAMP on a raw receiver: SCM_TIMESTAMP (29) with a non-zero time;
+ *   F. SO_TIMESTAMP on the ping socket: its echo reply brings SCM_TIMESTAMP with a non-zero time (ping_recvmsg calls
+ *      sock_recv_timestamp). */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -160,6 +162,13 @@ int main(void) {
     long e1 = rcv(rt, -1);
     snprintf(msg, sizeof msg, "E: SO_TIMESTAMP raw: received %ld, type %d, time set %d (21 29 1)", e1, n_cm ? cm_ty[0] : -1, n_cm && cm_val[0] != 0);
     check(e1 == 21 && n_cm == 1 && cm_ty[0] == 29 && cm_val[0] != 0, msg);
+
+    seti(p, 29, 1);
+    sendto_(p, echo, 8, a, 16);
+    nap();
+    long f1 = rcv(p, -1);
+    snprintf(msg, sizeof msg, "F: SO_TIMESTAMP ping: reply %ld, %d messages, type %d, time set %d (8 1 29 1)", f1, n_cm, n_cm ? cm_ty[0] : -1, n_cm && cm_val[0] != 0);
+    check(f1 == 8 && n_cm == 1 && cm_ty[0] == 29 && cm_val[0] != 0, msg);
 
     restore_ping_range();
     print(failures ? "hello476: FAIL\n" : "hello476: PASS\n");
