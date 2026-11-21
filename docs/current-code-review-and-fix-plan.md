@@ -11807,7 +11807,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 宿主机实测（`user/hello478.c -DHOST`，SO_MEMINFO 测得 truesize：短引用 960、完整 IPv4 引用 1280、长 IPv6 引用 2304）：见 user-space.md 中 hello478 一行。宿主机上的 ICMP 限速（`icmp_ratelimit` 1000 ms，突发约 10 个）会限制一秒内到达的差错数，测试在两轮之间停一秒。
 - 修复：`errqueue_policy`：`PAYLOAD_MAX` 64 → 1232，`Entry.len` 改为 u16，新增 `truesize`、`admits`；`Queue` 改为 kmalloc 节点的链表（`pushWith`/`popWith`/`clearWith`，分配器由 `udp.errq_alloc` 提供，另有 1024 条上限）；UDP 和 raw 的入队按套接字的 SO_RCVBUF 判断，端口释放、raw 关闭时清空；`udp.sendPortUnreachable`、`sendPortUnreachableV6` 的引用上限改为 576 − 48、1280 − 88 字节。
 - 快速 smoke：hello390、392、406、445、453、461、478 通过；一次把 hello449 紧接在 hello406 之后跑时它失败（hello406 的分片需要差错把到 127.0.0.1 的路径 MTU 降到 576），按正常顺序跑与 hello478 一起通过，与本改动无关。
-- 已知差异：TCP 套接字仍只保留一条差错（`TcpTcb.errq_entry`）。
+- ~~已知差异：TCP 套接字仍只保留一条差错（`TcpTcb.errq_entry`）~~：核对后不是差异。Linux 的 `tcp_v4_err` 只在 SYN_SENT/SYN_RECV 时调用 `ip_icmp_error` 入队，随后 `tcp_done_with_error` 结束连接；已建立的连接只设 sk_err，不入队（`tcp_v6_err` 同样）。所以一个 TCP 套接字的错误队列最多一条，与这里的单个槽位相同。
 
 ## 补充：brk 堆和栈上的 MADV_DONTFORK、MADV_WIPEONFORK（hello479）
 
