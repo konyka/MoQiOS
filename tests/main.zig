@@ -4679,7 +4679,7 @@ test "multicast outgoing interface: IP_MULTICAST_IF lo sends out lo only, IPV6_M
     const ss = kt.socket_syscall_source;
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "const src_key = "));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "const unreach6 = bind_addr_policy.routeErrno6(dst6, oif6);\n"));
-    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketMeta(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, ifindex, info.ttl, info.tos);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketMetaInfo(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, meta4);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.lo_source, "net_mod.handleRxPacketOn(&buf, n, ifindex);") != null);
 }
 
@@ -16123,7 +16123,7 @@ test "IPv4 UDP receive control messages IP_PKTINFO / IP_RECVTTL / IP_RECVTOS (he
 
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "pub fn handlePacketMeta(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, ifindex: u8, ttl: u8, tos: u8) void {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketMeta(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, ifindex, info.ttl, info.tos);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketMetaInfo(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, meta4);") != null);
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "ip_cmsg_policy.build(ip_cmsg_policy.Wanted.of(opts_ip).withStamp(sol_flags), meta, ctl_cap, &ctl_buf);") != null);
 }
@@ -17495,4 +17495,23 @@ test "net.ipv6.auto_flowlabels: /proc/sys/net/ipv6/auto_flowlabels takes 0..3, a
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "if (v < 0 or v > fp.MAX) return -22;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "} else if (str.eql(rest, \"sys/net/ipv6/auto_flowlabels\")) {") != null);
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello463", true, false).caps.cap_net_admin);
+}
+
+test "received IPv4 options are compiled, and IP_RECVOPTS / IP_RETOPTS report them (ip_rcv_options, ip_cmsg_recv_*opts; hello464)" {
+    const ipo = kt.ip_opt_policy;
+    const one = [4]u8{ 1, 0, 0, 0 };
+    const o = ipo.applySet(.{}, ipo.SOL_IP, ipo.IP_RECVOPTS, &one).ok;
+    try std.testing.expect(o.recvopts);
+    try std.testing.expect(ipo.applySet(.{}, ipo.SOL_IP, ipo.IP_RETOPTS, &one).ok.retopts);
+    const c = kt.ip_cmsg_policy;
+    var info: c.RecvInfo = .{ .optlen = 8, .retlen = 4 };
+    info.opts[0..8].* = .{ 7, 3, 4, 0, 0, 0, 0, 0 };
+    info.retopts[0..4].* = .{ 7, 3, 4, 0 };
+    var out: [128]u8 = undefined;
+    const b = c.build(.{ .recvopts = true, .retopts = true }, info, 128, &out);
+    try std.testing.expectEqual(@as(usize, 48), b.written);
+    try std.testing.expectEqual(@as(i32, 6), std.mem.readInt(i32, out[12..16], .little));
+    try std.testing.expectEqual(@as(u64, 20), std.mem.readInt(u64, out[24..32], .little));
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketMetaInfo(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, meta4);") != null);
+    try std.testing.expect(kt.capability_profile.profileForLaunch("hello464", true, false).caps.cap_net_raw);
 }

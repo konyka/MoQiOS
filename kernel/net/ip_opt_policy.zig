@@ -18,6 +18,8 @@ pub const IP_RECVTTL: u64 = 12;
 pub const IP_RECVTOS: u64 = 13;
 /// ICMP errors about what the socket sent are queued for recvmsg(MSG_ERRQUEUE) (Linux inet RECVERR, errqueue_policy.zig).
 pub const IP_RECVERR: u64 = 11;
+pub const IP_RECVOPTS: u64 = 6;
+pub const IP_RETOPTS: u64 = 7;
 /// recvmsg then brings IP_ORIGDSTADDR, the datagram's destination as a struct sockaddr_in (Linux IP_CMSG_ORIGDSTADDR).
 pub const IP_RECVORIGDSTADDR: u64 = 20;
 /// The same for IPv6: IPV6_ORIGDSTADDR with a struct sockaddr_in6.
@@ -98,6 +100,9 @@ pub const IpOpts = struct {
     recvtos: bool = false,
     origdst: bool = false,
     recverr: bool = false,
+    /// IP_RECVOPTS (6) / IP_RETOPTS (7) as receive switches: a datagram with IPv4 options brings them as control messages.
+    recvopts: bool = false,
+    retopts: bool = false,
     /// IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVTCLASS: the same for a received IPv6 datagram.
     pktinfo6: bool = false,
     recvhops6: bool = false,
@@ -184,6 +189,8 @@ pub fn applySet(cur: IpOpts, level: u64, optname: u64, val: []const u8) SetResul
             IP_RECVTOS => o.recvtos = v != 0,
             IP_RECVORIGDSTADDR => o.origdst = v != 0,
             IP_RECVERR => o.recverr = v != 0,
+            IP_RECVOPTS => o.recvopts = v != 0,
+            IP_RETOPTS => o.retopts = v != 0,
             // ip_sock_set_mtu_discover: DONT..OMIT, anything else EINVAL.
             IP_MTU_DISCOVER => {
                 if (v < PMTUDISC_DONT or v > PMTUDISC_OMIT) return .{ .err = -22 };
@@ -331,6 +338,8 @@ pub fn getValue(o: IpOpts, level: u64, optname: u64) ?i32 {
             IP_RECVTOS => @intFromBool(o.recvtos),
             IP_RECVORIGDSTADDR => @intFromBool(o.origdst),
             IP_RECVERR => @intFromBool(o.recverr),
+            IP_RECVOPTS => @intFromBool(o.recvopts),
+            IP_RETOPTS => @intFromBool(o.retopts),
             IP_MULTICAST_TTL => o.mc4_ttl,
             IP_MULTICAST_LOOP => @intFromBool(o.mc4_loop),
             IP_MULTICAST_ALL => @intFromBool(o.mc4_all),

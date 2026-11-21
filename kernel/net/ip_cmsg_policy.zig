@@ -19,6 +19,12 @@ pub const RecvInfo = struct {
     /// The datagram's destination port (IP_ORIGDSTADDR) and its arrival time on the real-time clock (SO_TIMESTAMP*), in ns.
     dst_port: u16 = 0,
     stamp_ns: u64 = 0,
+    /// The IPv4 options as ip_options_compile left them (IP_RECVOPTS), and what IP_RETOPTS reports (ip_options_echo + undo).
+    optlen: u8 = 0,
+    opts: [40]u8 = @splat(0),
+    retlen: u8 = 0,
+    ret_bad: bool = false,
+    retopts: [40]u8 = @splat(0),
 };
 
 /// Receive timestamps a socket asked for (SO_TIMESTAMP: struct timeval, SO_TIMESTAMPNS: struct timespec).
@@ -30,11 +36,15 @@ pub const Wanted = struct {
     recvtos: bool = false,
     origdst: bool = false,
     stamp: Stamp = .none,
+    /// IP_RECVOPTS / IP_RETOPTS: the received IPv4 options, as they arrived (with this host's additions) and as a reply would
+    /// carry them.
+    recvopts: bool = false,
+    retopts: bool = false,
     /// IPV6_FLOWINFO (rxflow): the received flowinfo, when it is not 0.
     flowinfo: bool = false,
 
     pub fn of(o: ipo.IpOpts) Wanted {
-        return .{ .pktinfo = o.pktinfo, .recvttl = o.recvttl, .recvtos = o.recvtos, .origdst = o.origdst };
+        return .{ .pktinfo = o.pktinfo, .recvttl = o.recvttl, .recvtos = o.recvtos, .origdst = o.origdst, .recvopts = o.recvopts, .retopts = o.retopts };
     }
 
     /// The IPv6 flags in the same slots: IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVTCLASS, IPV6_RECVORIGDSTADDR.
@@ -126,6 +136,11 @@ pub fn build(w: Wanted, info: RecvInfo, cap_in: usize, out: []u8) Built {
         put(out, &used, cap, @intCast(ipo.SOL_IP), @intCast(ipo.IP_TTL), &t, &truncated);
     }
     if (w.recvtos) put(out, &used, cap, @intCast(ipo.SOL_IP), @intCast(ipo.IP_TOS), &.{info.tos}, &truncated);
+    // ip_cmsg_recv_opts / ip_cmsg_recv_retopts (in that order, after IP_TOS): only a datagram that had options.
+    if (w.recvopts and info.optlen != 0) put(out, &used, cap, @intCast(ipo.SOL_IP), IP_RECVOPTS, info.opts[0..info.optlen], &truncated);
+    if (w.retopts and info.optlen != 0) {
+        if (info.ret_bad) truncated = true else put(out, &used, cap, @intCast(ipo.SOL_IP), IP_RETOPTS, info.retopts[0..info.retlen], &truncated);
+    }
     if (w.origdst) {
         // ip_cmsg_recv_dstaddr: a struct sockaddr_in of the header destination and the UDP destination port.
         var sa: [16]u8 = @splat(0);
@@ -230,6 +245,7 @@ pub const Send4Result = union(enum) { ok: Send4, err: i64 };
 pub const SOL_UDP: i32 = 17;
 pub const UDP_SEGMENT: i32 = 103;
 const IP_RETOPTS: i32 = 7;
+const IP_RECVOPTS: i32 = 6;
 const IP_PROTOCOL: i32 = 52;
 const SO_PRIORITY: i32 = 12;
 const SO_MARK: i32 = 36;

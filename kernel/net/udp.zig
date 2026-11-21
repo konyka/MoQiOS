@@ -1219,7 +1219,12 @@ pub fn handlePacketOn(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32,
 
 /// handlePacketOn with the IP header's TTL and TOS, kept with the datagram for IP_RECVTTL / IP_RECVTOS.
 pub fn handlePacketMeta(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, ifindex: u8, ttl: u8, tos: u8) void {
-    const meta: ip_cmsg_policy.RecvInfo = .{ .ifindex = ifindex, .dst = dst_ip, .ttl = ttl, .tos = tos };
+    handlePacketMetaInfo(src_ip, dst_ip, data, len, .{ .ifindex = ifindex, .dst = dst_ip, .ttl = ttl, .tos = tos });
+}
+
+/// handlePacketMeta with everything the IPv4 header gave (its options too, for IP_RECVOPTS / IP_RETOPTS).
+pub fn handlePacketMetaInfo(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, meta: ip_cmsg_policy.RecvInfo) void {
+    const ifindex = meta.ifindex;
     const hdr = udp_util.parseHeader(data, len) orelse return;
 
     // RFC 768: checksum 0 means "no checksum" for IPv4 UDP; verify when present.

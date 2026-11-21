@@ -27,6 +27,10 @@ pub fn init() void {
     icmpv6.startRouterSolicit();
 }
 
+fn isLocal4(a: [4]u8) bool {
+    return netif.isLocal4(a);
+}
+
 pub fn handleRxPacket(data: [*]const u8, len: u32) void {
     handleRxPacketOn(data, len, @intCast(@import("bind_addr_policy.zig").NIC_IFINDEX));
 }
@@ -51,6 +55,22 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
             const info = ipv4.parseHeader(data + 14, len - 14) orelse return;
             const payload_start: u32 = 14 + @as(u32, info.payload_offset);
             if (payload_start + @as(u32, info.payload_len) > len) return;
+            // ip_rcv_options: a header with options is compiled (record route and timestamps get this host's entry); a malformed
+            // option drops the datagram, and so does a source route (accept_source_route 0).
+            var meta4: @import("ip_cmsg_policy.zig").RecvInfo = .{ .ifindex = ifindex, .dst = info.dst_ip, .ttl = info.ttl, .tos = info.tos };
+            if (info.payload_offset > 20) {
+                const iop = @import("ip_options_policy.zig");
+                const n_opt: usize = info.payload_offset - 20;
+                @memcpy(meta4.opts[0..n_opt], data[14 + 20 ..][0..n_opt]);
+                const now_ms: u32 = @intCast((@import("../arch/arch.zig").tsc.nanos() / 1_000_000) % 86_400_000);
+                const c = switch (iop.compile(meta4.opts[0..n_opt], info.dst_ip, now_ms, &isLocal4)) {
+                    .ok => |o| o,
+                    .bad => return,
+                };
+                if (c.srr != null) return;
+                meta4.optlen = @intCast(n_opt);
+                if (iop.echo(meta4.opts[0..n_opt], c, info.src_ip, &meta4.retopts)) |rl| meta4.retlen = @intCast(rl) else meta4.ret_bad = true;
+            }
 
             // Linux raw_local_deliver hands each raw socket of the datagram's protocol a copy (IP header included) before the protocol
             // handler runs.
@@ -64,7 +84,7 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
                     tcp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, info.ecn_ce);
                 },
                 ipv4.PROTO_UDP => {
-                    udp.handlePacketMeta(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, ifindex, info.ttl, info.tos);
+                    udp.handlePacketMetaInfo(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, meta4);
                 },
                 // ip_protocol_deliver_rcu: a protocol with no handler that no raw socket took gets a protocol unreachable.
                 else => if (rp.protoUnreachable(info.protocol, raw_took)) icmp.sendProtoUnreachable(data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip),
