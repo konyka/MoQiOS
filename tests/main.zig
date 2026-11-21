@@ -17758,3 +17758,13 @@ test "ping socket replies carry their arrival time for SO_TIMESTAMP / SO_TIMESTA
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "e.meta.stamp_ns = @import(\"../proc/time_syscall.zig\").wallClockNanos();") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "e.meta6.stamp_ns = @import(\"../proc/time_syscall.zig\").wallClockNanos();") != null);
 }
+
+test "AF_UNIX datagram and seqpacket records carry SO_TIMESTAMP ahead of SCM_CREDENTIALS; streams none (hello477)" {
+    const us = kt.unix_socket_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "        pushStampLocked(peer);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "        const st = popStampLocked(sock);\n") != null);
+    const ss = kt.socket_syscall_source;
+    const st = std.mem.indexOf(u8, ss, "ip_cmsg_policy.build(ip_cmsg_policy.Wanted.withStamp(.{}, uview.opts.flags), .{ .stamp_ns = stamp }") orelse return error.TestUnexpectedResult;
+    const cr = std.mem.indexOf(u8, ss, "const cb = sp.buildCredentials(out.cred.pid, out.cred.uid, out.cred.gid,").?;
+    try std.testing.expect(st < cr);
+}

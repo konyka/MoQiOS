@@ -36,6 +36,8 @@ pub const UNIX_PATH_MAX: u8 = 108;
 pub const SRC_NAMES: u8 = MAX_UNIX_SOCKETS;
 /// The most datagram records the ring can hold (a zero-length datagram is its 2-byte length prefix).
 pub const MAX_RECORDS: u32 = UNIX_SOCK_BUF_SIZE / 2;
+/// Queued records whose arrival time a socket remembers (see UnixSocket.stamps).
+pub const STAMP_RING: u32 = 64;
 /// Index stored for a record from an unbound sender.
 const NO_NAME: u8 = 0xFF;
 
@@ -124,6 +126,13 @@ pub const UnixSocket = struct {
     rec_src: [MAX_RECORDS]u8 = @splat(NO_NAME),
     rec_head: u32 = 0,
     rec_count: u32 = 0,
+    /// Arrival times of the oldest STAMP_RING queued records (DGRAM and SEQPACKET), for SO_TIMESTAMP: record n (counting every
+    /// record ever queued) is in stamps[n % STAMP_RING] when fewer than STAMP_RING were queued ahead of it; a record without one is
+    /// stamped when it is read (sock_recv_timestamp takes the current time for an skb that has none).
+    stamps: [STAMP_RING]u64 = @splat(0),
+    stamp_valid: [STAMP_RING]bool = @splat(false),
+    stamp_head: u32 = 0,
+    stamp_tail: u32 = 0,
     /// Credentials of whoever sent the bytes now in this socket's ring (the
     /// latest sender); delivered by recvmsg when SO_PASSCRED is set.
     sender_cred: @import("sockopt_policy.zig").Cred = .{},
@@ -246,6 +255,8 @@ pub const RightsOut = struct {
     full_len: usize = 0,
     /// Bound name of the datagram's sender (len 0: unbound, or not remembered).
     src: SrcName = .{},
+    /// When the record just read was queued (wall clock ns), 0 when not remembered.
+    stamp_ns: u64 = 0,
     count: usize = 0,
     descs: [MAX_RIGHTS_FDS]vfs.FileDescriptor = undefined,
 };
@@ -1007,6 +1018,7 @@ pub fn unixSendRightsTo(idx: u32, data: [*]const u8, len: usize, rights: ?*Right
 
         peer.sender_cred = if (rights) |r| (r.cred_override orelse currentSenderCred()) else currentSenderCred();
         if (sock.sock_type == SOCK_DGRAM) pushSrcNameLocked(peer, sock);
+        pushStampLocked(peer);
         // Write data
         ringWrite(&peer.buffer, peer.buf_write, data, len);
         peer.buf_write = (peer.buf_write + @as(u32, @intCast(len))) % UNIX_SOCK_BUF_SIZE;
@@ -1053,6 +1065,37 @@ fn pushSrcNameLocked(peer: *UnixSocket, sender: *const UnixSocket) void {
     }
     peer.rec_src[(peer.rec_head + peer.rec_count) % MAX_RECORDS] = slot;
     peer.rec_count += 1;
+}
+
+/// Remember when the record just queued on `peer` arrived (unix_lock held).
+fn pushStampLocked(peer: *UnixSocket) void {
+    if (peer.stamp_tail -% peer.stamp_head < STAMP_RING) {
+        const at = peer.stamp_tail % STAMP_RING;
+        peer.stamps[at] = @import("../proc/time_syscall.zig").wallClockNanos();
+        peer.stamp_valid[at] = true;
+    }
+    peer.stamp_tail +%= 1;
+}
+
+/// The arrival time of the record being read from `sock`, or 0 (unix_lock held).
+fn popStampLocked(sock: *UnixSocket) u64 {
+    if (sock.stamp_head == sock.stamp_tail) return 0;
+    const at = sock.stamp_head % STAMP_RING;
+    const v = if (sock.stamp_valid[at]) sock.stamps[at] else 0;
+    sock.stamp_valid[at] = false;
+    sock.stamp_head +%= 1;
+    return v;
+}
+
+/// The arrival time of the next record on `idx` without taking it (MSG_PEEK), or 0.
+pub fn unixHeadStamp(idx: u32) u64 {
+    if (idx >= MAX_UNIX_SOCKETS) return 0;
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    const sock = &unix_sockets[idx];
+    if (!sock.active or sock.stamp_head == sock.stamp_tail) return 0;
+    const at = sock.stamp_head % STAMP_RING;
+    return if (sock.stamp_valid[at]) sock.stamps[at] else 0;
 }
 
 fn popSrcNameLocked(sock: *UnixSocket) SrcName {
@@ -1249,6 +1292,8 @@ pub fn unixRecvRights(idx: u32, buf: [*]u8, len_in: usize, out: ?*RightsOut) i64
             const src = popSrcNameLocked(sock);
             if (out) |o| o.src = src;
         }
+        const st = popStampLocked(sock);
+        if (out) |o| o.stamp_ns = st;
         if (discard > 0) {
             const actual_discard = @min(discard, sock.buf_count);
             sock.buf_read = (sock.buf_read + @as(u32, @intCast(actual_discard))) % UNIX_SOCK_BUF_SIZE;

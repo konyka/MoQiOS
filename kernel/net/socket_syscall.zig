@@ -1801,6 +1801,7 @@ fn unixRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8
         }
         out.full_len = full;
         out.cred = net_mod.unix_socket.unixSenderCred(idx);
+        out.stamp_ns = net_mod.unix_socket.unixHeadStamp(idx);
     } else {
         // Always ask for the set: a receiver without a control buffer still must
         // learn (MSG_CTRUNC) that descriptors were dropped.
@@ -1853,13 +1854,22 @@ fn unixRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8
     var out_flags: u32 = 0;
     var written: usize = 0;
     var ctl_buf: [256]u8 = undefined;
-    const pass_cred = (net_mod.unix_socket.unixOptView(idx) orelse return -9).opts.flags & 32 != 0;
+    const uview = net_mod.unix_socket.unixOptView(idx) orelse return -9;
+    // sock_recv_cmsgs before scm_recv_unix: a datagram or seqpacket record's SO_TIMESTAMP(NS) (and SO_RCVMARK / SO_RCVPRIORITY,
+    // both 0 for AF_UNIX) come ahead of the credentials and descriptors. A stream socket has none (unix_stream_read_generic).
+    if (!uview.stream) {
+        const stamp = if (out.stamp_ns != 0) out.stamp_ns else @import("../proc/time_syscall.zig").wallClockNanos();
+        const sb = ip_cmsg_policy.build(ip_cmsg_policy.Wanted.withStamp(.{}, uview.opts.flags), .{ .stamp_ns = stamp }, if (want_ctl) @intCast(@min(ctl_len, 256)) else 0, &ctl_buf);
+        written = sb.written;
+        if (sb.truncated) out_flags |= sp.MSG_CTRUNC;
+    }
+    const pass_cred = uview.opts.flags & 32 != 0;
     if (pass_cred) {
-        const cb = sp.buildCredentials(out.cred.pid, out.cred.uid, out.cred.gid, if (want_ctl) @intCast(@min(ctl_len, 256)) else 0, &ctl_buf);
+        const cb = sp.buildCredentials(out.cred.pid, out.cred.uid, out.cred.gid, if (want_ctl) @intCast(@min(ctl_len, 256) -| written) else 0, ctl_buf[written..]);
         if (cb.truncated) {
             out_flags |= sp.MSG_CTRUNC;
         } else {
-            written = cb.written;
+            written += cb.written;
         }
     }
 
