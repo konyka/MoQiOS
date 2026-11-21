@@ -17723,3 +17723,10 @@ test "SO_RCVMARK and SO_RCVPRIORITY: recvmsg reports the datagram's mark and pri
     try std.testing.expectEqual(@as(?u32, 7), c.parseSend4(&cm, .{ .net_admin = true }).ok.mark);
     try std.testing.expect(std.mem.indexOf(u8, kt.lo_source, "mark: u32 = 0,") != null);
 }
+
+test "a UDP socket's datagrams come out in arrival order whichever queue slot each took (hello473)" {
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "fn oldestLocked(port_idx: usize, fam: Fam) ?*UdpEntry {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    rx_seq += 1;\n    e.order = rx_seq;\n") != null);
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, us, "oldestLocked(port_idx, "));
+}

@@ -64,6 +64,9 @@ const UdpEntry = struct {
     data: [MAX_UDP_PAYLOAD]u8,
     /// Not null: the datagram is in this buffer instead of `data` (udp_lock).
     big: ?*BigBuf = null,
+    /// Arrival order (rx_seq when it was queued): readers take the oldest valid entry, so datagrams come out in the order they came
+    /// in, whichever slot each landed in (sk_receive_queue is a FIFO).
+    order: u64 = 0,
     valid: bool,
     is_v6: bool,
     /// Interface, header destination, TTL and TOS of an IPv4 datagram (IP_PKTINFO / IP_RECVTTL / IP_RECVTOS).
@@ -103,6 +106,24 @@ var udp_lock: IrqSpinlock = .{};
 /// Store `payload` in queue entry `e` of the socket in slot `port_idx` (udp_lock held): in `data` when it fits, else in a big buffer of
 /// its own. False when the socket's receive buffer has no room for it (__udp_enqueue_schedule_skb: rmem + truesize past SO_RCVBUF,
 /// unless the queue is empty) or no memory is to be had: the datagram is dropped, as Linux drops it.
+/// Arrival counter for UdpEntry.order (udp_lock).
+var rx_seq: u64 = 0;
+
+/// Which queued datagrams a reader looks at.
+const Fam = enum { any, v4, v6 };
+
+/// The oldest valid entry of slot `port_idx` of family `fam` (udp_lock held), or null.
+fn oldestLocked(port_idx: usize, fam: Fam) ?*UdpEntry {
+    var best: ?*UdpEntry = null;
+    for (&queues[port_idx]) |*e| {
+        if (!e.valid) continue;
+        if (fam == .v4 and e.is_v6) continue;
+        if (fam == .v6 and !e.is_v6) continue;
+        if (best == null or e.order < best.?.order) best = e;
+    }
+    return best;
+}
+
 fn fillEntryLocked(port_idx: usize, e: *UdpEntry, payload: []const u8) bool {
     const rp = @import("udp_rmem_policy.zig");
     if (!rp.admits(queueRmemLocked(port_idx), rp.truesize(payload.len), port_opts[port_idx].rcvbuf)) return false;
@@ -116,6 +137,8 @@ fn fillEntryLocked(port_idx: usize, e: *UdpEntry, payload: []const u8) bool {
         @memcpy(b.bytes()[0..payload.len], payload);
     }
     e.data_len = @intCast(payload.len);
+    rx_seq += 1;
+    e.order = rx_seq;
     return true;
 }
 
@@ -1061,10 +1084,7 @@ pub fn hasQueuedDatagramFor(port: u32, is_v6: bool) bool {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const port_idx = findPortIdxLocked(port) orelse return false;
-    for (0..QUEUE_DEPTH) |i| {
-        if (queues[port_idx][i].valid and queues[port_idx][i].is_v6 == is_v6) return true;
-    }
-    return false;
+    return oldestLocked(port_idx, if (is_v6) .v6 else .v4) != null;
 }
 
 /// True when a datagram is queued for `port` (epoll readiness).
@@ -1084,11 +1104,8 @@ pub fn nextDatagramLen(port: u32, is_v6: bool) u32 {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const port_idx = findPortIdxLocked(port) orelse return 0;
-    for (0..QUEUE_DEPTH) |i| {
-        const entry = &queues[port_idx][i];
-        if (entry.valid and entry.is_v6 == is_v6) return entry.data_len;
-    }
-    return 0;
+    const entry = oldestLocked(port_idx, if (is_v6) .v6 else .v4) orelse return 0;
+    return entry.data_len;
 }
 
 /// J1: the socket choice and the queue insert share one critical section.
@@ -1401,20 +1418,15 @@ pub fn recvFromMeta(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8,
 
     // J1: lookup and dequeue in one critical section (see enqueue).
     const port_idx = findPortIdxLocked(port) orelse return 0;
-    for (0..QUEUE_DEPTH) |i| {
-        const entry = &queues[port_idx][i];
-        if (entry.valid and !entry.is_v6) {
-            const n = @min(entry.data_len, out_len);
-            @memcpy(out_buf[0..n], entryBytes(entry)[0..n]);
-            out_src_ip.* = entry.src_ip[0..4].*;
-            out_src_port.* = entry.src_port;
-            out_full_len.* = entry.data_len;
-            out_meta.* = entry.meta;
-            if (!peek) dropEntryLocked(entry);
-            return n;
-        }
-    }
-    return 0;
+    const entry = oldestLocked(port_idx, .v4) orelse return 0;
+    const n = @min(entry.data_len, out_len);
+    @memcpy(out_buf[0..n], entryBytes(entry)[0..n]);
+    out_src_ip.* = entry.src_ip[0..4].*;
+    out_src_port.* = entry.src_port;
+    out_full_len.* = entry.data_len;
+    out_meta.* = entry.meta;
+    if (!peek) dropEntryLocked(entry);
+    return n;
 }
 
 /// A big datagram taken off the queue for copy-out: its buffer stays allocated until releaseBig, so recvfrom / recvmsg can
@@ -1427,9 +1439,8 @@ pub fn takeBig(port: u32, out_src_ip: *[4]u8, out_src_port: *u16, peek: bool, ou
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const port_idx = findPortIdxLocked(port) orelse return null;
-    for (0..QUEUE_DEPTH) |i| {
-        const entry = &queues[port_idx][i];
-        if (!(entry.valid and !entry.is_v6)) continue;
+    {
+        const entry = oldestLocked(port_idx, .v4) orelse return null;
         const b = entry.big orelse return null;
         out_src_ip.* = entry.src_ip[0..4].*;
         out_src_port.* = entry.src_port;
@@ -1452,9 +1463,8 @@ pub fn takeBig6(port: u32, out_src_ip: *[16]u8, out_src_port: *u16, peek: bool, 
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const port_idx = findPortIdxLocked(port) orelse return null;
-    for (0..QUEUE_DEPTH) |i| {
-        const entry = &queues[port_idx][i];
-        if (!(entry.valid and entry.is_v6)) continue;
+    {
+        const entry = oldestLocked(port_idx, .v6) orelse return null;
         const b = entry.big orelse return null;
         out_src_ip.* = entry.src_ip;
         out_src_port.* = entry.src_port;
@@ -1505,18 +1515,15 @@ pub fn recvFromV6Meta(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[16]
     defer udp_lock.release(saved);
 
     const port_idx = findPortIdxLocked(port) orelse return 0;
-    for (0..QUEUE_DEPTH) |i| {
-        const entry = &queues[port_idx][i];
-        if (entry.valid and entry.is_v6) {
-            const n = @min(entry.data_len, out_len);
-            @memcpy(out_buf[0..n], entry.data[0..n]);
-            out_src_ip.* = entry.src_ip;
-            out_src_port.* = entry.src_port;
-            out_full_len.* = entry.data_len;
-            out_meta6.* = entry.meta6;
-            if (!peek) dropEntryLocked(entry);
-            return n;
-        }
+    if (oldestLocked(port_idx, .v6)) |entry| {
+        const n = @min(entry.data_len, out_len);
+        @memcpy(out_buf[0..n], entry.data[0..n]);
+        out_src_ip.* = entry.src_ip;
+        out_src_port.* = entry.src_port;
+        out_full_len.* = entry.data_len;
+        out_meta6.* = entry.meta6;
+        if (!peek) dropEntryLocked(entry);
+        return n;
     }
     return 0;
 }
