@@ -4322,7 +4322,7 @@ test "a frame the full loopback queue refuses is a loss, not a failed send (hell
     try std.testing.expect(!lo.dropIsLoss(0));
     try std.testing.expect(!lo.dropIsLoss(lo.MAX_FRAME + 1));
     // Both UDP loopback send paths report such a drop as sent (Linux sendto on lo never fails for a full receiver).
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.udp_source, "lo.sendNow(&send_pkt, frame_len) or lo.dropIsLoss(frame_len)"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.udp_source, "(&send_pkt, frame_len, skbMeta(src_key, skb_ov)) or lo.dropIsLoss(frame_len)"));
     // Both TCP connect paths keep a loopback connection whose SYN was dropped: the retransmit timer resends it.
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (!synLostOnLoopback(tcb, netif.isLocal4(remote_ip))) {") != null);
@@ -4515,7 +4515,7 @@ test "IPv6 UDP multicast: IPV6_MULTICAST_* options, group membership, member-onl
     try std.testing.expectEqual(@as(u8, 1), m.outInterface(1));
 
     const us = kt.udp_source;
-    try std.testing.expect(std.mem.indexOf(u8, us, "    if (mcast.isMulticast(dst_ip)) {\n        enqueueMcast(hdr.dst_port, src_ip, hdr.src_port, dst_ip, data[8..][0..actual_payload], ifindex, meta6);\n        return;\n    }\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    if (mcast.isMulticast(dst_ip)) {\n        enqueueMcast(hdr.dst_port, src_ip, hdr.src_port, dst_ip, data[8..][0..actual_payload], meta6.ifindex, meta6);\n        return;\n    }\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "        if (!mcast.alwaysJoined(group) and !hostJoinedLocked(group, ifindex)) return;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "            if (!mcast.socketAccepts(&port_mc[i], port_opts[i].ip.mc_all, group)) continue;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    if (group) send_pkt[14 + 7] = opts.mc_hops;\n") != null);
@@ -4681,7 +4681,7 @@ test "multicast outgoing interface: IP_MULTICAST_IF lo sends out lo only, IPV6_M
 
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "    const via_lo = loopback or (group and out_if == lo.IFINDEX);\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "    const ok = if (via_lo) lo.sendNow(&send_pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "    const ok = if (via_lo) lo.sendNowMeta(&send_pkt, frame_len, skbMeta(src_key, skb_ov)) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    const our_ip = if (mcast.multicastSource4(group, bound, opts4.mc4_addr)) |a| a else ") != null);
     // Options come from the sending socket's own registry key, not from whichever socket first holds the port.
     try std.testing.expect(std.mem.indexOf(u8, us, "    var opts4: ip_opt_policy.IpOpts = if (getPortOpts(src_key)) |po| po.ip else .{};\n") != null);
@@ -4691,7 +4691,7 @@ test "multicast outgoing interface: IP_MULTICAST_IF lo sends out lo only, IPV6_M
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "const src_key = "));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "const unreach6 = bind_addr_policy.routeErrno6(dst6, oif6);\n"));
     try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketMetaInfo(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, meta4);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.lo_source, "net_mod.handleRxPacketOn(&buf, n, ifindex);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.lo_source, "net_mod.handleRxPacketMeta(&buf, n, ifindex, meta);") != null);
 }
 
 test "IPv6 bind ties a link-scoped socket to its sin6_scope_id interface: separate ports per interface, receive filter, getsockname scope, no stream multicast bind (hello364)" {
@@ -4759,7 +4759,7 @@ test "IPv6 bind ties a link-scoped socket to its sin6_scope_id interface: separa
     const stream_at = std.mem.indexOf(u8, ss, "const stream_rc = bind_addr_policy.streamBindErrno6(parsed.addr);").?;
     try std.testing.expect(stream_at < std.mem.indexOfPos(u8, ss, stream_at, "inet6ScopeErrno(parsed.addr").?);
     try std.testing.expect(std.mem.indexOf(u8, ss, "sa.writeInet6(&sa_buf, name_port, our6, sa.boundScope6(our6, udp.boundDev6(desc.udpKey())))") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketV6Meta(info6.src_ip, info6.dst_ip, data + up_start, up_len, ifindex,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketV6Info(info6.src_ip, info6.dst_ip, data + up_start, up_len, .{ .ifindex = ifindex,") != null);
 }
 
 test "IPv6 send interface: sendto's sin6_scope_id, the bound interface and IPV6_MULTICAST_IF pick it, lo carries only ::1; connect ties a scoped peer's interface (hello365)" {
@@ -5263,7 +5263,7 @@ test "an IPv6 UDP datagram leaves from its socket's bound address; NDP is sent a
     try std.testing.expect(std.mem.indexOf(u8, us, "    const our_ip = @import(\"tcp_port_policy.zig\").sourceAddr6(bound, dst_ip, if (is_loop) dst_ip else ndp.selectSourceAddress(dst_ip, our_mac));\n") != null);
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (udp.sendToV6FromOv(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, oif6, &tmp6, @intCast(n6), null, null, sndFlow6(src_key, flow6))) {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ss, "return if (udp.sendToV6FromOv(src6, dst6, dst_port6, src_key, oif6, payload.ptr, @intCast(n6), ov6.hops, ov6.tclass, flow)) @intCast(n6) else -1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "return if (udp.sendToV6FromSkb(src6, dst6, dst_port6, src_key, oif6, payload.ptr, @intCast(n6), ov6.hops, ov6.tclass, flow, .{ .mark = ov6.mark, .priority = ov6.priority })) @intCast(n6) else -1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "udp.sendToV6(dst6") == null);
     const iv = kt.icmpv6_source;
     try std.testing.expect(std.mem.indexOf(u8, iv, "pub const NDP_HOP_LIMIT: u8 = 255;\n") != null);
@@ -5433,7 +5433,7 @@ test "a UDP socket keeps its bound IPv4 address: getsockname and the datagram so
     try std.testing.expect(std.mem.indexOf(u8, ss, "const our4 = net_mod.tcp_port_policy.nameAddr(desc.udp_local_ip, desc.udp_connected, desc.udp_dst_ip, netif.getOurIp());") != null);
     // Two calls since hello452: the frame-sized copy and the kmalloc-staged datagram that will be fragmented.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "udp.sendToFrom("));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "udp.sendToFromOv("));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "udp.sendToFromSkb("));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ss, "udp.sendTo("));
     const p = kt.tcp_port_policy;
     try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, p.nameAddr(.{ 0, 0, 0, 0 }, false, .{ 0, 0, 0, 0 }, .{ 10, 0, 2, 15 }));
@@ -14605,7 +14605,7 @@ test "udp (hello388): the socket table holds 256 sockets and a port's sharers ge
 
 test "lo (hello388): a UDP loopback send is delivered at once, so a burst cannot leave the queue full for the next datagram" {
     const ls = kt.lo_source;
-    try std.testing.expect(std.mem.indexOf(u8, ls, "pub fn sendNow(data: [*]const u8, len: u32) bool {\n    if (!sendPacket(data, len)) {\n        _ = drain();\n        if (!sendPacket(data, len)) return false;\n    }\n    _ = drain();\n    return true;\n}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ls, "pub fn sendNowMeta(data: [*]const u8, len: u32, meta: Meta) bool {\n    if (!sendPacketMeta(data, len, IFINDEX, meta)) {\n        _ = drain();\n        if (!sendPacketMeta(data, len, IFINDEX, meta)) return false;\n    }\n    _ = drain();\n    return true;\n}") != null);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, kt.udp_source, "lo.sendPacket(&send_pkt, frame_len) or"));
 }
 
@@ -16175,7 +16175,7 @@ test "IPv6 UDP receive control messages IPV6_RECVPKTINFO / IPV6_RECVHOPLIMIT / I
     try std.testing.expectEqual(c.Wanted{ .pktinfo = true, .recvttl = false, .recvtos = true }, c.Wanted.of6(o));
 
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "pub fn handlePacketV6Meta(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32, ifindex: u8, hops: u8, tclass: u8, flowinfo: u32) void {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketV6Meta(info6.src_ip, info6.dst_ip, data + up_start, up_len, ifindex, info6.hop_limit, info6.tclass, info6.flowinfo);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketV6Info(info6.src_ip, info6.dst_ip, data + up_start, up_len, .{ .ifindex = ifindex, .dst = info6.dst_ip, .hops = info6.hop_limit, .tclass = info6.tclass, .flowinfo = info6.flowinfo, .mark = skb.mark, .priority = skb.priority });") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "ip_cmsg_policy.build6(ip_cmsg_policy.Wanted.of6(opts_ip).withStamp(sol_flags), meta6, ctl_cap, &ctl_buf)") != null);
 }
 
@@ -16591,7 +16591,7 @@ test "ping socket recvmsg control messages IP_PKTINFO / IP_TTL / IP_TOS and the 
     try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1, 127, 0, 0, 1 }, out[20..28]);
     // The IP layer's values reach the ping socket's queue entry.
     const m = kt.net_mod_source;
-    try std.testing.expect(std.mem.indexOf(u8, m, "var meta4: @import(\"ip_cmsg_policy.zig\").RecvInfo = .{ .ifindex = ifindex, .dst = info.dst_ip, .ttl = info.ttl, .tos = info.tos };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "var meta4: @import(\"ip_cmsg_policy.zig\").RecvInfo = .{ .ifindex = ifindex, .dst = info.dst_ip, .ttl = info.ttl, .tos = info.tos, .mark = skb.mark, .priority = skb.priority };") != null);
     try std.testing.expect(std.mem.indexOf(u8, m, "icmp.handlePacketMeta(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, meta4);") != null);
     try std.testing.expect(std.mem.indexOf(u8, m, "icmpv6.handlePacketMeta(info6.src_ip, info6.dst_ip, data + up_start, up_len, .{ .ifindex = ifindex, .dst = info6.dst_ip, .hops = info6.hop_limit, .tclass = info6.tclass });") != null);
     const us = kt.udp_source;
@@ -17169,7 +17169,7 @@ test "IPv4 reassembly is wired in: fragments go to ip_frag, big datagrams to a U
 test "IPv4 UDP datagrams over the MTU leave in fragments (hello452)" {
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "fn sendFragmented4(") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "return sendFragmented4(our_ip, dst_ip, dst_port, src_key, data[0..data_len], opts4, ttl_ov, group, mtu, dst_mac, our_mac, via_lo, wait_hop, built[0..optlen]);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "return sendFragmented4(our_ip, dst_ip, dst_port, src_key, data[0..data_len], opts4, ttl_ov, group, mtu, dst_mac, our_mac, via_lo, wait_hop, built[0..optlen], skbMeta(src_key, skb_ov));") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "const piece = frag.pieceLen(mtu, hl);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "const big = bigStage(len) orelse return -105;") != null);
 }
@@ -17694,4 +17694,32 @@ test "big UDP and raw datagrams take kmalloc buffers bounded by SO_RCVBUF; reass
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, rs, "if (!@import(\"udp_rmem_policy.zig\").rawAdmits(queueRmem(s), s.opts.rcvbuf)) continue;"));
     try std.testing.expectEqual(@as(usize, 64), kt.ip_frag_policy.QUEUES);
     try std.testing.expect(std.mem.indexOf(u8, kt.ip_frag_source, "fn releaseIdle() void {") != null);
+}
+
+test "SO_RCVMARK and SO_RCVPRIORITY: recvmsg reports the datagram's mark and priority after the timestamp (hello472)" {
+    const sp = kt.sockopt_policy;
+    var st: sp.Stored = .{};
+    try std.testing.expectEqual(@as(i64, 0), sp.applySet(&st, sp.SO_RCVMARK, &.{ 1, 0, 0, 0 }));
+    try std.testing.expectEqual(@as(i64, 0), sp.applySet(&st, sp.SO_RCVPRIORITY, &.{ 1, 0, 0, 0 }));
+    var o: [16]u8 = undefined;
+    _ = sp.encodeGet(st, .{ .id = sp.identity(.udp, false) }, sp.SO_RCVMARK, &o).?;
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, o[0..4], .little));
+    const c = kt.ip_cmsg_policy;
+    var out: [128]u8 = undefined;
+    const w = c.Wanted.of(.{}).withStamp(st.flags);
+    try std.testing.expect(w.rcvmark and w.rcvprio);
+    const b = c.build(w, .{ .mark = 9, .priority = 4 }, 128, &out);
+    try std.testing.expectEqual(@as(usize, 48), b.written);
+    try std.testing.expectEqual(@as(i32, 36), std.mem.readInt(i32, out[12..16], .little));
+    try std.testing.expectEqual(@as(u32, 9), std.mem.readInt(u32, out[16..20], .little));
+    try std.testing.expectEqual(@as(i32, 12), std.mem.readInt(i32, out[24 + 12 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 4), std.mem.readInt(u32, out[24 + 16 ..][0..4], .little));
+    // The SOL_SOCKET send messages are kept for the datagram.
+    var cm: [24]u8 = @splat(0);
+    std.mem.writeInt(u64, cm[0..8], 20, .little);
+    std.mem.writeInt(i32, cm[8..12], 1, .little);
+    std.mem.writeInt(i32, cm[12..16], 36, .little);
+    std.mem.writeInt(u32, cm[16..20], 7, .little);
+    try std.testing.expectEqual(@as(?u32, 7), c.parseSend4(&cm, .{ .net_admin = true }).ok.mark);
+    try std.testing.expect(std.mem.indexOf(u8, kt.lo_source, "mark: u32 = 0,") != null);
 }

@@ -33,6 +33,9 @@ pub const SO_TIMESTAMPNS: u64 = 35;
 pub const TS_FLAG: u16 = 128;
 pub const TSNS_FLAG: u16 = 256;
 pub const SO_ACCEPTCONN: u64 = 30;
+/// SOCK_RCVMARK / SOCK_RCVPRIORITY: recvmsg reports the datagram's mark and priority (sock_recv_mark, sock_recv_priority).
+pub const SO_RCVMARK: u64 = 75;
+pub const SO_RCVPRIORITY: u64 = 82;
 pub const SO_MARK: u64 = 36;
 pub const SO_PROTOCOL: u64 = 38;
 pub const SO_DOMAIN: u64 = 39;
@@ -90,6 +93,8 @@ pub fn flagBit(optname: u64) ?u16 {
         SO_DEBUG => 16,
         SO_PASSCRED => 32,
         SO_OOBINLINE => 64,
+        SO_RCVMARK => 512,
+        SO_RCVPRIORITY => 1024,
         else => null,
     };
 }

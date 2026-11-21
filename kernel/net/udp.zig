@@ -1331,7 +1331,11 @@ pub fn handlePacketV6On(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: 
 /// handlePacketV6On with the IPv6 header's hop limit and traffic class, kept with the datagram for IPV6_RECVHOPLIMIT /
 /// IPV6_RECVTCLASS (and the destination and interface for IPV6_RECVPKTINFO).
 pub fn handlePacketV6Meta(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32, ifindex: u8, hops: u8, tclass: u8, flowinfo: u32) void {
-    const meta6: ip_cmsg_policy.RecvInfo6 = .{ .ifindex = ifindex, .dst = dst_ip, .hops = hops, .tclass = tclass, .flowinfo = flowinfo };
+    handlePacketV6Info(src_ip, dst_ip, data, len, .{ .ifindex = ifindex, .dst = dst_ip, .hops = hops, .tclass = tclass, .flowinfo = flowinfo });
+}
+
+/// handlePacketV6Meta with the whole RecvInfo6 (the frame's mark and priority too).
+pub fn handlePacketV6Info(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32, meta6: ip_cmsg_policy.RecvInfo6) void {
     const hdr = udp_util.parseHeader(data, len) orelse return;
     if (hdr.udp_len < udp_util.HEADER_LEN or hdr.udp_len > len) return;
 
@@ -1345,7 +1349,7 @@ pub fn handlePacketV6Meta(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len
     const actual_payload = hdr.payload_len;
     if (8 + @as(u32, actual_payload) > len) return;
     if (mcast.isMulticast(dst_ip)) {
-        enqueueMcast(hdr.dst_port, src_ip, hdr.src_port, dst_ip, data[8..][0..actual_payload], ifindex, meta6);
+        enqueueMcast(hdr.dst_port, src_ip, hdr.src_port, dst_ip, data[8..][0..actual_payload], meta6.ifindex, meta6);
         return;
     }
     const bound = enqueue(hdr.dst_port, src_ip, hdr.src_port, hdr.dst_port, .{ 0, 0, 0, 0 }, dst_ip, data[8..][0..actual_payload], true, .{}, meta6);
@@ -1551,6 +1555,20 @@ pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, data
 /// sendToFrom with sendmsg's IP_TTL / IP_TOS control messages: `ttl_ov` and `tos_ov` replace the socket's values for this datagram
 /// (Linux cork->ttl / cork->tos; the TTL replaces IP_MULTICAST_TTL too, and the TOS is the whole byte, ECN bits included).
 pub fn sendToFromOv(bound: [4]u8, dst_ip_in: [4]u8, dst_port: u16, src_key: u32, data: [*]const u8, data_len: u16, ttl_ov: ?u8, tos_ov: ?u8, opts_ov: ?@import("ip_options_policy.zig").SendOpts) bool {
+    return sendToFromSkb(bound, dst_ip_in, dst_port, src_key, data, data_len, ttl_ov, tos_ov, opts_ov, .{});
+}
+
+/// SO_MARK / SO_PRIORITY control messages of one sendmsg (sockc.mark, sockc.priority): null keeps the socket's.
+pub const SkbOv = struct { mark: ?u32 = null, priority: ?u32 = null };
+
+/// The mark and priority a datagram of the socket with key `src_key` leaves with (skb->mark, skb->priority).
+fn skbMeta(src_key: u32, ov: SkbOv) lo.Meta {
+    const po = getPortOpts(src_key) orelse @import("sockopt_policy.zig").Stored{};
+    return .{ .mark = ov.mark orelse po.mark, .priority = ov.priority orelse @as(u32, @bitCast(po.priority)) };
+}
+
+/// sendToFromOv with sendmsg's SO_MARK / SO_PRIORITY control messages.
+pub fn sendToFromSkb(bound: [4]u8, dst_ip_in: [4]u8, dst_port: u16, src_key: u32, data: [*]const u8, data_len: u16, ttl_ov: ?u8, tos_ov: ?u8, opts_ov: ?@import("ip_options_policy.zig").SendOpts, skb_ov: SkbOv) bool {
     if (data_len > MAX_UDP_PAYLOAD_BIG) return false;
     // The IP options of this datagram: an IP_RETOPTS control message's, else the socket's IP_OPTIONS (ipc.opt / inet->inet_opt).
     const iop = @import("ip_options_policy.zig");
@@ -1604,7 +1622,7 @@ pub fn sendToFromOv(bound: [4]u8, dst_ip_in: [4]u8, dst_port: u16, src_key: u32,
         // ip_fragment: every piece carries the header with its options; the first all of them, the rest only the copied ones.
         var built: [40]u8 = @splat(0);
         if (ipopts) |so| iop.build(so, our_ip, dst_ip_in, iop.msSinceMidnight(@import("../proc/time_syscall.zig").wallClockNanos()), &built);
-        return sendFragmented4(our_ip, dst_ip, dst_port, src_key, data[0..data_len], opts4, ttl_ov, group, mtu, dst_mac, our_mac, via_lo, wait_hop, built[0..optlen]);
+        return sendFragmented4(our_ip, dst_ip, dst_port, src_key, data[0..data_len], opts4, ttl_ov, group, mtu, dst_mac, our_mac, via_lo, wait_hop, built[0..optlen], skbMeta(src_key, skb_ov));
     }
 
     // Stack-local frame buffer: concurrent sends on other CPUs must not tear it.
@@ -1649,7 +1667,7 @@ pub fn sendToFromOv(bound: [4]u8, dst_ip_in: [4]u8, dst_port: u16, src_key: u32,
         return true;
     }
 
-    const ok = if (via_lo) lo.sendNow(&send_pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);
+    const ok = if (via_lo) lo.sendNowMeta(&send_pkt, frame_len, skbMeta(src_key, skb_ov)) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.
     if (ok) ipv4.noteFullSizeSend(dst_ip, ipv4.HEADER_LEN + udp_total);
     return ok;
@@ -1658,7 +1676,7 @@ pub fn sendToFromOv(bound: [4]u8, dst_ip_in: [4]u8, dst_port: u16, src_key: u32,
 /// ip6_fragment for a UDP datagram over `mtu`: the UDP datagram (header and checksum included) is cut into pieces of (mtu - 40 - 8)
 /// rounded down to 8 bytes, each behind the IPv6 header (next header 44) and a Fragment header (next header UDP, the offset, M on all
 /// but the last, one id for the whole datagram). The datagram is staged in a kmalloc buffer.
-fn sendFragmented6(our_ip: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, oif: u8, payload: []const u8, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, is_loop: bool, wait_hop6: ?[16]u8, hops_ov: ?u8, tclass_ov: ?u8, flow_ov: ?u32) bool {
+fn sendFragmented6(our_ip: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, oif: u8, payload: []const u8, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, is_loop: bool, wait_hop6: ?[16]u8, hops_ov: ?u8, tclass_ov: ?u8, flow_ov: ?u32, skb: lo.Meta) bool {
     _ = oif;
     const slab = @import("../mm/slab.zig");
     const total: usize = 8 + payload.len;
@@ -1701,7 +1719,7 @@ fn sendFragmented6(our_ip: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, 
         if (wait_hop6) |hop| {
             @import("ndp_queue.zig").queueFrame(hop, &pkt, frame_len);
         } else {
-            const ok = if (is_loop) lo.sendNow(&pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt, frame_len);
+            const ok = if (is_loop) lo.sendNowMeta(&pkt, frame_len, skb) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt, frame_len);
             if (!ok) all_ok = false;
         }
         off += n;
@@ -1741,7 +1759,7 @@ pub fn autoFlowLabel(src: [16]u8, dst: [16]u8, sport: u16, dport: u16, proto: u8
 /// cut into pieces of ip_frag_policy.pieceLen bytes, each behind its own IPv4 header with the datagram's id, MF on all but the last,
 /// the offset in 8-byte units, DF clear. Each piece is sent as sendToFromOv sends a frame. The whole datagram is staged in a kmalloc
 /// buffer (up to 65515 bytes), not on the kernel stack.
-fn sendFragmented4(our_ip: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, payload: []const u8, opts4: ip_opt_policy.IpOpts, ttl_ov: ?u8, group: bool, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, via_lo: bool, wait_hop: ?[4]u8, ipopts_in: []const u8) bool {
+fn sendFragmented4(our_ip: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, payload: []const u8, opts4: ip_opt_policy.IpOpts, ttl_ov: ?u8, group: bool, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, via_lo: bool, wait_hop: ?[4]u8, ipopts_in: []const u8, skb: lo.Meta) bool {
     const frag = @import("ip_frag_policy.zig");
     const slab = @import("../mm/slab.zig");
     const total: usize = 8 + payload.len;
@@ -1789,7 +1807,7 @@ fn sendFragmented4(our_ip: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, pa
         if (wait_hop) |hop| {
             arp.queueFrame(hop, &pkt, frame_len);
         } else {
-            const ok = if (via_lo) lo.sendNow(&pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt, frame_len);
+            const ok = if (via_lo) lo.sendNowMeta(&pkt, frame_len, skb) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt, frame_len);
             if (!ok) all_ok = false;
         }
         off += n;
@@ -1813,6 +1831,11 @@ pub fn sendToV6From(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, 
 /// sendToV6From with sendmsg's IPV6_HOPLIMIT / IPV6_TCLASS control messages: `hops_ov` replaces the hop limit (the multicast one
 /// too; 0 is a hop limit) and `tclass_ov` the whole traffic class byte, ECN bits included, for this datagram only.
 pub fn sendToV6FromOv(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, oif: u8, data: [*]const u8, data_len: u16, hops_ov: ?u8, tclass_ov: ?u8, flow_ov: ?u32) bool {
+    return sendToV6FromSkb(bound, dst_ip, dst_port, src_key, oif, data, data_len, hops_ov, tclass_ov, flow_ov, .{});
+}
+
+/// sendToV6FromOv with sendmsg's SO_MARK / SO_PRIORITY control messages.
+pub fn sendToV6FromSkb(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32, oif: u8, data: [*]const u8, data_len: u16, hops_ov: ?u8, tclass_ov: ?u8, flow_ov: ?u32, skb_ov: SkbOv) bool {
     if (data_len > MAX_UDP_PAYLOAD_BIG6) return false;
     const src_port = portNumber(src_key);
 
@@ -1837,7 +1860,7 @@ pub fn sendToV6FromOv(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32
     // (ip6_fragment); the caller already refused it under IPV6_PMTUDISC_DO / PROBE.
     const mtu6 = ipv6.getSendMtu(dst_ip);
     if (ipv6.HEADER_LEN + @as(u32, udp_total) > mtu6) {
-        return sendFragmented6(our_ip, dst_ip, dst_port, src_key, oif, data[0..data_len], mtu6, dst_mac, our_mac, is_loop, wait_hop6, hops_ov, tclass_ov, flow_ov);
+        return sendFragmented6(our_ip, dst_ip, dst_port, src_key, oif, data[0..data_len], mtu6, dst_mac, our_mac, is_loop, wait_hop6, hops_ov, tclass_ov, flow_ov, skbMeta(src_key, skb_ov));
     }
 
     // Stack-local frame buffer: concurrent sends on other CPUs must not tear it.
@@ -1878,7 +1901,7 @@ pub fn sendToV6FromOv(bound: [16]u8, dst_ip: [16]u8, dst_port: u16, src_key: u32
         @import("ndp_queue.zig").queueFrame(hop, &send_pkt, frame_len);
         return true;
     }
-    const ok = if (is_loop) lo.sendNow(&send_pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);
+    const ok = if (is_loop) lo.sendNowMeta(&send_pkt, frame_len, skbMeta(src_key, skb_ov)) or lo.dropIsLoss(frame_len) else nic.sendPacket(&send_pkt, frame_len);
     // SK-104: full-MTU TX success can raise the Path MTU early.
     if (ok) ipv6.noteFullSizeSend(dst_ip, ipv6.HEADER_LEN + udp_total);
     return ok;

@@ -24,8 +24,15 @@ pub const IFINDEX: u8 = 1;
 const FrameSlot = struct {
     len: u32,
     ifindex: u8,
+    /// skb->mark and skb->priority of the frame's datagram: loopback_xmit hands the skb over as it is, so the receiver's SO_RCVMARK /
+    /// SO_RCVPRIORITY see what the sender gave it.
+    mark: u32 = 0,
+    priority: u32 = 0,
     data: [MAX_FRAME]u8,
 };
+
+/// The skb fields a loopback frame carries besides its bytes.
+pub const Meta = struct { mark: u32 = 0, priority: u32 = 0 };
 
 /// Counters of the loopback queue since boot (see /proc/lostats). A frame the full queue refuses is only counted here: nothing
 /// retransmits it at this layer, TCP's own timers do.
@@ -118,6 +125,11 @@ pub const LoopbackQueue = struct {
 
     /// enqueue, recording the interface the frame arrives on.
     pub fn enqueueOn(self: *LoopbackQueue, frame: []const u8, ifindex: u8) bool {
+        return self.enqueueMeta(frame, ifindex, .{});
+    }
+
+    /// enqueueOn with the frame's mark and priority.
+    pub fn enqueueMeta(self: *LoopbackQueue, frame: []const u8, ifindex: u8, meta: Meta) bool {
         if (frame.len == 0 or frame.len > MAX_FRAME) return false;
         if (self.len == QUEUE_DEPTH) {
             self.dropped += 1;
@@ -126,6 +138,8 @@ pub const LoopbackQueue = struct {
         const slot = &self.slots[self.tail];
         slot.len = @intCast(frame.len);
         slot.ifindex = ifindex;
+        slot.mark = meta.mark;
+        slot.priority = meta.priority;
         @memcpy(slot.data[0..frame.len], frame);
         self.tail = (self.tail + 1) % QUEUE_DEPTH;
         self.len += 1;
@@ -142,9 +156,16 @@ pub const LoopbackQueue = struct {
 
     /// dequeue, also reporting the interface the frame arrives on.
     pub fn dequeueFrom(self: *LoopbackQueue, out: []u8, ifindex: *u8) u32 {
+        var meta: Meta = .{};
+        return self.dequeueMeta(out, ifindex, &meta);
+    }
+
+    /// dequeueFrom, also reporting the frame's mark and priority.
+    pub fn dequeueMeta(self: *LoopbackQueue, out: []u8, ifindex: *u8, meta: *Meta) u32 {
         if (self.len == 0) return 0;
         const slot = &self.slots[self.head];
         ifindex.* = slot.ifindex;
+        meta.* = .{ .mark = slot.mark, .priority = slot.priority };
         const n: u32 = @intCast(@min(slot.len, out.len));
         @memcpy(out[0..n], slot.data[0..n]);
         slot.len = 0;
@@ -199,12 +220,23 @@ pub fn sendPacket(data: [*]const u8, len: u32) bool {
 /// (and once before, when a burst filled it), so frames a burst left behind, such as the ICMP errors it drew, cannot keep the next
 /// datagram out. Must not be called with tcp_lock or udp_lock held (drain re-enters the RX path). False when the frame was refused.
 pub fn sendNow(data: [*]const u8, len: u32) bool {
-    if (!sendPacket(data, len)) {
+    return sendNowMeta(data, len, .{});
+}
+
+/// sendNow for a frame whose datagram has a mark or priority (the sender's SO_MARK / SO_PRIORITY or control messages).
+pub fn sendNowMeta(data: [*]const u8, len: u32, meta: Meta) bool {
+    if (!sendPacketMeta(data, len, IFINDEX, meta)) {
         _ = drain();
-        if (!sendPacket(data, len)) return false;
+        if (!sendPacketMeta(data, len, IFINDEX, meta)) return false;
     }
     _ = drain();
     return true;
+}
+
+fn sendPacketMeta(data: [*]const u8, len: u32, ifindex: u8, meta: Meta) bool {
+    const saved = lo_lock.acquire();
+    defer lo_lock.release(saved);
+    return rx_queue.enqueueMeta(data[0..len], ifindex, meta);
 }
 
 /// sendPacket for a frame that arrives on interface `ifindex` rather than on lo.
@@ -229,11 +261,12 @@ pub fn drain() u32 {
     // anything left is picked up by the next pump.
     while (count < QUEUE_DEPTH * 4) {
         var ifindex: u8 = IFINDEX;
+        var meta: Meta = .{};
         const saved = lo_lock.acquire();
-        const n = rx_queue.dequeueFrom(&buf, &ifindex);
+        const n = rx_queue.dequeueMeta(&buf, &ifindex, &meta);
         lo_lock.release(saved);
         if (n == 0) break;
-        net_mod.handleRxPacketOn(&buf, n, ifindex);
+        net_mod.handleRxPacketMeta(&buf, n, ifindex, meta);
         count += 1;
     }
     return count;

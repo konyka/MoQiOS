@@ -19,6 +19,9 @@ pub const RecvInfo = struct {
     /// The datagram's destination port (IP_ORIGDSTADDR) and its arrival time on the real-time clock (SO_TIMESTAMP*), in ns.
     dst_port: u16 = 0,
     stamp_ns: u64 = 0,
+    /// skb->mark and skb->priority: what the sender's SO_MARK / SO_PRIORITY (or its control messages) gave the datagram.
+    mark: u32 = 0,
+    priority: u32 = 0,
     /// The IPv4 options as ip_options_compile left them (IP_RECVOPTS), and what IP_RETOPTS reports (ip_options_echo + undo).
     optlen: u8 = 0,
     opts: [40]u8 = @splat(0),
@@ -42,6 +45,9 @@ pub const Wanted = struct {
     retopts: bool = false,
     /// IPV6_FLOWINFO (rxflow): the received flowinfo, when it is not 0.
     flowinfo: bool = false,
+    /// SO_RCVMARK / SO_RCVPRIORITY.
+    rcvmark: bool = false,
+    rcvprio: bool = false,
 
     pub fn of(o: ipo.IpOpts) Wanted {
         return .{ .pktinfo = o.pktinfo, .recvttl = o.recvttl, .recvtos = o.recvtos, .origdst = o.origdst, .recvopts = o.recvopts, .retopts = o.retopts };
@@ -56,6 +62,8 @@ pub const Wanted = struct {
     pub fn withStamp(self: Wanted, sol_flags: u16) Wanted {
         var w = self;
         w.stamp = if (sol_flags & 128 == 0) .none else if (sol_flags & 256 != 0) .nano else .micro;
+        w.rcvmark = sol_flags & 512 != 0;
+        w.rcvprio = sol_flags & 1024 != 0;
         return w;
     }
 };
@@ -65,6 +73,19 @@ const SO_TIMESTAMP: i32 = 29;
 const SO_TIMESTAMPNS: i32 = 35;
 
 /// __sock_recv_timestamp: SCM_TIMESTAMP (struct timeval) or SCM_TIMESTAMPNS (struct timespec) first, at SOL_SOCKET.
+/// sock_recv_mark then sock_recv_priority (after the timestamp in __sock_recv_cmsgs): SOL_SOCKET / SO_MARK and SO_PRIORITY as u32.
+fn putMarkPrio(out: []u8, used: *usize, cap: usize, w: Wanted, mark: u32, priority: u32, truncated: *bool) void {
+    var v: [4]u8 = undefined;
+    if (w.rcvmark) {
+        std.mem.writeInt(u32, &v, mark, .little);
+        put(out, used, cap, SOL_SOCKET, 36, &v, truncated);
+    }
+    if (w.rcvprio) {
+        std.mem.writeInt(u32, &v, priority, .little);
+        put(out, used, cap, SOL_SOCKET, 12, &v, truncated);
+    }
+}
+
 fn putStamp(out: []u8, used: *usize, cap: usize, stamp: Stamp, ns: u64, truncated: *bool) void {
     if (stamp == .none) return;
     var t: [16]u8 = undefined;
@@ -84,6 +105,8 @@ pub const RecvInfo6 = struct {
     stamp_ns: u64 = 0,
     /// Traffic class and flow label of the IPv6 header (ip6_flowinfo), for IPV6_FLOWINFO.
     flowinfo: u32 = 0,
+    mark: u32 = 0,
+    priority: u32 = 0,
 };
 
 pub const Built = struct {
@@ -123,6 +146,7 @@ pub fn build(w: Wanted, info: RecvInfo, cap_in: usize, out: []u8) Built {
     var used: usize = 0;
     var truncated = false;
     putStamp(out, &used, cap, w.stamp, info.stamp_ns, &truncated);
+    putMarkPrio(out, &used, cap, w, info.mark, info.priority, &truncated);
     if (w.pktinfo) {
         var pi: [12]u8 = undefined;
         std.mem.writeInt(i32, pi[0..4], info.ifindex, .little);
@@ -202,6 +226,7 @@ pub fn build6(w: Wanted, info: RecvInfo6, cap_in: usize, out: []u8) Built {
     var truncated = false;
     const lv: i32 = @intCast(ipo.SOL_IPV6);
     putStamp(out, &used, cap, w.stamp, info.stamp_ns, &truncated);
+    putMarkPrio(out, &used, cap, w, info.mark, info.priority, &truncated);
     if (w.pktinfo) {
         var pi: [20]u8 = undefined;
         @memcpy(pi[0..16], &info.dst);
@@ -266,6 +291,9 @@ pub const Send4 = struct {
     retopts: bool = false,
     /// The options it gave (ip_options_compile without an skb), for this datagram only.
     opts: ?@import("ip_options_policy.zig").SendOpts = null,
+    /// SOL_SOCKET SO_MARK / SO_PRIORITY messages (sockc.mark, sockc.priority): replace the socket's for this datagram.
+    mark: ?u32 = null,
+    priority: ?u32 = null,
 };
 
 /// The control messages parsed, or the errno that fails the send.
@@ -368,6 +396,8 @@ fn ipCmsgSend4(control: []const u8, caps: SendCaps) Send4Result {
         if (m.level == scm.SOL_SOCKET) {
             const rc = sockCmsg(m, caps);
             if (rc != 0) return .{ .err = rc };
+            if (m.typ == SO_MARK) out.mark = readU32(m.data);
+            if (m.typ == SO_PRIORITY) out.priority = readU32(m.data);
             continue;
         }
         if (m.level != @as(i32, @intCast(ipo.SOL_IP))) continue;
@@ -448,6 +478,8 @@ pub const Send6 = struct {
     pktinfo: bool = false,
     oif: u32 = 0,
     src: [16]u8 = @splat(0),
+    mark: ?u32 = null,
+    priority: ?u32 = null,
 };
 
 /// The IPv6 control messages parsed, or the errno that fails the send.
@@ -523,6 +555,8 @@ fn datagramSendCtl6(control: []const u8, caps: SendCaps, ctx: Ctx6) Send6Result 
         if (m.level == scm.SOL_SOCKET) {
             const rc = sockCmsg(m, caps);
             if (rc != 0) return .{ .err = rc };
+            if (m.typ == SO_MARK) out.mark = readU32(m.data);
+            if (m.typ == SO_PRIORITY) out.priority = readU32(m.data);
             continue;
         }
         if (m.level != @as(i32, @intCast(ipo.SOL_IPV6))) continue;

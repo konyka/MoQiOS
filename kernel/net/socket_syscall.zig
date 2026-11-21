@@ -2039,7 +2039,7 @@ fn udpSendBytesFull(fd: u32, payload: []const u8, full_len: usize, addr_ptr: u64
         // udpv6_sendmsg: with IPV6_FLOWINFO_SEND sin6_flowinfo gives the flow label; an IPV6_FLOWINFO control message replaces it
         // (ip6_datagram_send_ctl). Without either the label stays 0 (auto_flowlabels is off for an unconnected socket here).
         const flow: ?u32 = ov6.flowlabel orelse sndFlow6(src_key, sin6_flow);
-        return if (udp.sendToV6FromOv(src6, dst6, dst_port6, src_key, oif6, payload.ptr, @intCast(n6), ov6.hops, ov6.tclass, flow)) @intCast(n6) else -1;
+        return if (udp.sendToV6FromSkb(src6, dst6, dst_port6, src_key, oif6, payload.ptr, @intCast(n6), ov6.hops, ov6.tclass, flow, .{ .mark = ov6.mark, .priority = ov6.priority })) @intCast(n6) else -1;
     }
     var dst_ip: [4]u8 = .{ 0, 0, 0, 0 };
     var dst_port: u16 = 0;
@@ -2069,7 +2069,7 @@ fn udpSendBytesFull(fd: u32, payload: []const u8, full_len: usize, addr_ptr: u64
     const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(src, dst_ip, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
     if (lo_rc != 0) return lo_rc;
     if (udpOversize4(src_key, dst_ip, dst_port, full_len)) |e| return e;
-    return if (udp.sendToFromOv(src, dst_ip, dst_port, src_key, payload.ptr, @intCast(payload.len), ov.ttl, ov.tos, ov.opts)) @intCast(payload.len) else -1;
+    return if (udp.sendToFromSkb(src, dst_ip, dst_port, src_key, payload.ptr, @intCast(payload.len), ov.ttl, ov.tos, ov.opts, .{ .mark = ov.mark, .priority = ov.priority })) @intCast(payload.len) else -1;
 }
 
 /// udpOversize4 for IPv6 (__ip6_append_data → ipv6_local_error): EMSGSIZE for a datagram over the path MTU, queued with IPV6_RECVERR

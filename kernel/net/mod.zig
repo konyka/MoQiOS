@@ -37,6 +37,11 @@ pub fn handleRxPacket(data: [*]const u8, len: u32) void {
 
 /// handleRxPacket for a frame that arrived on interface `ifindex` (1 lo, 2 the NIC); UDP group delivery depends on it.
 pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
+    handleRxPacketMeta(data, len, ifindex, .{});
+}
+
+/// handleRxPacketOn for a loopback frame with the mark and priority its datagram was sent with.
+pub fn handleRxPacketMeta(data: [*]const u8, len: u32, ifindex: u8, skb: @import("lo.zig").Meta) void {
     if (len < 14) return;
 
     const ethertype = eth.parseEthertype(data);
@@ -57,7 +62,7 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
             if (payload_start + @as(u32, info.payload_len) > len) return;
             // ip_rcv_options: a header with options is compiled (record route and timestamps get this host's entry); a malformed
             // option drops the datagram, and so does a source route (accept_source_route 0).
-            var meta4: @import("ip_cmsg_policy.zig").RecvInfo = .{ .ifindex = ifindex, .dst = info.dst_ip, .ttl = info.ttl, .tos = info.tos };
+            var meta4: @import("ip_cmsg_policy.zig").RecvInfo = .{ .ifindex = ifindex, .dst = info.dst_ip, .ttl = info.ttl, .tos = info.tos, .mark = skb.mark, .priority = skb.priority };
             var rx_hdr: [60]u8 = undefined;
             var rx_hdr_len: usize = 0;
             if (info.payload_offset > 20) {
@@ -145,7 +150,7 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
                     tcp.handlePacketV6(info6.src_ip, info6.dst_ip, data + up_start, up_len, info6.ecn_ce);
                 },
                 ipv6.PROTO_UDP => {
-                    udp.handlePacketV6Meta(info6.src_ip, info6.dst_ip, data + up_start, up_len, ifindex, info6.hop_limit, info6.tclass, info6.flowinfo);
+                    udp.handlePacketV6Info(info6.src_ip, info6.dst_ip, data + up_start, up_len, .{ .ifindex = ifindex, .dst = info6.dst_ip, .hops = info6.hop_limit, .tclass = info6.tclass, .flowinfo = info6.flowinfo, .mark = skb.mark, .priority = skb.priority });
                 },
                 // ip6_protocol_deliver_rcu: a next header with no handler that no raw socket took gets a parameter problem pointing at
                 // the next-header field that named it (the IPv6 header's, or the last extension header's).
