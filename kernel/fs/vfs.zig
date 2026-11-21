@@ -105,7 +105,42 @@ pub const PipeBuffer = struct {
     generation: u32 = 0,
     /// The page-sized buffers the queued bytes count as (Linux pipe_buffer slots, cap / 4096 of them): what makes the pipe full.
     slots: @import("pipe_slot_policy.zig").Slots = .{},
+    /// The real uid of the task that made the pipe: its cap / 4096 pages count against that user's pipe-user-pages limits
+    /// (Linux pipe->user, user_struct.pipe_bufs).
+    user: u32 = 0,
 };
+
+/// Who is making a pipe: the real uid its pages are charged to and the capabilities that lift the limits.
+pub const PipeCreator = struct {
+    uid: u32 = 0,
+    cap_sys_resource: bool = false,
+    cap_sys_admin: bool = false,
+
+    /// pipe_is_unprivileged_user: neither CAP_SYS_RESOURCE nor CAP_SYS_ADMIN.
+    pub fn unprivileged(self: PipeCreator) bool {
+        return !self.cap_sys_resource and !self.cap_sys_admin;
+    }
+};
+
+/// The pages the live pipes of `uid` hold (pipe_lock held).
+fn userPipePagesLocked(uid: u32) u64 {
+    var total: u64 = 0;
+    for (&pipes) |*p| {
+        if (p.ref_count != 0 and p.user == uid) total += p.cap / PIPE_BUF_SIZE;
+    }
+    return total;
+}
+
+/// F_SETPIPE_SZ's per-user check (pipe_set_size): growing pipe `pipe_idx` to `size` bytes would put its user past
+/// pipe-user-pages-soft or -hard, which only CAP_SYS_RESOURCE or CAP_SYS_ADMIN may do.
+pub fn pipeGrowRefused(pipe_idx: u32, size: u32, unprivileged: bool) bool {
+    if (pipe_idx >= pipes.len) return false;
+    const flags = pipe_lock.acquire();
+    defer pipe_lock.release(flags);
+    const pipe = &pipes[pipe_idx];
+    if (pipe.ref_count == 0) return false;
+    return @import("pipe_user_policy.zig").growRefused(pipe.cap / PIPE_BUF_SIZE, size / PIPE_BUF_SIZE, userPipePagesLocked(pipe.user), unprivileged);
+}
 
 /// The bytes of `pipe`'s ring (its first page, or the buffer F_SETPIPE_SZ gave it).
 fn ring(pipe: *PipeBuffer) [*]u8 {
@@ -303,31 +338,41 @@ pub fn pipeMakeSingleEnded(pipe_idx: u32) bool {
 /// had it starts with its own page, as Linux falls back to one buffer for a user over pipe-user-pages-soft.
 pub const PIPE_DEFAULT_SIZE: u32 = 16 * 4096;
 
-pub fn allocPipe(cap_sys_resource: bool) ?u32 {
+pub fn allocPipe(creator: PipeCreator) AllocPipe {
     const pmm = @import("../mm/pmm.zig");
     const hhdm = @import("../mm/hhdm.zig");
     // pipe-max-size below 64 KiB shrinks an unprivileged caller's new pipe (alloc_pipe_info); one page lives in `buf`.
-    const size = @import("fcntl_policy.zig").newPipeSize(PIPE_DEFAULT_SIZE, cap_sys_resource);
+    const wanted = @import("fcntl_policy.zig").newPipeSize(PIPE_DEFAULT_SIZE, creator.cap_sys_resource);
+    // Past pipe-user-pages-soft the pipe gets 2 pages, past -hard none (ENFILE).
+    const size: u32 = blk: {
+        const lf = pipe_lock.acquire();
+        defer pipe_lock.release(lf);
+        const pages = @import("pipe_user_policy.zig").newPipePages(wanted / PIPE_BUF_SIZE, userPipePagesLocked(creator.uid), creator.unprivileged()) orelse return .user_limit;
+        break :blk @intCast(pages * PIPE_BUF_SIZE);
+    };
     // Allocate outside pipe_lock; hand the pages back if no slot is free.
     const ext: ?[*]u8 = if (size <= PIPE_BUF_SIZE) null else if (pmm.allocContiguous(size / 4096)) |phys| @ptrFromInt(hhdm.physToVirt(phys)) else null;
     const flags = pipe_lock.acquire();
     for (0..MAX_PIPES) |i| {
         if (pipes[i].ref_count == 0) {
             const generation = pipes[i].generation +% 1;
-            pipes[i] = .{ .buf = @splat(0), .head = 0, .ref_count = 2, .read_refs = 1, .write_refs = 1, .generation = generation };
+            pipes[i] = .{ .buf = @splat(0), .head = 0, .ref_count = 2, .read_refs = 1, .write_refs = 1, .generation = generation, .user = creator.uid };
             if (ext) |e| {
                 pipes[i].ext = e;
                 pipes[i].cap = size;
             }
             pipe_count += 1;
             pipe_lock.release(flags);
-            return @intCast(i);
+            return .{ .ok = @intCast(i) };
         }
     }
     pipe_lock.release(flags);
     if (ext) |e| pmm.freeContiguous(hhdm.virtToPhys(@intFromPtr(e)), size / 4096);
-    return null;
+    return .no_slot;
 }
+
+/// allocPipe's result: the new pipe, no free pipe slot, or the creator's pipe-user-pages-hard limit.
+pub const AllocPipe = union(enum) { ok: u32, no_slot, user_limit };
 
 /// Read from a pipe; any read that gets as far as the buffer (data, EAGAIN or EOF) tells the O_ASYNC write ends (Linux pipe_read's
 /// closing kill_fasync POLL_OUT). An interrupted wait returns without it, as Linux's -ERESTARTSYS does.
@@ -1137,6 +1182,14 @@ fn sysctlWrite(desc: *FileDescriptor, buf: [*]const u8, count: usize, offset: u6
             if (w.value) |v| @import("fcntl_policy.zig").setPipeMaxSize(v);
             break :blk w.ret;
         },
+        .pipe_user_pages_soft, .pipe_user_pages_hard => blk: {
+            const pup = @import("pipe_user_policy.zig");
+            const w = pup.parseUlong(text);
+            if (w.value) |v| {
+                if (desc.proc_file_type == .pipe_user_pages_soft) pup.setSoftLimit(v) else pup.setHardLimit(v);
+            }
+            break :blk w.ret;
+        },
         .conf_file => @import("../net/arp.zig").confWrite(@import("../net/devconf_policy.zig").decode(desc.proc_pid), text),
         else => -1,
     };
@@ -1935,13 +1988,13 @@ pub const FdTable = struct {
                 pfile = .tcpstats;
             } else if (str.eql(rest, "randstats")) {
                 pfile = .randstats;
-            } else if (str.eql(rest, "sys/fs/pipe-max-size")) {
+            } else if (str.eql(rest, "sys/fs/pipe-max-size") or str.eql(rest, "sys/fs/pipe-user-pages-hard") or str.eql(rest, "sys/fs/pipe-user-pages-soft")) {
                 // Mode 0644 owned by root: writing needs fsuid 0 (the fs sysctls have no CAP_NET_ADMIN escape).
                 if (is_writable and euid != 0) {
                     self.freeFd(slot);
                     return -13; // EACCES
                 }
-                pfile = .pipe_max_size;
+                pfile = if (str.eql(rest, "sys/fs/pipe-max-size")) .pipe_max_size else if (str.eql(rest, "sys/fs/pipe-user-pages-hard")) .pipe_user_pages_hard else .pipe_user_pages_soft;
             } else if (str.eql(rest, "sys/net/ipv6/auto_flowlabels")) {
                 // Mode 0644 owned by root, like ping_group_range.
                 if (is_writable and euid != 0 and !effective_caps.cap_net_admin) {
@@ -3114,8 +3167,12 @@ pub const FdTable = struct {
     }
 
     /// Create a pipe. Returns read_fd in low 16 bits, write_fd in high 16 bits, or -errno.
-    pub fn createPipe(self: *FdTable, cap_sys_resource: bool) i64 {
-        const pipe_idx = allocPipe(cap_sys_resource) orelse return -1;
+    pub fn createPipe(self: *FdTable, creator: PipeCreator) i64 {
+        const pipe_idx = switch (allocPipe(creator)) {
+            .ok => |i| i,
+            .no_slot => return -1,
+            .user_limit => return -23, // ENFILE (get_pipe_inode)
+        };
 
         const read_fd = self.allocFd() orelse {
             pipeClose(pipe_idx, false);

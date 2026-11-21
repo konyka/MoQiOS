@@ -36,6 +36,9 @@ pub const ProcFile = enum(u8) {
     auto_flowlabels,
     /// /proc/sys/fs/pipe-max-size: the largest pipe an unprivileged F_SETPIPE_SZ may ask for (fcntl_policy), root may write it.
     pipe_max_size,
+    /// /proc/sys/fs/pipe-user-pages-{soft,hard}: the per-user pipe page limits (pipe_user_policy), root may write them.
+    pipe_user_pages_soft,
+    pipe_user_pages_hard,
     sys_fs_dir,
     /// /proc/sys/net/ipv6 (a directory).
     sys_ipv6_dir,
@@ -76,7 +79,7 @@ pub fn isSubdir(file: ProcFile) bool {
 
 /// A /proc/sys file (proc_sys_call_handler): a read past offset 0 returns nothing, and so does a write there (sysctl_writes_strict).
 pub fn isSysctl(file: ProcFile) bool {
-    return file == .ping_group_range or file == .conf_file or file == .auto_flowlabels or file == .pipe_max_size;
+    return file == .ping_group_range or file == .conf_file or file == .auto_flowlabels or file == .pipe_max_size or file == .pipe_user_pages_soft or file == .pipe_user_pages_hard;
 }
 
 /// The fixed directory a path below /proc names ("net", "sys/net/", ...), or null.
@@ -106,7 +109,7 @@ fn subdirChildren(dir: ProcFile) []const SubEntry {
     return switch (dir) {
         .net_dir => &.{.{ .name = "arp", .dtype = DT_REG }},
         .sys_dir => &.{ .{ .name = "fs", .dtype = DT_DIR }, .{ .name = "net", .dtype = DT_DIR } },
-        .sys_fs_dir => &.{.{ .name = "pipe-max-size", .dtype = DT_REG }},
+        .sys_fs_dir => &.{ .{ .name = "pipe-max-size", .dtype = DT_REG }, .{ .name = "pipe-user-pages-hard", .dtype = DT_REG }, .{ .name = "pipe-user-pages-soft", .dtype = DT_REG } },
         .sys_net_dir => &.{ .{ .name = "ipv4", .dtype = DT_DIR }, .{ .name = "ipv6", .dtype = DT_DIR } },
         .sys_ipv6_dir => &.{.{ .name = "auto_flowlabels", .dtype = DT_REG }},
         .sys_ipv4_dir => &.{ .{ .name = "conf", .dtype = DT_DIR }, .{ .name = "ping_group_range", .dtype = DT_REG } },
@@ -269,6 +272,12 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
         .root_dir, .pid_dir, .mount_dir, .fd_dir, .net_dir, .sys_dir, .sys_net_dir, .sys_ipv4_dir, .sys_ipv6_dir, .sys_conf_dir, .conf_dev_dir, .sys_fs_dir => 0,
         .pipe_max_size => blk: {
             const st = std.fmt.bufPrint(buf[0..@min(max_len, 16)], "{d}\n", .{@import("fcntl_policy.zig").pipeMaxSize()}) catch break :blk 0;
+            break :blk @intCast(st.len);
+        },
+        .pipe_user_pages_soft, .pipe_user_pages_hard => blk: {
+            const pup = @import("pipe_user_policy.zig");
+            const v = if (file == .pipe_user_pages_soft) pup.softLimit() else pup.hardLimit();
+            const st = std.fmt.bufPrint(buf[0..@min(max_len, 24)], "{d}\n", .{v}) catch break :blk 0;
             break :blk @intCast(st.len);
         },
         .auto_flowlabels => @intCast(@import("../net/devconf_policy.zig").formatInt(buf[0..@min(max_len, 16)], @import("../net/flowlabel_policy.zig").mode())),

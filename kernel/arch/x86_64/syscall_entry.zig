@@ -4590,7 +4590,7 @@ fn syscallPipe2(pipefd_ptr: u64, flags: u32) i64 {
     const tm = @import("../../proc/task.zig");
     const cur_idx = sched.currentTaskIndex() orelse return -3;
     const cur = tm.getTask(cur_idx) orelse return -3;
-    const result = cur.fd_table.createPipe(cur.effective_caps.cap_sys_resource);
+    const result = cur.fd_table.createPipe(.{ .uid = cur.uid, .cap_sys_resource = cur.effective_caps.cap_sys_resource, .cap_sys_admin = cur.effective_caps.cap_sys_admin });
     if (result < 0) return result;
     const read_fd: u32 = @intCast(@as(u64, @intCast(result & 0xFFFF)));
     const write_fd: u32 = @intCast(@as(u64, @intCast(result >> 16)) & 0xFFFF);

@@ -150,6 +150,10 @@ pub fn sysFcntl(fd_num: u64, cmd: u64, arg: u64) i64 {
             // F_SETPIPE_SZ takes an unsigned int (pipe_fcntl): the low 32 bits.
             const size = policy.roundPipeSize(@as(u32, @truncate(arg))) orelse return -22;
             const rc = policy.setPipeSizeErrno(size, st.capacity, st.readable, t.effective_caps.cap_sys_resource);
+            if (rc == -1) return rc;
+            // pipe_set_size checks the user's pipe-user-pages limits before resizing (EPERM ahead of ENOMEM and EBUSY).
+            const unprivileged = !t.effective_caps.cap_sys_resource and !t.effective_caps.cap_sys_admin;
+            if (vfs.pipeGrowRefused(t.fd_table.fds[fd].pipe_idx, @intCast(size), unprivileged)) return -1;
             if (rc != 0) return rc;
             return vfs.pipeSetSize(t.fd_table.fds[fd].pipe_idx, @intCast(size));
         },

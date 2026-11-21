@@ -16999,7 +16999,7 @@ test "a new pipe gets a 16-page ring like Linux (hello448)" {
     // Linux fs/pipe.c alloc_pipe_info: PIPE_DEF_BUFFERS (16) pages, F_GETPIPE_SZ 65536. The kernel gave every pipe one page.
     const v = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, v, "pub const PIPE_DEFAULT_SIZE: u32 = 16 * 4096;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, v, "const size = @import(\"fcntl_policy.zig\").newPipeSize(PIPE_DEFAULT_SIZE, cap_sys_resource);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "const wanted = @import(\"fcntl_policy.zig\").newPipeSize(PIPE_DEFAULT_SIZE, creator.cap_sys_resource);") != null);
     try std.testing.expect(std.mem.indexOf(u8, v, "pmm.allocContiguous(size / 4096)") != null);
     try std.testing.expect(std.mem.indexOf(u8, v, "pipes[i].cap = size;") != null);
     // F_SETPIPE_SZ still goes down to one page.
@@ -17815,8 +17815,29 @@ test "/proc/sys/fs/pipe-max-size: readable, root-writable, rounds like F_SETPIPE
     try std.testing.expectEqual(@as(i64, -34), fp.parsePipeMaxSize("2147483649").ret);
     try std.testing.expectEqual(@as(i64, -22), fp.parsePipeMaxSize("-5").ret);
     const pf = kt.procfs_source;
-    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_fs_dir => &.{.{ .name = \"pipe-max-size\", .dtype = DT_REG }},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_fs_dir => &.{ .{ .name = \"pipe-max-size\", .dtype = DT_REG }, .{ .name = \"pipe-user-pages-hard\", .dtype = DT_REG }, .{ .name = \"pipe-user-pages-soft\", .dtype = DT_REG } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "if (std.mem.eql(u8, body, \"sys/fs\")) return .sys_fs_dir;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "} else if (str.eql(rest, \"sys/fs/pipe-max-size\")) {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "pub fn createPipe(self: *FdTable, cap_sys_resource: bool) i64 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "} else if (str.eql(rest, \"sys/fs/pipe-max-size\") or str.eql(rest, \"sys/fs/pipe-user-pages-hard\") or str.eql(rest, \"sys/fs/pipe-user-pages-soft\")) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "pub fn createPipe(self: *FdTable, creator: PipeCreator) i64 {") != null);
+}
+
+test "pipe-user-pages-soft/hard: pipes charge their pages to the creator's real uid; past soft 2 pages and no growth, past hard ENFILE (hello482)" {
+    // Linux fs/pipe.c: alloc_pipe_info, pipe_set_size, too_many_pipe_buffers_soft/hard, pipe_is_unprivileged_user.
+    const pup = kt.pipe_user_policy;
+    try std.testing.expectEqual(@as(u64, 16384), pup.softLimit());
+    try std.testing.expectEqual(@as(u64, 0), pup.hardLimit());
+    defer pup.setSoftLimit(pup.DEFAULT_SOFT);
+    pup.setSoftLimit(256);
+    // Four 64-page pipes (256) plus a fifth 16-page one: 272 > 256, so the fifth gets 2 pages.
+    try std.testing.expectEqual(@as(?u64, 2), pup.newPipePages(16, 256, true));
+    // The fourth grow reaches exactly 256 (allowed, the limit is "more than"); growing the 2-page fifth pipe is refused.
+    try std.testing.expect(!pup.growRefused(16, 64, 3 * 64 + 16, true));
+    try std.testing.expect(pup.growRefused(2, 64, 4 * 64 + 2, true));
+    try std.testing.expect(!pup.growRefused(2, 64, 4 * 64 + 2, false));
+    const v = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, v, ".user_limit => return -23, // ENFILE (get_pipe_inode)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "if (p.ref_count != 0 and p.user == uid) total += p.cap / PIPE_BUF_SIZE;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, ".generation = generation, .user = creator.uid };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.fcntl_source, "if (vfs.pipeGrowRefused(t.fd_table.fds[fd].pipe_idx, @intCast(size), unprivileged)) return -1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "cur.fd_table.createPipe(.{ .uid = cur.uid, .cap_sys_resource = cur.effective_caps.cap_sys_resource, .cap_sys_admin = cur.effective_caps.cap_sys_admin });") != null);
 }

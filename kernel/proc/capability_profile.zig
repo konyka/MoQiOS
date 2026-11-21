@@ -171,6 +171,11 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // fs.pipe-max-size: root opens the sysctl for writing (mode 0644), without CAP_SYS_RESOURCE so the limit applies to it.
         return .{ .uid = 0, .gid = 0, .caps = NO_CAPS, .initial_init = false };
     }
+    if (std.mem.eql(u8, name, "hello482")) {
+        // fs.pipe-user-pages-{soft,hard}: root writes the sysctls and keeps CAP_SYS_RESOURCE (not limited); a child's setresuid to
+        // 4242 drops both capabilities, so its pipes meet the limits.
+        return .{ .uid = 0, .gid = 0, .caps = .{ .cap_setuid = true, .cap_sys_resource = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello476")) {
         // Raw sockets (CAP_NET_RAW), SO_MARK (CAP_NET_ADMIN) and root to open net.ipv4.ping_group_range for its ping socket.
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_raw = true, .cap_net_admin = true }, .initial_init = false };
