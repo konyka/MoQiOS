@@ -415,7 +415,18 @@ const TcpTcb = struct {
     /// them (icsk_ext_hdr_len). An accepted connection starts with the SYN's options echoed (tcp_v4_save_options), not the
     /// listener's.
     ipopts: @import("ip_options_policy.zig").SendOpts = .{},
+    /// What the SYN of an accepted connection arrived with (tcp_v4_syn_recv_sock: mc_index, mc_ttl, rcv_tos), for IP_PKTOPTIONS.
+    /// A socket that did not come from a SYN reports interface 0, TTL 1 and TOS 0.
+    rx_ifindex: u8 = 0,
+    rx_ttl: u8 = 1,
+    rx_tos: u8 = 0,
 };
+
+/// The interface, TTL and TOS an IPv4 segment arrived with.
+pub const RxMeta = struct { ifindex: u8 = 0, ttl: u8 = 1, tos: u8 = 0 };
+
+/// What getsockopt(IP_PKTOPTIONS) needs of a TCP socket.
+pub const PktOptions = struct { addr: [4]u8, ifindex: u8, ttl: u8, tos: u8, ip: ip_opt_policy.IpOpts };
 
 var tcbs: [MAX_CONNECTIONS]TcpTcb = undefined;
 
@@ -959,6 +970,9 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].remote_ip6 = @splat(0);
     tcbs[i].remote_ip = .{ 0, 0, 0, 0 };
     tcbs[i].ipopts = .{};
+    tcbs[i].rx_ifindex = 0;
+    tcbs[i].rx_ttl = 1;
+    tcbs[i].rx_tos = 0;
     return &tcbs[i];
 }
 
@@ -1173,6 +1187,18 @@ pub fn tcpSetOptions(tcb_idx: u32, opts: socket_opt.SocketOptions) bool {
     if (!tcbs[tcb_idx].active) return false;
     tcbs[tcb_idx].options = opts;
     return true;
+}
+
+/// getsockopt(IP_PKTOPTIONS) of a TCP socket: its local address, what its SYN arrived with and its IP options.
+pub fn tcpPktOptions(tcb_idx: u32) ?PktOptions {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return null;
+    const t = &tcbs[tcb_idx];
+    // inet_rcv_saddr: the bound address, or the source a connection was given (an unconnected wildcard socket: 0.0.0.0).
+    const unsynced = t.state == .closed or t.state == .listen;
+    const addr = if (unsynced) t.local_ip else tcp_port_policy.sourceAddr(t.local_ip, t.remote_ip, netif.getOurIp());
+    return .{ .addr = addr, .ifindex = t.rx_ifindex, .ttl = t.rx_ttl, .tos = t.rx_tos, .ip = t.options.ip };
 }
 
 /// setsockopt(IP_OPTIONS) on a TCP socket: the next segments carry them.
@@ -2377,7 +2403,7 @@ fn sendSynAck(tcb: *TcpTcb, peer_ecn: bool) void {
 /// Handle an incoming SYN for a listening socket.
 /// Creates a new TCB in SYN_RECEIVED state, sends SYN-ACK,
 /// and queues it in the listen backlog.
-fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions, flags: u8, rx_opts: ?@import("ip_options_policy.zig").SendOpts) void {
+fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions, flags: u8, rx_opts: ?@import("ip_options_policy.zig").SendOpts, rx: RxMeta) void {
     _ = _w;
     const peer_ecn = probeEcnPeerSetup(flags);
     // The listener bound to the SYN's destination address, else a wildcard one.
@@ -2401,6 +2427,9 @@ fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16,
             initTcbState(reuse_tcb);
             reuse_tcb.options = listenerOptions(ls);
             reuse_tcb.ipopts = rx_opts orelse .{};
+            reuse_tcb.rx_ifindex = rx.ifindex;
+            reuse_tcb.rx_ttl = rx.ttl;
+            reuse_tcb.rx_tos = rx.tos;
             reuse_tcb.iss = generateIss();
             reuse_tcb.ip_id = ipid.initial();
             reuse_tcb.snd_una = reuse_tcb.iss;
@@ -2455,6 +2484,9 @@ fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16,
     new_tcb.sock_uid = listenerSockUid(ls);
     new_tcb.options = listenerOptions(ls);
     new_tcb.ipopts = rx_opts orelse .{};
+    new_tcb.rx_ifindex = rx.ifindex;
+    new_tcb.rx_ttl = rx.ttl;
+    new_tcb.rx_tos = rx.tos;
     new_tcb.iss = generateIss();
     new_tcb.ip_id = ipid.initial();
     new_tcb.snd_una = new_tcb.iss;
@@ -3211,12 +3243,13 @@ fn driveTcbStateMachine(
 }
 
 pub fn handlePacket(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, ecn_ce: bool) void {
-    handlePacketOpts(src_ip, dst_ip, data, len, ecn_ce, null);
+    handlePacketOpts(src_ip, dst_ip, data, len, ecn_ce, null, .{});
 }
 
 /// handlePacket for a segment that arrived with IPv4 options: `rx_opts` are what a reply to it would carry (ip_options_echo, as
 /// ip_options_policy.compileForSend takes them), which a connection accepted from this SYN keeps (tcp_v4_save_options).
-pub fn handlePacketOpts(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, ecn_ce: bool, rx_opts: ?@import("ip_options_policy.zig").SendOpts) void {
+/// `rx` is the interface, TTL and TOS it arrived with, kept by a connection accepted from a SYN.
+pub fn handlePacketOpts(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u32, ecn_ce: bool, rx_opts: ?@import("ip_options_policy.zig").SendOpts, rx: RxMeta) void {
     if (len < 20) return;
 
     // Verify the TCP checksum (mandatory, RFC 793) before touching any state —
@@ -3271,7 +3304,7 @@ pub fn handlePacketOpts(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u3
         // No matching connection — check if any socket is listening on this port
         if (flags & SYN != 0) {
             const before = pendingBacklogCount();
-            handleIncomingSyn(src_ip, dst_ip, src_port, dst_port, seq_num, raw_window, opts, flags, rx_opts);
+            handleIncomingSyn(src_ip, dst_ip, src_port, dst_port, seq_num, raw_window, opts, flags, rx_opts, rx);
             // Nobody listens on the port: a loopback peer is told at once
             // (RFC 9293 §3.10.7.1) instead of retransmitting its SYN.
             if (pendingBacklogCount() == before and !hasListener(dst_port, false, dst_ip, @splat(0))) {

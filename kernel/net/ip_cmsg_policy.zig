@@ -152,6 +152,33 @@ pub fn build(w: Wanted, info: RecvInfo, cap_in: usize, out: []u8) Built {
     return .{ .written = used, .truncated = truncated };
 }
 
+/// getsockopt(IP_PKTOPTIONS) of a TCP socket (do_ip_getsockopt): the control messages a stream socket stands for, in a buffer of
+/// `cap` bytes cut like put_cmsg: IP_PKTINFO with `addr` (inet_rcv_saddr) as both addresses and `ifindex` (mc_index), IP_TTL with
+/// `ttl` (mc_ttl) and IP_TOS with `tos` (rcv_tos) as an int, each when the socket asked for it.
+pub fn buildPktOptions(w: Wanted, addr: [4]u8, ifindex: u8, ttl: u8, tos: u8, cap_in: usize, out: []u8) Built {
+    const cap = @min(cap_in, out.len);
+    var used: usize = 0;
+    var truncated = false;
+    if (w.pktinfo) {
+        var pi: [12]u8 = undefined;
+        std.mem.writeInt(i32, pi[0..4], ifindex, .little);
+        @memcpy(pi[4..8], &addr);
+        @memcpy(pi[8..12], &addr);
+        put(out, &used, cap, @intCast(ipo.SOL_IP), @intCast(ipo.IP_PKTINFO), &pi, &truncated);
+    }
+    if (w.recvttl) {
+        var t: [4]u8 = undefined;
+        std.mem.writeInt(i32, &t, ttl, .little);
+        put(out, &used, cap, @intCast(ipo.SOL_IP), @intCast(ipo.IP_TTL), &t, &truncated);
+    }
+    if (w.recvtos) {
+        var t: [4]u8 = undefined;
+        std.mem.writeInt(i32, &t, tos, .little);
+        put(out, &used, cap, @intCast(ipo.SOL_IP), @intCast(ipo.IP_TOS), &t, &truncated);
+    }
+    return .{ .written = used, .truncated = truncated };
+}
+
 /// ip6_datagram_recv_common_ctl then _specific_ctl: IPV6_PKTINFO (struct in6_pktinfo: in6_addr, then int ifindex), IPV6_HOPLIMIT
 /// (int), IPV6_TCLASS (int), then IPV6_ORIGDSTADDR, after the timestamp (`out` holds at least min(cap, 160) bytes).
 /// ipv6_recv_rxpmtu's message: one IPV6_PATHMTU control message holding struct ip6_mtuinfo (a sockaddr_in6 with the destination,

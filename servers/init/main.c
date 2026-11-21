@@ -585,6 +585,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello466"); /* IPv4 options on raw and ping sockets */
     run_test("hello467"); /* IPv4 options on TCP sockets */
     run_test("hello468"); /* TCP_MAXSEG reports mss_cache */
+    run_test("hello469"); /* IP_PKTOPTIONS on TCP sockets */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

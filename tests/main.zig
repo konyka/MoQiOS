@@ -15174,7 +15174,7 @@ test "IPv4 raw sockets of any protocol (hello401): creation, delivery and protoc
     const m = kt.net_mod_source;
     // Every IPv4 datagram reaches the raw sockets of its protocol before the protocol handler (raw_local_deliver first).
     const at_raw = std.mem.indexOf(u8, m, "@import(\"raw_icmp.zig\").deliver(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip, ifindex)\n            else\n                @import(\"raw_icmp.zig\").deliverHdr(") orelse return error.TestUnexpectedResult;
-    const at_tcp = std.mem.indexOf(u8, m, "tcp.handlePacketOpts(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, info.ecn_ce, rx_opts);").?;
+    const at_tcp = std.mem.indexOf(u8, m, "tcp.handlePacketOpts(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, info.ecn_ce, rx_opts, .{ .ifindex = ifindex, .ttl = info.ttl, .tos = info.tos });").?;
     try std.testing.expect(at_raw < at_tcp);
     try std.testing.expect(std.mem.indexOf(u8, m, "else => if (rp.protoUnreachable(info.protocol, raw_took)) icmp.sendProtoUnreachable(data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip),") != null);
     const rs = kt.raw_icmp_source;
@@ -17582,7 +17582,7 @@ test "IPv4 options on TCP sockets: every segment carries IP_OPTIONS, the MSS mak
     try std.testing.expect(std.mem.indexOf(u8, ts, "iop.build(tcb.ipopts, our_ip, tcb.remote_ip, iop.msSinceMidnight(") != null);
     try std.testing.expect(std.mem.count(u8, ts, ".ipopts = rx_opts orelse .{};") == 2);
     try std.testing.expect(std.mem.indexOf(u8, ts, "    tcbs[i].ipopts = .{};\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "tcp.handlePacketOpts(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, info.ecn_ce, rx_opts);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "tcp.handlePacketOpts(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, info.ecn_ce, rx_opts, .{ .ifindex = ifindex, .ttl = info.ttl, .tos = info.tos });") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_opt_source, ".tcp => |idx| if (@import(\"tcp.zig\").tcpSetIpOptions(idx, so)) 0 else -9,") != null);
     // A SYN's record route, echoed and built for the reply, records this host once more.
     const iop = kt.ip_options_policy;
@@ -17607,4 +17607,24 @@ test "TCP_MAXSEG reports mss_cache: 536 or the user's value before a connection,
 
 test "a SYN offers the MSS capped by TCP_MAXSEG (tcp_advertise_mss, hello468 C)" {
     try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "const offer: u16 = @intCast(tcp_info_policy.effectiveMss(localMssForTcb(tcb), tcb.options.user_mss));") != null);
+}
+
+test "IP_PKTOPTIONS on TCP sockets: IP_PKTINFO, IP_TTL and IP_TOS from what the SYN brought (do_ip_getsockopt, hello469)" {
+    const c = kt.ip_cmsg_policy;
+    var out: [128]u8 = undefined;
+    const w: c.Wanted = .{ .pktinfo = true, .recvttl = true, .recvtos = true };
+    const all = c.buildPktOptions(w, .{ 127, 0, 0, 1 }, 1, 33, 0x28, 256, &out);
+    try std.testing.expectEqual(@as(usize, 80), all.written);
+    try std.testing.expectEqual(@as(u64, 28), std.mem.readInt(u64, out[0..8], .little));
+    try std.testing.expectEqual(@as(i32, 8), std.mem.readInt(i32, out[12..16], .little));
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0, 127, 0, 0, 1, 127, 0, 0, 1 }, out[16..28]);
+    try std.testing.expectEqual(@as(i32, 33), std.mem.readInt(i32, out[48..52], .little));
+    try std.testing.expectEqual(@as(u64, 20), std.mem.readInt(u64, out[56..64], .little));
+    try std.testing.expectEqual(@as(i32, 0x28), std.mem.readInt(i32, out[72..76], .little));
+    try std.testing.expectEqual(@as(usize, 32), c.buildPktOptions(w, .{ 127, 0, 0, 1 }, 1, 33, 0x28, 40, &out).written);
+    try std.testing.expectEqual(@as(usize, 0), c.buildPktOptions(.{}, .{ 127, 0, 0, 1 }, 1, 33, 0x28, 256, &out).written);
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "pub fn tcpPktOptions(tcb_idx: u32) ?PktOptions {") != null);
+    try std.testing.expect(std.mem.count(u8, ts, ".rx_ttl = rx.ttl;") == 2);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_opt_source, "if (level == ipo.SOL_IP and optname == IP_PKTOPTIONS and ref == .tcp) {") != null);
 }

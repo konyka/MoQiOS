@@ -687,6 +687,21 @@ fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
         const k = @import("ip_options_policy.zig").userView(so, &ob);
         return copyOptOut(optval_ptr, optlen_ptr, ob[0..k]);
     }
+    // IP_PKTOPTIONS: a TCP socket's would-be control messages (do_ip_getsockopt; any other socket is ENOPROTOOPT).
+    if (level == ipo.SOL_IP and optname == IP_PKTOPTIONS) {
+        if (ref != .tcp) return -92;
+    }
+    if (level == ipo.SOL_IP and optname == IP_PKTOPTIONS and ref == .tcp) {
+        const po = @import("tcp.zig").tcpPktOptions(ref.tcp) orelse return -9;
+        const cmp = @import("ip_cmsg_policy.zig");
+        var buf: [96]u8 = undefined;
+        const copy_mod = @import("../mm/copy_from_user.zig");
+        if (optlen_ptr == 0 or optlen_ptr >= 0x0000_8000_0000_0000) return -14;
+        var lb: [4]u8 = undefined;
+        if (copy_mod.copyFromUser(&lb, @ptrFromInt(optlen_ptr), 4) != 4) return -14;
+        const b = cmp.buildPktOptions(cmp.Wanted.of(po.ip), po.addr, po.ifindex, po.ttl, po.tos, bo.readU32Le(&lb), &buf);
+        return copyOptOut(optval_ptr, optlen_ptr, buf[0..b.written]);
+    }
     // IPV6_PATHMTU: struct ip6_mtuinfo with only the MTU of a connected socket's route filled in (the address stays zero, as
     // ipv6_getsockopt memsets it); an optlen under 32 bytes is EINVAL, no route (not connected) ENOTCONN.
     if (level == ipo.SOL_IPV6 and optname == ipo.IPV6_PATHMTU) {
@@ -745,6 +760,8 @@ fn copyOptOut(optval_ptr: u64, optlen_ptr: u64, val: []const u8) i64 {
 }
 
 const SOL_ICMPV6: u64 = 58;
+/// IP_PKTOPTIONS (SOL_IP 9): read-only, TCP only.
+const IP_PKTOPTIONS: u64 = 9;
 /// SOL_RAW (255): ICMP_FILTER (option 1) on an IPv4 raw ICMP socket (raw_setsockopt), IPV6_CHECKSUM on an IPv6 one
 /// (rawv6_setsockopt); every other SOL_RAW option is ENOPROTOOPT.
 const SOL_RAW: u64 = 255;

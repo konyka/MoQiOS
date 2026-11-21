@@ -96,7 +96,7 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
                 ipv4.PROTO_TCP => {
                     // tcp_v4_save_options: a SYN's options, echoed, go with a connection accepted from it.
                     const rx_opts: ?@import("ip_options_policy.zig").SendOpts = if (meta4.optlen != 0 and !meta4.ret_bad and meta4.retlen != 0) @import("ip_options_policy.zig").compileForSend(meta4.retopts[0..meta4.retlen], true) else null;
-                    tcp.handlePacketOpts(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, info.ecn_ce, rx_opts);
+                    tcp.handlePacketOpts(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, info.ecn_ce, rx_opts, .{ .ifindex = ifindex, .ttl = info.ttl, .tos = info.tos });
                 },
                 ipv4.PROTO_UDP => {
                     udp.handlePacketMetaInfo(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, meta4);
