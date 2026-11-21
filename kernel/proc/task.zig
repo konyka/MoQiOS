@@ -336,6 +336,9 @@ pub const Task = struct {
     exit_signal_x: u8 = 0,
     /// Linux self_exec_id: bumped by every execve of this task.
     self_exec_id: u32 = 0,
+    /// exec_update_lock as a sequence count (pidfd_policy.execRead): odd while an execve closes its close-on-exec descriptors and
+    /// switches to the new image, so pidfd_getfd never takes a descriptor that exec is about to close.
+    exec_update_seq: u32 = 0,
     /// Linux parent_exec_id: the parent's self_exec_id when this task was made (fork, clone); a parent that has exec'd since gets
     /// SIGCHLD instead of a clone exit signal (proc_id_policy.notifySignal).
     parent_exec_id: u32 = 0,

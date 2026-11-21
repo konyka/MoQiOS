@@ -49,3 +49,20 @@ test "pidfd_open takes PIDFD_NONBLOCK and PIDFD_THREAD only" {
     try std.testing.expectEqual(@as(u32, 1), pollEvents(true, true));
     try std.testing.expectEqual(@as(u32, 0x11), pollEvents(false, false));
 }
+
+/// exec_update_lock as a sequence count: execve makes it odd before it closes the close-on-exec descriptors and even again once
+/// the new image is committed. pidfd_getfd copies a descriptor only while it is even and keeps the copy only when it did not move.
+pub const ExecRead = enum { wait, retry, ok };
+
+pub fn execRead(before: u32, after: u32) ExecRead {
+    if (before & 1 != 0) return .wait;
+    return if (after == before) .ok else .retry;
+}
+
+test "pidfd_getfd waits out an exec and retries a copy an exec overlapped" {
+    const std = @import("std");
+    try std.testing.expectEqual(ExecRead.wait, execRead(1, 1));
+    try std.testing.expectEqual(ExecRead.retry, execRead(2, 3));
+    try std.testing.expectEqual(ExecRead.retry, execRead(2, 4));
+    try std.testing.expectEqual(ExecRead.ok, execRead(4, 4));
+}

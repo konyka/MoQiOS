@@ -17379,7 +17379,7 @@ test "pidfd: PIDFD_SELF values, a thread pidfd's scope, pidfd_poll and waitid(P_
 test "pidfd_getfd copies the target's descriptor close-on-exec after a ptrace-access check (hello460 F)" {
     const se = kt.syscall_entry_source;
     try std.testing.expect(std.mem.indexOf(u8, se, "return -95; // EOPNOTSUPP\n}\n\n/// swapon") == null);
-    try std.testing.expect(std.mem.indexOf(u8, se, "const copy = vfs.snapshotForPassing(target.fd_table, targetfd) orelse return -9;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "var c = vfs.snapshotForPassing(target.fd_table, targetfd) orelse {") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "if (vfs.installPassed(cur.fd_table, copy, true)) |slot| return @intCast(slot);") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "!pvp.mayAccess(ids.of(cur), ids.of(target), cur.effective_caps.cap_sys_ptrace)) return -1;") != null);
 }
@@ -17627,4 +17627,18 @@ test "IP_PKTOPTIONS on TCP sockets: IP_PKTINFO, IP_TTL and IP_TOS from what the 
     try std.testing.expect(std.mem.indexOf(u8, ts, "pub fn tcpPktOptions(tcb_idx: u32) ?PktOptions {") != null);
     try std.testing.expect(std.mem.count(u8, ts, ".rx_ttl = rx.ttl;") == 2);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_opt_source, "if (level == ipo.SOL_IP and optname == IP_PKTOPTIONS and ref == .tcp) {") != null);
+}
+
+test "pidfd_getfd does not race the target's exec (exec_update_lock as a sequence count)" {
+    const p = kt.pidfd_policy;
+    try std.testing.expectEqual(p.ExecRead.wait, p.execRead(3, 3));
+    try std.testing.expectEqual(p.ExecRead.ok, p.execRead(6, 6));
+    const ex = kt.execve_source;
+    const begin = std.mem.indexOf(u8, ex, "_ = @atomicRmw(u32, &cur.exec_update_seq, .Add, 1, .acq_rel); // exec begins") orelse return error.TestUnexpectedResult;
+    const close = std.mem.indexOf(u8, ex, "(cur.fd_table.fds[i].fd_flags & fcntl_mod.FD_CLOEXEC) != 0)").?;
+    // The count goes even again when prepareExecName returns (a defer right after the increment), after the image switch.
+    const end = std.mem.indexOf(u8, ex, "defer _ = @atomicRmw(u32, &cur.exec_update_seq, .Add, 1, .acq_rel); // exec committed") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(begin < end and end < close);
+    const se = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, se, "switch (pp.execRead(seq0, @atomicLoad(u32, &target.exec_update_seq, .acquire))) {") != null);
 }

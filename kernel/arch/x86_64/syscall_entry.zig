@@ -6270,9 +6270,27 @@ fn syscallPidfdGetfd(pidfd: u32, targetfd: u32, flags: u32) i64 {
             return .{ .uid = t.uid, .euid = t.euid, .suid = t.suid, .gid = t.gid, .egid = t.egid, .sgid = t.sgid };
         }
     };
-    if (target != cur and !pvp.mayAccess(ids.of(cur), ids.of(target), cur.effective_caps.cap_sys_ptrace)) return -1; // EPERM
     if (targetfd >= vfs.MAX_FDS) return -9;
-    const copy = vfs.snapshotForPassing(target.fd_table, targetfd) orelse return -9;
+    // exec_update_lock (down_read_killable): the access check and the copy see either the old image or the new one, never an exec
+    // halfway through closing its close-on-exec descriptors or changing credentials.
+    const pp = @import("../../proc/pidfd_policy.zig");
+    const copy = while (true) {
+        const seq0 = @atomicLoad(u32, &target.exec_update_seq, .acquire);
+        if (seq0 & 1 != 0) {
+            // A killable wait: a fatal signal ends the caller there, a handled one is EINTR.
+            if (sleepUntil(@import("../../arch/x86_64/tsc.zig").nanos() + 1_000_000, 0) == -4) return -4;
+            continue;
+        }
+        if (target != cur and !pvp.mayAccess(ids.of(cur), ids.of(target), cur.effective_caps.cap_sys_ptrace)) return -1; // EPERM
+        var c = vfs.snapshotForPassing(target.fd_table, targetfd) orelse {
+            if (@atomicLoad(u32, &target.exec_update_seq, .acquire) != seq0) continue;
+            return -9;
+        };
+        switch (pp.execRead(seq0, @atomicLoad(u32, &target.exec_update_seq, .acquire))) {
+            .ok => break c,
+            .wait, .retry => vfs.releaseDescriptor(&c),
+        }
+    };
     if (vfs.installPassed(cur.fd_table, copy, true)) |slot| return @intCast(slot);
     vfs.releaseDescriptor(&copy);
     return -24; // EMFILE

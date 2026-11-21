@@ -163,6 +163,9 @@ pub fn prepareExecName(name: []const u8, argv_ptr: u64, envp_ptr: u64) Prepared 
         return .{ .err = policy.errno(.no_memory) };
     };
 
+    // exec_update_lock (begin_new_exec takes it before do_close_on_exec): pidfd_getfd waits until the new image is in place.
+    _ = @atomicRmw(u32, &cur.exec_update_seq, .Add, 1, .acq_rel); // exec begins
+    defer _ = @atomicRmw(u32, &cur.exec_update_seq, .Add, 1, .acq_rel); // exec committed
     // v53.44: Close FD_CLOEXEC file descriptors before destroying old address space.
     // POSIX requires exec to auto-close FDs with O_CLOEXEC/FD_CLOEXEC flag.
     {
