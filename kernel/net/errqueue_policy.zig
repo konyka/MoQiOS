@@ -12,10 +12,13 @@ pub const IPV6_RECVERR: u64 = 25;
 pub const SO_EE_ORIGIN_ICMP6: u8 = 3;
 pub const MSG_ERRQUEUE: u32 = 0x2000;
 pub const SO_EE_ORIGIN_ICMP: u8 = 2;
-/// Entries a socket keeps (Linux bounds the queue by sk_rcvbuf; this one is fixed).
-pub const DEPTH: usize = 4;
-/// Quoted payload kept per entry: an ICMP error quotes at least 8 bytes after the UDP header, and this stack only builds short ones.
-pub const PAYLOAD_MAX: usize = 64;
+/// Entries a socket keeps at most (Linux bounds the queue only by sk_rcvbuf, see `admits`; this keeps a raised SO_RCVBUF from letting
+/// one socket take all memory).
+pub const DEPTH: usize = 1024;
+/// Quoted bytes kept per entry: icmp_send quotes as much of the datagram as fits in 576 bytes (548 after the IP and ICMP headers),
+/// icmp6_send as much as fits in the 1280-byte minimum MTU (1232); what recvmsg(MSG_ERRQUEUE) returns is that less the quoted IP
+/// and transport headers (520 bytes of a UDP payload over IPv4, 1184 over IPv6).
+pub const PAYLOAD_MAX: usize = 1232;
 
 pub const Entry = struct {
     errno: i32 = 0,
@@ -30,34 +33,66 @@ pub const Entry = struct {
     /// A local error (ip_local_error): origin LOCAL, no offender address.
     local: bool = false,
     dst_port: u16 = 0,
-    len: u8 = 0,
+    len: u16 = 0,
     payload: [PAYLOAD_MAX]u8 = @splat(0),
 };
 
-pub const Queue = struct {
-    items: [DEPTH]Entry = @splat(.{}),
-    n: u8 = 0,
+/// What a queued error costs the socket's receive buffer (skb->truesize of the cloned ICMP skb, measured with SO_MEMINFO on Linux:
+/// 960 for a short quote, 1280 for a full IPv4 one, 2304 for a long IPv6 one).
+pub fn truesize(e: *const Entry) u32 {
+    const quoted: usize = e.len + (if (e.v6) @as(usize, 48) else 28);
+    if (quoted <= 400) return 960;
+    if (quoted <= 576) return 1280;
+    return 2304;
+}
 
-    /// sock_queue_err_skb: append (a full queue drops the new entry, as a full sk_rcvbuf does).
-    pub fn push(q: *Queue, e: Entry) bool {
-        if (q.n == DEPTH) return false;
-        q.items[q.n] = e;
+/// sock_queue_err_skb: a new error is refused when it would take the queue past SO_RCVBUF (measured: 8 short errors and 6 full IPv4
+/// quotes under SO_RCVBUF 4096, which reads 8192), unless the queue is empty.
+pub fn admits(rmem: u32, size: u32, rcvbuf: u32) bool {
+    return rmem == 0 or @as(u64, rmem) + size <= rcvbuf;
+}
+
+/// A socket's IP_RECVERR queue, oldest first: entries allocated one by one with `alloc` (kmalloc in the kernel), freed by `free`.
+pub const Queue = struct {
+    head: ?*Node = null,
+    tail: ?*Node = null,
+    n: u32 = 0,
+    rmem: u32 = 0,
+
+    pub const Node = struct { entry: Entry, next: ?*Node = null };
+    pub const Alloc = struct {
+        alloc: *const fn () ?*Node,
+        free: *const fn (*Node) void,
+    };
+
+    /// sock_queue_err_skb: append (refused, as a full sk_rcvbuf refuses it, when `rcvbuf` has no room or memory runs out).
+    pub fn pushWith(q: *Queue, e: Entry, rcvbuf: u32, a: Alloc) bool {
+        const size = truesize(&e);
+        if (q.n >= DEPTH or !admits(q.rmem, size, rcvbuf)) return false;
+        const node = a.alloc() orelse return false;
+        node.* = .{ .entry = e };
+        if (q.tail) |t| t.next = node else q.head = node;
+        q.tail = node;
         q.n += 1;
+        q.rmem += size;
         return true;
     }
 
     /// sock_dequeue_err_skb: the oldest entry, and the errno sk_err takes after it (the next entry's, or 0).
-    pub fn pop(q: *Queue) ?struct { entry: Entry, next_err: i32 } {
-        if (q.n == 0) return null;
-        const e = q.items[0];
-        var i: usize = 1;
-        while (i < q.n) : (i += 1) q.items[i - 1] = q.items[i];
+    pub fn popWith(q: *Queue, a: Alloc) ?struct { entry: Entry, next_err: i32 } {
+        const node = q.head orelse return null;
+        const e = node.entry;
+        q.head = node.next;
+        if (q.tail == node) q.tail = null;
         q.n -= 1;
-        return .{ .entry = e, .next_err = if (q.n > 0) q.items[0].errno else 0 };
+        q.rmem -|= truesize(&e);
+        a.free(node);
+        return .{ .entry = e, .next_err = if (q.head) |h| h.entry.errno else 0 };
     }
 
-    pub fn clear(q: *Queue) void {
-        q.n = 0;
+    pub fn clearWith(q: *Queue, a: Alloc) void {
+        while (q.head != null) _ = q.popWith(a);
+        q.* = .{};
     }
 };
 
@@ -137,17 +172,47 @@ pub fn encodeExtErr(e: Entry) struct { bytes: [44]u8, len: usize } {
     return .{ .bytes = out, .len = 32 };
 }
 
+const TestAlloc = struct {
+    fn alloc() ?*Queue.Node {
+        return std.testing.allocator.create(Queue.Node) catch null;
+    }
+    fn free(n: *Queue.Node) void {
+        std.testing.allocator.destroy(n);
+    }
+    const a: Queue.Alloc = .{ .alloc = alloc, .free = free };
+};
+
 test "the queue keeps order and sk_err follows its head" {
     var q: Queue = .{};
-    try std.testing.expect(q.push(.{ .errno = 111 }));
-    try std.testing.expect(q.push(.{ .errno = 113 }));
-    const a = q.pop().?;
-    try std.testing.expectEqual(@as(i32, 111), a.entry.errno);
-    try std.testing.expectEqual(@as(i32, 113), a.next_err);
-    try std.testing.expectEqual(@as(i32, 0), q.pop().?.next_err);
-    try std.testing.expect(q.pop() == null);
-    for (0..DEPTH) |_| try std.testing.expect(q.push(.{}));
-    try std.testing.expect(!q.push(.{}));
+    defer q.clearWith(TestAlloc.a);
+    try std.testing.expect(q.pushWith(.{ .errno = 111 }, 212992, TestAlloc.a));
+    try std.testing.expect(q.pushWith(.{ .errno = 113 }, 212992, TestAlloc.a));
+    const x = q.popWith(TestAlloc.a).?;
+    try std.testing.expectEqual(@as(i32, 111), x.entry.errno);
+    try std.testing.expectEqual(@as(i32, 113), x.next_err);
+    try std.testing.expectEqual(@as(i32, 0), q.popWith(TestAlloc.a).?.next_err);
+    try std.testing.expect(q.popWith(TestAlloc.a) == null);
+}
+
+test "SO_RCVBUF bounds the queue: 221 short errors, 166 full IPv4 quotes in the default 212992 bytes (Linux counts 960 and 1280)" {
+    var q: Queue = .{};
+    defer q.clearWith(TestAlloc.a);
+    var n: usize = 0;
+    while (q.pushWith(.{ .len = 1 }, 212992, TestAlloc.a)) n += 1;
+    try std.testing.expectEqual(@as(usize, 221), n);
+    q.clearWith(TestAlloc.a);
+    n = 0;
+    while (q.pushWith(.{ .len = 520 }, 212992, TestAlloc.a)) n += 1;
+    try std.testing.expectEqual(@as(usize, 166), n);
+    try std.testing.expectEqual(@as(u32, 2304), truesize(&.{ .len = 1184, .v6 = true }));
+    q.clearWith(TestAlloc.a);
+    n = 0;
+    while (q.pushWith(.{ .len = 1 }, 8192, TestAlloc.a)) n += 1;
+    try std.testing.expectEqual(@as(usize, 8), n);
+    q.clearWith(TestAlloc.a);
+    n = 0;
+    while (q.pushWith(.{ .len = 520 }, 8192, TestAlloc.a)) n += 1;
+    try std.testing.expectEqual(@as(usize, 6), n);
 }
 
 test "an oversized datagram is a local EMSGSIZE, queued only under DO/PROBE with IP_RECVERR" {

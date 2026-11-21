@@ -196,6 +196,7 @@ pub fn release(idx: u32) void {
     }
     const s = &sockets[idx];
     while (s.head != null) popEntry(s);
+    s.errq.clearWith(@import("udp.zig").errq_alloc);
     sockets[idx] = .{};
 }
 
@@ -423,7 +424,7 @@ pub fn notifyIcmpError(protocol: u8, quoted_src: [4]u8, quoted_dst: [4]u8, icmp_
                 const k = @min(body.len, errq.PAYLOAD_MAX);
                 ent.len = @intCast(k);
                 @memcpy(ent.payload[0..k], body[0..k]);
-                _ = s.errq.push(ent);
+                _ = s.errq.pushWith(ent, s.opts.rcvbuf, @import("udp.zig").errq_alloc);
             }
             if (!(recverr or e.hard)) continue;
             s.err = e.errno;
@@ -455,7 +456,7 @@ pub fn notifyIcmpError6(nexthdr: u8, quoted_src: [16]u8, quoted_dst: [16]u8, icm
                 const k = @min(body.len, errq.PAYLOAD_MAX);
                 ent.len = @intCast(k);
                 @memcpy(ent.payload[0..k], body[0..k]);
-                _ = s.errq.push(ent);
+                _ = s.errq.pushWith(ent, s.opts.rcvbuf, @import("udp.zig").errq_alloc);
             }
             if (!(recverr or conv.hard)) continue;
             s.err = conv.errno;
@@ -497,7 +498,7 @@ pub fn takeRxPmtu(idx: u32) ?@import("udp.zig").RxPmtu {
 pub fn queueLocalError(idx: u32, e: @import("errqueue_policy.zig").Entry) void {
     const saved = raw_lock.acquire();
     defer raw_lock.release(saved);
-    if (idx < MAX_SOCKETS and sockets[idx].used) _ = sockets[idx].errq.push(e);
+    if (idx < MAX_SOCKETS and sockets[idx].used) _ = sockets[idx].errq.pushWith(e, sockets[idx].opts.rcvbuf, @import("udp.zig").errq_alloc);
 }
 
 /// Make `e` the socket's pending error (do_recvmmsg's sk_err after a batch that failed part-way).
@@ -519,7 +520,7 @@ pub fn takeQueuedError(idx: u32) ?@import("errqueue_policy.zig").Entry {
     const saved = raw_lock.acquire();
     defer raw_lock.release(saved);
     if (idx >= MAX_SOCKETS or !sockets[idx].used) return null;
-    const r = sockets[idx].errq.pop() orelse return null;
+    const r = sockets[idx].errq.popWith(@import("udp.zig").errq_alloc) orelse return null;
     sockets[idx].err = r.next_err;
     return r.entry;
 }

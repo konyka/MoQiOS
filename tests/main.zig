@@ -17768,3 +17768,13 @@ test "AF_UNIX datagram and seqpacket records carry SO_TIMESTAMP ahead of SCM_CRE
     const cr = std.mem.indexOf(u8, ss, "const cb = sp.buildCredentials(out.cred.pid, out.cred.uid, out.cred.gid,").?;
     try std.testing.expect(st < cr);
 }
+
+test "the IP_RECVERR queue holds full ICMP quotes and is bounded by SO_RCVBUF, not 4 entries (hello478)" {
+    const e = kt.errqueue_policy;
+    try std.testing.expectEqual(@as(usize, 1232), e.PAYLOAD_MAX);
+    try std.testing.expect(e.admits(0, 2304, 100));
+    const us = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "const quote_udp: u16 = @min(udp_len, 576 - 20 - 8 - 20);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "const quote_udp: u16 = @min(udp_len, 1280 - 40 - 8 - 40);") != null);
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, us, "if (!port_errq[i].pushWith(ent, port_opts[i].rcvbuf, errq_alloc)) continue;"));
+}

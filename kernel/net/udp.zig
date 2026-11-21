@@ -203,6 +203,19 @@ var port_opts: [MAX_PORTS]@import("sockopt_policy.zig").Stored = @splat(.{});
 var port_err: [MAX_PORTS]i32 = @splat(0);
 /// IP_RECVERR error queue of each slot (errqueue_policy.zig); travels with the slot like port_err.
 var port_errq: [MAX_PORTS]errq.Queue = @splat(.{});
+
+/// kmalloc for IP_RECVERR queue nodes (errqueue_policy.Queue).
+pub const errq_alloc: errq.Queue.Alloc = .{ .alloc = errqNodeAlloc, .free = errqNodeFree };
+
+fn errqNodeAlloc() ?*errq.Queue.Node {
+    const raw = @import("../mm/slab.zig").kmalloc(@sizeOf(errq.Queue.Node)) orelse return null;
+    return @ptrCast(@alignCast(raw));
+}
+
+fn errqNodeFree(n: *errq.Queue.Node) void {
+    @import("../mm/slab.zig").kfree(n);
+}
+
 /// IP_OPTIONS of each port (inet->inet_opt), as ip_options_policy.compileForSend left them; len 0: none.
 var port_ipopts: [MAX_PORTS]@import("ip_options_policy.zig").SendOpts = @splat(.{});
 
@@ -414,7 +427,7 @@ pub fn queueLocalError(port: u32, e: errq.Entry) void {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const i = findPortIdxLocked(port) orelse return;
-    _ = port_errq[i].push(e);
+    _ = port_errq[i].pushWith(e, port_opts[i].rcvbuf, errq_alloc);
 }
 
 /// recvmsg(MSG_ERRQUEUE): the oldest queued error of the socket with key `port`, null when there is none. The pending error becomes the
@@ -423,7 +436,7 @@ pub fn takeQueuedError(port: u32) ?errq.Entry {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const i = findPortIdxLocked(port) orelse return null;
-    const r = port_errq[i].pop() orelse return null;
+    const r = port_errq[i].popWith(errq_alloc) orelse return null;
     port_err[i] = r.next_err;
     return r.entry;
 }
@@ -491,7 +504,7 @@ pub fn notifyIcmpError(e: IcmpError) void {
                 const k = @min(e.payload.len, errq.PAYLOAD_MAX);
                 ent.len = @intCast(k);
                 @memcpy(ent.payload[0..k], e.payload[0..k]);
-                if (!port_errq[i].push(ent)) continue;
+                if (!port_errq[i].pushWith(ent, port_opts[i].rcvbuf, errq_alloc)) continue;
             }
             if (!r.set_err) continue;
             port_err[i] = e.errno;
@@ -532,7 +545,7 @@ pub fn notifyPingIcmpError(ident: u16, e: IcmpError, queue: bool) void {
                 const k = @min(e.payload.len, errq.PAYLOAD_MAX);
                 ent.len = @intCast(k);
                 @memcpy(ent.payload[0..k], e.payload[0..k]);
-                if (!port_errq[i].push(ent)) continue;
+                if (!port_errq[i].pushWith(ent, port_opts[i].rcvbuf, errq_alloc)) continue;
             }
             if (!r.set_err) continue;
             port_err[i] = e.errno;
@@ -580,7 +593,7 @@ pub fn notifyIcmpError6(e: IcmpError6) void {
                 const k = @min(e.payload.len, errq.PAYLOAD_MAX);
                 ent.len = @intCast(k);
                 @memcpy(ent.payload[0..k], e.payload[0..k]);
-                if (!port_errq[i].push(ent)) continue;
+                if (!port_errq[i].pushWith(ent, port_opts[i].rcvbuf, errq_alloc)) continue;
             }
             if (!r.set_err) continue;
             port_err[i] = e.errno;
@@ -618,7 +631,7 @@ pub fn notifyPingIcmpError6(ident: u16, e: IcmpError6, queue: bool) void {
                 const k = @min(e.payload.len, errq.PAYLOAD_MAX);
                 ent.len = @intCast(k);
                 @memcpy(ent.payload[0..k], e.payload[0..k]);
-                if (!port_errq[i].push(ent)) continue;
+                if (!port_errq[i].pushWith(ent, port_opts[i].rcvbuf, errq_alloc)) continue;
             }
             if (!r.set_err) continue;
             port_err[i] = e.errno;
@@ -683,7 +696,7 @@ fn newSlotLocked(key: u32, is_v6: bool, uid: u32) u16 {
     port_refs[idx] = 1;
     port_opts[idx] = .{};
     port_err[idx] = 0;
-    port_errq[idx].clear();
+    port_errq[idx].clearWith(errq_alloc);
     port_rxpmtu[idx] = .{};
     port_ipopts[idx] = .{};
     port_ipid[idx] = 0;
@@ -1049,13 +1062,14 @@ fn releaseLocked(port: u32) void {
                 return;
             }
             dropAllLocked(i);
+            port_errq[i].clearWith(errq_alloc);
             num_ports -= 1;
             ports[i] = ports[num_ports];
             port_refs[i] = port_refs[num_ports];
             port_opts[i] = port_opts[num_ports];
             port_err[i] = port_err[num_ports];
             port_errq[i] = port_errq[num_ports];
-            port_errq[num_ports].clear();
+            port_errq[num_ports] = .{};
             port_rxpmtu[i] = port_rxpmtu[num_ports];
             port_rxpmtu[num_ports] = .{};
             port_ipopts[i] = port_ipopts[num_ports];
@@ -1309,9 +1323,9 @@ pub fn handlePacketMetaInfo(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len
 fn sendPortUnreachable(src_ip: [4]u8, dst_ip: [4]u8, udp: [*]const u8, udp_len: u16) void {
     const lo_dev = @import("lo.zig");
     const icmp_mod = @import("icmp.zig");
-    // icmp_send quotes as much of the datagram as fits in 576 bytes; 64 bytes of payload here (what the error queue keeps).
-    var pkt: [14 + 20 + 8 + 20 + 8 + 64]u8 = @splat(0);
-    const quote_udp: u16 = @min(udp_len, 8 + 64);
+    // icmp_send quotes as much of the datagram as fits in 576 bytes: the IP header and up to 576 - 20 - 8 - 20 bytes of UDP.
+    var pkt: [14 + 576]u8 = @splat(0);
+    const quote_udp: u16 = @min(udp_len, 576 - 20 - 8 - 20);
     // ICMP at 34: header (8) + quoted IP header (20) + quoted UDP bytes.
     ipv4.buildHeader(pkt[34 + 8 ..].ptr, src_ip, dst_ip, ipv4.PROTO_UDP, udp_len);
     @memcpy(pkt[34 + 8 + 20 ..][0..quote_udp], udp[0..quote_udp]);
@@ -1370,10 +1384,10 @@ pub fn handlePacketV6Info(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len
 /// ICMPv6 port unreachable (type 1 code 4) for a ::1 datagram nobody receives:
 /// carries the offending IPv6 header and the first 8 bytes of the UDP header.
 fn sendPortUnreachableV6(src_ip: [16]u8, dst_ip: [16]u8, udp: [*]const u8, udp_len: u16) void {
-    // icmp6_send quotes as much as fits in the minimum MTU; 64 bytes of payload here (what the error queue keeps).
-    var pkt: [14 + 40 + 8 + 40 + 8 + 64]u8 = @splat(0);
+    // icmp6_send quotes as much as fits in the 1280-byte minimum MTU: the IPv6 header and up to 1280 - 40 - 8 - 40 bytes of UDP.
+    var pkt: [14 + 1280]u8 = @splat(0);
     const icmp_off: u16 = 14 + ipv6.HEADER_LEN;
-    const quote_udp: u16 = @min(udp_len, 8 + 64);
+    const quote_udp: u16 = @min(udp_len, 1280 - 40 - 8 - 40);
     // ICMPv6: type, code, checksum, 4 unused bytes, then the invoking packet.
     pkt[icmp_off] = 1;
     pkt[icmp_off + 1] = 4;
