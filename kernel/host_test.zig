@@ -87,6 +87,7 @@ pub const lifecycle_policy = @import("mm/lifecycle_policy.zig");
 pub const clone_flags_policy = @import("mm/clone_flags_policy.zig");
 pub const pidfd_policy = @import("proc/pidfd_policy.zig");
 pub const pipe_slot_policy = @import("fs/pipe_slot_policy.zig");
+pub const fork_mark_policy = @import("mm/fork_mark_policy.zig");
 pub const udp_rmem_policy = @import("net/udp_rmem_policy.zig");
 pub const pidfd_signal_policy = @import("proc/pidfd_signal_policy.zig");
 pub const task_slot_lifetime = @import("proc/task_slot_lifetime.zig");
@@ -380,6 +381,7 @@ pub const copy_file_range_source = @embedFile("fs/copy_file_range.zig");
 test {
     _ = @import("net/tcp_urg_policy.zig");
     _ = @import("fs/pipe_slot_policy.zig");
+    _ = @import("mm/fork_mark_policy.zig");
     _ = @import("net/udp_rmem_policy.zig");
     _ = @import("drivers/random_seed_policy.zig");
     _ = @import("net/flowlabel_policy.zig");

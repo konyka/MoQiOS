@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello478`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello479`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -473,6 +473,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello476 | raw 套接字的 SO_RCVMARK、SO_RCVPRIORITY、SO_TIMESTAMP：协议 253 的 raw 接收端收到 SO_MARK 9、SO_PRIORITY 4（A）；ICMP raw 套接字看到 ping 套接字（SO_MARK 7、SO_PRIORITY 3）发的回显请求带 7 和 3，内核回的应答带 0 和 0（B）；ping 套接字自己收到的应答不带这两个控制消息（C）；IPv6 raw 接收端收到 SO_MARK 5（D）；开 SO_TIMESTAMP 的 raw 套接字收到 SCM_TIMESTAMP（E）；ping 套接字开 SO_TIMESTAMP 后回显应答带 SCM_TIMESTAMP（F） |
 | hello477 | AF_UNIX 套接字的 SO_TIMESTAMP：数据报 socketpair 收到 SCM_TIMESTAMP（cmsg_len 32、当前时间）（A）；SO_TIMESTAMPNS 时为 SCM_TIMESTAMPNS（B）；流 socketpair 不带控制消息（C）；seqpacket 带 SCM_TIMESTAMP（D）；设选项前已排队的数据报也带（E）；同时开 SO_PASSCRED 时先时间戳、后 SCM_CREDENTIALS，controllen 64（F） |
 | hello478 | IP_RECVERR 错误队列：发往 127.0.0.1 未绑定端口的 100 字节数据报的差错返回 100 字节，1000 字节的返回 520（A）；IPv6 的 1000 字节返回 1000，1300 字节返回 1184（B）；SO_RCVBUF 设 4096 后二十个 1 字节差错排下 8 个、1000 字节的排下 6 个（D） |
+| hello479 | brk 堆和栈上的 MADV_DONTFORK、MADV_WIPEONFORK：四页 brk 堆的第 1–2 页 WIPEONFORK、第 3 页 DONTFORK 都返回 0（A）；栈上一页 WIPEONFORK 返回 0（B）；fork 子进程读到第 0 页仍是 'H'、第 1–2 页和那页栈是 0，父进程不变（C）；程序代码页的 WIPEONFORK 为 EINVAL，DONTFORK、DOFORK 为 0（D） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

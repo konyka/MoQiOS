@@ -595,6 +595,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello476"); /* SO_RCVMARK / SO_RCVPRIORITY / SO_TIMESTAMP on raw sockets */
     run_test("hello477"); /* SO_TIMESTAMP on AF_UNIX sockets */
     run_test("hello478"); /* the IP_RECVERR queue: quote length and SO_RCVBUF */
+    run_test("hello479"); /* MADV_DONTFORK / MADV_WIPEONFORK on the brk heap and the stack */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

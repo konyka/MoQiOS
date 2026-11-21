@@ -85,7 +85,7 @@ fn isSharedMapping(regions: []const task_mod.MmapRegion, virt: u64) bool {
 /// fresh, unlinked pages — parent untouched); phase 2 downgrades and fills
 /// with zero allocations, so OOM can neither abandon a half-built child tree
 /// nor leave the parent COW-marked for a child that does not exist.
-pub fn cloneUserPages(parent_pml4_phys: u64, shared_regions: []const task_mod.MmapRegion) ?u64 {
+pub fn cloneUserPages(parent_pml4_phys: u64, shared_regions: []const task_mod.MmapRegion, marks: ?*const @import("../../mm/fork_mark_policy.zig").Table) ?u64 {
     const ADDR_MASK: u64 = 0xFFFFFFFFF000;
 
     const parent_pml4: [*]const u64 = @ptrFromInt(hhdm_mod.physToVirt(parent_pml4_phys));
@@ -208,7 +208,7 @@ pub fn cloneUserPages(parent_pml4_phys: u64, shared_regions: []const task_mod.Mm
                         (@as(u64, pt_idx) << 12);
                     // MADV_DONTFORK pages are not copied (the region is dropped from the child's table); MADV_WIPEONFORK pages are
                     // replaced by fork.fillWipedPages with fresh zero pages afterwards — the same rules as fork's cloneUserPagesCow.
-                    if (@import("../../mm/filemap.zig").inDontforkRegion(task_mod.MmapRegion, shared_regions, virt)) continue;
+                    if (@import("../../proc/fork.zig").pageSkippedByFork(shared_regions, marks, virt)) continue;
                     const shared_mapping = isSharedMapping(shared_regions, virt);
                     if (isZeroPage(src) and !shared_mapping) continue;
 
@@ -306,8 +306,10 @@ pub fn clone(
         clone: {
             var vm_guard = @import("../../mm/mm.zig").Mm.beginVmMutation(parent.mm, @ptrCast(parent)) catch return -12; // ENOMEM
             defer vm_guard.release();
-            const pml4 = cloneUserPages(parent.page_table_phys, parent.vma().regions) orelse return -12; // ENOMEM
-            if (!@import("../../proc/fork.zig").fillWipedPages(parent.page_table_phys, pml4, parent.vma().regions)) {
+            // MADV_DONTFORK / MADV_WIPEONFORK on pages outside the regions (brk heap, stack), read by the page copy.
+            const marks: ?*const @import("../../mm/fork_mark_policy.zig").Table = if (parent.mm) |pm| &pm.grp.fork_marks else null;
+            const pml4 = cloneUserPages(parent.page_table_phys, parent.vma().regions, marks) orelse return -12; // ENOMEM
+            if (!@import("../../proc/fork.zig").fillWipedPages(parent.page_table_phys, pml4, parent.vma().regions, marks)) {
                 @import("../../mm/user_space.zig").destroyUserSpace(pml4);
                 return -12; // ENOMEM
             }
@@ -351,6 +353,7 @@ pub fn clone(
     if (!shares_vm) {
         if (child.mm) |child_mm| if (parent.mm) |parent_mm| {
             child_mm.inheritBreak(parent_mm);
+            child_mm.grp.fork_marks = parent_mm.grp.fork_marks;
             child_mm.inheritCharges(parent_mm);
             child_mm.inheritLimits(parent_mm);
             child_mm.inheritFs(parent_mm);

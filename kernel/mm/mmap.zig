@@ -2126,11 +2126,48 @@ pub fn setWipeonfork(task: *task_mod.Task, addr: u64, length: u64, value: bool) 
     return setForkFlag(task, addr, length, .wipeonfork, value);
 }
 
+/// Whether page `va` is a heap or stack page no region tracks (brk heap [brk_start, brk_current), the stack below USER_STACK_TOP):
+/// the anonymous private pages madvise can mark through Mm.fork_marks.
+fn untrackedAnon(task: *task_mod.Task, va: u64) bool {
+    const m = task.mm orelse return false;
+    if (m.brk_current > m.brk_start and va >= (m.brk_start & ~@as(u64, user_space.PAGE_SIZE - 1)) and va < m.brk_current) return true;
+    return va >= user_space.USER_STACK_BOTTOM and va < user_space.USER_STACK_TOP;
+}
+
+fn inAnyRegion(task: *task_mod.Task, va: u64) bool {
+    var bits = task.vma().active_bm;
+    while (bits != 0) {
+        const i: usize = @intCast(@ctz(bits));
+        bits &= bits - 1;
+        const r = &task.vma().regions[i];
+        if (r.active and va >= r.base and va - r.base < r.num_pages * user_space.PAGE_SIZE) return true;
+    }
+    return false;
+}
+
 fn setForkFlag(task: *task_mod.Task, addr: u64, length: u64, which: ForkFlag, value: bool) i64 {
     const page = user_space.PAGE_SIZE;
     const pages = (length + page - 1) / page;
     var guard = mm_mod.Mm.beginVmMutation(task.mm, @ptrCast(task)) catch return -35;
     defer guard.release();
+    // Pages outside every region (brk heap, stack, image) take the mark in Mm.fork_marks, run by run; a full table is ENOMEM.
+    if (task.mm) |mmv| {
+        const fm = @import("fork_mark_policy.zig");
+        var trial = mmv.grp.fork_marks;
+        var p: u64 = 0;
+        while (p < pages) {
+            const va = addr + p * page;
+            if (inAnyRegion(task, va)) {
+                p += 1;
+                continue;
+            }
+            var q = p + 1;
+            while (q < pages and !inAnyRegion(task, addr + q * page)) q += 1;
+            if (!trial.set(va, addr + q * page, if (which == .dontfork) fm.Which.dontfork else fm.Which.wipeonfork, value)) return -12;
+            p = q;
+        }
+        mmv.grp.fork_marks = trial;
+    }
     var need: u32 = 0;
     var bits = task.vma().active_bm;
     while (bits != 0) {
@@ -2198,6 +2235,8 @@ pub fn rangePrivateAnon(task: *task_mod.Task, addr: u64, length: u64) bool {
             if (r.shared or r.file_kind != 0 or r.no_free) return false;
             continue :page_loop;
         }
+        // No region: the brk heap and the stack are private anonymous (Linux vmas of their own); the image is file-backed.
+        if (untrackedAnon(task, va)) continue;
         return false;
     }
     return true;

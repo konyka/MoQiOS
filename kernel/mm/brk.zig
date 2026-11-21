@@ -132,6 +132,7 @@ pub fn brk(addr: u64) i64 {
         // the range and panicked the kernel computing its length.
         releasePages(cur, new_page, old_page);
         mm.locks.releaseLossy(new_page, old_page - new_page); // the pages are gone, so are their locks
+        mm.grp.fork_marks.forget(new_page * PAGE, old_page * PAGE); // and their MADV_DONTFORK / MADV_WIPEONFORK marks
         cur.asUsed().* -|= (old_page - new_page) * PAGE; // RLIMIT_AS refund
         cur.dataUsed().* -|= (old_page - new_page) * PAGE; // RLIMIT_DATA refund
     }

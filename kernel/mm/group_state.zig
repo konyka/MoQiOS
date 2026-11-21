@@ -108,6 +108,11 @@ pub const GroupState = struct {
     /// Process-directed signals that every thread blocked when they were sent (proc/shared_pending_policy.zig): the first thread to
     /// unblock one takes it from the thread it was queued on, with every queued instance of a real-time one. A fork child starts with none.
     held_signals: u64 = 0,
+    /// MADV_DONTFORK / MADV_WIPEONFORK on pages no mmap region tracks (the brk heap, the stack, the image), as page ranges: a
+    /// property of the address space this page belongs to (one per Mm). Written under vm_lock; fork and clone without CLONE_VM
+    /// read them while they copy the pages and pass them on (Linux: the marks are vma flags, inherited by the child's vmas); a
+    /// new image (exec) starts with none.
+    fork_marks: @import("fork_mark_policy.zig").Table = .{},
 
     pub fn initial(max_fds: u64) GroupState {
         const inf: Limit = .{ .cur = RLIM_INFINITY, .max = RLIM_INFINITY };

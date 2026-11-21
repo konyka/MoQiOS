@@ -16971,7 +16971,7 @@ test "MADV_WIPEONFORK: fork gives the child fresh zero pages for the marked rang
     // Anonymous mappings are populated eagerly and have no demand-fill path: a wiped page left empty faulted to SIGSEGV in the child
     // (first QEMU run of hello447). fillWipedPages maps a zeroed frame per present parent page instead.
     const fk = kt.fork_source;
-    try std.testing.expect(std.mem.indexOf(u8, fk, "if (!fillWipedPages(parent.page_table_phys, pml4, parent.vma().regions)) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fk, "if (!fillWipedPages(parent.page_table_phys, pml4, parent.vma().regions, marks)) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, fk, "paging_mod.setPageEntryRaw(child_pml4_phys, va, phys | flags);") != null);
 }
 
@@ -16979,8 +16979,8 @@ test "clone without CLONE_VM honours MADV_DONTFORK and MADV_WIPEONFORK like fork
     // clone(SIGCHLD) copies the address space through arch/x86_64/clone.zig's own page-table walk, which used to copy every page
     // and keep every region, so DONTFORK / WIPEONFORK only worked for fork().
     const cs = kt.clone_source;
-    try std.testing.expect(std.mem.indexOf(u8, cs, "if (@import(\"../../mm/filemap.zig\").inDontforkRegion(task_mod.MmapRegion, shared_regions, virt)) continue;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cs, "@import(\"../../proc/fork.zig\").fillWipedPages(parent.page_table_phys, pml4, parent.vma().regions)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cs, "if (@import(\"../../proc/fork.zig\").pageSkippedByFork(shared_regions, marks, virt)) continue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cs, "@import(\"../../proc/fork.zig\").fillWipedPages(parent.page_table_phys, pml4, parent.vma().regions, marks)") != null);
     try std.testing.expect(std.mem.indexOf(u8, cs, "@import(\"../../mm/vma_table.zig\").dropDontfork(&vma_snap);") != null);
 }
 
@@ -17777,4 +17777,18 @@ test "the IP_RECVERR queue holds full ICMP quotes and is bounded by SO_RCVBUF, n
     try std.testing.expect(std.mem.indexOf(u8, us, "const quote_udp: u16 = @min(udp_len, 576 - 20 - 8 - 20);") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "const quote_udp: u16 = @min(udp_len, 1280 - 40 - 8 - 40);") != null);
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, us, "if (!port_errq[i].pushWith(ent, port_opts[i].rcvbuf, errq_alloc)) continue;"));
+}
+
+test "MADV_DONTFORK / MADV_WIPEONFORK mark the brk heap and the stack too (Mm.fork_marks); the image takes DONTFORK only (hello479)" {
+    const fm = kt.fork_mark_policy;
+    var t: fm.Table = .{};
+    try std.testing.expect(t.set(0x400000, 0x402000, .wipeonfork, true));
+    try std.testing.expect(t.at(0x401000).wipeonfork);
+    const mms = kt.mmap_source;
+    try std.testing.expect(std.mem.indexOf(u8, mms, "        if (untrackedAnon(task, va)) continue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mms, "if (!trial.set(va, addr + q * page,") != null);
+    const fk = kt.fork_source;
+    try std.testing.expect(std.mem.indexOf(u8, fk, "const pml4 = cloneUserPagesCow(parent.page_table_phys, parent.vma().regions, marks) orelse return -1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fk, "cm.grp.fork_marks = pm.grp.fork_marks;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.brk_source, "mm.grp.fork_marks.forget(new_page * PAGE, old_page * PAGE);") != null);
 }
