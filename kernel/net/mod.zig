@@ -58,6 +58,8 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
             // ip_rcv_options: a header with options is compiled (record route and timestamps get this host's entry); a malformed
             // option drops the datagram, and so does a source route (accept_source_route 0).
             var meta4: @import("ip_cmsg_policy.zig").RecvInfo = .{ .ifindex = ifindex, .dst = info.dst_ip, .ttl = info.ttl, .tos = info.tos };
+            var rx_hdr: [60]u8 = undefined;
+            var rx_hdr_len: usize = 0;
             if (info.payload_offset > 20) {
                 const iop = @import("ip_options_policy.zig");
                 const n_opt: usize = info.payload_offset - 20;
@@ -71,15 +73,25 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
                 if (c.srr != null) return;
                 meta4.optlen = @intCast(n_opt);
                 if (iop.echo(meta4.opts[0..n_opt], c, info.src_ip, &meta4.retopts)) |rl| meta4.retlen = @intCast(rl) else meta4.ret_bad = true;
+                // Raw sockets see the header as compiled (the skb's options were rewritten in place), its checksum redone.
+                @memcpy(rx_hdr[0..info.payload_offset], data[14..][0..info.payload_offset]);
+                @memcpy(rx_hdr[20..][0..n_opt], meta4.opts[0..n_opt]);
+                rx_hdr[10] = 0;
+                rx_hdr[11] = 0;
+                @import("../lib/byte_order.zig").writeU16BeAt(&rx_hdr, 10, ipv4.checksum(&rx_hdr, info.payload_offset));
+                rx_hdr_len = info.payload_offset;
             }
 
             // Linux raw_local_deliver hands each raw socket of the datagram's protocol a copy (IP header included) before the protocol
             // handler runs.
-            const raw_took = @import("raw_icmp.zig").deliver(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip, ifindex);
+            const raw_took = if (rx_hdr_len == 0)
+                @import("raw_icmp.zig").deliver(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip, ifindex)
+            else
+                @import("raw_icmp.zig").deliverHdr(info.protocol, rx_hdr[0..rx_hdr_len], data[payload_start .. payload_start + info.payload_len], info.src_ip, info.dst_ip, meta4);
             const rp = @import("raw_icmp_policy.zig");
             switch (info.protocol) {
                 ipv4.PROTO_ICMP => {
-                    icmp.handlePacketMeta(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, .{ .ifindex = ifindex, .dst = info.dst_ip, .ttl = info.ttl, .tos = info.tos });
+                    icmp.handlePacketMeta(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, meta4);
                 },
                 ipv4.PROTO_TCP => {
                     tcp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, info.ecn_ce);

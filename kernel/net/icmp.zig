@@ -61,9 +61,10 @@ pub fn buildEchoReplyMtu(
     return eth.buildFrame(o, reply_dst_mac, reply_src_mac, eth.ETHERTYPE_IPV4, 20 + icmp_total);
 }
 
-/// icmp_reply to a reassembled echo request longer than the MTU: the whole request is echoed back (type 0, checksum redone), in
-/// fragments (ip_push_pending_frames → ip_fragment), from `src` to `dst`.
-fn sendBigEchoReply(req: []const u8, src: [4]u8, dst: [4]u8, our_mac: [6]u8, dst_mac: [6]u8, via_lo: bool, tos: u8, mtu: u16) void {
+/// icmp_reply to a reassembled echo request longer than the MTU, or to one with IP options: the whole request is echoed back (type 0,
+/// checksum redone), behind `opts`, in fragments when it does not fit one frame (ip_push_pending_frames → ip_fragment), from `src`
+/// to `dst`.
+fn sendBigEchoReply(req: []const u8, src: [4]u8, dst: [4]u8, our_mac: [6]u8, dst_mac: [6]u8, via_lo: bool, tos: u8, mtu: u16, opts: []const u8) void {
     const slab = @import("../mm/slab.zig");
     const raw = slab.kmalloc(req.len) orelse return;
     defer slab.kfree(raw);
@@ -78,7 +79,7 @@ fn sendBigEchoReply(req: []const u8, src: [4]u8, dst: [4]u8, our_mac: [6]u8, dst
     ipv4.buildHeader(&hdr, src, dst, ipv4.PROTO_ICMP, 0);
     hdr[1] = tos;
     ipv4.setIdent(&hdr, ipid.global(dst, src, ipv4.PROTO_ICMP), false);
-    _ = @import("ip_frag.zig").send4(hdr, msg, mtu, dst_mac, our_mac, via_lo, null);
+    _ = @import("ip_frag.zig").send4(hdr, opts, msg, mtu, dst_mac, our_mac, via_lo, null);
 }
 
 /// Parsed ICMP Destination Unreachable / Fragmentation Needed (SK-101).
@@ -109,8 +110,17 @@ pub fn sendFrom(bound: [4]u8, dst: [4]u8, msg: []const u8, mode: u8) i64 {
 /// sendFrom with the IP header's TTL and TOS given (a ping socket's IP_TTL / IP_TOS, or the IP_TTL / IP_TOS control messages of
 /// that one request: ip_make_skb takes cork->ttl and cork->tos).
 pub fn sendFromOv(bound: [4]u8, dst: [4]u8, msg: []const u8, mode: u8, ttl: u8, tos: u8) i64 {
+    return sendFromOpts(bound, dst, msg, mode, ttl, tos, null);
+}
+
+/// sendFromOv with IPv4 options (ipc.opt: an IP_RETOPTS control message's, else the ping socket's IP_OPTIONS), built after the
+/// header for this request; a source route sends to its first hop.
+pub fn sendFromOpts(bound: [4]u8, dst_in: [4]u8, msg: []const u8, mode: u8, ttl: u8, tos: u8, ipopts: ?@import("ip_options_policy.zig").SendOpts) i64 {
+    const iop = @import("ip_options_policy.zig");
+    const dst = if (ipopts) |so| (if (so.o.srr != null) so.faddr else dst_in) else dst_in;
+    const optlen: usize = if (ipopts) |so| so.len else 0;
     const mtu = ipv4.getSendMtu(dst);
-    const orc = @import("raw_icmp_policy.zig").oversizeErrno4(msg.len, mtu, mode);
+    const orc = @import("raw_icmp_policy.zig").oversizeErrno4(msg.len + optlen, mtu, mode);
     if (orc != 0) return orc;
     const our_mac = netif.getMac();
     const via_lo = netif.isLocal4(dst);
@@ -123,14 +133,18 @@ pub fn sendFromOv(bound: [4]u8, dst: [4]u8, msg: []const u8, mode: u8, ttl: u8, 
         };
     };
     const src = @import("tcp_port_policy.zig").sourceAddr(bound, dst, netif.getOurIp());
-    if (msg.len + ipv4.HEADER_LEN > mtu) {
-        // ip_append_data → ip_fragment: pieces without DF, numbered from the shared generator.
+    const big = msg.len + optlen + ipv4.HEADER_LEN > mtu;
+    if (big or ipopts != null) {
+        // ip_append_data → ip_fragment: pieces without DF, numbered from the shared generator; within the MTU one frame with the
+        // options after the header.
         var hdr: [20]u8 = undefined;
         ipv4.buildHeader(&hdr, src, dst, ipv4.PROTO_ICMP, 0);
         hdr[1] = tos;
         hdr[8] = ttl;
-        ipv4.setIdent(&hdr, ipid.global(dst, src, ipv4.PROTO_ICMP), false);
-        return if (@import("ip_frag.zig").send4(hdr, msg, mtu, dst_mac, our_mac, via_lo, wait_hop)) 0 else -105;
+        if (big) ipv4.setIdent(&hdr, ipid.global(dst, src, ipv4.PROTO_ICMP), false) else ipv4.setIdent(&hdr, ipid.unowned(dst, src, ipv4.PROTO_ICMP, mode), ipo.datagramDf(mode));
+        var built: [40]u8 = @splat(0);
+        if (ipopts) |so| iop.build(so, src, dst_in, iop.msSinceMidnight(@import("../proc/time_syscall.zig").wallClockNanos()), &built);
+        return if (@import("ip_frag.zig").send4(hdr, built[0..optlen], msg, mtu, dst_mac, our_mac, via_lo, wait_hop)) 0 else -105;
     }
     var pkt: [1518]u8 = @splat(0);
     @memcpy(pkt[34..][0..msg.len], msg);
@@ -210,8 +224,23 @@ pub fn handlePacketMeta(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u3
         };
 
         const mtu = netif.getMtu();
+        // icmp_reply: a request with options is answered with them echoed (ip_options_echo; none that cannot be echoed means no
+        // reply), built again for the reply's header (ip_options_build): a record route or timestamp with room gets this host.
+        if (meta.optlen != 0) {
+            if (meta.ret_bad) return;
+            const iop = @import("ip_options_policy.zig");
+            var built: [40]u8 = @splat(0);
+            var bl: usize = 0;
+            if (meta.retlen != 0) {
+                const so = iop.compileForSend(meta.retopts[0..meta.retlen], true) orelse return;
+                iop.build(so, dst_ip, src_ip, iop.msSinceMidnight(@import("../proc/time_syscall.zig").wallClockNanos()), &built);
+                bl = so.len;
+            }
+            if (len <= 0xFFFF - ipv4.HEADER_LEN - bl) sendBigEchoReply(data[0..len], dst_ip, src_ip, our_mac, dst_mac, via_lo, meta.tos, mtu, built[0..bl]);
+            return;
+        }
         if (len + ipv4.HEADER_LEN > mtu and len <= 0xFFFF - ipv4.HEADER_LEN) {
-            sendBigEchoReply(data[0..len], dst_ip, src_ip, our_mac, dst_mac, via_lo, meta.tos, mtu);
+            sendBigEchoReply(data[0..len], dst_ip, src_ip, our_mac, dst_mac, via_lo, meta.tos, mtu, &.{});
             return;
         }
         var pkt: [echo_policy.FRAME_BUF_LEN]u8 = undefined;

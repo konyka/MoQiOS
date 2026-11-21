@@ -14648,8 +14648,8 @@ test "raw ICMP socket policy (hello389): protocol, delivery filter, destination 
 
 test "raw ICMP socket wiring (hello389): received ICMP reaches raw sockets first, descriptors share the socket, sends go out at once" {
     const m = kt.net_mod_source;
-    const at_raw = std.mem.indexOf(u8, m, "@import(\"raw_icmp.zig\").deliver(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip, ifindex);") orelse return error.TestUnexpectedResult;
-    const at_icmp = std.mem.indexOf(u8, m, "icmp.handlePacketMeta(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, .{").?;
+    const at_raw = std.mem.indexOf(u8, m, "@import(\"raw_icmp.zig\").deliverHdr(info.protocol, rx_hdr[0..rx_hdr_len], data[payload_start .. payload_start + info.payload_len], info.src_ip, info.dst_ip, meta4);") orelse return error.TestUnexpectedResult;
+    const at_icmp = std.mem.indexOf(u8, m, "icmp.handlePacketMeta(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, meta4);").?;
     try std.testing.expect(at_raw < at_icmp);
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "const perr = if (v6) rp.protocolErrno6(protocol) else rp.protocolErrno(protocol);") != null);
@@ -14721,7 +14721,7 @@ test "ICMP errors wiring (hello390): checksummed, sent to connected UDP and ping
     const ss = kt.socket_syscall_source;
     const ps = std.mem.indexOf(u8, ss, "fn pingSend(d: *vfs_mod.FileDescriptor") orelse return error.TestUnexpectedResult;
     const pend = std.mem.indexOfPos(u8, ss, ps, "const pending = udp.takePendingError(d.udpKey());") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(pend < std.mem.indexOfPos(u8, ss, ps, "const sent = @import(\"icmp.zig\").sendFromOv(").?);
+    try std.testing.expect(pend < std.mem.indexOfPos(u8, ss, ps, "const sent = @import(\"icmp.zig\").sendFromOpts(").?);
 }
 
 test "raw ICMPv6 socket policy (hello391): protocol, filter, destination, lengths, names and shutdown (Linux net/ipv6/raw.c)" {
@@ -14979,7 +14979,7 @@ test "raw ICMP sockets take SOL_IP / SOL_IPV6 options and their sends carry them
     // ip_getsockopt answers a level other than SOL_IP with EOPNOTSUPP; ip_setsockopt with ENOPROTOOPT.
     try std.testing.expect(std.mem.indexOf(u8, so, "if (!ipo.levelApplies(level, fam)) return if (fam == .v4) -95 else -92;") != null);
     const ss = kt.socket_syscall_source;
-    try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send(src, dst, @truncate(protocol), msg, ip)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "raw.sendOpts(src, dst, @truncate(protocol), msg, ip, ipopts)") != null);
     // hello461: the options go through ip6 (the socket's, with this send's IPV6_DONTFRAG).
     try std.testing.expect(std.mem.indexOf(u8, ss, "raw.send6(src6, to6, @truncate(raw.protocolOf(d.raw_idx)), raw.checksumOffset(d.raw_idx), msg, ip6, ov6.hops, ov6.tclass)") != null);
     const rs = kt.raw_icmp_source;
@@ -15111,7 +15111,7 @@ test "ICMP_FILTER on IPv4 raw ICMP sockets (hello399): a set bit blocks that typ
     try std.testing.expectEqual(@as(u32, 0x1111_bbaa), rp.setIcmpFilter(0x1111_1111, &.{ 0xaa, 0xbb }));
     try std.testing.expectEqual(@as(u32, 0x0403_0201), rp.setIcmpFilter(0, &.{ 1, 2, 3, 4, 5, 6 }));
     const rs = kt.raw_icmp_source;
-    try std.testing.expect(std.mem.indexOf(u8, rs, "if (policy.icmpTypeOf(dgram)) |ty| if (policy.icmpFilterBlocks(s.icmp_filter, ty)) continue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "if (icmpType(hdr, payload)) |ty| if (policy.icmpFilterBlocks(s.icmp_filter, ty)) continue;") != null);
     const so = kt.socket_opt_source;
     try std.testing.expect(std.mem.indexOf(u8, so, "if (!v6 and optname == ICMP_FILTER) return .icmp_filter;\n        if (v6 and optname == IPV6_CHECKSUM) return .checksum_raw;\n        return .noprotoopt;") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, "if (which != .checksum and which != .checksum_raw and which != .hdrincl6 and @as(i32, @bitCast(user_len)) < 0) return -22;") != null);
@@ -15173,13 +15173,13 @@ test "IPv4 raw sockets of any protocol (hello401): creation, delivery and protoc
     try std.testing.expectEqual(@as(i64, 0), rp.icmpFilterErrno(1));
     const m = kt.net_mod_source;
     // Every IPv4 datagram reaches the raw sockets of its protocol before the protocol handler (raw_local_deliver first).
-    const at_raw = std.mem.indexOf(u8, m, "const raw_took = @import(\"raw_icmp.zig\").deliver(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip, ifindex);") orelse return error.TestUnexpectedResult;
+    const at_raw = std.mem.indexOf(u8, m, "@import(\"raw_icmp.zig\").deliver(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip, ifindex)\n            else\n                @import(\"raw_icmp.zig\").deliverHdr(") orelse return error.TestUnexpectedResult;
     const at_tcp = std.mem.indexOf(u8, m, "tcp.handlePacket(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, info.ecn_ce);").?;
     try std.testing.expect(at_raw < at_tcp);
     try std.testing.expect(std.mem.indexOf(u8, m, "else => if (rp.protoUnreachable(info.protocol, raw_took)) icmp.sendProtoUnreachable(data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip),") != null);
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "if (s.protocol != protocol) continue;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rs, "if (protocol == policy.IPPROTO_ICMP) if (policy.icmpTypeOf(dgram)) |ty| if (policy.icmpFilterBlocks(s.icmp_filter, ty)) continue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "if (protocol == policy.IPPROTO_ICMP) if (icmpType(hdr, payload)) |ty| if (policy.icmpFilterBlocks(s.icmp_filter, ty)) continue;") != null);
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "const idx = raw.open(v6, protocol) orelse return -105; // ENOBUFS") != null);
     const so = kt.socket_opt_source;
@@ -16026,9 +16026,11 @@ test "IPv4 id and DF of kernel-built headers (hello418): per-connection ids, zer
     try std.testing.expect(std.mem.indexOf(u8, us, "            port_ipid[i] = port_ipid[num_ports];\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    ipv4.setIdent(pkt[14..].ptr, ipid.global(src_ip, dst_ip, ipv4.PROTO_ICMP), false);\n") != null);
     const is = kt.icmp_source;
-    // hello454: the fragmented ping send and the big echo reply number their headers from the shared generator too.
-    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, is, "ipv4.setIdent("));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, is, "ipv4.setIdent(&hdr, ipid.global(dst, src, ipv4.PROTO_ICMP), false);"));
+    // hello454: the fragmented ping send and the big echo reply number their headers from the shared generator too; hello466: a
+    // ping send with IP options within the MTU numbers its header as an unfragmented one.
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, is, "ipv4.setIdent("));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, is, "ipv4.setIdent(&hdr, ipid.global(dst, src, ipv4.PROTO_ICMP), false);"));
+    try std.testing.expect(std.mem.indexOf(u8, is, "if (big) ipv4.setIdent(&hdr, ipid.global(dst, src, ipv4.PROTO_ICMP), false) else ipv4.setIdent(&hdr, ipid.unowned(dst, src, ipv4.PROTO_ICMP, mode), ipo.datagramDf(mode));") != null);
     try std.testing.expect(std.mem.indexOf(u8, is, "    ipv4.setIdent(o + 14, ipid.global(reply_dst_ip, reply_src_ip, ipv4.PROTO_ICMP), false);\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, is, "    ipv4.setIdent(pkt[14..].ptr, ipid.global(src_ip, dst_ip, ipv4.PROTO_ICMP), false);\n") != null);
     const rs = kt.raw_icmp_source;
@@ -16440,7 +16442,7 @@ test "IPv4 raw socket sendmsg control messages IP_TTL / IP_TOS / IP_PKTINFO / IP
     const fs = std.mem.indexOf(u8, ss, "pub fn rawSendFrom(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest, control: []const u8) i64 {") orelse return error.TestUnexpectedResult;
     const dest = std.mem.indexOfPos(u8, ss, fs, "const rc = rp.sendtoErrno(false, 0, 0, raw.isConnected(d.raw_idx));") orelse return error.TestUnexpectedResult;
     const parse = std.mem.indexOfPos(u8, ss, fs, "ip_cmsg_policy.parseSendPing4(control, sendCaps())") orelse return error.TestUnexpectedResult;
-    const hdr_opts = std.mem.indexOfPos(u8, ss, fs, "if (hdrincl and ov.retopts) return -22;") orelse return error.TestUnexpectedResult;
+    const hdr_opts = std.mem.indexOfPos(u8, ss, fs, "if (hdrincl and (ov.retopts or sock_opts.set)) return -22;") orelse return error.TestUnexpectedResult;
     const len = std.mem.indexOfPos(u8, ss, fs, "const lrc = if (hdrincl) rp.hdrinclErrno(msg) else rp.sendLengthErrno(protocol, msg.len);") orelse return error.TestUnexpectedResult;
     try std.testing.expect(dest < parse and parse < hdr_opts and hdr_opts < len);
     try std.testing.expect(std.mem.indexOf(u8, ss, "return rawSendFrom(d, data[0..@intCast(got)], if (name_ptr != 0) RawDest{ .ptr = name_ptr, .len = name_len } else null, ctl[0..cl]);") != null);
@@ -16510,7 +16512,7 @@ test "raw socket recvmsg control messages IP_PKTINFO / IP_TTL / IP_TOS and the I
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "meta: @import(\"ip_cmsg_policy.zig\").RecvInfo = .{},") != null);
     try std.testing.expect(std.mem.indexOf(u8, rs, "meta6: @import(\"ip_cmsg_policy.zig\").RecvInfo6 = .{},") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rs, "e.meta = .{ .ifindex = ifindex, .dst = dst, .ttl = if (dgram.len > 8) dgram[8] else 0, .tos = if (dgram.len > 1) dgram[1] else 0 };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "return deliverInfo(protocol, dgram, src, dst, .{ .ifindex = ifindex, .dst = dst, .ttl = if (dgram.len > 8) dgram[8] else 0, .tos = if (dgram.len > 1) dgram[1] else 0 });") != null);
     try std.testing.expect(std.mem.indexOf(u8, rs, "e.meta6 = .{ .ifindex = ifindex, .dst = dst, .hops = hops, .tclass = tclass, .flowinfo = flowinfo };") != null);
     const ss = kt.socket_syscall_source;
     const fr = std.mem.indexOf(u8, ss, "fn rawRecvmsg(") orelse return error.TestUnexpectedResult;
@@ -16578,7 +16580,8 @@ test "ping socket recvmsg control messages IP_PKTINFO / IP_TTL / IP_TOS and the 
     try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1, 127, 0, 0, 1 }, out[20..28]);
     // The IP layer's values reach the ping socket's queue entry.
     const m = kt.net_mod_source;
-    try std.testing.expect(std.mem.indexOf(u8, m, "icmp.handlePacketMeta(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, .{ .ifindex = ifindex, .dst = info.dst_ip, .ttl = info.ttl, .tos = info.tos });") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "var meta4: @import(\"ip_cmsg_policy.zig\").RecvInfo = .{ .ifindex = ifindex, .dst = info.dst_ip, .ttl = info.ttl, .tos = info.tos };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "icmp.handlePacketMeta(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, meta4);") != null);
     try std.testing.expect(std.mem.indexOf(u8, m, "icmpv6.handlePacketMeta(info6.src_ip, info6.dst_ip, data + up_start, up_len, .{ .ifindex = ifindex, .dst = info6.dst_ip, .hops = info6.hop_limit, .tclass = info6.tclass });") != null);
     const us = kt.udp_source;
     const d4 = std.mem.indexOf(u8, us, "pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8, meta: ip_cmsg_policy.RecvInfo) void {") orelse return error.TestUnexpectedResult;
@@ -17176,7 +17179,7 @@ test "IPv6 fragments: a Fragment header after the options goes to reassembly, bi
 test "raw sockets keep a reassembled datagram whole in a shared big buffer, given back when read or on close (hello452 D/E)" {
     const rs = kt.raw_icmp_source;
     try std.testing.expect(std.mem.indexOf(u8, rs, "pub const RAW_BIG_LEN = 65535;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rs, "            store(e, dgram);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "            store2(e, hdr, payload);") != null);
     try std.testing.expect(std.mem.indexOf(u8, rs, "            store(e, msg);") != null);
     try std.testing.expect(std.mem.indexOf(u8, rs, "    if (!peek) dropEntry(e);") != null);
     try std.testing.expect(std.mem.indexOf(u8, rs, "while (k < s.count) : (k += 1) dropEntry(&s.queue[(@as(usize, s.head) + k) % QUEUE_DEPTH]);") != null);
@@ -17200,9 +17203,9 @@ test "IPv4 raw and ping sends past the MTU are fragmented unless IP_MTU_DISCOVER
     const pp = kt.ping_policy;
     try std.testing.expectEqual(@as(i64, 0), pp.sendErrno(65535, 8, 0));
     try std.testing.expectEqual(@as(i64, -90), pp.sendErrno(65536, 8, 0));
-    try std.testing.expect(std.mem.indexOf(u8, kt.raw_icmp_source, "const ok = @import(\"ip_frag.zig\").send4(hdr, msg, mtu, dst_mac, our_mac, via_lo, wait_hop);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "return if (@import(\"ip_frag.zig\").send4(hdr, msg, mtu, dst_mac, our_mac, via_lo, wait_hop)) 0 else -105;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "sendBigEchoReply(data[0..len], dst_ip, src_ip, our_mac, dst_mac, via_lo, meta.tos, mtu);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.raw_icmp_source, "const ok = @import(\"ip_frag.zig\").send4(hdr, built[0..optlen], msg, mtu, dst_mac, our_mac, via_lo, wait_hop);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "return if (@import(\"ip_frag.zig\").send4(hdr, built[0..optlen], msg, mtu, dst_mac, our_mac, via_lo, wait_hop)) 0 else -105;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "sendBigEchoReply(data[0..len], dst_ip, src_ip, our_mac, dst_mac, via_lo, meta.tos, mtu, &.{});") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "if (!fillEntryLocked(e, msg)) break;") != null);
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello454", true, false).caps.cap_net_raw);
 }
@@ -17533,5 +17536,41 @@ test "a UDP sender's IPv4 options: IP_OPTIONS and a non-empty IP_RETOPTS control
     b[16..20].* = .{ 7, 2, 0, 0 };
     try std.testing.expectEqual(@as(i64, -22), c.parseSend4(b[0..24], .{}).err);
     try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "iop.build(so, our_ip, dst_ip_in, iop.msSinceMidnight(") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.socket_opt_source, "if (level == ipo.SOL_IP and optname == ipo.IP_OPTIONS and ref == .udp) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_opt_source, "if (level == ipo.SOL_IP and optname == ipo.IP_OPTIONS and (ref == .udp or ref == .raw)) {") != null);
+}
+
+test "IPv4 options on raw and ping sockets: IP_OPTIONS, IP_RECVOPTS / IP_RETOPTS on receive, echo replies echo them (hello466)" {
+    const iop = kt.ip_options_policy;
+    // icmp_reply: a request's record route is echoed and the reply records this host again.
+    var rx = [_]u8{ 7, 11, 12, 127, 0, 0, 1, 127, 0, 0, 1, 0 };
+    var ret: [40]u8 = undefined;
+    const c = switch (iop.compile(&rx, .{ 127, 0, 0, 1 }, 0, &struct {
+        fn f(_: [4]u8) bool {
+            return true;
+        }
+    }.f)) {
+        .ok => |o| o,
+        .bad => return error.TestUnexpectedResult,
+    };
+    const rl = iop.echo(&rx, c, .{ 127, 0, 0, 1 }, &ret).?;
+    try std.testing.expectEqual(@as(usize, 12), rl);
+    const so = iop.compileForSend(ret[0..rl], true).?;
+    var built: [40]u8 = undefined;
+    iop.build(so, .{ 127, 0, 0, 1 }, .{ 127, 0, 0, 1 }, 0, &built);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 11, 12, 127, 0, 0, 1, 127, 0, 0, 1, 0 }, built[0..12]);
+    // Raw sockets keep IP_OPTIONS (and whether any were set: an IP_HDRINCL send is then EINVAL); the sends and the ping send take them.
+    const rs = kt.raw_icmp_source;
+    try std.testing.expect(std.mem.indexOf(u8, rs, "pub fn setIpOptions(idx: u32, so: iop.SendOpts) bool {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs, "pub fn deliverHdr(protocol: u8, hdr: []const u8, payload: []const u8, src: [4]u8, dst: [4]u8, meta: @import(\"ip_cmsg_policy.zig\").RecvInfo) bool {") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (hdrincl and (ov.retopts or sock_opts.set)) return -22;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const sent = @import(\"icmp.zig\").sendFromOpts(src, dst, msg[0..payload.len], ping_ip.pmtudisc, ttl, tos, ipopts);") != null);
+    // Received options: raw sockets see the compiled header, ICMP (ping replies, echo replies) the compiled options.
+    const m = kt.net_mod_source;
+    try std.testing.expect(std.mem.indexOf(u8, m, "@memcpy(rx_hdr[20..][0..n_opt], meta4.opts[0..n_opt]);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.icmp_source, "if (meta.optlen != 0) {\n            if (meta.ret_bad) return;") != null);
+    // Fragments of an optioned datagram keep the header length; send4 takes the options.
+    try std.testing.expect(std.mem.indexOf(u8, kt.ip_frag_source, "pub fn send4(hdr: [20]u8, opts: []const u8, payload: []const u8, mtu: u16,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.ip_frag_source, "if (off == 0 and ol != 0) @import(\"ip_options_policy.zig\").fragmentOpts(o[0..ol]);") != null);
+    try std.testing.expect(kt.capability_profile.profileForLaunch("hello466", true, false).caps.cap_net_raw);
 }

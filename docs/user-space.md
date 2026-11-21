@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello465`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello466`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -460,6 +460,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello463 | net.ipv6.auto_flowlabels：`/proc/sys/net/ipv6/auto_flowlabels` 读 1，写 0、3、" 2" 生效，4、-1、abc 为 EINVAL（A）；0 时不加标签（B）；2 时没设 IPV6_AUTOFLOWLABEL 的套接字不加、设 1 的加（C）；3 时设 0 也加（D）；改回 1（E） |
 | hello464 | 收到的 IPv4 选项：IP_RECVOPTS、IP_RETOPTS 设 1 读回 1，无选项的数据报不带控制消息（A）；NOP NOP NOP END 的 IP_RECVOPTS 原样、IP_RETOPTS 为空（B）；记录路由有空位时接收端记下 127.0.0.1（C）；记录路由已满时原样，IP_RETOPTS 只有 4 字节（D）；时间戳选项写入 UTC 当天毫秒数（与 CLOCK_REALTIME 相差不到 1 秒）、指针到 9（E）；格式错误的选项和松散源路由的数据报被丢弃（F） |
 | hello465 | UDP 发送端的 IPv4 选项：IP_OPTIONS 设 7 字节记录路由，读回补齐的 8 字节，接收端看到发送端记下 127.0.0.1（A）；时间戳选项写入时间（B）；格式错误、长度不对、超过 40 字节为 EINVAL，0 字节清除（C）；sendmsg 的非空 IP_RETOPTS 控制消息只作用于这一次发送，格式错误为 EINVAL（D）；记录路由加路由器告警、3000 字节的数据报分片发出，接收端收到全部字节，IP_RECVOPTS 是第一片的选项（E） |
+| hello466 | raw 和 ping 套接字的 IPv4 选项：raw ICMP 套接字设 11 字节记录路由，读回 12 字节，观察者 raw 套接字（开 IP_RECVOPTS、IP_RETOPTS）看到请求的头为 32 字节、选项里记下发送端和接收端，两个控制消息相同，回显应答也带这些选项（A）；时间戳选项的请求写入两个时间，应答的溢出计数为 1（B）；sendmsg 的 IP_RETOPTS 记录路由生效，IPPROTO_RAW 套接字可设 IP_OPTIONS 但发送为 EINVAL（C）；ping 套接字的 IP_OPTIONS 格式错误为 EINVAL，记录路由设置、读回，开 IP_RECVOPTS 的回显应答带选项（D）；记录路由加路由器告警、3000 字节的请求分片发出，观察者收到重组后的 3036 字节请求和只带记录路由的 3028 字节应答（E） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

@@ -106,37 +106,49 @@ pub fn receive6(frame: [*]const u8, len: u32, pkt6: []const u8, frag_off: usize,
 }
 
 /// ip_fragment for a locally built IPv4 datagram: `hdr` is its 20-byte header (protocol, addresses, id, TTL, TOS, DF as it should go
-/// out), `payload` what follows it. Each piece carries the header with its offset, MF and length, re-checksummed, and leaves as an
-/// Ethernet frame to `dst_mac`: through lo (delivered at once) when `via_lo`, queued on the neighbour when `wait_hop`, else out the
-/// NIC. False when the device refused a piece.
-pub fn send4(hdr: [20]u8, payload: []const u8, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, via_lo: bool, wait_hop: ?[4]u8) bool {
+/// out), `opts` the IP options that follow it (a multiple of 4 bytes, as ip_options_policy.build wrote them; empty for none) and
+/// `payload` what comes after. Each piece carries the header and options with its offset, MF and length, re-checksummed, and leaves
+/// as an Ethernet frame to `dst_mac`: through lo (delivered at once) when `via_lo`, queued on the neighbour when `wait_hop`, else out
+/// the NIC. After the first piece only the copied options remain (ip_options_fragment). A datagram within `mtu` goes out as one
+/// frame. False when the device refused a piece.
+pub fn send4(hdr: [20]u8, opts: []const u8, payload: []const u8, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, via_lo: bool, wait_hop: ?[4]u8) bool {
     const ipv4 = @import("ipv4.zig");
     const eth = @import("eth.zig");
     const lo = @import("lo.zig");
-    const piece = policy.pieceLen(mtu, ipv4.HEADER_LEN);
+    const ol: usize = opts.len;
+    const hl: usize = ipv4.HEADER_LEN + ol;
+    var o: [40]u8 = @splat(0);
+    @memcpy(o[0..ol], opts);
+    const piece: usize = if (hl + payload.len <= mtu) payload.len else policy.pieceLen(mtu, @intCast(hl));
     var off: usize = 0;
     var all_ok = true;
-    while (off < payload.len) {
+    while (true) {
         const n: usize = @min(piece, payload.len - off);
         const last = off + n == payload.len;
         var pkt: [1518]u8 = undefined;
         @memcpy(pkt[14..34], &hdr);
         const ip = pkt[14..].ptr;
-        bo.writeU16BeAt(ip, 2, @intCast(20 + n));
+        if (ol != 0) {
+            @memcpy(pkt[34..][0..ol], o[0..ol]);
+            ip[0] = (hdr[0] & 0xf0) | @as(u8, @intCast(hl / 4));
+        }
+        bo.writeU16BeAt(ip, 2, @intCast(hl + n));
         const fo: u16 = @as(u16, @intCast(off / 8)) | (if (last) @as(u16, 0) else policy.MF);
         bo.writeU16BeAt(ip, 6, fo | (bo.readU16BeAt(&hdr, 6) & policy.DF));
         ip[10] = 0;
         ip[11] = 0;
-        bo.writeU16BeAt(ip, 10, ipv4.checksum(ip, 20));
-        @memcpy(pkt[34..][0..n], payload[off..][0..n]);
-        const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, @intCast(20 + n));
+        bo.writeU16BeAt(ip, 10, ipv4.checksum(ip, @intCast(hl)));
+        @memcpy(pkt[14 + hl ..][0..n], payload[off..][0..n]);
+        const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, @intCast(hl + n));
         if (wait_hop) |hop| {
             @import("arp.zig").queueFrame(hop, &pkt, frame_len);
         } else {
             const ok = if (via_lo) lo.sendNow(&pkt, frame_len) or lo.dropIsLoss(frame_len) else @import("nic.zig").sendPacket(&pkt, frame_len);
             if (!ok) all_ok = false;
         }
+        if (off == 0 and ol != 0) @import("ip_options_policy.zig").fragmentOpts(o[0..ol]);
         off += n;
+        if (off >= payload.len) break;
     }
     return all_ok;
 }

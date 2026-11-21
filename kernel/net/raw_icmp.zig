@@ -14,6 +14,7 @@ const arp = @import("arp.zig");
 const eth = @import("eth.zig");
 const route4 = @import("route4_policy.zig");
 const ipo = @import("ip_opt_policy.zig");
+const iop = @import("ip_options_policy.zig");
 const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 
 /// Raw sockets at once (each queues up to QUEUE_DEPTH datagrams of RAW_QUEUE_LEN bytes inline, longer ones in the shared big buffers).
@@ -79,6 +80,10 @@ const Socket = struct {
     errq: @import("errqueue_policy.zig").Queue = .{},
     /// np->rxpmtu: the last IPV6_DONTFRAG refusal of an IPV6_RECVPATHMTU socket, for one recvmsg.
     rxpmtu: @import("udp.zig").RxPmtu = .{},
+    /// IP_OPTIONS (inet->inet_opt) as ip_options_policy.compileForSend left them; `ipopts_set` once any IP_OPTIONS call stored a
+    /// value, even an empty one (raw_send_hdrinc refuses an IP_HDRINCL send while inet_opt exists).
+    ipopts: iop.SendOpts = .{},
+    ipopts_set: bool = false,
 };
 
 var sockets: [MAX_SOCKETS]Socket = @splat(.{});
@@ -86,22 +91,29 @@ var raw_lock: IrqSpinlock = .{};
 
 /// Store `bytes` in queue entry `e` (raw_lock held): inline when it fits, else in a free big buffer, else cut to RAW_QUEUE_LEN.
 fn store(e: *Entry, bytes: []const u8) void {
-    const n = @min(bytes.len, RAW_BIG_LEN);
+    store2(e, bytes, &.{});
+}
+
+/// store for a datagram held in two parts, `head` then `tail` (a header rewritten apart from the frame, then the payload).
+fn store2(e: *Entry, head: []const u8, tail: []const u8) void {
+    const n = @min(head.len + tail.len, RAW_BIG_LEN);
     e.big = 0;
-    if (n > RAW_QUEUE_LEN) {
-        if (for (big_used, 0..) |u, k| {
-            if (!u) break k;
-        } else null) |slot| {
-            big_used[slot] = true;
-            e.big = @intCast(slot + 1);
-            @memcpy(big_bufs[slot][0..n], bytes[0..n]);
-            e.len = @intCast(n);
-            return;
+    const dst: []u8 = blk: {
+        if (n > RAW_QUEUE_LEN) {
+            if (for (big_used, 0..) |u, k| {
+                if (!u) break k;
+            } else null) |slot| {
+                big_used[slot] = true;
+                e.big = @intCast(slot + 1);
+                break :blk big_bufs[slot][0..n];
+            }
         }
-    }
-    const k = @min(n, RAW_QUEUE_LEN);
-    @memcpy(e.dgram[0..k], bytes[0..k]);
-    e.len = @intCast(k);
+        break :blk e.dgram[0..@min(n, RAW_QUEUE_LEN)];
+    };
+    const h = @min(head.len, dst.len);
+    @memcpy(dst[0..h], head[0..h]);
+    @memcpy(dst[h..], tail[0 .. dst.len - h]);
+    e.len = @intCast(dst.len);
 }
 
 fn bytesOf(e: *const Entry) []const u8 {
@@ -178,6 +190,26 @@ pub fn setOpts(idx: u32, st: @import("sockopt_policy.zig").Stored) bool {
 }
 
 /// Whether a datagram is queued for the socket (poll, and the wait in a blocking recv).
+/// setsockopt(IP_OPTIONS) on raw socket `idx`; false for a slot not in use.
+pub fn setIpOptions(idx: u32, so: iop.SendOpts) bool {
+    if (idx >= MAX_SOCKETS) return false;
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (!sockets[idx].used) return false;
+    sockets[idx].ipopts = so;
+    sockets[idx].ipopts_set = true;
+    return true;
+}
+
+/// The IP_OPTIONS of raw socket `idx` (len 0: none), and whether any were ever set.
+pub fn getIpOptions(idx: u32) ?struct { so: iop.SendOpts, set: bool } {
+    if (idx >= MAX_SOCKETS) return null;
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (!sockets[idx].used) return null;
+    return .{ .so = sockets[idx].ipopts, .set = sockets[idx].ipopts_set };
+}
+
 pub fn hasData(idx: u32) bool {
     const saved = raw_lock.acquire();
     defer raw_lock.release(saved);
@@ -494,6 +526,17 @@ pub fn isConnected(idx: u32) bool {
 /// drops the datagram. Whether any socket matched (raw_v4_input's `delivered`, set before ICMP_FILTER and the queue are looked at):
 /// a datagram no protocol handles is then not answered with protocol unreachable. `ifindex` is the interface it arrived on.
 pub fn deliver(protocol: u8, dgram: []const u8, src: [4]u8, dst: [4]u8, ifindex: u8) bool {
+    return deliverInfo(protocol, dgram, src, dst, .{ .ifindex = ifindex, .dst = dst, .ttl = if (dgram.len > 8) dgram[8] else 0, .tos = if (dgram.len > 1) dgram[1] else 0 });
+}
+
+/// deliver with what the datagram arrived with (interface, destination, TTL, TOS and its compiled IP options, for IP_RECVOPTS and
+/// IP_RETOPTS); `dgram` carries the options as compiled too (raw_rcv hands over the skb after ip_rcv_options).
+pub fn deliverInfo(protocol: u8, dgram: []const u8, src: [4]u8, dst: [4]u8, meta: @import("ip_cmsg_policy.zig").RecvInfo) bool {
+    return deliverHdr(protocol, dgram, &.{}, src, dst, meta);
+}
+
+/// deliverInfo for a datagram whose IP header `hdr` (options included) is held apart from `payload`.
+pub fn deliverHdr(protocol: u8, hdr: []const u8, payload: []const u8, src: [4]u8, dst: [4]u8, meta: @import("ip_cmsg_policy.zig").RecvInfo) bool {
     var notify: [MAX_SOCKETS]u32 = undefined;
     var n_notify: usize = 0;
     var took = false;
@@ -506,13 +549,13 @@ pub fn deliver(protocol: u8, dgram: []const u8, src: [4]u8, dst: [4]u8, ifindex:
             if (s.protocol != protocol) continue;
             if (!policy.matches(s.bound, s.peer, src, dst)) continue;
             took = true;
-            if (protocol == policy.IPPROTO_ICMP) if (policy.icmpTypeOf(dgram)) |ty| if (policy.icmpFilterBlocks(s.icmp_filter, ty)) continue;
+            if (protocol == policy.IPPROTO_ICMP) if (icmpType(hdr, payload)) |ty| if (policy.icmpFilterBlocks(s.icmp_filter, ty)) continue;
             const at = policy.enqueueSlot(s.head, s.count) orelse continue;
             const e = &s.queue[at];
-            store(e, dgram);
+            store2(e, hdr, payload);
             e.src = @splat(0);
             @memcpy(e.src[0..4], &src);
-            e.meta = .{ .ifindex = ifindex, .dst = dst, .ttl = if (dgram.len > 8) dgram[8] else 0, .tos = if (dgram.len > 1) dgram[1] else 0 };
+            e.meta = meta;
             s.count += 1;
             notify[n_notify] = @intCast(i);
             n_notify += 1;
@@ -523,6 +566,13 @@ pub fn deliver(protocol: u8, dgram: []const u8, src: [4]u8, dst: [4]u8, ifindex:
         @import("epoll.zig").epollNotify(.raw_socket, idx, @import("epoll.zig").EPOLLIN);
     }
     return took;
+}
+
+/// The ICMP type of a datagram held as `hdr` then `payload` (policy.icmpTypeOf when it is all in `hdr`).
+fn icmpType(hdr: []const u8, payload: []const u8) ?u8 {
+    if (payload.len == 0) return policy.icmpTypeOf(hdr);
+    if (hdr.len < 20 or payload.len < 8) return null;
+    return payload[0];
 }
 
 /// One IPv6 packet of next header `protocol` that arrived on this host, `src` → `dst`, `msg` being what follows its IPv6 header
@@ -620,8 +670,17 @@ pub fn send6(bound: [16]u8, dst: [16]u8, protocol: u8, csum_off: ?u32, msg: []co
 /// path MTU is fragmented (ip_append_data) unless IP_MTU_DISCOVER refuses it (policy.oversizeErrno4). 0, or -EMSGSIZE, -ENOBUFS
 /// when the device drops it.
 pub fn send(bound: [4]u8, dst: [4]u8, protocol: u8, msg: []const u8, ip: ipo.IpOpts) i64 {
+    return sendOpts(bound, dst, protocol, msg, ip, null);
+}
+
+/// send with IPv4 options (ipc.opt: an IP_RETOPTS control message's, else the socket's IP_OPTIONS): they follow the 20-byte header,
+/// built for this datagram (ip_options_build), and a source route sends to its first hop.
+pub fn sendOpts(bound: [4]u8, dst_in: [4]u8, protocol: u8, msg: []const u8, ip: ipo.IpOpts, ipopts: ?iop.SendOpts) i64 {
+    const dst = if (ipopts) |so| (if (so.o.srr != null) so.faddr else dst_in) else dst_in;
+    const optlen: usize = if (ipopts) |so| so.len else 0;
     const mtu = ipv4.getSendMtu(dst);
-    const orc = policy.oversizeErrno4(msg.len, mtu, ip.pmtudisc);
+    if (msg.len + optlen > policy.MAX_PAYLOAD4) return -90;
+    const orc = policy.oversizeErrno4(msg.len + optlen, mtu, ip.pmtudisc);
     if (orc != 0) return orc;
     const our_mac = netif.getMac();
     const via_lo = netif.isLocal4(dst);
@@ -634,14 +693,17 @@ pub fn send(bound: [4]u8, dst: [4]u8, protocol: u8, msg: []const u8, ip: ipo.IpO
         };
     };
     const src = @import("tcp_port_policy.zig").sourceAddr(bound, dst, netif.getOurIp());
-    if (msg.len + ipv4.HEADER_LEN > mtu) {
+    const big = msg.len + optlen + ipv4.HEADER_LEN > mtu;
+    if (big or ipopts != null) {
         // ip_append_data → ip_fragment: the datagram leaves in pieces, without DF (it is only set on a datagram within the MTU) and
         // with an id from the shared generator (ip_select_ident: a datagram that may be fragmented always gets one).
         var hdr: [20]u8 = undefined;
         ipv4.buildHeader(&hdr, src, dst, protocol, 0);
-        ipv4.setIdent(&hdr, ipid.global(dst, src, protocol), false);
+        if (big) ipv4.setIdent(&hdr, ipid.global(dst, src, protocol), false) else ipv4.setIdent(&hdr, ipid.unowned(dst, src, protocol, ip.pmtudisc), ipo.datagramDf(ip.pmtudisc));
         if (ipo.ipv4NeedsPatch(ip)) ipo.patchIpv4(&hdr, ip, ipv4.checksum);
-        const ok = @import("ip_frag.zig").send4(hdr, msg, mtu, dst_mac, our_mac, via_lo, wait_hop);
+        var built: [40]u8 = @splat(0);
+        if (ipopts) |so| iop.build(so, src, dst_in, iop.msSinceMidnight(@import("../proc/time_syscall.zig").wallClockNanos()), &built);
+        const ok = @import("ip_frag.zig").send4(hdr, built[0..optlen], msg, mtu, dst_mac, our_mac, via_lo, wait_hop);
         return if (ok) 0 else -105;
     }
     var pkt: [FRAME_BUF_LEN]u8 = @splat(0);

@@ -562,9 +562,9 @@ fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
     if (ref == .tcp and level == ipo.SOL_IP) {
         if (ipo.streamSetErrno4(optname)) |e| return e;
     }
-    // IP_OPTIONS (do_ip_setsockopt → ip_options_get): up to 40 bytes of options a UDP socket's datagrams carry; 0 bytes clears
+    // IP_OPTIONS (do_ip_setsockopt → ip_options_get): up to 40 bytes of options a UDP, ping or raw socket's datagrams carry; 0 bytes clears
     // them; malformed ones (or, without CAP_NET_RAW, unknown ones) are EINVAL.
-    if (level == ipo.SOL_IP and optname == ipo.IP_OPTIONS and ref == .udp) {
+    if (level == ipo.SOL_IP and optname == ipo.IP_OPTIONS and (ref == .udp or ref == .raw)) {
         if (optlen > 40) return -22;
         var ob: [40]u8 = undefined;
         const k: usize = @intCast(optlen);
@@ -574,7 +574,11 @@ fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
         }
         const cur = @import("../proc/sched.zig").currentTaskIndex() orelse return -1;
         const so = if (k == 0) @import("ip_options_policy.zig").SendOpts{} else @import("ip_options_policy.zig").compileForSend(ob[0..k], @import("../ipc/capability.zig").hasSysCap(cur, "cap_net_raw")) orelse return -22;
-        return if (@import("udp.zig").setIpOptions(ref.udp, so)) 0 else -9;
+        return switch (ref) {
+            .udp => |port| if (@import("udp.zig").setIpOptions(port, so)) 0 else -9,
+            .raw => |idx| if (@import("raw_icmp.zig").setIpOptions(idx, so)) 0 else -9,
+            else => unreachable,
+        };
     }
     var raw: [16]u8 = undefined;
     const n = readOptval(optval_ptr, optlen, &raw);
@@ -671,8 +675,12 @@ fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
     // ip_getsockopt answers a level other than SOL_IP with EOPNOTSUPP; an IPv6 socket's ipv6_getsockopt with ENOPROTOOPT.
     if (!ipo.levelApplies(level, fam)) return if (fam == .v4) -95 else -92;
     // IP_OPTIONS: the socket's options as it gave them (ip_options_undo), at most optlen bytes.
-    if (level == ipo.SOL_IP and optname == ipo.IP_OPTIONS and ref == .udp) {
-        const so = @import("udp.zig").getIpOptions(ref.udp) orelse return -9;
+    if (level == ipo.SOL_IP and optname == ipo.IP_OPTIONS and (ref == .udp or ref == .raw)) {
+        const so = switch (ref) {
+            .udp => |port| @import("udp.zig").getIpOptions(port) orelse return -9,
+            .raw => |idx| (@import("raw_icmp.zig").getIpOptions(idx) orelse return -9).so,
+            else => unreachable,
+        };
         var ob: [40]u8 = undefined;
         const k = @import("ip_options_policy.zig").userView(so, &ob);
         return copyOptOut(optval_ptr, optlen_ptr, ob[0..k]);

@@ -185,8 +185,10 @@ pub fn rawSendFrom(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDe
         .ok => |v| v,
         .err => |e| return e,
     };
-    // Linux does not mangle an IP_HDRINCL header, so IP options with it make no sense (raw_sendmsg).
-    if (hdrincl and ov.retopts) return -22;
+    // Linux does not mangle an IP_HDRINCL header, so IP options with it make no sense (raw_sendmsg); IP_OPTIONS stored on the
+    // socket, even empty ones, refuse it too (raw_send_hdrinc).
+    const sock_opts = raw.getIpOptions(d.raw_idx) orelse return -9;
+    if (hdrincl and (ov.retopts or sock_opts.set)) return -22;
     // IP_HDRINCL: `msg` is the whole datagram, header first (raw_send_hdrinc); otherwise raw_sendmsg reads the ICMP type and code
     // from the user buffer of an ICMP socket (raw_probe_proto_opt), and fewer than 2 bytes is EFAULT.
     const protocol = raw.protocolOf(d.raw_idx);
@@ -210,7 +212,9 @@ pub fn rawSendFrom(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDe
     }
     if (ov.ttl) |v| ip.ttl = v;
     if (ov.tos) |v| ip.tos = v;
-    const sent = raw.send(src, dst, @truncate(protocol), msg, ip);
+    // ipc.opt: the IP_RETOPTS control message's options, else the socket's IP_OPTIONS.
+    const ipopts = ov.opts orelse (if (sock_opts.so.len != 0) sock_opts.so else null);
+    const sent = raw.sendOpts(src, dst, @truncate(protocol), msg, ip, ipopts);
     return if (sent < 0) sent else @intCast(msg.len);
 }
 
@@ -491,7 +495,8 @@ fn pingSend(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr
     const sock_ttl: u8 = if (dst[0] >= 224 and dst[0] <= 239) ping_ip.mc4_ttl else ipo.effectiveTtl(ping_ip);
     const ttl: u8 = ov.ttl orelse sock_ttl;
     const tos: u8 = ov.tos orelse ping_ip.tos;
-    const sent = @import("icmp.zig").sendFromOv(src, dst, msg[0..payload.len], ping_ip.pmtudisc, ttl, tos);
+    const ipopts = ov.opts orelse if (udp.getIpOptions(d.udpKey())) |so| (if (so.len != 0) so else null) else null;
+    const sent = @import("icmp.zig").sendFromOpts(src, dst, msg[0..payload.len], ping_ip.pmtudisc, ttl, tos, ipopts);
     return if (sent < 0) sent else @intCast(payload.len);
 }
 
