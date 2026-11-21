@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello482`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello483`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -477,6 +477,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello480 | sigreturn 按 fpregs 所指恢复 FPU：处理函数把 fpregs 指向自己改过 xmm0 的副本，返回后 xmm0 为 0x11223344（A）；fpregs 设为 0，返回后 xmm0 为 0、MXCSR 为 0x1f80（B）；子进程里把 fpregs 设成未对齐地址，子进程死于 SIGSEGV（C） |
 | hello481 | /proc/sys/fs/pipe-max-size：读出 1048576（A）；root 写 100000 读回 131072（B）；超过上限的 F_SETPIPE_SZ 为 EPERM（C）；上限 16384 时新管道为 16384（D）；负数、垃圾为 EINVAL，超过 2^31 为 ERANGE（E）；上限 4096 时新管道一页（F）；写回 1048576（G） |
 | hello482 | 按用户统计管道页数：pipe-user-pages-soft/hard 读出 16384、0（A）；root 写软限制 256，负数、垃圾为 EINVAL（B）；uid 4242 放大 4 个管道到 256 KiB 后 EPERM，新管道只有 2 页且不能放大，缩小仍可（C）；硬限制 40 时第三个管道 ENFILE，放大超限 EPERM，root 不受限（D）；恢复默认值（E） |
+| hello483 | AF_UNIX 每条排队记录保留自己的到达时间：100 个数据报都带读取前的时间戳且不递减（A）；seqpacket 64 条（B）；第 70 条的 MSG_PEEK 与随后的读取时间相同（C）；设置 SO_TIMESTAMPNS 之前发送的记录取读取时刻（D）；accept 之前排队的 seqpacket 记录取读取时刻，之后的取发送时刻（E） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

@@ -13177,7 +13177,7 @@ test "AF_UNIX: a stream client that closes while queued stays acceptable with it
     try std.testing.expect(std.mem.indexOf(u8, us, "if (unix_sockets[conn_idx].closed_queued) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "        unix_sockets[conn_idx] = .{};\n        return @intCast(new_idx);") != null);
     // The listener closing frees parked connectors it still queues, so the table cannot fill up.
-    try std.testing.expect(std.mem.indexOf(u8, us, "if (queued < MAX_UNIX_SOCKETS and unix_sockets[queued].closed_queued) unix_sockets[queued] = .{};") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "if (queued < MAX_UNIX_SOCKETS and unix_sockets[queued].closed_queued) {\n                freeStampsLocked(&unix_sockets[queued]);\n                unix_sockets[queued] = .{};") != null);
 }
 
 test "AF_UNIX autobind: a family-only bind() takes a kernel-chosen abstract name" {
@@ -17762,7 +17762,7 @@ test "ping socket replies carry their arrival time for SO_TIMESTAMP / SO_TIMESTA
 
 test "AF_UNIX datagram and seqpacket records carry SO_TIMESTAMP ahead of SCM_CREDENTIALS; streams none (hello477)" {
     const us = kt.unix_socket_source;
-    try std.testing.expect(std.mem.indexOf(u8, us, "        pushStampLocked(peer);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "        pushStampLocked(peer, peer.opts.flags & @import(\"sockopt_policy.zig\").TS_FLAG != 0);\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "        const st = popStampLocked(sock);\n") != null);
     const ss = kt.socket_syscall_source;
     const st = std.mem.indexOf(u8, ss, "ip_cmsg_policy.build(ip_cmsg_policy.Wanted.withStamp(.{}, uview.opts.flags), .{ .stamp_ns = stamp }") orelse return error.TestUnexpectedResult;
@@ -17852,4 +17852,17 @@ test "MADV_DONTFORK / MADV_WIPEONFORK outside mmap regions hold 32 separate runs
     try std.testing.expect(!t.set(64 * fm.PAGE, 65 * fm.PAGE, .dontfork, true));
     try std.testing.expect(t.at(62 * fm.PAGE).dontfork);
     try std.testing.expect(@sizeOf(kt.group_state.GroupState) <= 4096);
+}
+
+test "AF_UNIX records keep their own arrival time, stamped only when the receiver asked at send time (hello483)" {
+    // Linux unix_dgram_sendmsg / unix_seqpacket_sendmsg: __net_timestamp(skb) when the receiver has SOCK_RCVTSTAMP; an skb without
+    // one is stamped at the read (__sock_recv_timestamp). The kernel kept 64 times and stamped every record, and records queued
+    // before accept() took no slot, so the ones after them read their neighbours' times.
+    const us = kt.unix_socket_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "stamps: ?*[MAX_RECORDS]u64 = null,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "pushStampLocked(peer, peer.opts.flags & @import(\"sockopt_policy.zig\").TS_FLAG != 0);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "pushPendingStampsLocked(nsock, &conn_sock.pending, n);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "pushPendingStampsLocked(nsock, &dead.pending, n);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "STAMP_RING") == null);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, us, "freeStampsLocked(&unix_sockets[") + std.mem.count(u8, us, "freeStampsLocked(sock);"));
 }

@@ -36,8 +36,6 @@ pub const UNIX_PATH_MAX: u8 = 108;
 pub const SRC_NAMES: u8 = MAX_UNIX_SOCKETS;
 /// The most datagram records the ring can hold (a zero-length datagram is its 2-byte length prefix).
 pub const MAX_RECORDS: u32 = UNIX_SOCK_BUF_SIZE / 2;
-/// Queued records whose arrival time a socket remembers (see UnixSocket.stamps).
-pub const STAMP_RING: u32 = 64;
 /// Index stored for a record from an unbound sender.
 const NO_NAME: u8 = 0xFF;
 
@@ -126,11 +124,11 @@ pub const UnixSocket = struct {
     rec_src: [MAX_RECORDS]u8 = @splat(NO_NAME),
     rec_head: u32 = 0,
     rec_count: u32 = 0,
-    /// Arrival times of the oldest STAMP_RING queued records (DGRAM and SEQPACKET), for SO_TIMESTAMP: record n (counting every
-    /// record ever queued) is in stamps[n % STAMP_RING] when fewer than STAMP_RING were queued ahead of it; a record without one is
-    /// stamped when it is read (sock_recv_timestamp takes the current time for an skb that has none).
-    stamps: [STAMP_RING]u64 = @splat(0),
-    stamp_valid: [STAMP_RING]bool = @splat(false),
+    /// Arrival times of the queued records (DGRAM and SEQPACKET), for SO_TIMESTAMP: record n (counting every record ever queued) is
+    /// in stamps[n % MAX_RECORDS], 0 when the receiver had no SO_TIMESTAMP when it was sent (unix_dgram_sendmsg stamps the skb only
+    /// then); such a record is stamped when it is read (sock_recv_timestamp takes the current time for an skb that has none). The
+    /// array is kmalloc'd at the first stamped record and freed with the socket; without it every record reads as unstamped.
+    stamps: ?*[MAX_RECORDS]u64 = null,
     stamp_head: u32 = 0,
     stamp_tail: u32 = 0,
     /// Credentials of whoever sent the bytes now in this socket's ring (the
@@ -801,10 +799,12 @@ pub fn unixAccept(idx: u32) i32 {
         const nsock = &unix_sockets[new_idx];
         if (n > 0) {
             ringWrite(&nsock.buffer, nsock.buf_write, &dead.pending, n);
+            pushPendingStampsLocked(nsock, &dead.pending, n);
             nsock.buf_write = (nsock.buf_write + @as(u32, @intCast(n))) % UNIX_SOCK_BUF_SIZE;
             nsock.buf_count += @as(u32, @intCast(n));
             wake.in |= EpollWake.bit(new_idx);
         }
+        freeStampsLocked(&unix_sockets[conn_idx]);
         unix_sockets[conn_idx] = .{};
         return @intCast(new_idx);
     }
@@ -844,6 +844,7 @@ pub fn unixAccept(idx: u32) i32 {
         const nsock = &unix_sockets[new_idx];
         const n: usize = conn_sock.pending_len;
         ringWrite(&nsock.buffer, nsock.buf_write, &conn_sock.pending, n);
+        pushPendingStampsLocked(nsock, &conn_sock.pending, n);
         nsock.buf_write = (nsock.buf_write + @as(u32, @intCast(n))) % UNIX_SOCK_BUF_SIZE;
         nsock.buf_count += @as(u32, @intCast(n));
         conn_sock.pending_len = 0;
@@ -1018,7 +1019,7 @@ pub fn unixSendRightsTo(idx: u32, data: [*]const u8, len: usize, rights: ?*Right
 
         peer.sender_cred = if (rights) |r| (r.cred_override orelse currentSenderCred()) else currentSenderCred();
         if (sock.sock_type == SOCK_DGRAM) pushSrcNameLocked(peer, sock);
-        pushStampLocked(peer);
+        pushStampLocked(peer, peer.opts.flags & @import("sockopt_policy.zig").TS_FLAG != 0);
         // Write data
         ringWrite(&peer.buffer, peer.buf_write, data, len);
         peer.buf_write = (peer.buf_write + @as(u32, @intCast(len))) % UNIX_SOCK_BUF_SIZE;
@@ -1067,23 +1068,47 @@ fn pushSrcNameLocked(peer: *UnixSocket, sender: *const UnixSocket) void {
     peer.rec_count += 1;
 }
 
-/// Remember when the record just queued on `peer` arrived (unix_lock held).
-fn pushStampLocked(peer: *UnixSocket) void {
-    if (peer.stamp_tail -% peer.stamp_head < STAMP_RING) {
-        const at = peer.stamp_tail % STAMP_RING;
-        peer.stamps[at] = @import("../proc/time_syscall.zig").wallClockNanos();
-        peer.stamp_valid[at] = true;
-    }
+/// Note the record just queued on `peer`: its arrival time when `stamp` (the receiver has SO_TIMESTAMP), else 0 (unix_lock held).
+/// The first stamped record allocates the array, the records already queued reading as unstamped; when that fails it is unstamped too.
+fn pushStampLocked(peer: *UnixSocket, stamp: bool) void {
+    const at = peer.stamp_tail % MAX_RECORDS;
     peer.stamp_tail +%= 1;
+    if (peer.stamps == null and stamp) {
+        const raw = @import("../mm/slab.zig").kmalloc(@sizeOf([MAX_RECORDS]u64)) orelse return;
+        const arr: *[MAX_RECORDS]u64 = @ptrCast(@alignCast(raw));
+        @memset(arr, 0);
+        peer.stamps = arr;
+    }
+    const arr = peer.stamps orelse return;
+    arr[at] = if (stamp) @import("../proc/time_syscall.zig").wallClockNanos() else 0;
+}
+
+/// Records a seqpacket client queued before accept() move into the accepted socket's ring: none of them is stamped (the
+/// receiving socket did not exist when they were sent, and it does not inherit the listener's SO_TIMESTAMP). `bytes` holds them,
+/// each with its 2-byte length prefix (unix_lock held).
+fn pushPendingStampsLocked(sock: *UnixSocket, bytes: []const u8, n: usize) void {
+    if (sock.sock_type != SOCK_SEQPACKET) return;
+    var off: usize = 0;
+    while (off + 2 <= n) {
+        const len = @as(usize, bytes[off]) | (@as(usize, bytes[off + 1]) << 8);
+        pushStampLocked(sock, false);
+        off += 2 + len;
+    }
+}
+
+fn freeStampsLocked(sock: *UnixSocket) void {
+    if (sock.stamps) |arr| @import("../mm/slab.zig").kfree(arr);
+    sock.stamps = null;
 }
 
 /// The arrival time of the record being read from `sock`, or 0 (unix_lock held).
 fn popStampLocked(sock: *UnixSocket) u64 {
     if (sock.stamp_head == sock.stamp_tail) return 0;
-    const at = sock.stamp_head % STAMP_RING;
-    const v = if (sock.stamp_valid[at]) sock.stamps[at] else 0;
-    sock.stamp_valid[at] = false;
+    const at = sock.stamp_head % MAX_RECORDS;
     sock.stamp_head +%= 1;
+    const arr = sock.stamps orelse return 0;
+    const v = arr[at];
+    arr[at] = 0;
     return v;
 }
 
@@ -1094,8 +1119,8 @@ pub fn unixHeadStamp(idx: u32) u64 {
     defer unix_lock.release(saved);
     const sock = &unix_sockets[idx];
     if (!sock.active or sock.stamp_head == sock.stamp_tail) return 0;
-    const at = sock.stamp_head % STAMP_RING;
-    return if (sock.stamp_valid[at]) sock.stamps[at] else 0;
+    const arr = sock.stamps orelse return 0;
+    return arr[sock.stamp_head % MAX_RECORDS];
 }
 
 fn popSrcNameLocked(sock: *UnixSocket) SrcName {
@@ -1382,7 +1407,10 @@ pub fn unixClose(idx: u32) void {
             wake.hup |= EpollWake.bit(queued);
             wake.sig_hup |= EpollWake.bit(queued);
             // A client that had already closed was only kept for this listener to accept: free its slot.
-            if (queued < MAX_UNIX_SOCKETS and unix_sockets[queued].closed_queued) unix_sockets[queued] = .{};
+            if (queued < MAX_UNIX_SOCKETS and unix_sockets[queued].closed_queued) {
+                freeStampsLocked(&unix_sockets[queued]);
+                unix_sockets[queued] = .{};
+            }
         }
     }
     // DGRAM senders aimed at this socket now fail instead of blocking.
@@ -1441,6 +1469,7 @@ pub fn unixClose(idx: u32) void {
     for (&unix_sockets) |*o| {
         if (o.nospace_on == idx) o.nospace_on = 255;
     }
+    freeStampsLocked(sock);
     sock.* = .{};
 }
 

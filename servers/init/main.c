@@ -599,6 +599,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello480"); /* sigreturn takes the FPU image fpregs points at */
     run_test("hello481"); /* /proc/sys/fs/pipe-max-size */
     run_test("hello482"); /* pipe-user-pages-soft/hard */
+    run_test("hello483"); /* AF_UNIX per-record receive timestamps */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */
