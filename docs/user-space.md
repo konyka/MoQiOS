@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello470`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello471`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -465,6 +465,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello468 | TCP_MAXSEG 报告 mss_cache：新套接字和监听套接字为 536（A）；回环连接两端为 1448（1460 减时间戳的 12 字节），tcpi_snd_mss、tcpi_advmss 相同（B）；connect 前设 536，未连接时读回 536，连接后两端都是 524（C） |
 | hello469 | TCP 套接字的 IP_PKTOPTIONS：没开任何选项时为 0 字节（A）；客户端设 IP_TOS 0x28、IP_TTL 33 并开 IP_PKTINFO、IP_RECVTTL、IP_RECVTOS，connect 前读出 80 字节（地址全 0、TTL 1、TOS 0），连接后地址为 127.0.0.1（B）；accept 得到的套接字读出接口 1、TTL 33、TOS 0x28（SYN 的值）（C）；40 字节缓冲只放下 IP_PKTINFO，16 字节缓冲得到截断的头（D）；UDP 套接字读取、setsockopt 都是 ENOPROTOOPT（E） |
 | hello470 | 管道按页大小的缓冲计数：新管道写 1000 字节写进 64 次后 EAGAIN、POLLOUT 0（A）；读走 1000 字节不释放缓冲，仍 EAGAIN（B）；再读 3000 字节空出第一页后 POLLOUT，1000 和 100 字节写进、3000 字节 EAGAIN（C）；一页的管道写入 1000 字节后 POLLOUT 0，3096 字节仍能并入，再写 1 字节 EAGAIN（D）；15 整页后写 4000 字节，200 字节放不进、96 字节放得进（E）；15 整页加 100 字节后写 8000 字节写进 3904（F）；三次 2000 字节占两个缓冲，缩到一页 EBUSY、两页成功（G）；writev 算一次写：15 整页加 100 字节后 writev 4000+4000 写进 3904，100 字节后 writev 三段 100 字节全部并入，之后还能写 15 整页（H） |
+| hello471 | 大数据报按 SO_RCVBUF 计数：默认 SO_RCVBUF 的 UDP 套接字收下 20 个 60000 字节数据报中的 2 个（A）；SO_RCVBUF 设 4 MiB 后按读回值能放下的个数收（本内核读回 425984，收 4 个）（B）；默认缓冲的 raw 套接字收下 20 个 60000 字节数据报中的 3 个、8 个 1000 字节的全部（C）；8 个交错发送的分片数据报全部重组送达（D） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

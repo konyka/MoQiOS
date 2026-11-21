@@ -9,6 +9,31 @@ const IrqSpinlock = @import("../sync/irq_spinlock.zig").IrqSpinlock;
 var lock: IrqSpinlock = .{};
 var queues: [policy.QUEUES]policy.Queue = @splat(.{});
 
+/// The queue for `key` (policy.find) with a buffer to reassemble into: a queue that starts gets one from kmalloc (lock held; no
+/// memory: the fragment is dropped). Buffers of queues no longer in use go back in releaseIdle.
+fn findWithBuf(key: policy.Key, now: u64) ?*policy.Queue {
+    const q = policy.find(&queues, key, now) orelse return null;
+    if (q.buf == null) {
+        const raw = @import("../mm/slab.zig").kmalloc(policy.BUF_LEN) orelse {
+            q.used = false;
+            return null;
+        };
+        q.buf = @ptrCast(@alignCast(raw));
+    }
+    return q;
+}
+
+/// Give back the buffers of queues that are done, discarded or expired (lock held), so idle queues hold no memory.
+fn releaseIdle() void {
+    for (&queues) |*q| {
+        if (q.used or q.busy) continue;
+        if (q.buf) |b| {
+            @import("../mm/slab.zig").kfree(b);
+            q.buf = null;
+        }
+    }
+}
+
 /// Whether `ip` (an IPv4 header and what follows, `len` bytes) is a fragment: MF set or a non-zero offset.
 pub fn isFragment(ip: [*]const u8, len: u32) bool {
     if (len < 20) return false;
@@ -32,7 +57,8 @@ pub fn receive(frame: [*]const u8, len: u32, ifindex: u8) void {
     const q = blk: {
         const saved = lock.acquire();
         defer lock.release(saved);
-        const q = policy.find(&queues, key, now) orelse return;
+        defer releaseIdle();
+        const q = findWithBuf(key, now) orelse return;
         switch (policy.insert(q, fi.offset, fi.more, ip[ihl..total], ip[0..ihl])) {
             .complete => {
                 q.busy = true;
@@ -47,6 +73,7 @@ pub fn receive(frame: [*]const u8, len: u32, ifindex: u8) void {
     defer lock.release(saved);
     q.busy = false;
     q.used = false;
+    releaseIdle();
 }
 
 
@@ -86,7 +113,8 @@ pub fn receive6(frame: [*]const u8, len: u32, pkt6: []const u8, frag_off: usize,
     const q = blk: {
         const saved = lock.acquire();
         defer lock.release(saved);
-        const q = policy.find(&queues, key, now) orelse return;
+        defer releaseIdle();
+        const q = findWithBuf(key, now) orelse return;
         var hdr: [40]u8 = pkt6[0..40].*;
         hdr[6] = fh.nh;
         switch (policy.insert(q, fh.offset, fh.more, body, &hdr)) {
@@ -103,6 +131,7 @@ pub fn receive6(frame: [*]const u8, len: u32, pkt6: []const u8, frag_off: usize,
     defer lock.release(saved);
     q.busy = false;
     q.used = false;
+    releaseIdle();
 }
 
 /// ip_fragment for a locally built IPv4 datagram: `hdr` is its 20-byte header (protocol, addresses, id, TTL, TOS, DF as it should go

@@ -24,8 +24,11 @@ pub const MAX_DATAGRAM: usize = 65535;
 pub const MAX_PAYLOAD: usize = 65535;
 /// Distinct byte ranges a queue tracks; a datagram cut into more pieces than this is dropped.
 pub const MAX_RANGES: usize = 64;
-/// Queues kept at once (Linux bounds them by memory, ipfrag_high_thresh); a new datagram when all are busy takes the oldest.
-pub const QUEUES: usize = 4;
+/// Queues kept at once: 64 of up to 64 KiB each, Linux's 4 MiB ipfrag_high_thresh; a new datagram when all are busy takes the oldest.
+/// A queue's buffer is allocated when it starts (`buf` null until then) and freed when it is done.
+pub const QUEUES: usize = 64;
+/// The bytes a queue's buffer holds.
+pub const BUF_LEN: usize = PAYLOAD_OFF + MAX_PAYLOAD;
 
 /// A reassembly queue's identity: (source, destination, id, protocol) for IPv4 (the addresses in the first 4 bytes, a 16-bit id);
 /// (source, destination, id) for IPv6, whose 32-bit id names the datagram on its own (ip6_frag_find, `protocol` 0).
@@ -94,10 +97,10 @@ pub const Queue = struct {
     /// The first fragment's IP header (the reassembled datagram takes it, minus the fragment fields).
     header: [60]u8 = @splat(0),
     header_len: u8 = 0,
-    buf: [PAYLOAD_OFF + MAX_PAYLOAD]u8 = undefined,
+    buf: ?*[BUF_LEN]u8 = null,
 
     pub fn data(q: *Queue) []u8 {
-        return q.buf[PAYLOAD_OFF..][0..q.len];
+        return q.buf.?[PAYLOAD_OFF..][0..q.len];
     }
 
     /// The completed datagram as an Ethernet frame (`eth` its 14-byte header): the first fragment's IP header with the fragment
@@ -105,8 +108,8 @@ pub const Queue = struct {
     pub fn frame(q: *Queue, eth: []const u8) []u8 {
         const hl: usize = q.header_len;
         const start = PAYLOAD_OFF - hl - 14;
-        @memcpy(q.buf[start..][0..14], eth[0..14]);
-        const h = q.buf[start + 14 ..][0..hl];
+        @memcpy(q.buf.?[start..][0..14], eth[0..14]);
+        const h = q.buf.?[start + 14 ..][0..hl];
         @memcpy(h, q.header[0..hl]);
         const total: u16 = @intCast(hl + q.len);
         h[2] = @intCast(total >> 8);
@@ -118,19 +121,19 @@ pub const Queue = struct {
         const c = headerChecksum(h);
         h[10] = @intCast(c >> 8);
         h[11] = @truncate(c);
-        return q.buf[start .. PAYLOAD_OFF + q.len];
+        return q.buf.?[start .. PAYLOAD_OFF + q.len];
     }
 
     /// frame for an IPv6 datagram: the first fragment's 40-byte header (its next header already the Fragment header's) with the payload
     /// length set (ip6_frag_reasm), then the payload. A payload over 65535 bytes is never complete (insert drops it).
     pub fn frame6(q: *Queue, eth: []const u8) []u8 {
         const start = PAYLOAD_OFF - 40 - 14;
-        @memcpy(q.buf[start..][0..14], eth[0..14]);
-        const h = q.buf[start + 14 ..][0..40];
+        @memcpy(q.buf.?[start..][0..14], eth[0..14]);
+        const h = q.buf.?[start + 14 ..][0..40];
         @memcpy(h, q.header[0..40]);
         h[4] = @intCast(q.len >> 8);
         h[5] = @truncate(q.len);
-        return q.buf[start .. PAYLOAD_OFF + q.len];
+        return q.buf.?[start .. PAYLOAD_OFF + q.len];
     }
 };
 
@@ -186,7 +189,8 @@ pub fn insert(q: *Queue, offset: u32, more: bool, payload: []const u8, header: [
     if (q.n == MAX_RANGES) return discard(q);
     q.ranges[q.n] = .{ .start = offset, .end = end };
     q.n += 1;
-    @memcpy(q.buf[PAYLOAD_OFF + offset ..][0 .. end - offset], payload[0 .. end - offset]);
+    const buf = q.buf orelse return discard(q);
+    @memcpy(buf[PAYLOAD_OFF + offset ..][0 .. end - offset], payload[0 .. end - offset]);
     q.meat += end - offset;
     if (offset == 0) {
         q.first_in = true;
@@ -253,6 +257,14 @@ pub fn needsFragment(total: usize, mtu: u16) bool {
     return total > mtu;
 }
 
+fn testBufs(qs: []Queue) !void {
+    for (qs) |*q| q.buf = try std.testing.allocator.create([BUF_LEN]u8);
+}
+
+fn freeTestBufs(qs: []Queue) void {
+    for (qs) |*q| if (q.buf) |b| std.testing.allocator.destroy(b);
+}
+
 test "fragInfo reads MF and the offset in 8-byte units" {
     try std.testing.expect(!fragInfo(0).is_fragment);
     try std.testing.expect(!fragInfo(DF).is_fragment);
@@ -264,6 +276,8 @@ test "fragInfo reads MF and the offset in 8-byte units" {
 
 test "three in-order pieces reassemble; out of order too" {
     var qs: [QUEUES]Queue = @splat(.{});
+    try testBufs(&qs);
+    defer freeTestBufs(&qs);
     const key: Key = .{ .src = .{ 127, 0, 0, 1 }, .dst = .{ 127, 0, 0, 1 }, .id = 7, .protocol = 17 };
     var src: [4000]u8 = undefined;
     for (&src, 0..) |*b, i| b.* = @truncate(i);
@@ -295,6 +309,8 @@ test "three in-order pieces reassemble; out of order too" {
 
 test "overlaps, a second last fragment and data past the end discard the queue" {
     var qs: [QUEUES]Queue = @splat(.{});
+    try testBufs(&qs);
+    defer freeTestBufs(&qs);
     const key: Key = .{ .src = .{ 1, 2, 3, 4 }, .dst = .{ 5, 6, 7, 8 }, .id = 1, .protocol = 17 };
     const hdr = [_]u8{0x45} ++ [_]u8{0} ** 19;
     var buf: [2000]u8 = @splat(0xaa);
@@ -314,6 +330,8 @@ test "overlaps, a second last fragment and data past the end discard the queue" 
 
 test "a datagram over 65535 bytes is dropped, and so is a stale queue" {
     var qs: [QUEUES]Queue = @splat(.{});
+    try testBufs(&qs);
+    defer freeTestBufs(&qs);
     const key: Key = .{ .src = .{ 1, 2, 3, 4 }, .dst = .{ 5, 6, 7, 8 }, .id = 1, .protocol = 17 };
     const hdr = [_]u8{0x45} ++ [_]u8{0} ** 19;
     var big: [MAX_PAYLOAD]u8 = undefined;
@@ -334,6 +352,8 @@ test "piece length is the MTU less the header, a multiple of 8" {
 
 test "a delivering queue is never reused" {
     var qs: [1]Queue = @splat(.{});
+    try testBufs(&qs);
+    defer freeTestBufs(&qs);
     const key: Key = .{ .src = .{ 1, 2, 3, 4 }, .dst = .{ 5, 6, 7, 8 }, .id = 1, .protocol = 17 };
     const q = find(&qs, key, 0).?;
     q.busy = true;

@@ -30,13 +30,31 @@ const MAX_UDP_PAYLOAD_V6 = 1452;
 pub const MAX_UDP_PAYLOAD_BIG = 65507;
 /// The IPv6 one (65535 - 8): the payload length field does not count the 40-byte header.
 pub const MAX_UDP_PAYLOAD_BIG6 = 65527;
-/// Buffers for queued datagrams longer than one frame holds (they only come from IPv4 reassembly); a datagram that finds none free
-/// is dropped, as a full receive buffer drops it in Linux.
-const BIG_SLOTS = 4;
-/// A big buffer holds the largest IPv6 payload: an IPv6 ping socket's echo reply may be 65535 bytes, ICMPv6 header included.
+/// A queued datagram longer than one frame holds (it only comes from reassembly) lives in a kmalloc buffer of its own; how many a
+/// socket keeps is bounded by its SO_RCVBUF (udp_rmem_policy), as in Linux. The largest is an IPv6 payload: an IPv6 ping socket's
+/// echo reply may be 65535 bytes, ICMPv6 header included.
 const BIG_BUF_LEN = 65535;
-var big_bufs: [BIG_SLOTS][BIG_BUF_LEN]u8 = undefined;
-var big_used: [BIG_SLOTS]bool = @splat(false);
+/// The header in front of a big datagram's bytes: a peek copying them out (outside udp_lock) pins it; an entry dropped meanwhile
+/// leaves the freeing to the last releaseBig (`orphan`).
+const BigBuf = struct {
+    pinned: u16 = 0,
+    orphan: bool = false,
+
+    fn bytes(self: *BigBuf) [*]u8 {
+        return @as([*]u8, @ptrCast(self)) + @sizeOf(BigBuf);
+    }
+};
+
+fn allocBig(len: usize) ?*BigBuf {
+    const raw = @import("../mm/slab.zig").kmalloc(@sizeOf(BigBuf) + len) orelse return null;
+    const b: *BigBuf = @ptrCast(@alignCast(raw));
+    b.* = .{};
+    return b;
+}
+
+fn freeBig(b: *BigBuf) void {
+    @import("../mm/slab.zig").kfree(b);
+}
 
 const UdpEntry = struct {
     src_ip: [16]u8,
@@ -44,8 +62,8 @@ const UdpEntry = struct {
     dst_port: u16,
     data_len: u16,
     data: [MAX_UDP_PAYLOAD]u8,
-    /// Not 0: the datagram is in big_bufs[big - 1] instead of `data` (udp_lock).
-    big: u8 = 0,
+    /// Not null: the datagram is in this buffer instead of `data` (udp_lock).
+    big: ?*BigBuf = null,
     valid: bool,
     is_v6: bool,
     /// Interface, header destination, TTL and TOS of an IPv4 datagram (IP_PKTINFO / IP_RECVTTL / IP_RECVTOS).
@@ -82,41 +100,46 @@ var queues: [MAX_PORTS][QUEUE_DEPTH]UdpEntry = @splat(@splat(.{
 var num_ports: u16 = 0;
 var udp_lock: IrqSpinlock = .{};
 
-/// Store `payload` in queue entry `e` (udp_lock held): in `data` when it fits, else in a free big buffer. False when it does not fit
-/// anywhere (no big buffer free).
-fn fillEntryLocked(e: *UdpEntry, payload: []const u8) bool {
+/// Store `payload` in queue entry `e` of the socket in slot `port_idx` (udp_lock held): in `data` when it fits, else in a big buffer of
+/// its own. False when the socket's receive buffer has no room for it (__udp_enqueue_schedule_skb: rmem + truesize past SO_RCVBUF,
+/// unless the queue is empty) or no memory is to be had: the datagram is dropped, as Linux drops it.
+fn fillEntryLocked(port_idx: usize, e: *UdpEntry, payload: []const u8) bool {
+    const rp = @import("udp_rmem_policy.zig");
+    if (!rp.admits(queueRmemLocked(port_idx), rp.truesize(payload.len), port_opts[port_idx].rcvbuf)) return false;
     if (payload.len <= MAX_UDP_PAYLOAD) {
-        e.big = 0;
+        e.big = null;
         @memcpy(e.data[0..payload.len], payload);
     } else {
         if (payload.len > BIG_BUF_LEN) return false;
-        const slot = for (big_used, 0..) |u, k| {
-            if (!u) break k;
-        } else return false;
-        big_used[slot] = true;
-        e.big = @intCast(slot + 1);
-        @memcpy(big_bufs[slot][0..payload.len], payload);
+        const b = allocBig(payload.len) orelse return false;
+        e.big = b;
+        @memcpy(b.bytes()[0..payload.len], payload);
     }
     e.data_len = @intCast(payload.len);
     return true;
 }
 
+/// sk_rmem_alloc of the socket in slot `port_idx`: what its queued datagrams cost (udp_lock held).
+fn queueRmemLocked(port_idx: usize) u32 {
+    var sum: u32 = 0;
+    for (&queues[port_idx]) |*q| {
+        if (q.valid) sum +|= @import("udp_rmem_policy.zig").truesize(q.data_len);
+    }
+    return sum;
+}
+
 /// The bytes of a queued entry (udp_lock held).
 fn entryBytes(e: *const UdpEntry) []const u8 {
-    if (e.big != 0) return big_bufs[e.big - 1][0..e.data_len];
+    if (e.big) |b| return b.bytes()[0..e.data_len];
     return e.data[0..e.data_len];
 }
 
-/// A peek is copying big_bufs[k] out (outside udp_lock): an entry dropped meanwhile leaves the buffer to releaseBig (big_orphan).
-var big_pinned: [BIG_SLOTS]u8 = @splat(0);
-var big_orphan: [BIG_SLOTS]bool = @splat(false);
-
 /// Drop a queued entry, giving back its big buffer (udp_lock held).
 fn dropEntryLocked(e: *UdpEntry) void {
-    if (e.big != 0) {
-        if (big_pinned[e.big - 1] != 0) big_orphan[e.big - 1] = true else big_used[e.big - 1] = false;
+    if (e.big) |b| {
+        if (b.pinned != 0) b.orphan = true else freeBig(b);
     }
-    e.big = 0;
+    e.big = null;
     e.valid = false;
 }
 /// SOL_SOCKET options per registered port (travels with the port slot).
@@ -741,7 +764,7 @@ pub fn deliverPing(ident: u16, src_ip: [4]u8, dst_ip: [4]u8, msg: []const u8, me
                 if (e.valid) continue;
                 // A reply to a fragmented request is reassembled before it gets here: one longer than a frame takes a big buffer
                 // (none free: it is dropped, as a full queue drops it).
-                if (!fillEntryLocked(e, msg)) break;
+                if (!fillEntryLocked(i, e, msg)) break;
                 e.src_ip = @splat(0);
                 @memcpy(e.src_ip[0..4], &src_ip);
                 e.src_port = 0;
@@ -784,7 +807,7 @@ pub fn deliverPing6(ident: u16, src_ip: [16]u8, dst_ip: [16]u8, msg: []const u8,
             const e = &queues[i][j];
             if (e.valid) continue;
             // A reply longer than a frame (reassembled) takes a big buffer, or is dropped when none is free.
-            if (!fillEntryLocked(e, msg)) break;
+            if (!fillEntryLocked(i, e, msg)) break;
             e.src_ip = src_ip;
             e.src_port = 0;
             e.dst_port = ident;
@@ -1026,7 +1049,7 @@ fn releaseLocked(port: u32) void {
             // slot never delivers stale datagrams to a new owner.
             for (0..QUEUE_DEPTH) |j| {
                 queues[num_ports][j].valid = false;
-                queues[num_ports][j].big = 0;
+                queues[num_ports][j].big = null;
             }
             return;
         }
@@ -1126,7 +1149,7 @@ fn enqueue(port: u16, src_ip: [16]u8, src_port: u16, dst_port: u16, dst_ip: [4]u
         const port_idx = cand[pick];
         for (0..QUEUE_DEPTH) |i| {
             if (!queues[port_idx][i].valid) {
-                if (!fillEntryLocked(&queues[port_idx][i], payload)) break :blk false;
+                if (!fillEntryLocked(port_idx, &queues[port_idx][i], payload)) break :blk false;
                 queues[port_idx][i].src_ip = src_ip;
                 queues[port_idx][i].src_port = src_port;
                 queues[port_idx][i].dst_port = dst_port;
@@ -1172,7 +1195,7 @@ fn enqueueMcast(port: u16, src_ip: [16]u8, src_port: u16, group: [16]u8, payload
             for (0..QUEUE_DEPTH) |j| {
                 const e = &queues[i][j];
                 if (e.valid) continue;
-                if (!fillEntryLocked(e, payload)) break;
+                if (!fillEntryLocked(i, e, payload)) break;
                 e.src_ip = src_ip;
                 e.src_port = src_port;
                 e.dst_port = port;
@@ -1211,7 +1234,7 @@ fn enqueueMcast4(port: u16, src_ip: [16]u8, src_port: u16, group: [4]u8, payload
                 const e = &queues[i][j];
                 if (e.valid) continue;
                 e.src_ip = src_ip;
-                if (!fillEntryLocked(e, payload)) break;
+                if (!fillEntryLocked(i, e, payload)) break;
                 e.src_port = src_port;
                 e.dst_port = port;
                 e.is_v6 = false;
@@ -1390,9 +1413,9 @@ pub fn recvFromMeta(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8,
     return 0;
 }
 
-/// A big datagram taken off the queue for copy-out: its buffer stays reserved (big_used) until releaseBig, so recvfrom / recvmsg can
+/// A big datagram taken off the queue for copy-out: its buffer stays allocated until releaseBig, so recvfrom / recvmsg can
 /// copy it to the user in pieces without holding udp_lock and without a 64 KiB stack buffer.
-pub const BigTake = struct { slot: u8, len: u16 };
+pub const BigTake = struct { buf: *BigBuf, len: u16 };
 
 /// The next IPv4 datagram on `port` when it is a big one (recvFromMeta's contract otherwise: src, full length, meta): taken off the
 /// queue unless `peek`; the buffer is pinned for `bigBytes` until releaseBig. Null when the next datagram is not big (or none).
@@ -1403,16 +1426,16 @@ pub fn takeBig(port: u32, out_src_ip: *[4]u8, out_src_port: *u16, peek: bool, ou
     for (0..QUEUE_DEPTH) |i| {
         const entry = &queues[port_idx][i];
         if (!(entry.valid and !entry.is_v6)) continue;
-        if (entry.big == 0) return null;
+        const b = entry.big orelse return null;
         out_src_ip.* = entry.src_ip[0..4].*;
         out_src_port.* = entry.src_port;
         out_meta.* = entry.meta;
-        const t: BigTake = .{ .slot = entry.big - 1, .len = entry.data_len };
+        const t: BigTake = .{ .buf = b, .len = entry.data_len };
         if (peek) {
-            big_pinned[t.slot] += 1;
+            b.pinned += 1;
         } else {
-            // The buffer leaves the entry but stays in use until releaseBig.
-            entry.big = 0;
+            // The buffer leaves the entry; releaseBig frees it.
+            entry.big = null;
             entry.valid = false;
         }
         return t;
@@ -1428,15 +1451,15 @@ pub fn takeBig6(port: u32, out_src_ip: *[16]u8, out_src_port: *u16, peek: bool, 
     for (0..QUEUE_DEPTH) |i| {
         const entry = &queues[port_idx][i];
         if (!(entry.valid and entry.is_v6)) continue;
-        if (entry.big == 0) return null;
+        const b = entry.big orelse return null;
         out_src_ip.* = entry.src_ip;
         out_src_port.* = entry.src_port;
         out_meta6.* = entry.meta6;
-        const t: BigTake = .{ .slot = entry.big - 1, .len = entry.data_len };
+        const t: BigTake = .{ .buf = b, .len = entry.data_len };
         if (peek) {
-            big_pinned[t.slot] += 1;
+            b.pinned += 1;
         } else {
-            entry.big = 0;
+            entry.big = null;
             entry.valid = false;
         }
         return t;
@@ -1446,7 +1469,7 @@ pub fn takeBig6(port: u32, out_src_ip: *[16]u8, out_src_port: *u16, peek: bool, 
 
 /// The bytes of a taken big datagram (stable until releaseBig).
 pub fn bigBytes(t: BigTake) []const u8 {
-    return big_bufs[t.slot][0..t.len];
+    return t.buf.bytes()[0..t.len];
 }
 
 /// End a takeBig: a consumed datagram's buffer becomes free; a peeked one stays with its entry.
@@ -1454,12 +1477,9 @@ pub fn releaseBig(t: BigTake, peek: bool) void {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     if (peek) {
-        big_pinned[t.slot] -= 1;
-        if (big_pinned[t.slot] == 0 and big_orphan[t.slot]) {
-            big_orphan[t.slot] = false;
-            big_used[t.slot] = false;
-        }
-    } else big_used[t.slot] = false;
+        t.buf.pinned -= 1;
+        if (t.buf.pinned == 0 and t.buf.orphan) freeBig(t.buf);
+    } else freeBig(t.buf);
 }
 
 /// Drain one IPv6 datagram for `port` (SK-70).

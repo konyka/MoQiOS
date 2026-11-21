@@ -23,11 +23,8 @@ const QUEUE_DEPTH = policy.QUEUE_DEPTH;
 pub const RAW_QUEUE_LEN = 1500;
 /// Largest datagram a raw socket keeps whole: a reassembled IPv4 datagram (total length) or IPv6 payload.
 pub const RAW_BIG_LEN = 65535;
-/// Shared buffers for queued datagrams longer than RAW_QUEUE_LEN (only reassembly makes them); with none free one is kept cut to
-/// RAW_QUEUE_LEN bytes, its length then that.
-const BIG_SLOTS = 4;
-var big_bufs: [BIG_SLOTS][RAW_BIG_LEN]u8 = undefined;
-var big_used: [BIG_SLOTS]bool = @splat(false);
+/// A queued datagram longer than RAW_QUEUE_LEN (only reassembly makes one) gets a kmalloc buffer of its own; how many a socket keeps
+/// is bounded by its SO_RCVBUF (udp_rmem_policy.rawAdmits). Without memory for it, it is kept cut to RAW_QUEUE_LEN bytes.
 /// Largest ICMP message a send carries (1472-byte UDP payload and ICMP header: the same bound the ping sockets use).
 pub const MAX_MESSAGE = 1480;
 /// Largest datagram an IP_HDRINCL send writes whole (header included): one Ethernet MTU.
@@ -37,9 +34,9 @@ const FRAME_BUF_LEN = 14 + 20 + MAX_MESSAGE;
 
 const Entry = struct {
     dgram: [RAW_QUEUE_LEN]u8 = @splat(0),
-    /// The datagram's whole length; past RAW_QUEUE_LEN the bytes are in big_bufs[big - 1].
+    /// The datagram's whole length; past RAW_QUEUE_LEN the bytes are in `big`.
     len: u16 = 0,
-    big: u8 = 0,
+    big: ?[*]u8 = null,
     /// The sender: an IPv4 address in the first 4 bytes, or an IPv6 one.
     src: [16]u8 = @splat(0),
     /// What the datagram arrived with, for recvmsg's IP_PKTINFO / IP_TTL / IP_TOS (an IPv4 socket) or IPV6_PKTINFO /
@@ -97,15 +94,13 @@ fn store(e: *Entry, bytes: []const u8) void {
 /// store for a datagram held in two parts, `head` then `tail` (a header rewritten apart from the frame, then the payload).
 fn store2(e: *Entry, head: []const u8, tail: []const u8) void {
     const n = @min(head.len + tail.len, RAW_BIG_LEN);
-    e.big = 0;
+    e.big = null;
     const dst: []u8 = blk: {
         if (n > RAW_QUEUE_LEN) {
-            if (for (big_used, 0..) |u, k| {
-                if (!u) break k;
-            } else null) |slot| {
-                big_used[slot] = true;
-                e.big = @intCast(slot + 1);
-                break :blk big_bufs[slot][0..n];
+            if (@import("../mm/slab.zig").kmalloc(n)) |raw| {
+                const p: [*]u8 = @ptrCast(raw);
+                e.big = p;
+                break :blk p[0..n];
             }
         }
         break :blk e.dgram[0..@min(n, RAW_QUEUE_LEN)];
@@ -116,15 +111,23 @@ fn store2(e: *Entry, head: []const u8, tail: []const u8) void {
     e.len = @intCast(dst.len);
 }
 
+/// sk_rmem_alloc of raw socket `s`: what its queued datagrams cost (raw_lock held).
+fn queueRmem(s: *const Socket) u32 {
+    var sum: u32 = 0;
+    var k: u8 = 0;
+    while (k < s.count) : (k += 1) sum +|= @import("udp_rmem_policy.zig").rawTruesize(s.queue[(@as(usize, s.head) + k) % QUEUE_DEPTH].len);
+    return sum;
+}
+
 fn bytesOf(e: *const Entry) []const u8 {
-    if (e.big != 0) return big_bufs[e.big - 1][0..e.len];
+    if (e.big) |p| return p[0..e.len];
     return e.dgram[0..e.len];
 }
 
 /// Give back an entry's big buffer (raw_lock held): it was read, or its socket is going away.
 fn dropEntry(e: *Entry) void {
-    if (e.big != 0) big_used[e.big - 1] = false;
-    e.big = 0;
+    if (e.big) |p| @import("../mm/slab.zig").kfree(p);
+    e.big = null;
 }
 
 /// A new socket of `protocol` (an IPv6 one when `v6`) on the first free slot, or null (ENOBUFS). Nothing is shared with a UDP
@@ -550,6 +553,7 @@ pub fn deliverHdr(protocol: u8, hdr: []const u8, payload: []const u8, src: [4]u8
             if (!policy.matches(s.bound, s.peer, src, dst)) continue;
             took = true;
             if (protocol == policy.IPPROTO_ICMP) if (icmpType(hdr, payload)) |ty| if (policy.icmpFilterBlocks(s.icmp_filter, ty)) continue;
+            if (!@import("udp_rmem_policy.zig").rawAdmits(queueRmem(s), s.opts.rcvbuf)) continue;
             const at = policy.enqueueSlot(s.head, s.count) orelse continue;
             const e = &s.queue[at];
             store2(e, hdr, payload);
@@ -599,6 +603,7 @@ pub fn deliver6Flow(protocol: u8, msg: []const u8, src: [16]u8, dst: [16]u8, ifi
             took = true;
             if (protocol == policy.IPPROTO_ICMPV6 and (msg.len < 4 or policy.filterBlocks(s.filter, msg[0]))) continue;
             if (s.csum_off != null and policy.sum6(src, dst, s.protocol, msg) != 0) continue;
+            if (!@import("udp_rmem_policy.zig").rawAdmits(queueRmem(s), s.opts.rcvbuf)) continue;
             const at = policy.enqueueSlot(s.head, s.count) orelse continue;
             const e = &s.queue[at];
             store(e, msg);
