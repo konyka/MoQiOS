@@ -62,7 +62,8 @@ pub fn handleRxPacketOn(data: [*]const u8, len: u32, ifindex: u8) void {
                 const iop = @import("ip_options_policy.zig");
                 const n_opt: usize = info.payload_offset - 20;
                 @memcpy(meta4.opts[0..n_opt], data[14 + 20 ..][0..n_opt]);
-                const now_ms: u32 = @intCast((@import("../arch/arch.zig").tsc.nanos() / 1_000_000) % 86_400_000);
+                // inet_current_timestamp: milliseconds since midnight UTC.
+                const now_ms = iop.msSinceMidnight(@import("../proc/time_syscall.zig").wallClockNanos());
                 const c = switch (iop.compile(meta4.opts[0..n_opt], info.dst_ip, now_ms, &isLocal4)) {
                     .ok => |o| o,
                     .bad => return,

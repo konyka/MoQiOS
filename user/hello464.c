@@ -6,7 +6,8 @@
  *   B. NOP NOP NOP END: IP_RECVOPTS 01 01 01 00 00 00 00 00 (24 bytes), IP_RETOPTS empty (16 bytes);
  *   C. record route with one free slot (07 07 04 ...): the receiver records itself, both messages read 07 07 08 7f 00 00 01 00;
  *   D. a full record route (07 03 04 00): IP_RECVOPTS 07 03 04 00 00 00 00 00, IP_RETOPTS 07 03 04 00 (20 bytes);
- *   E. a timestamp (44 08 05 00, time only): the receiver writes its time and advances the pointer to 9 in both messages;
+ *   E. a timestamp (44 08 05 00, time only): the receiver writes its time and advances the pointer to 9 in both messages; the time
+ *      is milliseconds since midnight UTC (within a second of CLOCK_REALTIME);
  *   F. a malformed option (record route of length 2) or a loose source route drops the datagram (EAGAIN). */
 #ifdef HOST
 #define _GNU_SOURCE
@@ -25,6 +26,8 @@ static long setopt_(long s, int lv, int o, const void *v, int l) { return rc(set
 static long getint(long s, int lv, int o) { int v = -1; socklen_t l = 4; long r = rc(getsockopt((int)s, lv, o, &v, &l)); return r < 0 ? r : v; }
 static long recvmsg_(long s, void *m, int f) { return rc(recvmsg((int)s, m, f)); }
 static void nap(void) { usleep(20000); }
+#include <time.h>
+static long now_ms(void) { struct timespec t; clock_gettime(CLOCK_REALTIME, &t); return (long)((t.tv_sec % 86400) * 1000 + t.tv_nsec / 1000000); }
 #else
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
 #include "../lib/moqi_libc/include/stdio.h"
@@ -37,6 +40,7 @@ static long setopt_(long s, int lv, int o, const void *v, int l) { return syscal
 static long getint(long s, int lv, int o) { int v = -1; int l = 4; long r = syscall5(133, s, lv, o, (long)&v, (long)&l); return r < 0 ? r : v; }
 static long recvmsg_(long s, void *m, int f) { return syscall3(130, s, (long)m, f); }
 static void nap(void) { long t[2] = { 0, 20000000 }; syscall1(104, 0); syscall2(35, (long)t, 0); }
+static long now_ms(void) { long t[2] = { 0, 0 }; syscall2(SYS_clock_gettime, 0, (long)t); return (t[0] % 86400) * 1000 + t[1] / 1000000; }
 #endif
 static int failures;
 static char msg[400];
@@ -132,8 +136,14 @@ int main(void) {
     static const unsigned char ts[8] = { 0x44, 8, 5, 0, 0, 0, 0, 0 };
     send_opts(ts);
     long er = next();
-    snprintf(msg, sizeof msg, "E: timestamp: recv %ld, IP_RECVOPTS %ld pointer %u, IP_RETOPTS %ld pointer %u (1 24 9 24 9)", er, ro_len, ro[2], rr_len, rr[2]);
-    check(er == 1 && ro_len == 24 && ro[0] == 0x44 && ro[2] == 9 && rr_len == 24 && rr[2] == 9, msg);
+    long when = now_ms();
+    long stamp = (long)ro[4] << 24 | ro[5] << 16 | ro[6] << 8 | ro[7];
+    long diff = when - stamp;
+    if (diff < -43200000) diff += 86400000;
+    if (diff > 43200000) diff -= 86400000;
+    snprintf(msg, sizeof msg, "E: timestamp: recv %ld, IP_RECVOPTS %ld pointer %u, IP_RETOPTS %ld pointer %u; stamp %ld ms, clock %ld ms (1 24 9 24 9; within 1000)", er, ro_len, ro[2], rr_len,
+             rr[2], stamp, when);
+    check(er == 1 && ro_len == 24 && ro[0] == 0x44 && ro[2] == 9 && rr_len == 24 && rr[2] == 9 && diff >= -1000 && diff <= 1000, msg);
 
     static const unsigned char bad[8] = { 7, 2, 4, 0, 0, 0, 0, 0 };
     static const unsigned char lsrr[8] = { 0x83, 7, 4, 127, 0, 0, 1, 0 };

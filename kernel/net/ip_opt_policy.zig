@@ -19,6 +19,7 @@ pub const IP_RECVTOS: u64 = 13;
 /// ICMP errors about what the socket sent are queued for recvmsg(MSG_ERRQUEUE) (Linux inet RECVERR, errqueue_policy.zig).
 pub const IP_RECVERR: u64 = 11;
 pub const IP_RECVOPTS: u64 = 6;
+pub const IP_OPTIONS: u64 = 4;
 pub const IP_RETOPTS: u64 = 7;
 /// recvmsg then brings IP_ORIGDSTADDR, the datagram's destination as a struct sockaddr_in (Linux IP_CMSG_ORIGDSTADDR).
 pub const IP_RECVORIGDSTADDR: u64 = 20;

@@ -126,6 +126,24 @@ var port_opts: [MAX_PORTS]@import("sockopt_policy.zig").Stored = @splat(.{});
 var port_err: [MAX_PORTS]i32 = @splat(0);
 /// IP_RECVERR error queue of each slot (errqueue_policy.zig); travels with the slot like port_err.
 var port_errq: [MAX_PORTS]errq.Queue = @splat(.{});
+/// IP_OPTIONS of each port (inet->inet_opt), as ip_options_policy.compileForSend left them; len 0: none.
+var port_ipopts: [MAX_PORTS]@import("ip_options_policy.zig").SendOpts = @splat(.{});
+
+pub fn setIpOptions(port: u32, so: @import("ip_options_policy.zig").SendOpts) bool {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return false;
+    port_ipopts[i] = so;
+    return true;
+}
+
+pub fn getIpOptions(port: u32) ?@import("ip_options_policy.zig").SendOpts {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return null;
+    return port_ipopts[i];
+}
+
 /// np->rxpmtu: the last IPV6_DONTFRAG refusal of an IPV6_RECVPATHMTU socket (destination and MTU), for one recvmsg.
 pub const RxPmtu = struct { valid: bool = false, dst: [16]u8 = @splat(0), scope: u32 = 0, mtu: u32 = 0 };
 var port_rxpmtu: [MAX_PORTS]RxPmtu = @splat(.{});
@@ -590,6 +608,7 @@ fn newSlotLocked(key: u32, is_v6: bool, uid: u32) u16 {
     port_err[idx] = 0;
     port_errq[idx].clear();
     port_rxpmtu[idx] = .{};
+    port_ipopts[idx] = .{};
     port_ipid[idx] = 0;
     port_peer[idx] = 0;
     port_peer_ip[idx] = @splat(0);
@@ -976,6 +995,8 @@ fn releaseLocked(port: u32) void {
             port_errq[num_ports].clear();
             port_rxpmtu[i] = port_rxpmtu[num_ports];
             port_rxpmtu[num_ports] = .{};
+            port_ipopts[i] = port_ipopts[num_ports];
+            port_ipopts[num_ports] = .{};
             port_ipid[i] = port_ipid[num_ports];
             port_peer[i] = port_peer[num_ports];
             port_peer_ip[i] = port_peer_ip[num_ports];
@@ -1504,13 +1525,19 @@ pub fn sendTo(dst_ip: [4]u8, dst_port: u16, src_port: u16, data: [*]const u8, da
 /// (0.0.0.0 when unbound): the source address follows tcp_port_policy.sourceAddr, so a loopback datagram leaves from the bound
 /// loopback address or else 127.0.0.1. The IP options are that socket's own, also when other sockets share its port.
 pub fn sendToFrom(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, data: [*]const u8, data_len: u16) bool {
-    return sendToFromOv(bound, dst_ip, dst_port, src_key, data, data_len, null, null);
+    return sendToFromOv(bound, dst_ip, dst_port, src_key, data, data_len, null, null, null);
 }
 
 /// sendToFrom with sendmsg's IP_TTL / IP_TOS control messages: `ttl_ov` and `tos_ov` replace the socket's values for this datagram
 /// (Linux cork->ttl / cork->tos; the TTL replaces IP_MULTICAST_TTL too, and the TOS is the whole byte, ECN bits included).
-pub fn sendToFromOv(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, data: [*]const u8, data_len: u16, ttl_ov: ?u8, tos_ov: ?u8) bool {
+pub fn sendToFromOv(bound: [4]u8, dst_ip_in: [4]u8, dst_port: u16, src_key: u32, data: [*]const u8, data_len: u16, ttl_ov: ?u8, tos_ov: ?u8, opts_ov: ?@import("ip_options_policy.zig").SendOpts) bool {
     if (data_len > MAX_UDP_PAYLOAD_BIG) return false;
+    // The IP options of this datagram: an IP_RETOPTS control message's, else the socket's IP_OPTIONS (ipc.opt / inet->inet_opt).
+    const iop = @import("ip_options_policy.zig");
+    const ipopts: ?iop.SendOpts = opts_ov orelse if (getIpOptions(src_key)) |so| (if (so.len != 0) so else null) else null;
+    // A source route sends to its first hop; the final destination rides in the option (ip_route_connect with faddr).
+    const dst_ip = if (ipopts) |so| (if (so.o.srr != null) so.faddr else dst_ip_in) else dst_ip_in;
+    const optlen: u16 = if (ipopts) |so| so.len else 0;
     const src_port = portNumber(src_key);
     var opts4: ip_opt_policy.IpOpts = if (getPortOpts(src_key)) |po| po.ip else .{};
     if (ttl_ov) |v| opts4.ttl = v;
@@ -1553,32 +1580,46 @@ pub fn sendToFromOv(bound: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, da
     // SK-101/105: honor Path MTU (or armed oversized raise probe). A datagram over it leaves in fragments (ip_fragment); the caller
     // already refused it under IP_PMTUDISC_DO / PROBE.
     const mtu = ipv4.getSendMtu(dst_ip);
-    if (ipv4.HEADER_LEN + @as(u32, udp_total) > mtu) {
+    if (ipv4.HEADER_LEN + optlen + @as(u32, udp_total) > mtu) {
+        // Fragmenting a datagram that carries IP options is not done here (ip_fragment would copy the copied options to each piece).
+        if (optlen != 0) return false;
         return sendFragmented4(our_ip, dst_ip, dst_port, src_key, data[0..data_len], opts4, ttl_ov, group, mtu, dst_mac, our_mac, via_lo, wait_hop);
     }
 
     // Stack-local frame buffer: concurrent sends on other CPUs must not tear it.
     var send_pkt: [1518]u8 = @splat(0);
+    const u_off: usize = 34 + optlen;
 
-    // Build UDP header at offset 34 (14 eth + 20 ipv4)
-    bo.writeU16BeAt(&send_pkt, 34, src_port);
-    bo.writeU16BeAt(&send_pkt, 36, dst_port);
-    bo.writeU16BeAt(&send_pkt, 38, udp_total);
-    send_pkt[40] = 0x00;
-    send_pkt[41] = 0x00;
+    // Build UDP header after the IPv4 header and its options
+    bo.writeU16BeAt(&send_pkt, u_off, src_port);
+    bo.writeU16BeAt(&send_pkt, u_off + 2, dst_port);
+    bo.writeU16BeAt(&send_pkt, u_off + 4, udp_total);
+    send_pkt[u_off + 6] = 0x00;
+    send_pkt[u_off + 7] = 0x00;
 
     // Copy payload after UDP header
-    @memcpy(send_pkt[42 .. 42 + data_len], data[0..data_len]);
+    @memcpy(send_pkt[u_off + 8 ..][0..data_len], data[0..data_len]);
 
     // Build IPv4 header at offset 14 (after ethernet header)
-    ipv4.buildHeader(send_pkt[14..].ptr, our_ip, dst_ip, ipv4.PROTO_UDP, udp_total);
+    ipv4.buildHeader(send_pkt[14..].ptr, our_ip, dst_ip, ipv4.PROTO_UDP, udp_total + optlen);
     ipv4.setIdent(send_pkt[14..].ptr, takePortIpid(src_key, dst_ip, our_ip, opts4.pmtudisc), ip_opt_policy.datagramDf(opts4.pmtudisc));
     if (ip_opt_policy.ipv4NeedsPatch(opts4)) ip_opt_policy.patchIpv4(send_pkt[14..][0..20], opts4, ipv4.checksum);
     // A datagram to a group carries IP_MULTICAST_TTL (default 1), not the unicast TTL.
     if (group) ip_opt_policy.setTtl4(send_pkt[14..][0..20], ttl_ov orelse opts4.mc4_ttl, ipv4.checksum);
+    if (ipopts) |so| {
+        // ip_options_build: the options follow the 20-byte header (IHL grows), record route and timestamps get our entry; the
+        // header checksum then covers the whole header.
+        var ob: [40]u8 = undefined;
+        iop.build(so, our_ip, dst_ip_in, iop.msSinceMidnight(@import("../proc/time_syscall.zig").wallClockNanos()), &ob);
+        @memcpy(send_pkt[34..][0..optlen], ob[0..optlen]);
+        send_pkt[14] = 0x40 | @as(u8, @intCast((20 + optlen) / 4));
+        send_pkt[24] = 0;
+        send_pkt[25] = 0;
+        bo.writeU16BeAt(&send_pkt, 24, ipv4.checksum(send_pkt[14..].ptr, @intCast(20 + optlen)));
+    }
 
     // Build ethernet frame
-    const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, 20 + udp_total);
+    const frame_len = eth.buildFrame(&send_pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, 20 + optlen + udp_total);
     // IP_MULTICAST_LOOP: when this host is a member of the group on the outgoing interface (the NIC here) a copy is delivered locally
     // too, arriving on that interface (Linux ip_mc_output, ip_check_mc_rcu, dev_loopback_xmit).
     if (group and !via_lo and opts4.mc4_loop and (mcast.alwaysJoined4(dst_ip) or hostJoined4(dst_ip, out_if))) _ = lo.sendPacketOn(&send_pkt, frame_len, out_if);

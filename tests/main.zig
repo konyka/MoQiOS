@@ -17515,3 +17515,23 @@ test "received IPv4 options are compiled, and IP_RECVOPTS / IP_RETOPTS report th
     try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "udp.handlePacketMetaInfo(info.src_ip, info.dst_ip, data + payload_start, info.payload_len, meta4);") != null);
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello464", true, false).caps.cap_net_raw);
 }
+
+test "a UDP sender's IPv4 options: IP_OPTIONS and a non-empty IP_RETOPTS control message go into the header (ip_options_get / build; hello465)" {
+    const iop = kt.ip_options_policy;
+    const so = iop.compileForSend(&.{ 7, 7, 4, 0, 0, 0, 0 }, false).?;
+    var out: [40]u8 = undefined;
+    iop.build(so, .{ 10, 0, 2, 15 }, .{ 10, 0, 2, 2 }, 0, &out);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 7, 8, 10, 0, 2, 15, 0 }, out[0..8]);
+    const c = kt.ip_cmsg_policy;
+    var b: [64]u8 = @splat(0);
+    std.mem.writeInt(u64, b[0..8], 24, .little);
+    std.mem.writeInt(i32, b[12..16], 7, .little);
+    b[16..24].* = .{ 7, 7, 4, 0, 0, 0, 0, 0 };
+    const r = c.parseSend4(b[0..24], .{}).ok;
+    try std.testing.expect(r.retopts and r.opts != null);
+    std.mem.writeInt(u64, b[0..8], 20, .little);
+    b[16..20].* = .{ 7, 2, 0, 0 };
+    try std.testing.expectEqual(@as(i64, -22), c.parseSend4(b[0..24], .{}).err);
+    try std.testing.expect(std.mem.indexOf(u8, kt.udp_source, "iop.build(so, our_ip, dst_ip_in, iop.msSinceMidnight(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_opt_source, "if (level == ipo.SOL_IP and optname == ipo.IP_OPTIONS and ref == .udp) {") != null);
+}

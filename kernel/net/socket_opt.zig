@@ -562,6 +562,20 @@ fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
     if (ref == .tcp and level == ipo.SOL_IP) {
         if (ipo.streamSetErrno4(optname)) |e| return e;
     }
+    // IP_OPTIONS (do_ip_setsockopt → ip_options_get): up to 40 bytes of options a UDP socket's datagrams carry; 0 bytes clears
+    // them; malformed ones (or, without CAP_NET_RAW, unknown ones) are EINVAL.
+    if (level == ipo.SOL_IP and optname == ipo.IP_OPTIONS and ref == .udp) {
+        if (optlen > 40) return -22;
+        var ob: [40]u8 = undefined;
+        const k: usize = @intCast(optlen);
+        if (k != 0) {
+            if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;
+            if (@import("../mm/copy_from_user.zig").copyFromUser(ob[0..k], @ptrFromInt(optval_ptr), k) != k) return -14;
+        }
+        const cur = @import("../proc/sched.zig").currentTaskIndex() orelse return -1;
+        const so = if (k == 0) @import("ip_options_policy.zig").SendOpts{} else @import("ip_options_policy.zig").compileForSend(ob[0..k], @import("../ipc/capability.zig").hasSysCap(cur, "cap_net_raw")) orelse return -22;
+        return if (@import("udp.zig").setIpOptions(ref.udp, so)) 0 else -9;
+    }
     var raw: [16]u8 = undefined;
     const n = readOptval(optval_ptr, optlen, &raw);
     if (n < 0) return n;
@@ -656,6 +670,13 @@ fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
     const fam = socketFamily(ref, v6_hint) orelse return unknownLevel(ref, v6_hint, true);
     // ip_getsockopt answers a level other than SOL_IP with EOPNOTSUPP; an IPv6 socket's ipv6_getsockopt with ENOPROTOOPT.
     if (!ipo.levelApplies(level, fam)) return if (fam == .v4) -95 else -92;
+    // IP_OPTIONS: the socket's options as it gave them (ip_options_undo), at most optlen bytes.
+    if (level == ipo.SOL_IP and optname == ipo.IP_OPTIONS and ref == .udp) {
+        const so = @import("udp.zig").getIpOptions(ref.udp) orelse return -9;
+        var ob: [40]u8 = undefined;
+        const k = @import("ip_options_policy.zig").userView(so, &ob);
+        return copyOptOut(optval_ptr, optlen_ptr, ob[0..k]);
+    }
     // IPV6_PATHMTU: struct ip6_mtuinfo with only the MTU of a connected socket's route filled in (the address stays zero, as
     // ipv6_getsockopt memsets it); an optlen under 32 bytes is EINVAL, no route (not connected) ENOTCONN.
     if (level == ipo.SOL_IPV6 and optname == ipo.IPV6_PATHMTU) {

@@ -237,6 +237,8 @@ pub const Send4 = struct {
     /// IP_RETOPTS was given (ip_options_get: the datagram then has an options block, even an empty one, which an IP_HDRINCL raw
     /// socket refuses with EINVAL).
     retopts: bool = false,
+    /// The options it gave (ip_options_compile without an skb), for this datagram only.
+    opts: ?@import("ip_options_policy.zig").SendOpts = null,
 };
 
 /// The control messages parsed, or the errno that fails the send.
@@ -344,7 +346,8 @@ fn ipCmsgSend4(control: []const u8, caps: SendCaps) Send4Result {
         if (m.level != @as(i32, @intCast(ipo.SOL_IP))) continue;
         switch (m.typ) {
             IP_RETOPTS => {
-                if (m.data.len != 0) return .{ .err = -22 };
+                // ip_options_get: up to 40 bytes, checked as a sender's options (unknown ones need CAP_NET_RAW).
+                out.opts = @import("ip_options_policy.zig").compileForSend(m.data, caps.net_raw) orelse return .{ .err = -22 };
                 out.retopts = true;
             },
             @as(i32, @intCast(ipo.IP_PKTINFO)) => {

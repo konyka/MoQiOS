@@ -2064,7 +2064,7 @@ fn udpSendBytesFull(fd: u32, payload: []const u8, full_len: usize, addr_ptr: u64
     const lo_rc = @import("route4_policy.zig").loopbackSourceErrno(src, dst_ip, netif.getOurIp(), @import("arp.zig").loopbackAllowed());
     if (lo_rc != 0) return lo_rc;
     if (udpOversize4(src_key, dst_ip, dst_port, full_len)) |e| return e;
-    return if (udp.sendToFromOv(src, dst_ip, dst_port, src_key, payload.ptr, @intCast(payload.len), ov.ttl, ov.tos)) @intCast(payload.len) else -1;
+    return if (udp.sendToFromOv(src, dst_ip, dst_port, src_key, payload.ptr, @intCast(payload.len), ov.ttl, ov.tos, ov.opts)) @intCast(payload.len) else -1;
 }
 
 /// udpOversize4 for IPv6 (__ip6_append_data → ipv6_local_error): EMSGSIZE for a datagram over the path MTU, queued with IPV6_RECVERR
