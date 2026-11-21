@@ -17594,3 +17594,17 @@ test "IPv4 options on TCP sockets: every segment carries IP_OPTIONS, the MSS mak
     try std.testing.expectEqualSlices(u8, &.{ 7, 7, 8, 127, 0, 0, 1, 0 }, out[0..8]);
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello467", true, false).caps.cap_net_raw);
 }
+
+test "TCP_MAXSEG reports mss_cache: 536 or the user's value before a connection, the MSS less the timestamp option after (hello468)" {
+    const t = kt.tcp_info_policy;
+    try std.testing.expectEqual(@as(u32, 536), t.reportedMaxseg(true, 1460, 0, false));
+    try std.testing.expectEqual(@as(u32, 1000), t.reportedMaxseg(true, 1460, 1000, false));
+    try std.testing.expectEqual(@as(u32, 1448), t.reportedMaxseg(false, 1460, 0, true));
+    try std.testing.expectEqual(@as(u32, 1460), t.reportedMaxseg(false, 1460, 0, false));
+    try std.testing.expectEqual(@as(u32, 524), t.reportedMaxseg(false, 536, 536, true));
+    try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "return tcp_info_policy.reportedMaxseg(") != null);
+}
+
+test "a SYN offers the MSS capped by TCP_MAXSEG (tcp_advertise_mss, hello468 C)" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "const offer: u16 = @intCast(tcp_info_policy.effectiveMss(localMssForTcb(tcb), tcb.options.user_mss));") != null);
+}

@@ -1381,8 +1381,9 @@ fn fillTcpSegment(
     const is_syn = (flags & SYN) != 0;
 
     if (is_syn) {
-        // SK-100: MSS first (RFC 9293 recommends early in the option list).
-        const offer = localMssForTcb(tcb);
+        // SK-100: MSS first (RFC 9293 recommends early in the option list). TCP_MAXSEG caps what is offered (tcp_advertise_mss:
+        // tp->rx_opt.user_mss clamps the advertised MSS).
+        const offer: u16 = @intCast(tcp_info_policy.effectiveMss(localMssForTcb(tcb), tcb.options.user_mss));
         opt_buf[opt_len] = 2;
         opt_buf[opt_len + 1] = 4;
         bo.writeU16BeAt(&opt_buf, opt_len + 2, offer);
@@ -5239,7 +5240,8 @@ pub fn tcpEffectiveMss(tcb_idx: u32) u32 {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return 0;
-    return mssForTcb(&tcbs[tcb_idx]);
+    const t = &tcbs[tcb_idx];
+    return tcp_info_policy.reportedMaxseg(t.state == .closed or t.state == .listen, mssForTcb(t), t.options.user_mss, t.ts_enabled);
 }
 
 /// Snapshot of the connection for TCP_INFO.
@@ -5259,7 +5261,8 @@ pub fn tcpInfoSnapshot(tcb_idx: u32) ?tcp_info_policy.Snapshot {
         .snd_wscale = t.snd_wnd_scale,
         .rcv_wscale = t.rcv_wnd_scale,
         .rto_us = tcp_info_policy.msToUs(t.rto),
-        .snd_mss = mss,
+        // tcpi_snd_mss and tcpi_advmss are mss_cache, what TCP_MAXSEG reports.
+        .snd_mss = tcp_info_policy.reportedMaxseg(t.state == .closed or t.state == .listen, mss, t.options.user_mss, t.ts_enabled),
         .rcv_mss = mss,
         .unacked = t.snd_nxt -% t.snd_una,
         .pmtu = if (t.is_v6) ipv6.getPathMtu(t.remote_ip6) else ipv4.getPathMtu(t.remote_ip),

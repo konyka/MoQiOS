@@ -27,6 +27,18 @@ pub fn effectiveMss(path_mss: u32, user_cap: u32) u32 {
     return if (user_cap != 0 and user_cap < path_mss) user_cap else path_mss;
 }
 
+/// TCP_MSS_DEFAULT: what an unconnected socket's mss_cache starts at.
+pub const MSS_DEFAULT: u32 = 536;
+
+/// getsockopt(TCP_MAXSEG) (tcp_getsockopt: tp->mss_cache, or rx_opt.user_mss on a closed or listening socket that set one).
+/// `unsynced`: the socket is closed or listening; `mss` the segment size of the connection (path, peer and user clamps applied);
+/// `ts` timestamps were negotiated, whose 12 bytes come off mss_cache (tcp_sync_mss → tcp_mss_to_mtu less tcp_header_len).
+pub fn reportedMaxseg(unsynced: bool, mss: u32, user_mss: u32, ts: bool) u32 {
+    if (unsynced) return if (user_mss != 0) user_mss else MSS_DEFAULT;
+    const opt: u32 = if (ts) 12 else 0;
+    return if (mss > opt + 1) mss - opt else 1;
+}
+
 pub const CONGESTION_NAME = "cubic";
 
 /// Linux numbers for `tcpi_state`.
