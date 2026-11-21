@@ -71,6 +71,19 @@ pub fn writev(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
     // One writev() covers one contiguous range of a shared description: its offset lock is held across every iovec.
     const held = if (fd < vfs_mod.MAX_FDS) vfs_mod.lockOffset(&cur.fd_table.fds[fd]) else 0;
     defer vfs_mod.unlockOffset(held);
+    // A pipe accounts for the whole writev() as one write (anon_pipe_write sees one iov_iter): its total length, summed first.
+    const to_pipe = fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .pipe_write and cur.fd_table.fds[fd].writable;
+    var whole: usize = 0;
+    if (to_pipe) {
+        for (0..iovcnt) |i| {
+            var iov_buf: [16]u8 = undefined;
+            if (copy.copyFromUser(&iov_buf, @ptrFromInt(iov_ptr + @as(u64, @intCast(i)) * 16), 16) < 16) break;
+            const b: u64 = bo.readU64At(&iov_buf, 0);
+            if (b == 0 or b >= 0x0000_8000_0000_0000) continue;
+            whole +|= @intCast(@min(bo.readU64At(&iov_buf, 8), 0x7FFFFFFF));
+        }
+    }
+    var pipe_part: vfs_mod.PipeWritePart = .{ .total = whole };
     var total: usize = 0;
     for (0..iovcnt) |i| {
         var iov_buf: [16]u8 = undefined;
@@ -90,7 +103,10 @@ pub fn writev(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
             var kbuf: [4096]u8 = undefined;
             const from_user = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(iov_base + pos), chunk);
             if (from_user == 0) break;
-            const result = cur.fd_table.writeHeld(fd, &kbuf, from_user, held);
+            const result = if (to_pipe)
+                vfs_mod.pipeWritePart(cur.fd_table.fds[fd].pipe_idx, &kbuf, from_user, cur.fd_table.fds[fd].status_flags, &pipe_part)
+            else
+                cur.fd_table.writeHeld(fd, &kbuf, from_user, held);
             if (result <= 0) {
                 if (total == 0 and pos == 0) return @bitCast(result);
                 break;

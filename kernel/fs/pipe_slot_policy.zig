@@ -15,6 +15,8 @@ pub const Slots = struct {
     first: u16 = 0,
     count: u16 = 0,
     first_off: u16 = 0,
+    /// Counts every buffer taken, so a write can tell whether the last buffer is still the one it took.
+    pushes: u32 = 0,
     /// Where each slot's bytes end within its page (1..4096), with NOMERGE set on a slot a later write may not add to (one spliced
     /// in from another pipe: splice_pipe_to_pipe clears PIPE_BUF_FLAG_CAN_MERGE).
     ends: [MAX_SLOTS]u16 = @splat(0),
@@ -54,6 +56,7 @@ pub const Slots = struct {
     pub fn push(self: *Slots, n: usize) void {
         self.ends[self.at(self.count)] = @intCast(n);
         self.count += 1;
+        self.pushes +%= 1;
     }
 
     /// A read took `n` bytes from the front: every slot emptied by it is freed.
@@ -83,61 +86,64 @@ pub fn transfer(src: *Slots, dst: *Slots, dst_max: usize, count: usize) usize {
         const n = @min(left, count - moved);
         dst.ends[dst.at(dst.count)] = @as(u16, @intCast(n)) | Slots.NOMERGE;
         dst.count += 1;
+        dst.pushes +%= 1;
         src.consume(n);
         moved += n;
     }
     return moved;
 }
 
-/// The bytes of a write of `total` (`done` already taken by this call) that go into the pipe now, slot by slot, and how: `merge`
-/// bytes into the last slot (only at the start of the call), then `pages` fresh slots, the last holding `tail` bytes (4096 for a
-/// whole page; 0 when `pages` is 0).
-pub const Plan = struct { merge: usize = 0, pages: usize = 0, tail: usize = 0 };
+/// One write() (or writev()) as anon_pipe_write sees it, carried across the pieces it reaches the pipe in and the waits between
+/// them: first the remainder of the whole length (`total` modulo 4096) merges into the last buffer when it fits there, then the
+/// bytes fill fresh pages from their start, each page topped up to 4096 before the next is taken.
+pub const WriteState = struct {
+    total: usize,
+    started: bool = false,
+    merge_left: usize = 0,
+    /// The last buffer is a page this write took (Slots.pushes right after it), which it keeps filling.
+    page_open: bool = false,
+    my_push: u32 = 0,
+};
 
-pub fn plan(s: *const Slots, max: usize, total: usize, done: usize, first_try: bool) Plan {
-    var p: Plan = .{};
-    var left = total - done;
-    if (first_try) {
-        const chars = total & (PAGE - 1);
-        if (s.mergeable(chars)) {
-            p.merge = chars;
-            left -= chars;
+/// Put up to `want` more bytes of the write into `s` (a pipe of `max` buffers): how many fit now.
+pub fn step(s: *Slots, max: usize, st: *WriteState, want: usize) usize {
+    if (!st.started) {
+        st.started = true;
+        const chars = st.total & (PAGE - 1);
+        if (s.mergeable(chars)) st.merge_left = chars;
+    }
+    var took: usize = 0;
+    while (took < want) {
+        const left = want - took;
+        if (st.merge_left != 0) {
+            const k = @min(left, st.merge_left);
+            s.merge(k);
+            st.merge_left -= k;
+            took += k;
+            continue;
         }
+        if (st.page_open and s.count != 0 and s.pushes == st.my_push) {
+            const end = s.endOf(s.at(s.count - 1));
+            if (end < PAGE) {
+                const k = @min(left, PAGE - end);
+                s.merge(k);
+                took += k;
+                continue;
+            }
+        }
+        if (s.full(max)) break;
+        const k = @min(left, @as(usize, PAGE));
+        s.push(k);
+        st.page_open = true;
+        st.my_push = s.pushes;
+        took += k;
     }
-    const slots = s.free(max);
-    const need = (left + PAGE - 1) / PAGE;
-    p.pages = @min(slots, need);
-    if (p.pages != 0) {
-        const taken = @min(left, p.pages * PAGE);
-        p.tail = taken - (p.pages - 1) * PAGE;
-    }
-    return p;
-}
-
-/// `p` cut to its first `limit` bytes (the piece of the write at hand): fewer pages, the last of them partial.
-pub fn clip(p: Plan, limit: usize) Plan {
-    if (p.merge >= limit) return .{ .merge = limit };
-    const rest = limit - p.merge;
-    const have = bytesOf(p) - p.merge;
-    if (have <= rest) return p;
-    const pages = (rest + PAGE - 1) / PAGE;
-    return .{ .merge = p.merge, .pages = pages, .tail = rest - (pages - 1) * PAGE };
-}
-
-fn bytesOf(p: Plan) usize {
-    return p.merge + if (p.pages == 0) 0 else (p.pages - 1) * PAGE + p.tail;
-}
-
-fn apply(s: *Slots, p: Plan) void {
-    if (p.merge != 0) s.merge(p.merge);
-    var i: usize = 0;
-    while (i < p.pages) : (i += 1) s.push(if (i + 1 == p.pages) p.tail else PAGE);
+    return took;
 }
 
 fn write(s: *Slots, max: usize, total: usize) usize {
-    const p = plan(s, max, total, 0, true);
-    apply(s, p);
-    return bytesOf(p);
+    var st: WriteState = .{ .total = total };
+    return step(s, max, &st, total);
 }
 
 test "sixty-four 1000-byte writes fill a 16-page pipe; a read frees a slot only once it is empty (measured on Linux)" {
@@ -186,20 +192,25 @@ test "a slot spliced in from another pipe is not merged into" {
     try std.testing.expectEqual(@as(usize, 4096), transfer(&b, &c, 1, 6000));
 }
 
-test "a write handed over in 4 KiB pieces is planned as one: the remainder merges first, then whole pages" {
+test "a write handed over in pieces is one write: the remainder merges first, then pages are filled whole" {
     var s: Slots = .{};
     var i: usize = 0;
     while (i < 15) : (i += 1) s.push(PAGE);
     s.push(100);
-    // write(8000) arrives as 4096 + 3904: the remainder 3904 merges behind the 100 bytes; no slot is left for the rest.
-    const p0 = clip(plan(&s, 16, 8000, 0, true), 4096);
-    try std.testing.expectEqual(@as(usize, 3904), p0.merge);
-    try std.testing.expectEqual(@as(usize, 0), p0.pages);
+    // write(8000) arrives as 4096 + 3904: the remainder 3904 merges behind the 100 bytes; no buffer is left for the rest.
+    var st: WriteState = .{ .total = 8000 };
+    try std.testing.expectEqual(@as(usize, 3904), step(&s, 16, &st, 4096));
     var t: Slots = .{};
-    const q0 = clip(plan(&t, 16, 8000, 0, true), 4096);
-    try std.testing.expectEqual(@as(usize, 1), q0.pages);
-    try std.testing.expectEqual(@as(usize, 4096), q0.tail);
-    apply(&t, q0);
-    const q1 = clip(plan(&t, 16, 8000, 4096, false), 3904);
-    try std.testing.expectEqual(@as(usize, 3904), q1.tail);
+    t.push(100);
+    // writev of three 100-byte pieces after 100 bytes: all 300 merge.
+    var w: WriteState = .{ .total = 300 };
+    try std.testing.expectEqual(@as(usize, 100), step(&t, 16, &w, 100));
+    try std.testing.expectEqual(@as(usize, 100), step(&t, 16, &w, 100));
+    try std.testing.expectEqual(@as(usize, 100), step(&t, 16, &w, 100));
+    try std.testing.expectEqual(@as(u16, 1), t.count);
+    // An empty pipe: three 100-byte pieces fill one fresh page.
+    var u: Slots = .{};
+    var x: WriteState = .{ .total = 300 };
+    for (0..3) |_| _ = step(&u, 16, &x, 100);
+    try std.testing.expectEqual(@as(u16, 1), u.count);
 }

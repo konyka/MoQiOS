@@ -59,6 +59,7 @@ pub fn write(fd: u64, buf: u64, count: u64) i64 {
             const held = if (fdIndex(fd) < vfs_mod.MAX_FDS) vfs_mod.lockOffset(&cur.fd_table.fds[fdIndex(fd)]) else 0;
             defer vfs_mod.unlockOffset(held);
             var pos: usize = 0;
+            var pipe_part: vfs_mod.PipeWritePart = .{ .total = n };
             while (pos < n) {
                 const chunk = @min(n - pos, 4096);
                 var kbuf: [4096]u8 = undefined;
@@ -66,7 +67,7 @@ pub fn write(fd: u64, buf: u64, count: u64) i64 {
                 if (copied == 0) break;
                 // A pipe accounts for the whole write() at once (vfs.pipeWritePart), not for each 4 KiB piece.
                 const result = if (fdIndex(fd) < vfs_mod.MAX_FDS and cur.fd_table.fds[fdIndex(fd)].fd_type == .pipe_write and cur.fd_table.fds[fdIndex(fd)].writable)
-                    vfs_mod.pipeWritePart(cur.fd_table.fds[fdIndex(fd)].pipe_idx, &kbuf, copied, cur.fd_table.fds[fdIndex(fd)].status_flags, .{ .total = n, .done = pos })
+                    vfs_mod.pipeWritePart(cur.fd_table.fds[fdIndex(fd)].pipe_idx, &kbuf, copied, cur.fd_table.fds[fdIndex(fd)].status_flags, &pipe_part)
                 else
                     cur.fd_table.writeHeld(fdIndex(fd), &kbuf, copied, held);
                 // Propagate a first-chunk error (e.g. -28 ENOSPC from the

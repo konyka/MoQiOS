@@ -730,12 +730,18 @@ test "a pipe write that fits an empty pipe is written whole or not at all" {
     const source = kt.vfs_source;
     // The pipe fills a buffer slot at a time (pipe_slot_policy, hello470): a write of at most PIPE_BUF (4096) bytes needs one slot
     // and goes in whole or waits, as POSIX and Linux have it.
-    try std.testing.expect(std.mem.indexOf(u8, source, "var pl = sp.plan(&pipe.slots, pipeSlots(pipe), total, part.done + n, first_try and part.done == 0);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "const take = @import(\"pipe_slot_policy.zig\").step(&pipe.slots, pipeSlots(pipe), part, count - n);") != null);
     const sp = kt.pipe_slot_policy;
     var e: sp.Slots = .{};
     e.push(4000);
-    const p0 = sp.plan(&e, 1, 4096, 0, true);
-    try std.testing.expectEqual(@as(usize, 0), p0.merge + p0.pages);
+    var w: sp.WriteState = .{ .total = 4096 };
+    try std.testing.expectEqual(@as(usize, 0), sp.step(&e, 1, &w, 4096));
+    // 3000 bytes behind 2000: they do not merge, so they go into one fresh page whole.
+    var f: sp.Slots = .{};
+    f.push(2000);
+    var w3: sp.WriteState = .{ .total = 3000 };
+    try std.testing.expectEqual(@as(usize, 3000), sp.step(&f, 16, &w3, 3000));
+    try std.testing.expectEqual(@as(u16, 2), f.count);
 }
 
 test "a blocking pipe write waits on the writers' queue and readers wake it" {
@@ -5366,7 +5372,7 @@ test "read, write, readv and writev hold the shared description's offset lock ac
     const rv = kt.readv_source;
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, rv, "    const held = if (fd < vfs_mod.MAX_FDS) vfs_mod.lockOffset(&cur.fd_table.fds[fd]) else 0;\n    defer vfs_mod.unlockOffset(held);\n"));
     try std.testing.expect(std.mem.indexOf(u8, rv, "const result = cur.fd_table.readHeld(fd, &kbuf, chunk, held);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rv, "const result = cur.fd_table.writeHeld(fd, &kbuf, from_user, held);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rv, "                cur.fd_table.writeHeld(fd, &kbuf, from_user, held);") != null);
     const v = kt.vfs_source;
     try std.testing.expect(std.mem.indexOf(u8, v, "        if (held == 0) return self.read(fd, buf, count);\n        const d = &self.fds[fd];\n        syncOffsetIn(d);\n        const r = self.readInner(fd, buf, count);\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, v, "        if (held == 0) return self.write(fd, buf, count);\n        const d = &self.fds[fd];\n        syncOffsetIn(d);\n        const r = self.writeInner(fd, buf, count);\n") != null);
@@ -17294,9 +17300,8 @@ test "a pipe holds its whole capacity: 65536 bytes in a 16-page pipe, 4096 in on
     var s16: sp.Slots = .{};
     var i: usize = 0;
     while (i < 16) : (i += 1) {
-        const pl = sp.plan(&s16, 16, 4096, 0, true);
-        try std.testing.expectEqual(@as(usize, 1), pl.pages);
-        s16.push(pl.tail);
+        var w: sp.WriteState = .{ .total = 4096 };
+        try std.testing.expectEqual(@as(usize, 4096), sp.step(&s16, 16, &w, 4096));
     }
     try std.testing.expect(s16.full(16));
 }
@@ -17666,10 +17671,13 @@ test "a pipe counts page-sized buffers like Linux: 64 writes of 1000 bytes fill 
     var s: sp.Slots = .{};
     var n: usize = 0;
     while (true) {
-        const pl = sp.plan(&s, 16, 1000, 0, true);
-        if (pl.merge == 0 and pl.pages == 0) break;
-        if (pl.merge != 0) s.merge(pl.merge) else s.push(pl.tail);
+        var w: sp.WriteState = .{ .total = 1000 };
+        if (sp.step(&s, 16, &w, 1000) != 1000) break;
         n += 1;
     }
     try std.testing.expectEqual(@as(usize, 64), n);
+}
+
+test "writev to a pipe is one write for the buffer accounting (hello470 H)" {
+    try std.testing.expect(std.mem.indexOf(u8, kt.readv_source, "vfs_mod.pipeWritePart(cur.fd_table.fds[fd].pipe_idx, &kbuf, from_user, cur.fd_table.fds[fd].status_flags, &pipe_part)") != null);
 }

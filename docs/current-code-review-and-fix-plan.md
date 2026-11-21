@@ -11738,7 +11738,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 问题：管道按字节计容量，16 页的管道每次写 1000 字节能写进 65 次（65000 字节），Linux 是 64 次；一页的管道装着数据时仍报 POLLOUT；POLLOUT 的条件是“剩余至少 4096 字节”。Linux 的 `anon_pipe_write` 把写长度对页取余的部分并入最后一个缓冲（管道非空、放得下、可合并时），其余每页占一个新的 `pipe_buffer`；缓冲（默认 16 个）用完就满，不管各缓冲里有多少空间；`pipe_read` 读空一个缓冲才释放它；`pipe_poll` 的 POLLOUT 是“还有空缓冲”；`pipe_resize_ring` 在占用的缓冲数大于新槽数时返回 EBUSY；splice 从另一个管道搬来的缓冲不能再合并。
 - 宿主机实测（`user/hello470.c -DHOST`）：见 user-space.md 中 hello470 一行。
-- 修复：新增 `fs/pipe_slot_policy.zig`（`Slots` 记每个缓冲在页内的结束位置；`plan` 算出一次写的合并字节、新页数和最后一页的字节数；`clip` 把计划截到当前这一段；`transfer` 是管道之间的 splice，每段占目的管道一个不可合并的缓冲；带 host 单元测试）；`PipeBuffer.slots`；`pipeWritable` 改为“有空缓冲”；`pipeWriteInner` 按计划写入，合并只在一次 write 的开头；读、splice 读提交时 `consume`；`pipeTransfer`、`pipeTransferWait`、`pipeWaitWritable` 按缓冲判断满；`pipeSetSize` 检查缓冲数。write() 把用户缓冲按 4 KiB 分段交给文件表，管道的计划要按整次 write 算，所以新增 `vfs.pipeWritePart`（带整次长度和已写字节），`file_io.write` 对管道写端调用它。
-- 第一次快速 smoke：F 项（15 整页加 100 字节后写 8000 字节）得到 EAGAIN：write() 把 8000 字节分成 4096 和 3904 两段交给管道，第一段按自己的长度算余数为 0，不合并，又没有空缓冲；据此加了 `pipeWritePart`。
+- 修复：新增 `fs/pipe_slot_policy.zig`（`Slots` 记每个缓冲在页内的结束位置；`WriteState`/`step` 记一次写（write 或整个 writev）的进度：先把总长度对页取余的部分并入最后一个缓冲，再取新页、每页填满再取下一页（`pushes` 计数保证只续写自己取的那一页）；`transfer` 是管道之间的 splice，每段占目的管道一个不可合并的缓冲；带 host 单元测试）；`PipeBuffer.slots`；`pipeWritable` 改为“有空缓冲”；`pipeWriteInner` 按计划写入，合并只在一次 write 的开头；读、splice 读提交时 `consume`；`pipeTransfer`、`pipeTransferWait`、`pipeWaitWritable` 按缓冲判断满；`pipeSetSize` 检查缓冲数。write() 把用户缓冲按 4 KiB 分段交给文件表，管道的计划要按整次 write 算，所以新增 `vfs.pipeWritePart`（调用方持有的 `WriteState`），`file_io.write` 和 `readv.writev`（先算出所有 iovec 的总长）对管道写端调用它。
+- 第一次快速 smoke：F 项（15 整页加 100 字节后写 8000 字节）得到 EAGAIN：write() 把 8000 字节分成 4096 和 3904 两段交给管道，第一段按自己的长度算余数为 0，不合并，又没有空缓冲；据此加了 `pipeWritePart`。第二次快速 smoke 中新加的 H 项（writev 三段 100 字节之后还能写 15 整页）得到 13：按段截断的计划让每段各取一个新页；改为 `step` 续写自己取的页。
 - host 测试：新增 hello470 测试和策略单元测试；hello229 原子写、hello448 C/D、hello351/O_APPEND 写锁的源码断言随新写法更新。
-- 已知差异：writev 写管道时每个 iovec 段各算一次写（Linux 把整个 writev 当一次写）；一次写超过 4096 字节时 PIPE_BUF 原子性不受影响（Linux 也不保证）。
+- 已知差异：没有。writev 也按一次写计算（hello470 H）。

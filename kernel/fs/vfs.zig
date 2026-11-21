@@ -736,14 +736,15 @@ pub fn pipeWaitWritable(pipe_idx: u32, nonblocking: bool) i64 {
 /// Write to a pipe; every write that reaches the buffer tells the O_ASYNC read ends (Linux pipe_write: kill_fasync POLL_IN on the
 /// way out and before each wait for room).
 pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u32) i64 {
-    return pipeWritePart(pipe_idx, buf, count, status_flags, .{});
+    var part: PipeWritePart = .{ .total = count };
+    return pipeWritePart(pipe_idx, buf, count, status_flags, &part);
 }
 
-/// Where a piece handed to pipeWrite sits in the write() it belongs to: write() copies the user buffer in 4 KiB pieces, but the
-/// pipe's buffer accounting (anon_pipe_write) is per call: the remainder of the whole length merges, and only at its start.
-pub const PipeWritePart = struct { total: usize = 0, done: usize = 0 };
+/// One write() as the pipe's buffer accounting sees it (pipe_slot_policy.WriteState): write() and writev() copy the user buffer in
+/// 4 KiB pieces, but anon_pipe_write handles the whole call at once, so the caller keeps this across its pieces.
+pub const PipeWritePart = @import("pipe_slot_policy.zig").WriteState;
 
-pub fn pipeWritePart(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u32, part: PipeWritePart) i64 {
+pub fn pipeWritePart(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u32, part: *PipeWritePart) i64 {
     if (pipe_idx >= MAX_PIPES) return -1;
     if (count == 0) return 0;
     const r = pipeWriteInner(pipe_idx, buf, count, status_flags, part);
@@ -751,14 +752,12 @@ pub fn pipeWritePart(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags
     return r;
 }
 
-fn pipeWriteInner(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u32, part: PipeWritePart) i64 {
+fn pipeWriteInner(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u32, part: *PipeWritePart) i64 {
     const sched = @import("../proc/sched.zig");
     const task_mod = @import("../proc/task.zig");
     const sig_mod = @import("../proc/signal.zig");
     const nonblocking = (status_flags & @as(u32, 0x800)) != 0;
     var n: usize = 0;
-    // anon_pipe_write merges the write's remainder into the last buffer only at its start, before any wait.
-    var first_try = true;
     while (true) {
         const flags = pipe_lock.acquire();
         const pipe = &pipes[pipe_idx];
@@ -773,18 +772,10 @@ fn pipeWriteInner(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u
             return if (n > 0) @intCast(n) else -32; // EPIPE
         }
         const before = n;
-        // The bytes go in a buffer at a time (pipe_slot_policy.plan): the remainder merged into the last one, then a fresh page
-        // each. A write of at most PIPE_BUF bytes needs one buffer, so it goes in whole or waits (POSIX PIPE_BUF atomicity).
-        const sp = @import("pipe_slot_policy.zig");
-        // The plan is for the whole write() this piece belongs to, cut to the piece.
-        const total = if (part.total != 0) part.total else count;
-        var pl = sp.plan(&pipe.slots, pipeSlots(pipe), total, part.done + n, first_try and part.done == 0);
-        first_try = false;
-        pl = sp.clip(pl, count - n);
-        const take: usize = pl.merge + if (pl.pages == 0) 0 else (pl.pages - 1) * sp.PAGE + pl.tail;
-        if (pl.merge != 0) pipe.slots.merge(pl.merge);
-        var pg: usize = 0;
-        while (pg < pl.pages) : (pg += 1) pipe.slots.push(if (pg + 1 == pl.pages) pl.tail else sp.PAGE);
+        // The bytes go in a buffer at a time (pipe_slot_policy.step): the write's remainder merged into the last buffer, then
+        // fresh pages filled whole. A write of at most PIPE_BUF bytes needs one buffer, so it goes in whole or waits (POSIX PIPE_BUF
+        // atomicity).
+        const take = @import("pipe_slot_policy.zig").step(&pipe.slots, pipeSlots(pipe), part, count - n);
         const stop = n + take;
         while (n < stop) {
             ring(pipe)[(pipe.head + pipe.len) % pipe.cap] = buf[n];

@@ -7,7 +7,9 @@
  *   D. a one-page pipe (F_SETPIPE_SZ 4096): a 1000-byte write, then POLLOUT 0; a 3096-byte write still merges; one more byte EAGAIN;
  *   E. 15 whole pages, then 4000 bytes: a 200-byte write does not fit behind them (EAGAIN), a 96-byte one does;
  *   F. 15 whole pages, 100 bytes, then 8000: 3904 go in (the 8000's remainder 3904 merges; no buffer is left for the rest);
- *   G. three 2000-byte writes take two buffers: shrinking to one page is EBUSY, to two pages works. */
+ *   G. three 2000-byte writes take two buffers: shrinking to one page is EBUSY, to two pages works;
+ *   H. writev is one write: 15 pages and 100 bytes, then writev of 4000 + 4000 writes 3904 (the 8000's remainder merges); after 100
+ *      bytes, writev of three 100-byte pieces merges them all, and 15 whole pages still fit. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -38,8 +40,11 @@ static long pollout(int fd) { struct { int fd; short ev, rev; } p = { fd, 4, 0 }
 #define F_GETPIPE_SZ 1032
 #ifdef HOST
 static void close2(int *p) { close(p[0]); close(p[1]); }
+#include <sys/uio.h>
+static long wrv(int fd, const void *iov, int n) { return rc(writev(fd, iov, n)); }
 #else
 static void close2(int *p) { syscall1(SYS_close, p[0]); syscall1(SYS_close, p[1]); }
+static long wrv(int fd, const void *iov, int n) { return syscall3(139, fd, (long)iov, n); }
 #endif
 static int failures;
 static char msg[500];
@@ -97,6 +102,22 @@ int main(void) {
     long g1 = fcntl_(p[1], F_SETPIPE_SZ, 4096), g2 = fcntl_(p[1], F_SETPIPE_SZ, 8192);
     snprintf(msg, sizeof msg, "G: three 2000-byte writes (two pages), shrink to 4096 %ld, to 8192 %ld (-16 8192)", g1, g2);
     check(g1 == -16 && g2 == 8192, msg);
+
+    close2(p);
+    pipe_nb(p);
+    for (int i = 0; i < 15; i++) wr(p[1], b, 4096);
+    wr(p[1], b, 100);
+    long v2[4] = { (long)b, 4000, (long)b, 4000 };
+    long h1 = wrv(p[1], v2, 2);
+    close2(p);
+    pipe_nb(p);
+    wr(p[1], b, 100);
+    long v3[6] = { (long)b, 100, (long)b, 100, (long)b, 100 };
+    long h2 = wrv(p[1], v3, 3);
+    int pages = 0;
+    while (wr(p[1], b, 4096) == 4096) pages++;
+    snprintf(msg, sizeof msg, "H: writev 4000+4000 after 15 pages and 100 bytes %ld; writev 3x100 after 100 bytes %ld, then whole pages %d (3904 300 15)", h1, h2, pages);
+    check(h1 == 3904 && h2 == 300 && pages == 15, msg);
 
     print(failures ? "hello470: FAIL\n" : "hello470: PASS\n");
     return failures ? 1 : 0;
