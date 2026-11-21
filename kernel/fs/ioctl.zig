@@ -261,8 +261,13 @@ pub fn sysIoctl(fd: u64, cmd: u64, arg: u64) i64 {
             return 0;
         },
         TIOCGPGRP => {
-            if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;
             const jc = @import("../proc/jobctl.zig");
+            // Linux tiocgpgrp: only on the caller's controlling terminal (an unclaimed console is claimed, as TIOCSPGRP does);
+            // a session that does not own it (setsid without opening the terminal again) gets ENOTTY.
+            if (jc.ctty_owner_sid == 0) jc.ctty_owner_sid = cur0.sid;
+            const gp = ip.tiocgpgrpErrno(cur0.sid == jc.ctty_owner_sid);
+            if (gp != 0) return gp;
+            if (arg == 0 or arg >= 0x0000_8000_0000_0000) return -14;
             var pgid: u16 = jc.foreground_pgid;
             if (pgid == 0) {
                 // If no fg group set, use current process's pgid

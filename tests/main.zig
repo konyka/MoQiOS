@@ -17895,3 +17895,9 @@ test "IPv6 raw sends check their flow label like rawv6_sendmsg; ping sends do no
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "@import(\"flowlabel_mgr.zig\").checkSend(.{ .kind = .raw, .key = d.raw_idx }"));
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (addr_flow != 0) ip6.flow_ov6 = addr_flow;") != null);
 }
+
+test "TIOCGPGRP answers only in the session that owns the console (hello485)" {
+    // Linux tiocgpgrp: current->signal->tty != real_tty is ENOTTY.
+    try std.testing.expectEqual(@as(i64, -25), kt.ioctl_policy.tiocgpgrpErrno(false));
+    try std.testing.expect(std.mem.indexOf(u8, kt.ioctl_source, "const gp = ip.tiocgpgrpErrno(cur0.sid == jc.ctty_owner_sid);") != null);
+}

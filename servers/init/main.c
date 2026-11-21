@@ -601,6 +601,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello482"); /* pipe-user-pages-soft/hard */
     run_test("hello483"); /* AF_UNIX per-record receive timestamps */
     run_test("hello484"); /* IPV6_FLOWLABEL_MGR */
+    run_test("hello485"); /* TIOCGPGRP only on the controlling terminal */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

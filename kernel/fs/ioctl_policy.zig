@@ -71,6 +71,16 @@ pub fn terminalCheck(cmd: u64, target: Target) i64 {
 
 /// TIOCSTI (Linux tiocsti, with LEGACY_TIOCSTI as upstream defaults): only on the caller's controlling terminal, unless it holds
 /// CAP_SYS_ADMIN; anyone else gets EPERM (-1).
+/// tiocgpgrp: the foreground process group is only reported on the caller's controlling terminal (ENOTTY otherwise).
+pub fn tiocgpgrpErrno(is_ctty: bool) i64 {
+    return if (is_ctty) 0 else -25;
+}
+
+test "TIOCGPGRP outside the controlling terminal's session is ENOTTY" {
+    try @import("std").testing.expectEqual(@as(i64, 0), tiocgpgrpErrno(true));
+    try @import("std").testing.expectEqual(@as(i64, -25), tiocgpgrpErrno(false));
+}
+
 pub fn tiocstiPermission(is_ctty: bool, cap_sys_admin: bool) i64 {
     return if (is_ctty or cap_sys_admin) 0 else -1;
 }

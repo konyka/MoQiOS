@@ -824,6 +824,7 @@ const SchedStats = struct {
 - **单一终端模型**：一个全局控制终端（ctty），`ctty_owner_sid` 由首个 TIOCSPGRP 调用者
   认领，`foreground_pgid` 记录前台进程组；fd0 的 read 前经 `jobctl.stdinJobCheck` 做前后台
   判定。v1 无 `/dev/tty` 文件节点、无 TOSTOP（后台写不拦）。
+- **TIOCGPGRP 只对控制终端回答（hello485）**：调用者的会话不是 `ctty_owner_sid` 时返回 ENOTTY（Linux `tiocgpgrp`），未认领的控制台先由调用者认领。
 - **后台读 SIGTTIN**：后台组读 fd0 → 给全组发 SIGTTIN：已装 handler 的成员走 pending
   投递 + read 返回 -EINTR；默认动作的成员 `stopTask` 置 `Task.stopped` 并内核内等待，
   直到 TIOCSPGRP 把它所在组切为前台 + SIGCONT 解除停止，再进入真正的键盘读。
