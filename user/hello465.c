@@ -51,6 +51,7 @@ static void check(int ok, const char *w) {
 static long rcv;
 static unsigned char ro[40];
 static long ro_len;
+static int rflags = 0x40;
 /* The next datagram on the receiver and its IP_RECVOPTS payload (ro_len: cmsg_len, -1 when absent). */
 static long next(void) {
     nap();
@@ -63,7 +64,7 @@ static long next(void) {
     long ip = (long)iov, one = 1, cp = (long)ctl, cl = sizeof ctl;
     memcpy(mh + 16, &ip, 8); memcpy(mh + 24, &one, 8); memcpy(mh + 32, &cp, 8); memcpy(mh + 40, &cl, 8);
     ro_len = -1;
-    long r = recvmsg_(rcv, mh, 0x40);
+    long r = recvmsg_(rcv, mh, rflags);
     if (r < 0) return r;
     long used;
     memcpy(&used, mh + 40, 8);
@@ -144,6 +145,18 @@ int main(void) {
     long d3 = send_retopts(u, rbad, 4);
     snprintf(msg, sizeof msg, "D: IP_RETOPTS record route: send %ld received %ld options %ld right %d; malformed %ld (1 1 24 1 -22)", d1, d2, ro_len, d_ok, d3);
     check(d1 == 1 && d2 == 1 && d_ok && d3 == -22, msg);
+
+    static const unsigned char rr_ra[16] = { 7, 7, 4, 0, 0, 0, 0, 0x94, 4, 0, 0, 1, 1, 1, 0, 0 };
+    static const unsigned char rr_ra_got[16] = { 7, 7, 8, 127, 0, 0, 1, 0x94, 4, 0, 0, 1, 1, 1, 0, 0 };
+    static char bulk[3000];
+    memset(bulk, 'b', sizeof bulk);
+    long e1 = setopt_(u, 0, 4, rr_ra, 15);
+    long e2 = sendto_(u, bulk, sizeof bulk, a, 16);
+    rflags = 0x40 | 0x20;
+    long e3 = next();
+    rflags = 0x40;
+    snprintf(msg, sizeof msg, "E: record route + router alert over the MTU: set %ld send %ld received %ld IP_RECVOPTS %ld right %d (0 3000 3000 32 1)", e1, e2, e3, ro_len, eq(ro, rr_ra_got, 16));
+    check(e1 == 0 && e2 == 3000 && e3 == 3000 && ro_len == 32 && eq(ro, rr_ra_got, 16), msg);
 
     print(failures ? "hello465: FAIL\n" : "hello465: PASS\n");
     return failures ? 1 : 0;

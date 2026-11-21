@@ -322,6 +322,33 @@ pub fn build(so: SendOpts, src: [4]u8, daddr: [4]u8, ms_since_midnight: u32, out
     }
 }
 
+/// ip_options_fragment: the options of every fragment after the first, from the first's built `opts` (`len` bytes): an option whose
+/// copied bit (0x80) is clear becomes NOPs; END stops the walk.
+pub fn fragmentOpts(opts: []u8) void {
+    var i: usize = 0;
+    while (i < opts.len) {
+        switch (opts[i]) {
+            IPOPT_END => return,
+            IPOPT_NOOP => {
+                i += 1;
+                continue;
+            },
+            else => {},
+        }
+        if (i + 1 >= opts.len) return;
+        const optlen: usize = opts[i + 1];
+        if (optlen < 2 or optlen > opts.len - i) return;
+        if (opts[i] & 0x80 == 0) @memset(opts[i..][0..optlen], IPOPT_NOOP);
+        i += optlen;
+    }
+}
+
+test "later fragments keep only the copied options (router alert), the rest become NOPs" {
+    var o = [_]u8{ 7, 7, 8, 127, 0, 0, 1, 0x94, 4, 0, 0, 1, 1, 1, 0, 0 };
+    fragmentOpts(&o);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 1, 1, 1, 1, 1, 1, 0x94, 4, 0, 0, 1, 1, 1, 0, 0 }, &o);
+}
+
 /// getsockopt(IP_OPTIONS): the options as the user gave them back (a source route's first hop restored, ip_options_undo).
 pub fn userView(so: SendOpts, out: *[40]u8) usize {
     out.* = so.data;

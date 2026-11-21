@@ -1581,9 +1581,10 @@ pub fn sendToFromOv(bound: [4]u8, dst_ip_in: [4]u8, dst_port: u16, src_key: u32,
     // already refused it under IP_PMTUDISC_DO / PROBE.
     const mtu = ipv4.getSendMtu(dst_ip);
     if (ipv4.HEADER_LEN + optlen + @as(u32, udp_total) > mtu) {
-        // Fragmenting a datagram that carries IP options is not done here (ip_fragment would copy the copied options to each piece).
-        if (optlen != 0) return false;
-        return sendFragmented4(our_ip, dst_ip, dst_port, src_key, data[0..data_len], opts4, ttl_ov, group, mtu, dst_mac, our_mac, via_lo, wait_hop);
+        // ip_fragment: every piece carries the header with its options; the first all of them, the rest only the copied ones.
+        var built: [40]u8 = @splat(0);
+        if (ipopts) |so| iop.build(so, our_ip, dst_ip_in, iop.msSinceMidnight(@import("../proc/time_syscall.zig").wallClockNanos()), &built);
+        return sendFragmented4(our_ip, dst_ip, dst_port, src_key, data[0..data_len], opts4, ttl_ov, group, mtu, dst_mac, our_mac, via_lo, wait_hop, built[0..optlen]);
     }
 
     // Stack-local frame buffer: concurrent sends on other CPUs must not tear it.
@@ -1720,7 +1721,7 @@ pub fn autoFlowLabel(src: [16]u8, dst: [16]u8, sport: u16, dport: u16, proto: u8
 /// cut into pieces of ip_frag_policy.pieceLen bytes, each behind its own IPv4 header with the datagram's id, MF on all but the last,
 /// the offset in 8-byte units, DF clear. Each piece is sent as sendToFromOv sends a frame. The whole datagram is staged in a kmalloc
 /// buffer (up to 65515 bytes), not on the kernel stack.
-fn sendFragmented4(our_ip: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, payload: []const u8, opts4: ip_opt_policy.IpOpts, ttl_ov: ?u8, group: bool, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, via_lo: bool, wait_hop: ?[4]u8) bool {
+fn sendFragmented4(our_ip: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, payload: []const u8, opts4: ip_opt_policy.IpOpts, ttl_ov: ?u8, group: bool, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, via_lo: bool, wait_hop: ?[4]u8, ipopts_in: []const u8) bool {
     const frag = @import("ip_frag_policy.zig");
     const slab = @import("../mm/slab.zig");
     const total: usize = 8 + payload.len;
@@ -1737,24 +1738,34 @@ fn sendFragmented4(our_ip: [4]u8, dst_ip: [4]u8, dst_port: u16, src_key: u32, pa
     if (c == 0) c = 0xffff;
     bo.writeU16BeAt(whole, 6, c);
     const id = takePortIpid(src_key, dst_ip, our_ip, opts4.pmtudisc);
-    const piece = frag.pieceLen(mtu, ipv4.HEADER_LEN);
+    const ol: u16 = @intCast(ipopts_in.len);
+    var ipopts: [40]u8 = @splat(0);
+    @memcpy(ipopts[0..ol], ipopts_in);
+    const hl: u16 = ipv4.HEADER_LEN + ol;
+    const piece = frag.pieceLen(mtu, hl);
     var off: usize = 0;
     var all_ok = true;
     while (off < total) {
         const n: usize = @min(piece, total - off);
         const last = off + n == total;
         var pkt: [1518]u8 = @splat(0);
-        ipv4.buildHeader(pkt[14..].ptr, our_ip, dst_ip, ipv4.PROTO_UDP, @intCast(n));
+        ipv4.buildHeader(pkt[14..].ptr, our_ip, dst_ip, ipv4.PROTO_UDP, @intCast(n + ol));
         ipv4.setIdent(pkt[14..].ptr, id, false);
         if (ip_opt_policy.ipv4NeedsPatch(opts4)) ip_opt_policy.patchIpv4(pkt[14..][0..20], opts4, ipv4.checksum);
         if (group) ip_opt_policy.setTtl4(pkt[14..][0..20], ttl_ov orelse opts4.mc4_ttl, ipv4.checksum);
         const fo: u16 = @as(u16, @intCast(off / 8)) | (if (last) @as(u16, 0) else frag.MF);
         bo.writeU16BeAt(pkt[14..].ptr, 6, fo | (bo.readU16BeAt(pkt[14..].ptr, 6) & frag.DF));
+        if (ol != 0) {
+            @memcpy(pkt[34..][0..ol], ipopts[0..ol]);
+            pkt[14] = 0x40 | @as(u8, @intCast(hl / 4));
+            // ip_options_fragment: after the first piece only the copied options remain.
+            if (off == 0) @import("ip_options_policy.zig").fragmentOpts(ipopts[0..ol]);
+        }
         pkt[24] = 0;
         pkt[25] = 0;
-        bo.writeU16BeAt(pkt[14..].ptr, 10, ipv4.checksum(pkt[14..].ptr, 20));
-        @memcpy(pkt[34..][0..n], whole[off..][0..n]);
-        const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, @intCast(20 + n));
+        bo.writeU16BeAt(pkt[14..].ptr, 10, ipv4.checksum(pkt[14..].ptr, hl));
+        @memcpy(pkt[14 + hl ..][0..n], whole[off..][0..n]);
+        const frame_len = eth.buildFrame(&pkt, dst_mac, our_mac, eth.ETHERTYPE_IPV4, @intCast(hl + n));
         if (wait_hop) |hop| {
             arp.queueFrame(hop, &pkt, frame_len);
         } else {

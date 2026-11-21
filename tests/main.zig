@@ -17155,8 +17155,8 @@ test "IPv4 reassembly is wired in: fragments go to ip_frag, big datagrams to a U
 test "IPv4 UDP datagrams over the MTU leave in fragments (hello452)" {
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "fn sendFragmented4(") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "return sendFragmented4(our_ip, dst_ip, dst_port, src_key, data[0..data_len], opts4, ttl_ov, group, mtu, dst_mac, our_mac, via_lo, wait_hop);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, us, "const piece = frag.pieceLen(mtu, ipv4.HEADER_LEN);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "return sendFragmented4(our_ip, dst_ip, dst_port, src_key, data[0..data_len], opts4, ttl_ov, group, mtu, dst_mac, our_mac, via_lo, wait_hop, built[0..optlen]);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "const piece = frag.pieceLen(mtu, hl);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "const big = bigStage(len) orelse return -105;") != null);
 }
 
