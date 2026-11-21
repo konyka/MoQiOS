@@ -86,6 +86,7 @@ pub const vm_lock_policy = @import("mm/vm_lock_policy.zig");
 pub const lifecycle_policy = @import("mm/lifecycle_policy.zig");
 pub const clone_flags_policy = @import("mm/clone_flags_policy.zig");
 pub const pidfd_policy = @import("proc/pidfd_policy.zig");
+pub const pipe_slot_policy = @import("fs/pipe_slot_policy.zig");
 pub const pidfd_signal_policy = @import("proc/pidfd_signal_policy.zig");
 pub const task_slot_lifetime = @import("proc/task_slot_lifetime.zig");
 pub const nvme_flush_policy = @import("drivers/nvme_flush_policy.zig");
@@ -377,6 +378,7 @@ pub const copy_file_range_source = @embedFile("fs/copy_file_range.zig");
 // arch/x86_64/clone.zig and mm/process_vm.zig.
 test {
     _ = @import("net/tcp_urg_policy.zig");
+    _ = @import("fs/pipe_slot_policy.zig");
     _ = @import("drivers/random_seed_policy.zig");
     _ = @import("net/flowlabel_policy.zig");
     _ = @import("net/ip_options_policy.zig");

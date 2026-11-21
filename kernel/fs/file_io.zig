@@ -64,7 +64,11 @@ pub fn write(fd: u64, buf: u64, count: u64) i64 {
                 var kbuf: [4096]u8 = undefined;
                 const copied = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(buf + pos), chunk);
                 if (copied == 0) break;
-                const result = cur.fd_table.writeHeld(fdIndex(fd), &kbuf, copied, held);
+                // A pipe accounts for the whole write() at once (vfs.pipeWritePart), not for each 4 KiB piece.
+                const result = if (fdIndex(fd) < vfs_mod.MAX_FDS and cur.fd_table.fds[fdIndex(fd)].fd_type == .pipe_write and cur.fd_table.fds[fdIndex(fd)].writable)
+                    vfs_mod.pipeWritePart(cur.fd_table.fds[fdIndex(fd)].pipe_idx, &kbuf, copied, cur.fd_table.fds[fdIndex(fd)].status_flags, .{ .total = n, .done = pos })
+                else
+                    cur.fd_table.writeHeld(fdIndex(fd), &kbuf, copied, held);
                 // Propagate a first-chunk error (e.g. -28 ENOSPC from the
                 // writeback cache) instead of reporting a 0-byte write that
                 // callers would retry forever — mirrors pwrite below.

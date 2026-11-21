@@ -728,9 +728,14 @@ test "tcp close: a non-zero linger with nothing unread is a FIN, with unread dat
 
 test "a pipe write that fits an empty pipe is written whole or not at all" {
     const source = kt.vfs_source;
-    // The ring now fills to its capacity, so a write of exactly PIPE_BUF (4096) bytes is atomic, as POSIX and Linux have it.
-    try std.testing.expect(std.mem.indexOf(u8, source, "const atomic = count <= PIPE_BUF_SIZE;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "if (!atomic or room >= count) {") != null);
+    // The pipe fills a buffer slot at a time (pipe_slot_policy, hello470): a write of at most PIPE_BUF (4096) bytes needs one slot
+    // and goes in whole or waits, as POSIX and Linux have it.
+    try std.testing.expect(std.mem.indexOf(u8, source, "var pl = sp.plan(&pipe.slots, pipeSlots(pipe), total, part.done + n, first_try and part.done == 0);") != null);
+    const sp = kt.pipe_slot_policy;
+    var e: sp.Slots = .{};
+    e.push(4000);
+    const p0 = sp.plan(&e, 1, 4096, 0, true);
+    try std.testing.expectEqual(@as(usize, 0), p0.merge + p0.pages);
 }
 
 test "a blocking pipe write waits on the writers' queue and readers wake it" {
@@ -5355,7 +5360,7 @@ test "getdents64 holds the shared description's offset lock across the directory
 test "read, write, readv and writev hold the shared description's offset lock across the whole call, not each 4 KiB piece (hello351)" {
     const f = kt.file_io_source;
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, f, "vfs_mod.lockOffset(&cur.fd_table.fds["));
-    try std.testing.expect(std.mem.indexOf(u8, f, "const result = cur.fd_table.writeHeld(fdIndex(fd), &kbuf, copied, held);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f, "                    cur.fd_table.writeHeld(fdIndex(fd), &kbuf, copied, held);") != null);
     try std.testing.expect(std.mem.indexOf(u8, f, "const result = cur.fd_table.readHeld(fd, &kbuf, chunk, held);") != null);
     try std.testing.expect(std.mem.indexOf(u8, f, "const r = cur.fd_table.readHeld(fd, &tmp, 1, held);") != null);
     const rv = kt.readv_source;
@@ -13128,7 +13133,7 @@ test "write() and writev() on an O_APPEND file hold one lock across all their pi
     const w = kt.file_io_source;
     const wl = std.mem.indexOf(u8, w, "if (append_call) cur.fd_table.lockAppendCall(fdIndex(fd));") orelse return error.TestUnexpectedResult;
     const wo = std.mem.indexOf(u8, w, "vfs_mod.lockOffset(&cur.fd_table.fds[fdIndex(fd)])") orelse return error.TestUnexpectedResult;
-    const wp = std.mem.indexOf(u8, w, "const result = cur.fd_table.writeHeld(fdIndex(fd), &kbuf, copied, held);") orelse return error.TestUnexpectedResult;
+    const wp = std.mem.indexOf(u8, w, "                    cur.fd_table.writeHeld(fdIndex(fd), &kbuf, copied, held);") orelse return error.TestUnexpectedResult;
     try std.testing.expect(wl < wo and wo < wp);
     const r = kt.readv_source;
     const rs = std.mem.indexOf(u8, r, "pub fn writev(") orelse return error.TestUnexpectedResult;
@@ -17283,8 +17288,17 @@ test "a pipe holds its whole capacity: 65536 bytes in a 16-page pipe, 4096 in on
     try std.testing.expect(std.mem.indexOf(u8, v, "    len: u32 = 0,") != null);
     try std.testing.expect(std.mem.indexOf(u8, v, "cap - 1") == null);
     try std.testing.expect(std.mem.indexOf(u8, kt.splice_source, "state.capacity - 1") == null);
-    try std.testing.expect(std.mem.indexOf(u8, v, "while (n < count and pipe.len < pipe.cap) {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, v, "if (pipe.ref_count == 0 or used > size or pipe.read_reservation != 0) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v, "if (pipe.ref_count == 0 or used > size or pipe.slots.count > size / PIPE_BUF_SIZE or pipe.read_reservation != 0) {") != null);
+    // 16 whole-page writes fill a 16-page pipe (65536 bytes); one page takes 4096.
+    const sp = kt.pipe_slot_policy;
+    var s16: sp.Slots = .{};
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        const pl = sp.plan(&s16, 16, 4096, 0, true);
+        try std.testing.expectEqual(@as(usize, 1), pl.pages);
+        s16.push(pl.tail);
+    }
+    try std.testing.expect(s16.full(16));
 }
 
 test "a recvmmsg batch that fails part-way keeps its count and leaves the error pending (do_recvmmsg sk_err; hello458)" {
@@ -17641,4 +17655,21 @@ test "pidfd_getfd does not race the target's exec (exec_update_lock as a sequenc
     try std.testing.expect(begin < end and end < close);
     const se = kt.syscall_entry_source;
     try std.testing.expect(std.mem.indexOf(u8, se, "switch (pp.execRead(seq0, @atomicLoad(u32, &target.exec_update_seq, .acquire))) {") != null);
+}
+
+test "a pipe counts page-sized buffers like Linux: 64 writes of 1000 bytes fill 16 pages, POLLOUT needs a free buffer (hello470)" {
+    const v = kt.vfs_source;
+    try std.testing.expect(std.mem.indexOf(u8, v, "    return !pipe.slots.full(pipeSlots(pipe));") != null);
+    try std.testing.expect(std.mem.count(u8, v, "pipe.slots.consume(n);") == 2);
+    try std.testing.expect(std.mem.indexOf(u8, v, "@import(\"pipe_slot_policy.zig\").transfer(&src.slots, &dst.slots, pipeSlots(dst), count)") != null);
+    const sp = kt.pipe_slot_policy;
+    var s: sp.Slots = .{};
+    var n: usize = 0;
+    while (true) {
+        const pl = sp.plan(&s, 16, 1000, 0, true);
+        if (pl.merge == 0 and pl.pages == 0) break;
+        if (pl.merge != 0) s.merge(pl.merge) else s.push(pl.tail);
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 64), n);
 }

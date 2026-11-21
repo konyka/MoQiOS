@@ -103,6 +103,8 @@ pub const PipeBuffer = struct {
     read_reservation: u32 = 0,
     /// Changes whenever this slot is allocated for a new pipe.
     generation: u32 = 0,
+    /// The page-sized buffers the queued bytes count as (Linux pipe_buffer slots, cap / 4096 of them): what makes the pipe full.
+    slots: @import("pipe_slot_policy.zig").Slots = .{},
 };
 
 /// The bytes of `pipe`'s ring (its first page, or the buffer F_SETPIPE_SZ gave it).
@@ -110,11 +112,14 @@ fn ring(pipe: *PipeBuffer) [*]u8 {
     return if (pipe.ext) |e| e else &pipe.buf;
 }
 
-/// POLLOUT (Linux pipe_poll: a free buffer slot, i.e. a page): at least PIPE_BUF bytes of room, or any room in a one-page pipe (which
-/// never has a whole free page while it holds anything).
+/// POLLOUT (Linux pipe_poll: !pipe_full): a buffer slot is free, however much room the taken ones have left.
 fn pipeWritable(pipe: *const PipeBuffer) bool {
-    const room = pipe.cap - pipeUsed(pipe);
-    return if (pipe.cap > PIPE_BUF_SIZE) room >= PIPE_BUF_SIZE else room > 0;
+    return !pipe.slots.full(pipeSlots(pipe));
+}
+
+/// How many page-sized buffers `pipe` has (pipe->max_usage).
+fn pipeSlots(pipe: *const PipeBuffer) usize {
+    return pipe.cap / PIPE_BUF_SIZE;
 }
 
 /// Bytes queued in `pipe`.
@@ -146,7 +151,8 @@ pub fn pipeSetSize(pipe_idx: u32, size: u32) i64 {
     const flags = pipe_lock.acquire();
     const pipe = &pipes[pipe_idx];
     const used = pipeUsed(pipe);
-    if (pipe.ref_count == 0 or used > size or pipe.read_reservation != 0) {
+    // pipe_resize_ring: the buffers in use must fit the new number of slots (EBUSY), not just their bytes.
+    if (pipe.ref_count == 0 or used > size or pipe.slots.count > size / PIPE_BUF_SIZE or pipe.read_reservation != 0) {
         pipe_lock.release(flags);
         if (fresh) |f| pmm.freeContiguous(hhdm.virtToPhys(@intFromPtr(f)), pages);
         return if (pipe.ref_count == 0) -9 else -16; // EBUSY
@@ -402,6 +408,7 @@ fn pipeReadInner(pipe_idx: u32, buf: [*]u8, count: usize, status_flags: u32) i64
             pipe.len -= 1;
             n += 1;
         }
+        pipe.slots.consume(n);
         if (n > 0) sched.wakeAll(&pipe_write_waiters[pipe_idx]);
         pipe_lock.release(flags);
         if (n > 0) {
@@ -527,6 +534,7 @@ pub fn pipeCommitRead(token: PipeReadToken, count: usize) i64 {
     const n: u32 = @intCast(@min(count, @as(usize, pipe.read_reservation)));
     pipe.head = (pipe.head + n) % pipe.cap;
     pipe.len -= n;
+    pipe.slots.consume(n);
     pipe.read_reservation -= n;
     if (n > 0) @import("../proc/sched.zig").wakeAll(&pipe_write_waiters[token.pipe_idx]);
     pipe_lock.release(flags);
@@ -576,10 +584,8 @@ pub fn pipeTransfer(src_idx: u32, dst_idx: u32, count: usize) i64 {
         pipe_lock.release(flags);
         return 0;
     }
-    const readable: u32 = pipeUsed(src);
-    const dst_readable: u32 = pipeUsed(dst);
-    const writable = dst.cap - dst_readable;
-    const n: u32 = @intCast(@min(count, @as(usize, @min(readable, writable))));
+    // splice_pipe_to_pipe: whole source buffers (or the front of one) each take a destination slot of their own.
+    const n: u32 = @intCast(@import("pipe_slot_policy.zig").transfer(&src.slots, &dst.slots, pipeSlots(dst), count));
     var i: u32 = 0;
     const dst_tail = (dst.head + dst.len) % dst.cap;
     while (i < n) : (i += 1) ring(dst)[(dst_tail + i) % dst.cap] = ring(src)[(src.head + i) % src.cap];
@@ -633,9 +639,7 @@ pub fn pipeTransferWait(src_idx: u32, dst_idx: u32, count: usize, nonblocking: b
             pipe_lock.release(flags);
             return 0;
         }
-        const dst_readable: u32 = pipeUsed(dst);
-        const writable = dst.cap - dst_readable;
-        if (readable > 0 and writable > 0) {
+        if (readable > 0 and !dst.slots.full(pipeSlots(dst))) {
             pipe_lock.release(flags);
             const moved = pipeTransfer(src_idx, dst_idx, count);
             // Another reader or writer may have emptied the source or filled the destination in between: wait again.
@@ -692,8 +696,7 @@ pub fn pipeWaitWritable(pipe_idx: u32, nonblocking: bool) i64 {
             pipe_lock.release(flags);
             return -1;
         }
-        const used: u32 = pipeUsed(pipe);
-        if (pipe.read_refs == 0 or used < pipe.cap) {
+        if (pipe.read_refs == 0 or !pipe.slots.full(pipeSlots(pipe))) {
             pipe_lock.release(flags);
             return 0;
         }
@@ -733,19 +736,29 @@ pub fn pipeWaitWritable(pipe_idx: u32, nonblocking: bool) i64 {
 /// Write to a pipe; every write that reaches the buffer tells the O_ASYNC read ends (Linux pipe_write: kill_fasync POLL_IN on the
 /// way out and before each wait for room).
 pub fn pipeWrite(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u32) i64 {
+    return pipeWritePart(pipe_idx, buf, count, status_flags, .{});
+}
+
+/// Where a piece handed to pipeWrite sits in the write() it belongs to: write() copies the user buffer in 4 KiB pieces, but the
+/// pipe's buffer accounting (anon_pipe_write) is per call: the remainder of the whole length merges, and only at its start.
+pub const PipeWritePart = struct { total: usize = 0, done: usize = 0 };
+
+pub fn pipeWritePart(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u32, part: PipeWritePart) i64 {
     if (pipe_idx >= MAX_PIPES) return -1;
     if (count == 0) return 0;
-    const r = pipeWriteInner(pipe_idx, buf, count, status_flags);
+    const r = pipeWriteInner(pipe_idx, buf, count, status_flags, part);
     pipeFasyncNotify(pipe_idx, false);
     return r;
 }
 
-fn pipeWriteInner(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u32) i64 {
+fn pipeWriteInner(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u32, part: PipeWritePart) i64 {
     const sched = @import("../proc/sched.zig");
     const task_mod = @import("../proc/task.zig");
     const sig_mod = @import("../proc/signal.zig");
     const nonblocking = (status_flags & @as(u32, 0x800)) != 0;
     var n: usize = 0;
+    // anon_pipe_write merges the write's remainder into the last buffer only at its start, before any wait.
+    var first_try = true;
     while (true) {
         const flags = pipe_lock.acquire();
         const pipe = &pipes[pipe_idx];
@@ -760,17 +773,23 @@ fn pipeWriteInner(pipe_idx: u32, buf: [*]const u8, count: usize, status_flags: u
             return if (n > 0) @intCast(n) else -32; // EPIPE
         }
         const before = n;
-        const used: usize = pipeUsed(pipe);
-        const room: usize = pipe.cap - used;
-        // A write that can fit in an empty pipe is atomic (POSIX PIPE_BUF): it goes in whole or not at all, so another writer's
-        // bytes are never mixed into it. Only a bigger write is let in piecemeal.
-        const atomic = count <= PIPE_BUF_SIZE; // PIPE_BUF: atomic up to one page whatever the size
-        if (!atomic or room >= count) {
-            while (n < count and pipe.len < pipe.cap) {
-                ring(pipe)[(pipe.head + pipe.len) % pipe.cap] = buf[n];
-                pipe.len += 1;
-                n += 1;
-            }
+        // The bytes go in a buffer at a time (pipe_slot_policy.plan): the remainder merged into the last one, then a fresh page
+        // each. A write of at most PIPE_BUF bytes needs one buffer, so it goes in whole or waits (POSIX PIPE_BUF atomicity).
+        const sp = @import("pipe_slot_policy.zig");
+        // The plan is for the whole write() this piece belongs to, cut to the piece.
+        const total = if (part.total != 0) part.total else count;
+        var pl = sp.plan(&pipe.slots, pipeSlots(pipe), total, part.done + n, first_try and part.done == 0);
+        first_try = false;
+        pl = sp.clip(pl, count - n);
+        const take: usize = pl.merge + if (pl.pages == 0) 0 else (pl.pages - 1) * sp.PAGE + pl.tail;
+        if (pl.merge != 0) pipe.slots.merge(pl.merge);
+        var pg: usize = 0;
+        while (pg < pl.pages) : (pg += 1) pipe.slots.push(if (pg + 1 == pl.pages) pl.tail else sp.PAGE);
+        const stop = n + take;
+        while (n < stop) {
+            ring(pipe)[(pipe.head + pipe.len) % pipe.cap] = buf[n];
+            pipe.len += 1;
+            n += 1;
         }
         if (n > before) _ = sched.wakeOne(&pipe_read_waiters[pipe_idx]);
         if (n == count or nonblocking) {
