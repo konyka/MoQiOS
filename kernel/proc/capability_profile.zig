@@ -172,8 +172,9 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         return .{ .uid = 0, .gid = 0, .caps = NO_CAPS, .initial_init = false };
     }
     if (std.mem.eql(u8, name, "hello484")) {
-        // IPV6_FLOWLABEL_MGR: root without CAP_NET_ADMIN (a linger past 150 s is EPERM); CAP_SETUID so a child takes uid 1000.
-        return .{ .uid = 0, .gid = 0, .caps = .{ .cap_setuid = true }, .initial_init = false };
+        // IPV6_FLOWLABEL_MGR: root without CAP_NET_ADMIN (a linger past 150 s is EPERM); CAP_SETUID so a child takes uid 1000;
+        // CAP_NET_RAW for the raw ICMPv6 socket of item L.
+        return .{ .uid = 0, .gid = 0, .caps = .{ .cap_setuid = true, .cap_net_raw = true }, .initial_init = false };
     }
     if (std.mem.eql(u8, name, "hello482")) {
         // fs.pipe-user-pages-{soft,hard}: root writes the sysctls and keeps CAP_SYS_RESOURCE (not limited); a child's setresuid to

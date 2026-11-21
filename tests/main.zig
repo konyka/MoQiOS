@@ -17888,3 +17888,10 @@ test "IPV6_FLOWLABEL_MGR: leases, share modes, and sends limited to held labels 
     try std.testing.expect(std.mem.indexOf(u8, kt.tcp_source, "@import(\"flowlabel_mgr.zig\").dropHolder(.{ .kind = .tcp, .key = tcb_idx });") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "@import(\"../net/flowlabel_mgr.zig\").rekey(.{ .kind = .udp, .key = old }, .{ .kind = .udp, .key = new });") != null);
 }
+
+test "IPv6 raw sends check their flow label like rawv6_sendmsg; ping sends do not (hello484 L)" {
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (rawIpOpts(d.raw_idx).sndflow6 and parsed.flowinfo & 0xFFFFF != 0) {") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "@import(\"flowlabel_mgr.zig\").checkSend(.{ .kind = .raw, .key = d.raw_idx }"));
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (addr_flow != 0) ip6.flow_ov6 = addr_flow;") != null);
+}

@@ -87,12 +87,12 @@ fn readInet4(addr_ptr: u64, addr_len: u32) union(enum) { ok: struct { family: u1
 
 /// A user sockaddr_in6 of `addr_len` bytes at `addr_ptr` (the first 24 are enough, as for rawv6_sendmsg): family, port, address,
 /// scope (0 when not given).
-fn readInet6(addr_ptr: u64, addr_len: u32) union(enum) { ok: struct { family: u16, port: u16, addr: [16]u8, scope: u32 }, err: i64 } {
+fn readInet6(addr_ptr: u64, addr_len: u32) union(enum) { ok: struct { family: u16, port: u16, addr: [16]u8, scope: u32, flowinfo: u32 = 0 }, err: i64 } {
     if (addr_ptr == 0 or addr_ptr >= 0x0000_8000_0000_0000) return .{ .err = -14 };
     var b: [28]u8 = @splat(0);
     const n = @min(addr_len, 28);
     if (n >= 2 and copy.copyFromUser(b[0..n], @ptrFromInt(addr_ptr), n) != n) return .{ .err = -14 };
-    return .{ .ok = .{ .family = bo.readU16Le(b[0..2]), .port = bo.readU16BeAt(&b, 2), .addr = b[8..24].*, .scope = bo.readU32Le(b[24..28]) } };
+    return .{ .ok = .{ .family = bo.readU16Le(b[0..2]), .port = bo.readU16BeAt(&b, 2), .addr = b[8..24].*, .scope = bo.readU32Le(b[24..28]), .flowinfo = std.mem.readInt(u32, b[4..8], .big) } };
 }
 
 /// sendto/send/write/sendmsg on an IPv6 raw socket: the destination is checked first (rawv6_sendmsg), then the control messages
@@ -104,6 +104,7 @@ fn rawSendFrom6(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest,
     const rp = @import("raw_icmp_policy.zig");
     var dst = raw.peerAddr6(d.raw_idx);
     var scope: u32 = 0;
+    var addr_flow: u32 = 0;
     if (to) |a| {
         const parsed = switch (readInet6(a.ptr, a.len)) {
             .ok => |v| v,
@@ -113,6 +114,13 @@ fn rawSendFrom6(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest,
         if (rc != 0) return rc;
         dst = parsed.addr;
         scope = parsed.scope;
+        // rawv6_sendmsg: with IPV6_FLOWINFO_SEND sin6_flowinfo gives the flow label, which must be one the socket holds once some
+        // label is exclusive (fl6_sock_lookup, EINVAL), checked before the control messages.
+        if (rawIpOpts(d.raw_idx).sndflow6 and parsed.flowinfo & 0xFFFFF != 0) {
+            addr_flow = parsed.flowinfo & 0xFFFFF;
+            const fl_rc = @import("flowlabel_mgr.zig").checkSend(.{ .kind = .raw, .key = d.raw_idx }, addr_flow);
+            if (fl_rc != 0) return fl_rc;
+        }
     } else {
         const rc = rp.sendtoErrno6(false, 0, 0, 0, raw.isConnected(d.raw_idx), raw.protocolOf(d.raw_idx));
         if (rc != 0) return rc;
@@ -124,6 +132,13 @@ fn rawSendFrom6(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest,
         .ok => |v| v,
         .err => |e| return e,
     };
+    // An IPV6_FLOWINFO control message's label is looked up the same way when the address gave none.
+    if (ov6.flowlabel) |fl| {
+        if (addr_flow == 0) {
+            const fl_rc = @import("flowlabel_mgr.zig").checkSend(.{ .kind = .raw, .key = d.raw_idx }, fl);
+            if (fl_rc != 0) return fl_rc;
+        }
+    }
     // IPV6_HDRINCL: `msg` is the whole packet, header first, sent as written once routed (rawv6_send_hdrinc); otherwise the
     // ICMPv6 type and code are read before the route is looked up (rawv6_probe_proto_opt).
     const hdrincl = rawIpOpts(d.raw_idx).hdrincl;
@@ -141,6 +156,7 @@ fn rawSendFrom6(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest,
     const src6 = if (ov6.pktinfo and !std.mem.allEqual(u8, &ov6.src, 0)) ov6.src else raw.boundAddr6(d.raw_idx);
     var ip6 = ip;
     if (ov6.dontfrag) |df| ip6.dontfrag6 = df;
+    if (addr_flow != 0) ip6.flow_ov6 = addr_flow;
     if (ov6.flowlabel) |fl| ip6.flow_ov6 = fl;
     setSkb(&ip6, raw.getOpts(d.raw_idx), ov6.mark, ov6.priority);
     const sent = raw.send6(src6, to6, @truncate(raw.protocolOf(d.raw_idx)), raw.checksumOffset(d.raw_idx), msg, ip6, ov6.hops, ov6.tclass);

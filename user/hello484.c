@@ -15,7 +15,10 @@
  *      with action PUT is EINVAL;
  *   I. F_REFLECT on a UDP socket: EPERM (flowlabel_consistency); an IPv4 socket: ENOPROTOOPT;
  *   J. a child process may not join the parent's PROCESS label (EPERM); it may join its USER label (0);
- *   K. a label lingers (at least 6 s) after its last holder closes: creating the EXCL label 0x22222 again right away is EPERM. */
+ *   K. a label lingers (at least 6 s) after its last holder closes: creating the EXCL label 0x22222 again right away is EPERM;
+ *   L. a raw ICMPv6 socket (rawv6_sendmsg) holding 0x11111: an IPV6_FLOWINFO control message with an unheld label is EINVAL, with
+ *      the held one the echo request goes out (8); without IPV6_FLOWINFO_SEND sin6_flowinfo is ignored (8); with it an unheld label
+ *      is EINVAL and the held one sends. (A ping socket does no such check: ping_v6_sendmsg has no fl6_sock_lookup.) */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -31,6 +34,7 @@ static long sock(int f, int t, int p) { return rc(socket(f, t, p)); }
 static long bind_(long s, const void *a, int l) { return rc(bind((int)s, a, (socklen_t)l)); }
 static long connect_(long s, const void *a, int l) { return rc(connect((int)s, a, (socklen_t)l)); }
 static long sendto_(long s, const void *b, long n, const void *a, int al) { return rc(sendto((int)s, b, (size_t)n, 0, a, (socklen_t)al)); }
+static long sendmsg_(long s, const void *m) { return rc(sendmsg((int)s, m, 0)); }
 static long setopt_(long s, int lv, int o, const void *v, int l) { return rc(setsockopt((int)s, lv, o, v, (socklen_t)l)); }
 static long getopt_(long s, int lv, int o, void *v, int *l) { socklen_t sl = (socklen_t)*l; long r = rc(getsockopt((int)s, lv, o, v, &sl)); *l = (int)sl; return r; }
 static void close_(long s) { close((int)s); }
@@ -46,6 +50,7 @@ static long sock(int f, int t, int p) { return syscall3(117, f, t, p); }
 static long bind_(long s, const void *a, int l) { return syscall3(118, s, (long)a, l); }
 static long connect_(long s, const void *a, int l) { return syscall3(124, s, (long)a, l); }
 static long sendto_(long s, const void *b, long n, const void *a, int al) { return syscall6(121, s, (long)b, n, 0, (long)a, al); }
+static long sendmsg_(long s, const void *m) { return syscall3(129, s, (long)m, 0); }
 static long setopt_(long s, int lv, int o, const void *v, int l) { return syscall5(132, s, lv, o, (long)v, l); }
 static long getopt_(long s, int lv, int o, void *v, int *l) { return syscall5(133, s, lv, o, (long)v, (long)l); }
 static void close_(long s) { syscall1(11, s); }
@@ -187,6 +192,35 @@ int main(void) {
     long k1 = mgr(s, 0, 1, 1, 0x22222);
     snprintf(msg, sizeof msg, "K: EXCL 0x22222 again while it lingers after its holder closed %ld (-1)", k1);
     check(k1 == -1, msg);
+    /* L: raw ICMPv6. */
+    long raw = sock(10, 3, 58);
+    long l0 = mgr(raw, 0, 255, 1, 0x11111);
+    struct sin6 da = { 10, 0, 0, { 0 }, 0 };
+    memcpy(da.addr, lo6, 16);
+    unsigned char echo[8] = { 128, 0, 0, 0, 0, 1, 0, 1 };
+    long rl[6];
+    for (int k = 0; k < 2; k++) {
+        unsigned char mh[56], ctl[24];
+        memset(mh, 0, sizeof mh);
+        memset(ctl, 0, sizeof ctl);
+        long clen = 20, lvl = 41;
+        int ty = 11;
+        unsigned int fl = be32(k ? 0x11111 : 0x54321);
+        memcpy(ctl, &clen, 8); memcpy(ctl + 8, &lvl, 4); memcpy(ctl + 12, &ty, 4); memcpy(ctl + 16, &fl, 4);
+        long iov[2] = { (long)echo, 8 };
+        long np_ = (long)&da, nl = sizeof da, ip = (long)iov, one_ = 1, cp = (long)ctl, cl = 24;
+        memcpy(mh, &np_, 8); memcpy(mh + 8, &nl, 4); memcpy(mh + 16, &ip, 8); memcpy(mh + 24, &one_, 8); memcpy(mh + 32, &cp, 8); memcpy(mh + 40, &cl, 8);
+        rl[k] = sendmsg_(raw, mh);
+    }
+    da.flow = be32(0x54321);
+    rl[2] = sendto_(raw, echo, 8, &da, sizeof da);
+    setopt_(raw, 41, 33, &one, 4);
+    rl[3] = sendto_(raw, echo, 8, &da, sizeof da);
+    da.flow = be32(0x11111);
+    rl[4] = sendto_(raw, echo, 8, &da, sizeof da);
+    snprintf(msg, sizeof msg, "L: raw GET %ld; cmsg unheld %ld held %ld; addr label without SNDFLOW %ld; with SNDFLOW unheld %ld held %ld (0 -22 8 8 -22 8)", l0, rl[0], rl[1], rl[2], rl[3], rl[4]);
+    check(l0 == 0 && rl[0] == -22 && rl[1] == 8 && rl[2] == 8 && rl[3] == -22 && rl[4] == 8, msg);
+    close_(raw);
     close_(s);
     close_(u);
     close_(v);

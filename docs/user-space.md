@@ -478,7 +478,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello481 | /proc/sys/fs/pipe-max-size：读出 1048576（A）；root 写 100000 读回 131072（B）；超过上限的 F_SETPIPE_SZ 为 EPERM（C）；上限 16384 时新管道为 16384（D）；负数、垃圾为 EINVAL，超过 2^31 为 ERANGE（E）；上限 4096 时新管道一页（F）；写回 1048576（G） |
 | hello482 | 按用户统计管道页数：pipe-user-pages-soft/hard 读出 16384、0（A）；root 写软限制 256，负数、垃圾为 EINVAL（B）；uid 4242 放大 4 个管道到 256 KiB 后 EPERM，新管道只有 2 页且不能放大，缩小仍可（C）；硬限制 40 时第三个管道 ENFILE，放大超限 EPERM，root 不受限（D）；恢复默认值（E） |
 | hello483 | AF_UNIX 每条排队记录保留自己的到达时间：100 个数据报都带读取前的时间戳且不递减（A）；seqpacket 64 条（B）；第 70 条的 MSG_PEEK 与随后的读取时间相同（C）；设置 SO_TIMESTAMPNS 之前发送的记录取读取时刻（D）；accept 之前排队的 seqpacket 记录取读取时刻，之后的取发送时刻（E） |
-| hello484 | IPV6_FLOWLABEL_MGR：GET CREATE 标签 0 写回随机标签（A）；ENOENT、加入、F_EXCL 为 EEXIST（B）；独占和不同共享模式为 EPERM（C）；PUT/RENEW 未持有为 ESRCH（D）；各类 EINVAL（E）；linger 151 无 CAP_NET_ADMIN 为 EPERM（F）；存在独占标签时发送只能用持有的标签（G）；getsockopt 报告 connect 的标签（H）；F_REFLECT、IPv4 套接字（I）；PROCESS 与 USER 共享（J）；标签在最后持有者关闭后保留（K） |
+| hello484 | IPV6_FLOWLABEL_MGR：GET CREATE 标签 0 写回随机标签（A）；ENOENT、加入、F_EXCL 为 EEXIST（B）；独占和不同共享模式为 EPERM（C）；PUT/RENEW 未持有为 ESRCH（D）；各类 EINVAL（E）；linger 151 无 CAP_NET_ADMIN 为 EPERM（F）；存在独占标签时发送只能用持有的标签（G）；getsockopt 报告 connect 的标签（H）；F_REFLECT、IPv4 套接字（I）；PROCESS 与 USER 共享（J）；标签在最后持有者关闭后保留（K）；raw ICMPv6 套接字的控制消息和 sin6_flowinfo 标签检查（L） |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
