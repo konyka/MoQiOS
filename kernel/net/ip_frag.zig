@@ -141,6 +141,11 @@ pub fn receive6(frame: [*]const u8, len: u32, pkt6: []const u8, frag_off: usize,
 /// the NIC. After the first piece only the copied options remain (ip_options_fragment). A datagram within `mtu` goes out as one
 /// frame. False when the device refused a piece.
 pub fn send4(hdr: [20]u8, opts: []const u8, payload: []const u8, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, via_lo: bool, wait_hop: ?[4]u8) bool {
+    return send4Meta(hdr, opts, payload, mtu, dst_mac, our_mac, via_lo, wait_hop, .{});
+}
+
+/// send4 for a datagram with a mark and priority (carried with its loopback frames).
+pub fn send4Meta(hdr: [20]u8, opts: []const u8, payload: []const u8, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, via_lo: bool, wait_hop: ?[4]u8, skb: @import("lo.zig").Meta) bool {
     const ipv4 = @import("ipv4.zig");
     const eth = @import("eth.zig");
     const lo = @import("lo.zig");
@@ -172,7 +177,7 @@ pub fn send4(hdr: [20]u8, opts: []const u8, payload: []const u8, mtu: u16, dst_m
         if (wait_hop) |hop| {
             @import("arp.zig").queueFrame(hop, &pkt, frame_len);
         } else {
-            const ok = if (via_lo) lo.sendNow(&pkt, frame_len) or lo.dropIsLoss(frame_len) else @import("nic.zig").sendPacket(&pkt, frame_len);
+            const ok = if (via_lo) lo.sendNowMeta(&pkt, frame_len, skb) or lo.dropIsLoss(frame_len) else @import("nic.zig").sendPacket(&pkt, frame_len);
             if (!ok) all_ok = false;
         }
         if (off == 0 and ol != 0) @import("ip_options_policy.zig").fragmentOpts(o[0..ol]);
@@ -196,6 +201,11 @@ pub fn nextId6() u32 {
 /// is `nh`, the protocol of `payload`). Each piece is the header (next header 44, its payload length), a Fragment header (next header
 /// `nh`, the offset, M on all but the last, one id) and up to (mtu - 48) & ~7 bytes; it leaves as send4's pieces do.
 pub fn send6(hdr: [40]u8, nh: u8, payload: []const u8, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, via_lo: bool, wait_hop: ?[16]u8) bool {
+    return send6Meta(hdr, nh, payload, mtu, dst_mac, our_mac, via_lo, wait_hop, .{});
+}
+
+/// send6 for a packet with a mark and priority.
+pub fn send6Meta(hdr: [40]u8, nh: u8, payload: []const u8, mtu: u16, dst_mac: [6]u8, our_mac: [6]u8, via_lo: bool, wait_hop: ?[16]u8, skb: @import("lo.zig").Meta) bool {
     const eth = @import("eth.zig");
     const lo = @import("lo.zig");
     const id = nextId6();
@@ -218,7 +228,7 @@ pub fn send6(hdr: [40]u8, nh: u8, payload: []const u8, mtu: u16, dst_mac: [6]u8,
         if (wait_hop) |hop| {
             @import("ndp_queue.zig").queueFrame(hop, &pkt, frame_len);
         } else {
-            const ok = if (via_lo) lo.sendNow(&pkt, frame_len) or lo.dropIsLoss(frame_len) else @import("nic.zig").sendPacket(&pkt, frame_len);
+            const ok = if (via_lo) lo.sendNowMeta(&pkt, frame_len, skb) or lo.dropIsLoss(frame_len) else @import("nic.zig").sendPacket(&pkt, frame_len);
             if (!ok) all_ok = false;
         }
         off += n;

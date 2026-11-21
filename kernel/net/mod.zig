@@ -90,7 +90,7 @@ pub fn handleRxPacketMeta(data: [*]const u8, len: u32, ifindex: u8, skb: @import
             // Linux raw_local_deliver hands each raw socket of the datagram's protocol a copy (IP header included) before the protocol
             // handler runs.
             const raw_took = if (rx_hdr_len == 0)
-                @import("raw_icmp.zig").deliver(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip, ifindex)
+                @import("raw_icmp.zig").deliverInfo(info.protocol, data[14 .. payload_start + info.payload_len], info.src_ip, info.dst_ip, meta4)
             else
                 @import("raw_icmp.zig").deliverHdr(info.protocol, rx_hdr[0..rx_hdr_len], data[payload_start .. payload_start + info.payload_len], info.src_ip, info.dst_ip, meta4);
             const rp = @import("raw_icmp_policy.zig");
@@ -141,7 +141,7 @@ pub fn handleRxPacketMeta(data: [*]const u8, len: u32, ifindex: u8, skb: @import
             const up_start: u32 = payload_start6 + @as(u32, @intCast(ext.off));
             const up_len: u16 = info6.payload_len - @as(u16, @intCast(ext.off));
             // raw6_local_deliver: each IPv6 raw socket of the upper-layer header gets it, before the protocol handler.
-            const raw_took6 = raw6.deliver6Flow(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass, info6.flowinfo);
+            const raw_took6 = raw6.deliver6Skb(ext.nh, data[up_start .. up_start + up_len], info6.src_ip, info6.dst_ip, ifindex, info6.hop_limit, info6.tclass, info6.flowinfo, skb);
             switch (ext.nh) {
                 ipv6.PROTO_ICMPV6 => {
                     icmpv6.handlePacketMeta(info6.src_ip, info6.dst_ip, data + up_start, up_len, .{ .ifindex = ifindex, .dst = info6.dst_ip, .hops = info6.hop_limit, .tclass = info6.tclass });

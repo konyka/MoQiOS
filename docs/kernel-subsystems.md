@@ -1120,7 +1120,7 @@ const SchedStats = struct {
 - **管道默认 64 KiB（hello448）**：`allocPipe` 给新管道分配 16 页连续内存作为环形缓冲（`PIPE_DEFAULT_SIZE`，放在 `PipeBuffer.ext`），F_GETPIPE_SZ 读 65536；分配失败时退回自带的一页。F_SETPIPE_SZ 仍可在 4 KiB 到 4 MiB 之间调整。
 - **管道按页缓冲计数（hello470）**：`PipeBuffer.slots`（`fs/pipe_slot_policy.zig`）记每个页大小缓冲的结束位置：一次写的余数并入最后一个缓冲，其余各占新页，缓冲用完即满（POLLOUT、写等待、splice、F_SETPIPE_SZ 缩小都按缓冲数判断）；`file_io.write` 经 `vfs.pipeWritePart` 让 4 KiB 分段的写按整次长度计算。
 - **大数据报按 SO_RCVBUF 计数（hello471）**：UDP 和 raw 套接字超过一帧的数据报各自 `kmalloc`，入队前按 `udp_rmem_policy` 的 truesize 与套接字的 SO_RCVBUF 判断（UDP：总和超过 SO_RCVBUF 丢弃，队列空时总收；raw：已达 SO_RCVBUF 丢弃）；分片重组队列 64 个，缓冲在队列开始时分配、结束后归还（`ip_frag.findWithBuf`/`releaseIdle`）。
-- **SO_RCVMARK、SO_RCVPRIORITY（hello472）**：UDP 数据报的 mark、priority（sendmsg 控制消息，否则套接字的 SO_MARK、SO_PRIORITY，`udp.skbMeta`）随回环帧（`lo.Meta`）带到接收端，`ip_cmsg_policy.putMarkPrio` 在时间戳之后加 SOL_SOCKET/SO_MARK、SO_PRIORITY。
+- **SO_RCVMARK、SO_RCVPRIORITY（hello472）**：UDP 数据报的 mark、priority（sendmsg 控制消息，否则套接字的 SO_MARK、SO_PRIORITY，`udp.skbMeta`）随回环帧（`lo.Meta`）带到接收端，`ip_cmsg_policy.putMarkPrio` 在时间戳之后加 SOL_SOCKET/SO_MARK、SO_PRIORITY。 raw 套接字也报告这两个和 SO_TIMESTAMP，raw、ping 套接字的发送经 `IpOpts.skb_mark`/`skb_prio` 带上 mark、priority（hello476）。
 - **UDP 接收队列先进先出（hello473）**：入队时 `UdpEntry.order` 记全局序号，所有读取经 `udp.oldestLocked` 取最早的有效项，读走中间的槽不会让后到的数据报插队。
 - **UDP 接收队列只按 SO_RCVBUF 计数（hello474）**：每个数据报一个 `kmalloc` 的 `UdpEntry`，链在套接字的 `Queue` 尾部；`newEntryLocked` 按 `Queue.rmem` 与 SO_RCVBUF 判断收不收（上限另有 `QUEUE_MAX` 4096 个）。
 - **raw 接收队列只按 SO_RCVBUF 计数（hello475）**：raw 套接字的数据报同样各自 `kmalloc` 成 `Entry`、链在 `Socket.head` 之后，`newEntry` 在 `rmem` 低于 SO_RCVBUF 时收（`__sock_queue_rcv_skb`）。

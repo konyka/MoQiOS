@@ -501,7 +501,7 @@ pub fn sendProto6Ov(bound: [16]u8, dst: [16]u8, next_header: u8, csum_off: ?u32,
             hdr[1] = (hdr[1] & 0x0F) | (tc << 4);
         }
         if (flowLabel6(ip, src, dst, next_header)) |fl| ipo.setFlowLabel6(&hdr, fl);
-        return if (@import("ip_frag.zig").send6(hdr, next_header, msg, mtu, dst_mac, our_mac, via_lo, wait_hop)) 0 else -105;
+        return if (@import("ip_frag.zig").send6Meta(hdr, next_header, msg, mtu, dst_mac, our_mac, via_lo, wait_hop, .{ .mark = ip.skb_mark, .priority = ip.skb_prio })) 0 else -105;
     }
     var pkt: [1518]u8 = @splat(0);
     const icmp_off: usize = 14 + ipv6.HEADER_LEN;
@@ -520,7 +520,7 @@ pub fn sendProto6Ov(bound: [16]u8, dst: [16]u8, next_header: u8, csum_off: ?u32,
         return 0;
     }
     const lo = @import("lo.zig");
-    const ok = if (via_lo) lo.sendPacket(&pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt, frame_len);
+    const ok = if (via_lo) lo.sendPacketMeta(&pkt, frame_len, lo.IFINDEX, .{ .mark = ip.skb_mark, .priority = ip.skb_prio }) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt, frame_len);
     return if (ok) 0 else -105;
 }
 

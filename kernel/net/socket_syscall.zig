@@ -142,6 +142,7 @@ fn rawSendFrom6(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDest,
     var ip6 = ip;
     if (ov6.dontfrag) |df| ip6.dontfrag6 = df;
     if (ov6.flowlabel) |fl| ip6.flow_ov6 = fl;
+    setSkb(&ip6, raw.getOpts(d.raw_idx), ov6.mark, ov6.priority);
     const sent = raw.send6(src6, to6, @truncate(raw.protocolOf(d.raw_idx)), raw.checksumOffset(d.raw_idx), msg, ip6, ov6.hops, ov6.tclass);
     // __ip6_append_data → ipv6_local_error: an IPV6_DONTFRAG refusal reaches the error queue of an IPV6_RECVERR socket, with the
     // path MTU as ee_info.
@@ -212,10 +213,24 @@ pub fn rawSendFrom(d: *const vfs_mod.FileDescriptor, msg: []const u8, to: ?RawDe
     }
     if (ov.ttl) |v| ip.ttl = v;
     if (ov.tos) |v| ip.tos = v;
+    setSkb(&ip, raw.getOpts(d.raw_idx), ov.mark, ov.priority);
     // ipc.opt: the IP_RETOPTS control message's options, else the socket's IP_OPTIONS.
     const ipopts = ov.opts orelse (if (sock_opts.so.len != 0) sock_opts.so else null);
     const sent = raw.sendOpts(src, dst, @truncate(protocol), msg, ip, ipopts);
     return if (sent < 0) sent else @intCast(msg.len);
+}
+
+/// A send's skb->mark and skb->priority into `ip` (ip_opt_policy.IpOpts.skb_mark / skb_prio): the SO_MARK / SO_PRIORITY control
+/// message's value, else the socket's (`st`).
+fn setSkb(ip: *@import("ip_opt_policy.zig").IpOpts, st: ?@import("sockopt_policy.zig").Stored, mark: ?u32, priority: ?u32) void {
+    const so = st orelse @import("sockopt_policy.zig").Stored{};
+    ip.skb_mark = mark orelse so.mark;
+    ip.skb_prio = priority orelse @as(u32, @bitCast(so.priority));
+}
+
+/// The SOL_SOCKET flags of a raw socket (SO_TIMESTAMP*, SO_RCVMARK, SO_RCVPRIORITY: what its recvmsg reports).
+fn rawSolFlags(idx: u32) u16 {
+    return if (@import("raw_icmp.zig").getOpts(idx)) |o| o.flags else 0;
 }
 
 /// The IP-level options (IP_TTL, IP_TOS, IPV6_UNICAST_HOPS, IPV6_TCLASS) a raw socket's sends carry.
@@ -496,7 +511,9 @@ fn pingSend(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, addr
     const ttl: u8 = ov.ttl orelse sock_ttl;
     const tos: u8 = ov.tos orelse ping_ip.tos;
     const ipopts = ov.opts orelse if (udp.getIpOptions(d.udpKey())) |so| (if (so.len != 0) so else null) else null;
-    const sent = @import("icmp.zig").sendFromOpts(src, dst, msg[0..payload.len], ping_ip.pmtudisc, ttl, tos, ipopts);
+    var skb_ip: ipo.IpOpts = .{};
+    setSkb(&skb_ip, udp.getPortOpts(d.udpKey()), ov.mark, ov.priority);
+    const sent = @import("icmp.zig").sendFromSkb(src, dst, msg[0..payload.len], ping_ip.pmtudisc, ttl, tos, ipopts, .{ .mark = skb_ip.skb_mark, .priority = skb_ip.skb_prio });
     return if (sent < 0) sent else @intCast(payload.len);
 }
 
@@ -546,6 +563,7 @@ fn pingSend6(d: *vfs_mod.FileDescriptor, payload: []const u8, addr_ptr: u64, add
     var ping_ip6: @import("ip_opt_policy.zig").IpOpts = if (udp.getPortOpts(d.udpKey())) |po| po.ip else .{};
     if (ov6.dontfrag) |df| ping_ip6.dontfrag6 = df;
     if (ov6.flowlabel) |fl| ping_ip6.flow_ov6 = fl;
+    setSkb(&ping_ip6, udp.getPortOpts(d.udpKey()), ov6.mark, ov6.priority);
     const sent = @import("icmpv6.zig").sendProto6Ov(d.udp_local_ip6, dst, 58, 2, msg[0..payload.len], ping_ip6, ov6.hops, ov6.tclass);
     // ipv6_local_error: an IPV6_DONTFRAG refusal reaches an IPV6_RECVERR ping socket's error queue too.
     if (sent == -90 and ping_ip6.dontfrag6 and ping_ip6.recverr6 and payload.len <= 0xFFFF)
@@ -2213,7 +2231,9 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
     const ctl_cap: usize = if (ctl_ptr == 0) 0 else @intCast(@min(bo.readU64At(msghdr, 40), 1 << 20));
     const port_opts = udp.getPortOpts(port);
     const opts_ip: ip_opt_policy.IpOpts = if (port_opts) |po| po.ip else .{};
-    const sol_flags: u16 = if (port_opts) |po| po.flags else 0;
+    // ping_recvmsg calls sock_recv_timestamp, not sock_recv_cmsgs: a ping socket reports no SO_RCVMARK / SO_RCVPRIORITY.
+    const mark_prio = @import("sockopt_policy.zig").flagBit(@import("sockopt_policy.zig").SO_RCVMARK).? | @import("sockopt_policy.zig").flagBit(@import("sockopt_policy.zig").SO_RCVPRIORITY).?;
+    const sol_flags: u16 = if (port_opts) |po| (if (d.udp_ping) po.flags & ~mark_prio else po.flags) else 0;
     var ctl_buf: [192]u8 = undefined;
     const cm = if (is_v6)
         ip_cmsg_policy.build6(ip_cmsg_policy.Wanted.of6(opts_ip).withStamp(sol_flags), meta6, ctl_cap, &ctl_buf)
@@ -2386,9 +2406,9 @@ fn rawRecvmsg(d: *vfs_mod.FileDescriptor, msg_ptr: u64, msghdr: *const [56]u8, f
     const opts_ip = rawIpOpts(d.raw_idx);
     var ctl_buf: [192]u8 = undefined;
     const cm = if (@import("raw_icmp.zig").isV6(d.raw_idx))
-        ip_cmsg_policy.build6(ip_cmsg_policy.Wanted.of6(opts_ip), got_meta.v6, ctl_cap, &ctl_buf)
+        ip_cmsg_policy.build6(ip_cmsg_policy.Wanted.of6(opts_ip).withStamp(rawSolFlags(d.raw_idx)), got_meta.v6, ctl_cap, &ctl_buf)
     else
-        ip_cmsg_policy.build(ip_cmsg_policy.Wanted.of(opts_ip), got_meta.v4, ctl_cap, &ctl_buf);
+        ip_cmsg_policy.build(ip_cmsg_policy.Wanted.of(opts_ip).withStamp(rawSolFlags(d.raw_idx)), got_meta.v4, ctl_cap, &ctl_buf);
     if (cm.written != 0) {
         if (ctl_ptr >= 0x0000_8000_0000_0000) return -14;
         if (copy.copyToUser(@ptrFromInt(ctl_ptr), ctl_buf[0..cm.written], cm.written) != cm.written) return -14;

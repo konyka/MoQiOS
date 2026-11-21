@@ -116,6 +116,12 @@ pub fn sendFromOv(bound: [4]u8, dst: [4]u8, msg: []const u8, mode: u8, ttl: u8, 
 /// sendFromOv with IPv4 options (ipc.opt: an IP_RETOPTS control message's, else the ping socket's IP_OPTIONS), built after the
 /// header for this request; a source route sends to its first hop.
 pub fn sendFromOpts(bound: [4]u8, dst_in: [4]u8, msg: []const u8, mode: u8, ttl: u8, tos: u8, ipopts: ?@import("ip_options_policy.zig").SendOpts) i64 {
+    return sendFromSkb(bound, dst_in, msg, mode, ttl, tos, ipopts, .{});
+}
+
+/// sendFromOpts with the request's mark and priority (the ping socket's SO_MARK / SO_PRIORITY or control messages), carried with its
+/// loopback frames.
+pub fn sendFromSkb(bound: [4]u8, dst_in: [4]u8, msg: []const u8, mode: u8, ttl: u8, tos: u8, ipopts: ?@import("ip_options_policy.zig").SendOpts, skb: lo.Meta) i64 {
     const iop = @import("ip_options_policy.zig");
     const dst = if (ipopts) |so| (if (so.o.srr != null) so.faddr else dst_in) else dst_in;
     const optlen: usize = if (ipopts) |so| so.len else 0;
@@ -144,7 +150,7 @@ pub fn sendFromOpts(bound: [4]u8, dst_in: [4]u8, msg: []const u8, mode: u8, ttl:
         if (big) ipv4.setIdent(&hdr, ipid.global(dst, src, ipv4.PROTO_ICMP), false) else ipv4.setIdent(&hdr, ipid.unowned(dst, src, ipv4.PROTO_ICMP, mode), ipo.datagramDf(mode));
         var built: [40]u8 = @splat(0);
         if (ipopts) |so| iop.build(so, src, dst_in, iop.msSinceMidnight(@import("../proc/time_syscall.zig").wallClockNanos()), &built);
-        return if (@import("ip_frag.zig").send4(hdr, built[0..optlen], msg, mtu, dst_mac, our_mac, via_lo, wait_hop)) 0 else -105;
+        return if (@import("ip_frag.zig").send4Meta(hdr, built[0..optlen], msg, mtu, dst_mac, our_mac, via_lo, wait_hop, skb)) 0 else -105;
     }
     var pkt: [1518]u8 = @splat(0);
     @memcpy(pkt[34..][0..msg.len], msg);
@@ -158,7 +164,7 @@ pub fn sendFromOpts(bound: [4]u8, dst_in: [4]u8, msg: []const u8, mode: u8, ttl:
         return 0;
     }
     // A loopback frame is delivered at once, so a ping socket's reply is queued by the time its send returns.
-    const ok = if (via_lo) lo.sendNow(&pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt, frame_len);
+    const ok = if (via_lo) lo.sendNowMeta(&pkt, frame_len, skb) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt, frame_len);
     return if (ok) 0 else -105;
 }
 

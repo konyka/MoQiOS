@@ -121,6 +121,10 @@ pub const IpOpts = struct {
     /// One send's explicit IPv6 flow label (an IPV6_FLOWINFO control message), 0 for none: carried here so the shared ICMPv6 / raw
     /// send path sees it without another parameter. Never stored with the socket's options.
     flow_ov6: u32 = 0,
+    /// One send's skb->mark and skb->priority (the socket's SO_MARK / SO_PRIORITY or that send's control messages), carried the same
+    /// way to the loopback frame (lo.Meta). Never stored with the socket's options.
+    skb_mark: u32 = 0,
+    skb_prio: u32 = 0,
 };
 
 pub const Family = enum { v4, v6 };

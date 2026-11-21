@@ -579,6 +579,8 @@ pub fn deliverHdr(protocol: u8, hdr: []const u8, payload: []const u8, src: [4]u8
             e.src = @splat(0);
             @memcpy(e.src[0..4], &src);
             e.meta = meta;
+            // sock_recv_timestamp: the arrival time on the real-time clock, for SO_TIMESTAMP / SO_TIMESTAMPNS.
+            e.meta.stamp_ns = @import("../proc/time_syscall.zig").wallClockNanos();
             notify[n_notify] = @intCast(i);
             n_notify += 1;
         }
@@ -608,6 +610,11 @@ pub fn deliver6(protocol: u8, msg: []const u8, src: [16]u8, dst: [16]u8, ifindex
 
 /// deliver6 with the packet's flowinfo (traffic class and flow label), for IPV6_FLOWINFO on receive.
 pub fn deliver6Flow(protocol: u8, msg: []const u8, src: [16]u8, dst: [16]u8, ifindex: u8, hops: u8, tclass: u8, flowinfo: u32) bool {
+    return deliver6Skb(protocol, msg, src, dst, ifindex, hops, tclass, flowinfo, .{});
+}
+
+/// deliver6Flow with the mark and priority the packet's loopback frame carried.
+pub fn deliver6Skb(protocol: u8, msg: []const u8, src: [16]u8, dst: [16]u8, ifindex: u8, hops: u8, tclass: u8, flowinfo: u32, rx_skb: @import("lo.zig").Meta) bool {
     var notify: [MAX_SOCKETS]u32 = undefined;
     var n_notify: usize = 0;
     var took = false;
@@ -625,7 +632,7 @@ pub fn deliver6Flow(protocol: u8, msg: []const u8, src: [16]u8, dst: [16]u8, ifi
             store(e, msg);
             charge(s, e);
             e.src = src;
-            e.meta6 = .{ .ifindex = ifindex, .dst = dst, .hops = hops, .tclass = tclass, .flowinfo = flowinfo };
+            e.meta6 = .{ .ifindex = ifindex, .dst = dst, .hops = hops, .tclass = tclass, .flowinfo = flowinfo, .mark = rx_skb.mark, .priority = rx_skb.priority, .stamp_ns = @import("../proc/time_syscall.zig").wallClockNanos() };
             notify[n_notify] = @intCast(i);
             n_notify += 1;
         }
@@ -724,7 +731,7 @@ pub fn sendOpts(bound: [4]u8, dst_in: [4]u8, protocol: u8, msg: []const u8, ip: 
         if (ipo.ipv4NeedsPatch(ip)) ipo.patchIpv4(&hdr, ip, ipv4.checksum);
         var built: [40]u8 = @splat(0);
         if (ipopts) |so| iop.build(so, src, dst_in, iop.msSinceMidnight(@import("../proc/time_syscall.zig").wallClockNanos()), &built);
-        const ok = @import("ip_frag.zig").send4(hdr, built[0..optlen], msg, mtu, dst_mac, our_mac, via_lo, wait_hop);
+        const ok = @import("ip_frag.zig").send4Meta(hdr, built[0..optlen], msg, mtu, dst_mac, our_mac, via_lo, wait_hop, .{ .mark = ip.skb_mark, .priority = ip.skb_prio });
         return if (ok) 0 else -105;
     }
     var pkt: [FRAME_BUF_LEN]u8 = @splat(0);
@@ -739,7 +746,7 @@ pub fn sendOpts(bound: [4]u8, dst_in: [4]u8, protocol: u8, msg: []const u8, ip: 
     }
     // A loopback frame is delivered at once (lo.sendNow), so the echo request a raw socket just sent is already queued for it when
     // the send returns, as on Linux.
-    const ok = if (via_lo) lo.sendNow(&pkt, frame_len) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt, frame_len);
+    const ok = if (via_lo) lo.sendNowMeta(&pkt, frame_len, .{ .mark = ip.skb_mark, .priority = ip.skb_prio }) or lo.dropIsLoss(frame_len) else nic.sendPacket(&pkt, frame_len);
     return if (ok) 0 else -105;
 }
 

@@ -167,6 +167,10 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // Proxy ARP test: CAP_NET_ADMIN to set and remove proxy entries.
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_net_admin = true }, .initial_init = false };
     }
+    if (std.mem.eql(u8, name, "hello476")) {
+        // Raw sockets (CAP_NET_RAW), SO_MARK (CAP_NET_ADMIN) and root to open net.ipv4.ping_group_range for its ping socket.
+        return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_raw = true, .cap_net_admin = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello472")) {
         // SO_RCVMARK / SO_RCVPRIORITY: uid 1000 with CAP_NET_ADMIN sets SO_MARK and sends a SO_MARK control message (sk_setsockopt,
         // __sock_cmsg_send).

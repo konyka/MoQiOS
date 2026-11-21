@@ -233,7 +233,8 @@ pub fn sendNowMeta(data: [*]const u8, len: u32, meta: Meta) bool {
     return true;
 }
 
-fn sendPacketMeta(data: [*]const u8, len: u32, ifindex: u8, meta: Meta) bool {
+/// sendPacketOn for a frame with a mark and priority.
+pub fn sendPacketMeta(data: [*]const u8, len: u32, ifindex: u8, meta: Meta) bool {
     const saved = lo_lock.acquire();
     defer lo_lock.release(saved);
     return rx_queue.enqueueMeta(data[0..len], ifindex, meta);
