@@ -460,9 +460,19 @@ pub fn sigreturn() ?SigreturnResult {
         claimHeld(cur);
     }
     if (comptime @import("builtin").cpu.arch == .x86_64) {
+        // The FXSAVE image is wherever uc_mcontext.fpregs points now (a handler may have pointed it at its own copy); null resets
+        // the FPU; a misaligned or unreadable pointer is a bad frame (Linux fpu__restore_sig / badframe: SIGSEGV).
+        var fpu: [512]u8 align(16) = undefined;
+        switch (sigreturn_policy.fpRestore(sig_frame.uc.fpregs)) {
+            .init => fpu = sigreturn_policy.initFxsave(),
+            .bad => return badFrame(),
+            .load => {
+                const copy_mod = @import("../mm/copy_from_user.zig");
+                if (copy_mod.copyFromUser(&fpu, @ptrFromInt(sig_frame.uc.fpregs), 512) != 512) return badFrame();
+            },
+        }
         // MXCSR comes from user memory: reserved bits set would make fxrstor
         // raise #GP in the kernel. Clear them (MXCSR_MASK default 0xFFBF).
-        var fpu: [512]u8 align(16) = sig_frame.fpu;
         const mxcsr = @as(u32, fpu[24]) | (@as(u32, fpu[25]) << 8) | (@as(u32, fpu[26]) << 16) | (@as(u32, fpu[27]) << 24);
         const clean = mxcsr & 0xFFBF;
         fpu[24] = @truncate(clean);
@@ -501,6 +511,13 @@ pub fn sigreturn() ?SigreturnResult {
         .r14 = gregs[si.REG_R14],
         .r15 = gregs[si.REG_R15],
     };
+}
+
+/// A sigreturn whose frame names an FPU image it cannot load: the task gets SIGSEGV (Linux badframe → force_sig), and the
+/// syscall itself reports EFAULT like an unreadable frame, leaving the registers alone.
+fn badFrame() ?SigreturnResult {
+    sig_mod.raiseSelf(sig_mod.SIGSEGV);
+    return null;
 }
 
 /// Copy a signal frame out of user memory. Returns null when `addr` is not a

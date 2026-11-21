@@ -20,6 +20,36 @@ pub fn sanitizeRflags(value: u64) u64 {
     return (value & USER_RFLAGS) | FORCED_RFLAGS;
 }
 
+/// What sigreturn does with uc_mcontext.fpregs (Linux restore_sigcontext → fpu__restore_sig): null resets the FPU to its initial
+/// state (fpu__clear_user_states); a pointer that is not 16-byte aligned or not readable user memory fails the sigreturn, which
+/// ends in SIGSEGV (badframe → force_sig); anything else is the FXSAVE image to load, wherever the handler pointed it.
+pub const FpRestore = enum { init, load, bad };
+
+pub fn fpRestore(fpregs: u64) FpRestore {
+    if (fpregs == 0) return .init;
+    if (fpregs & 15 != 0 or fpregs >= USER_LIMIT - 512) return .bad;
+    return .load;
+}
+
+/// The FXSAVE image of a freshly initialised FPU (fninit + the default MXCSR): FCW 0x037F, MXCSR 0x1F80, every register zero.
+pub fn initFxsave() [512]u8 {
+    var img: [512]u8 = @splat(0);
+    img[0] = 0x7F;
+    img[1] = 0x03;
+    img[24] = 0x80;
+    img[25] = 0x1F;
+    return img;
+}
+
+test "sigreturn's fpregs: null resets, misaligned or kernel is a bad frame" {
+    const std = @import("std");
+    try std.testing.expectEqual(FpRestore.init, fpRestore(0));
+    try std.testing.expectEqual(FpRestore.bad, fpRestore(8));
+    try std.testing.expectEqual(FpRestore.bad, fpRestore(0xffff_8000_0000_0000));
+    try std.testing.expectEqual(FpRestore.load, fpRestore(0x7fff_0000));
+    try std.testing.expectEqual(@as(u8, 0x1F), initFxsave()[25]);
+}
+
 test "sigreturn rejects kernel targets and masks privileged flags" {
     const std = @import("std");
     try std.testing.expect(userTargetValid(0x4000));

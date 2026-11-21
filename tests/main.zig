@@ -17792,3 +17792,10 @@ test "MADV_DONTFORK / MADV_WIPEONFORK mark the brk heap and the stack too (Mm.fo
     try std.testing.expect(std.mem.indexOf(u8, fk, "cm.grp.fork_marks = pm.grp.fork_marks;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.brk_source, "mm.grp.fork_marks.forget(new_page * PAGE, old_page * PAGE);") != null);
 }
+
+test "sigreturn loads the FPU image uc_mcontext.fpregs points at; null resets, misaligned is SIGSEGV (hello480)" {
+    const ss = kt.signal_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "switch (sigreturn_policy.fpRestore(sig_frame.uc.fpregs)) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "var fpu: [512]u8 align(16) = sig_frame.fpu;") == null);
+    try std.testing.expectEqual(kt.sigreturn_policy.FpRestore.bad, kt.sigreturn_policy.fpRestore(0x1008));
+}
