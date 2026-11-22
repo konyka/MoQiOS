@@ -636,6 +636,8 @@ fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
     }
     if (ref == .tcp and level == ipo.SOL_IP) {
         if (ipo.streamSetErrno4(optname)) |e| return e;
+        // do_ip_setsockopt: IP_RECVFRAGSIZE is for raw and datagram sockets.
+        if (optname == ipo.IP_RECVFRAGSIZE) return -22;
     }
     // IP_OPTIONS (do_ip_setsockopt → ip_options_get): up to 40 bytes of options a UDP, ping, raw or TCP socket's datagrams carry; 0 bytes clears
     // them; malformed ones (or, without CAP_NET_RAW, unknown ones) are EINVAL.
@@ -789,6 +791,20 @@ fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
         return copyOptOut(optval_ptr, optlen_ptr, buf[0..b.written]);
     }
     if (level == ipo.SOL_IPV6 and optname == @import("flowlabel_mgr.zig").IPV6_FLOWLABEL_MGR) return getFlowlabelMgr(ref, optval_ptr, optlen_ptr);
+    // IPV6_2292PKTOPTIONS: only a stream socket answers (ENOPROTOOPT otherwise), with the control messages its receive switches
+    // ask for; with none of them on that is nothing at all (length 0, optval untouched).
+    if (level == ipo.SOL_IPV6 and optname == ipo.IPV6_2292PKTOPTIONS) {
+        if (ref != .tcp) return -92;
+        const o = (@import("tcp.zig").tcpGetOptions(ref.tcp) orelse return -9).ip;
+        if (ipo.pktOptions6Empty(o)) {
+            const copy_mod = @import("../mm/copy_from_user.zig");
+            if (optlen_ptr == 0 or optlen_ptr >= 0x0000_8000_0000_0000) return -14;
+            var zero: [4]u8 = @splat(0);
+            if (copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &zero, 4) != 4) return -14;
+            return 0;
+        }
+        return -92;
+    }
     // IPV6_PATHMTU: struct ip6_mtuinfo with only the MTU of a connected socket's route filled in (the address stays zero, as
     // ipv6_getsockopt memsets it); an optlen under 32 bytes is EINVAL, no route (not connected) ENOTCONN.
     if (level == ipo.SOL_IPV6 and optname == ipo.IPV6_PATHMTU) {

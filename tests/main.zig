@@ -17973,4 +17973,9 @@ test "SOL_IP / SOL_IPV6 options the stack only stores, and the fixed answers of 
     const tc = p.keepEcnForDatagram(p.applySet(none, p.SOL_IPV6, p.IPV6_TCLASS, &[_]u8{ 1, 0, 0, 0 }), p.SOL_IPV6, p.IPV6_TCLASS, 1).ok;
     try std.testing.expectEqual(@as(u8, 1), tc.tclass);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_opt_source, "if (ipo.applyExtra(cur, level, optname, v, val.len, admin)) |r| return r;") != null);
+    // TCP (hello487 C, D): IPV6_2292PKTOPTIONS with no receive switch on reads back nothing; IP_RECVFRAGSIZE is EINVAL.
+    try std.testing.expect(p.pktOptions6Empty(none));
+    try std.testing.expect(!p.pktOptions6Empty(.{ .recvhops6 = true }));
+    try std.testing.expect(!p.pktOptions6Empty(s1));
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_opt_source, "if (optname == ipo.IP_RECVFRAGSIZE) return -22;") != null);
 }
