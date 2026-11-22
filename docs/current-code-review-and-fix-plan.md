@@ -11900,3 +11900,23 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - host 测试 "TIOCGPGRP answers only in the session that owns the console (hello485)" 和 `ioctl_policy.zig` 内联测试。
 - 已知差异：MoQiOS 只有一个控制台，属主会话由第一次访问决定；Linux 的控制终端在会话首进程打开终端时取得。
 
+
+## 补充：本端 shutdown(SHUT_RD) 之后的 poll 与 AF_UNIX 数据报的 shutdown（hello486）
+
+- 问题：本端 `shutdown(SHUT_RD)` 之后 poll 不报 `POLLRDHUP`（AF_UNIX 流、seqpacket 只有 `POLLIN`，TCP 同样）；AF_UNIX 数据报套接字的 shutdown 完全不生效（只对面向连接的套接字记录标志），未连接的 AF_UNIX 套接字 shutdown 返回 ENOTCONN。
+- Linux 行为（`net/unix/af_unix.c`、`net/ipv4/tcp.c`，宿主机实测）：
+  - `tcp_poll`、`unix_poll`、`unix_dgram_poll` 遇到 `RCV_SHUTDOWN` 都报 `EPOLLIN | EPOLLRDNORM | EPOLLRDHUP`，`SHUTDOWN_MASK` 再加 `EPOLLHUP`；从未连接的流套接字（`TCP_CLOSE`）报 `POLLOUT | POLLHUP`。
+  - `unix_shutdown` 不检查连接状态，任何类型都记下标志，只有流和 seqpacket 把半关闭镜像到对端。
+  - `unix_dgram_sendmsg`：本端 `SEND_SHUTDOWN` 或接收方 `RCV_SHUTDOWN` 为 EPIPE（按绑定名 `sendto` 也一样），且不发 SIGPIPE（只有 `unix_stream_sendmsg` 发）。
+  - `unix_dgram_recvmsg`：`RCV_SHUTDOWN` 后先读完已排队的报文，之后非阻塞为 EAGAIN，阻塞读返回 0。
+- 修复：
+  - `tcp_ready_policy.events`：`RDHUP` 跟随 `read_done`（对端 FIN、本端 `SHUT_RD`、已关闭）。
+  - `unix_epoll_policy.State` 新增 `own_shut_rd`、`own_shut_wr`、`never_connected`；`unixEpollEvents` 填充。
+  - `unixShutdown`：去掉 ENOTCONN，任何类型都记标志；只在已连接时通知对端；SHUT_WR 唤醒本端写方、SHUT_RD 唤醒发往本端的套接字的写方。
+  - 数据报读：`unixDgramReadShut`（本端 `shut_rd`）让阻塞的 recv、read、MSG_PEEK 在空队列上返回 0 而不是等待，非阻塞仍为 EAGAIN；`parkOn` 的读等待条件也看它。数据报发送检查 `sock.shut_wr or peer.shut_rd`。
+  - `namespace_policy.unixRaisesSigpipe` / `unixSendResult`：AF_UNIX 的 write、sendto、sendmsg 只在流套接字上发 SIGPIPE（seqpacket 原来也发，与 Linux 不同）。
+- 宿主机实测（`user/hello486.c -DHOST`）：A–J 全部通过；改前 MoQiOS 上 B、C、D 失败；第一版修复把数据报的 EOF 放进 `shutEofLocked`，非阻塞读也变成 0，E 失败，改为只在阻塞路径返回 0 后全部通过。
+- TCP：`shutdown` 成功后对该 TCB 调 `epollNotify`，epoll 等待者立即看到新的 `IN|RDHUP`。
+- host 测试：`tests/unix_epoll_test.zig` 新增 2 个；`tests/main.zig` 的 TCP readiness 两个测试按 `tcp_poll` 改为本端 `SHUT_RD` 报 `RDHUP`，新增 "AF_UNIX: datagram and seqpacket EPIPE raise no SIGPIPE …"，seqpacket 和 sendResult 的源码断言同步。
+- 验证：host 测试全部通过；完整 smoke SMP=2 `PASS`（0 FAIL）；SMP=1 hello486 PASS，退出码 1 只因文档已记录的偶发项 hello108（两份并行时宿主机 load 约 7）；另一份并行的 SMP=2 停在 hello151 B 段（文档已记录的间歇性停顿），单独重跑通过。
+- 已知差异：无新增。

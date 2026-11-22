@@ -205,6 +205,16 @@ pub fn sendResult(result: i64, msg_flags: u32) i64 {
     return result;
 }
 
+/// sendResult for an AF_UNIX socket: only unix_stream_sendmsg raises SIGPIPE;
+/// the datagram and seqpacket paths (unix_dgram_sendmsg) report EPIPE without it.
+pub fn unixRaisesSigpipe(result: i64, msg_flags: u32, stream: bool) bool {
+    return stream and raisesSigpipe(result, msg_flags);
+}
+
+pub fn unixSendResult(result: i64, msg_flags: u32, stream: bool) i64 {
+    return if (stream) sendResult(result, msg_flags) else result;
+}
+
 /// Whether read() asks the descriptor for another chunk after a full one.
 /// Regular files always have the next bytes; a pipe, socket or device may have
 /// none yet, and a blocking read would then wait for data the caller never

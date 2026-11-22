@@ -1113,9 +1113,9 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
                 .ok => |n| n,
                 .err => |e| return e,
             };
-            return @import("../fs/namespace_policy.zig").sendResult(net_mod.unix_socket.unixSendToBlocking(unix_idx, &tmp_unix, n_unix, dest_buf[2..][0..dlen], @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), flags)), flags);
+            return @import("../fs/namespace_policy.zig").unixSendResult(net_mod.unix_socket.unixSendToBlocking(unix_idx, &tmp_unix, n_unix, dest_buf[2..][0..dlen], @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), flags)), flags, net_mod.unix_socket.unixIsStream(unix_idx));
         }
-        return @import("../fs/namespace_policy.zig").sendResult(net_mod.unix_socket.unixSendBlocking(unix_idx, &tmp_unix, n_unix, @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), flags)), flags);
+        return @import("../fs/namespace_policy.zig").unixSendResult(net_mod.unix_socket.unixSendBlocking(unix_idx, &tmp_unix, n_unix, @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), flags)), flags, net_mod.unix_socket.unixIsStream(unix_idx));
     } else {
         // Not a socket — use regular write
         var tmp_buf: [4096]u8 = undefined;
@@ -1220,6 +1220,10 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
             result = net_mod.unix_socket.unixPeek(unix_idx, &tmp_buf, to_read, &full_len_u);
             // Like a blocking read, a peek waits for something to look at.
             while (result == -11 and !nonblock_u) {
+                if (net_mod.unix_socket.unixDgramReadShut(unix_idx)) {
+                    result = 0;
+                    break;
+                }
                 const w = net_mod.unix_socket.unixWaitReadable(unix_idx);
                 if (w != 0) return w;
                 result = net_mod.unix_socket.unixPeek(unix_idx, &tmp_buf, to_read, &full_len_u);
@@ -1676,7 +1680,10 @@ pub fn shutdown(fd: u32, how: u32) i64 {
         return net_mod.unix_socket.unixShutdown(cur.fd_table.fds[fd].unix_sock_idx, how);
     }
     if (cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88; // ENOTSOCK
-    const result = net_mod.tcp.tcpShutdown(cur.fd_table.fds[fd].tcb_idx, how);
+    const tcb_idx = cur.fd_table.fds[fd].tcb_idx;
+    const result = net_mod.tcp.tcpShutdown(tcb_idx, how);
+    // sk_state_change: an epoll waiter on this socket sees the new IN | RDHUP (or OUT) at once.
+    if (result == 0) @import("epoll.zig").epollNotify(.tcp_socket, tcb_idx, net_mod.tcp.tcpReadiness(tcb_idx));
     return result;
 }
 
@@ -1824,6 +1831,10 @@ fn unixRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8
         var full: usize = 0;
         n = net_mod.unix_socket.unixPeek(idx, &data, room, &full);
         while (n == -11 and !nonblock) {
+            if (net_mod.unix_socket.unixDgramReadShut(idx)) {
+                n = 0;
+                break;
+            }
             const w = net_mod.unix_socket.unixWaitReadable(idx);
             if (w != 0) return w;
             n = net_mod.unix_socket.unixPeek(idx, &data, room, &full);
@@ -2483,7 +2494,7 @@ pub fn sendmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
     if (fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .unix_socket) {
         var hdr: [56]u8 = undefined;
         if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;
-        return @import("../fs/namespace_policy.zig").sendResult(unixSendmsg(cur, fd, &hdr), flags);
+        return @import("../fs/namespace_policy.zig").unixSendResult(unixSendmsg(cur, fd, &hdr), flags, net_mod.unix_socket.unixIsStream(cur.fd_table.fds[fd].unix_sock_idx));
     }
     if (fd < vfs_mod.MAX_FDS and flags & urg.MSG_OOB != 0 and (cur.fd_table.fds[fd].fd_type == .udp_socket or cur.fd_table.fds[fd].fd_type == .raw_socket)) return -95;
     if (fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .udp_socket) {

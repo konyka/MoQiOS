@@ -187,9 +187,26 @@ fn halfCloseLocked(idx: u32) np.HalfClose {
     return h;
 }
 
-/// An empty ring on stream `idx` reads EOF because of a shutdown (unix_lock held).
+/// An empty ring on connection-oriented `idx` reads EOF because of a shutdown (unix_lock held).
 fn shutEofLocked(idx: u32) bool {
     return connectionOriented(unix_sockets[idx].sock_type) and np.halfCloseReadEof(halfCloseLocked(idx));
+}
+
+/// A datagram socket that shut its read side (unix_lock held): unix_dgram_recvmsg
+/// stops waiting on RCV_SHUTDOWN, so a blocking read of the empty queue returns 0
+/// while a non-blocking one is still EAGAIN.
+fn dgramReadShutLocked(idx: u32) bool {
+    const sock = &unix_sockets[idx];
+    return !connectionOriented(sock.sock_type) and sock.shut_rd;
+}
+
+/// dgramReadShutLocked for callers outside the lock: a blocking reader that got
+/// EAGAIN returns 0 instead of waiting.
+pub fn unixDgramReadShut(idx: u32) bool {
+    if (idx >= MAX_UNIX_SOCKETS) return false;
+    const saved = unix_lock.acquire();
+    defer unix_lock.release(saved);
+    return unix_sockets[idx].active and dgramReadShutLocked(idx);
 }
 
 // ── SCM_RIGHTS: descriptors in flight ──────────────────────────────────────
@@ -994,6 +1011,9 @@ pub fn unixSendRightsTo(idx: u32, data: [*]const u8, len: usize, rights: ?*Right
         if (sock.sock_type == SOCK_SEQPACKET) {
             if (!peer.connected or peer.peer_idx != @as(u8, @intCast(idx))) return -32; // EPIPE
             if (np.halfCloseSendBroken(halfCloseLocked(idx))) return -32; // EPIPE: shutdown(SHUT_WR) here or SHUT_RD at the peer
+        } else {
+            // unix_dgram_sendmsg: this end shut its writing side, or the receiver its reading side.
+            if (sock.shut_wr or peer.shut_rd) return -32; // EPIPE
         }
         // For DGRAM, write the datagram length prefix (2 bytes LE) + data
         const total = 2 + len;
@@ -1526,7 +1546,7 @@ fn parkOn(idx: u32, kind: WaitKind, min_room: u32, deadline: ?u64) i64 {
         // The condition may have changed between the caller's check and now;
         // the wake side holds this same lock, so re-testing here loses no wake-up.
         const still = switch (kind) {
-            .read => sock.buf_count == 0 and !shutEofLocked(idx) and (!connectionOriented(sock.sock_type) or sock.connected or queuedOnBacklogLocked(idx)),
+.read => sock.buf_count == 0 and !shutEofLocked(idx) and !dgramReadShutLocked(idx) and (!connectionOriented(sock.sock_type) or sock.connected or queuedOnBacklogLocked(idx)),
             .accept => sock.backlog_count == 0 and sock.listening,
             // A writer waits while the peer's ring has no room; with no peer
             // to wait for the caller re-tries and gets the real error.
@@ -1602,6 +1622,7 @@ pub fn unixRecvBlockingRights(idx: u32, buf: [*]u8, len: usize, nonblock: bool, 
         const r = unixRecvRights(idx, buf, len, out);
         reapZombies();
         if (r != -11 or nonblock) return r;
+        if (unixDgramReadShut(idx)) return 0;
         if (!armed) {
             const ms = if (unixOptView(idx)) |v| v.opts.rcv_ms else 0;
             deadline = urp.deadlineNs(tsc.nanos(), ms);
@@ -1734,8 +1755,11 @@ fn wakeWaitList(head: *?*WaitNode) void {
 /// shutdown(how): SHUT_RD(0) / SHUT_WR(1) / SHUT_RDWR(2). The flags are kept
 /// per end: SHUT_WR makes this end's sends fail (EPIPE) and the peer read EOF
 /// once its ring is drained; SHUT_RD makes this end read EOF and the peer's
-/// sends fail. The opposite direction keeps working. An unconnected socket is
-/// ENOTCONN.
+/// sends fail. The opposite direction keeps working. Like unix_shutdown, any
+/// type and any state takes the flags: a datagram socket that shut its read
+/// side refuses sends into it (EPIPE) and reads EOF once drained, and an
+/// unconnected socket shuts down with 0. Only a connection-oriented peer gets
+/// the mirrored half-close.
 pub fn unixShutdown(idx: u32, how: u32) i64 {
     if (how > 2) return -22;
     if (idx >= MAX_UNIX_SOCKETS) return -9;
@@ -1745,13 +1769,12 @@ pub fn unixShutdown(idx: u32, how: u32) i64 {
     defer unix_lock.release(saved);
     const sock = &unix_sockets[idx];
     if (!sock.active) return -9;
-    if (!sock.connected) return -107; // ENOTCONN
     const shut_rd = how == 0 or how == 2;
     const shut_wr = how == 1 or how == 2;
-    if (connectionOriented(sock.sock_type)) {
-        if (shut_rd) sock.shut_rd = true;
-        if (shut_wr) sock.shut_wr = true;
-    }
+    if (shut_rd) sock.shut_rd = true;
+    if (shut_wr) sock.shut_wr = true;
+    if (shut_wr) wake.out |= EpollWake.bit(idx);
+    if (shut_rd) wake.out |= sendersIntoLocked(idx);
     // Everyone whose wait condition just changed: this end's readers (EOF) and
     // writers (EPIPE), and the same on the peer.
     if (shut_rd or shut_wr) {
@@ -1759,7 +1782,7 @@ pub fn unixShutdown(idx: u32, how: u32) i64 {
         wakeWaitList(&sock.read_waiters);
         wakeWaitList(&sock.write_waiters);
     }
-    if (sock.peer_idx < MAX_UNIX_SOCKETS) {
+    if (sock.connected and sock.peer_idx < MAX_UNIX_SOCKETS) {
         const peer = &unix_sockets[sock.peer_idx];
         if (peer.active and peer.peer_idx == @as(u8, @intCast(idx))) {
             wake.hup |= EpollWake.bit(sock.peer_idx);
@@ -1811,6 +1834,9 @@ pub fn unixEpollEvents(idx: u32) u32 {
         .send_broken = connectionOriented(sock.sock_type) and np.halfCloseSendBroken(halfCloseLocked(idx)),
         .peer_shut_wr = connectionOriented(sock.sock_type) and halfCloseLocked(idx).peer_shut_wr,
         .connect_pending = connectionOriented(sock.sock_type) and !sock.connected and queuedOnBacklogLocked(idx),
+        .own_shut_rd = sock.shut_rd,
+        .own_shut_wr = sock.shut_wr,
+        .never_connected = sock.sock_type == SOCK_STREAM and !sock.connected and !sock.was_connected,
         .peer_free = sendRoomLocked(idx),
     });
 }

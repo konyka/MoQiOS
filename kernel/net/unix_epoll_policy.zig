@@ -31,6 +31,14 @@ pub const State = struct {
     /// Records keep their boundaries (datagram, seqpacket): a send needs room for
     /// the length prefix plus a byte, even on a connection-oriented socket.
     msg_boundaries: bool = false,
+    /// This socket shut its own read side (any type): unix_poll and unix_dgram_poll report
+    /// RCV_SHUTDOWN as EPOLLIN | EPOLLRDHUP.
+    own_shut_rd: bool = false,
+    /// This socket shut its own write side; with own_shut_rd both directions are shut (EPOLLHUP).
+    own_shut_wr: bool = false,
+    /// STREAM only: never connected (not a peer that went away): unix_poll reports TCP_CLOSE as
+    /// EPOLLHUP and the socket writable, but nothing to read.
+    never_connected: bool = false,
     /// Free bytes in the ring of the peer this socket sends into; null when
     /// there is no valid peer to block on (send fails immediately instead).
     peer_free: ?u32,
@@ -39,6 +47,8 @@ pub const State = struct {
 pub fn events(s: State) u32 {
     var ev: u32 = 0;
     if (s.rx_bytes > 0 or s.read_eof) ev |= EPOLLIN;
+    if (s.own_shut_rd) ev |= EPOLLIN | EPOLLRDHUP;
+    if (s.own_shut_rd and s.own_shut_wr) ev |= EPOLLHUP;
     if (s.send_broken) ev |= EPOLLOUT;
     if (s.stream and s.listening) {
         // Linux never reports a listening socket writable or hung up.
@@ -47,7 +57,10 @@ pub fn events(s: State) u32 {
     }
     if (s.stream and s.connect_pending) return ev;
     if (s.stream and s.peer_shut_wr) ev |= EPOLLRDHUP;
-    if (s.stream and s.disconnected) return ev | EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP;
+    if (s.stream and s.disconnected) {
+        if (s.never_connected) return ev | EPOLLOUT | EPOLLHUP;
+        return ev | EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP;
+    }
     if (s.peer_free) |free| {
         const min_room: u32 = if (s.stream and !s.msg_boundaries) 1 else DGRAM_MIN_ROOM;
         if (free >= min_room) ev |= EPOLLOUT;

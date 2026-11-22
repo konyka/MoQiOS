@@ -10769,8 +10769,25 @@ test "socket send: EPIPE raises SIGPIPE unless MSG_NOSIGNAL" {
 }
 
 test "every socket send entry point routes its result through sendResult" {
-    try std.testing.expect(std.mem.count(u8, kt.vfs_source, "sendResult(") >= 2);
-    try std.testing.expect(std.mem.count(u8, kt.socket_syscall_source, "sendResult(") >= 4);
+    try std.testing.expect(std.mem.count(u8, kt.vfs_source, ".sendResult(") >= 1);
+    try std.testing.expect(std.mem.count(u8, kt.socket_syscall_source, ".sendResult(") >= 3);
+    // AF_UNIX entry points raise SIGPIPE only for a stream socket (unix_stream_sendmsg).
+    try std.testing.expect(std.mem.count(u8, kt.vfs_source, "unixSendResult(") == 1);
+    try std.testing.expect(std.mem.count(u8, kt.socket_syscall_source, "unixSendResult(") == 3);
+}
+
+test "AF_UNIX: datagram and seqpacket EPIPE raise no SIGPIPE, a stream EPIPE does (hello486 G)" {
+    const np = kt.namespace_policy;
+    try std.testing.expect(!np.unixRaisesSigpipe(-32, 0, false));
+    try std.testing.expect(np.unixRaisesSigpipe(-32, 0, true));
+    try std.testing.expect(!np.unixRaisesSigpipe(-32, np.MSG_NOSIGNAL, true));
+    // A datagram socket's shutdown takes effect on send and recv, any state; the peer half-close stays connection-only.
+    const src = kt.unix_socket_source;
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (sock.shut_wr or peer.shut_rd) return -32; // EPIPE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (r != -11 or nonblock) return r;\n        if (unixDgramReadShut(idx)) return 0;") != null);
+    try std.testing.expect(std.mem.count(u8, kt.socket_syscall_source, "unixDgramReadShut(") == 2);
+    try std.testing.expect(std.mem.indexOf(u8, src, "    if (shut_rd) sock.shut_rd = true;\n    if (shut_wr) sock.shut_wr = true;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (!sock.connected) return -107; // ENOTCONN\n    const shut_rd") == null);
 }
 
 test "tcp: shutdown(SHUT_RD) makes reads EOF and is wired into the data path" {
@@ -10801,10 +10818,10 @@ test "tcp readiness: idle, data, peer EOF, our SHUT_RD, reset, closed" {
     var cw = idle;
     cw.state = S.close_wait;
     try std.testing.expectEqual(@as(u32, rd.IN | rd.OUT | rd.RDHUP), rd.events(cw));
-    // Our SHUT_RD: a read returns EOF at once.
+    // Our SHUT_RD: a read returns EOF at once, and tcp_poll reports RCV_SHUTDOWN as RDHUP.
     var sr = idle;
     sr.shut_rd = true;
-    try std.testing.expectEqual(@as(u32, rd.IN | rd.OUT), rd.events(sr));
+    try std.testing.expectEqual(@as(u32, rd.IN | rd.OUT | rd.RDHUP), rd.events(sr));
     // Both sides finished: hang-up.
     var both = idle;
     both.state = S.last_ack;
@@ -10842,7 +10859,7 @@ test "poll and epoll share the TCP readiness function" {
     try std.testing.expect(std.mem.indexOf(u8, kt.epoll_source, "tcp.tcpReadiness(resource_idx)") != null);
 }
 
-test "tcp readiness: RDHUP follows the peer's FIN, not our own shutdown" {
+test "tcp readiness: RDHUP follows the peer's FIN and our own SHUT_RD, not our SHUT_WR" {
     const rd = kt.tcp_ready_policy;
     const S = kt.tcp_recv_policy.TcpState;
     const idle: rd.Snapshot = .{ .active = true, .state = S.established, .recv_bytes = 0, .send_space = 100, .reset_by_peer = false, .shut_rd = false, .fin_pending = false };
@@ -10853,10 +10870,10 @@ test "tcp readiness: RDHUP follows the peer's FIN, not our own shutdown" {
         s.state = st;
         try std.testing.expect(rd.events(s) & rd.RDHUP != 0);
     }
-    // Our own SHUT_RD / SHUT_WR do not make the peer "hang up".
+    // tcp_poll: RCV_SHUTDOWN (peer FIN or our own SHUT_RD) is RDHUP; our SHUT_WR is not.
     var sr = idle;
     sr.shut_rd = true;
-    try std.testing.expectEqual(@as(u32, 0), rd.events(sr) & rd.RDHUP);
+    try std.testing.expect(rd.events(sr) & rd.RDHUP != 0);
     var sw = idle;
     sw.fin_pending = true;
     try std.testing.expectEqual(@as(u32, 0), rd.events(sw) & rd.RDHUP);
@@ -11292,7 +11309,7 @@ test "socket(AF_UNIX, SOCK_SEQPACKET): type matrix and the listen/connect/accept
     // Half-close, send room and epoll treat seqpacket like a stream.
     try std.testing.expect(std.mem.indexOf(u8, src, "return connectionOriented(unix_sockets[idx].sock_type) and np.halfCloseReadEof(halfCloseLocked(idx));") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "if (connectionOriented(sock.sock_type)) {\n        if (!sock.connected or !peer.connected or peer.peer_idx != @as(u8, @intCast(idx))) return null;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, src, "if (connectionOriented(sock.sock_type)) {\n        if (shut_rd) sock.shut_rd = true;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (sock.connected and sock.peer_idx < MAX_UNIX_SOCKETS) {") != null);
 }
 
 test "cpu_time_policy: process totals, reclaimed threads and waited-for children" {

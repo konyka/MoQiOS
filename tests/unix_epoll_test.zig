@@ -93,3 +93,21 @@ test "datagram never reports HUP" {
     };
     try std.testing.expectEqual(p.EPOLLIN | p.EPOLLOUT, p.events(s));
 }
+
+test "own SHUT_RD reports IN | RDHUP on every type, SHUT_RDWR adds HUP (unix_poll / unix_dgram_poll)" {
+    var s: p.State = .{ .stream = false, .rx_bytes = 0, .listening = false, .pending_connections = 0, .disconnected = false, .peer_free = 100, .own_shut_rd = true };
+    try std.testing.expectEqual(p.EPOLLIN | p.EPOLLOUT | p.EPOLLRDHUP, p.events(s));
+    s.own_shut_wr = true;
+    try std.testing.expectEqual(p.EPOLLIN | p.EPOLLOUT | p.EPOLLRDHUP | p.EPOLLHUP, p.events(s));
+    var st = connectedStream(0, 100);
+    st.own_shut_rd = true;
+    st.read_eof = true;
+    try std.testing.expectEqual(p.EPOLLIN | p.EPOLLOUT | p.EPOLLRDHUP, p.events(st));
+}
+
+test "a never-connected stream reports OUT | HUP, and IN | RDHUP once it shut its read side" {
+    var s: p.State = .{ .stream = true, .rx_bytes = 0, .listening = false, .pending_connections = 0, .disconnected = true, .never_connected = true, .peer_free = null };
+    try std.testing.expectEqual(p.EPOLLOUT | p.EPOLLHUP, p.events(s));
+    s.own_shut_rd = true;
+    try std.testing.expectEqual(p.EPOLLIN | p.EPOLLOUT | p.EPOLLHUP | p.EPOLLRDHUP, p.events(s));
+}
