@@ -125,10 +125,9 @@ pub const IpOpts = struct {
     /// way to the loopback frame (lo.Meta). Never stored with the socket's options.
     skb_mark: u32 = 0,
     skb_prio: u32 = 0,
-    /// Options that are only stored and read back here (the stack has no path that consults them): the RFC 2292 receive switches,
-    /// IPV6_RECVHOPOPTS/RTHDR/DSTOPTS/FRAGSIZE, IPV6_ROUTER_ALERT_ISOLATE, IPV6_RECVERR_RFC4884, FREEBIND, MINHOPCOUNT and
-    /// IPV6_ADDR_PREFERENCES; their IPv4 counterparts IP_FREEBIND, IP_PASSSEC, IP_MINTTL, IP_CHECKSUM, IP_BIND_ADDRESS_NO_PORT,
-    /// IP_RECVFRAGSIZE, IP_RECVERR_RFC4884 and IP_LOCAL_PORT_RANGE.
+    /// Option flags shared by the protocol paths. The RFC 2292 receive switches, IPV6_RECVHOPOPTS/RTHDR/DSTOPTS/FRAGSIZE,
+    /// IPV6_ROUTER_ALERT_ISOLATE, IPV6_RECVERR_RFC4884, IPV6_ADDR_PREFERENCES, IP_PASSSEC, IP_CHECKSUM, IP_BIND_ADDRESS_NO_PORT,
+    /// IP_RECVFRAGSIZE and IP_RECVERR_RFC4884 are only stored; FREEBIND/TRANSPARENT and MINHOPCOUNT/MINTTL affect bind and TCP input.
     flags6: u16 = 0,
     flags4: u16 = 0,
     min_hops6: u8 = 0,
@@ -137,7 +136,7 @@ pub const IpOpts = struct {
     port_range4: u32 = 0,
 };
 
-/// Bits of IpOpts.flags6 / flags4 (stored-only switches).
+/// Bits of IpOpts.flags6 / flags4.
 pub const F6_2292PKTINFO: u16 = 1 << 0;
 pub const F6_2292HOPOPTS: u16 = 1 << 1;
 pub const F6_2292DSTOPTS: u16 = 1 << 2;
@@ -298,6 +297,16 @@ pub fn applyExtra(cur: IpOpts, level: u64, optname: u64, v: i32, int_len: usize,
     return applyExtraCaps(cur, level, optname, v, int_len, has_net_admin, has_net_admin);
 }
 
+/// Linux has one INET_FLAGS_FREEBIND bit shared by IP_FREEBIND and IPV6_FREEBIND.
+pub fn freebind(o: IpOpts) bool {
+    return o.flags4 & F4_FREEBIND != 0 or o.flags6 & F6_FREEBIND != 0;
+}
+
+/// IP_TRANSPARENT and IPV6_TRANSPARENT share INET_FLAGS_TRANSPARENT.
+pub fn transparent(o: IpOpts) bool {
+    return o.flags4 & F4_TRANSPARENT != 0 or o.flags6 & F6_TRANSPARENT != 0;
+}
+
 /// applyExtra with CAP_NET_RAW apart from "CAP_NET_RAW or CAP_NET_ADMIN" (`may_transparent`): the sticky hop-by-hop and
 /// destination-option headers need CAP_NET_RAW (ipv6_set_opt_hdr), IP_TRANSPARENT / IPV6_TRANSPARENT either one.
 pub fn applyExtraCaps(cur: IpOpts, level: u64, optname: u64, v: i32, int_len: usize, may_transparent: bool, has_net_raw: bool) ?SetResult {
@@ -307,6 +316,13 @@ pub fn applyExtraCaps(cur: IpOpts, level: u64, optname: u64, v: i32, int_len: us
 /// applyExtraCaps for a raw socket (`raw`): IP_ROUTER_ALERT (ip_ra_control) and IP_NODEFRAG are its options and are stored.
 pub fn applyExtraFor(cur: IpOpts, level: u64, optname: u64, v: i32, int_len: usize, may_transparent: bool, has_net_raw: bool, raw: bool) ?SetResult {
     const has_net_admin = may_transparent;
+    if ((level == SOL_IP and optname == IP_FREEBIND) or (level == SOL_IPV6 and optname == IPV6_FREEBIND)) {
+        if (int_len < 4) return .{ .err = -22 };
+        var o = cur;
+        o.flags4 = setFlag(o.flags4, F4_FREEBIND, v != 0);
+        o.flags6 = setFlag(o.flags6, F6_FREEBIND, v != 0);
+        return .{ .ok = o };
+    }
     if (raw and level == SOL_IP and (optname == IP_ROUTER_ALERT or optname == IP_NODEFRAG)) {
         var r = cur;
         // ip_ra_control: turning the alert on again while this socket is on the chain is EADDRINUSE.
@@ -407,6 +423,7 @@ pub fn applyExtraFor(cur: IpOpts, level: u64, optname: u64, v: i32, int_len: usi
 /// getsockopt of the options applyExtra handles: the stored value, a fixed one, or (as `err`) the errno Linux answers. Null: not
 /// one of them.
 pub fn getExtra(o: IpOpts, level: u64, optname: u64) ?union(enum) { val: i32, err: i64 } {
+    if ((level == SOL_IP and optname == IP_FREEBIND) or (level == SOL_IPV6 and optname == IPV6_FREEBIND)) return .{ .val = @intFromBool(freebind(o)) };
     switch (level) {
         SOL_IPV6 => switch (optname) {
             // IPV6_ADDRFORM on a UDP socket that is not connected, IPV6_MTU without a route.

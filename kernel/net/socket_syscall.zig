@@ -314,7 +314,7 @@ fn rawBind6(d: *vfs_mod.FileDescriptor, addr_ptr: u64, addr_len: u32) i64 {
     if (@import("raw_icmp_policy.zig").isMapped6(parsed.addr)) return -99;
     const scope_rc = bind_addr_policy.inet6ScopeErrno(parsed.addr, parsed.scope, nic_mod.isActive());
     if (scope_rc != 0) return scope_rc;
-    if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;
+    if (bindAddrNotAvail6For(d, parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;
     _ = @import("raw_icmp.zig").bind6(d.raw_idx, parsed.addr);
     return 0;
 }
@@ -356,7 +356,7 @@ fn rawBind(d: *vfs_mod.FileDescriptor, addr_ptr: u64, addr_len: u32) i64 {
     };
     // raw_bind checks the address type only (inet_addr_type_table): a group or a broadcast address is EADDRNOTAVAIL.
     const a = parsed.addr;
-    if ((a[0] >= 224 and a[0] <= 239) or (a[0] == 255 and a[1] == 255 and a[2] == 255 and a[3] == 255) or bindAddrNotAvail4(a)) return -99;
+    if ((a[0] >= 224 and a[0] <= 239) or (a[0] == 255 and a[1] == 255 and a[2] == 255 and a[3] == 255) or bindAddrNotAvail4For(d, a)) return -99;
     _ = @import("raw_icmp.zig").bind(d.raw_idx, a);
     return 0;
 }
@@ -715,6 +715,23 @@ fn bindAddrNotAvail6(addr: [16]u8) bool {
     return !bind_addr_policy.inet6Bindable(addr, nic, ndp.hasLocalAddress(addr));
 }
 
+fn nonlocalBindAllowedFor(d: *const vfs_mod.FileDescriptor) bool {
+    return switch (d.fd_type) {
+        .udp_socket => if (udp.getPortOpts(d.udpKey())) |o| ip_opt_policy.freebind(o.ip) or ip_opt_policy.transparent(o.ip) else false,
+        .raw_socket => if (@import("raw_icmp.zig").getOpts(d.raw_idx)) |o| ip_opt_policy.freebind(o.ip) or ip_opt_policy.transparent(o.ip) else false,
+        .tcp_socket => if (net_mod.tcp.tcpGetOptions(d.tcb_idx)) |o| ip_opt_policy.freebind(o.ip) or ip_opt_policy.transparent(o.ip) else false,
+        else => false,
+    };
+}
+
+fn bindAddrNotAvail4For(d: *const vfs_mod.FileDescriptor, addr: [4]u8) bool {
+    return !nonlocalBindAllowedFor(d) and bindAddrNotAvail4(addr);
+}
+
+fn bindAddrNotAvail6For(d: *const vfs_mod.FileDescriptor, addr: [16]u8) bool {
+    return !nonlocalBindAllowedFor(d) and bindAddrNotAvail6(addr);
+}
+
 /// bind(fd, addr_ptr, addr_len) → 0 or -errno
 pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
@@ -757,7 +774,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         if (fam_rc != 0) return fam_rc;
         const parsed = sa.parseInet6(&pa6) orelse return -97;
         const dev_ok = parsed.scope_id == bind_addr_policy.LO_IFINDEX or (nic_mod.isActive() and parsed.scope_id == bind_addr_policy.NIC_IFINDEX);
-        const addr_rc = pp6.bindAddrErrno6(parsed.addr, bind_addr_policy.needsScope6(parsed.addr), parsed.scope_id, dev_ok, !bindAddrNotAvail6(parsed.addr));
+        const addr_rc = pp6.bindAddrErrno6(parsed.addr, bind_addr_policy.needsScope6(parsed.addr), parsed.scope_id, dev_ok, !bindAddrNotAvail6For(&t.fd_table.fds[fd], parsed.addr));
         if (addr_rc != 0) return addr_rc;
         const d6 = &t.fd_table.fds[fd];
         const bind_rc6 = pp6.bindErrno(d6.udp_ping_bound);
@@ -781,7 +798,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         if (!@import("socket_address_policy.zig").inet4FamilyValid(bo.readU16Le(pa[0..2]))) return -97;
         const addr4 = [4]u8{ pa[4], pa[5], pa[6], pa[7] };
         const pp = @import("ping_policy.zig");
-        if (!pp.bindAddrAllowed(addr4, !bindAddrNotAvail4(addr4))) return bind_addr_policy.EADDRNOTAVAIL;
+        if (!pp.bindAddrAllowed(addr4, !bindAddrNotAvail4For(&t.fd_table.fds[fd], addr4))) return bind_addr_policy.EADDRNOTAVAIL;
         const d = &t.fd_table.fds[fd];
         const bind_rc = pp.bindErrno(d.udp_ping_bound);
         if (bind_rc != 0) return bind_rc;
@@ -809,7 +826,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
             const parsed = sa.parseInet6(&sa6) orelse return -97; // EAFNOSUPPORT
             const scope_rc = bind_addr_policy.inet6ScopeErrno(parsed.addr, parsed.scope_id, nic_mod.isActive());
             if (scope_rc != 0) return scope_rc;
-            if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;
+            if (bindAddrNotAvail6For(&t.fd_table.fds[fd], parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;
             if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
             return udpRebind(t, fd, parsed.port, .{ 0, 0, 0, 0 }, parsed.addr, bind_addr_policy.boundDev6(parsed.addr, parsed.scope_id));
         }
@@ -819,7 +836,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         if (n4 < SOCKADDR_IN_MIN_LEN) return -22;
         // Accept legacy callers that only filled port+addr; family may be unset.
         const new_port = bo.readU16BeAt(&sock_addr, 2);
-        if (bindAddrNotAvail4(.{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] })) return bind_addr_policy.EADDRNOTAVAIL;
+        if (bindAddrNotAvail4For(&t.fd_table.fds[fd], .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] })) return bind_addr_policy.EADDRNOTAVAIL;
         if (net_mod.tcp_port_policy.bindNeedsPrivilege(new_port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
         return udpRebind(t, fd, new_port, .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] }, @splat(0), 0);
     }
@@ -840,7 +857,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         if (stream_rc != 0) return stream_rc;
         const scope_rc = bind_addr_policy.inet6ScopeErrno(parsed.addr, parsed.scope_id, nic_mod.isActive());
         if (scope_rc != 0) return scope_rc;
-        if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;
+        if (bindAddrNotAvail6For(&t.fd_table.fds[fd], parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;
         if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
         return net_mod.tcp.tcpBindAddr46(tcb_idx, parsed.port, net_mod.tcp_port_policy.WILDCARD4, parsed.addr, bind_addr_policy.boundDev6(parsed.addr, parsed.scope_id));
     }
@@ -850,7 +867,7 @@ pub fn bind(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
     if (copy.copyFromUser(&sock_addr, @ptrFromInt(addr_ptr), SOCKADDR_IN_MIN_LEN) != SOCKADDR_IN_MIN_LEN) return -14;
     if (!@import("socket_address_policy.zig").inet4FamilyValid(bo.readU16Le(sock_addr[0..2]))) return -97; // EAFNOSUPPORT
     const port = bo.readU16BeAt(&sock_addr, 2);
-    if (bindAddrNotAvail4(.{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] })) return bind_addr_policy.EADDRNOTAVAIL;
+    if (bindAddrNotAvail4For(&t.fd_table.fds[fd], .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] })) return bind_addr_policy.EADDRNOTAVAIL;
     if (net_mod.tcp_port_policy.bindNeedsPrivilege(port) and !cap_mod.hasSysCap(cur_idx, "cap_net_bind")) return net_mod.tcp_port_policy.BIND_EACCES;
     return net_mod.tcp.tcpBindAddr(tcb_idx, port, .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] });
 }

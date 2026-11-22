@@ -13091,10 +13091,10 @@ test "bind(): an address the host does not have is EADDRNOTAVAIL, checked before
     try std.testing.expect(bp.inet6Bindable(doc, up, true));
     // Wiring: every bind path (TCP/UDP x IPv4/IPv6, and the IPv6 raw socket) asks the policy before the port rules.
     const ss = kt.socket_syscall_source;
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "if (bindAddrNotAvail4("));
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, ss, "if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;"));
-    try std.testing.expect(std.mem.indexOf(u8, ss, "if (bindAddrNotAvail6(parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;\n        if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ss, "if (bindAddrNotAvail4(.{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] })) return bind_addr_policy.EADDRNOTAVAIL;\n    if (net_mod.tcp_port_policy.bindNeedsPrivilege(port)") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "if (bindAddrNotAvail4For("));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, ss, "if (bindAddrNotAvail6For("));
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (bindAddrNotAvail6For(&t.fd_table.fds[fd], parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;\n        if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (bindAddrNotAvail4For(&t.fd_table.fds[fd], .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] })) return bind_addr_policy.EADDRNOTAVAIL;\n    if (net_mod.tcp_port_policy.bindNeedsPrivilege(port)") != null);
 }
 
 test "SIGSTOP on a task running on another CPU kicks that CPU instead of waiting for its next tick" {
@@ -18058,4 +18058,26 @@ test "IP_LOCAL_PORT_RANGE clamps both UDP and TCP ephemeral allocation to the sy
     try std.testing.expectEqual(@as(u16, 65535), tp.localPortRange(1000 | (2000 << 16)).last);
     try std.testing.expectEqual(@as(u16, 49152), tp.localPortRange(51010 << 16).first);
     try std.testing.expectEqual(@as(u16, 51010), tp.localPortRange(51010 << 16).last);
+}
+
+test "IP_FREEBIND and IPV6_FREEBIND are one shared flag, and it permits nonlocal bind (hello490)" {
+    const p = kt.ip_opt_policy;
+    var o = p.applyExtra(.{}, p.SOL_IP, p.IP_FREEBIND, 1, 4, false).?.ok;
+    try std.testing.expect(p.freebind(o));
+    try std.testing.expectEqual(@as(i32, 1), p.getExtra(o, p.SOL_IPV6, p.IPV6_FREEBIND).?.val);
+    o = p.applyExtra(o, p.SOL_IPV6, p.IPV6_FREEBIND, 0, 4, false).?.ok;
+    try std.testing.expect(!p.freebind(o));
+    try std.testing.expectEqual(@as(i32, 0), p.getExtra(o, p.SOL_IP, p.IP_FREEBIND).?.val);
+    try std.testing.expect(kt.bind_addr_policy.inet4Bindable(.{ 192, 0, 2, 1 }, .{}) == false);
+}
+
+test "IP_TRANSPARENT and IPV6_TRANSPARENT share the nonlocal-bind permission (hello491)" {
+    const p = kt.ip_opt_policy;
+    var o = p.applyExtra(.{}, p.SOL_IP, p.IP_TRANSPARENT, 1, 4, true).?.ok;
+    try std.testing.expect(p.transparent(o));
+    try std.testing.expectEqual(@as(i32, 1), p.getExtra(o, p.SOL_IPV6, p.IPV6_TRANSPARENT).?.val);
+    o = p.applyExtra(o, p.SOL_IPV6, p.IPV6_TRANSPARENT, 0, 4, true).?.ok;
+    try std.testing.expect(p.transparent(o));
+    try std.testing.expectEqual(@as(i32, 1), p.getExtra(o, p.SOL_IP, p.IP_TRANSPARENT).?.val);
+    try std.testing.expect(!p.freebind(o));
 }

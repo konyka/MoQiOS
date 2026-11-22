@@ -3774,7 +3774,8 @@ fn rofsAccess(cur: anytype, name: []const u8, mode: u32, creds: @import("../../f
 ///
 /// Signal protocol matches the other wait primitives (devfs_proxy pattern):
 /// a fatal pending signal terminates via exitTask; an actionable one returns
-/// -EINTR with the remaining time written back to `rem`.
+/// -EINTR with the remaining time written back to `rem`. A default stop is
+/// consumed after the task becomes blocked and before it yields the CPU.
 const UserTimespec = struct { sec: i64, nsec: i64 };
 
 fn readUserTimespec(ptr: u64) ?UserTimespec {
@@ -3842,7 +3843,7 @@ pub fn sleepUntil(deadline: u64, rem_ptr: u64) i64 {
         @atomicStore(u64, &cur.sleep_deadline_ns, deadline, .release);
         _ = @atomicRmw(u64, &sched.sleep_bm, .Or, bit, .seq_cst);
         tm.blockTask(cur_idx);
-        sched.forceReschedule();
+        if (!sig_mod.stopWhileWaiting(cur)) sched.forceReschedule();
         // yield trap 可能未切换（本 CPU 无可运行同伴时 tick 直接返回），
         // 本任务仍以 .blocked 继续执行——必须修复状态，否则逃出循环后
         // 一旦被抢占就永远不会再被调度。
@@ -3896,7 +3897,7 @@ fn sleepUntilProcessCpu(target_ns: u64, rem_ptr: u64) i64 {
         @atomicStore(u64, &cur.sleep_deadline_ns, tsc.nanos() +| POLL_NS, .release);
         _ = @atomicRmw(u64, &sched.sleep_bm, .Or, bit, .seq_cst);
         tm.blockTask(cur_idx);
-        sched.forceReschedule();
+        if (!sig_mod.stopWhileWaiting(cur)) sched.forceReschedule();
         sched.repairCurrentAfterBlock();
     }
 

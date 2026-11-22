@@ -171,6 +171,14 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // fs.pipe-max-size: root opens the sysctl for writing (mode 0644), without CAP_SYS_RESOURCE so the limit applies to it.
         return .{ .uid = 0, .gid = 0, .caps = NO_CAPS, .initial_init = false };
     }
+    if (std.mem.eql(u8, name, "hello491")) {
+        // TRANSPARENT and raw/ping sockets: CAP_NET_RAW; writing ping_group_range also needs CAP_NET_ADMIN.
+        return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_raw = true, .cap_net_admin = true }, .initial_init = false };
+    }
+    if (std.mem.eql(u8, name, "hello490")) {
+        // Nonlocal bind on raw sockets: only CAP_NET_RAW is needed for their creation.
+        return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_raw = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello487")) {
         // SOL_IP / SOL_IPV6 option sweep: raw sockets (CAP_NET_RAW, the only capability, matching the host measurement).
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_raw = true }, .initial_init = false };

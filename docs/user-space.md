@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello489`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello491`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -484,6 +484,8 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello487 | UDP 套接字上 SOL_IPV6、SOL_IP 的 0 到 79 号选项全部与 Linux 一致：新套接字 getsockopt 的长度或 errno（A）；每个选项依次 setsockopt 1、255、256、-1 并读回的结果（B）。TCP 套接字上的同样两项（C、D），ICMP/ICMPv6 raw 套接字上的同样两项（E、F）；六张表都在宿主机上只带 CAP_NET_RAW 实测（与测试在 MoQiOS 上的能力相同）。G 检查 TCP 的 IPV6_2292PKTOPTIONS：六种接收开关的全部 64 种组合、控制消息顺序和默认值、put_cmsg 截断、填充字节不变及零长度空指针 |
 | hello488 | TCP 的 IP_MINTTL / IPV6_MINHOPCOUNT：监听者阈值 2 时，TTL 1 的 IPv4 SYN 被丢弃，带 200 ms SO_SNDTIMEO 的 connect 返回 EINPROGRESS，TTL 2 在阈值处可连接并 accept（A）；IPv6 的 hop-limit 1/2 同样（B） |
 | hello489 | IP_LOCAL_PORT_RANGE：UDP 套接字在首次 sendto 自动命名后，getsockname 的端口落在 51000–51010（A）；TCP 客户端连接后端口落在 51100–51110，且服务端 accept 成功（B） |
+| hello490 | IP_FREEBIND / IPV6_FREEBIND：UDP、TCP、raw 的 IPv4（A）和 IPv6（B）非本机地址 bind；未开启时目标机为 EADDRNOTAVAIL，开启后成功且 getsockname 保留地址；host 策略测试覆盖两个选项共用标志 |
+| hello491 | IP_TRANSPARENT / IPV6_TRANSPARENT：UDP、TCP、raw、ping 的 IPv4（A）和 IPv6（B）非本机地址 bind；目标机开启后成功且 getsockname 保留地址。宿主机 IPv4 ping 仍返回 EADDRNOTAVAIL，与所参照的 Linux 7.0.6 `ping_check_bind_addr` 不同，单独记录；ping 测试先写 ping_group_range，结束后恢复 |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 
