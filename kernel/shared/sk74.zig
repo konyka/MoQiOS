@@ -68,16 +68,16 @@ pub fn announce() void {
     var zero = seg;
     zero[16] = 0;
     zero[17] = 0;
-    tcp.handlePacketV6(SRC6, DST6, &zero, 20, false);
-    tcp.handlePacketV6(SRC6, DST6, &bad, 20, false);
-    tcp.handlePacketV6(SRC6, DST6, &seg, 20, false);
+    tcp.handlePacketV6(SRC6, DST6, &zero, 20, false, 0);
+    tcp.handlePacketV6(SRC6, DST6, &bad, 20, false, 0);
+    tcp.handlePacketV6(SRC6, DST6, &seg, 20, false, 0);
 
     // Truncated / bad data-offset ignored.
-    tcp.handlePacketV6(SRC6, DST6, &seg, 10, false);
+    tcp.handlePacketV6(SRC6, DST6, &seg, 10, false, 0);
     var bad_off = seg;
     bad_off[12] = 0xF0; // offset 60 > len 20
     // Fix checksum so only offset check matters — gate checks offset before csum.
-    tcp.handlePacketV6(SRC6, DST6, &bad_off, 20, false);
+    tcp.handlePacketV6(SRC6, DST6, &bad_off, 20, false, 0);
 
     arch.serial.writeString("[SK-74] tcp over ipv6 checksum/rx gate non-x86: OK\n");
 }

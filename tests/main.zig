@@ -5200,7 +5200,7 @@ test "IPv6 TCP connect: a group is ENETUNREACH, a link-local peer needs an inter
 
     const ss = kt.socket_syscall_source;
     const dev_at = std.mem.indexOf(u8, ss, "const dev_rc = net_mod.tcp.tcpConnectDev6(tcb_idx, parsed.addr, parsed.scope_id);").?;
-    try std.testing.expect(dev_at < std.mem.indexOfPos(u8, ss, dev_at, "net_mod.tcp.tcpConnectSocketV6(tcb_idx, parsed.addr, parsed.port)").?);
+    try std.testing.expect(dev_at < std.mem.indexOfPos(u8, ss, dev_at, "net_mod.tcp.tcpConnectSocketV6Flow(tcb_idx, parsed.addr, parsed.port,").?);
     try std.testing.expect(std.mem.indexOf(u8, ss, "return net_mod.tcp.tcpBindAddr46(tcb_idx, parsed.port, net_mod.tcp_port_policy.WILDCARD4, parsed.addr, bind_addr_policy.boundDev6(parsed.addr, parsed.scope_id));") != null);
     const ts = kt.tcp_source;
     const f = std.mem.indexOf(u8, ts, "pub fn tcpConnectDev6(").?;
@@ -17911,6 +17911,24 @@ test "IPv6 raw sends check their flow label like rawv6_sendmsg; ping sends do no
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (rawIpOpts(d.raw_idx).sndflow6 and parsed.flowinfo & 0xFFFFF != 0) {") != null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "@import(\"flowlabel_mgr.zig\").checkSend(.{ .kind = .raw, .key = d.raw_idx }"));
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (addr_flow != 0) ip6.flow_ov6 = addr_flow;") != null);
+}
+
+test "IPv6 TCP connect checks its flow label like tcp_v6_connect (hello484 M)" {
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (net_mod.tcp.tcpSndflow6(tcb_idx) and parsed.flowinfo & 0xFFFFF != 0) {\n            const fl_rc = @import(\"flowlabel_mgr.zig\").checkSend(.{ .kind = .tcp, .key = tcb_idx }, parsed.flowinfo & 0xFFFFF);\n            if (fl_rc != 0) return fl_rc;\n        }\n        // A link-local peer") != null);
+}
+
+test "IPV6_FL_F_REMOTE reports the flow label last received, like ipv6_flowlabel_opt_get (hello484 N)" {
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (q.flags & flm.F_REMOTE != 0) return -2;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (q.flags & flm.F_REMOTE != 0) {") != null);
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.count(u8, ts, "new_tcb.rx_flow6 = flowinfo;") + std.mem.count(u8, ts, "reuse_tcb.rx_flow6 = flowinfo;") == 2);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.options.ip.rxflow6 or tcb.options.ip.recvtclass6) tcb.rx_flow6 = flowinfo;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "tcp.handlePacketV6(info6.src_ip, info6.dst_ip, data + up_start, up_len, info6.ecn_ce, info6.flowinfo);") != null);
+    // tcp_v6_connect keeps sin6_flowinfo's label (np->flow_label) and every segment carries it instead of the automatic one.
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "tcpConnectSocketV6Flow(tcb_idx, parsed.addr, parsed.port, if (net_mod.tcp.tcpSndflow6(tcb_idx)) parsed.flowinfo else 0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.tx_flow6 != 0) {\n        ip_opt_policy.setFlowLabel6(send_pkt[14..][0..40], tcb.tx_flow6);") != null);
 }
 
 test "TIOCGPGRP answers only in the session that owns the console (hello485)" {

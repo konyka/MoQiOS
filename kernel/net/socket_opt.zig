@@ -591,7 +591,16 @@ fn getFlowlabelMgr(ref: SockRef, optval_ptr: u64, optlen_ptr: u64) i64 {
     if (copy_mod.copyFromUser(&b, @ptrFromInt(optval_ptr), flm.REQ_LEN) != flm.REQ_LEN) return -14;
     const q = flm.Req.parse(&b);
     if (q.action != flm.A_GET) return -22;
-    if (q.flags & flm.F_REMOTE != 0) return -2;
+    // ipv6_flowlabel_opt_get: IPV6_FL_F_REMOTE reports only the label last received (rcv_flowinfo), every other field zero. Only a
+    // TCP socket keeps one here (Linux updates it from datagram receives too, but never for UDP or raw: their recvmsg does not).
+    if (q.flags & flm.F_REMOTE != 0) {
+        const got: flm.Req = .{ .label = if (ref == .tcp) @import("tcp.zig").tcpRemoteFlowLabel(ref.tcp) else 0 };
+        got.write(&b);
+        bo.writeU32Le(&lb, flm.REQ_LEN);
+        if (copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &lb, 4) != 4) return -14;
+        if (copy_mod.copyToUser(@ptrFromInt(optval_ptr), &b, flm.REQ_LEN) != flm.REQ_LEN) return -14;
+        return 0;
+    }
     const flow = if (ref == .udp) currentUdpFlow6(ref.udp) else 0;
     switch (flm.optGet(flowHolder(ref), flow)) {
         .err => |e| return e,

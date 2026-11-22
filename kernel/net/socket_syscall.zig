@@ -1525,10 +1525,15 @@ pub fn connect(fd: u32, addr_ptr: u64, addr_len: u32) i64 {
         if (copy.copyFromUser(&sa6, @ptrFromInt(addr_ptr), sa.SOCKADDR_IN6_LEN) < sa.SOCKADDR_IN6_LEN)
             return -22;
         const parsed = sa.parseInet6(&sa6) orelse return -97;
+        // tcp_v6_connect: with IPV6_FLOWINFO_SEND, sin6_flowinfo's label must be one the socket holds once some label is exclusive.
+        if (net_mod.tcp.tcpSndflow6(tcb_idx) and parsed.flowinfo & 0xFFFFF != 0) {
+            const fl_rc = @import("flowlabel_mgr.zig").checkSend(.{ .kind = .tcp, .key = tcb_idx }, parsed.flowinfo & 0xFFFFF);
+            if (fl_rc != 0) return fl_rc;
+        }
         // A link-local peer ties the socket to its interface; a group or a missing interface fails before the handshake starts.
         const dev_rc = net_mod.tcp.tcpConnectDev6(tcb_idx, parsed.addr, parsed.scope_id);
         if (dev_rc != 0) return dev_rc;
-        return finishTcpConnect(t, fd, net_mod.tcp.tcpConnectSocketV6(tcb_idx, parsed.addr, parsed.port));
+        return finishTcpConnect(t, fd, net_mod.tcp.tcpConnectSocketV6Flow(tcb_idx, parsed.addr, parsed.port, if (net_mod.tcp.tcpSndflow6(tcb_idx)) parsed.flowinfo else 0));
     }
     if (!@import("socket_address_policy.zig").inetLengthValid(addr_len, false)) return -22;
     var sock_addr: [8]u8 = undefined;

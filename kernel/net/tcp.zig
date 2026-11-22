@@ -420,6 +420,12 @@ const TcpTcb = struct {
     rx_ifindex: u8 = 0,
     rx_ttl: u8 = 1,
     rx_tos: u8 = 0,
+    /// IPv6 traffic class and flow label last received (np->rcv_flowinfo, IPV6_FL_F_REMOTE): an accepted connection starts with
+    /// its SYN's; an in-order data segment updates it while IPV6_RECVFLOWINFO or IPV6_RECVTCLASS is on.
+    rx_flow6: u32 = 0,
+    /// The flow label connect() took from sin6_flowinfo under IPV6_FLOWINFO_SEND (np->flow_label): every segment carries it in
+    /// place of the automatic label (ip6_make_flowlabel). 0 for none.
+    tx_flow6: u32 = 0,
 };
 
 /// The interface, TTL and TOS an IPv4 segment arrived with.
@@ -973,6 +979,8 @@ fn allocTcb() ?*TcpTcb {
     tcbs[i].rx_ifindex = 0;
     tcbs[i].rx_ttl = 1;
     tcbs[i].rx_tos = 0;
+    tcbs[i].rx_flow6 = 0;
+    tcbs[i].tx_flow6 = 0;
     return &tcbs[i];
 }
 
@@ -1216,6 +1224,22 @@ pub fn tcpGetIpOptions(tcb_idx: u32) ?@import("ip_options_policy.zig").SendOpts 
     defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return null;
     return tcbs[tcb_idx].ipopts;
+}
+
+/// IPV6_FLOWINFO_SEND on a TCP socket: connect takes the flow label from sin6_flowinfo.
+pub fn tcpSndflow6(tcb_idx: u32) bool {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return false;
+    return tcbs[tcb_idx].options.ip.sndflow6;
+}
+
+/// The flow label (low 20 bits of rcv_flowinfo) last received on a TCP socket, for IPV6_FL_F_REMOTE.
+pub fn tcpRemoteFlowLabel(tcb_idx: u32) u32 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return 0;
+    return tcbs[tcb_idx].rx_flow6 & 0xFFFFF;
 }
 
 /// True when the socket is an IPv6 (dual-stack) endpoint (SO_DOMAIN).
@@ -1728,7 +1752,9 @@ fn sendSegmentV6Seq(tcb: *TcpTcb, flags_in: u8, data: [*]const u8, data_len: u16
     // IPV6_UNICAST_HOPS / IPV6_TCLASS (applied before ECN, which owns the low two bits).
     if (ip_opt_policy.ipv6NeedsPatch(tcb.options.ip)) ip_opt_policy.patchIpv6(send_pkt[14..][0..40], tcb.options.ip);
     // ip6_make_flowlabel: every segment of the connection carries its flow's automatic label unless IPV6_AUTOFLOWLABEL is off.
-    if (@import("flowlabel_policy.zig").labels(tcb.options.ip.autoflow6, @import("flowlabel_policy.zig").mode())) ip_opt_policy.setFlowLabel6(send_pkt[14..][0..40], @import("udp.zig").autoFlowLabel(our_ip, tcb.remote_ip6, tcb.local_port, tcb.remote_port, ipv6.PROTO_TCP));
+    if (tcb.tx_flow6 != 0) {
+        ip_opt_policy.setFlowLabel6(send_pkt[14..][0..40], tcb.tx_flow6);
+    } else if (@import("flowlabel_policy.zig").labels(tcb.options.ip.autoflow6, @import("flowlabel_policy.zig").mode())) ip_opt_policy.setFlowLabel6(send_pkt[14..][0..40], @import("udp.zig").autoFlowLabel(our_ip, tcb.remote_ip6, tcb.local_port, tcb.remote_port, ipv6.PROTO_TCP));
     // SK-131/143: ECT(1) for AccECN/L4S, else ECT(0) for classic ECN.
     if (tcb.ecn_ok and (flags & SYN) == 0) {
         if (tcb.accecn_ok) ipv6.setEct1(send_pkt[14..].ptr) else ipv6.setEct0(send_pkt[14..].ptr);
@@ -1818,7 +1844,7 @@ fn tcpChecksumV6(src_ip: [16]u8, dst_ip: [16]u8, tcp_hdr: [*]const u8, tcp_len: 
 }
 
 /// IPv6 TCP receive (SK-74..77): checksum, demux/listen SYN, shared state machine.
-pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32, ecn_ce: bool) void {
+pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32, ecn_ce: bool, flowinfo: u32) void {
     if (len < 20) return;
     const tcp_len: u16 = @intCast(@min(len, 0xFFFF));
     const data_offset = (@as(u16, data[12]) >> 4) * 4;
@@ -1855,7 +1881,7 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
     const tcb = findTcbByTupleV6(dst_ip, dst_port, src_port, src_ip) orelse {
         if (flags & SYN != 0) {
             const before = pendingBacklogCount();
-            handleIncomingSynV6(src_ip, dst_ip, src_port, dst_port, seq_num, raw_window, opts, flags);
+            handleIncomingSynV6(src_ip, dst_ip, src_port, dst_port, seq_num, raw_window, opts, flags, flowinfo);
             // Nobody listens on the port: a ::1 peer is told at once (RFC 9293
             // §3.10.7.1) instead of retransmitting its SYN.
             if (pendingBacklogCount() == before and !hasListener(dst_port, true, tcp_port_policy.WILDCARD4, dst_ip)) {
@@ -1864,6 +1890,10 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
         } else if (!hasListener(dst_port, true, tcp_port_policy.WILDCARD4, dst_ip)) sendLoopbackResetV6(src_ip, dst_ip, src_port, dst_port, flags, ack_num, seq_num, payload_len);
         return;
     };
+    // tcp_v6_do_rcv: an in-order data segment on an open connection refreshes rcv_flowinfo while rxflow or rxtclass is on.
+    if (payload_len > 0 and seq_num == tcb.rcv_nxt and tcb.state != .closed and tcb.state != .listen) {
+        if (tcb.options.ip.rxflow6 or tcb.options.ip.recvtclass6) tcb.rx_flow6 = flowinfo;
+    }
 
     driveTcbStateMachine(tcb, seq_num, ack_num, flags, raw_window, opts, data, data_offset, payload_len, &pending_events, &pending_idx, ecn_ce);
 }
@@ -2532,7 +2562,7 @@ fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16,
 }
 
 /// IPv6 listen SYN (SK-75/76). Creates SYN_RECEIVED and sends SYN-ACK via NDP.
-fn handleIncomingSynV6(src_ip: [16]u8, dst_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions, flags: u8) void {
+fn handleIncomingSynV6(src_ip: [16]u8, dst_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions, flags: u8, flowinfo: u32) void {
     _ = _w;
     const peer_ecn = probeEcnPeerSetup(flags);
     // The listener bound to the SYN's destination address, else one bound to ::.
@@ -2575,6 +2605,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, dst_ip: [16]u8, src_port: u16, dst_port: 
             reuse_tcb.ecn_ok = peer_ecn;
             reuse_tcb.accecn_ok = peer_ecn;
             reuse_tcb.local_ip6 = dst_ip;
+            reuse_tcb.rx_flow6 = flowinfo;
             sendSynAck(reuse_tcb, peer_ecn);
             return;
         }
@@ -2591,6 +2622,7 @@ fn handleIncomingSynV6(src_ip: [16]u8, dst_ip: [16]u8, src_port: u16, dst_port: 
     new_tcb.is_v6 = true;
     new_tcb.remote_ip6 = src_ip;
     new_tcb.local_ip6 = dst_ip;
+    new_tcb.rx_flow6 = flowinfo;
     new_tcb.owner_task = ls.owner_task;
     new_tcb.sock_uid = listenerSockUid(ls);
     new_tcb.options = listenerOptions(ls);
@@ -3690,6 +3722,11 @@ pub fn tcpConnectSocket(tcb_idx: u32, remote_ip: [4]u8, remote_port: u16) i64 {
 
 /// Connect an IPv6 TCP socket (SK-78). Requires `tcpSetIpv6` first.
 pub fn tcpConnectSocketV6(tcb_idx: u32, remote_ip6: [16]u8, remote_port: u16) i64 {
+    return tcpConnectSocketV6Flow(tcb_idx, remote_ip6, remote_port, 0);
+}
+
+/// tcpConnectSocketV6 with the flow label sin6_flowinfo gave under IPV6_FLOWINFO_SEND (tcp_v6_connect: np->flow_label), 0 for none.
+pub fn tcpConnectSocketV6Flow(tcb_idx: u32, remote_ip6: [16]u8, remote_port: u16, flow: u32) i64 {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
     if (tcb_idx >= MAX_CONNECTIONS) return -1;
@@ -3697,6 +3734,7 @@ pub fn tcpConnectSocketV6(tcb_idx: u32, remote_ip6: [16]u8, remote_port: u16) i6
     if (!tcb.active or !tcb.is_v6) return -1;
     if (tcb.state != .closed) return tcp_recv_policy.connectRejection(tcb.state);
     tcb.refused = false;
+    tcb.tx_flow6 = flow & 0xFFFFF;
 
     // A nonzero port bind() did not set is a leftover of the slot's previous
     // connection; reusing it could collide with a live TCB's 4-tuple.

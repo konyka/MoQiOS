@@ -11890,7 +11890,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
   - hello484 的启动 profile：uid 0，只有 CAP_SETUID。
 - 宿主机实测（`user/hello484.c -DHOST`，`unshare --map-auto --map-root-user -n`，lo up）：A–K 全部通过；MoQiOS 上同样全部通过。
 - host 测试：`flowlabel_mgr.zig` 内联测试（按宿主机实测的返回值）和 tests/main.zig 的 "IPV6_FLOWLABEL_MGR: … (hello484)"；hello462 的源码断言改成新写法。
-- 已知差异：标签表 64 项（Linux 4096），超出时为 ENOBUFS；“存在独占标签”这一状态一旦置位不再复位（与 `flowlabel_has_excl` 相同，Linux 另有一个在独占标签全部释放约 1 秒后关闭的静态分支）；~~raw、ping、TCP 套接字可以申请标签，但它们的发送和 connect 不做持有检查~~（hello484 L 起 IPv6 raw 套接字的发送检查：带 IPV6_FLOWINFO_SEND 时 sin6_flowinfo 的标签，以及 IPV6_FLOWINFO 控制消息的标签；宿主机实测 ping 套接字不检查，`ping_v6_sendmsg` 没有 `fl6_sock_lookup`，与 Linux 相同；TCP 的 connect 仍不检查）；标签不带 IPv6 扩展头选项（`fl->opt`，Linux 允许在 GET 后附带控制消息）；IPV6_FL_F_REMOTE 的 getsockopt 返回 ENOENT（Linux 报告收到的流标签）。
+- 已知差异：标签表 64 项（Linux 4096），超出时为 ENOBUFS；“存在独占标签”这一状态一旦置位不再复位（与 `flowlabel_has_excl` 相同，Linux 另有一个在独占标签全部释放约 1 秒后关闭的静态分支）；~~raw、ping、TCP 套接字可以申请标签，但它们的发送和 connect 不做持有检查~~（hello484 L 起 IPv6 raw 套接字的发送检查：带 IPV6_FLOWINFO_SEND 时 sin6_flowinfo 的标签，以及 IPV6_FLOWINFO 控制消息的标签；宿主机实测 ping 套接字不检查，`ping_v6_sendmsg` 没有 `fl6_sock_lookup`，与 Linux 相同；~~TCP 的 connect 仍不检查~~，hello484 M 起与 `tcp_v6_connect` 相同：带 IPV6_FLOWINFO_SEND 时 sin6_flowinfo 的标签未持有为 EINVAL，在握手之前检查；连接随后的每个段都带这个标签（`tx_flow6`），hello484 N 的服务端读到的正是它）；标签不带 IPv6 扩展头选项（`fl->opt`，Linux 允许在 GET 后附带控制消息）；~~IPV6_FL_F_REMOTE 的 getsockopt 返回 ENOENT（Linux 报告收到的流标签）~~（hello484 N 起报告 TCP 套接字最近收到的标签：accept 得到的连接取 SYN 的标签，打开 IPV6_RECVFLOWINFO 或 IPV6_RECVTCLASS 后按序到达的数据段更新它；UDP、raw 为 0，与宿主机实测相同）。
 
 ## 补充：TIOCGPGRP 只在控制终端上回答（hello485）
 

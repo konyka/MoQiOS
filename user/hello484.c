@@ -18,7 +18,13 @@
  *   K. a label lingers (at least 6 s) after its last holder closes: creating the EXCL label 0x22222 again right away is EPERM;
  *   L. a raw ICMPv6 socket (rawv6_sendmsg) holding 0x11111: an IPV6_FLOWINFO control message with an unheld label is EINVAL, with
  *      the held one the echo request goes out (8); without IPV6_FLOWINFO_SEND sin6_flowinfo is ignored (8); with it an unheld label
- *      is EINVAL and the held one sends. (A ping socket does no such check: ping_v6_sendmsg has no fl6_sock_lookup.) */
+ *      is EINVAL and the held one sends. (A ping socket does no such check: ping_v6_sendmsg has no fl6_sock_lookup.)
+ *   M. TCP over IPv6 (tcp_v6_connect): with IPV6_FLOWINFO_SEND a connect whose sin6_flowinfo is an unheld label is EINVAL before
+ *      the handshake starts; a socket holding the label connects to a listener on [::1] (0); without IPV6_FLOWINFO_SEND the
+ *      label is not looked at (0);
+ *   N. getsockopt with IPV6_FL_F_REMOTE reports the flow label last received (np->rcv_flowinfo): 0 on a UDP socket and on the
+ *      connecting TCP socket; the accepted TCP socket reads the label of the SYN that made it (tcp_v6_syn_recv_sock); once the
+ *      client sets IPV6_RECVFLOWINFO, data it receives in order updates its value to the label the server sends with. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -33,6 +39,10 @@ static long rc(long r) { return r < 0 ? -errno : r; }
 static long sock(int f, int t, int p) { return rc(socket(f, t, p)); }
 static long bind_(long s, const void *a, int l) { return rc(bind((int)s, a, (socklen_t)l)); }
 static long connect_(long s, const void *a, int l) { return rc(connect((int)s, a, (socklen_t)l)); }
+static long listen_(long s) { return rc(listen((int)s, 4)); }
+static long accept_(long s) { return rc(accept((int)s, 0, 0)); }
+static long write_(long s, const void *b, long n) { return rc(write((int)s, b, (size_t)n)); }
+static long read_(long s, void *b, long n) { return rc(read((int)s, b, (size_t)n)); }
 static long sendto_(long s, const void *b, long n, const void *a, int al) { return rc(sendto((int)s, b, (size_t)n, 0, a, (socklen_t)al)); }
 static long sendmsg_(long s, const void *m) { return rc(sendmsg((int)s, m, 0)); }
 static long setopt_(long s, int lv, int o, const void *v, int l) { return rc(setsockopt((int)s, lv, o, v, (socklen_t)l)); }
@@ -49,6 +59,10 @@ static long setuid_(long u) { return rc(setresuid((uid_t)u, (uid_t)u, (uid_t)u))
 static long sock(int f, int t, int p) { return syscall3(117, f, t, p); }
 static long bind_(long s, const void *a, int l) { return syscall3(118, s, (long)a, l); }
 static long connect_(long s, const void *a, int l) { return syscall3(124, s, (long)a, l); }
+static long listen_(long s) { return syscall2(119, s, 4); }
+static long accept_(long s) { return syscall3(120, s, 0, 0); }
+static long write_(long s, const void *b, long n) { return syscall3(1, s, (long)b, n); }
+static long read_(long s, void *b, long n) { return syscall3(10, s, (long)b, n); }
 static long sendto_(long s, const void *b, long n, const void *a, int al) { return syscall6(121, s, (long)b, n, 0, (long)a, al); }
 static long sendmsg_(long s, const void *m) { return syscall3(129, s, (long)m, 0); }
 static long setopt_(long s, int lv, int o, const void *v, int l) { return syscall5(132, s, lv, o, (long)v, l); }
@@ -87,6 +101,16 @@ static long mgr_l(long s, int act, int share, int flags, unsigned int label, int
     return r;
 }
 static long mgr(long s, int act, int share, int flags, unsigned int label) { return mgr_l(s, act, share, flags, label, 6, 32); }
+/* getsockopt(IPV6_FLOWLABEL_MGR) with action GET and IPV6_FL_F_REMOTE (8). */
+static long remote_label(long s, unsigned int *label) {
+    struct req q;
+    memset(&q, 0, sizeof q);
+    q.flags = 8;
+    int l = sizeof q;
+    long r = getopt_(s, 41, 32, &q, &l);
+    *label = be32(q.label);
+    return r;
+}
 struct sin6 { unsigned short fam, port; unsigned int flow; unsigned char addr[16]; unsigned int scope; };
 static long send_flow(long s, unsigned int label) {
     struct sin6 a = { 10, be16(40484), be32(label), { 0 }, 0 };
@@ -221,6 +245,37 @@ int main(void) {
     snprintf(msg, sizeof msg, "L: raw GET %ld; cmsg unheld %ld held %ld; addr label without SNDFLOW %ld; with SNDFLOW unheld %ld held %ld (0 -22 8 8 -22 8)", l0, rl[0], rl[1], rl[2], rl[3], rl[4]);
     check(l0 == 0 && rl[0] == -22 && rl[1] == 8 && rl[2] == 8 && rl[3] == -22 && rl[4] == 8, msg);
     close_(raw);
+    /* M: TCP. */
+    long ls = sock(10, 1, 0);
+    setopt_(ls, 1, 2, &one, 4);
+    struct sin6 la = { 10, be16(40487), 0, { 0 }, 0 };
+    memcpy(la.addr, lo6, 16);
+    long m0 = bind_(ls, &la, sizeof la);
+    long m1 = listen_(ls);
+    long ta = sock(10, 1, 0), tb = sock(10, 1, 0), tc = sock(10, 1, 0);
+    setopt_(ta, 41, 33, &one, 4);
+    setopt_(tb, 41, 33, &one, 4);
+    long m2 = mgr(tb, 0, 255, 1, 0x13131);
+    la.flow = be32(0x13131);
+    long m3 = connect_(ta, &la, sizeof la), m4 = connect_(tb, &la, sizeof la), m5 = connect_(tc, &la, sizeof la);
+    snprintf(msg, sizeof msg, "M: tcp bind %ld listen %ld GET %ld; connect unheld %ld, held %ld, without SNDFLOW %ld (0 0 0 -22 0 0)", m0, m1, m2, m3, m4, m5);
+    check(m0 == 0 && m1 == 0 && m2 == 0 && m3 == -22 && m4 == 0 && m5 == 0, msg);
+    long ac = accept_(ls);
+    unsigned int n0 = 1, n1 = 1, n2 = 1, n3 = 1;
+    long r0 = remote_label(u, &n0), r1 = remote_label(ac, &n1), r2 = remote_label(tb, &n2);
+    int rfl = 1;
+    setopt_(tb, 41, 11, &rfl, 4);
+    long ws = write_(ac, "q", 1);
+    char nb[4];
+    long rd = read_(tb, nb, 4);
+    long r3 = remote_label(tb, &n3);
+    snprintf(msg, sizeof msg, "N: REMOTE udp %ld 0x%x, accepted %ld 0x%x, client %ld 0x%x; write %ld read %ld, client after RECVFLOWINFO %ld nonzero %d (0 0 0 0x13131 0 0 1 1 0 1)", r0, n0, r1, n1, r2, n2, ws, rd, r3, n3 != 0);
+    check(r0 == 0 && n0 == 0 && r1 == 0 && n1 == 0x13131 && r2 == 0 && n2 == 0 && ws == 1 && rd == 1 && r3 == 0 && n3 != 0 && (n3 & ~0xfffffu) == 0, msg);
+    close_(ac);
+    close_(ta);
+    close_(tb);
+    close_(tc);
+    close_(ls);
     close_(s);
     close_(u);
     close_(v);
