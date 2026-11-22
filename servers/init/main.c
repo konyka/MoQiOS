@@ -609,6 +609,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello490"); /* IP_FREEBIND / IPV6_FREEBIND on nonlocal bind */
     run_test("hello491"); /* IP_TRANSPARENT / IPV6_TRANSPARENT on nonlocal bind */
     run_test("hello492"); /* net.ipv4/ipv6.ip_nonlocal_bind */
+    run_test("hello493"); /* net.ipv4.ip_local_port_range */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

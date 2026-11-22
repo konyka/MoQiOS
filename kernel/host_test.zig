@@ -210,6 +210,7 @@ pub const ioctl_policy = @import("fs/ioctl_policy.zig");
 pub const ifreq_policy = @import("net/ifreq_policy.zig");
 pub const bind_addr_policy = @import("net/bind_addr_policy.zig");
 pub const nonlocal_bind_policy = @import("net/nonlocal_bind_policy.zig");
+pub const local_port_sysctl = @import("net/local_port_sysctl.zig");
 pub const route4_policy = @import("net/route4_policy.zig");
 pub const ping_policy = @import("net/ping_policy.zig");
 pub const raw_icmp_policy = @import("net/raw_icmp_policy.zig");

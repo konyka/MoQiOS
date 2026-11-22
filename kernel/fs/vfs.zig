@@ -1181,6 +1181,7 @@ fn sysctlWrite(desc: *FileDescriptor, buf: [*]const u8, count: usize, offset: u6
         .ping_group_range => @import("../net/udp.zig").pingGroupWrite(text),
         .ip_nonlocal_bind4 => @import("../net/nonlocal_bind_policy.zig").write(.v4, text),
         .ip_nonlocal_bind6 => @import("../net/nonlocal_bind_policy.zig").write(.v6, text),
+        .ip_local_port_range => @import("../net/local_port_sysctl.zig").write(text),
         .auto_flowlabels => autoFlowlabelsWrite(text),
         .pipe_max_size => blk: {
             const w = @import("fcntl_policy.zig").parsePipeMaxSize(text);
@@ -2003,6 +2004,12 @@ pub const FdTable = struct {
                     return -13; // EACCES
                 }
                 pfile = if (str.eql(rest, "sys/fs/pipe-max-size")) .pipe_max_size else if (str.eql(rest, "sys/fs/pipe-user-pages-hard")) .pipe_user_pages_hard else .pipe_user_pages_soft;
+            } else if (str.eql(rest, "sys/net/ipv4/ip_local_port_range")) {
+                if (is_writable and euid != 0 and !effective_caps.cap_net_admin) {
+                    self.freeFd(slot);
+                    return -13; // EACCES
+                }
+                pfile = .ip_local_port_range;
             } else if (str.eql(rest, "sys/net/ipv4/ip_nonlocal_bind") or str.eql(rest, "sys/net/ipv6/ip_nonlocal_bind")) {
                 // Mode 0644 owned by root: fsuid 0 or CAP_NET_ADMIN may write either family's switch.
                 if (is_writable and euid != 0 and !effective_caps.cap_net_admin) {

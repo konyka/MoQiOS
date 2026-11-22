@@ -14307,7 +14307,7 @@ test "procfs: /proc/net, /proc/sys, /proc/sys/net and /proc/sys/net/ipv4 are dir
     try std.testing.expect(std.mem.indexOf(u8, pf, ".net_dir => &.{.{ .name = \"arp\", .dtype = DT_REG }},") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_dir => &.{ .{ .name = \"fs\", .dtype = DT_DIR }, .{ .name = \"net\", .dtype = DT_DIR } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_net_dir => &.{ .{ .name = \"ipv4\", .dtype = DT_DIR }, .{ .name = \"ipv6\", .dtype = DT_DIR } },") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ip_nonlocal_bind\", .dtype = DT_REG }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ip_local_port_range\", .dtype = DT_REG }, .{ .name = \"ip_nonlocal_bind\", .dtype = DT_REG }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "return file == .root_dir or file == .pid_dir or file == .mount_dir or file == .fd_dir or isSubdir(file);") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "if (std.mem.eql(u8, body, \"sys/net/ipv4\")) return .sys_ipv4_dir;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "procfs.subdirEntryAt(desc.proc_file_type, pos)") != null);
@@ -14469,7 +14469,7 @@ test "devconf policy: net.ipv4.conf.<dev>.proxy_arp paths, proc_dointvec writes,
     try std.testing.expect(std.mem.indexOf(u8, io, ".toggle => |d| {") != null);
     try std.testing.expect(std.mem.indexOf(u8, io, "arp.setProxyArp(arp.confDev(d), if (cmd == ap.SIOCSARP) 1 else 0);") != null);
     const pf = kt.procfs_source;
-    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ip_nonlocal_bind\", .dtype = DT_REG }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ip_local_port_range\", .dtype = DT_REG }, .{ .name = \"ip_nonlocal_bind\", .dtype = DT_REG }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".conf_file => @intCast(@import(\"../net/arp.zig\").confRead(@import(\"../net/devconf_policy.zig\").decode(pid), buf[0..@min(max_len, 16)])),") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "pub fn isSysctl(file: ProcFile) bool {") != null);
     const vs = kt.vfs_source;
@@ -18045,19 +18045,20 @@ test "IP_LOCAL_PORT_RANGE clamps both UDP and TCP ephemeral allocation to the sy
     const tp = kt.tcp_port_policy;
     const up = kt.udp_port_policy;
     const raw: u32 = 51000 | (51010 << 16);
-    const r = tp.localPortRange(raw);
+    const sys = tp.EPHEMERAL_RANGE;
+    const r = tp.localPortRange(raw, sys);
     try std.testing.expectEqual(@as(u16, 51000), r.first);
     try std.testing.expectEqual(@as(u16, 51010), r.last);
-    try std.testing.expectEqual(@as(?u16, 51000), tp.pickEphemeralPortInRange(49152, &.{}, raw));
-    try std.testing.expectEqual(@as(?u16, 51001), tp.pickEphemeralPortInRange(51000, &.{51000}, raw));
-    try std.testing.expectEqual(@as(?u16, 51000), tp.pickEphemeralPortInRange(51010, &.{51010}, raw));
-    try std.testing.expectEqual(@as(?u16, 51000), up.pickAutobindPortInRange(49152, &.{}, raw));
-    try std.testing.expectEqual(@as(?u16, 51005), up.pickAutobindPortInRange(51005, &.{}, raw));
-    try std.testing.expectEqual(@as(?u16, 51001), up.pickAutobindPortInRange(51000, &.{51000}, raw));
-    try std.testing.expectEqual(@as(u16, 49152), tp.localPortRange(1000 | (2000 << 16)).first);
-    try std.testing.expectEqual(@as(u16, 65535), tp.localPortRange(1000 | (2000 << 16)).last);
-    try std.testing.expectEqual(@as(u16, 49152), tp.localPortRange(51010 << 16).first);
-    try std.testing.expectEqual(@as(u16, 51010), tp.localPortRange(51010 << 16).last);
+    try std.testing.expectEqual(@as(?u16, 51000), tp.pickEphemeralPortInRange(49152, &.{}, raw, sys));
+    try std.testing.expectEqual(@as(?u16, 51001), tp.pickEphemeralPortInRange(51000, &.{51000}, raw, sys));
+    try std.testing.expectEqual(@as(?u16, 51000), tp.pickEphemeralPortInRange(51010, &.{51010}, raw, sys));
+    try std.testing.expectEqual(@as(?u16, 51000), up.pickAutobindPortInRange(49152, &.{}, raw, sys));
+    try std.testing.expectEqual(@as(?u16, 51005), up.pickAutobindPortInRange(51005, &.{}, raw, sys));
+    try std.testing.expectEqual(@as(?u16, 51001), up.pickAutobindPortInRange(51000, &.{51000}, raw, sys));
+    try std.testing.expectEqual(@as(u16, 49152), tp.localPortRange(1000 | (2000 << 16), sys).first);
+    try std.testing.expectEqual(@as(u16, 65535), tp.localPortRange(1000 | (2000 << 16), sys).last);
+    try std.testing.expectEqual(@as(u16, 49152), tp.localPortRange(51010 << 16, sys).first);
+    try std.testing.expectEqual(@as(u16, 51010), tp.localPortRange(51010 << 16, sys).last);
 }
 
 test "IP_FREEBIND and IPV6_FREEBIND are one shared flag, and it permits nonlocal bind (hello490)" {
@@ -18097,4 +18098,22 @@ test "ip_nonlocal_bind sysctls are independent u8 values (hello492)" {
     try std.testing.expectEqual(@as(u8, 1), np.get(.v6));
     try std.testing.expectEqual(@as(i64, 2), np.write(.v4, "0\n"));
     try std.testing.expectEqual(@as(i64, 2), np.write(.v6, "0\n"));
+}
+
+test "ip_local_port_range sysctl narrows both automatic allocation and the socket option (hello493)" {
+    const lp = kt.local_port_sysctl;
+    const tp = kt.tcp_port_policy;
+    try std.testing.expectEqual(@as(u32, 49152 | (65535 << 16)), lp.get());
+    try std.testing.expectEqual(@as(i64, 12), lp.write("52000 52010\n"));
+    const system = lp.get();
+    try std.testing.expectEqual(@as(u16, 52000), tp.localPortRange(0, system).first);
+    try std.testing.expectEqual(@as(u16, 52010), tp.localPortRange(0, system).last);
+    const socket = tp.localPortRange(52004 | (52006 << 16), system);
+    try std.testing.expectEqual(@as(u16, 52004), socket.first);
+    try std.testing.expectEqual(@as(u16, 52006), socket.last);
+    try std.testing.expectEqual(@as(i64, -22), lp.write("52010 52000\n"));
+    try std.testing.expectEqual(@as(i64, -22), lp.write("1023 2000\n"));
+    try std.testing.expectEqual(@as(i64, -22), lp.write("65536 65535\n"));
+    try std.testing.expectEqual(system, lp.get());
+    try std.testing.expectEqual(@as(i64, 12), lp.write("49152 65535\n"));
 }
