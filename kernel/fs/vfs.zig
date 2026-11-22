@@ -1169,9 +1169,8 @@ pub fn statusFlagsOf(desc: *FileDescriptor) u32 {
 
 /// F_GETOWN / F_GETSIG: the owner (pid, -pgrp or 0) and signal (0: SIGIO) of the whole open file description.
 /// `kind` is the F_SETOWN_EX type (fcntl_policy.F_OWNER_*): a TID owner is signalled as that thread, a PID owner as its process.
-/// A write to a /proc/sys file at `offset`: ping_group_range (ipv4_ping_group_range) or a device's conf file (proc_dointvec). At an
-/// offset past 0 the write is swallowed whole and changes nothing (sysctl_writes_strict, measured in hello383); the rest of /proc is
-/// read-only.
+/// Write one of the procfs entries recognized by isSysctl. At an offset past 0 the write is swallowed whole and changes nothing
+/// (sysctl_writes_strict, measured in hello383); the rest of /proc is read-only.
 fn sysctlWrite(desc: *FileDescriptor, buf: [*]const u8, count: usize, offset: u64) i64 {
     const procfs = @import("procfs.zig");
     if (!procfs.isSysctl(desc.proc_file_type)) return -1;
@@ -1180,6 +1179,8 @@ fn sysctlWrite(desc: *FileDescriptor, buf: [*]const u8, count: usize, offset: u6
     const text = buf[0..count];
     return switch (desc.proc_file_type) {
         .ping_group_range => @import("../net/udp.zig").pingGroupWrite(text),
+        .ip_nonlocal_bind4 => @import("../net/nonlocal_bind_policy.zig").write(.v4, text),
+        .ip_nonlocal_bind6 => @import("../net/nonlocal_bind_policy.zig").write(.v6, text),
         .auto_flowlabels => autoFlowlabelsWrite(text),
         .pipe_max_size => blk: {
             const w = @import("fcntl_policy.zig").parsePipeMaxSize(text);
@@ -2002,6 +2003,13 @@ pub const FdTable = struct {
                     return -13; // EACCES
                 }
                 pfile = if (str.eql(rest, "sys/fs/pipe-max-size")) .pipe_max_size else if (str.eql(rest, "sys/fs/pipe-user-pages-hard")) .pipe_user_pages_hard else .pipe_user_pages_soft;
+            } else if (str.eql(rest, "sys/net/ipv4/ip_nonlocal_bind") or str.eql(rest, "sys/net/ipv6/ip_nonlocal_bind")) {
+                // Mode 0644 owned by root: fsuid 0 or CAP_NET_ADMIN may write either family's switch.
+                if (is_writable and euid != 0 and !effective_caps.cap_net_admin) {
+                    self.freeFd(slot);
+                    return -13; // EACCES
+                }
+                pfile = if (str.eql(rest, "sys/net/ipv4/ip_nonlocal_bind")) .ip_nonlocal_bind4 else .ip_nonlocal_bind6;
             } else if (str.eql(rest, "sys/net/ipv6/auto_flowlabels")) {
                 // Mode 0644 owned by root, like ping_group_range.
                 if (is_writable and euid != 0 and !effective_caps.cap_net_admin) {

@@ -1,5 +1,5 @@
-//! Which local addresses bind() accepts (Linux inet_bind / inet6_bind without IP_FREEBIND).
-//!
+//! The local-address portion of bind() checks (Linux inet_bind / inet6_bind).
+//! Socket FREEBIND/TRANSPARENT options and the two ip_nonlocal_bind sysctls are applied by socket_syscall.
 //! An address that is neither this host's own, a broadcast, a multicast group nor the wildcard is
 //! EADDRNOTAVAIL. The check comes before the port checks (EACCES, EADDRINUSE) as in Linux.
 

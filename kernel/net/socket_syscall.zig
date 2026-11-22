@@ -697,6 +697,7 @@ fn socketCreate(domain: u32, sock_type: u32) i64 {
 }
 
 fn bindAddrNotAvail4(addr: [4]u8) bool {
+    if (@import("nonlocal_bind_policy.zig").allows(.v4)) return false;
     var nic: bind_addr_policy.Nic = .{ .active = nic_mod.isActive() };
     if (nic.active) {
         nic.ip = netif.getOurIp();
@@ -706,6 +707,9 @@ fn bindAddrNotAvail4(addr: [4]u8) bool {
 }
 
 fn bindAddrNotAvail6(addr: [16]u8) bool {
+    const nonlocal = @import("nonlocal_bind_policy.zig");
+    if (nonlocal.allows(.v6)) return false;
+    if (nonlocal.allows(.v4) and @import("raw_icmp_policy.zig").isMapped6(addr)) return false;
     var nic: bind_addr_policy.Nic = .{ .active = nic_mod.isActive() };
     if (nic.active) {
         nic.ip = netif.getOurIp();

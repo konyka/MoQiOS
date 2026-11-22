@@ -171,6 +171,10 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // fs.pipe-max-size: root opens the sysctl for writing (mode 0644), without CAP_SYS_RESOURCE so the limit applies to it.
         return .{ .uid = 0, .gid = 0, .caps = NO_CAPS, .initial_init = false };
     }
+    if (std.mem.eql(u8, name, "hello492")) {
+        // Root/CAP_NET_ADMIN opens the two network sysctls for writing; UDP itself needs no extra capability.
+        return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_admin = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello491")) {
         // TRANSPARENT and raw/ping sockets: CAP_NET_RAW; writing ping_group_range also needs CAP_NET_ADMIN.
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_raw = true, .cap_net_admin = true }, .initial_init = false };

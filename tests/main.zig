@@ -14307,7 +14307,7 @@ test "procfs: /proc/net, /proc/sys, /proc/sys/net and /proc/sys/net/ipv4 are dir
     try std.testing.expect(std.mem.indexOf(u8, pf, ".net_dir => &.{.{ .name = \"arp\", .dtype = DT_REG }},") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_dir => &.{ .{ .name = \"fs\", .dtype = DT_DIR }, .{ .name = \"net\", .dtype = DT_DIR } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_net_dir => &.{ .{ .name = \"ipv4\", .dtype = DT_DIR }, .{ .name = \"ipv6\", .dtype = DT_DIR } },") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ip_nonlocal_bind\", .dtype = DT_REG }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "return file == .root_dir or file == .pid_dir or file == .mount_dir or file == .fd_dir or isSubdir(file);") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "if (std.mem.eql(u8, body, \"sys/net/ipv4\")) return .sys_ipv4_dir;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "procfs.subdirEntryAt(desc.proc_file_type, pos)") != null);
@@ -14469,7 +14469,7 @@ test "devconf policy: net.ipv4.conf.<dev>.proxy_arp paths, proc_dointvec writes,
     try std.testing.expect(std.mem.indexOf(u8, io, ".toggle => |d| {") != null);
     try std.testing.expect(std.mem.indexOf(u8, io, "arp.setProxyArp(arp.confDev(d), if (cmd == ap.SIOCSARP) 1 else 0);") != null);
     const pf = kt.procfs_source;
-    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ip_nonlocal_bind\", .dtype = DT_REG }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".conf_file => @intCast(@import(\"../net/arp.zig\").confRead(@import(\"../net/devconf_policy.zig\").decode(pid), buf[0..@min(max_len, 16)])),") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "pub fn isSysctl(file: ProcFile) bool {") != null);
     const vs = kt.vfs_source;
@@ -17532,7 +17532,7 @@ test "net.ipv6.auto_flowlabels: /proc/sys/net/ipv6/auto_flowlabels takes 0..3, a
     try std.testing.expect(fp.labels(true, fp.OPTIN));
     try std.testing.expect(fp.labels(false, fp.FORCED));
     try std.testing.expect(!fp.labels(true, fp.OFF));
-    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".sys_ipv6_dir => &.{.{ .name = \"auto_flowlabels\", .dtype = DT_REG }},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".sys_ipv6_dir => &.{ .{ .name = \"auto_flowlabels\", .dtype = DT_REG }, .{ .name = \"ip_nonlocal_bind\", .dtype = DT_REG } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "if (v < 0 or v > fp.MAX) return -22;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "} else if (str.eql(rest, \"sys/net/ipv6/auto_flowlabels\")) {") != null);
     try std.testing.expect(kt.capability_profile.profileForLaunch("hello463", true, false).caps.cap_net_admin);
@@ -18080,4 +18080,21 @@ test "IP_TRANSPARENT and IPV6_TRANSPARENT share the nonlocal-bind permission (he
     try std.testing.expect(p.transparent(o));
     try std.testing.expectEqual(@as(i32, 1), p.getExtra(o, p.SOL_IP, p.IP_TRANSPARENT).?.val);
     try std.testing.expect(!p.freebind(o));
+}
+
+test "ip_nonlocal_bind sysctls are independent u8 values (hello492)" {
+    const np = kt.nonlocal_bind_policy;
+    try std.testing.expectEqual(@as(u8, 0), np.get(.v4));
+    try std.testing.expectEqual(@as(u8, 0), np.get(.v6));
+    try std.testing.expectEqual(@as(i64, 2), np.write(.v4, "1\n"));
+    try std.testing.expect(np.allows(.v4));
+    try std.testing.expect(!np.allows(.v6));
+    try std.testing.expectEqual(@as(i64, 2), np.write(.v6, "1\n"));
+    try std.testing.expect(np.allows(.v6));
+    try std.testing.expectEqual(@as(i64, -22), np.write(.v4, "256\n"));
+    try std.testing.expectEqual(@as(i64, -22), np.write(.v6, "-1\n"));
+    try std.testing.expectEqual(@as(u8, 1), np.get(.v4));
+    try std.testing.expectEqual(@as(u8, 1), np.get(.v6));
+    try std.testing.expectEqual(@as(i64, 2), np.write(.v4, "0\n"));
+    try std.testing.expectEqual(@as(i64, 2), np.write(.v6, "0\n"));
 }
