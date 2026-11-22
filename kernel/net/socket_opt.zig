@@ -813,18 +813,38 @@ fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
     }
     if (level == ipo.SOL_IPV6 and optname == @import("flowlabel_mgr.zig").IPV6_FLOWLABEL_MGR) return getFlowlabelMgr(ref, optval_ptr, optlen_ptr);
     // IPV6_2292PKTOPTIONS: only a stream socket answers (ENOPROTOOPT otherwise), with the control messages its receive switches
-    // ask for; with none of them on that is nothing at all (length 0, optval untouched).
+    // ask for. This stack has no queued packet-options skb, so it uses the socket's current receive values as Linux's !skb path does.
     if (level == ipo.SOL_IPV6 and optname == ipo.IPV6_2292PKTOPTIONS) {
         if (ref != .tcp) return -92;
-        const o = (@import("tcp.zig").tcpGetOptions(ref.tcp) orelse return -9).ip;
-        if (ipo.pktOptions6Empty(o)) {
-            const copy_mod = @import("../mm/copy_from_user.zig");
-            if (optlen_ptr == 0 or optlen_ptr >= 0x0000_8000_0000_0000) return -14;
-            var zero: [4]u8 = @splat(0);
-            if (copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &zero, 4) != 4) return -14;
+        const tcp = @import("tcp.zig");
+        const o = (tcp.tcpGetOptions(ref.tcp) orelse return -9).ip;
+        const copy_mod = @import("../mm/copy_from_user.zig");
+        if (optlen_ptr == 0 or optlen_ptr >= 0x0000_8000_0000_0000) return -14;
+        var lb: [4]u8 = undefined;
+        if (copy_mod.copyFromUser(&lb, @ptrFromInt(optlen_ptr), 4) != 4) return -14;
+        var buf: [176]u8 = undefined;
+        const b = @import("ip_cmsg_policy.zig").buildPktOptions6(o, tcp.tcpReceivedFlowInfo(ref.tcp), bo.readU32Le(&lb), &buf);
+        // put_cmsg writes a header and its data but not alignment padding. Copy those spans separately so the staging buffer's
+        // zeroed padding does not overwrite the caller's bytes (and no uninitialised staging bytes can escape).
+        if (b.written != 0) {
+            if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;
+            var off: usize = 0;
+            while (off < b.written) {
+                if (b.written - off < 16) return -14;
+                const clen: usize = @intCast(bo.readU64Le(buf[off..][0..8]));
+                if (clen < 16 or clen > b.written - off) return -14;
+                if (copy_mod.copyToUser(@ptrFromInt(optval_ptr + @as(u64, @intCast(off))), buf[off .. off + clen], clen) != clen) return -14;
+                off += @min(@import("scm_policy.zig").cmsgSpace(clen - 16), b.written - off);
+            }
+            var len_out: [4]u8 = undefined;
+            bo.writeU32Le(&len_out, @intCast(b.written));
+            if (copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &len_out, 4) != 4) return -14;
             return 0;
         }
-        return -92;
+        // With no room even for a header, put_cmsg does not touch optval; a null optval is then valid.
+        var zero: [4]u8 = @splat(0);
+        if (copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &zero, 4) != 4) return -14;
+        return 0;
     }
     // IPV6_PATHMTU: struct ip6_mtuinfo with only the MTU of a connected socket's route filled in (the address stays zero, as
     // ipv6_getsockopt memsets it); an optlen under 32 bytes is EINVAL, no route (not connected) ENOTCONN.

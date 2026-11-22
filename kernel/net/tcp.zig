@@ -1234,6 +1234,14 @@ pub fn tcpSndflow6(tcb_idx: u32) bool {
     return tcbs[tcb_idx].options.ip.sndflow6;
 }
 
+/// The complete traffic class and flow label last received on a TCP socket (np->rcv_flowinfo), for IPV6_2292PKTOPTIONS.
+pub fn tcpReceivedFlowInfo(tcb_idx: u32) u32 {
+    const lock_flags = tcp_lock.acquire();
+    defer tcp_lock.release(lock_flags);
+    if (tcb_idx >= MAX_CONNECTIONS or !tcbs[tcb_idx].active) return 0;
+    return tcbs[tcb_idx].rx_flow6;
+}
+
 /// The flow label (low 20 bits of rcv_flowinfo) last received on a TCP socket, for IPV6_FL_F_REMOTE.
 pub fn tcpRemoteFlowLabel(tcb_idx: u32) u32 {
     const lock_flags = tcp_lock.acquire();

@@ -278,12 +278,6 @@ pub fn addrPreferencesValue(prefs: u16) i32 {
     return v;
 }
 
-/// IPV6_2292PKTOPTIONS on a TCP socket with none of the receive switches it reports (rxinfo, rxhlim, rxtclass, rxoinfo, rxohlim,
-/// rxflow): nothing to write.
-pub fn pktOptions6Empty(o: IpOpts) bool {
-    return !o.pktinfo6 and !o.recvhops6 and !o.recvtclass6 and !o.rxflow6 and o.flags6 & (F6_2292PKTINFO | F6_2292HOPLIMIT) == 0;
-}
-
 /// IP_TOS / IPV6_TCLASS on a datagram socket keep the two ECN bits the caller gave (__ip_sock_set_tos and do_ipv6_setsockopt
 /// clear them only for SOCK_STREAM, which applySet's result is shaped for). `v` is the value set; `r` applySet's answer.
 pub fn keepEcnForDatagram(r: SetResult, level: u64, optname: u64, v: i32) SetResult {

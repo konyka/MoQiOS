@@ -17973,10 +17973,7 @@ test "SOL_IP / SOL_IPV6 options the stack only stores, and the fixed answers of 
     const tc = p.keepEcnForDatagram(p.applySet(none, p.SOL_IPV6, p.IPV6_TCLASS, &[_]u8{ 1, 0, 0, 0 }), p.SOL_IPV6, p.IPV6_TCLASS, 1).ok;
     try std.testing.expectEqual(@as(u8, 1), tc.tclass);
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_opt_source, "if (ipo.applyExtraFor(cur, level, optname, v, val.len, admin, net_raw, raw)) |r| return r;") != null);
-    // TCP (hello487 C, D): IPV6_2292PKTOPTIONS with no receive switch on reads back nothing; IP_RECVFRAGSIZE is EINVAL.
-    try std.testing.expect(p.pktOptions6Empty(none));
-    try std.testing.expect(!p.pktOptions6Empty(.{ .recvhops6 = true }));
-    try std.testing.expect(!p.pktOptions6Empty(s1));
+    // TCP (hello487 C, D): IP_RECVFRAGSIZE is EINVAL; G covers IPV6_2292PKTOPTIONS with every receive-switch combination.
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_opt_source, "if (optname == ipo.IP_RECVFRAGSIZE) return -22;") != null);
     // Raw sockets (hello487 E, F): IP_ROUTER_ALERT on, on again EADDRINUSE, off, off again ENOBUFS (ip_ra_control); IP_NODEFRAG
     // stored; with CAP_NET_RAW the sticky header options fail the header check (EINVAL), without it EPERM.
@@ -17989,4 +17986,48 @@ test "SOL_IP / SOL_IPV6 options the stack only stores, and the fixed answers of 
     try std.testing.expectEqual(@as(i64, -22), p.applyExtraCaps(none, p.SOL_IPV6, p.IPV6_HOPOPTS, 1, 4, true, true).?.err);
     try std.testing.expectEqual(@as(i64, -1), p.applyExtraCaps(none, p.SOL_IPV6, p.IPV6_HOPOPTS, 1, 4, false, false).?.err);
     try std.testing.expectEqual(@as(i32, 1), p.getExtra(p.applyExtraCaps(none, p.SOL_IP, p.IP_TRANSPARENT, 1, 4, true, true).?.ok, p.SOL_IPV6, p.IPV6_TRANSPARENT).?.val);
+}
+
+test "TCP IPV6_2292PKTOPTIONS emits the six receive control messages with put_cmsg truncation (hello487 G)" {
+    const p = kt.ip_opt_policy;
+    const c = kt.ip_cmsg_policy;
+    const o: p.IpOpts = .{
+        .pktinfo6 = true,
+        .recvhops6 = true,
+        .recvtclass6 = true,
+        .rxflow6 = true,
+        .flags6 = p.F6_2292PKTINFO | p.F6_2292HOPLIMIT,
+        .mc_hops = 37,
+        .mc_if = 1,
+    };
+    var out: [176]u8 = @splat(0xa5);
+    const b = c.buildPktOptions6(o, 0x0ab1_2345, out.len, &out);
+    try std.testing.expectEqual(@as(usize, 176), b.written);
+    const offsets = [_]usize{ 0, 40, 64, 88, 128, 152 };
+    const types = [_]i32{ 50, 52, 67, 2, 8, 11 };
+    const lens = [_]u64{ 36, 20, 20, 36, 20, 20 };
+    const spaces = [_]usize{ 40, 24, 24, 40, 24, 24 };
+    for (offsets, types, lens, spaces) |off, typ, len, space| {
+        try std.testing.expectEqual(len, std.mem.readInt(u64, out[off..][0..8], .little));
+        try std.testing.expectEqual(@as(i32, 41), std.mem.readInt(i32, out[off + 8 ..][0..4], .little));
+        try std.testing.expectEqual(typ, std.mem.readInt(i32, out[off + 12 ..][0..4], .little));
+        try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 4), out[off + len .. off + space]);
+    }
+    try std.testing.expectEqual(@as(i32, 1), std.mem.readInt(i32, out[32..36], .little));
+    try std.testing.expectEqual(@as(i32, 1), std.mem.readInt(i32, out[120..124], .little));
+    try std.testing.expectEqual(@as(i32, 37), std.mem.readInt(i32, out[56..60], .little));
+    try std.testing.expectEqual(@as(i32, 37), std.mem.readInt(i32, out[144..148], .little));
+    try std.testing.expectEqual(@as(i32, 0xab), std.mem.readInt(i32, out[80..84], .little));
+    try std.testing.expectEqual(@as(u32, 0x0ab1_2345), std.mem.readInt(u32, out[168..172], .big));
+    try std.testing.expectEqual(@as(usize, 0), c.buildPktOptions6(.{}, 0, out.len, &out).written);
+
+    var short: [40]u8 = @splat(0xa5);
+    const just_info: p.IpOpts = .{ .pktinfo6 = true };
+    try std.testing.expectEqual(@as(usize, 0), c.buildPktOptions6(just_info, 0, 15, &short).written);
+    const cut = c.buildPktOptions6(just_info, 0, 17, &short);
+    try std.testing.expectEqual(@as(usize, 17), cut.written);
+    try std.testing.expect(cut.truncated);
+    try std.testing.expectEqual(@as(u64, 17), std.mem.readInt(u64, short[0..8], .little));
+    try std.testing.expectEqual(@as(u8, 0), short[16]);
+    try std.testing.expectEqual(@as(u8, 0xa5), short[17]);
 }

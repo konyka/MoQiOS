@@ -3,7 +3,8 @@
  * getsockopt (its value, -1000 when it fails): what is accepted, what is EINVAL, how the value reads back. Both tables were measured
  * on the host (gcc -DHOST: the same program, compared against itself), every table with CAP_NET_RAW only (unshare + setpriv) as
  * this test runs here: the sticky header options then fail the header check (EINVAL) and IP_TRANSPARENT may be set. C and D: the same two sweeps on a TCP socket;
- * E and F: on a raw socket (ICMP / ICMPv6). */
+ * E and F: on a raw socket (ICMP / ICMPv6). G: IPV6_2292PKTOPTIONS on TCP with every combination of its six receive switches,
+ * including put_cmsg truncation, untouched alignment padding and a null optval with zero length. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -174,8 +175,84 @@ int main(void) {
             }
         }
     }
-    snprintf(line, sizeof line, "hello487: A %d, B %d, C %d, D %d, E %d, F %d of 160 differ\n", a_fail, b_fail, c_fail, d_fail, e_fail,
-             failures - a_fail - b_fail - c_fail - d_fail - e_fail);
+    int f_fail = failures - a_fail - b_fail - c_fail - d_fail - e_fail;
+    static const int recv_opts[6] = { 49, 51, 66, 2, 8, 11 };
+    static const int cmsg_types[6] = { 50, 52, 67, 2, 8, 11 };
+    static const int cmsg_lens[6] = { 36, 20, 20, 36, 20, 20 };
+    static const int cmsg_spaces[6] = { 40, 24, 24, 40, 24, 24 };
+    for (int mask = 0; mask < 64; mask++) {
+        long s = sock(10, 1, 0);
+        int expected = 0;
+        for (int i = 0; i < 6; i++) if (mask & (1 << i)) {
+            int one = 1;
+            setopt_(s, 41, recv_opts[i], &one, 4);
+            expected += cmsg_spaces[i];
+        }
+        unsigned char b[256];
+        for (int i = 0; i < 256; i++) b[i] = 0xa5;
+        unsigned l = sizeof b;
+        long r = getopt_(s, 41, 6, b, &l);
+        int bad = r != 0 || l != (unsigned)expected;
+        int off = 0;
+        if (!bad) for (int i = 0; i < 6; i++) if (mask & (1 << i)) {
+            for (int k = 0; k < 8; k++) if (b[off + k] != (unsigned char)((unsigned long long)cmsg_lens[i] >> (8 * k))) bad = 1;
+            if (b[off + 8] != 41 || b[off + 9] || b[off + 10] || b[off + 11] ||
+                b[off + 12] != cmsg_types[i] || b[off + 13] || b[off + 14] || b[off + 15]) bad = 1;
+            for (int k = 0; k < cmsg_lens[i] - 16; k++) {
+                unsigned char want_byte = (i == 1 || i == 4) && k == 0 ? 1 : 0;
+                if (b[off + 16 + k] != want_byte) bad = 1;
+            }
+            for (int k = cmsg_lens[i]; k < cmsg_spaces[i]; k++) if (b[off + k] != 0xa5) bad = 1;
+            off += cmsg_spaces[i];
+        }
+        close_(s);
+        if (bad) {
+            snprintf(line, sizeof line, "hello487:   FAIL G mask %d: r %d len %u (Linux 0, %d)\n", mask, (int)r, l, expected);
+            print(line);
+            failures++;
+        }
+    }
+    static const unsigned caps[] = { 0, 1, 15, 16, 17, 19, 20, 23, 24, 25, 39, 40 };
+    for (int k = 0; k < 12; k++) {
+        long s = sock(10, 1, 0);
+        int one = 1;
+        setopt_(s, 41, 49, &one, 4);
+        unsigned char b[64];
+        for (int i = 0; i < 64; i++) b[i] = 0xa5;
+        unsigned l = caps[k];
+        long r = getopt_(s, 41, 6, b, &l);
+        unsigned want_len = caps[k] < 16 ? 0 : caps[k];
+        int bad = r != 0 || l != want_len;
+        if (!bad && caps[k] >= 16) {
+            unsigned want_cmsg = caps[k] < 36 ? caps[k] : 36;
+            for (int i = 0; i < 8; i++) if (b[i] != (unsigned char)((unsigned long long)want_cmsg >> (8 * i))) bad = 1;
+            if (b[8] != 41 || b[12] != 50) bad = 1;
+            for (unsigned i = 16; i < want_cmsg; i++) if (b[i] != 0) bad = 1;
+            for (unsigned i = want_cmsg; i < want_len; i++) if (b[i] != 0xa5) bad = 1;
+        }
+        close_(s);
+        if (bad) {
+            snprintf(line, sizeof line, "hello487:   FAIL G cap %u: r %d len %u (Linux 0, %u)\n", caps[k], (int)r, l, want_len);
+            print(line);
+            failures++;
+        }
+    }
+    for (int enabled = 0; enabled < 2; enabled++) {
+        long s = sock(10, 1, 0);
+        int one = 1;
+        if (enabled) setopt_(s, 41, 49, &one, 4);
+        unsigned l = 0;
+        long r = getopt_(s, 41, 6, 0, &l);
+        close_(s);
+        if (r != 0 || l != 0) {
+            snprintf(line, sizeof line, "hello487:   FAIL G null cap 0 enabled %d: r %d len %u\n", enabled, (int)r, l);
+            print(line);
+            failures++;
+        }
+    }
+    int g_fail = failures - a_fail - b_fail - c_fail - d_fail - e_fail - f_fail;
+    snprintf(line, sizeof line, "hello487: A %d, B %d, C %d, D %d, E %d, F %d, G %d differ\n", a_fail, b_fail, c_fail, d_fail, e_fail,
+             f_fail, g_fail);
     print(line);
     print(failures ? "hello487: FAIL\n" : "hello487: PASS\n");
     return failures ? 1 : 0;

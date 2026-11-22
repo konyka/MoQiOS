@@ -24,7 +24,9 @@
  *      label is not looked at (0);
  *   N. getsockopt with IPV6_FL_F_REMOTE reports the flow label last received (np->rcv_flowinfo): 0 on a UDP socket and on the
  *      connecting TCP socket; the accepted TCP socket reads the label of the SYN that made it (tcp_v6_syn_recv_sock); once the
- *      client sets IPV6_RECVFLOWINFO, data it receives in order updates its value to the label the server sends with. */
+ *      client sets IPV6_RECVFLOWINFO, data it receives in order updates its value to the label the server sends with.
+ *   O. IPV6_2292PKTOPTIONS on that client reports the complete flowinfo: the server's non-ECN traffic-class bits and flow label,
+ *      not only the low 20-bit label returned by IPV6_FL_F_REMOTE (TCP may mark the data ECT(1)). */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -265,12 +267,26 @@ int main(void) {
     long r0 = remote_label(u, &n0), r1 = remote_label(ac, &n1), r2 = remote_label(tb, &n2);
     int rfl = 1;
     setopt_(tb, 41, 11, &rfl, 4);
+    setopt_(tb, 41, 66, &rfl, 4);
+    int tc6 = 0xa8;
+    setopt_(ac, 41, 67, &tc6, 4);
     long ws = write_(ac, "q", 1);
     char nb[4];
     long rd = read_(tb, nb, 4);
     long r3 = remote_label(tb, &n3);
     snprintf(msg, sizeof msg, "N: REMOTE udp %ld 0x%x, accepted %ld 0x%x, client %ld 0x%x; write %ld read %ld, client after RECVFLOWINFO %ld nonzero %d (0 0 0 0x13131 0 0 1 1 0 1)", r0, n0, r1, n1, r2, n2, ws, rd, r3, n3 != 0);
     check(r0 == 0 && n0 == 0 && r1 == 0 && n1 == 0x13131 && r2 == 0 && n2 == 0 && ws == 1 && rd == 1 && r3 == 0 && n3 != 0 && (n3 & ~0xfffffu) == 0, msg);
+    unsigned char po[48];
+    memset(po, 0xa5, sizeof po);
+    int pol = sizeof po;
+    long por = getopt_(tb, 41, 6, po, &pol);
+    unsigned int oflow = 0x0a800000u | n3;
+    unsigned int actual_flow = ((unsigned int)po[40] << 24) | ((unsigned int)po[41] << 16) | ((unsigned int)po[42] << 8) | po[43];
+    // TCP may mark data ECT(1); compare the other six traffic-class bits and the label, not ECN.
+    int flow_ok = (actual_flow & ~0x00300000u) == oflow;
+    snprintf(msg, sizeof msg, "O: PKTOPTIONS r %ld len %d, TCLASS %d, FLOWINFO bytes %02x %02x %02x %02x (0 48 168 & 252, %02x %02x %02x %02x without ECN)",
+             por, pol, po[16], po[40], po[41], po[42], po[43], oflow >> 24, (oflow >> 16) & 255, (oflow >> 8) & 255, oflow & 255);
+    check(por == 0 && pol == 48 && po[12] == 67 && (po[16] & 0xfc) == 0xa8 && po[17] == 0 && po[36] == 11 && flow_ok, msg);
     close_(ac);
     close_(ta);
     close_(tb);

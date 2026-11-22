@@ -203,6 +203,41 @@ pub fn buildPktOptions(w: Wanted, addr: [4]u8, ifindex: u8, ttl: u8, tos: u8, ca
     return .{ .written = used, .truncated = truncated };
 }
 
+/// getsockopt(IPV6_2292PKTOPTIONS) with no queued packet options (do_ipv6_getsockopt): the six receive messages in Linux order.
+/// A fresh stream has a zero sticky address, while the interface and hop limit are its multicast values; flowinfo is the last one
+/// received (np->rcv_flowinfo). Unlike recvmsg, the flowinfo message is present even when its value is zero.
+pub fn buildPktOptions6(o: ipo.IpOpts, flowinfo: u32, cap_in: usize, out: []u8) Built {
+    const cap = @min(cap_in, out.len);
+    var used: usize = 0;
+    var truncated = false;
+    const lv: i32 = @intCast(ipo.SOL_IPV6);
+    var pi: [20]u8 = @splat(0);
+    std.mem.writeInt(i32, pi[16..20], o.mc_if, .little);
+    if (o.pktinfo6) put(out, &used, cap, lv, @intCast(ipo.IPV6_PKTINFO), &pi, &truncated);
+    if (o.recvhops6) {
+        var h: [4]u8 = undefined;
+        std.mem.writeInt(i32, &h, o.mc_hops, .little);
+        put(out, &used, cap, lv, @intCast(ipo.IPV6_HOPLIMIT), &h, &truncated);
+    }
+    if (o.recvtclass6) {
+        var t: [4]u8 = undefined;
+        std.mem.writeInt(i32, &t, @intCast((flowinfo >> 20) & 0xff), .little);
+        put(out, &used, cap, lv, @intCast(ipo.IPV6_TCLASS), &t, &truncated);
+    }
+    if (o.flags6 & ipo.F6_2292PKTINFO != 0) put(out, &used, cap, lv, IPV6_2292PKTINFO, &pi, &truncated);
+    if (o.flags6 & ipo.F6_2292HOPLIMIT != 0) {
+        var h: [4]u8 = undefined;
+        std.mem.writeInt(i32, &h, o.mc_hops, .little);
+        put(out, &used, cap, lv, IPV6_2292HOPLIMIT, &h, &truncated);
+    }
+    if (o.rxflow6) {
+        var f: [4]u8 = undefined;
+        std.mem.writeInt(u32, &f, flowinfo, .big);
+        put(out, &used, cap, lv, IPV6_FLOWINFO, &f, &truncated);
+    }
+    return .{ .written = used, .truncated = truncated };
+}
+
 /// ip6_datagram_recv_common_ctl then _specific_ctl: IPV6_PKTINFO (struct in6_pktinfo: in6_addr, then int ifindex), IPV6_HOPLIMIT
 /// (int), IPV6_TCLASS (int), then IPV6_ORIGDSTADDR, after the timestamp (`out` holds at least min(cap, 160) bytes).
 /// ipv6_recv_rxpmtu's message: one IPV6_PATHMTU control message holding struct ip6_mtuinfo (a sockaddr_in6 with the destination,
