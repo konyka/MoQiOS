@@ -1852,7 +1852,7 @@ fn tcpChecksumV6(src_ip: [16]u8, dst_ip: [16]u8, tcp_hdr: [*]const u8, tcp_len: 
 }
 
 /// IPv6 TCP receive (SK-74..77): checksum, demux/listen SYN, shared state machine.
-pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32, ecn_ce: bool, flowinfo: u32) void {
+pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u32, ecn_ce: bool, flowinfo: u32, hop_limit: u8) void {
     if (len < 20) return;
     const tcp_len: u16 = @intCast(@min(len, 0xFFFF));
     const data_offset = (@as(u16, data[12]) >> 4) * 4;
@@ -1889,7 +1889,7 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
     const tcb = findTcbByTupleV6(dst_ip, dst_port, src_port, src_ip) orelse {
         if (flags & SYN != 0) {
             const before = pendingBacklogCount();
-            handleIncomingSynV6(src_ip, dst_ip, src_port, dst_port, seq_num, raw_window, opts, flags, flowinfo);
+            handleIncomingSynV6(src_ip, dst_ip, src_port, dst_port, seq_num, raw_window, opts, flags, flowinfo, hop_limit);
             // Nobody listens on the port: a ::1 peer is told at once (RFC 9293
             // §3.10.7.1) instead of retransmitting its SYN.
             if (pendingBacklogCount() == before and !hasListener(dst_port, true, tcp_port_policy.WILDCARD4, dst_ip)) {
@@ -1898,6 +1898,8 @@ pub fn handlePacketV6(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: u3
         } else if (!hasListener(dst_port, true, tcp_port_policy.WILDCARD4, dst_ip)) sendLoopbackResetV6(src_ip, dst_ip, src_port, dst_port, flags, ack_num, seq_num, payload_len);
         return;
     };
+    // tcp_v6_rcv: an existing socket only accepts segments meeting its IPV6_MINHOPCOUNT threshold.
+    if (hop_limit < tcb.options.ip.min_hops6) return;
     // tcp_v6_do_rcv: an in-order data segment on an open connection refreshes rcv_flowinfo while rxflow or rxtclass is on.
     if (payload_len > 0 and seq_num == tcb.rcv_nxt and tcb.state != .closed and tcb.state != .listen) {
         if (tcb.options.ip.rxflow6 or tcb.options.ip.recvtclass6) tcb.rx_flow6 = flowinfo;
@@ -2446,6 +2448,8 @@ fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16,
     const peer_ecn = probeEcnPeerSetup(flags);
     // The listener bound to the SYN's destination address, else a wildcard one.
     const ls = pickListenSlot(dst_port, false, dst_ip, @splat(0), src_ip, src_port) orelse return;
+    // tcp_v4_rcv: IP_MINTTL drops the segment before the listener changes state.
+    if (rx.ttl < tcbs[ls.tcb_idx].options.ip.min_ttl4) return;
 
     // T17: Allow TCB reuse for TIME_WAIT connections (if ISN is larger)
     var tw_bm = tcb_active_bitmap.snapshot();
@@ -2570,11 +2574,13 @@ fn handleIncomingSyn(src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16,
 }
 
 /// IPv6 listen SYN (SK-75/76). Creates SYN_RECEIVED and sends SYN-ACK via NDP.
-fn handleIncomingSynV6(src_ip: [16]u8, dst_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions, flags: u8, flowinfo: u32) void {
+fn handleIncomingSynV6(src_ip: [16]u8, dst_ip: [16]u8, src_port: u16, dst_port: u16, seq_num: u32, _w: u16, opts: TcpOptions, flags: u8, flowinfo: u32, hop_limit: u8) void {
     _ = _w;
     const peer_ecn = probeEcnPeerSetup(flags);
     // The listener bound to the SYN's destination address, else one bound to ::.
     const ls = pickListenSlot(dst_port, true, tcp_port_policy.WILDCARD4, dst_ip, .{ src_ip[12], src_ip[13], src_ip[14], src_ip[15] }, src_port) orelse return;
+    // tcp_v6_rcv: IPV6_MINHOPCOUNT drops the segment before the listener changes state.
+    if (hop_limit < tcbs[ls.tcb_idx].options.ip.min_hops6) return;
 
     var tw_bm = tcb_active_bitmap.snapshot();
     while (tw_bm.next()) |i| {
@@ -3339,6 +3345,8 @@ pub fn handlePacketOpts(src_ip: [4]u8, dst_ip: [4]u8, data: [*]const u8, len: u3
     // Find matching TCB. A new SYN for a 4-tuple still in TIME_WAIT starts a new connection when its sequence number is newer (RFC 1122 4.2.2.13,
     // Linux tcp_timewait_state_process): it goes to the listener like a fresh SYN, which takes over the TIME_WAIT slot.
     const found = findTcbByTuple(dst_ip, dst_port, src_port, src_ip);
+    // tcp_v4_rcv: an existing socket only accepts segments meeting its IP_MINTTL threshold.
+    if (found) |t| if (rx.ttl < t.options.ip.min_ttl4) return;
     const tw_reopen = if (found) |t| t.state == .time_wait and flags & SYN != 0 and flags & ACK == 0 and tcp_util.seqGt(seq_num, t.irs) else false;
     const tcb = (if (tw_reopen) null else found) orelse {
         // No matching connection — check if any socket is listening on this port

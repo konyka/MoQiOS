@@ -147,7 +147,7 @@ pub fn handleRxPacketMeta(data: [*]const u8, len: u32, ifindex: u8, skb: @import
                     icmpv6.handlePacketMeta(info6.src_ip, info6.dst_ip, data + up_start, up_len, .{ .ifindex = ifindex, .dst = info6.dst_ip, .hops = info6.hop_limit, .tclass = info6.tclass });
                 },
                 ipv6.PROTO_TCP => {
-                    tcp.handlePacketV6(info6.src_ip, info6.dst_ip, data + up_start, up_len, info6.ecn_ce, info6.flowinfo);
+                    tcp.handlePacketV6(info6.src_ip, info6.dst_ip, data + up_start, up_len, info6.ecn_ce, info6.flowinfo, info6.hop_limit);
                 },
                 ipv6.PROTO_UDP => {
                     udp.handlePacketV6Info(info6.src_ip, info6.dst_ip, data + up_start, up_len, .{ .ifindex = ifindex, .dst = info6.dst_ip, .hops = info6.hop_limit, .tclass = info6.tclass, .flowinfo = info6.flowinfo, .mark = skb.mark, .priority = skb.priority });

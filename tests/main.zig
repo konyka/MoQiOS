@@ -17925,7 +17925,7 @@ test "IPV6_FL_F_REMOTE reports the flow label last received, like ipv6_flowlabel
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.count(u8, ts, "new_tcb.rx_flow6 = flowinfo;") + std.mem.count(u8, ts, "reuse_tcb.rx_flow6 = flowinfo;") == 2);
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.options.ip.rxflow6 or tcb.options.ip.recvtclass6) tcb.rx_flow6 = flowinfo;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "tcp.handlePacketV6(info6.src_ip, info6.dst_ip, data + up_start, up_len, info6.ecn_ce, info6.flowinfo);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "tcp.handlePacketV6(info6.src_ip, info6.dst_ip, data + up_start, up_len, info6.ecn_ce, info6.flowinfo, info6.hop_limit);") != null);
     // tcp_v6_connect keeps sin6_flowinfo's label (np->flow_label) and every segment carries it instead of the automatic one.
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_syscall_source, "tcpConnectSocketV6Flow(tcb_idx, parsed.addr, parsed.port, if (net_mod.tcp.tcpSndflow6(tcb_idx)) parsed.flowinfo else 0)") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (tcb.tx_flow6 != 0) {\n        ip_opt_policy.setFlowLabel6(send_pkt[14..][0..40], tcb.tx_flow6);") != null);
@@ -18030,4 +18030,13 @@ test "TCP IPV6_2292PKTOPTIONS emits the six receive control messages with put_cm
     try std.testing.expectEqual(@as(u64, 17), std.mem.readInt(u64, short[0..8], .little));
     try std.testing.expectEqual(@as(u8, 0), short[16]);
     try std.testing.expectEqual(@as(u8, 0xa5), short[17]);
+}
+
+test "IP_MINTTL and IPV6_MINHOPCOUNT filter existing TCP sockets and listening SYNs (hello488)" {
+    const ts = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (rx.ttl < tcbs[ls.tcb_idx].options.ip.min_ttl4) return;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (found) |t| if (rx.ttl < t.options.ip.min_ttl4) return;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (hop_limit < tcbs[ls.tcb_idx].options.ip.min_hops6) return;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (hop_limit < tcb.options.ip.min_hops6) return;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "tcp.handlePacketV6(info6.src_ip, info6.dst_ip, data + up_start, up_len, info6.ecn_ce, info6.flowinfo, info6.hop_limit);") != null);
 }
