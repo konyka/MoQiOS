@@ -26,7 +26,9 @@
  *      connecting TCP socket; the accepted TCP socket reads the label of the SYN that made it (tcp_v6_syn_recv_sock); once the
  *      client sets IPV6_RECVFLOWINFO, data it receives in order updates its value to the label the server sends with.
  *   O. IPV6_2292PKTOPTIONS on that client reports the complete flowinfo: the server's non-ECN traffic-class bits and flow label,
- *      not only the low 20-bit label returned by IPV6_FL_F_REMOTE (TCP may mark the data ECT(1)). */
+ *      not only the low 20-bit label returned by IPV6_FL_F_REMOTE (TCP may mark the data ECT(1)).
+ *   P. after every exclusive label is gone (six-second linger plus the deferred one-second static key), a send with an unheld
+ *      label is allowed again. */
 #ifdef HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -297,6 +299,16 @@ int main(void) {
     close_(v);
     close_(p);
     close_(rs);
+    long prs = sock(10, 2, 0);
+    long prb = bind_(prs, &ra, sizeof ra);
+    long ps = sock(10, 2, 0);
+    setopt_(ps, 41, 33, &one, 4);
+    sleep(8);
+    long p1 = send_flow(ps, 0x5a5a5);
+    snprintf(msg, sizeof msg, "P: after the last exclusive label expired and its deferred key turned off, unheld send: bind %ld send %ld (0 1)", prb, p1);
+    check(prb == 0 && p1 == 1, msg);
+    close_(ps);
+    close_(prs);
     print(failures ? "hello484: FAIL\n" : "hello484: PASS\n");
     return failures ? 1 : 0;
 }

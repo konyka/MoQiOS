@@ -101,9 +101,10 @@ const Holding = struct { used: bool = false, holder: Holder = .{}, label: u32 = 
 pub const State = struct {
     labels: [MAX_LABELS]Label = @splat(.{}),
     holdings: [MAX_HOLDINGS]Holding = @splat(.{}),
-    /// A label with a share mode that limits who may use it exists (fl_shared_exclusive / flowlabel_has_excl, sticky as in Linux):
-    /// sends and connects must then use labels their socket holds.
+    /// The deferred static key is active while an exclusive label exists and for one second after the last one is freed
+    /// (ipv6_flowlabel_exclusive). Linux's separate flowlabel_has_excl flag remains sticky, but is not consulted once that key is off.
     has_excl: bool = false,
+    excl_off_ms: u64 = 0,
     rng: u64 = 0x9E37_79B9_7F4A_7C15,
 
     fn find(s: *State, label: u32, now_ms: u64) ?*Label {
@@ -114,12 +115,34 @@ pub const State = struct {
         return null;
     }
 
-    /// ip6_fl_gc: a label nobody holds goes once its expiry (no earlier than the last use plus the linger) has passed.
+    /// ip6_fl_gc: a label nobody holds goes once its expiry (no earlier than the last use plus the linger) has passed. The deferred
+    /// key's deadline comes from that expiry too, so a caller that has not touched the table for a while does not add another second.
     fn gc(s: *State, now_ms: u64) void {
+        var last_excl_free_ms: u64 = 0;
         for (&s.labels) |*l| {
             if (!l.used or l.users != 0) continue;
             const ttd = @max(l.expires_ms, l.lastuse_ms + @as(u64, l.linger_s) * 1000);
-            if (now_ms >= ttd) l.* = .{};
+            if (now_ms >= ttd) {
+                if (l.share != S_ANY) last_excl_free_ms = @max(last_excl_free_ms, ttd);
+                l.* = .{};
+            }
+        }
+        var exclusive = false;
+        for (&s.labels) |*l| {
+            if (l.used and l.share != S_ANY) {
+                exclusive = true;
+                break;
+            }
+        }
+        if (exclusive) {
+            s.has_excl = true;
+            s.excl_off_ms = 0;
+        } else if (s.has_excl) {
+            if (last_excl_free_ms != 0) s.excl_off_ms = last_excl_free_ms + 1000;
+            if (s.excl_off_ms != 0 and now_ms >= s.excl_off_ms) {
+                s.has_excl = false;
+                s.excl_off_ms = 0;
+            }
         }
     }
 
@@ -264,7 +287,10 @@ pub const State = struct {
         const slot = s.freeLabel() orelse return -105;
         if (!s.link(h, fresh.label)) return -12;
         slot.* = fresh;
-        if (fresh.share != S_ANY) s.has_excl = true;
+        if (fresh.share != S_ANY) {
+            s.has_excl = true;
+            s.excl_off_ms = 0;
+        }
         return 0;
     }
 
@@ -291,9 +317,10 @@ pub const State = struct {
         return .{ .ok = .{ .label = l.label, .dst = l.dst, .share = l.share, .expires = @intCast(@min(left_ms / 1000, 0xFFFF)), .linger = @intCast(@min(l.linger_s, 0xFFFF)) } };
     }
 
-    /// fl6_sock_lookup on a send or connect with flow label `label` (its low 20 bits): EINVAL when some label is held
-    /// exclusively and this socket does not hold `label`; otherwise 0.
+    /// fl6_sock_lookup on a send or connect with flow label `label` (its low 20 bits): EINVAL while the deferred exclusive key
+    /// is active and this socket does not hold `label`; otherwise 0.
     pub fn checkSend(s: *State, h: Holder, label: u32, now_ms: u64) i64 {
+        s.gc(now_ms);
         const l = label & LABEL_MASK;
         if (l == 0 or !s.has_excl) return 0;
         if (!s.holds(h, l)) return -22;
@@ -488,4 +515,26 @@ pub fn rekey(old: Holder, new: Holder) void {
     const f = lock.acquire();
     defer lock.release(f);
     state.rekey(old, new);
+}
+
+test "exclusive send gate turns off one second after the final label expires (hello484 P)" {
+    var s: State = .{};
+    const a: Holder = .{ .kind = .udp, .key = 1 };
+    const b: Holder = .{ .kind = .udp, .key = 2 };
+    var c: Caller = .{ .now_ms = 1000 };
+    var r = mkReq(A_GET, S_EXCL, F_CREATE, 0x5a5a5);
+    try std.testing.expectEqual(@as(i64, 0), s.opt(a, &r, c, false));
+    try std.testing.expectEqual(@as(i64, -22), s.checkSend(b, 0x54321, c.now_ms));
+    s.dropHolder(a, c.now_ms);
+    c.now_ms = 6999;
+    try std.testing.expectEqual(@as(i64, -22), s.checkSend(b, 0x54321, c.now_ms));
+    c.now_ms = 7000;
+    try std.testing.expectEqual(@as(i64, -22), s.checkSend(b, 0x54321, c.now_ms));
+    c.now_ms = 7999;
+    try std.testing.expectEqual(@as(i64, -22), s.checkSend(b, 0x54321, c.now_ms));
+    c.now_ms = 8000;
+    try std.testing.expectEqual(@as(i64, 0), s.checkSend(b, 0x54321, c.now_ms));
+    r = mkReq(A_GET, S_EXCL, F_CREATE, 0x6b6b6);
+    try std.testing.expectEqual(@as(i64, 0), s.opt(a, &r, c, false));
+    try std.testing.expectEqual(@as(i64, -22), s.checkSend(b, 0x54321, c.now_ms));
 }
