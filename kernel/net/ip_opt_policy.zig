@@ -150,12 +150,16 @@ pub const F6_RECVRTHDR: u16 = 1 << 8;
 pub const F6_RECVDSTOPTS: u16 = 1 << 9;
 pub const F6_RECVFRAGSIZE: u16 = 1 << 10;
 pub const F6_FREEBIND: u16 = 1 << 11;
+pub const F6_TRANSPARENT: u16 = 1 << 12;
 pub const F4_FREEBIND: u16 = 1 << 0;
 pub const F4_PASSSEC: u16 = 1 << 1;
 pub const F4_CHECKSUM: u16 = 1 << 2;
 pub const F4_BIND_NO_PORT: u16 = 1 << 3;
 pub const F4_RECVFRAGSIZE: u16 = 1 << 4;
 pub const F4_RFC4884: u16 = 1 << 5;
+pub const F4_TRANSPARENT: u16 = 1 << 6;
+pub const F4_ROUTER_ALERT: u16 = 1 << 7;
+pub const F4_NODEFRAG: u16 = 1 << 8;
 
 /// Option numbers handled only by the rules below (Linux include/uapi/linux/in.h, in6.h).
 pub const IP_ROUTER_ALERT: u64 = 5;
@@ -297,6 +301,27 @@ pub fn keepEcnForDatagram(r: SetResult, level: u64, optname: u64, v: i32) SetRes
 /// multicast source filters, unicast-interface binding or address-form change). `int_len` is the optlen the caller gave. Null:
 /// not one of them.
 pub fn applyExtra(cur: IpOpts, level: u64, optname: u64, v: i32, int_len: usize, has_net_admin: bool) ?SetResult {
+    return applyExtraCaps(cur, level, optname, v, int_len, has_net_admin, has_net_admin);
+}
+
+/// applyExtra with CAP_NET_RAW apart from "CAP_NET_RAW or CAP_NET_ADMIN" (`may_transparent`): the sticky hop-by-hop and
+/// destination-option headers need CAP_NET_RAW (ipv6_set_opt_hdr), IP_TRANSPARENT / IPV6_TRANSPARENT either one.
+pub fn applyExtraCaps(cur: IpOpts, level: u64, optname: u64, v: i32, int_len: usize, may_transparent: bool, has_net_raw: bool) ?SetResult {
+    return applyExtraFor(cur, level, optname, v, int_len, may_transparent, has_net_raw, false);
+}
+
+/// applyExtraCaps for a raw socket (`raw`): IP_ROUTER_ALERT (ip_ra_control) and IP_NODEFRAG are its options and are stored.
+pub fn applyExtraFor(cur: IpOpts, level: u64, optname: u64, v: i32, int_len: usize, may_transparent: bool, has_net_raw: bool, raw: bool) ?SetResult {
+    const has_net_admin = may_transparent;
+    if (raw and level == SOL_IP and (optname == IP_ROUTER_ALERT or optname == IP_NODEFRAG)) {
+        var r = cur;
+        // ip_ra_control: turning the alert on again while this socket is on the chain is EADDRINUSE.
+        if (optname == IP_ROUTER_ALERT and v != 0 and cur.flags4 & F4_ROUTER_ALERT != 0) return .{ .err = -98 };
+        // Turning it off while it is not on finds nothing to remove and no new entry to add: ENOBUFS.
+        if (optname == IP_ROUTER_ALERT and v == 0 and cur.flags4 & F4_ROUTER_ALERT == 0) return .{ .err = -105 };
+        r.flags4 = setFlag(r.flags4, if (optname == IP_ROUTER_ALERT) F4_ROUTER_ALERT else F4_NODEFRAG, v != 0);
+        return .{ .ok = r };
+    }
     var o = cur;
     switch (level) {
         SOL_IPV6 => switch (optname) {
@@ -311,9 +336,15 @@ pub fn applyExtra(cur: IpOpts, level: u64, optname: u64, v: i32, int_len: usize,
             IPV6_IPSEC_POLICY, IPV6_XFRM_POLICY => return .{ .err = -1 },
             42, 43, 44, 45, 46, 47, MCAST_MSFILTER => return .{ .err = -22 },
             IPV6_PKTINFO => return .{ .err = -22 },
-            IPV6_HOPOPTS, IPV6_RTHDRDSTOPTS, IPV6_DSTOPTS => return .{ .err = -1 },
+            // With CAP_NET_RAW the 4-byte value fails the header check (under 8 bytes or not a multiple of 8): EINVAL.
+            IPV6_HOPOPTS, IPV6_RTHDRDSTOPTS, IPV6_DSTOPTS => return .{ .err = if (has_net_raw) -22 else -1 },
             IPV6_RTHDR => return .{ .err = -22 },
-            IPV6_TRANSPARENT => return .{ .err = if (v != 0 and !has_net_admin) -1 else if (int_len < 4) -22 else 0 },
+            IPV6_TRANSPARENT => {
+                if (v != 0 and !has_net_admin) return .{ .err = -1 };
+                if (int_len < 4) return .{ .err = -22 };
+                o.flags6 = setFlag(o.flags6, F6_TRANSPARENT, v != 0);
+                return .{ .ok = o };
+            },
             IPV6_UNICAST_IF => return .{ .err = -99 },
             IPV6_RECVERR_RFC4884 => {
                 if (int_len < 4 or v < 0 or v > 1) return .{ .err = -22 };
@@ -342,7 +373,12 @@ pub fn applyExtra(cur: IpOpts, level: u64, optname: u64, v: i32, int_len: usize,
             IP_ROUTER_ALERT => return .{ .err = -22 },
             IP_MTU, IP_NODEFRAG, IP_PROTOCOL => return .{ .err = -92 },
             IP_IPSEC_POLICY, IP_XFRM_POLICY => return .{ .err = -1 },
-            IP_TRANSPARENT => return .{ .err = -1 },
+            IP_TRANSPARENT => {
+                if (v != 0 and !has_net_admin) return .{ .err = -1 };
+                if (int_len < 1) return .{ .err = -22 };
+                o.flags4 = setFlag(o.flags4, F4_TRANSPARENT, v != 0);
+                return .{ .ok = o };
+            },
             37, 38, 39, 40, IP_MSFILTER, 42, 43, 44, 45, 46, 47, MCAST_MSFILTER => return .{ .err = -22 },
             IP_UNICAST_IF => return .{ .err = if (int_len != 4) -22 else -99 },
             IP_MINTTL => {
@@ -384,7 +420,9 @@ pub fn getExtra(o: IpOpts, level: u64, optname: u64) ?union(enum) { val: i32, er
             IPV6_RECVERR_RFC4884 => return .{ .val = @intFromBool(o.flags6 & F6_RFC4884 != 0) },
             IPV6_MINHOPCOUNT => return .{ .val = o.min_hops6 },
             IPV6_ADDR_PREFERENCES => return .{ .val = addrPreferencesValue(o.srcprefs6) },
-            IPV6_ROUTER_ALERT, IPV6_TRANSPARENT => return .{ .val = 0 },
+            IPV6_ROUTER_ALERT => return .{ .val = 0 },
+            // Linux keeps one transparent bit for both families (inet TRANSPARENT).
+            IPV6_TRANSPARENT => return .{ .val = @intFromBool(o.flags6 & F6_TRANSPARENT != 0 or o.flags4 & F4_TRANSPARENT != 0) },
             IPV6_UNICAST_IF => return .{ .val = 0 },
             MCAST_MSFILTER => return .{ .err = -99 },
             // The sticky header options (ipv6_getsockopt_sticky): no options set, nothing copied.
@@ -395,7 +433,10 @@ pub fn getExtra(o: IpOpts, level: u64, optname: u64) ?union(enum) { val: i32, er
             },
         },
         SOL_IP => switch (optname) {
-            IP_ROUTER_ALERT, IP_TRANSPARENT, IP_NODEFRAG, IP_UNICAST_IF, IP_PROTOCOL => return .{ .val = 0 },
+            IP_ROUTER_ALERT => return .{ .val = @intFromBool(o.flags4 & F4_ROUTER_ALERT != 0) },
+            IP_NODEFRAG => return .{ .val = @intFromBool(o.flags4 & F4_NODEFRAG != 0) },
+            IP_UNICAST_IF, IP_PROTOCOL => return .{ .val = 0 },
+            IP_TRANSPARENT => return .{ .val = @intFromBool(o.flags4 & F4_TRANSPARENT != 0 or o.flags6 & F6_TRANSPARENT != 0) },
             IP_MTU => return .{ .err = -107 },
             IP_MINTTL => return .{ .val = o.min_ttl4 },
             IP_RECVERR_RFC4884 => return .{ .val = @intFromBool(o.flags4 & F4_RFC4884 != 0) },

@@ -171,6 +171,10 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // fs.pipe-max-size: root opens the sysctl for writing (mode 0644), without CAP_SYS_RESOURCE so the limit applies to it.
         return .{ .uid = 0, .gid = 0, .caps = NO_CAPS, .initial_init = false };
     }
+    if (std.mem.eql(u8, name, "hello487")) {
+        // SOL_IP / SOL_IPV6 option sweep: raw sockets (CAP_NET_RAW, the only capability, matching the host measurement).
+        return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_raw = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello484")) {
         // IPV6_FLOWLABEL_MGR: root without CAP_NET_ADMIN (a linger past 150 s is EPERM); CAP_SETUID so a child takes uid 1000;
         // CAP_NET_RAW for the raw ICMPv6 socket of item L.

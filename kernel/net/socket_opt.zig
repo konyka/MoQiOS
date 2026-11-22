@@ -631,6 +631,9 @@ fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
     if (level == ipo.SOL_IP and (optname == ipo.IP_ADD_MEMBERSHIP or optname == ipo.IP_DROP_MEMBERSHIP)) return setMembership4(ref, optname, optval_ptr, optlen);
     // do_ip_setsockopt: IP_HDRINCL is for SOCK_RAW only; any other socket still reads it as 0.
     if (level == ipo.SOL_IP and optname == ipo.IP_HDRINCL and ref != .raw) return -92;
+    if (ref == .raw) {
+        if (rawSetErrno(level, optname)) |e| return e;
+    }
     if (ref == .tcp and level == ipo.SOL_IPV6) {
         if (ipo.streamSetErrno(optname)) |e| return e;
     }
@@ -697,7 +700,7 @@ fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
         .raw => |idx| {
             const raw_mod = @import("raw_icmp.zig");
             var st = raw_mod.getOpts(idx) orelse return -9;
-            switch (ipo.keepEcnForDatagram(applyIpSet(st.ip, level, optname, raw[0..@intCast(n)]), level, optname, ipo.readInt(raw[0..@intCast(n)]) orelse 0)) {
+            switch (ipo.keepEcnForDatagram(applyIpSetFor(st.ip, level, optname, raw[0..@intCast(n)], true), level, optname, ipo.readInt(raw[0..@intCast(n)]) orelse 0)) {
                 .err => |e| return e,
                 .ok => |v| st.ip = v,
             }
@@ -730,8 +733,9 @@ fn setMembership(ref: SockRef, optname: u64, optval_ptr: u64, optlen: u64) i64 {
 /// address) is EINVAL; 12 bytes and more are a struct ip_mreqn with an interface index too (Linux do_ip_setsockopt).
 fn setMembership4(ref: SockRef, optname: u64, optval_ptr: u64, optlen: u64) i64 {
     if (ref == .tcp) return -71;
-    if (ref != .udp) return -92;
+    // do_ip_setsockopt checks optlen against struct ip_mreq for every socket type first.
     if (optlen < 8) return -22;
+    if (ref != .udp) return -92;
     const copy_mod = @import("../mm/copy_from_user.zig");
     if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;
     var mreq: [12]u8 = @splat(0);
@@ -749,13 +753,30 @@ fn setMembership4(ref: SockRef, optname: u64, optval_ptr: u64, optlen: u64) i64 
         udp_mod.mcDrop4(ref.udp, group, addr, index, nic_on, our);
 }
 
+/// Answers a raw socket gives where it differs from a datagram one (measured with CAP_NET_RAW): a raw socket is already "bound" to
+/// its protocol (inet_num), so IPV6_V6ONLY is EINVAL; IP_ROUTER_ALERT is taken (ip_ra_control) and IP_NODEFRAG too; multicast
+/// group membership on an ICMP raw socket is EINVAL (no matching interface); IP_MULTICAST_IF with an address of no interface is
+/// EADDRNOTAVAIL. Null: as for any socket.
+fn rawSetErrno(level: u64, optname: u64) ?i64 {
+    if (level == ipo.SOL_IPV6 and optname == ipo.IPV6_V6ONLY) return -22;
+    // ip_mc_find_dev for the in_addr given (1.0.0.0, 0.0.0.255 ...): no such interface.
+    if (level == ipo.SOL_IP and optname == ipo.IP_MULTICAST_IF) return -99;
+    return null;
+}
+
 /// ipo.applySet, with the options it does not know tried against ipo.applyExtra first (the value read as Linux does: an int, or
 /// one byte when that is all the caller gave).
 fn applyIpSet(cur: ipo.IpOpts, level: u64, optname: u64, val: []const u8) ipo.SetResult {
+    return applyIpSetFor(cur, level, optname, val, false);
+}
+
+fn applyIpSetFor(cur: ipo.IpOpts, level: u64, optname: u64, val: []const u8, raw: bool) ipo.SetResult {
     const v: i32 = ipo.readInt(val) orelse if (val.len >= 1) val[0] else 0;
     const task = @import("../proc/sched.zig").currentTaskIndex();
-    const admin = if (task) |t| @import("../ipc/capability.zig").hasSysCap(t, "cap_net_admin") or @import("../ipc/capability.zig").hasSysCap(t, "cap_net_raw") else false;
-    if (ipo.applyExtra(cur, level, optname, v, val.len, admin)) |r| return r;
+    const cap = @import("../ipc/capability.zig");
+    const net_raw = if (task) |t| cap.hasSysCap(t, "cap_net_raw") else false;
+    const admin = if (task) |t| cap.hasSysCap(t, "cap_net_admin") or net_raw else false;
+    if (ipo.applyExtraFor(cur, level, optname, v, val.len, admin, net_raw, raw)) |r| return r;
     return ipo.applySet(cur, level, optname, val);
 }
 
@@ -829,6 +850,13 @@ fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
         .raw => |idx| (@import("raw_icmp.zig").getOpts(idx) orelse return -9).ip,
         else => return -92,
     };
+    if (ref == .raw) {
+        // A raw socket never set IPV6_V6ONLY (it cannot: EINVAL above) and reads 0; IP_PROTOCOL is its protocol (inet_num).
+        if (level == ipo.SOL_IPV6 and optname == ipo.IPV6_V6ONLY) return putInt(optval_ptr, optlen_ptr, 0);
+        // do_ipv6_getsockopt: IPV6_ADDRFORM is for UDP and TCP sockets only.
+        if (level == ipo.SOL_IPV6 and optname == ipo.IPV6_ADDRFORM) return -92;
+        if (level == ipo.SOL_IP and optname == ipo.IP_PROTOCOL) return putInt(optval_ptr, optlen_ptr, @intCast(@import("raw_icmp.zig").protocolOf(ref.raw)));
+    }
     const v = ipo.getValue(cur, level, optname) orelse blk: {
         const x = ipo.getExtra(cur, level, optname) orelse return -92;
         switch (x) {
@@ -855,6 +883,17 @@ fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
     bo.writeU32Le(&len_out, n);
     if (copy_mod.copyToUser(@ptrFromInt(optlen_ptr), &len_out, 4) != 4) return -14;
     return 0;
+}
+
+/// An int getsockopt answer (at most 4 bytes, as many as the caller's optlen).
+fn putInt(optval_ptr: u64, optlen_ptr: u64, v: i32) i64 {
+    const copy_mod = @import("../mm/copy_from_user.zig");
+    if (optlen_ptr == 0 or optlen_ptr >= 0x0000_8000_0000_0000) return -14;
+    var lb: [4]u8 = undefined;
+    if (copy_mod.copyFromUser(&lb, @ptrFromInt(optlen_ptr), 4) != 4) return -14;
+    var out: [4]u8 = undefined;
+    bo.writeU32Le(&out, @bitCast(v));
+    return copyOptOut(optval_ptr, optlen_ptr, out[0..@min(bo.readU32Le(&lb), 4)]);
 }
 
 /// Copy `val` out as a getsockopt answer: at most the caller's optlen bytes, then the length written.

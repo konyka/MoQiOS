@@ -4636,7 +4636,7 @@ test "IPv4 UDP multicast: IP_MULTICAST_* options, group membership, member-only 
     try std.testing.expect(std.mem.indexOf(u8, us, "            port_mc4[i] = port_mc4[num_ports];\n") != null);
     const so = kt.socket_opt_source;
     try std.testing.expect(std.mem.indexOf(u8, so, "(optname == ipo.IP_ADD_MEMBERSHIP or optname == ipo.IP_DROP_MEMBERSHIP)) return setMembership4(ref, optname, optval_ptr, optlen);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, so, "    if (ref == .tcp) return -71;\n    if (ref != .udp) return -92;\n    if (optlen < 8) return -22;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "    if (ref == .tcp) return -71;\n    // do_ip_setsockopt checks optlen against struct ip_mreq for every socket type first.\n    if (optlen < 8) return -22;\n    if (ref != .udp) return -92;\n") != null);
 }
 
 test "multicast outgoing interface: IP_MULTICAST_IF lo sends out lo only, IPV6_MULTICAST_IF lo is ENETUNREACH, IPv4 group delivery checks the arrival interface, each sharing socket sends with its own options (hello363)" {
@@ -15003,7 +15003,7 @@ test "raw ICMP sockets take SOL_IP / SOL_IPV6 options and their sends carry them
     const so = kt.socket_opt_source;
     try std.testing.expect(std.mem.indexOf(u8, so, ".raw => |idx| if (@import(\"raw_icmp.zig\").isV6(idx)) .v6 else .v4,") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, ".raw => |idx| (@import(\"raw_icmp.zig\").getOpts(idx) orelse return -9).ip,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, so, "var st = raw_mod.getOpts(idx) orelse return -9;\n            switch (ipo.keepEcnForDatagram(applyIpSet(st.ip, level, optname, raw[0..@intCast(n)]), level, optname, ipo.readInt(raw[0..@intCast(n)]) orelse 0)) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "var st = raw_mod.getOpts(idx) orelse return -9;\n            switch (ipo.keepEcnForDatagram(applyIpSetFor(st.ip, level, optname, raw[0..@intCast(n)], true), level, optname, ipo.readInt(raw[0..@intCast(n)]) orelse 0)) {") != null);
     // ip_getsockopt answers a level other than SOL_IP with EOPNOTSUPP; ip_setsockopt with ENOPROTOOPT.
     try std.testing.expect(std.mem.indexOf(u8, so, "if (!ipo.levelApplies(level, fam)) return if (fam == .v4) -95 else -92;") != null);
     const ss = kt.socket_syscall_source;
@@ -17972,10 +17972,21 @@ test "SOL_IP / SOL_IPV6 options the stack only stores, and the fixed answers of 
     try std.testing.expectEqual(@as(u8, 0x10), p.applySet(none, p.SOL_IP, p.IP_TOS, &[_]u8{ 0x13, 0, 0, 0 }).ok.tos);
     const tc = p.keepEcnForDatagram(p.applySet(none, p.SOL_IPV6, p.IPV6_TCLASS, &[_]u8{ 1, 0, 0, 0 }), p.SOL_IPV6, p.IPV6_TCLASS, 1).ok;
     try std.testing.expectEqual(@as(u8, 1), tc.tclass);
-    try std.testing.expect(std.mem.indexOf(u8, kt.socket_opt_source, "if (ipo.applyExtra(cur, level, optname, v, val.len, admin)) |r| return r;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_opt_source, "if (ipo.applyExtraFor(cur, level, optname, v, val.len, admin, net_raw, raw)) |r| return r;") != null);
     // TCP (hello487 C, D): IPV6_2292PKTOPTIONS with no receive switch on reads back nothing; IP_RECVFRAGSIZE is EINVAL.
     try std.testing.expect(p.pktOptions6Empty(none));
     try std.testing.expect(!p.pktOptions6Empty(.{ .recvhops6 = true }));
     try std.testing.expect(!p.pktOptions6Empty(s1));
     try std.testing.expect(std.mem.indexOf(u8, kt.socket_opt_source, "if (optname == ipo.IP_RECVFRAGSIZE) return -22;") != null);
+    // Raw sockets (hello487 E, F): IP_ROUTER_ALERT on, on again EADDRINUSE, off, off again ENOBUFS (ip_ra_control); IP_NODEFRAG
+    // stored; with CAP_NET_RAW the sticky header options fail the header check (EINVAL), without it EPERM.
+    const ra = p.applyExtraFor(none, p.SOL_IP, p.IP_ROUTER_ALERT, 1, 4, false, true, true).?.ok;
+    try std.testing.expectEqual(@as(i32, 1), p.getExtra(ra, p.SOL_IP, p.IP_ROUTER_ALERT).?.val);
+    try std.testing.expectEqual(@as(i64, -98), p.applyExtraFor(ra, p.SOL_IP, p.IP_ROUTER_ALERT, 255, 4, false, true, true).?.err);
+    const ra_off = p.applyExtraFor(ra, p.SOL_IP, p.IP_ROUTER_ALERT, 0, 4, false, true, true).?.ok;
+    try std.testing.expectEqual(@as(i64, -105), p.applyExtraFor(ra_off, p.SOL_IP, p.IP_ROUTER_ALERT, 0, 4, false, true, true).?.err);
+    try std.testing.expectEqual(@as(i64, -22), p.applyExtraFor(none, p.SOL_IP, p.IP_ROUTER_ALERT, 1, 4, false, true, false).?.err);
+    try std.testing.expectEqual(@as(i64, -22), p.applyExtraCaps(none, p.SOL_IPV6, p.IPV6_HOPOPTS, 1, 4, true, true).?.err);
+    try std.testing.expectEqual(@as(i64, -1), p.applyExtraCaps(none, p.SOL_IPV6, p.IPV6_HOPOPTS, 1, 4, false, false).?.err);
+    try std.testing.expectEqual(@as(i32, 1), p.getExtra(p.applyExtraCaps(none, p.SOL_IP, p.IP_TRANSPARENT, 1, 4, true, true).?.ok, p.SOL_IPV6, p.IPV6_TRANSPARENT).?.val);
 }
