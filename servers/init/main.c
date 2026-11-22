@@ -605,6 +605,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello486"); /* poll after own SHUT_RD */
     run_test("hello487"); /* getsockopt sweep of SOL_IPV6 / SOL_IP option numbers */
     run_test("hello488"); /* IP_MINTTL / IPV6_MINHOPCOUNT on TCP input */
+    run_test("hello489"); /* IP_LOCAL_PORT_RANGE on automatic local ports */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

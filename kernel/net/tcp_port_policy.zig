@@ -24,14 +24,33 @@ pub fn portAvailable(port: u16, in_use: []const u16) bool {
     return true;
 }
 
+pub const PortRange = struct { first: u16, last: u16 };
+
+/// inet_sk_get_local_port_range: a socket's IP_LOCAL_PORT_RANGE narrows the system range. Each nonzero endpoint that lies in the
+/// current range replaces its endpoint; MoQiOS's system range is the default one (no ip_local_port_range sysctl).
+pub fn localPortRange(raw: u32) PortRange {
+    var r: PortRange = .{ .first = EPHEMERAL_FIRST, .last = EPHEMERAL_LAST };
+    const lo: u16 = @truncate(raw);
+    const hi: u16 = @truncate(raw >> 16);
+    if (lo >= r.first and lo <= r.last) r.first = lo;
+    if (hi >= r.first and hi <= r.last) r.last = hi;
+    return r;
+}
+
 /// First available ephemeral port at or after `start` (wrapping), or null
 /// when every port of the range is taken. Bounded by the range size.
 pub fn pickEphemeralPort(start: u16, in_use: []const u16) ?u16 {
-    var port: u16 = if (start < EPHEMERAL_FIRST) EPHEMERAL_FIRST else start;
+    return pickEphemeralPortInRange(start, in_use, 0);
+}
+
+pub fn pickEphemeralPortInRange(start: u16, in_use: []const u16, raw_range: u32) ?u16 {
+    const range = localPortRange(raw_range);
+    var port: u16 = if (start < range.first or start > range.last) range.first else start;
+    const count: u32 = @as(u32, range.last) - range.first + 1;
     var tries: u32 = 0;
-    while (tries < EPHEMERAL_COUNT) : (tries += 1) {
+    while (tries < count) : (tries += 1) {
         if (portAvailable(port, in_use)) return port;
-        port = nextEphemeralPort(port);
+        port = if (port == range.last) range.first else port + 1;
     }
     return null;
 }

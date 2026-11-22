@@ -1169,7 +1169,7 @@ fn allocEphemeralPort(self: *const TcpTcb) u16 {
         in_use[n] = tcbs[i].local_port;
         n += 1;
     }
-    const port = tcp_port_policy.pickEphemeralPort(next_ephemeral_port, in_use[0..n]) orelse return 0;
+    const port = tcp_port_policy.pickEphemeralPortInRange(next_ephemeral_port, in_use[0..n], self.options.ip.port_range4) orelse return 0;
     // Wrapping advance: saturating (+|=) would park at 65535 forever,
     // aliasing every later connection's 4-tuple.
     next_ephemeral_port = tcp_port_policy.nextEphemeralPort(port);

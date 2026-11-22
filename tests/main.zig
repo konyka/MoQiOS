@@ -18040,3 +18040,22 @@ test "IP_MINTTL and IPV6_MINHOPCOUNT filter existing TCP sockets and listening S
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (hop_limit < tcb.options.ip.min_hops6) return;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.net_mod_source, "tcp.handlePacketV6(info6.src_ip, info6.dst_ip, data + up_start, up_len, info6.ecn_ce, info6.flowinfo, info6.hop_limit);") != null);
 }
+
+test "IP_LOCAL_PORT_RANGE clamps both UDP and TCP ephemeral allocation to the system range (hello489)" {
+    const tp = kt.tcp_port_policy;
+    const up = kt.udp_port_policy;
+    const raw: u32 = 51000 | (51010 << 16);
+    const r = tp.localPortRange(raw);
+    try std.testing.expectEqual(@as(u16, 51000), r.first);
+    try std.testing.expectEqual(@as(u16, 51010), r.last);
+    try std.testing.expectEqual(@as(?u16, 51000), tp.pickEphemeralPortInRange(49152, &.{}, raw));
+    try std.testing.expectEqual(@as(?u16, 51001), tp.pickEphemeralPortInRange(51000, &.{51000}, raw));
+    try std.testing.expectEqual(@as(?u16, 51000), tp.pickEphemeralPortInRange(51010, &.{51010}, raw));
+    try std.testing.expectEqual(@as(?u16, 51000), up.pickAutobindPortInRange(49152, &.{}, raw));
+    try std.testing.expectEqual(@as(?u16, 51005), up.pickAutobindPortInRange(51005, &.{}, raw));
+    try std.testing.expectEqual(@as(?u16, 51001), up.pickAutobindPortInRange(51000, &.{51000}, raw));
+    try std.testing.expectEqual(@as(u16, 49152), tp.localPortRange(1000 | (2000 << 16)).first);
+    try std.testing.expectEqual(@as(u16, 65535), tp.localPortRange(1000 | (2000 << 16)).last);
+    try std.testing.expectEqual(@as(u16, 49152), tp.localPortRange(51010 << 16).first);
+    try std.testing.expectEqual(@as(u16, 51010), tp.localPortRange(51010 << 16).last);
+}
