@@ -15003,7 +15003,7 @@ test "raw ICMP sockets take SOL_IP / SOL_IPV6 options and their sends carry them
     const so = kt.socket_opt_source;
     try std.testing.expect(std.mem.indexOf(u8, so, ".raw => |idx| if (@import(\"raw_icmp.zig\").isV6(idx)) .v6 else .v4,") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, ".raw => |idx| (@import(\"raw_icmp.zig\").getOpts(idx) orelse return -9).ip,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, so, "var st = raw_mod.getOpts(idx) orelse return -9;\n            switch (ipo.applySet(st.ip, level, optname, raw[0..@intCast(n)])) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "var st = raw_mod.getOpts(idx) orelse return -9;\n            switch (ipo.keepEcnForDatagram(applyIpSet(st.ip, level, optname, raw[0..@intCast(n)]), level, optname, ipo.readInt(raw[0..@intCast(n)]) orelse 0)) {") != null);
     // ip_getsockopt answers a level other than SOL_IP with EOPNOTSUPP; ip_setsockopt with ENOPROTOOPT.
     try std.testing.expect(std.mem.indexOf(u8, so, "if (!ipo.levelApplies(level, fam)) return if (fam == .v4) -95 else -92;") != null);
     const ss = kt.socket_syscall_source;
@@ -17935,4 +17935,42 @@ test "TIOCGPGRP answers only in the session that owns the console (hello485)" {
     // Linux tiocgpgrp: current->signal->tty != real_tty is ENOTTY.
     try std.testing.expectEqual(@as(i64, -25), kt.ioctl_policy.tiocgpgrpErrno(false));
     try std.testing.expect(std.mem.indexOf(u8, kt.ioctl_source, "const gp = ip.tiocgpgrpErrno(cur0.sid == jc.ctty_owner_sid);") != null);
+}
+
+test "SOL_IP / SOL_IPV6 options the stack only stores, and the fixed answers of the rest (hello487)" {
+    const p = kt.ip_opt_policy;
+    const none: p.IpOpts = .{};
+    // RFC 2292 switches and the other stored booleans: any nonzero int sets, a short optlen is EINVAL (IPV6_RECVFRAGSIZE takes any).
+    const s1 = p.applyExtra(none, p.SOL_IPV6, p.IPV6_2292PKTINFO, 255, 4, false).?.ok;
+    try std.testing.expectEqual(@as(i32, 1), p.getExtra(s1, p.SOL_IPV6, p.IPV6_2292PKTINFO).?.val);
+    try std.testing.expectEqual(@as(i64, -22), p.applyExtra(none, p.SOL_IPV6, p.IPV6_RECVHOPOPTS, 1, 1, false).?.err);
+    _ = p.applyExtra(none, p.SOL_IPV6, p.IPV6_RECVFRAGSIZE, 1, 1, false).?.ok;
+    // IPV6_RECVERR_RFC4884 and IP_RECVERR_RFC4884: 0 or 1 only. IPV6_MINHOPCOUNT and IP_MINTTL: 0..255.
+    try std.testing.expectEqual(@as(i64, -22), p.applyExtra(none, p.SOL_IPV6, p.IPV6_RECVERR_RFC4884, 255, 4, false).?.err);
+    try std.testing.expectEqual(@as(i64, -22), p.applyExtra(none, p.SOL_IP, p.IP_RECVERR_RFC4884, 2, 4, false).?.err);
+    try std.testing.expectEqual(@as(i64, -22), p.applyExtra(none, p.SOL_IPV6, p.IPV6_MINHOPCOUNT, 256, 4, false).?.err);
+    try std.testing.expectEqual(@as(i32, 255), p.getExtra(p.applyExtra(none, p.SOL_IP, p.IP_MINTTL, 255, 4, false).?.ok, p.SOL_IP, p.IP_MINTTL).?.val);
+    // IPV6_ADDR_PREFERENCES: default PUBTMP_DEFAULT | HOME (0x500); TMP gives 0x401; PUBLIC | TMP is EINVAL.
+    try std.testing.expectEqual(@as(i32, 0x500), p.getExtra(none, p.SOL_IPV6, p.IPV6_ADDR_PREFERENCES).?.val);
+    try std.testing.expectEqual(@as(i32, 0x401), p.getExtra(p.applyExtra(none, p.SOL_IPV6, p.IPV6_ADDR_PREFERENCES, 1, 4, false).?.ok, p.SOL_IPV6, p.IPV6_ADDR_PREFERENCES).?.val);
+    try std.testing.expectEqual(@as(i64, -22), p.applyExtra(none, p.SOL_IPV6, p.IPV6_ADDR_PREFERENCES, 3, 4, false).?.err);
+    // IP_LOCAL_PORT_RANGE: exactly 4 bytes, lo <= hi unless one is 0; reads back as set (-1 is lo = hi = 65535).
+    try std.testing.expectEqual(@as(i32, -1), p.getExtra(p.applyExtra(none, p.SOL_IP, p.IP_LOCAL_PORT_RANGE, -1, 4, false).?.ok, p.SOL_IP, p.IP_LOCAL_PORT_RANGE).?.val);
+    try std.testing.expectEqual(@as(i64, -22), p.applyExtra(none, p.SOL_IP, p.IP_LOCAL_PORT_RANGE, 0x0001_0002, 4, false).?.err);
+    // Fixed answers: unconnected IPV6_MTU / IP_MTU / IPV6_ADDRFORM read ENOTCONN; no unicast interface 99 (EADDRNOTAVAIL);
+    // IP_TRANSPARENT without CAP_NET_ADMIN EPERM; the sticky header options read with length 0.
+    try std.testing.expectEqual(@as(i64, -107), p.getExtra(none, p.SOL_IPV6, p.IPV6_MTU).?.err);
+    try std.testing.expectEqual(@as(i64, -107), p.getExtra(none, p.SOL_IP, p.IP_MTU).?.err);
+    try std.testing.expectEqual(@as(i64, -99), p.applyExtra(none, p.SOL_IPV6, p.IPV6_UNICAST_IF, 1, 4, false).?.err);
+    try std.testing.expectEqual(@as(i64, -1), p.applyExtra(none, p.SOL_IP, p.IP_TRANSPARENT, 1, 4, false).?.err);
+    try std.testing.expectEqual(@as(i32, -1), p.getExtra(none, p.SOL_IPV6, p.IPV6_HOPOPTS).?.val);
+    // An option applyExtra does not own is left to applySet.
+    try std.testing.expect(p.applyExtra(none, p.SOL_IP, p.IP_TTL, 5, 4, false) == null);
+    // A datagram socket keeps the ECN bits of IP_TOS / IPV6_TCLASS; applySet alone (a stream socket) drops them.
+    const tos = p.keepEcnForDatagram(p.applySet(none, p.SOL_IP, p.IP_TOS, &[_]u8{ 0x13, 0, 0, 0 }), p.SOL_IP, p.IP_TOS, 0x13).ok;
+    try std.testing.expectEqual(@as(u8, 0x13), tos.tos);
+    try std.testing.expectEqual(@as(u8, 0x10), p.applySet(none, p.SOL_IP, p.IP_TOS, &[_]u8{ 0x13, 0, 0, 0 }).ok.tos);
+    const tc = p.keepEcnForDatagram(p.applySet(none, p.SOL_IPV6, p.IPV6_TCLASS, &[_]u8{ 1, 0, 0, 0 }), p.SOL_IPV6, p.IPV6_TCLASS, 1).ok;
+    try std.testing.expectEqual(@as(u8, 1), tc.tclass);
+    try std.testing.expect(std.mem.indexOf(u8, kt.socket_opt_source, "if (ipo.applyExtra(cur, level, optname, v, val.len, admin)) |r| return r;") != null);
 }

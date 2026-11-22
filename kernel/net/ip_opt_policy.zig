@@ -125,7 +125,284 @@ pub const IpOpts = struct {
     /// way to the loopback frame (lo.Meta). Never stored with the socket's options.
     skb_mark: u32 = 0,
     skb_prio: u32 = 0,
+    /// Options that are only stored and read back here (the stack has no path that consults them): the RFC 2292 receive switches,
+    /// IPV6_RECVHOPOPTS/RTHDR/DSTOPTS/FRAGSIZE, IPV6_ROUTER_ALERT_ISOLATE, IPV6_RECVERR_RFC4884, FREEBIND, MINHOPCOUNT and
+    /// IPV6_ADDR_PREFERENCES; their IPv4 counterparts IP_FREEBIND, IP_PASSSEC, IP_MINTTL, IP_CHECKSUM, IP_BIND_ADDRESS_NO_PORT,
+    /// IP_RECVFRAGSIZE, IP_RECVERR_RFC4884 and IP_LOCAL_PORT_RANGE.
+    flags6: u16 = 0,
+    flags4: u16 = 0,
+    min_hops6: u8 = 0,
+    min_ttl4: u8 = 0,
+    srcprefs6: u16 = 0,
+    port_range4: u32 = 0,
 };
+
+/// Bits of IpOpts.flags6 / flags4 (stored-only switches).
+pub const F6_2292PKTINFO: u16 = 1 << 0;
+pub const F6_2292HOPOPTS: u16 = 1 << 1;
+pub const F6_2292DSTOPTS: u16 = 1 << 2;
+pub const F6_2292RTHDR: u16 = 1 << 3;
+pub const F6_2292HOPLIMIT: u16 = 1 << 4;
+pub const F6_RA_ISOLATE: u16 = 1 << 5;
+pub const F6_RFC4884: u16 = 1 << 6;
+pub const F6_RECVHOPOPTS: u16 = 1 << 7;
+pub const F6_RECVRTHDR: u16 = 1 << 8;
+pub const F6_RECVDSTOPTS: u16 = 1 << 9;
+pub const F6_RECVFRAGSIZE: u16 = 1 << 10;
+pub const F6_FREEBIND: u16 = 1 << 11;
+pub const F4_FREEBIND: u16 = 1 << 0;
+pub const F4_PASSSEC: u16 = 1 << 1;
+pub const F4_CHECKSUM: u16 = 1 << 2;
+pub const F4_BIND_NO_PORT: u16 = 1 << 3;
+pub const F4_RECVFRAGSIZE: u16 = 1 << 4;
+pub const F4_RFC4884: u16 = 1 << 5;
+
+/// Option numbers handled only by the rules below (Linux include/uapi/linux/in.h, in6.h).
+pub const IP_ROUTER_ALERT: u64 = 5;
+pub const IP_MTU: u64 = 14;
+pub const IP_FREEBIND: u64 = 15;
+pub const IP_IPSEC_POLICY: u64 = 16;
+pub const IP_XFRM_POLICY: u64 = 17;
+pub const IP_PASSSEC: u64 = 18;
+pub const IP_TRANSPARENT: u64 = 19;
+pub const IP_MINTTL: u64 = 21;
+pub const IP_NODEFRAG: u64 = 22;
+pub const IP_CHECKSUM: u64 = 23;
+pub const IP_BIND_ADDRESS_NO_PORT: u64 = 24;
+pub const IP_RECVFRAGSIZE: u64 = 25;
+pub const IP_RECVERR_RFC4884: u64 = 26;
+pub const IP_MSFILTER: u64 = 41;
+pub const MCAST_MSFILTER: u64 = 48;
+pub const IP_UNICAST_IF: u64 = 50;
+pub const IP_LOCAL_PORT_RANGE: u64 = 51;
+pub const IP_PROTOCOL: u64 = 52;
+pub const IPV6_ADDRFORM: u64 = 1;
+pub const IPV6_2292PKTINFO: u64 = 2;
+pub const IPV6_2292HOPOPTS: u64 = 3;
+pub const IPV6_2292DSTOPTS: u64 = 4;
+pub const IPV6_2292RTHDR: u64 = 5;
+pub const IPV6_2292PKTOPTIONS: u64 = 6;
+pub const IPV6_2292HOPLIMIT: u64 = 8;
+pub const IPV6_ROUTER_ALERT: u64 = 22;
+pub const IPV6_MTU: u64 = 24;
+pub const IPV6_ROUTER_ALERT_ISOLATE: u64 = 30;
+pub const IPV6_RECVERR_RFC4884: u64 = 31;
+pub const IPV6_IPSEC_POLICY: u64 = 34;
+pub const IPV6_XFRM_POLICY: u64 = 35;
+pub const IPV6_RECVHOPOPTS: u64 = 53;
+pub const IPV6_HOPOPTS: u64 = 54;
+pub const IPV6_RTHDRDSTOPTS: u64 = 55;
+pub const IPV6_RECVRTHDR: u64 = 56;
+pub const IPV6_RTHDR: u64 = 57;
+pub const IPV6_RECVDSTOPTS: u64 = 58;
+pub const IPV6_DSTOPTS: u64 = 59;
+pub const IPV6_ADDR_PREFERENCES: u64 = 72;
+pub const IPV6_MINHOPCOUNT: u64 = 73;
+pub const IPV6_TRANSPARENT: u64 = 75;
+pub const IPV6_UNICAST_IF: u64 = 76;
+pub const IPV6_RECVFRAGSIZE: u64 = 77;
+pub const IPV6_FREEBIND: u64 = 78;
+
+fn flag6Of(optname: u64) ?u16 {
+    return switch (optname) {
+        IPV6_2292PKTINFO => F6_2292PKTINFO,
+        IPV6_2292HOPOPTS => F6_2292HOPOPTS,
+        IPV6_2292DSTOPTS => F6_2292DSTOPTS,
+        IPV6_2292RTHDR => F6_2292RTHDR,
+        IPV6_2292HOPLIMIT => F6_2292HOPLIMIT,
+        IPV6_ROUTER_ALERT_ISOLATE => F6_RA_ISOLATE,
+        IPV6_RECVHOPOPTS => F6_RECVHOPOPTS,
+        IPV6_RECVRTHDR => F6_RECVRTHDR,
+        IPV6_RECVDSTOPTS => F6_RECVDSTOPTS,
+        IPV6_RECVFRAGSIZE => F6_RECVFRAGSIZE,
+        IPV6_FREEBIND => F6_FREEBIND,
+        else => null,
+    };
+}
+
+fn flag4Of(optname: u64) ?u16 {
+    return switch (optname) {
+        IP_FREEBIND => F4_FREEBIND,
+        IP_PASSSEC => F4_PASSSEC,
+        IP_CHECKSUM => F4_CHECKSUM,
+        IP_BIND_ADDRESS_NO_PORT => F4_BIND_NO_PORT,
+        IP_RECVFRAGSIZE => F4_RECVFRAGSIZE,
+        else => null,
+    };
+}
+
+fn setFlag(word: u16, bit: u16, on: bool) u16 {
+    return if (on) word | bit else word & ~bit;
+}
+
+/// ip6_sock_set_addr_preferences: PUBLIC / TMP / PUBTMP_DEFAULT, HOME / COA and CGA / NONCGA must each name at most one choice
+/// (EINVAL); the stored bits keep the earlier choice of a group the call did not mention.
+pub fn addrPreferences(cur: u16, val: i32) ?u16 {
+    const v: u32 = @bitCast(val);
+    var mask: u16 = 0xFFFF;
+    var pref: u16 = 0;
+    switch (v & 0x0103) {
+        0x0002 => {
+            pref |= 0x0002;
+            mask &= ~@as(u16, 0x0003);
+        },
+        0x0001 => {
+            pref |= 0x0001;
+            mask &= ~@as(u16, 0x0003);
+        },
+        0x0100 => mask &= ~@as(u16, 0x0003),
+        0 => {},
+        else => return null,
+    }
+    switch (v & 0x0404) {
+        0x0400 => mask &= ~@as(u16, 0x0004),
+        0x0004 => pref |= 0x0004,
+        0 => {},
+        else => return null,
+    }
+    switch (v & 0x0808) {
+        0x0008, 0x0800, 0 => {},
+        else => return null,
+    }
+    return (cur & mask) | pref;
+}
+
+/// getsockopt(IPV6_ADDR_PREFERENCES): TMP, else PUBLIC, else PUBTMP_DEFAULT; COA, else HOME.
+pub fn addrPreferencesValue(prefs: u16) i32 {
+    var v: i32 = if (prefs & 0x0001 != 0) 0x0001 else if (prefs & 0x0002 != 0) 0x0002 else 0x0100;
+    v |= if (prefs & 0x0004 != 0) 0x0004 else 0x0400;
+    return v;
+}
+
+/// IP_TOS / IPV6_TCLASS on a datagram socket keep the two ECN bits the caller gave (__ip_sock_set_tos and do_ipv6_setsockopt
+/// clear them only for SOCK_STREAM, which applySet's result is shaped for). `v` is the value set; `r` applySet's answer.
+pub fn keepEcnForDatagram(r: SetResult, level: u64, optname: u64, v: i32) SetResult {
+    var o = switch (r) {
+        .ok => |x| x,
+        .err => return r,
+    };
+    const ecn: u8 = @as(u8, @truncate(@as(u32, @bitCast(v)))) & ECN_MASK;
+    if (level == SOL_IP and optname == IP_TOS) o.tos |= ecn;
+    if (level == SOL_IPV6 and optname == IPV6_TCLASS and v != -1) o.tclass |= ecn;
+    return .{ .ok = o };
+}
+
+/// The rules for the options IpOpts only stores, plus the ones whose answer is fixed here (no routing alert, ipsec, anycast,
+/// multicast source filters, unicast-interface binding or address-form change). `int_len` is the optlen the caller gave. Null:
+/// not one of them.
+pub fn applyExtra(cur: IpOpts, level: u64, optname: u64, v: i32, int_len: usize, has_net_admin: bool) ?SetResult {
+    var o = cur;
+    switch (level) {
+        SOL_IPV6 => switch (optname) {
+            IPV6_ADDRFORM => return .{ .err = -22 },
+            IPV6_2292PKTOPTIONS => return .{ .ok = o },
+            IPV6_ROUTER_ALERT => return .{ .err = -92 },
+            IPV6_MTU => {
+                if (int_len < 4) return .{ .err = -22 };
+                return .{ .err = -22 };
+            },
+            27, 28 => return .{ .err = -22 },
+            IPV6_IPSEC_POLICY, IPV6_XFRM_POLICY => return .{ .err = -1 },
+            42, 43, 44, 45, 46, 47, MCAST_MSFILTER => return .{ .err = -22 },
+            IPV6_PKTINFO => return .{ .err = -22 },
+            IPV6_HOPOPTS, IPV6_RTHDRDSTOPTS, IPV6_DSTOPTS => return .{ .err = -1 },
+            IPV6_RTHDR => return .{ .err = -22 },
+            IPV6_TRANSPARENT => return .{ .err = if (v != 0 and !has_net_admin) -1 else if (int_len < 4) -22 else 0 },
+            IPV6_UNICAST_IF => return .{ .err = -99 },
+            IPV6_RECVERR_RFC4884 => {
+                if (int_len < 4 or v < 0 or v > 1) return .{ .err = -22 };
+                o.flags6 = setFlag(o.flags6, F6_RFC4884, v != 0);
+                return .{ .ok = o };
+            },
+            IPV6_MINHOPCOUNT => {
+                if (int_len < 4 or v < 0 or v > 255) return .{ .err = -22 };
+                o.min_hops6 = @intCast(v);
+                return .{ .ok = o };
+            },
+            IPV6_ADDR_PREFERENCES => {
+                if (int_len < 4) return .{ .err = -22 };
+                o.srcprefs6 = addrPreferences(o.srcprefs6, v) orelse return .{ .err = -22 };
+                return .{ .ok = o };
+            },
+            else => {
+                const bit = flag6Of(optname) orelse return null;
+                // IPV6_RECVFRAGSIZE takes any length (no optlen check in do_ipv6_setsockopt); the others need a full int.
+                if (optname != IPV6_RECVFRAGSIZE and int_len < 4) return .{ .err = -22 };
+                o.flags6 = setFlag(o.flags6, bit, v != 0);
+                return .{ .ok = o };
+            },
+        },
+        SOL_IP => switch (optname) {
+            IP_ROUTER_ALERT => return .{ .err = -22 },
+            IP_MTU, IP_NODEFRAG, IP_PROTOCOL => return .{ .err = -92 },
+            IP_IPSEC_POLICY, IP_XFRM_POLICY => return .{ .err = -1 },
+            IP_TRANSPARENT => return .{ .err = -1 },
+            37, 38, 39, 40, IP_MSFILTER, 42, 43, 44, 45, 46, 47, MCAST_MSFILTER => return .{ .err = -22 },
+            IP_UNICAST_IF => return .{ .err = if (int_len != 4) -22 else -99 },
+            IP_MINTTL => {
+                if (v < 0 or v > 255) return .{ .err = -22 };
+                o.min_ttl4 = @intCast(v);
+                return .{ .ok = o };
+            },
+            IP_RECVERR_RFC4884 => {
+                if (v < 0 or v > 1) return .{ .err = -22 };
+                o.flags4 = setFlag(o.flags4, F4_RFC4884, v != 0);
+                return .{ .ok = o };
+            },
+            IP_LOCAL_PORT_RANGE => {
+                if (int_len != 4) return .{ .err = -22 };
+                const u: u32 = @bitCast(v);
+                const lo: u16 = @truncate(u);
+                const hi: u16 = @truncate(u >> 16);
+                if (lo != 0 and hi != 0 and lo > hi) return .{ .err = -22 };
+                o.port_range4 = u;
+                return .{ .ok = o };
+            },
+            else => {
+                const bit = flag4Of(optname) orelse return null;
+                o.flags4 = setFlag(o.flags4, bit, v != 0);
+                return .{ .ok = o };
+            },
+        },
+        else => return null,
+    }
+}
+
+/// getsockopt of the options applyExtra handles: the stored value, a fixed one, or (as `err`) the errno Linux answers. Null: not
+/// one of them.
+pub fn getExtra(o: IpOpts, level: u64, optname: u64) ?union(enum) { val: i32, err: i64 } {
+    switch (level) {
+        SOL_IPV6 => switch (optname) {
+            // IPV6_ADDRFORM on a UDP socket that is not connected, IPV6_MTU without a route.
+            IPV6_ADDRFORM, IPV6_MTU => return .{ .err = -107 },
+            IPV6_RECVERR_RFC4884 => return .{ .val = @intFromBool(o.flags6 & F6_RFC4884 != 0) },
+            IPV6_MINHOPCOUNT => return .{ .val = o.min_hops6 },
+            IPV6_ADDR_PREFERENCES => return .{ .val = addrPreferencesValue(o.srcprefs6) },
+            IPV6_ROUTER_ALERT, IPV6_TRANSPARENT => return .{ .val = 0 },
+            IPV6_UNICAST_IF => return .{ .val = 0 },
+            MCAST_MSFILTER => return .{ .err = -99 },
+            // The sticky header options (ipv6_getsockopt_sticky): no options set, nothing copied.
+            IPV6_HOPOPTS, IPV6_RTHDRDSTOPTS, IPV6_RTHDR, IPV6_DSTOPTS => return .{ .val = -1 },
+            else => {
+                const bit = flag6Of(optname) orelse return null;
+                return .{ .val = @intFromBool(o.flags6 & bit != 0) };
+            },
+        },
+        SOL_IP => switch (optname) {
+            IP_ROUTER_ALERT, IP_TRANSPARENT, IP_NODEFRAG, IP_UNICAST_IF, IP_PROTOCOL => return .{ .val = 0 },
+            IP_MTU => return .{ .err = -107 },
+            IP_MINTTL => return .{ .val = o.min_ttl4 },
+            IP_RECVERR_RFC4884 => return .{ .val = @intFromBool(o.flags4 & F4_RFC4884 != 0) },
+            IP_LOCAL_PORT_RANGE => return .{ .val = @bitCast(o.port_range4) },
+            IP_MSFILTER, MCAST_MSFILTER => return .{ .err = -22 },
+            else => {
+                const bit = flag4Of(optname) orelse return null;
+                return .{ .val = @intFromBool(o.flags4 & bit != 0) };
+            },
+        },
+        else => return null,
+    }
+}
 
 pub const Family = enum { v4, v6 };
 

@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello486`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello487`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -481,6 +481,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello484 | IPV6_FLOWLABEL_MGR：GET CREATE 标签 0 写回随机标签（A）；ENOENT、加入、F_EXCL 为 EEXIST（B）；独占和不同共享模式为 EPERM（C）；PUT/RENEW 未持有为 ESRCH（D）；各类 EINVAL（E）；linger 151 无 CAP_NET_ADMIN 为 EPERM（F）；存在独占标签时发送只能用持有的标签（G）；getsockopt 报告 connect 的标签（H）；F_REFLECT、IPv4 套接字（I）；PROCESS 与 USER 共享（J）；标签在最后持有者关闭后保留（K）；raw ICMPv6 套接字的控制消息和 sin6_flowinfo 标签检查（L）；IPv6 TCP 带 IPV6_FLOWINFO_SEND 时 connect 用未持有的标签为 EINVAL，持有的可连接，不带该选项时不看标签（M）；getsockopt 带 IPV6_FL_F_REMOTE 报告最近收到的流标签：UDP 和发起连接的 TCP 为 0，accept 得到的连接是 SYN 的标签，客户端打开 IPV6_RECVFLOWINFO 后读到服务端发来的标签（N） |
 | hello485 | TIOCGPGRP 只在调用者的控制终端上回答：拥有控制台的会话读到前台进程组（A）；setsid 之后的子进程得到 ENOTTY（B）；管道上为 ENOTTY（C） |
 | hello486 | 本端 shutdown(SHUT_RD) 之后的 poll 与收发：数据报对端 SHUT_WR 不改变本端 revents（A）；数据报、流、seqpacket、TCP 本端 SHUT_RD 都报 POLLIN\|POLLRDHUP（B、C、J、D）；数据报 SHUT_RD 后先读完已排队的报文，之后非阻塞 EAGAIN、阻塞 recv 返回 0（E）；向已 SHUT_RD 的数据报套接字发送（含按绑定名 sendto）为 EPIPE（F）；本端 SHUT_WR 后 send 为 EPIPE，反方向照常，且数据报的 EPIPE 不产生 SIGPIPE（G）；未连接数据报 SHUT_RDWR 加 POLLHUP（H）；从未连接的流套接字 SHUT_RD 返回 0 并生效（I） |
+| hello487 | UDP 套接字上 SOL_IPV6、SOL_IP 的 0 到 79 号选项全部与 Linux 一致：新套接字 getsockopt 的长度或 errno（A）；每个选项依次 setsockopt 1、255、256、-1 并读回的结果（B）。两张表都在宿主机上实测 |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

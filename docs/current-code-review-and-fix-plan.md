@@ -11927,3 +11927,14 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 已排除：四个文件的 append 锁不同（`appendKey` 取 FAT32 打开文件槽，`stripeOf` 取低 6 位，连续创建的四个文件落在不同的槽）；单独连跑 hello270 8 次、并行两份完整 smoke 都没有复现。
 - 计时（hello270 现在逐个写进程打印开始时刻、写耗时和 close 耗时）：FAT32 上 plain 与 O_APPEND 形态相同，单个写进程的写阶段从几十毫秒到 2.5 秒不等，close（最后一次刷盘）0.7 到 1.7 秒。时间花在写回池淘汰和同步磁盘写（`writeFile` 在 `fs_lock` 外但按簇串行），而不是 append 锁；两轮之间的差别来自磁盘 I/O 与宿主机调度。
 - 结论（如实）：没有找到 O_APPEND 特有的等待；测试对宿主机负载敏感。下次复现时用新增的每写进程计时判断是哪一个写进程、在写阶段还是 close 时拖慢。
+
+## 补充：SOL_IP / SOL_IPV6 选项号逐一对照（hello487）
+
+- 方法：hello487 对 UDP 套接字的 SOL_IPV6、SOL_IP 0 到 79 号选项做两件事：A 新套接字 getsockopt（长度或 errno）；B 每个选项一个新套接字，依次 setsockopt 1、255、256、-1，每次之后 getsockopt 读回。两张表在宿主机 Linux 上由同一程序（`-DHOST`）测出。
+- 改前：A 有 40 处、B 有 65 处与 Linux 不同，几乎都是 MoQiOS 不认识的选项一律 ENOPROTOOPT。
+- 修复（`ip_opt_policy.applyExtra` / `getExtra`，`socket_opt.applyIpSet` 先查它们再交给 `applySet`）：
+  - 只保存、读回的选项：RFC 2292 的 IPV6_2292PKTINFO/HOPOPTS/DSTOPTS/RTHDR/HOPLIMIT，IPV6_RECVHOPOPTS/RECVRTHDR/RECVDSTOPTS/RECVFRAGSIZE、IPV6_ROUTER_ALERT_ISOLATE、IPV6_FREEBIND、IPV6_RECVERR_RFC4884（只收 0、1）、IPV6_MINHOPCOUNT（0..255）、IPV6_ADDR_PREFERENCES（`ip6_sock_set_addr_preferences` 的三组互斥检查，默认读出 0x500）；IP_FREEBIND、IP_PASSSEC、IP_CHECKSUM、IP_BIND_ADDRESS_NO_PORT、IP_RECVFRAGSIZE、IP_MINTTL（0..255）、IP_RECVERR_RFC4884、IP_LOCAL_PORT_RANGE（必须 4 字节，lo <= hi）。
+  - 固定的回答：未连接时 IPV6_MTU、IP_MTU、IPV6_ADDRFORM 读为 ENOTCONN；IPV6_ROUTER_ALERT 设为 ENOPROTOOPT、读为 0；anycast、源过滤类组播选项、IPV6_PKTINFO 设为 EINVAL；IPSEC/XFRM 策略 EPERM；IPV6_UNICAST_IF、IP_UNICAST_IF 为 EADDRNOTAVAIL（本机没有可绑定的接口号之外的设备）；IP_TRANSPARENT/IPV6_TRANSPARENT 没有 CAP_NET_ADMIN/CAP_NET_RAW 为 EPERM；IPV6_HOPOPTS 等粘滞头选项读出长度 0，设置为 EPERM/EINVAL；IP_NODEFRAG、IP_PROTOCOL 设置为 ENOPROTOOPT、读为 0；IP_ROUTER_ALERT 在 UDP 上设置为 EINVAL。
+  - IP_TOS、IPV6_TCLASS：数据报套接字保留调用者给的 ECN 两位（`__ip_sock_set_tos`、`do_ipv6_setsockopt` 只对 SOCK_STREAM 清掉），原来所有套接字都清掉；`keepEcnForDatagram` 只用于 UDP 和 raw，TCP 不变（hello178 的断言仍成立）。宿主机实测 UDP 设 0x13，接收端 IP_RECVTOS 读到 0x13。
+- host 测试 "SOL_IP / SOL_IPV6 options the stack only stores, and the fixed answers of the rest (hello487)"；hello395 的源码断言同步。
+- 已知差异：这些只保存的选项没有行为（MoQiOS 没有扩展头接收、最小跳数过滤、源地址偏好、本地端口范围等路径），只保证 setsockopt/getsockopt 的结果与 Linux 相同；只覆盖了 UDP 套接字，TCP、raw 上同样的选项沿用同一套规则但没有逐号对照。

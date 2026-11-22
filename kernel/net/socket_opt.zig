@@ -677,7 +677,7 @@ fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
         .tcp => |idx| {
             const tcp_mod = @import("tcp.zig");
             var o = tcp_mod.tcpGetOptions(idx) orelse return -9;
-            switch (ipo.applySet(o.ip, level, optname, raw[0..@intCast(n)])) {
+            switch (applyIpSet(o.ip, level, optname, raw[0..@intCast(n)])) {
                 .err => |e| return e,
                 .ok => |v| o.ip = v,
             }
@@ -686,7 +686,7 @@ fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
         .udp => |port| {
             const udp_mod = @import("udp.zig");
             var st = udp_mod.getPortOpts(port) orelse return -9;
-            switch (ipo.applySet(st.ip, level, optname, raw[0..@intCast(n)])) {
+            switch (ipo.keepEcnForDatagram(applyIpSet(st.ip, level, optname, raw[0..@intCast(n)]), level, optname, ipo.readInt(raw[0..@intCast(n)]) orelse 0)) {
                 .err => |e| return e,
                 .ok => |v| st.ip = v,
             }
@@ -695,7 +695,7 @@ fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
         .raw => |idx| {
             const raw_mod = @import("raw_icmp.zig");
             var st = raw_mod.getOpts(idx) orelse return -9;
-            switch (ipo.applySet(st.ip, level, optname, raw[0..@intCast(n)])) {
+            switch (ipo.keepEcnForDatagram(applyIpSet(st.ip, level, optname, raw[0..@intCast(n)]), level, optname, ipo.readInt(raw[0..@intCast(n)]) orelse 0)) {
                 .err => |e| return e,
                 .ok => |v| st.ip = v,
             }
@@ -745,6 +745,16 @@ fn setMembership4(ref: SockRef, optname: u64, optval_ptr: u64, optlen: u64) i64 
         udp_mod.mcJoin4(ref.udp, group, addr, index, nic_on, our)
     else
         udp_mod.mcDrop4(ref.udp, group, addr, index, nic_on, our);
+}
+
+/// ipo.applySet, with the options it does not know tried against ipo.applyExtra first (the value read as Linux does: an int, or
+/// one byte when that is all the caller gave).
+fn applyIpSet(cur: ipo.IpOpts, level: u64, optname: u64, val: []const u8) ipo.SetResult {
+    const v: i32 = ipo.readInt(val) orelse if (val.len >= 1) val[0] else 0;
+    const task = @import("../proc/sched.zig").currentTaskIndex();
+    const admin = if (task) |t| @import("../ipc/capability.zig").hasSysCap(t, "cap_net_admin") or @import("../ipc/capability.zig").hasSysCap(t, "cap_net_raw") else false;
+    if (ipo.applyExtra(cur, level, optname, v, val.len, admin)) |r| return r;
+    return ipo.applySet(cur, level, optname, val);
 }
 
 fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u64, optlen_ptr: u64) i64 {
@@ -803,7 +813,17 @@ fn getIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
         .raw => |idx| (@import("raw_icmp.zig").getOpts(idx) orelse return -9).ip,
         else => return -92,
     };
-    const v = ipo.getValue(cur, level, optname) orelse return -92;
+    const v = ipo.getValue(cur, level, optname) orelse blk: {
+        const x = ipo.getExtra(cur, level, optname) orelse return -92;
+        switch (x) {
+            .err => |e| return e,
+            .val => |val| {
+                // The sticky IPv6 header options with nothing set: success with length 0 (ipv6_getsockopt_sticky).
+                if (val == -1 and level == ipo.SOL_IPV6 and (optname == ipo.IPV6_HOPOPTS or optname == ipo.IPV6_RTHDRDSTOPTS or optname == ipo.IPV6_RTHDR or optname == ipo.IPV6_DSTOPTS)) return copyOptOut(optval_ptr, optlen_ptr, &.{});
+                break :blk val;
+            },
+        }
+    };
     const copy_mod = @import("../mm/copy_from_user.zig");
     if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;
     if (optlen_ptr == 0 or optlen_ptr >= 0x0000_8000_0000_0000) return -14;
