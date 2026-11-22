@@ -45,6 +45,7 @@ static long run(const char *prefix, int append) {
         if (p == 0) {
             static char rec[REC];
             memset(rec, 'a' + k, sizeof rec);
+            long c0 = now_ms();
             int fd = (int)open(path[k], O_WRONLY | (append ? O_APPEND : 0), 0644);
             int bad = fd < 0 ? -1 : 0;
             long last = 0;
@@ -53,7 +54,10 @@ static long run(const char *prefix, int append) {
                 if (w != REC) { bad = i + 1; last = w; break; }
             }
             if (bad != 0) printf("hello270: writer %d (%s): open fd %d, write %d returned %ld errno %d\n", k, append ? "O_APPEND" : "plain", fd, bad, last, errno);
+            long c1 = now_ms();
             close(fd);
+            /* Which writer took the time, and where: a stall in one writer, or in close (the final flush), or all four alike. */
+            printf("hello270:   %s writer %d: start +%ld ms, writes %ld ms, close %ld ms\n", append ? "O_APPEND" : "plain", k, c0 - t0, c1 - c0, now_ms() - c1);
             _exit(bad == 0 ? 0 : 1);
         }
         pids[k] = p;

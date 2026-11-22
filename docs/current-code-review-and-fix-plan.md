@@ -11920,3 +11920,10 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - host 测试：`tests/unix_epoll_test.zig` 新增 2 个；`tests/main.zig` 的 TCP readiness 两个测试按 `tcp_poll` 改为本端 `SHUT_RD` 报 `RDHUP`，新增 "AF_UNIX: datagram and seqpacket EPIPE raise no SIGPIPE …"，seqpacket 和 sendResult 的源码断言同步。
 - 验证：host 测试全部通过；完整 smoke SMP=2 `PASS`（0 FAIL）；SMP=1 hello486 PASS，退出码 1 只因文档已记录的偶发项 hello108（两份并行时宿主机 load 约 7）；另一份并行的 SMP=2 停在 hello151 B 段（文档已记录的间歇性停顿），单独重跑通过。
 - 已知差异：无新增。
+
+## 补充：hello270 FAT32 偶发超限的诊断（未修，已加计时）
+
+- 现象：完整 smoke 里 hello270 的 FAT32 一行偶发失败，O_APPEND 比普通写慢 4 到 5 倍（11633 ms、14910 ms 对 2825 ms、2899 ms）；tmpfs 和 ext2 同一轮正常。两次失败都发生在宿主机同时跑两份 QEMU 和 zig 构建的时候（load 约 7）。
+- 已排除：四个文件的 append 锁不同（`appendKey` 取 FAT32 打开文件槽，`stripeOf` 取低 6 位，连续创建的四个文件落在不同的槽）；单独连跑 hello270 8 次、并行两份完整 smoke 都没有复现。
+- 计时（hello270 现在逐个写进程打印开始时刻、写耗时和 close 耗时）：FAT32 上 plain 与 O_APPEND 形态相同，单个写进程的写阶段从几十毫秒到 2.5 秒不等，close（最后一次刷盘）0.7 到 1.7 秒。时间花在写回池淘汰和同步磁盘写（`writeFile` 在 `fs_lock` 外但按簇串行），而不是 append 锁；两轮之间的差别来自磁盘 I/O 与宿主机调度。
+- 结论（如实）：没有找到 O_APPEND 特有的等待；测试对宿主机负载敏感。下次复现时用新增的每写进程计时判断是哪一个写进程、在写阶段还是 close 时拖慢。
