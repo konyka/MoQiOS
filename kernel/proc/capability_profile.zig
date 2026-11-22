@@ -171,6 +171,10 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // fs.pipe-max-size: root opens the sysctl for writing (mode 0644), without CAP_SYS_RESOURCE so the limit applies to it.
         return .{ .uid = 0, .gid = 0, .caps = NO_CAPS, .initial_init = false };
     }
+    if (std.mem.eql(u8, name, "hello494")) {
+        // The test keeps CAP_NET_ADMIN for the sysctl and drops CAP_NET_BIND_SERVICE before bind.
+        return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_admin = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello493")) {
         // Root/CAP_NET_ADMIN writes ip_local_port_range; the UDP/TCP sockets need no extra capability.
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_admin = true }, .initial_init = false };

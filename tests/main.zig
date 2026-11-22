@@ -12187,11 +12187,11 @@ test "TCP bind errors and SO_REUSEADDR sharing" {
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ts, "return tcp_port_policy.CONNECT_EADDRNOTAVAIL;"));
     // Both bind paths (IPv4 and IPv6) refuse a privileged port without the capability with EACCES.
     const ss = kt.socket_syscall_source;
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n        return net_mod.tcp.tcpBindAddr46(tcb_idx, parsed.port, net_mod.tcp_port_policy.WILDCARD4, parsed.addr, bind_addr_policy.boundDev6(parsed.addr, parsed.scope_id));"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n    return net_mod.tcp.tcpBindAddr(tcb_idx, port, .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] });"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n        return net_mod.tcp.tcpBindAddr46(tcb_idx, parsed.port, net_mod.tcp_port_policy.WILDCARD4, parsed.addr, bind_addr_policy.boundDev6(parsed.addr, parsed.scope_id));"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ss, "if (bindNeedsPrivilege(port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n    return net_mod.tcp.tcpBindAddr(tcb_idx, port, .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] });"));
     // UDP (IPv4 and IPv6) refuses a privileged port the same way; no bare -1 is left in any bind path.
-    try std.testing.expect(std.mem.indexOf(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n            return udpRebind(t, fd, parsed.port, .{ 0, 0, 0, 0 }, parsed.addr, bind_addr_policy.boundDev6(parsed.addr, parsed.scope_id));") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ss, "if (net_mod.tcp_port_policy.bindNeedsPrivilege(new_port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (bindNeedsPrivilege(parsed.port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;\n            return udpRebind(t, fd, parsed.port, .{ 0, 0, 0, 0 }, parsed.addr, bind_addr_policy.boundDev6(parsed.addr, parsed.scope_id));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (bindNeedsPrivilege(new_port) and !cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return net_mod.tcp_port_policy.BIND_EACCES;") != null);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ss, "!cap_mod.hasSysCap(cur_idx, \"cap_net_bind\")) return -1;"));
     // hello183 runs as uid 0 with only CAP_SETUID so the child's setuid leaves it unprivileged.
     const h = kt.capability_profile.profileForLaunch("hello183", true, false);
@@ -13093,8 +13093,8 @@ test "bind(): an address the host does not have is EADDRNOTAVAIL, checked before
     const ss = kt.socket_syscall_source;
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, ss, "if (bindAddrNotAvail4For("));
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, ss, "if (bindAddrNotAvail6For("));
-    try std.testing.expect(std.mem.indexOf(u8, ss, "if (bindAddrNotAvail6For(&t.fd_table.fds[fd], parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;\n        if (net_mod.tcp_port_policy.bindNeedsPrivilege(parsed.port)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ss, "if (bindAddrNotAvail4For(&t.fd_table.fds[fd], .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] })) return bind_addr_policy.EADDRNOTAVAIL;\n    if (net_mod.tcp_port_policy.bindNeedsPrivilege(port)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (bindAddrNotAvail6For(&t.fd_table.fds[fd], parsed.addr)) return bind_addr_policy.EADDRNOTAVAIL;\n        if (bindNeedsPrivilege(parsed.port)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (bindAddrNotAvail4For(&t.fd_table.fds[fd], .{ sock_addr[4], sock_addr[5], sock_addr[6], sock_addr[7] })) return bind_addr_policy.EADDRNOTAVAIL;\n    if (bindNeedsPrivilege(port)") != null);
 }
 
 test "SIGSTOP on a task running on another CPU kicks that CPU instead of waiting for its next tick" {
@@ -14307,7 +14307,7 @@ test "procfs: /proc/net, /proc/sys, /proc/sys/net and /proc/sys/net/ipv4 are dir
     try std.testing.expect(std.mem.indexOf(u8, pf, ".net_dir => &.{.{ .name = \"arp\", .dtype = DT_REG }},") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_dir => &.{ .{ .name = \"fs\", .dtype = DT_DIR }, .{ .name = \"net\", .dtype = DT_DIR } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_net_dir => &.{ .{ .name = \"ipv4\", .dtype = DT_DIR }, .{ .name = \"ipv6\", .dtype = DT_DIR } },") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ip_local_port_range\", .dtype = DT_REG }, .{ .name = \"ip_nonlocal_bind\", .dtype = DT_REG }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ip_local_port_range\", .dtype = DT_REG }, .{ .name = \"ip_unprivileged_port_start\", .dtype = DT_REG }, .{ .name = \"ip_nonlocal_bind\", .dtype = DT_REG }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "return file == .root_dir or file == .pid_dir or file == .mount_dir or file == .fd_dir or isSubdir(file);") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "if (std.mem.eql(u8, body, \"sys/net/ipv4\")) return .sys_ipv4_dir;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "procfs.subdirEntryAt(desc.proc_file_type, pos)") != null);
@@ -14469,7 +14469,7 @@ test "devconf policy: net.ipv4.conf.<dev>.proxy_arp paths, proc_dointvec writes,
     try std.testing.expect(std.mem.indexOf(u8, io, ".toggle => |d| {") != null);
     try std.testing.expect(std.mem.indexOf(u8, io, "arp.setProxyArp(arp.confDev(d), if (cmd == ap.SIOCSARP) 1 else 0);") != null);
     const pf = kt.procfs_source;
-    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ip_local_port_range\", .dtype = DT_REG }, .{ .name = \"ip_nonlocal_bind\", .dtype = DT_REG }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ip_local_port_range\", .dtype = DT_REG }, .{ .name = \"ip_unprivileged_port_start\", .dtype = DT_REG }, .{ .name = \"ip_nonlocal_bind\", .dtype = DT_REG }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".conf_file => @intCast(@import(\"../net/arp.zig\").confRead(@import(\"../net/devconf_policy.zig\").decode(pid), buf[0..@min(max_len, 16)])),") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "pub fn isSysctl(file: ProcFile) bool {") != null);
     const vs = kt.vfs_source;
@@ -18116,4 +18116,23 @@ test "ip_local_port_range sysctl narrows both automatic allocation and the socke
     try std.testing.expectEqual(@as(i64, -22), lp.write("65536 65535\n"));
     try std.testing.expectEqual(system, lp.get());
     try std.testing.expectEqual(@as(i64, 12), lp.write("49152 65535\n"));
+}
+
+test "ip_unprivileged_port_start controls bind and cannot overlap the automatic range (hello494)" {
+    const lp = kt.local_port_sysctl;
+    const tp = kt.tcp_port_policy;
+    try std.testing.expectEqual(@as(u32, 1024), lp.unprivilegedStart());
+    try std.testing.expect(tp.bindNeedsPrivilegeAt(80, lp.unprivilegedStart()));
+    try std.testing.expect(!tp.bindNeedsPrivilegeAt(1024, lp.unprivilegedStart()));
+    try std.testing.expect(!tp.bindNeedsPrivilegeAt(0, lp.unprivilegedStart()));
+    try std.testing.expectEqual(@as(i64, 2), lp.writeUnprivilegedStart("0\n"));
+    try std.testing.expect(!tp.bindNeedsPrivilegeAt(80, lp.unprivilegedStart()));
+    try std.testing.expectEqual(@as(i64, 4), lp.writeUnprivilegedStart("100\n"));
+    try std.testing.expect(tp.bindNeedsPrivilegeAt(99, lp.unprivilegedStart()));
+    try std.testing.expect(!tp.bindNeedsPrivilegeAt(100, lp.unprivilegedStart()));
+    try std.testing.expectEqual(@as(i64, -22), lp.writeUnprivilegedStart("-1\n"));
+    try std.testing.expectEqual(@as(i64, -22), lp.writeUnprivilegedStart("65536\n"));
+    try std.testing.expectEqual(@as(i64, -22), lp.writeUnprivilegedStart("50000\n"));
+    try std.testing.expectEqual(@as(u32, 100), lp.unprivilegedStart());
+    try std.testing.expectEqual(@as(i64, 5), lp.writeUnprivilegedStart("1024\n"));
 }

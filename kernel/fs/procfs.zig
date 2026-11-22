@@ -37,6 +37,8 @@ pub const ProcFile = enum(u8) {
     ip_nonlocal_bind6,
     /// /proc/sys/net/ipv4/ip_local_port_range: the system UDP/TCP automatic-port range (two integers).
     ip_local_port_range,
+    /// /proc/sys/net/ipv4/ip_unprivileged_port_start: first port not requiring CAP_NET_BIND_SERVICE.
+    ip_unprivileged_port_start,
     /// /proc/sys/net/ipv6/auto_flowlabels: 0..3 (flowlabel_policy), root may write it (mode 0644).
     auto_flowlabels,
     /// /proc/sys/fs/pipe-max-size: the largest pipe an unprivileged F_SETPIPE_SZ may ask for (fcntl_policy), root may write it.
@@ -84,7 +86,7 @@ pub fn isSubdir(file: ProcFile) bool {
 
 /// A /proc/sys file (proc_sys_call_handler): a read past offset 0 returns nothing, and so does a write there (sysctl_writes_strict).
 pub fn isSysctl(file: ProcFile) bool {
-    return file == .ping_group_range or file == .ip_nonlocal_bind4 or file == .ip_nonlocal_bind6 or file == .ip_local_port_range or file == .conf_file or file == .auto_flowlabels or file == .pipe_max_size or file == .pipe_user_pages_soft or file == .pipe_user_pages_hard;
+    return file == .ping_group_range or file == .ip_nonlocal_bind4 or file == .ip_nonlocal_bind6 or file == .ip_local_port_range or file == .ip_unprivileged_port_start or file == .conf_file or file == .auto_flowlabels or file == .pipe_max_size or file == .pipe_user_pages_soft or file == .pipe_user_pages_hard;
 }
 
 /// The fixed directory a path below /proc names ("net", "sys/net/", ...), or null.
@@ -117,7 +119,7 @@ fn subdirChildren(dir: ProcFile) []const SubEntry {
         .sys_fs_dir => &.{ .{ .name = "pipe-max-size", .dtype = DT_REG }, .{ .name = "pipe-user-pages-hard", .dtype = DT_REG }, .{ .name = "pipe-user-pages-soft", .dtype = DT_REG } },
         .sys_net_dir => &.{ .{ .name = "ipv4", .dtype = DT_DIR }, .{ .name = "ipv6", .dtype = DT_DIR } },
         .sys_ipv6_dir => &.{ .{ .name = "auto_flowlabels", .dtype = DT_REG }, .{ .name = "ip_nonlocal_bind", .dtype = DT_REG } },
-        .sys_ipv4_dir => &.{ .{ .name = "conf", .dtype = DT_DIR }, .{ .name = "ip_local_port_range", .dtype = DT_REG }, .{ .name = "ip_nonlocal_bind", .dtype = DT_REG }, .{ .name = "ping_group_range", .dtype = DT_REG } },
+        .sys_ipv4_dir => &.{ .{ .name = "conf", .dtype = DT_DIR }, .{ .name = "ip_local_port_range", .dtype = DT_REG }, .{ .name = "ip_unprivileged_port_start", .dtype = DT_REG }, .{ .name = "ip_nonlocal_bind", .dtype = DT_REG }, .{ .name = "ping_group_range", .dtype = DT_REG } },
         .sys_conf_dir => if (@import("../net/nic.zig").isActive()) &conf_devs else conf_devs[0..3],
         .conf_dev_dir => &.{ .{ .name = "proxy_arp", .dtype = DT_REG }, .{ .name = "route_localnet", .dtype = DT_REG } },
         else => &.{},
@@ -143,7 +145,7 @@ pub fn subdirEntryAt(dir: ProcFile, pos: u32) ?DirEntry {
 
 /// One directory entry for getdents64: a name and its DT_* type.
 pub const DirEntry = struct {
-    name: [20]u8 = undefined,
+    name: [32]u8 = undefined,
     len: u8 = 0,
     dtype: u8 = 0,
 
@@ -153,6 +155,11 @@ pub const DirEntry = struct {
         self.dtype = dtype;
     }
 };
+
+test "the longest sysctl name survives directory enumeration" {
+    const entry = subdirEntryAt(.sys_ipv4_dir, 4) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("ip_unprivileged_port_start", entry.name[0..entry.len]);
+}
 
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
@@ -280,6 +287,7 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
             const text = std.fmt.bufPrint(buf[0..@min(max_len, 32)], "{d}\t{d}\n", .{ low, high }) catch break :blk 0;
             break :blk @intCast(text.len);
         },
+        .ip_unprivileged_port_start => @intCast(@import("../net/devconf_policy.zig").formatInt(buf[0..@min(max_len, 16)], @intCast(@import("../net/local_port_sysctl.zig").unprivilegedStart()))),
         .conf_file => @intCast(@import("../net/arp.zig").confRead(@import("../net/devconf_policy.zig").decode(pid), buf[0..@min(max_len, 16)])),
         .net_arp => @intCast(@import("../net/arp.zig").formatProc(buf[0..max_len])),
         .root_dir, .pid_dir, .mount_dir, .fd_dir, .net_dir, .sys_dir, .sys_net_dir, .sys_ipv4_dir, .sys_ipv6_dir, .sys_conf_dir, .conf_dev_dir, .sys_fs_dir => 0,

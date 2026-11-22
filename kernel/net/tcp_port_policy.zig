@@ -66,7 +66,11 @@ pub const PRIVILEGED_PORT_LIMIT: u16 = 1024;
 
 /// bind() to `port` without the capability: EACCES for a privileged port.
 pub fn bindNeedsPrivilege(port: u16) bool {
-    return port != 0 and port < PRIVILEGED_PORT_LIMIT;
+    return bindNeedsPrivilegeAt(port, PRIVILEGED_PORT_LIMIT);
+}
+
+pub fn bindNeedsPrivilegeAt(port: u16, unprivileged_start: u32) bool {
+    return port != 0 and port < unprivileged_start;
 }
 
 /// A port another socket holds can still be bound (or listened on) when both sockets set SO_REUSEADDR and the holder is not listening

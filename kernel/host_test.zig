@@ -414,6 +414,7 @@ test {
     _ = @import("proc/sched_getaffinity_policy.zig");
     _ = @import("fs/slot_bitmap.zig");
     _ = @import("fs/procfs_policy.zig");
+    _ = @import("fs/procfs.zig");
     _ = @import("fs/pid_status.zig");
     _ = @import("fs/fat32_util.zig");
     _ = @import("fs/deleted_name_policy.zig");
