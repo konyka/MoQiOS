@@ -58,15 +58,16 @@ long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, lo
         }
         return r;
     }
-    long r = nr == SYS_dns_query && q_calls < q_n ? q_reply[q_calls] : -38;
+    long r = (nr == SYS_dns_query || nr == SYS_dns_query6) && q_calls < q_n ? q_reply[q_calls] : -38;
     q_calls++;
     size_t l = strlen(q_log);
     const char *name = (const char *)a1;
     const unsigned char *srv = (const unsigned char *)a3;
     size_t k = strlen(name);
-    if (l + k + 16 < sizeof q_log) {
+    if (l + k + 18 < sizeof q_log) {
         memcpy(q_log + l, name, k);
         l += k;
+        if (nr == SYS_dns_query6) { q_log[l++] = '/'; q_log[l++] = '6'; }
         q_log[l++] = '@';
         q_log[l++] = (char)('0' + srv[3] % 10);
         q_log[l++] = '/';
@@ -83,12 +84,18 @@ long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, lo
             unsigned char *ans = (unsigned char *)a5;
             if (q_answer && q_answer_len <= (size_t)a6) {
                 memcpy(ans, q_answer, q_answer_len);
-                memcpy(out, q_answer + 2, 4);
+                memcpy(out, q_answer + 3, q_answer[2]);
             } else {
-                /* The kernel's form for one address under the asked name. */
-                ans[0] = 1; ans[1] = 0;
-                memcpy(ans + 2, out, 4);
-                strcpy((char *)ans + 6, name);
+                /* The kernel's form for one address under the asked name: counts, the address length, the address, the name. An
+                 * AAAA query gets 2001:db8::<call number>. */
+                size_t al = nr == SYS_dns_query6 ? 16 : 4;
+                if (al == 16) {
+                    memset(out, 0, 16);
+                    out[0] = 0x20; out[1] = 0x01; out[2] = 0x0d; out[3] = 0xb8; out[15] = (unsigned char)q_calls;
+                }
+                ans[0] = 1; ans[1] = 0; ans[2] = (unsigned char)al;
+                memcpy(ans + 3, out, al);
+                strcpy((char *)ans + 3 + al, name);
             }
         }
     }
@@ -862,7 +869,7 @@ int main(void) {
 
         /* hello520: the whole answer of dns_query. a.test CNAME b.test, two addresses: h_name is b.test, h_aliases {a.test}, both
          * addresses in h_addr_list; getaddrinfo lists both, with ai_canonname b.test. */
-        static const unsigned char cn[] = {2, 1, 10, 9, 9, 1, 10, 9, 9, 2, 'b', '.', 't', 'e', 's', 't', 0, 'a', '.', 't', 'e', 's', 't', 0};
+        static const unsigned char cn[] = {2, 1, 4, 10, 9, 9, 1, 10, 9, 9, 2, 'b', '.', 't', 'e', 's', 't', 0, 'a', '.', 't', 'e', 's', 't', 0};
         static const long ok1[] = {0};
         q_script(one, ok1, 1);
         q_answer = cn;
@@ -883,7 +890,7 @@ int main(void) {
         assert(res->ai_next && res->ai_next->ai_addr[7] == 2 && res->ai_next->ai_next == 0 && res->ai_addr[7] == 1);
         freeaddrinfo(res);
         /* A search domain and a CNAME together: the canonical name is the chain's end, the asked name (with its domain) an alias. */
-        static const unsigned char cn2[] = {1, 1, 10, 9, 9, 3, 'z', '.', 't', 'e', 's', 't', 0, 'x', '.', 'a', '.', 't', 'e', 's', 't', 0};
+        static const unsigned char cn2[] = {1, 1, 4, 10, 9, 9, 3, 'z', '.', 't', 'e', 's', 't', 0, 'x', '.', 'a', '.', 't', 'e', 's', 't', 0};
         q_script("nameserver 10.0.0.1\nsearch a.test\noptions attempts:1\n", ok1, 1);
         q_answer = cn2;
         q_answer_len = sizeof cn2;
@@ -894,6 +901,7 @@ int main(void) {
         size_t mn = 0;
         big523[mn++] = 40;
         big523[mn++] = 12;
+        big523[mn++] = 4;
         for (int i = 0; i < 40; i++) { big523[mn++] = 10; big523[mn++] = 9; big523[mn++] = 0; big523[mn++] = (unsigned char)(i + 1); }
         mn += (size_t)sprintf((char *)big523 + mn, "w12.test") + 1;
         mn += (size_t)sprintf((char *)big523 + mn, "w.test") + 1;
@@ -951,6 +959,71 @@ int main(void) {
         /* The counter has moved four times since the seed (1): the fifth rotated query starts at 5 % 2, the second server. */
         q_script("nameserver 10.0.0.1\nnameserver 10.0.0.2\noptions attempts:1 timeout:1 rotate\n", ok, 1);
         assert(gethostbyname_ipv4("x.y", a4) == 0 && strcmp(q_log, "x.y@2/1;") == 0);
+        moqi_test_resolv_conf = (const char *)0;
+    }
+
+    /* hello525: AAAA. gethostbyname2(AF_INET6) asks AAAA records through dns_query6 (509); getaddrinfo AF_UNSPEC asks AAAA then A
+     * and lists IPv6 first; AF_INET6 + AI_V4MAPPED asks A only when there is no AAAA (and both with AI_ALL); when no family
+     * answers, NXDOMAIN wins over NODATA, which wins over a failure (glibc 2.44, measured). */
+    {
+        static const char one[] = "nameserver 10.0.0.1\noptions attempts:1\n";
+        static const long ok[] = {0}, ok2[] = {0, 0}, nd_ok[] = {-61, 0}, ok_nd[] = {0, -61};
+        static const long nd_nx[] = {-61, -2}, nx_nd[] = {-2, -61}, sf_nd[] = {-11, -61}, nd_sf[] = {-61, -11}, sf_sf[] = {-11, -11};
+        q_script(one, ok, 1);
+        struct hostent *h6 = gethostbyname2("v6.test", AF_INET6);
+        assert(h6 && h6->h_length == 16 && h6->h_addrtype == AF_INET6 && (unsigned char)h6->h_addr_list[0][0] == 0x20);
+        assert(strcmp(q_log, "v6.test/6@1/5;") == 0);
+        q_script(one, nd_ok, 1);
+        assert(gethostbyname2("v4only.test", AF_INET6) == 0 && h_errno == NO_DATA);
+        /* No nameserver: AF_INET6 is not asked of the kernel's DHCP server (it answers A only). */
+        q_script("search x.test\n", ok, 1);
+        assert(gethostbyname2("v6.test", AF_INET6) == 0 && h_errno == HOST_NOT_FOUND && q_calls == 0);
+
+        struct addrinfo hints, *res = 0;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_socktype = SOCK_STREAM;
+        q_script(one, ok2, 2);
+        assert(getaddrinfo("both.test", 0, &hints, &res) == 0);
+        assert(res && res->ai_family == AF_INET6 && res->ai_next && res->ai_next->ai_family == AF_INET && res->ai_next->ai_next == 0);
+        assert(strcmp(q_log, "both.test/6@1/5;both.test@1/5;") == 0);
+        freeaddrinfo(res);
+        q_script(one, nd_ok, 2);
+        assert(getaddrinfo("v4.test", 0, &hints, &res) == 0 && res->ai_family == AF_INET && res->ai_next == 0);
+        freeaddrinfo(res);
+        q_script(one, ok_nd, 2);
+        assert(getaddrinfo("v6.test", 0, &hints, &res) == 0 && res->ai_family == AF_INET6 && res->ai_next == 0);
+        freeaddrinfo(res);
+        q_script(one, nd_nx, 2);
+        assert(getaddrinfo("x.test", 0, &hints, &res) == EAI_NONAME);
+        q_script(one, nx_nd, 2);
+        assert(getaddrinfo("x.test", 0, &hints, &res) == EAI_NONAME);
+        q_script(one, sf_nd, 2);
+        assert(getaddrinfo("x.test", 0, &hints, &res) == EAI_NODATA);
+        q_script(one, nd_sf, 2);
+        assert(getaddrinfo("x.test", 0, &hints, &res) == EAI_NODATA);
+        q_script(one, sf_sf, 2);
+        assert(getaddrinfo("x.test", 0, &hints, &res) == EAI_AGAIN);
+        /* AF_INET6: AAAA only; AI_V4MAPPED maps the A answer when there is no AAAA; with an AAAA it is not asked unless AI_ALL. */
+        hints.ai_family = AF_INET6;
+        q_script(one, nd_ok, 2);
+        assert(getaddrinfo("v4.test", 0, &hints, &res) == EAI_NODATA && q_calls == 1);
+        hints.ai_flags = AI_V4MAPPED;
+        q_script(one, nd_ok, 2);
+        assert(getaddrinfo("v4.test", 0, &hints, &res) == 0 && res->ai_family == AF_INET6 && res->ai_addr[18] == 0xff && res->ai_addr[19] == 0xff);
+        freeaddrinfo(res);
+        q_script(one, ok2, 2);
+        assert(getaddrinfo("both.test", 0, &hints, &res) == 0 && res->ai_next == 0 && q_calls == 1);
+        freeaddrinfo(res);
+        hints.ai_flags = AI_V4MAPPED | AI_ALL;
+        q_script(one, ok2, 2);
+        assert(getaddrinfo("both.test", 0, &hints, &res) == 0 && res->ai_next && res->ai_next->ai_addr[19] == 0xff && q_calls == 2);
+        freeaddrinfo(res);
+        /* AF_INET: A only. */
+        hints.ai_family = AF_INET;
+        hints.ai_flags = 0;
+        q_script(one, ok, 1);
+        assert(getaddrinfo("v4.test", 0, &hints, &res) == 0 && strcmp(q_log, "v4.test@1/5;") == 0);
+        freeaddrinfo(res);
         moqi_test_resolv_conf = (const char *)0;
     }
 

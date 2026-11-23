@@ -25,17 +25,21 @@ long gethostbyname_ipv4(const char *name, uint8_t out[4]);
 long gethostbyname_ipv4_name(const char *name, uint8_t out[4], char *found, size_t found_cap);
 
 /* The whole answer of a lookup through a nameserver of /etc/resolv.conf, as dns_query (507) hands it over: the address count,
- * the alias count, the addresses, then the canonical name (the end of the CNAME chain) and the aliases (the names before it),
+ * the alias count, the address length (4 or 16), the addresses, then the canonical name (the end of the CNAME chain) and the aliases (the names before it),
  * NUL-terminated (glibc getanswer_r, measured). `len` is 0 when the answer did not come from such a query (a literal or the
  * kernel's DHCP server through dns_resolve). */
-struct resolv_answer { uint8_t buf[4608]; size_t len; };
+struct resolv_answer { uint8_t buf[5376]; size_t len; };
 
 /* gethostbyname_ipv4_name that also fills `ans` (may be NULL). Everything it uses is per call, so threads may resolve at once. */
 long resolv_lookup(const char *name, uint8_t out[4], char *found, size_t found_cap, struct resolv_answer *ans);
 
-/* Up to `cap` addresses of `ans` in reply order into `addrs`, and in `names` (may be NULL) "canonical alias alias...". Returns
+/* Up to `cap` addresses of `ans` in reply order into `addrs` (4 or 16 bytes used of each slot, as the answer's family), and in `names` (may be NULL) "canonical alias alias...". Returns
  * the number of addresses; 0 when `ans` holds none. */
-size_t resolv_answer_unpack(const struct resolv_answer *ans, uint8_t addrs[][4], size_t cap, char *names, size_t names_cap);
+size_t resolv_answer_unpack(const struct resolv_answer *ans, uint8_t addrs[][16], size_t cap, char *names, size_t names_cap);
+
+/* resolv_lookup for family `af`: AF_INET asks A records (4-byte `out`), AF_INET6 AAAA records (16-byte `out`, through dns_query6,
+ * 509). With no nameserver line AF_INET6 is -ENOENT (the kernel's own server answers A queries only). */
+long resolv_lookup_af(const char *name, int af, uint8_t *out, char *found, size_t found_cap, struct resolv_answer *ans);
 
 /* The host name of `addr` (4 bytes for AF_INET, 16 for AF_INET6) from a PTR query to the nameservers of /etc/resolv.conf, with
  * its timeout and attempts, through dns_ptr (508); NUL-terminated and cut to `cap`. 0 or the dns_query results; -ENOENT also when
@@ -162,8 +166,8 @@ extern int h_errno;
 struct hostent *gethostbyname(const char *name);
 
 /* gethostbyname for a family: AF_INET (what gethostbyname does) or AF_INET6. Every /etc/hosts line of that family for the name
- * is listed in file order (up to 16 addresses), with h_length 4 or 16; a literal answers only its own family; AF_INET6 has no
- * DNS fallback (the kernel resolver has no AAAA), so a name not in /etc/hosts is HOST_NOT_FOUND. Another family is NO_DATA. */
+ * is listed in file order (up to 64 addresses), with h_length 4 or 16; a literal answers only its own family; a name not in
+ * /etc/hosts is asked of DNS for A (AF_INET) or AAAA (AF_INET6) records. Another family is NO_DATA. */
 struct hostent *gethostbyname2(const char *name, int af);
 
 /* Reverse an IPv4/IPv6 address through /etc/hosts. The result shares gethostbyname's static storage. A mapped IPv6

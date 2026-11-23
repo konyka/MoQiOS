@@ -18381,12 +18381,12 @@ test "dns_query (507): a reply's RCODE and answers decide the outcome, and the w
     try std.testing.expect(std.mem.indexOf(u8, se, "if (ans_len != 0 and ans_len < 256) return -34; // ERANGE") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "const n = da.encode(&ans, enc[0..@intCast(@min(ans_len, enc.len))]) orelse return -90; // EMSGSIZE") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "if (!dp.timeoutValid(timeout_ms)) return -22;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, se, "@import(\"../../net/dns.zig\").queryVia(hp.stripTrailingDot(name), server, timeout_ms * 1_000_000, dnsSleep, &ans)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "dns.queryVia(hp.stripTrailingDot(name), server, timeout_ms * 1_000_000, dnsSleep, &ans);") != null);
     const dns = kt.dns_source;
     try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryVia(hostname: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {") != null);
     // hello520: answers with no address for the name (only a CNAME, or records for other owners) are NO_RECOVERY in glibc, so the
     // kernel reports them as `failed`; NODATA is only NOERROR without answers.
-    try std.testing.expect(std.mem.indexOf(u8, dns, "if (!dns_answer.parse(msg, hostname, ans)) return .{ .outcome = .failed };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "if (!dns_answer.parseType(msg, hostname, qtype, ans)) return .{ .outcome = .failed };") != null);
 }
 
 test "dns_answer: CNAME chains, several A records and the canonical name, as glibc's getanswer_r reads them (hello520)" {
@@ -18570,7 +18570,7 @@ test "dns_answer: CNAME chains, several A records and the canonical name, as gli
     try std.testing.expect(da.parse(b.buf[0..b.n], "e.test", &a));
     var out: [64]u8 = undefined;
     const n = da.encode(&a, &out) orelse return error.TestUnexpectedResult;
-    const want = [_]u8{ 2, 2, 10, 9, 9, 2, 10, 9, 9, 3 } ++ "g.test".* ++ [_]u8{0} ++ "e.test".* ++ [_]u8{0} ++ "f.test".* ++ [_]u8{0};
+    const want = [_]u8{ 2, 2, 4, 10, 9, 9, 2, 10, 9, 9, 3 } ++ "g.test".* ++ [_]u8{0} ++ "e.test".* ++ [_]u8{0} ++ "f.test".* ++ [_]u8{0};
     try std.testing.expectEqualSlices(u8, &want, out[0..n]);
     try std.testing.expect(da.encode(&a, out[0 .. want.len - 1]) == null);
     try std.testing.expect(da.encode(&a, out[0..want.len]) != null);
@@ -18703,10 +18703,10 @@ test "a DNS reply over 512 bytes is read whole, and up to 64 addresses and 16 al
     try std.testing.expect(da.parse(msg[0..n], "x.test", &a));
     try std.testing.expectEqual(da.MAX_ADDRS, a.naddr);
     // A 16-step CNAME chain keeps every step as an alias. The encoded answer of 64 addresses and 16 aliases fits 2 KiB.
-    // The longest encoded answer fits the buffer libc passes (struct resolv_answer, 4608 bytes).
-    try std.testing.expect(da.MAX_ENCODED <= 4608);
+    // The longest encoded answer fits the buffer libc passes (struct resolv_answer, 5376 bytes; hello525 made addresses 16 bytes).
+    try std.testing.expect(da.MAX_ENCODED <= 5376);
     try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "var enc: [da.MAX_ENCODED]u8 = undefined;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.netdb_header_source, "struct resolv_answer { uint8_t buf[4608]; size_t len; };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.netdb_header_source, "struct resolv_answer { uint8_t buf[5376]; size_t len; };") != null);
     // The kernel reads replies into a buffer big enough for them (not 512 bytes, which cut such a reply short).
     const dns = kt.dns_source;
     try std.testing.expect(std.mem.indexOf(u8, dns, "var buf: [512]u8") == null);
@@ -18737,4 +18737,58 @@ test "a DNS reply with TC set is not used: the query is asked again over TCP to 
     const dns = kt.dns_source;
     try std.testing.expect(std.mem.indexOf(u8, dns, "if (r.outcome == .truncated) return queryTcp(hostname, dns_server, timeout_ns, yield, ans, qtype);") != null);
     try std.testing.expect(std.mem.indexOf(u8, dns, "fn queryTcp(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16) Result {") != null);
+}
+
+test "AAAA answers: dns_answer reads type-28 records of 16 bytes for an AAAA query, A records for an A query (hello525)" {
+    const da = kt.dns_answer;
+    var msg: [512]u8 = undefined;
+    const head = [_]u8{ 0x12, 0x34, 0x81, 0x80, 0, 1, 0, 3, 0, 0, 0, 0, 1, 'x', 4, 't', 'e', 's', 't', 0, 0, 28, 0, 1 };
+    @memcpy(msg[0..head.len], &head);
+    var n: usize = head.len;
+    // A CNAME to y.test is not used here (owner x.test, target written as a pointer-free name), then an AAAA for x.test, then
+    // an A for x.test (the wrong type for this query).
+    const aaaa = [_]u8{ 0xc0, 12, 0, 28, 0, 1, 0, 0, 0, 60, 0, 16, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    const aaaa2 = [_]u8{ 0xc0, 12, 0, 28, 0, 1, 0, 0, 0, 60, 0, 16, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+    const a4 = [_]u8{ 0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 10, 6, 6, 1 };
+    for ([_][]const u8{ &aaaa, &a4, &aaaa2 }) |rr| {
+        @memcpy(msg[n..][0..rr.len], rr);
+        n += rr.len;
+    }
+    var a: da.Answer = .{};
+    try std.testing.expect(da.parseType(msg[0..n], "x.test", 28, &a));
+    try std.testing.expectEqual(@as(u8, 16), a.alen);
+    try std.testing.expectEqual(@as(u8, 2), a.naddr);
+    try std.testing.expectEqual(@as(u8, 0x20), a.addrs[0][0]);
+    try std.testing.expectEqual(@as(u8, 2), a.addrs[1][15]);
+    // The same reply read for an A query takes only the A record.
+    try std.testing.expect(da.parseType(msg[0..n], "x.test", 1, &a));
+    try std.testing.expectEqual(@as(u8, 4), a.alen);
+    try std.testing.expectEqual(@as(u8, 1), a.naddr);
+    try std.testing.expectEqual(@as(u8, 10), a.addrs[0][0]);
+    // An AAAA record whose length is not 16 is skipped (a well-formed record of type 28 with 4 bytes of data, then a good one).
+    var bad: [512]u8 = undefined;
+    @memcpy(bad[0..head.len], &head);
+    bad[7] = 2;
+    var bn: usize = head.len;
+    const short = [_]u8{ 0xc0, 12, 0, 28, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4 };
+    for ([_][]const u8{ &short, &aaaa2 }) |rr| {
+        @memcpy(bad[bn..][0..rr.len], rr);
+        bn += rr.len;
+    }
+    try std.testing.expect(da.parseType(bad[0..bn], "x.test", 28, &a));
+    try std.testing.expectEqual(@as(u8, 1), a.naddr);
+    try std.testing.expectEqual(@as(u8, 2), a.addrs[0][15]);
+    // encode: the address length is the third byte; 16-byte addresses follow.
+    var b: da.Answer = .{};
+    da.single(&b, "v6.test", .{ 1, 2, 3, 4 });
+    try std.testing.expectEqual(@as(u8, 4), b.alen);
+    var out: [128]u8 = undefined;
+    const e = da.encode(&b, &out).?;
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 4, 1, 2, 3, 4 }, out[0..7]);
+    try std.testing.expectEqual(@as(usize, 7 + 8), e);
+    // dns_query6 (509): an AAAA query; wiring.
+    const se = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, se, "509 => { // dns_query6(name, out16, server4, timeout_ms, ans, ans_len)") != null);
+    const dns = kt.dns_source;
+    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryVia6(hostname: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {") != null);
 }

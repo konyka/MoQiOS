@@ -91,6 +91,7 @@
 #define SYS_dns_resolve_via 506
 #define SYS_dns_query       507
 #define SYS_dns_ptr         508
+#define SYS_dns_query6      509
 
 /* Processes, identity and terminals */
 #define SYS_pause       34

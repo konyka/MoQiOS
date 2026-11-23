@@ -155,6 +155,14 @@ pub fn queryVia(hostname: []const u8, server: [4]u8, timeout_ns: u64, yield: Yie
     return queryCore(hostname, server, timeout_ns, yield, ans);
 }
 
+/// queryVia for AAAA records (dns_query6, 509): every IPv6 address of the reply lands in `ans` (alen 16). An IPv4 literal or a static
+/// name has no AAAA record: NODATA, as for a name that exists without one.
+pub fn queryVia6(hostname: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {
+    if (hostname.len == 0 or hostname.len > MAX_NAME) return .{ .outcome = .nxdomain };
+    if (@import("static_hosts.zig").lookup(hostname) != null or isIpV4(hostname)) return .{ .outcome = .nodata };
+    return queryType(hostname, server, timeout_ns, yield, ans, TYPE_AAAA);
+}
+
 /// A PTR query to `server` for `addr` (4 bytes IPv4 or 16 bytes IPv6), waiting at most `timeout_ns` (dns_ptr, 508): the host name
 /// lands in ans.canonName(). The shared cache is not used.
 pub fn queryPtr(addr: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {
@@ -165,6 +173,7 @@ pub fn queryPtr(addr: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield, 
 
 const TYPE_A_Q: u16 = 1;
 const TYPE_PTR: u16 = 12;
+const TYPE_AAAA: u16 = 28;
 
 fn queryCore(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {
     return queryType(hostname, dns_server, timeout_ns, yield, ans, TYPE_A_Q);
@@ -185,7 +194,7 @@ fn buildQuery(pkt: []u8, hostname: []const u8, qtype: u16, query_id: u16) usize 
     bo.writeU16BeAt(pkt.ptr, 4, 1); // qdcount
     var offset: usize = 12;
     offset += encodeDnsName(hostname, pkt[offset..]);
-    bo.writeU16BeAt(pkt.ptr, offset, qtype); // TYPE_A or TYPE_PTR
+    bo.writeU16BeAt(pkt.ptr, offset, qtype); // TYPE_A, TYPE_PTR or TYPE_AAAA
     pkt[offset + 2] = 0x00;
     pkt[offset + 3] = 0x01; // CLASS_IN
     return offset + 4;
@@ -201,8 +210,8 @@ fn readReply(msg: []const u8, hostname: []const u8, qtype: u16, ans: *dns_answer
         if (!dns_answer.parsePtr(msg, hostname, ans)) return .{ .outcome = .failed };
         return .{ .outcome = .answer };
     }
-    if (!dns_answer.parse(msg, hostname, ans)) return .{ .outcome = .failed };
-    return .{ .outcome = .answer, .ip = ans.addrs[0] };
+    if (!dns_answer.parseType(msg, hostname, qtype, ans)) return .{ .outcome = .failed };
+    return .{ .outcome = .answer, .ip = ans.addrs[0][0..4].* };
 }
 
 /// The query over TCP to `dns_server`:53 (RFC 1035 4.2.2: a 2-byte length, then the message), waiting at most `timeout_ns` for the

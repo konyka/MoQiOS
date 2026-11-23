@@ -2615,6 +2615,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         507 => { // dns_query(name, out4, server4, timeout_ms, ans, ans_len) — one query to one server, and how it ended (a resolver in libc)
             frame.rax = @bitCast(syscallDnsQuery(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
         },
+        509 => { // dns_query6(name, out16, server4, timeout_ms, ans, ans_len) — dns_query for AAAA records
+            frame.rax = @bitCast(syscallDnsQueryType(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9, true));
+        },
         508 => { // dns_ptr(addr, family, server4, timeout_ms, name_out, name_len) — a reverse (PTR) query to one server
             frame.rax = @bitCast(syscallDnsPtr(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
         },
@@ -6677,10 +6680,17 @@ fn syscallDnsResolveVia(name_ptr: u64, out_ptr: u64, server_ptr: u64) i64 {
 /// addresses, the canonical name and the CNAME aliases); -ERANGE (before any query) when ans_len is under 256 bytes, -EMSGSIZE
 /// when the answer does not fit.
 fn syscallDnsQuery(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_ms: u64, ans_ptr: u64, ans_len: u64) i64 {
+    return syscallDnsQueryType(name_ptr, out_ptr, server_ptr, timeout_ms, ans_ptr, ans_len, false);
+}
+
+/// dns_query (507, A records, `out` 4 bytes) or dns_query6 (509, AAAA records, `out` 16 bytes): the same checks and results. An IPv4
+/// literal or a static name has no AAAA record (-ENODATA).
+fn syscallDnsQueryType(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_ms: u64, ans_ptr: u64, ans_len: u64, v6: bool) i64 {
     const copy = @import("../../mm/copy_from_user.zig");
     const hp = @import("../../net/hostname_policy.zig");
     const dp = @import("../../net/dns_policy.zig");
-    if (!copy.validateUserBufferWritable(out_ptr, 4)) return -14; // EFAULT, before any network wait
+    const out_len: usize = if (v6) 16 else 4;
+    if (!copy.validateUserBufferWritable(out_ptr, out_len)) return -14; // EFAULT, before any network wait
     var server: [4]u8 = undefined;
     if (copy.copyFromUser(&server, @ptrFromInt(server_ptr), 4) != 4) return -14;
     if (!dp.serverUsable(server)) return -22;
@@ -6700,9 +6710,13 @@ fn syscallDnsQuery(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_ms: u64
     }
     const da = @import("../../net/dns_answer.zig");
     var ans: da.Answer = .{};
-    const r = @import("../../net/dns.zig").queryVia(hp.stripTrailingDot(name), server, timeout_ms * 1_000_000, dnsSleep, &ans);
+    const dns = @import("../../net/dns.zig");
+    const r = if (v6)
+        dns.queryVia6(hp.stripTrailingDot(name), server, timeout_ms * 1_000_000, dnsSleep, &ans)
+    else
+        dns.queryVia(hp.stripTrailingDot(name), server, timeout_ms * 1_000_000, dnsSleep, &ans);
     if (r.outcome != .answer) return dp.queryResult(r.outcome);
-    if (copy.copyToUser(@ptrFromInt(out_ptr), &r.ip, 4) != 4) return -14;
+    if (copy.copyToUser(@ptrFromInt(out_ptr), ans.addrs[0][0..out_len], out_len) != out_len) return -14;
     if (ans_len != 0) {
         var enc: [da.MAX_ENCODED]u8 = undefined;
         const n = da.encode(&ans, enc[0..@intCast(@min(ans_len, enc.len))]) orelse return -90; // EMSGSIZE

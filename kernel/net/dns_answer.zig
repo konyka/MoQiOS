@@ -1,4 +1,4 @@
-//! The answer section of a DNS reply to an A query, read the way glibc's getanswer_r reads it (glibc 2.44, measured with a local
+//! The answer section of a DNS reply to an A or AAAA query, read the way glibc's getanswer_r reads it (glibc 2.44, measured with a local
 //! server): the records are walked in order with an "expected name" that starts as the queried name. A CNAME (whatever its
 //! owner) makes its target the expected name and keeps the name it replaces as an alias; an A record counts only when its owner
 //! is the expected name (compared without regard to ASCII case), and the canonical name is the expected name at the end, spelled
@@ -8,16 +8,19 @@ pub const MAX_ADDRS: u8 = 64;
 pub const MAX_ALIASES: u8 = 16;
 pub const MAX_NAME: usize = 253;
 /// The longest encode() result: counts, every address, the canonical name and every alias with their NULs.
-pub const MAX_ENCODED: usize = 2 + @as(usize, MAX_ADDRS) * 4 + (@as(usize, MAX_ALIASES) + 1) * (MAX_NAME + 1);
+pub const MAX_ENCODED: usize = 3 + @as(usize, MAX_ADDRS) * 16 + (@as(usize, MAX_ALIASES) + 1) * (MAX_NAME + 1);
 
 const TYPE_A: u16 = 1;
 const TYPE_CNAME: u16 = 5;
 const TYPE_PTR: u16 = 12;
+const TYPE_AAAA: u16 = 28;
 const CLASS_IN: u16 = 1;
 
 pub const Answer = struct {
-    addrs: [MAX_ADDRS][4]u8 = undefined,
+    /// The addresses, `alen` bytes each (4 for an A query, 16 for AAAA).
+    addrs: [MAX_ADDRS][16]u8 = undefined,
     naddr: u8 = 0,
+    alen: u8 = 4,
     /// Name text: the canonical name first, then each alias, back to back; `ends[i]` is where name i stops.
     names: [(MAX_ALIASES + 1) * (MAX_NAME + 1)]u8 = undefined,
     ends: [MAX_ALIASES + 1]u16 = undefined,
@@ -92,7 +95,16 @@ fn be16(msg: []const u8, at: usize) u16 {
 /// Read `msg` (a whole reply) for addresses of `qname`. True when at least one address was found; false for no address (only
 /// CNAMEs, records for other owners, a CNAME loop) or a malformed message.
 pub fn parse(msg: []const u8, qname: []const u8, out: *Answer) bool {
+    return parseType(msg, qname, TYPE_A, out);
+}
+
+/// parse() for a query of type `qtype`: A (1) takes 4-byte A records, AAAA (28) 16-byte AAAA records; the other type's records
+/// are skipped like any other. CNAMEs are followed the same way for both.
+pub fn parseType(msg: []const u8, qname: []const u8, qtype: u16, out: *Answer) bool {
     out.* = .{};
+    const want_type: u16 = if (qtype == TYPE_AAAA) TYPE_AAAA else TYPE_A;
+    const want_len: u16 = if (qtype == TYPE_AAAA) 16 else 4;
+    out.alen = @intCast(want_len);
     if (msg.len < 12 or qname.len == 0 or qname.len > MAX_NAME) return false;
     const qdcount = be16(msg, 4);
     const ancount = be16(msg, 6);
@@ -133,9 +145,9 @@ pub fn parse(msg: []const u8, qname: []const u8, out: *Answer) bool {
             out.ends[out.nalias] = @intCast(start + td.len);
             continue;
         }
-        if (rtype == TYPE_A and rdlen == 4 and eqlIgnoreCase(owner[0..od.len], out.canonName())) {
+        if (rtype == want_type and rdlen == want_len and eqlIgnoreCase(owner[0..od.len], out.canonName())) {
             if (out.naddr < MAX_ADDRS) {
-                @memcpy(&out.addrs[out.naddr], msg[rdata..][0..4]);
+                @memcpy(out.addrs[out.naddr][0..want_len], msg[rdata..][0..want_len]);
                 out.naddr += 1;
             }
         }
@@ -246,22 +258,25 @@ pub fn single(out: *Answer, name: []const u8, ip: [4]u8) void {
     const n = @min(name.len, MAX_NAME);
     @memcpy(out.names[0..n], name[0..n]);
     out.ends[0] = @intCast(n);
-    out.addrs[0] = ip;
+    @memcpy(out.addrs[0][0..4], &ip);
     out.naddr = 1;
+    out.alen = 4;
 }
 
-/// The answer as dns_query (507) hands it to user space: the address count, the alias count, the addresses (4 bytes each), then
-/// the canonical name and each alias in order, NUL-terminated. null when `dst` is too small.
+/// The answer as dns_query (507) and dns_query6 (509) hand it to user space: the address count, the alias count, the address length
+/// (4 or 16), the addresses, then the canonical name and each alias in order, NUL-terminated. null when `dst` is too small.
 pub fn encode(a: *const Answer, dst: []u8) ?usize {
-    var need: usize = 2 + @as(usize, a.naddr) * 4 + a.canonName().len + 1;
+    const al: usize = a.alen;
+    var need: usize = 3 + @as(usize, a.naddr) * al + a.canonName().len + 1;
     for (0..a.nalias) |i| need += a.alias(i).len + 1;
     if (dst.len < need) return null;
     dst[0] = a.naddr;
     dst[1] = a.nalias;
-    var p: usize = 2;
+    dst[2] = a.alen;
+    var p: usize = 3;
     for (a.addrs[0..a.naddr]) |ad| {
-        @memcpy(dst[p..][0..4], &ad);
-        p += 4;
+        @memcpy(dst[p..][0..al], ad[0..al]);
+        p += al;
     }
     const c = a.canonName();
     @memcpy(dst[p..][0..c.len], c);

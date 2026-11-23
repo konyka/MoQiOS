@@ -252,15 +252,17 @@ static size_t resolv_first_server(const struct resolv_opts *opt, size_t nns) {
     return __atomic_fetch_add(&resolv_rotate_next, 1u, __ATOMIC_ACQ_REL) % nns;
 }
 
-static long resolve_one(const char *name, uint8_t out[4], uint8_t ns[][4], size_t nns, const struct resolv_opts *opt,
-                        struct resolv_answer *ans) {
+static long resolve_one(const char *name, uint8_t *out, uint8_t ns[][4], size_t nns, const struct resolv_opts *opt,
+                        struct resolv_answer *ans, int af) {
     if (ans) ans->len = 0;
-    if (nns == 0) return NETDB_SYSCALL2(SYS_dns_resolve, (long)name, (long)out);
+    /* The kernel's own server (no nameserver line) answers A queries only. */
+    if (nns == 0) return af == AF_INET6 ? -2 : NETDB_SYSCALL2(SYS_dns_resolve, (long)name, (long)out);
+    long nr = af == AF_INET6 ? SYS_dns_query6 : SYS_dns_query;
     long last_reply = -110; /* ETIMEDOUT: no server replied (or attempts:0 asked nobody) */
     size_t first = resolv_first_server(opt, nns);
     for (int a = 0; a < opt->attempts; a++) {
         for (size_t i = 0; i < nns; i++) {
-            long r = NETDB_SYSCALL6(SYS_dns_query, (long)name, (long)out, (long)ns[(first + i) % nns], resolv_wait_ms(opt->timeout, i, nns),
+            long r = NETDB_SYSCALL6(nr, (long)name, (long)out, (long)ns[(first + i) % nns], resolv_wait_ms(opt->timeout, i, nns),
                                     ans ? (long)ans->buf : 0, ans ? (long)sizeof ans->buf : 0);
             if (r == 0 && ans) ans->len = sizeof ans->buf;
             if (r == -11 || r == -111) last_reply = r; /* SERVFAIL; NOTIMP or REFUSED: the last reply is what res_search sees */
@@ -277,9 +279,14 @@ long gethostbyname_ipv4_name(const char *name, uint8_t out[4], char *found, size
     return resolv_lookup(name, out, found, found_cap, (struct resolv_answer *)0);
 }
 
-/* The file text and the candidate names are per call (on the stack): two threads resolving at once share nothing. */
 long resolv_lookup(const char *name, uint8_t out[4], char *found, size_t found_cap, struct resolv_answer *ans) {
+    return resolv_lookup_af(name, AF_INET, out, found, found_cap, ans);
+}
+
+/* The file text and the candidate names are per call (on the stack): two threads resolving at once share nothing. */
+long resolv_lookup_af(const char *name, int af, uint8_t *out, char *found, size_t found_cap, struct resolv_answer *ans) {
     if (!name || !out) return -22; /* EINVAL */
+    if (af != AF_INET && af != AF_INET6) return -97; /* EAFNOSUPPORT */
     char resolv_conf_buf[2048];
     char resolv_cand[RESOLV_MAX_CANDIDATES][256];
     struct resolv_answer local;
@@ -300,18 +307,18 @@ long resolv_lookup(const char *name, uint8_t out[4], char *found, size_t found_c
      * long to send) ends the domain list, though the name as given is still asked if it has not been. With nothing found the
      * result is the as-given query's when it came first, else NODATA if a domain had it, else SERVFAIL if one had that, else the
      * last query's. */
-    if (nc == 0) return resolve_one(name, out, ns, nns, &opt, ans);
+    if (nc == 0) return resolve_one(name, out, ns, nns, &opt, ans, af);
     long saved = 0, last = -2;
     int asis_first = 0, got_nodata = 0, got_servfail = 0, done = 0;
     for (size_t i = 0; i < nc; i++) {
         int is_name = strcmp(resolv_cand[i], name) == 0 || (strlen(name) == strlen(resolv_cand[i]) + 1 && name[strlen(name) - 1] == '.');
         if (!is_name && done) continue;
-        long r = resolve_one(is_name ? name : resolv_cand[i], out, ns, nns, &opt, ans);
+        long r = resolve_one(is_name ? name : resolv_cand[i], out, ns, nns, &opt, ans, af);
         if (r == 0) {
             if (found && found_cap) {
                 /* The canonical name of the answer (the end of its CNAME chain), else the name that was asked. */
                 const char *canon = resolv_cand[i];
-                if (ans && ans->len) canon = (const char *)ans->buf + 2 + 4 * ans->buf[0];
+                if (ans && ans->len) canon = (const char *)ans->buf + 3 + ans->buf[2] * ans->buf[0];
                 size_t k = strlen(canon);
                 if (k >= found_cap) k = found_cap - 1;
                 memcpy(found, canon, k);
@@ -383,15 +390,15 @@ long resolv_ptr(const void *addr, int family, char *name, size_t cap) {
     return last;
 }
 
-size_t resolv_answer_unpack(const struct resolv_answer *ans, uint8_t addrs[][4], size_t cap, char *names, size_t names_cap) {
+size_t resolv_answer_unpack(const struct resolv_answer *ans, uint8_t addrs[][16], size_t cap, char *names, size_t names_cap) {
     if (names && names_cap) names[0] = 0;
     if (!ans || !ans->len) return 0;
-    size_t na = ans->buf[0], nal = ans->buf[1];
-    if (na == 0 || 2 + 4 * na >= ans->len) return 0;
-    for (size_t i = 0; i < na && i < cap; i++) memcpy(addrs[i], ans->buf + 2 + 4 * i, 4);
+    size_t na = ans->buf[0], nal = ans->buf[1], al = ans->buf[2];
+    if (na == 0 || (al != 4 && al != 16) || 3 + al * na >= ans->len) return 0;
+    for (size_t i = 0; i < na && i < cap; i++) memcpy(addrs[i], ans->buf + 3 + al * i, al);
     if (names && names_cap) {
         /* "canonical alias alias ...": the canonical name, then the aliases in the order the chain met them. */
-        const char *p = (const char *)ans->buf + 2 + 4 * na;
+        const char *p = (const char *)ans->buf + 3 + al * na;
         const char *end = (const char *)ans->buf + ans->len;
         size_t o = 0;
         for (size_t k = 0; k <= nal && p < end; k++) {
@@ -1070,21 +1077,16 @@ static void lookup_name(const char *name, int af, char *hosts, size_t hosts_cap,
             memcpy(ans->name_store, names, names_len);
             ans->names = ans->name_store;
             ans->names_len = names_len;
-        } else if (af == AF_INET6) {
-            ans->herr = HOST_NOT_FOUND; /* the kernel resolver has no AAAA records */
-            return;
         } else {
-            /* The name that answered (a search domain may have been appended, and the end of a CNAME chain) is the canonical
+            /* AF_INET asks A records, AF_INET6 AAAA records (gethostbyname2, glibc measured). The name that answered (a search domain may have been appended, and the end of a CNAME chain) is the canonical
              * name, the names before it in the chain the aliases, and every address of the reply is listed (glibc, measured). */
             ans->name_store[0] = 0;
             struct resolv_answer ra;
-            long r = resolv_lookup(name, ans->addrs[0], ans->name_store, HOSTENT_NAME_MAX, &ra);
+            long r = resolv_lookup_af(name, af, ans->addrs[0], ans->name_store, HOSTENT_NAME_MAX, &ra);
             if (r == 0) {
-                uint8_t all[HOSTENT_ADDRS_MAX][4];
                 char chain[HOSTENT_NAME_MAX];
-                size_t k = resolv_answer_unpack(&ra, all, HOSTENT_ADDRS_MAX, chain, sizeof chain);
+                size_t k = resolv_answer_unpack(&ra, ans->addrs, HOSTENT_ADDRS_MAX, chain, sizeof chain);
                 if (k) {
-                    for (size_t i = 0; i < k; i++) memcpy(ans->addrs[i], all[i], 4);
                     memcpy(ans->name_store, chain, strlen(chain) + 1);
                 }
                 ans->naddrs = k ? k : 1;
@@ -1633,30 +1635,68 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
             }
         }
         if (naddrs == 0) {
-            /* The kernel resolver answers A records only. */
-            if (family == AF_INET6 && !(flags & AI_V4MAPPED)) return EAI_NONAME;
+            /* DNS (glibc 2.44, measured): AF_INET asks A records, AF_INET6 AAAA records, AF_UNSPEC both, listing the IPv6 addresses
+             * first. AF_INET6 with AI_V4MAPPED falls back to the A records, mapped, when there is no AAAA; with AI_ALL as well it
+             * lists both. One family failing while the other answers is fine; when neither answers the lookup is EAI_NONAME if either
+             * said NXDOMAIN (or the name is malformed), else EAI_NODATA if either said NODATA, else EAI_AGAIN. canon_buf ends up
+             * holding the end of the CNAME chain of the first answer. */
+            int want6 = family == AF_INET6 || family == AF_UNSPEC;
+            int want4 = family == AF_INET || family == AF_UNSPEC || (family == AF_INET6 && (flags & AI_V4MAPPED));
+            int all = family == AF_INET6 && (flags & AI_V4MAPPED) && (flags & AI_ALL);
             canon_buf[0] = 0;
+            long r6 = -2, r4 = -2;
+            uint8_t a16[16];
             struct resolv_answer ra;
-            long r = resolv_lookup(node, v4, canon_buf, sizeof canon_buf, &ra);
-            if (r < 0) {
-                int h = netdb_herr_of(r);
-                /* glibc (measured): NO_DATA is EAI_NODATA, NO_RECOVERY like HOST_NOT_FOUND is EAI_NONAME, TRY_AGAIN EAI_AGAIN. */
-                return h == NO_DATA ? EAI_NODATA : h == TRY_AGAIN ? EAI_AGAIN : EAI_NONAME;
+            if (want6) {
+                r6 = resolv_lookup_af(node, AF_INET6, a16, canon_buf, sizeof canon_buf, &ra);
+                if (r6 == 0) {
+                    uint8_t got[GAI_MAX_ADDRS][16];
+                    size_t k = resolv_answer_unpack(&ra, got, GAI_MAX_ADDRS, (char *)0, 0);
+                    if (k == 0) {
+                        memcpy(got[0], a16, 16);
+                        k = 1;
+                    }
+                    for (size_t i = 0; i < k && naddrs < GAI_MAX_ADDRS; i++) {
+                        memset(&addrs[naddrs], 0, sizeof addrs[naddrs]);
+                        addrs[naddrs].family = AF_INET6;
+                        memcpy(addrs[naddrs].addr, got[i], 16);
+                        naddrs++;
+                    }
+                }
             }
-            /* Every address of the reply, in its order (glibc, measured); canon_buf holds the end of the CNAME chain. */
-            uint8_t all[GAI_MAX_ADDRS][4];
-            size_t k = resolv_answer_unpack(&ra, all, GAI_MAX_ADDRS, (char *)0, 0);
-            if (k == 0) {
-                memcpy(all[0], v4, 4);
-                k = 1;
+            /* AF_INET6 + AI_V4MAPPED asks A only when AAAA gave nothing, unless AI_ALL. */
+            if (want4 && (family != AF_INET6 || naddrs == 0 || all)) {
+                char canon4[256];
+                canon4[0] = 0;
+                r4 = resolv_lookup_af(node, AF_INET, v4, canon4, sizeof canon4, &ra);
+                if (r4 == 0) {
+                    uint8_t got[GAI_MAX_ADDRS][16];
+                    size_t k = resolv_answer_unpack(&ra, got, GAI_MAX_ADDRS, (char *)0, 0);
+                    if (k == 0) {
+                        memcpy(got[0], v4, 4);
+                        k = 1;
+                    }
+                    for (size_t i = 0; i < k && naddrs < GAI_MAX_ADDRS; i++) {
+                        set_v4(&addrs[naddrs], got[i][0], got[i][1], got[i][2], got[i][3]);
+                        if (family == AF_INET6) map_v4(&addrs[naddrs]);
+                        naddrs++;
+                    }
+                    if (!canon_buf[0]) memcpy(canon_buf, canon4, strlen(canon4) + 1);
+                }
             }
-            for (size_t i = 0; i < k; i++) {
-                set_v4(&addrs[i], all[i][0], all[i][1], all[i][2], all[i][3]);
-                if (family == AF_INET6) map_v4(&addrs[i]);
+            if (naddrs == 0) {
+                long rs[2] = {want6 ? r6 : 0, want4 ? r4 : 0};
+                int nx = 0, nd = 0;
+                for (int i = 0; i < 2; i++) {
+                    if (rs[i] == -2 || rs[i] == -22 || rs[i] == -36 || rs[i] == -71) nx = 1;
+                    if (rs[i] == -61) nd = 1;
+                }
+                /* One family asked: its own mapping (NO_RECOVERY like HOST_NOT_FOUND is EAI_NONAME). */
+                if (nx) return EAI_NONAME;
+                if (nd) return EAI_NODATA;
+                return EAI_AGAIN;
             }
-            naddrs = k;
             names = (const char *)0;
-            /* The name that answered (with a search domain, when one was appended) is the canonical name. */
             if (canon_buf[0]) {
                 names = canon_buf;
                 names_len = strlen(canon_buf);
