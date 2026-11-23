@@ -107,6 +107,8 @@ static void reset(void) {
     for (int i = 0; i < 64; i++) cnt[i] = 0, code[i] = band[i] = sfd[i] = -9;
 }
 static void await(int sig, long n) { for (int i = 0; i < 100 && cnt[sig] < n; i++) { pump(); usleep(5000); } }
+/* await with a longer limit: up to 3 s for a signal that depends on segments still in flight on a loaded host. */
+static void await_long(int sig, long n) { for (int i = 0; i < 600 && cnt[sig] < n; i++) { pump(); usleep(5000); } }
 static void quiet(void) { for (int i = 0; i < 8; i++) { pump(); usleep(5000); } }
 static long fl(int fd) { return fc(fd, C_GETFL, 0); }
 static void arm(int fd, int sig) {
@@ -225,7 +227,9 @@ int main(void) {
     }
     quiet();
     drain(s);
-    await(S_CLI, 1);
+    /* The POLL_OUT comes with the ACK that frees half the ring, which can trail the drain by a few scheduler ticks when every CPU of
+     * the guest is busy: wait up to 3 s for it (a missing one still fails). */
+    await_long(S_CLI, 1);
     snprintf(msg, sizeof msg, "G: a full sender gets POLL_OUT once the peer drains (queued %ld then %ld; hits %ld code %ld fd %ld/%d)", g0, g1, cnt[S_CLI], code[S_CLI],
              sfd[S_CLI], c);
     check(g0 > 0 && g1 == -11 && cnt[S_CLI] >= 1 && code[S_CLI] == 2 && sfd[S_CLI] == c, msg);
