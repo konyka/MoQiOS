@@ -28,7 +28,7 @@ long gethostbyname_ipv4_name(const char *name, uint8_t out[4], char *found, size
  * the alias count, the addresses, then the canonical name (the end of the CNAME chain) and the aliases (the names before it),
  * NUL-terminated (glibc getanswer_r, measured). `len` is 0 when the answer did not come from such a query (a literal or the
  * kernel's DHCP server through dns_resolve). */
-struct resolv_answer { uint8_t buf[1024]; size_t len; };
+struct resolv_answer { uint8_t buf[4608]; size_t len; };
 
 /* gethostbyname_ipv4_name that also fills `ans` (may be NULL). Everything it uses is per call, so threads may resolve at once. */
 long resolv_lookup(const char *name, uint8_t out[4], char *found, size_t found_cap, struct resolv_answer *ans);
@@ -146,7 +146,7 @@ long tcp_connect_host(const char *host, uint16_t port);
 
 struct hostent {
     char  *h_name;       /* the canonical name from /etc/hosts, else the name asked for */
-    char **h_aliases;    /* NULL-terminated; the /etc/hosts line's other names (up to 16), else empty */
+    char **h_aliases;    /* NULL-terminated; the /etc/hosts line's other names, or the CNAME chain before the canonical name (up to 16) */
     int    h_addrtype;   /* AF_INET, or AF_INET6 from gethostbyname2 */
     int    h_length;     /* 4 or 16 */
     char **h_addr_list;  /* NULL-terminated; every /etc/hosts address of the family, else one */

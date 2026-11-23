@@ -889,6 +889,36 @@ int main(void) {
         q_answer_len = sizeof cn2;
         hc = gethostbyname("x");
         assert(hc && strcmp(hc->h_name, "z.test") == 0 && strcmp(hc->h_aliases[0], "x.a.test") == 0 && strcmp(q_log, "x.a.test@1/5;") == 0);
+        /* hello523: 40 addresses and a 12-step chain are all kept (glibc 2.44, measured: 60 addresses, 12 aliases). */
+        static unsigned char big523[4608];
+        size_t mn = 0;
+        big523[mn++] = 40;
+        big523[mn++] = 12;
+        for (int i = 0; i < 40; i++) { big523[mn++] = 10; big523[mn++] = 9; big523[mn++] = 0; big523[mn++] = (unsigned char)(i + 1); }
+        mn += (size_t)sprintf((char *)big523 + mn, "w12.test") + 1;
+        mn += (size_t)sprintf((char *)big523 + mn, "w.test") + 1;
+        for (int i = 1; i < 12; i++) mn += (size_t)sprintf((char *)big523 + mn, "w%d.test", i) + 1;
+        q_script(one, ok1, 1);
+        q_answer = big523;
+        q_answer_len = mn;
+        hc = gethostbyname("w.test");
+        int na = 0, nal = 0;
+        while (hc && hc->h_addr_list[na]) na++;
+        while (hc && hc->h_aliases[nal]) nal++;
+        assert(hc && strcmp(hc->h_name, "w12.test") == 0 && na == 40 && nal == 12 && (unsigned char)hc->h_addr_list[39][3] == 40);
+        assert(strcmp(hc->h_aliases[11], "w11.test") == 0);
+        q_script(one, ok1, 1);
+        q_answer = big523;
+        q_answer_len = mn;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        assert(getaddrinfo("w.test", 0, &hints, &res) == 0);
+        int ng = 0;
+        for (struct addrinfo *x = res; x; x = x->ai_next) ng++;
+        assert(ng == 40);
+        freeaddrinfo(res);
+
         /* Without a CNAME the asked name is canonical and there are no aliases. 507 gets an answer buffer of at least 256 bytes. */
         q_script(one, ok1, 1);
         hc = gethostbyname("plain.test");

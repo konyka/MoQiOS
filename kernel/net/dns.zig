@@ -16,6 +16,10 @@ const bo = @import("../lib/byte_order.zig");
 const dns_policy = @import("dns_policy.zig");
 const dns_answer = @import("dns_answer.zig");
 
+/// Largest reply read: a reply over 512 bytes reaches us whole over UDP (glibc reads such replies too, measured: 984 bytes, 60
+/// addresses), so the buffer must not cut it at the classic 512.
+const MAX_REPLY: usize = 4096;
+
 const DNS_PORT: u16 = dns_policy.DNS_PORT;
 const DNS_CACHE_SIZE: u32 = 16;
 
@@ -218,7 +222,7 @@ fn queryType(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yi
     var wait_iters: u32 = 0;
     while (!dns_policy.waitExpiredAfter(start, tsc.nanos(), wait_iters, timeout_ns)) : (wait_iters += 1) {
         pumpRx(); // replies only reach the UDP queue when the NIC is polled
-        var buf: [512]u8 = @splat(0);
+        var buf: [MAX_REPLY]u8 = undefined;
         var from_ip: [4]u8 = .{ 0, 0, 0, 0 };
         var from_port: u16 = 0;
 

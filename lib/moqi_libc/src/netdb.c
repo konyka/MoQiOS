@@ -961,8 +961,10 @@ long tcp_connect_host(const char *host, uint16_t port) {
 
 int h_errno;
 
-#define HOSTENT_NAME_MAX 256
-#define HOSTENT_ADDRS_MAX 16
+/* A DNS answer brings up to 64 addresses and a canonical name with 16 aliases (dns_answer.zig); glibc keeps them all (measured:
+ * 60 addresses, a 12-step CNAME chain). The names field holds the canonical name and every alias, blank-separated. */
+#define HOSTENT_NAME_MAX (17 * 254)
+#define HOSTENT_ADDRS_MAX 64
 #define HOSTENT_ALIASES_MAX 16
 
 int hostent_pack(struct hostent *he, char *buf, size_t buf_len, const char *names, size_t names_len, int af,
@@ -1192,7 +1194,7 @@ static void lookup_addr(const void *addr, unsigned int len, int family, char *ho
 }
 
 /* The static functions: one result in static storage, overwritten by the next call (as in glibc); not thread-safe. Its buffer
- * is large enough for any answer (16 addresses of 16 bytes, a 255-byte names field). */
+ * is large enough for any answer (HOSTENT_ADDRS_MAX addresses of 16 bytes and a full names field). */
 static struct hostent hostent_result;
 static union {
     char *align;
@@ -1429,7 +1431,7 @@ static int scoped_ipv6(const char *node, uint8_t out[16], uint32_t *scope) {
     return 1;
 }
 
-#define GAI_MAX_ADDRS 16
+#define GAI_MAX_ADDRS 64
 
 /* ---- AI_ADDRCONFIG ------------------------------------------------------------------------------------------- */
 

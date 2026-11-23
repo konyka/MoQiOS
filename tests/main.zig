@@ -18536,11 +18536,11 @@ test "dns_answer: CNAME chains, several A records and the canonical name, as gli
     b.rr("q.test", 5, "q.test", true);
     try std.testing.expect(!da.parse(b.buf[0..b.n], "q.test", &a));
 
-    // At most MAX_ADDRS addresses are kept.
+    // Twenty addresses are all kept (the cap, MAX_ADDRS, is checked in the hello523 test).
     b.header("r.test", 20);
     for (0..20) |i| b.rr("r.test", 1, &.{ 10, 9, 9, @intCast(i + 1) }, false);
     try std.testing.expect(da.parse(b.buf[0..b.n], "r.test", &a));
-    try std.testing.expectEqual(@as(u8, da.MAX_ADDRS), a.naddr);
+    try std.testing.expectEqual(@as(u8, 20), a.naddr);
 
     // Compression pointers in owners and CNAME targets; a pointer loop or a truncated record is no answer.
     var c = [_]u8{ 0x12, 0x34, 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0 } ++
@@ -18667,4 +18667,45 @@ test "dns_answer.parsePtr: the names a PTR reply gives for an address, after its
     try std.testing.expect(std.mem.indexOf(u8, se, "508 => { // dns_ptr(addr, family, server4, timeout_ms, name_out, name_len)") != null);
     const dns = kt.dns_source;
     try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryPtr(addr: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {") != null);
+}
+
+test "a DNS reply over 512 bytes is read whole, and up to 64 addresses and 16 aliases are kept (glibc 2.44 took 60 and 12, measured) (hello523)" {
+    const da = kt.dns_answer;
+    try std.testing.expect(da.MAX_ADDRS >= 64);
+    try std.testing.expect(da.MAX_ALIASES >= 16);
+    // 40 A records (a 664-byte reply, measured to be taken whole by glibc without EDNS).
+    var msg: [4096]u8 = undefined;
+    const head = [_]u8{ 0x12, 0x34, 0x81, 0x80, 0, 1, 0, 40, 0, 0, 0, 0, 1, 'x', 4, 't', 'e', 's', 't', 0, 0, 1, 0, 1 };
+    @memcpy(msg[0..head.len], &head);
+    var n: usize = head.len;
+    for (0..40) |k| {
+        const rr = [_]u8{ 0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 10, 9, 0, @intCast(k + 1) };
+        @memcpy(msg[n..][0..rr.len], &rr);
+        n += rr.len;
+    }
+    try std.testing.expect(n > 512);
+    var a: da.Answer = .{};
+    try std.testing.expect(da.parse(msg[0..n], "x.test", &a));
+    try std.testing.expectEqual(@as(u8, 40), a.naddr);
+    try std.testing.expectEqual(@as(u8, 40), a.addrs[39][3]);
+    // Past MAX_ADDRS the extra addresses are dropped, not an error.
+    n = head.len;
+    msg[7] = 70;
+    for (0..70) |k| {
+        const rr = [_]u8{ 0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 10, 9, 1, @intCast(k + 1) };
+        @memcpy(msg[n..][0..rr.len], &rr);
+        n += rr.len;
+    }
+    try std.testing.expect(da.parse(msg[0..n], "x.test", &a));
+    try std.testing.expectEqual(da.MAX_ADDRS, a.naddr);
+    // A 16-step CNAME chain keeps every step as an alias. The encoded answer of 64 addresses and 16 aliases fits 2 KiB.
+    // The longest encoded answer fits the buffer libc passes (struct resolv_answer, 4608 bytes).
+    try std.testing.expect(da.MAX_ENCODED <= 4608);
+    try std.testing.expect(std.mem.indexOf(u8, kt.syscall_entry_source, "var enc: [da.MAX_ENCODED]u8 = undefined;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.netdb_header_source, "struct resolv_answer { uint8_t buf[4608]; size_t len; };") != null);
+    // The kernel reads replies into a buffer big enough for them (not 512 bytes, which cut such a reply short).
+    const dns = kt.dns_source;
+    try std.testing.expect(std.mem.indexOf(u8, dns, "var buf: [512]u8") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "var buf: [MAX_REPLY]u8 = undefined;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "const MAX_REPLY: usize = 4096;") != null);
 }

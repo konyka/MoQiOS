@@ -4,9 +4,11 @@
 //! is the expected name (compared without regard to ASCII case), and the canonical name is the expected name at the end, spelled
 //! as the record that introduced it. Pure: no kernel imports, host-tested.
 
-pub const MAX_ADDRS: u8 = 16;
-pub const MAX_ALIASES: u8 = 8;
+pub const MAX_ADDRS: u8 = 64;
+pub const MAX_ALIASES: u8 = 16;
 pub const MAX_NAME: usize = 253;
+/// The longest encode() result: counts, every address, the canonical name and every alias with their NULs.
+pub const MAX_ENCODED: usize = 2 + @as(usize, MAX_ADDRS) * 4 + (@as(usize, MAX_ALIASES) + 1) * (MAX_NAME + 1);
 
 const TYPE_A: u16 = 1;
 const TYPE_CNAME: u16 = 5;

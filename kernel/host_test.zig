@@ -342,6 +342,7 @@ pub const fd_target_source = @embedFile("fs/fd_target.zig");
 pub const syscall_entry_source = @embedFile("arch/x86_64/syscall_entry.zig");
 pub const idt_source = @embedFile("arch/x86_64/idt.zig");
 pub const moqi_syscalls_header = @embedFile("moqi_syscalls_header");
+pub const netdb_header_source = @embedFile("netdb_header");
 pub const aarch64_trap_source = @embedFile("arch/aarch64/trap.zig");
 pub const riscv64_trap_source = @embedFile("arch/riscv64/trap.zig");
 pub const riscv64_start_source = @embedFile("arch/riscv64/start.zig");

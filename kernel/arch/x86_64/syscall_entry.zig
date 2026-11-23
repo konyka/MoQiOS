@@ -6704,7 +6704,7 @@ fn syscallDnsQuery(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_ms: u64
     if (r.outcome != .answer) return dp.queryResult(r.outcome);
     if (copy.copyToUser(@ptrFromInt(out_ptr), &r.ip, 4) != 4) return -14;
     if (ans_len != 0) {
-        var enc: [4096]u8 = undefined;
+        var enc: [da.MAX_ENCODED]u8 = undefined;
         const n = da.encode(&ans, enc[0..@intCast(@min(ans_len, enc.len))]) orelse return -90; // EMSGSIZE
         if (copy.copyToUser(@ptrFromInt(ans_ptr), enc[0..n], n) != n) return -14;
     }
