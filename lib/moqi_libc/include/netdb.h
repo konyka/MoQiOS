@@ -27,6 +27,19 @@ long ipv4_to_text(const uint8_t addr[4], char *buf, size_t buf_len);
  * address (NULL arguments included). `out` is written only on success. */
 int ipv4_from_text(const char *text, uint8_t out[4]);
 
+/* Look `name` up in the text of an /etc/hosts file (`len` bytes): the first line with a dotted IPv4 address that lists the name
+ * (ASCII case-insensitive, whole field) wins; '#' starts a comment. Returns 1 and writes the address, or 0. gethostbyname,
+ * getaddrinfo and resolve_ipv4_sockaddr consult /etc/hosts this way before the kernel resolver, as glibc's "files" source does. */
+int hosts_find(const char *text, size_t len, const char *name, uint8_t out[4]);
+
+/* hosts_find that also returns the matching line's names: *names points at the first name (the canonical one, then the aliases,
+ * separated by spaces or tabs) and the return value is the length of that run up to the comment or line end; 0 means no match. */
+size_t hosts_find_names(const char *text, size_t len, const char *name, uint8_t out[4], const char **names);
+
+/* The reverse lookup getnameinfo uses: the canonical name (first name field) of the first line in the /etc/hosts text whose
+ * dotted IPv4 address is `addr` and that lists a name. Returns the name's length and points *name into `text`, or 0. */
+size_t hosts_reverse(const char *text, size_t len, const uint8_t addr[4], const char **name);
+
 /* Build a Linux `struct sockaddr_in` (16 bytes) for bind/connect/sendto: family AF_INET (2) as a little-endian
  * u16, `port` in network byte order, the 4 address bytes, 8 bytes of zero padding. */
 void ipv4_sockaddr(const uint8_t addr[4], uint16_t port, uint8_t out[16]);
@@ -53,8 +66,8 @@ long tcp_connect_host(const char *host, uint16_t port);
 #define NO_DATA        4
 
 struct hostent {
-    char  *h_name;       /* the name asked for */
-    char **h_aliases;    /* NULL-terminated; always empty here */
+    char  *h_name;       /* the canonical name from /etc/hosts, else the name asked for */
+    char **h_aliases;    /* NULL-terminated; the /etc/hosts line's other names (up to 16), else empty */
     int    h_addrtype;   /* AF_INET */
     int    h_length;     /* 4 */
     char **h_addr_list;  /* NULL-terminated; exactly one address */
@@ -63,7 +76,7 @@ struct hostent {
 
 extern int h_errno;
 
-/* Look `name` up: a dotted-decimal literal, or a name through the kernel resolver. The result is in static
+/* Look `name` up: a dotted-decimal literal, /etc/hosts, then the kernel resolver. The result is in static
  * storage that the next call overwrites (as in glibc), so it is not thread-safe. NULL on failure with h_errno set:
  * HOST_NOT_FOUND for a name that does not exist or is malformed or a NULL name, TRY_AGAIN when the server did
  * not answer or the lookup failed for another reason. h_errno is reset to 0 on success. */

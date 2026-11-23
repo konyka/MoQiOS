@@ -68,11 +68,142 @@ void ipv4_sockaddr(const uint8_t addr[4], uint16_t port, uint8_t out[16]) {
     for (int i = 8; i < 16; i++) out[i] = 0;
 }
 
+static int hosts_space(char c) { return c == ' ' || c == '\t' || c == '\r'; }
+static char hosts_lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
+
+/* Whether the field text[a..b) is `name`, ignoring ASCII case. */
+static int hosts_field_is(const char *text, size_t a, size_t b, const char *name) {
+    size_t i = 0;
+    for (; a + i < b; i++) {
+        if (name[i] == 0 || hosts_lower(text[a + i]) != hosts_lower(name[i])) return 0;
+    }
+    return name[i] == 0;
+}
+
+size_t hosts_find_names(const char *text, size_t len, const char *name, uint8_t out[4], const char **names) {
+    if (!text || !name || !out || !names || name[0] == 0) return 0;
+    size_t pos = 0;
+    while (pos < len) {
+        size_t end = pos;
+        while (end < len && text[end] != '\n') end++;
+        size_t stop = pos;
+        while (stop < end && text[stop] != '#') stop++;
+        size_t i = pos;
+        while (i < stop && hosts_space(text[i])) i++;
+        size_t a = i;
+        while (i < stop && !hosts_space(text[i])) i++;
+        char addr_text[16];
+        uint8_t addr[4];
+        if (i > a && i - a < sizeof(addr_text)) {
+            for (size_t k = 0; k < i - a; k++) addr_text[k] = text[a + k];
+            addr_text[i - a] = 0;
+            if (ipv4_from_text(addr_text, addr)) {
+                while (i < stop && hosts_space(text[i])) i++;
+                size_t first = i, last = i;
+                int hit = 0;
+                while (i < stop) {
+                    while (i < stop && hosts_space(text[i])) i++;
+                    size_t f = i;
+                    while (i < stop && !hosts_space(text[i])) i++;
+                    if (i > f) {
+                        last = i;
+                        if (hosts_field_is(text, f, i, name)) hit = 1;
+                    }
+                }
+                if (hit) {
+                    for (int k = 0; k < 4; k++) out[k] = addr[k];
+                    *names = text + first;
+                    return last - first;
+                }
+            }
+        }
+        pos = end + 1;
+    }
+    return 0;
+}
+
+int hosts_find(const char *text, size_t len, const char *name, uint8_t out[4]) {
+    const char *names = (const char *)0;
+    return hosts_find_names(text, len, name, out, &names) > 0;
+}
+
+size_t hosts_reverse(const char *text, size_t len, const uint8_t want[4], const char **name) {
+    if (!text || !want || !name) return 0;
+    size_t pos = 0;
+    while (pos < len) {
+        size_t end = pos;
+        while (end < len && text[end] != '\n') end++;
+        size_t stop = pos;
+        while (stop < end && text[stop] != '#') stop++;
+        size_t i = pos;
+        while (i < stop && hosts_space(text[i])) i++;
+        size_t a = i;
+        while (i < stop && !hosts_space(text[i])) i++;
+        char addr_text[16];
+        uint8_t addr[4];
+        if (i > a && i - a < sizeof(addr_text)) {
+            for (size_t k = 0; k < i - a; k++) addr_text[k] = text[a + k];
+            addr_text[i - a] = 0;
+            if (ipv4_from_text(addr_text, addr) && addr[0] == want[0] && addr[1] == want[1] && addr[2] == want[2] &&
+                addr[3] == want[3]) {
+                while (i < stop && hosts_space(text[i])) i++;
+                size_t f = i;
+                while (i < stop && !hosts_space(text[i])) i++;
+                if (i > f) {
+                    *name = text + f;
+                    return i - f;
+                }
+            }
+        }
+        pos = end + 1;
+    }
+    return 0;
+}
+
+/* The host test links netdb.o without the file system: there /etc/hosts is never read. */
+#ifdef MOQI_HOST_TEST_SYSCALL
+static size_t etc_hosts_read(void) { return 0; }
+static char etc_hosts_buf[1];
+#else
+static char etc_hosts_buf[8192];
+static size_t etc_hosts_read(void) {
+    long fd = syscall3(SYS_open, (long)"/etc/hosts", 0 /* O_RDONLY */, 0);
+    if (fd < 0) return 0;
+    long n = 0;
+    while (n < (long)sizeof(etc_hosts_buf)) {
+        long r = syscall3(SYS_read, fd, (long)(etc_hosts_buf + n), (long)sizeof(etc_hosts_buf) - n);
+        if (r <= 0) break;
+        n += r;
+    }
+    syscall1(SYS_close, fd);
+    return (size_t)n;
+}
+#endif
+
+/* /etc/hosts first, then the kernel resolver (glibc's "files dns" order). When the file answers and `names` is given, the
+ * matching line's names (canonical name first, then aliases, separated by blanks) are copied there NUL-terminated, cut to `cap`;
+ * otherwise names[0] is 0. */
+static long lookup_ipv4(const char *name, uint8_t out[4], char *names, size_t cap) {
+    if (names && cap) names[0] = 0;
+    size_t n = etc_hosts_read();
+    const char *found = (const char *)0;
+    size_t k = n ? hosts_find_names(etc_hosts_buf, n, name, out, &found) : 0;
+    if (k > 0) {
+        if (names && cap) {
+            if (k >= cap) k = cap - 1;
+            memcpy(names, found, k);
+            names[k] = 0;
+        }
+        return 0;
+    }
+    return gethostbyname_ipv4(name, out);
+}
+
 long resolve_ipv4_sockaddr(const char *host, uint16_t port, uint8_t out[16]) {
     if (!host || !out) return -22; /* EINVAL */
     uint8_t addr[4];
     if (!ipv4_from_text(host, addr)) {
-        long r = gethostbyname_ipv4(host, addr);
+        long r = lookup_ipv4(host, addr, (char *)0, 0);
         if (r < 0) return r;
     }
     ipv4_sockaddr(addr, port, out);
@@ -118,7 +249,8 @@ int h_errno;
 static struct hostent hostent_result;
 static char hostent_name[HOSTENT_NAME_MAX];
 static char hostent_addr[4];
-static char *hostent_aliases[1];
+#define HOSTENT_ALIASES_MAX 16
+static char *hostent_aliases[HOSTENT_ALIASES_MAX + 1];
 static char *hostent_addr_list[2];
 
 struct hostent *gethostbyname(const char *name) {
@@ -127,8 +259,9 @@ struct hostent *gethostbyname(const char *name) {
         return (struct hostent *)0;
     }
     uint8_t addr[4];
+    hostent_name[0] = 0;
     if (!ipv4_from_text(name, addr)) {
-        long r = gethostbyname_ipv4(name, addr);
+        long r = lookup_ipv4(name, addr, hostent_name, HOSTENT_NAME_MAX);
         if (r < 0) {
             /* A name that does not exist, is malformed, or is too long is a definitive "no such host"; a timeout
              * or any other failure is worth retrying. */
@@ -138,14 +271,28 @@ struct hostent *gethostbyname(const char *name) {
             return (struct hostent *)0;
         }
     }
-    size_t n = 0;
-    while (name[n] && n + 1 < HOSTENT_NAME_MAX) {
-        hostent_name[n] = name[n];
-        n++;
+    int naliases = 0;
+    if (hostent_name[0]) {
+        /* From /etc/hosts: the canonical name, then the line's other names as aliases (glibc, measured). */
+        char *p = hostent_name;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        while (*p) {
+            *p++ = 0;
+            while (*p == ' ' || *p == '\t') p++;
+            if (!*p) break;
+            if (naliases < HOSTENT_ALIASES_MAX) hostent_aliases[naliases++] = p;
+            while (*p && *p != ' ' && *p != '\t') p++;
+        }
+    } else {
+        size_t n = 0;
+        while (name[n] && n + 1 < HOSTENT_NAME_MAX) {
+            hostent_name[n] = name[n];
+            n++;
+        }
+        hostent_name[n] = 0;
     }
-    hostent_name[n] = 0;
     for (int i = 0; i < 4; i++) hostent_addr[i] = (char)addr[i];
-    hostent_aliases[0] = (char *)0;
+    hostent_aliases[naliases] = (char *)0;
     hostent_addr_list[0] = hostent_addr;
     hostent_addr_list[1] = (char *)0;
     hostent_result.h_name = hostent_name;
@@ -287,6 +434,7 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
 
     uint8_t addr[4];
     const char *canon = (const char *)0;
+    char canon_buf[256];
     if (!node) {
         if (flags & AI_PASSIVE) { addr[0] = addr[1] = addr[2] = addr[3] = 0; }
         else { addr[0] = 127; addr[1] = 0; addr[2] = 0; addr[3] = 1; }
@@ -294,11 +442,17 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
         if (flags & AI_CANONNAME) canon = node;
     } else {
         if (flags & AI_NUMERICHOST) return EAI_NONAME;
-        long r = gethostbyname_ipv4(node, addr);
+        long r = lookup_ipv4(node, addr, canon_buf, sizeof(canon_buf));
         if (r < 0) {
             return (r == -2 || r == -22 || r == -36) ? EAI_NONAME : EAI_AGAIN;
         }
-        if (flags & AI_CANONNAME) canon = node;
+        if (flags & AI_CANONNAME) {
+            /* A name from /etc/hosts is canonicalised to the line's first name, as glibc does. */
+            size_t k = 0;
+            while (canon_buf[k] && canon_buf[k] != ' ' && canon_buf[k] != '\t') k++;
+            canon_buf[k] = 0;
+            canon = canon_buf[0] ? canon_buf : node;
+        }
     }
 
     struct addrinfo *head = (struct addrinfo *)0, **tail = &head;
@@ -334,7 +488,19 @@ int getnameinfo(const uint8_t *sa, unsigned int salen, char *host, unsigned int 
     if (host && hostlen > 0) {
         const char *text = (const char *)0;
         char dotted[16];
-        if (!(flags & NI_NUMERICHOST) && addr[0] == 127 && addr[1] == 0 && addr[2] == 0 && addr[3] == 1) text = "localhost";
+        char found[NI_MAXHOST];
+        if (!(flags & NI_NUMERICHOST)) {
+            size_t n = etc_hosts_read();
+            const char *name = (const char *)0;
+            size_t k = n ? hosts_reverse(etc_hosts_buf, n, addr, &name) : 0;
+            if (k > 0 && k < sizeof(found)) {
+                memcpy(found, name, k);
+                found[k] = 0;
+                text = found;
+            } else if (addr[0] == 127 && addr[1] == 0 && addr[2] == 0 && addr[3] == 1) {
+                text = "localhost";
+            }
+        }
         if (!text) {
             if (flags & NI_NAMEREQD) return EAI_NONAME;
             ipv4_to_text(addr, dotted, sizeof(dotted));

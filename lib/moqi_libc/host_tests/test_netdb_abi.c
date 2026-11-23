@@ -95,6 +95,61 @@ int main(void) {
     assert(gethostbyname_ipv4("nope.invalid", ip) == -2);
     assert(ip[0] == 0xAA && ip[3] == 0xAA);
 
+    /* /etc/hosts lines (glibc files backend, measured): the first line naming the host wins, any of its names counts, case does
+     * not matter, '#' starts a comment, fields are separated by spaces or tabs; a trailing dot does not match; a line whose
+     * address is not dotted IPv4 is skipped here. */
+    {
+        static const char hosts[] =
+            "127.0.0.1 localhost\n# a comment line\n  10.1.2.3\tfoo.example\tfoo  # trailing comment\n"
+            "::1 v6only\n10.9.9.9 Foo other\nbogus line\n192.168.0.7 last";
+        uint8_t h[4] = {0, 0, 0, 0};
+        assert(hosts_find(hosts, sizeof(hosts) - 1, "foo", h) == 1 && h[0] == 10 && h[1] == 1 && h[2] == 2 && h[3] == 3);
+        assert(hosts_find(hosts, sizeof(hosts) - 1, "FOO.example", h) == 1 && h[3] == 3);
+        assert(hosts_find(hosts, sizeof(hosts) - 1, "other", h) == 1 && h[0] == 10 && h[3] == 9);
+        assert(hosts_find(hosts, sizeof(hosts) - 1, "last", h) == 1 && h[0] == 192 && h[3] == 7);
+        assert(hosts_find(hosts, sizeof(hosts) - 1, "localhost", h) == 1 && h[0] == 127);
+        assert(hosts_find(hosts, sizeof(hosts) - 1, "foo.example.", h) == 0);
+        assert(hosts_find(hosts, sizeof(hosts) - 1, "v6only", h) == 0);
+        assert(hosts_find(hosts, sizeof(hosts) - 1, "comment", h) == 0);
+        assert(hosts_find(hosts, sizeof(hosts) - 1, "fo", h) == 0);
+        assert(hosts_find(hosts, sizeof(hosts) - 1, "bar", h) == 0);
+        assert(hosts_find(hosts, 0, "foo", h) == 0);
+    }
+
+    /* The matched line's names, for h_name/h_aliases and AI_CANONNAME (glibc returns the canonical name and the aliases). */
+    {
+        static const char hosts[] = "10.1.2.3\tCanon.example  alias \t# note\n10.1.2.3 later\n10.1.2.4 solo";
+        uint8_t h[4] = {0, 0, 0, 0};
+        const char *names = 0;
+        size_t k = hosts_find_names(hosts, sizeof(hosts) - 1, "ALIAS", h, &names);
+        assert(k == 20 && memcmp(names, "Canon.example  alias", 20) == 0 && h[3] == 3);
+        k = hosts_find_names(hosts, sizeof(hosts) - 1, "later", h, &names);
+        assert(k == 5 && memcmp(names, "later", 5) == 0);
+        k = hosts_find_names(hosts, sizeof(hosts) - 1, "solo", h, &names);
+        assert(k == 4 && memcmp(names, "solo", 4) == 0 && h[3] == 4);
+        names = 0;
+        assert(hosts_find_names(hosts, sizeof(hosts) - 1, "none", h, &names) == 0 && names == 0);
+    }
+
+    /* Reverse: the first matching line's first name (glibc getnameinfo with /etc/hosts, measured). */
+    {
+        static const char hosts[] =
+            "127.0.0.1 localhost\n# 10.5.0.4 commented\n10.5.0.4\n 10.5.0.4\tFirst.example  alias\n10.5.0.4 second\n"
+            "10.05.0.9 bad\n10.5.0.9 nine # note\n10.5.0.10 last";
+        const char *n = 0;
+        size_t k = hosts_reverse(hosts, sizeof(hosts) - 1, (const uint8_t[]){10, 5, 0, 4}, &n);
+        assert(k == 13 && memcmp(n, "First.example", 13) == 0);
+        k = hosts_reverse(hosts, sizeof(hosts) - 1, (const uint8_t[]){10, 5, 0, 9}, &n);
+        assert(k == 4 && memcmp(n, "nine", 4) == 0);
+        k = hosts_reverse(hosts, sizeof(hosts) - 1, (const uint8_t[]){10, 5, 0, 10}, &n);
+        assert(k == 4 && memcmp(n, "last", 4) == 0);
+        k = hosts_reverse(hosts, sizeof(hosts) - 1, (const uint8_t[]){127, 0, 0, 1}, &n);
+        assert(k == 9 && memcmp(n, "localhost", 9) == 0);
+        n = 0;
+        assert(hosts_reverse(hosts, sizeof(hosts) - 1, (const uint8_t[]){10, 5, 0, 7}, &n) == 0 && n == 0);
+        assert(hosts_reverse(hosts, 0, (const uint8_t[]){10, 5, 0, 4}, &n) == 0);
+    }
+
     /* A NULL name or output never reaches the kernel: the wrapper refuses it first with EINVAL. */
     moqi_test_last_nr = 0;
     assert(gethostbyname_ipv4((const char *)0, ip) == -22);

@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello502`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello505`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -492,6 +492,9 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello495 | net.ipv4.ip_local_reserved_ports：写入并读回 52000,52002-52004，保留端口仍可显式 bind（B）；限制自动范围为 52000–52010 后 UDP/TCP 都分到未保留端口（C、D）；倒置范围和 65536 为 EINVAL 且不改值（E）；换行清空（F），最后恢复两个 sysctl（G） |
 | hello496 | TCP ICMP 差错的 IP_MINTTL / IPV6_MINHOPCOUNT：阈值 2、连接保持 SYN_SENT 时，低于阈值的 host-unreachable 被忽略，达到阈值才报告 EHOSTUNREACH；IPv4 改变被引用报文的 TTL（A），IPv6 改变 ICMPv6 外层 hop limit（B），与 Linux 两条错误路径的实际数据来源一致 |
 | hello498 | clone 的 CLONE_SIGHAND / CLONE_FS：不带 CLONE_VM 的 CLONE_SIGHAND、不带 CLONE_SIGHAND 的 CLONE_THREAD 为 EINVAL（A）；CLONE_VM\|FS\|FILES\|SIGHAND\|THREAD 线程看到创建者之后的 chdir 和 sigaction（B），创建者也看到线程的修改（C） |
+| hello505 | /etc/hosts 命中时返回规范名：写入测试用 /etc/hosts（A）；`gethostbyname` 查别名得到该行第一个名字作 `h_name`、其余名字作 `h_aliases`（B）；换大小写查规范名结果相同（C）；只有一个名字的行没有别名（D）；`getaddrinfo` 的 `AI_CANONNAME` 给出第一个名字（E）；字面量的 `h_name` 是它自己（F）；清理（G） |
+| hello504 | `getnameinfo` 经 /etc/hosts 反查：写入测试用 /etc/hosts（A）；地址的首个匹配行给出它的第一个名字，`NI_NAMEREQD` 下也成功（B）；`NI_NUMERICHOST` 仍为数字，缓冲区比名字短一字节为 `EAI_OVERFLOW`（C）；文件里没有的地址是数字、`NI_NAMEREQD` 下 `EAI_NONAME`（D）；127.0.0.1 是 localhost（E）；删除文件后恢复数字（F） |
+| hello503 | moqi_libc 解析先查 /etc/hosts：写入测试用 /etc/hosts（A）；`gethostbyname` 解析首个匹配行的任一名字、大小写不敏感（B）；`getaddrinfo` 同样走 /etc/hosts（C）；localhost 仍可解析（D）；只有 IPv6 地址的行和未知名字不被当作 IPv4 结果（E）；清理（F） |
 | hello502 | net.ipv4.tcp_notsent_lowat：默认 4294967295（A）；-1、2^32、非数字为 EINVAL 且不改值（B）；写 1024（C）；没设 TCP_NOTSENT_LOWAT 的客户端按 sysctl 停止排队、无 POLLOUT（D）；套接字自己的值优先（E）；恢复（F） |
 | hello501 | 写 `/proc/<pid>/comm` 改名：写 /proc/self/comm 后 PR_GET_NAME 与读回都变（A）；超过 15 字节的写返回全长、名字截成 15 字节（B）；写子进程的 comm 为 EINVAL、名字不变（C） |
 | hello500 | raw 套接字的组播成员资格：IPv6 加入 lo 为 0、重复 EADDRINUSE、不存在的接口 ENODEV、退出为 0、再退出 EADDRNOTAVAIL、非组播地址 EINVAL（A）；IPv4 对应各项（B） |

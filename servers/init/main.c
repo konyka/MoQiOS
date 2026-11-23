@@ -116,6 +116,7 @@ int main(int argc, char **argv, char **envp) {
     printf("init (pid %ld) started\n", getpid());
     print("Hello from init!\n");
 
+
     /* hello2: the only child reaped with a status pointer, and the only
      * one that prints "child exited" instead of "hello2 done". */
     int status;
@@ -619,6 +620,9 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello500"); /* multicast membership on raw sockets */
     run_test("hello501"); /* writable /proc/<pid>/comm */
     run_test("hello502"); /* net.ipv4.tcp_notsent_lowat */
+    run_test("hello503"); /* /etc/hosts before the resolver */
+    run_test("hello504"); /* getnameinfo names addresses from /etc/hosts */
+    run_test("hello505"); /* canonical names and aliases from /etc/hosts */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

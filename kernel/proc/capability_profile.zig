@@ -167,6 +167,10 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // Proxy ARP test: CAP_NET_ADMIN to set and remove proxy entries.
         return .{ .uid = DEFAULT_UID, .gid = DEFAULT_GID, .caps = .{ .cap_net_admin = true }, .initial_init = false };
     }
+    if (std.mem.eql(u8, name, "hello503") or std.mem.eql(u8, name, "hello504") or std.mem.eql(u8, name, "hello505")) {
+        // Root creates /etc/hosts (the root directory is not writable by the default user).
+        return .{ .uid = 0, .gid = 0, .caps = NO_CAPS, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello481")) {
         // fs.pipe-max-size: root opens the sysctl for writing (mode 0644), without CAP_SYS_RESOURCE so the limit applies to it.
         return .{ .uid = 0, .gid = 0, .caps = NO_CAPS, .initial_init = false };
