@@ -12066,3 +12066,9 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：hello500 先在 Linux 网络命名空间通过：IPv6 加入 lo 0、重复 EADDRINUSE、不存在的接口 ENODEV、退出 0、再退出 EADDRNOTAVAIL、非组播 EINVAL；IPv4 同理。（宿主机对照最初用了接口 0，在只有 lo 的命名空间里 Linux 返回 ENODEV 而 MoQiOS 有网卡会成功；改用不存在的接口 99 后两边语义一致。）未实现目标机 A/B 全部 ENOPROTOOPT。
 - 实现：`raw_icmp.Socket` 增加 `mc6`/`mc4` 成员表，`mcMembership6`/`mcMembership4` 在 raw_lock 内调用 `mcast_policy.join/drop/join4/drop4`；`setMembership`/`setMembership4` 对 raw 套接字分派到这两个函数。未绑定地址的 raw 套接字照旧收下所有组播（与 Linux 相同）；Linux 还让绑在单播地址上的套接字经 `inet6_mc_check`（成员资格或 IPV6_MULTICAST_ALL）收组播，这一分支尚未接入投递路径，已在文档中注明。
 - 验证：Linux 对照与目标机 A/B 全绿；hello362 的源码断言随新规则更新；host 全量、`zig build` 通过；SMP=2 完整 smoke 中 UDP 组播 hello360–369 与 hello495–500 均 PASS，到达 shell、退出码 0。
+
+## 记录：`9685e21` 的 CI 失败是 hello174 C 的已知偶发项
+
+- 现象：GitHub CI run 45097930044（`9685e21`）的 smoke-qemu SMP=2 失败，唯一的失败是 `hello174: FAIL C: reading drains everything that was accepted within 10 s, and the window reopens`；host-tests、smoke-cross-arch 通过。现场：`drain_got=70128`、`drain_total_plus_1=81919`、`drain_elapsed_ms=10008`、`drain_stalled_for_ms=9987`，与上文 `07ab4f0` 和本地复现的形状相同（读取在约第 1 秒后不再增加）。
+- 判断依据：`9685e21` 相对 `6e243a2` 只改了 `docs/kernel-subsystems.md` 的 3 行（`git diff --stat 6e243a2 9685e21`），内核与测试字节相同，而 `6e243a2` 的 CI（run 45097482740）三项全部通过。所以这不是本轮改动引入的回归，而是上文多次记录、根因仍未查清的 hello174 C 段停滞。
+- 处理：没有放宽断言，也没有凭推测修改 TCP 窗口或节拍逻辑；当前令牌无权重跑该 CI（`gh run rerun` 返回 "Resource not accessible by personal access token"），改以后续提交的 CI 作为同一份代码的复核。根因调查仍是开放项。
