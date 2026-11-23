@@ -554,6 +554,26 @@ int main(void) {
         assert(h && h->h_addrtype == AF_INET && h->h_length == 4 && (unsigned char)h->h_addr_list[0][3] == 1 && h->h_addr_list[1] == 0);
     }
 
+    /* /etc/resolv.conf nameserver lines (glibc res_init, measured): the keyword at the start of the line and in lower case, then a
+     * blank or tab and a dotted IPv4 address, optionally followed by blanks and anything; at most 3, in file order. '#' and ';'
+     * lines, a leading blank, "addr;x", a CR before the newline, IPv6 and invalid addresses are not servers here. */
+    {
+        uint8_t ns[3][4];
+        static const char conf[] =
+            "# comment\n; also\n  nameserver 1.1.1.1\nNameServer 2.2.2.2\nnameserver 300.1.1.1\nnameserver 7.7.7.7x\nnameserver ::1\n"
+            "nameserver 10.0.2.3\nnameserver\t10.0.2.4 # trailing\nnameserver 10.0.2.5;x\nnameserver 10.0.2.6\r\noptions ndots:2\n"
+            "nameserver 10.0.2.7\nnameserver 10.0.2.8\n";
+        size_t k = resolv_conf_servers(conf, sizeof conf - 1, ns, 3);
+        assert(k == 3);
+        assert(ns[0][0] == 10 && ns[0][3] == 3 && ns[1][3] == 4 && ns[2][3] == 7);
+        assert(resolv_conf_servers(conf, sizeof conf - 1, ns, 1) == 1 && ns[0][3] == 3);
+        assert(resolv_conf_servers("", 0, ns, 3) == 0);
+        assert(resolv_conf_servers("nameserver 10.9.9.9", 19, ns, 3) == 1 && ns[0][3] == 9); /* no final newline */
+        /* The 0.0.0.0, broadcast and multicast addresses the kernel refuses are not servers either. */
+        static const char odd[] = "nameserver 0.0.0.0\nnameserver 255.255.255.255\nnameserver 224.0.0.251\nnameserver 10.1.1.1\n";
+        assert(resolv_conf_servers(odd, sizeof odd - 1, ns, 3) == 1 && ns[0][3] == 1);
+    }
+
     /* A NULL name or output never reaches the kernel: the wrapper refuses it first with EINVAL. */
     moqi_test_last_nr = 0;
     assert(gethostbyname_ipv4((const char *)0, ip) == -22);

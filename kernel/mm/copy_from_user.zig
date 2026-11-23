@@ -45,7 +45,10 @@ fn userPageMapped(root: u64, page: u64) bool {
 
 /// Same admission for kernel-write destinations: the swap entry's preserved
 /// writable (bit 2) or preserved COW (bit 3) means the fault+swap-in retry
-/// can complete the write; neither set means genuinely read-only.
+/// can complete the write; neither set means genuinely read-only. A page with
+/// no entry yet (a stack page below what the process has used) is faulted in
+/// first, as Linux's copy_to_user would through its fault: a kernel-mode store
+/// has no demand path of its own.
 fn userPageWritable(root: u64, page: u64) bool {
     if (paging.isUserWritable(root, page)) return true;
     if (comptime builtin.cpu.arch == .x86_64) {
@@ -53,8 +56,18 @@ fn userPageWritable(root: u64, page: u64) bool {
             const swap = @import("swap.zig");
             if (swap.isSwapEntry(raw)) return (raw & 0xC) != 0;
         }
+        if (prefaultForKernelWrite(root, page)) return paging.isUserWritable(root, page);
     }
     return false;
+}
+
+/// Fault in one not-present page of the current task's own address space the way a user access would (stack growth, file
+/// backing), so a kernel write into it can go ahead. Only a page with no entry at all: a swap entry or a PROT_NONE reservation is
+/// a live non-present entry and keeps its own handling, and the demand path refuses holes, the stack floor and RLIMIT_STACK.
+fn prefaultForKernelWrite(root: u64, page: u64) bool {
+    if (root != activeRoot()) return false;
+    if (paging.getPageEntryRaw(root, page)) |raw| if (raw != 0) return false;
+    return @import("../arch/x86_64/idt.zig").prefaultUserPage(page);
 }
 
 /// Verify every page in [addr, addr+len) is present and user-accessible in the

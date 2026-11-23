@@ -2609,6 +2609,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         495 => { // dns_resolve(name, out4) — hostname to IPv4 through the kernel resolver
             frame.rax = @bitCast(syscallDnsResolve(frame.rdi, frame.rsi));
         },
+        506 => { // dns_resolve_via(name, out4, server4) — the same through a caller-named nameserver (/etc/resolv.conf)
+            frame.rax = @bitCast(syscallDnsResolveVia(frame.rdi, frame.rsi, frame.rdx));
+        },
         494 => { // pselect6(nfds, readfds, writefds, exceptfds, timespec, {sigmask, size})
             frame.rax = @bitCast(select_mod.pselect6(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
             checkSignalsOnSyscallReturn(frame);
@@ -6621,6 +6624,33 @@ fn syscallDnsResolve(name_ptr: u64, out_ptr: u64) i64 {
         .invalid => return -22, // EINVAL
     }
     const ip = @import("../../net/dns.zig").resolve(hp.stripTrailingDot(name));
+    if (ip[0] == 0 and ip[1] == 0 and ip[2] == 0 and ip[3] == 0) return -2; // ENOENT: did not resolve
+    if (copy.copyToUser(@ptrFromInt(out_ptr), &ip, 4) != 4) return -14;
+    return 0;
+}
+
+/// dns_resolve_via(name, out4, server4): dns_resolve through `server4` (4 bytes, network order), a nameserver the caller read
+/// from /etc/resolv.conf. EINVAL for a server that is not unicast IPv4; everything else as dns_resolve.
+fn syscallDnsResolveVia(name_ptr: u64, out_ptr: u64, server_ptr: u64) i64 {
+    const copy = @import("../../mm/copy_from_user.zig");
+    const hp = @import("../../net/hostname_policy.zig");
+    const dp = @import("../../net/dns_policy.zig");
+    if (!copy.validateUserBufferWritable(out_ptr, 4)) return -14; // EFAULT, before any network wait
+    var server: [4]u8 = undefined;
+    if (copy.copyFromUser(&server, @ptrFromInt(server_ptr), 4) != 4) return -14;
+    if (!dp.serverUsable(server)) return -22;
+    var buf: [256]u8 = undefined;
+    const name = switch (userPathResult(name_ptr, &buf)) {
+        .ok => |n| n,
+        .err => |e| return e,
+    };
+    switch (hp.check(name)) {
+        .ok => {},
+        .empty => return -2, // ENOENT
+        .too_long => return -36, // ENAMETOOLONG
+        .invalid => return -22, // EINVAL
+    }
+    const ip = @import("../../net/dns.zig").resolveVia(hp.stripTrailingDot(name), server);
     if (ip[0] == 0 and ip[1] == 0 and ip[2] == 0 and ip[3] == 0) return -2; // ENOENT: did not resolve
     if (copy.copyToUser(@ptrFromInt(out_ptr), &ip, 4) != 4) return -14;
     return 0;

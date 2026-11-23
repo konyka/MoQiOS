@@ -19,6 +19,26 @@ pub fn acceptResponse(
     return resp_id == query_id;
 }
 
+/// What an accepted reply (right server, port and id) means for the query: it carries answers to look through, it settles that
+/// there is no address (an error RCODE such as NXDOMAIN, SERVFAIL or REFUSED, or NOERROR with no answers), or it is not a response.
+pub const Verdict = enum { answer, no_address, ignore };
+
+/// `flags` is the reply's second header word, `ancount` its answer count (RFC 1035 4.1.1).
+pub fn verdict(flags: u16, ancount: u16) Verdict {
+    if ((flags & 0x8000) == 0) return .ignore;
+    if ((flags & 0x000F) != 0) return .no_address;
+    return if (ancount == 0) .no_address else .answer;
+}
+
+/// Whether a caller-named nameserver (dns_resolve_via, from /etc/resolv.conf) is an address a query can go to: unicast IPv4.
+/// 0.0.0.0, the limited broadcast and multicast (224/4) are refused.
+pub fn serverUsable(ip: [4]u8) bool {
+    if (ip[0] == 0 and ip[1] == 0 and ip[2] == 0 and ip[3] == 0) return false;
+    if (ip[0] == 255 and ip[1] == 255 and ip[2] == 255 and ip[3] == 255) return false;
+    if (ip[0] >= 224 and ip[0] <= 239) return false;
+    return true;
+}
+
 /// How long one DNS query may wait for its server (in nanoseconds of real time).
 pub const QUERY_TIMEOUT_NS: u64 = 2_000_000_000;
 

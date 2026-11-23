@@ -631,6 +631,8 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello511"); /* if_nametoindex, if_indextoname and interface-name scopes */
     run_test("hello512"); /* /proc/net/if_inet6 and AI_ADDRCONFIG */
     run_test("hello513"); /* if_nameindex and if_freenameindex */
+    run_test("hello514"); /* /etc/resolv.conf nameservers */
+    run_test("hello515"); /* system calls writing into untouched stack pages */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

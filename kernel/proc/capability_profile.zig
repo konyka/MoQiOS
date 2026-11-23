@@ -171,6 +171,10 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // Root creates /etc/hosts (the root directory is not writable by the default user).
         return .{ .uid = 0, .gid = 0, .caps = NO_CAPS, .initial_init = false };
     }
+    if (std.mem.eql(u8, name, "hello514")) {
+        // Root creates /etc/resolv.conf, and its stand-in DNS server binds 127.0.0.1:53 (a privileged port).
+        return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_bind = true }, .initial_init = false };
+    }
     if (std.mem.eql(u8, name, "hello481")) {
         // fs.pipe-max-size: root opens the sysctl for writing (mode 0644), without CAP_SYS_RESOURCE so the limit applies to it.
         return .{ .uid = 0, .gid = 0, .caps = NO_CAPS, .initial_init = false };

@@ -10,9 +10,85 @@ extern long moqi_test_syscall2(long nr, long a1, long a2);
 #define NETDB_SYSCALL2(nr, a1, a2) syscall2((nr), (a1), (a2))
 #endif
 
+/* The socket syscalls only exist on the target; the host unit test links a recording stub instead. */
+#ifdef MOQI_HOST_TEST_SYSCALL
+extern long moqi_test_syscall3(long nr, long a1, long a2, long a3);
+#define NETDB_SYSCALL3(nr, a1, a2, a3) moqi_test_syscall3((nr), (a1), (a2), (a3))
+#define NETDB_SYSCALL1(nr, a1) moqi_test_syscall3((nr), (a1), 0, 0)
+#else
+#define NETDB_SYSCALL3(nr, a1, a2, a3) syscall3((nr), (a1), (a2), (a3))
+#define NETDB_SYSCALL1(nr, a1) syscall1((nr), (a1))
+#endif
+
+static int resolv_blank(char c) { return c == ' ' || c == '\t'; }
+
+size_t resolv_conf_servers(const char *text, size_t len, uint8_t out[][4], size_t cap) {
+    static const char kw[] = "nameserver";
+    const size_t kl = sizeof kw - 1;
+    size_t count = 0, pos = 0;
+    while (text && pos < len && count < cap) {
+        size_t end = pos;
+        while (end < len && text[end] != '\n') end++;
+        /* The keyword must start the line, in lower case, and be followed by a blank. */
+        if (end - pos > kl && memcmp(text + pos, kw, kl) == 0 && resolv_blank(text[pos + kl])) {
+            size_t i = pos + kl;
+            while (i < end && resolv_blank(text[i])) i++;
+            size_t a = i;
+            while (i < end && !resolv_blank(text[i])) i++;
+            char addr[16];
+            uint8_t ip[4];
+            if (i > a && i - a < sizeof addr) {
+                memcpy(addr, text + a, i - a);
+                addr[i - a] = 0;
+                int unicast = 1;
+                if (ipv4_from_text(addr, ip)) {
+                    if ((ip[0] | ip[1] | ip[2] | ip[3]) == 0) unicast = 0;
+                    if ((ip[0] & ip[1] & ip[2] & ip[3]) == 255) unicast = 0;
+                    if (ip[0] >= 224 && ip[0] <= 239) unicast = 0;
+                    if (unicast) memcpy(out[count++], ip, 4);
+                }
+            }
+        }
+        pos = end + 1;
+    }
+    return count;
+}
+
+#define RESOLV_MAXNS 3
+
+#ifdef MOQI_HOST_TEST_SYSCALL
+static size_t resolv_conf_read(char *buf, size_t cap) { (void)buf; (void)cap; return 0; }
+#else
+static size_t resolv_conf_read(char *buf, size_t cap) {
+    long fd = syscall3(SYS_open, (long)"/etc/resolv.conf", 0 /* O_RDONLY */, 0);
+    if (fd < 0) return 0;
+    long n = 0;
+    while (n < (long)cap) {
+        long r = syscall3(SYS_read, fd, (long)(buf + n), (long)cap - n);
+        if (r <= 0) break;
+        n += r;
+    }
+    syscall1(SYS_close, fd);
+    return (size_t)n;
+}
+#endif
+
 long gethostbyname_ipv4(const char *name, uint8_t out[4]) {
     if (!name || !out) return -22; /* EINVAL */
-    return NETDB_SYSCALL2(SYS_dns_resolve, (long)name, (long)out);
+    /* The nameservers of /etc/resolv.conf, tried in order until one answers (glibc moves to the next on a timeout); without a
+     * usable line the kernel's own server (DHCP's) is asked. */
+    char conf[2048];
+    uint8_t ns[RESOLV_MAXNS][4];
+    size_t nns = resolv_conf_servers(conf, resolv_conf_read(conf, sizeof conf), ns, RESOLV_MAXNS);
+    if (nns == 0) return NETDB_SYSCALL2(SYS_dns_resolve, (long)name, (long)out);
+    long r = -2;
+    for (size_t i = 0; i < nns; i++) {
+        r = NETDB_SYSCALL3(SYS_dns_resolve_via, (long)name, (long)out, (long)ns[i]);
+        /* A malformed name is the same at every server. The kernel reports "no such name" and "no reply" both as ENOENT
+         * (a NXDOMAIN reply returns at once, a silent server after the timeout), so the next server is tried either way. */
+        if (r == 0 || r == -22 || r == -36 || r == -14) break;
+    }
+    return r;
 }
 
 long ipv4_to_text(const uint8_t addr[4], char *buf, size_t buf_len) {
@@ -418,15 +494,6 @@ long resolve_ipv4_sockaddr(const char *host, uint16_t port, uint8_t out[16]) {
     return 0;
 }
 
-/* The socket syscalls only exist on the target; the host unit test links a recording stub instead. */
-#ifdef MOQI_HOST_TEST_SYSCALL
-extern long moqi_test_syscall3(long nr, long a1, long a2, long a3);
-#define NETDB_SYSCALL3(nr, a1, a2, a3) moqi_test_syscall3((nr), (a1), (a2), (a3))
-#define NETDB_SYSCALL1(nr, a1) moqi_test_syscall3((nr), (a1), 0, 0)
-#else
-#define NETDB_SYSCALL3(nr, a1, a2, a3) syscall3((nr), (a1), (a2), (a3))
-#define NETDB_SYSCALL1(nr, a1) syscall1((nr), (a1))
-#endif
 
 /* ---- interface names ---------------------------------------------------------------------------------------- */
 

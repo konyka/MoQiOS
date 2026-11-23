@@ -18,6 +18,13 @@
  * `out` is -EINVAL and never reaches the kernel. */
 long gethostbyname_ipv4(const char *name, uint8_t out[4]);
 
+/* The nameservers of an /etc/resolv.conf text (`len` bytes), as glibc's res_init takes them (measured): "nameserver" at the start of
+ * a line, in lower case, a blank or tab, a dotted IPv4 address, then nothing or blanks and anything; '#' and ';' lines, a leading
+ * blank, a CR before the newline and IPv6 addresses do not count, nor 0.0.0.0, 255.255.255.255 or multicast (the kernel refuses
+ * those). Up to `cap` servers in file order into `out`; returns how many. gethostbyname_ipv4 asks them in order through
+ * dns_resolve_via (506) and, when the file has none, falls back to the kernel's own server (DHCP's) through dns_resolve. */
+size_t resolv_conf_servers(const char *text, size_t len, uint8_t out[][4], size_t cap);
+
 /* Format `addr` as "a.b.c.d" into `buf` (NUL-terminated). Returns the text length (without the NUL), or -ERANGE
  * (-34) when `buf` cannot hold the text plus its NUL, in which case `buf` is not written. */
 long ipv4_to_text(const uint8_t addr[4], char *buf, size_t buf_len);

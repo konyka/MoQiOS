@@ -2024,6 +2024,60 @@ test "dns_resolve: hostname syntax, error codes, and the order of checks" {
     try std.testing.expect(std.mem.indexOf(u8, kt.moqi_syscalls_header, "#define SYS_dns_resolve 495") != null);
 }
 
+test "dns: a reply that answers the query ends the wait, also when it says there is no such name (hello514)" {
+    const dp = kt.dns_policy;
+    // RFC 1035 4.1.1: QR (0x8000) marks a response; RCODE (low 4 bits) 0 is NOERROR, 3 NXDOMAIN (the name does not exist), 2 SERVFAIL,
+    // 5 REFUSED. A NOERROR reply with no address (NODATA) and an error reply both answer the query: waiting the remaining seconds for
+    // another reply only delays the same "no address" result (glibc returns at once). A packet that is not a response is ignored.
+    try std.testing.expectEqual(dp.Verdict.answer, dp.verdict(0x8180, 1));
+    try std.testing.expectEqual(dp.Verdict.no_address, dp.verdict(0x8180, 0));
+    try std.testing.expectEqual(dp.Verdict.no_address, dp.verdict(0x8183, 0)); // NXDOMAIN
+    try std.testing.expectEqual(dp.Verdict.no_address, dp.verdict(0x8182, 0)); // SERVFAIL
+    try std.testing.expectEqual(dp.Verdict.no_address, dp.verdict(0x8185, 0)); // REFUSED
+    try std.testing.expectEqual(dp.Verdict.no_address, dp.verdict(0x8183, 1)); // an error never carries a usable answer
+    try std.testing.expectEqual(dp.Verdict.ignore, dp.verdict(0x0100, 1)); // a query, not a response
+    // The wait loop stops on either verdict.
+    const dns = kt.dns_source;
+    try std.testing.expect(std.mem.indexOf(u8, dns, "if (dns_policy.verdict(bo.readU16BeAt(&buf, 2), bo.readU16BeAt(&buf, 6)) == .no_address) return .{ 0, 0, 0, 0 };") != null);
+}
+
+test "dns_resolve_via: a caller-chosen nameserver, and the shared cache stays out of it (hello514)" {
+    const dp = kt.dns_policy;
+    // Which servers a caller may name: a unicast IPv4 address. 0.0.0.0, the limited broadcast and multicast are not servers.
+    try std.testing.expect(dp.serverUsable(.{ 10, 0, 2, 3 }));
+    try std.testing.expect(dp.serverUsable(.{ 127, 0, 0, 1 }));
+    try std.testing.expect(dp.serverUsable(.{ 8, 8, 8, 8 }));
+    try std.testing.expect(!dp.serverUsable(.{ 0, 0, 0, 0 }));
+    try std.testing.expect(!dp.serverUsable(.{ 255, 255, 255, 255 }));
+    try std.testing.expect(!dp.serverUsable(.{ 224, 0, 0, 251 }));
+    try std.testing.expect(!dp.serverUsable(.{ 239, 1, 2, 3 }));
+
+    // The system call checks the output, the server and the name before any network wait, like dns_resolve; it resolves through
+    // dns.resolveVia, which answers the static table and literals itself and otherwise asks only `server`, never the shared
+    // cache: an answer from a server the caller picked must not be served to other processes, and a cached answer must not be
+    // mistaken for one from `server`.
+    const src = kt.syscall_entry_source;
+    const f = std.mem.indexOf(u8, src, "fn syscallDnsResolveVia(").?;
+    const body = src[f..];
+    const out_ok = std.mem.indexOf(u8, body, "if (!copy.validateUserBufferWritable(out_ptr, 4)) return -14;").?;
+    const srv_in = std.mem.indexOf(u8, body, "if (copy.copyFromUser(&server, @ptrFromInt(server_ptr), 4) != 4) return -14;").?;
+    const srv_ok = std.mem.indexOf(u8, body, "if (!dp.serverUsable(server)) return -22;").?;
+    const name_in = std.mem.indexOf(u8, body, "const name = switch (userPathResult(name_ptr, &buf)) {").?;
+    const res = std.mem.indexOf(u8, body, "@import(\"../../net/dns.zig\").resolveVia(hp.stripTrailingDot(name), server)").?;
+    try std.testing.expect(out_ok < srv_in and srv_in < srv_ok and srv_ok < name_in and name_in < res);
+    try std.testing.expect(std.mem.indexOf(u8, src, "506 => { // dns_resolve_via(name, out4, server4)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.moqi_syscalls_header, "#define SYS_dns_resolve_via 506") != null);
+
+    const dns = kt.dns_source;
+    const rv = std.mem.indexOf(u8, dns, "pub fn resolveVia(").?;
+    const rv_end = std.mem.indexOfPos(u8, dns, rv, "\n}\n").?;
+    const rv_body = dns[rv..rv_end];
+    try std.testing.expect(std.mem.indexOf(u8, rv_body, "lookupCache(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rv_body, "return queryDnsCache(hostname, server, false);") != null);
+    // queryDns keeps caching for the default path only.
+    try std.testing.expect(std.mem.indexOf(u8, dns, "if (cache_result) addToCache(hostname, result, 300);") != null);
+}
+
 test "setitimer: Linux validation, saturating arithmetic, and the check order" {
     const ip = kt.itimer_policy;
     const max: i64 = std.math.maxInt(i64);
@@ -2066,6 +2120,29 @@ test "setitimer: Linux validation, saturating arithmetic, and the check order" {
     // The scheduler re-arms a periodic timer with a saturating add: a huge interval used to panic the tick.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.sched_source, "now_ns +| t.itimer_real_interval"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, kt.sched_source, "now_ns + t.itimer_real_interval"));
+}
+
+test "a kernel write into a not-yet-faulted user stack page faults it in first (hello515)" {
+    // The stack grows by demand faults, and a kernel-mode store has no demand path, so the writable prevalidation of every copy
+    // into user memory (read, getcwd, recvfrom, ...) refused a stack page the process had not touched yet with EFAULT; Linux faults
+    // it in. The prevalidation now asks the arch layer to fault in a not-present page the way a user access would (the same
+    // prefault signal delivery uses), then checks it again; a PROT_NONE reservation, an unmapped hole or a read-only page is
+    // still refused, because the demand path refuses them.
+    const c = kt.copy_from_user_source;
+    const w = std.mem.indexOf(u8, c, "fn userPageWritable(root: u64, page: u64) bool {").?;
+    const w_end = std.mem.indexOfPos(u8, c, w, "\n}\n").?;
+    const body = c[w..w_end];
+    const pre = std.mem.indexOf(u8, body, "if (prefaultForKernelWrite(root, page)) return paging.isUserWritable(root, page);").?;
+    const first = std.mem.indexOf(u8, body, "if (paging.isUserWritable(root, page)) return true;").?;
+    try std.testing.expect(first < pre);
+    const pf = std.mem.indexOf(u8, c, "fn prefaultForKernelWrite(root: u64, page: u64) bool {").?;
+    const pf_end = std.mem.indexOfPos(u8, c, pf, "\n}\n").?;
+    const pf_body = c[pf..pf_end];
+    // Only the current task's own address space, only a page with no entry at all (a swap entry or a PROT_NONE reservation is a
+    // live non-present entry and keeps its own handling), and only on x86_64, where the demand path lives.
+    try std.testing.expect(std.mem.indexOf(u8, pf_body, "if (root != activeRoot()) return false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf_body, "if (paging.getPageEntryRaw(root, page)) |raw| if (raw != 0) return false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf_body, "return @import(\"../arch/x86_64/idt.zig\").prefaultUserPage(page);") != null);
 }
 
 test "hostile user pointers cannot panic the copy helpers, and huge ranges skip absent page tables" {

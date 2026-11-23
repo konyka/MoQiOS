@@ -97,8 +97,23 @@ pub fn getDnsServer() [4]u8 {
     return .{ 8, 8, 8, 8 }; // Default: Google DNS
 }
 
-/// Send a DNS query and wait for response.
+/// Resolve `hostname` through `server` (a nameserver from /etc/resolv.conf, dns_resolve_via). The static table and dotted
+/// literals still answer first, as in resolve(); the shared cache is neither read nor written: an answer from a server one
+/// caller chose must not reach other processes, and a cached answer would not have come from `server`.
+pub fn resolveVia(hostname: []const u8, server: [4]u8) [4]u8 {
+    if (hostname.len == 0 or hostname.len > 63) return .{ 0, 0, 0, 0 };
+    if (@import("static_hosts.zig").lookup(hostname)) |ip| return ip;
+    if (isIpV4(hostname)) return parseIpV4(hostname);
+    return queryDnsCache(hostname, server, false);
+}
+
+/// Send a DNS query and wait for response; the answer goes into the shared cache.
 fn queryDns(hostname: []const u8, dns_server: [4]u8) [4]u8 {
+    return queryDnsCache(hostname, dns_server, true);
+}
+
+/// Send a DNS query and wait for response, caching the answer only when `cache_result`.
+fn queryDnsCache(hostname: []const u8, dns_server: [4]u8, cache_result: bool) [4]u8 {
     var pkt: [512]u8 = @splat(0);
     var offset: usize = 0;
 
@@ -155,11 +170,14 @@ fn queryDns(hostname: []const u8, dns_server: [4]u8) [4]u8 {
         var src_port: u16 = 0;
 
         const n = udp.recvFrom(12345, &buf, @intCast(buf.len), &src_ip, &src_port);
-        if (n >= 2 and dns_policy.acceptResponse(src_ip, src_port, dns_server, bo.readU16BeAt(&buf, 0), query_id)) {
+        if (n >= 12 and dns_policy.acceptResponse(src_ip, src_port, dns_server, bo.readU16BeAt(&buf, 0), query_id)) {
+            // An error reply (NXDOMAIN, SERVFAIL, ...) or one with no answers settles the query: no address, without waiting
+            // out the timeout for a reply that will not come.
+            if (dns_policy.verdict(bo.readU16BeAt(&buf, 2), bo.readU16BeAt(&buf, 6)) == .no_address) return .{ 0, 0, 0, 0 };
             const result = parseResponse(&buf, @intCast(n), query_id);
             if (result[0] != 0 or result[1] != 0 or result[2] != 0 or result[3] != 0) {
-                // Cache the result
-                addToCache(hostname, result, 300); // Default TTL 5 minutes
+                // Default TTL 5 minutes.
+                if (cache_result) addToCache(hostname, result, 300);
                 return result;
             }
         }

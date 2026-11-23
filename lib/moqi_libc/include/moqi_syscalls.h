@@ -88,6 +88,7 @@
 #define SYS_clock_adjtime 503
 #define SYS_setfsuid    504
 #define SYS_setfsgid    505
+#define SYS_dns_resolve_via 506
 
 /* Processes, identity and terminals */
 #define SYS_pause       34
