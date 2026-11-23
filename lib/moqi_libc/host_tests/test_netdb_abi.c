@@ -222,6 +222,90 @@ int main(void) {
         assert(gethostbyaddr((const void *)0, 4, AF_INET) == 0 && h_errno == HOST_NOT_FOUND);
     }
 
+    /* The reentrant forms (glibc, measured): everything goes into the caller's buffer and *result; the return value is 0, ERANGE
+     * (buffer too small, *h_errnop NETDB_INTERNAL, errno ERANGE) or EAFNOSUPPORT. A miss is 0 with *result NULL; the static
+     * gethostbyname storage and the global h_errno are left alone. */
+    {
+        struct hostent he, *res;
+        char buf[512];
+        int herr;
+        h_errno = 77;
+        struct hostent *stat = gethostbyname("5.6.7.8");
+        h_errno = 77;
+        res = (struct hostent *)1; herr = 12345;
+        assert(gethostbyname_r("1.2.3.4", &he, buf, sizeof buf, &res, &herr) == 0 && res == &he && herr == 0);
+        assert(strcmp(he.h_name, "1.2.3.4") == 0 && he.h_addrtype == AF_INET && he.h_length == 4 && he.h_aliases[0] == 0);
+        assert((uint8_t)he.h_addr_list[0][0] == 1 && (uint8_t)he.h_addr_list[0][3] == 4 && he.h_addr_list[1] == 0);
+        assert(he.h_name >= buf && he.h_name < buf + sizeof buf && (char *)he.h_addr_list >= buf && (char *)he.h_addr_list < buf + sizeof buf);
+        assert(h_errno == 77 && stat && (uint8_t)stat->h_addr_list[0][0] == 5); /* the static result is untouched */
+        /* Too small for the literal: ERANGE, NETDB_INTERNAL, errno ERANGE, *result NULL. */
+        res = (struct hostent *)1; herr = 12345; errno = 0;
+        assert(gethostbyname_r("1.2.3.4", &he, buf, 16, &res, &herr) == ERANGE && res == 0 && herr == NETDB_INTERNAL && errno == ERANGE);
+        res = (struct hostent *)1; herr = 12345; errno = 0;
+        assert(gethostbyname_r("1.2.3.4", &he, buf, 0, &res, &herr) == ERANGE && res == 0 && herr == NETDB_INTERNAL);
+        /* gethostbyname2_r: IPv6 literals, family mismatch is a miss, another family is EAFNOSUPPORT with NO_DATA. */
+        res = (struct hostent *)1; herr = 12345;
+        assert(gethostbyname2_r("2001:db8::9", AF_INET6, &he, buf, sizeof buf, &res, &herr) == 0 && res == &he && herr == 0);
+        assert(he.h_addrtype == AF_INET6 && he.h_length == 16 && (uint8_t)he.h_addr_list[0][15] == 9 && he.h_addr_list[1] == 0);
+        res = (struct hostent *)1; herr = 12345;
+        assert(gethostbyname2_r("1.2.3.4", AF_INET6, &he, buf, sizeof buf, &res, &herr) == 0 && res == 0 && herr == HOST_NOT_FOUND);
+        res = (struct hostent *)1; herr = 12345;
+        assert(gethostbyname2_r("2001:db8::9", AF_INET, &he, buf, sizeof buf, &res, &herr) == 0 && res == 0 && herr == HOST_NOT_FOUND);
+        res = (struct hostent *)1; herr = 12345; errno = 0;
+        assert(gethostbyname2_r("x", 1, &he, buf, sizeof buf, &res, &herr) == EAFNOSUPPORT && res == 0 && herr == NO_DATA && errno == EAFNOSUPPORT);
+        /* A name through the kernel resolver: a hit fills the buffer, a miss is 0/NULL/HOST_NOT_FOUND, a timeout TRY_AGAIN. */
+        moqi_test_reply = 0;
+        moqi_test_fill[0] = 10; moqi_test_fill[1] = 0; moqi_test_fill[2] = 2; moqi_test_fill[3] = 2;
+        res = (struct hostent *)1; herr = 12345;
+        assert(gethostbyname_r("gateway", &he, buf, sizeof buf, &res, &herr) == 0 && res == &he && strcmp(he.h_name, "gateway") == 0);
+        assert((uint8_t)he.h_addr_list[0][0] == 10 && (uint8_t)he.h_addr_list[0][3] == 2);
+        moqi_test_reply = -2;
+        res = (struct hostent *)1; herr = 12345;
+        assert(gethostbyname_r("nope.invalid", &he, buf, sizeof buf, &res, &herr) == 0 && res == 0 && herr == HOST_NOT_FOUND);
+        moqi_test_reply = -110;
+        res = (struct hostent *)1; herr = 12345;
+        errno = 0;
+        assert(gethostbyname_r("slow.example", &he, buf, sizeof buf, &res, &herr) == EAGAIN && res == 0 && herr == TRY_AGAIN && errno == EAGAIN);
+        moqi_test_reply = 0;
+        res = (struct hostent *)1; herr = 12345;
+        assert(gethostbyname_r((const char *)0, &he, buf, sizeof buf, &res, &herr) == 0 && res == 0 && herr == HOST_NOT_FOUND);
+        assert(h_errno == 77);
+        /* gethostbyaddr_r: argument errors as in gethostbyaddr, but reported through the return value and *h_errnop. */
+        static const uint8_t addr4[16] = {10, 5, 0, 9};
+        res = (struct hostent *)1; herr = 12345; errno = 0;
+        assert(gethostbyaddr_r(addr4, 3, AF_INET, &he, buf, sizeof buf, &res, &herr) == EAFNOSUPPORT && res == 0 && herr == NETDB_INTERNAL && errno == EAFNOSUPPORT);
+        res = (struct hostent *)1; herr = 12345; errno = 0;
+        assert(gethostbyaddr_r(addr4, 5, AF_INET, &he, buf, sizeof buf, &res, &herr) == 0 && res == 0 && herr == TRY_AGAIN && errno == 0);
+        res = (struct hostent *)1; herr = 12345; errno = 0;
+        assert(gethostbyaddr_r(addr4, 4, 1, &he, buf, sizeof buf, &res, &herr) == EAFNOSUPPORT && res == 0 && herr == NETDB_INTERNAL);
+        res = (struct hostent *)1; herr = 12345;
+        assert(gethostbyaddr_r(addr4, 4, AF_INET, &he, buf, sizeof buf, &res, &herr) == 0 && res == 0 && herr == HOST_NOT_FOUND);
+        res = (struct hostent *)1; herr = 12345; errno = 0;
+        assert(gethostbyaddr_r(addr4, 4, AF_UNSPEC, &he, buf, sizeof buf, &res, &herr) == EAFNOSUPPORT && res == 0 && herr == NETDB_INTERNAL);
+        assert(h_errno == 77);
+    }
+
+    /* Packing a whole line into the caller's buffer: the exact size is what decides ERANGE, and nothing is written past it. */
+    {
+        static const char hosts[] = "10.5.0.9 First.example alias other\n";
+        const char *names = 0;
+        size_t nl = hosts_reverse_names(hosts, sizeof(hosts) - 1, AF_INET, (const uint8_t[]){10, 5, 0, 9}, &names);
+        static const uint8_t a4[4] = {10, 5, 0, 9};
+        const char *addrs[1] = {(const char *)a4};
+        struct hostent he;
+        char buf[256];
+        size_t need = 0;
+        for (size_t cap = 0; cap < sizeof buf; cap++) {
+            memset(buf, 0x5A, sizeof buf);
+            if (hostent_pack(&he, buf, cap, names, nl, AF_INET, addrs, 1) == 0) { need = cap; break; }
+            for (size_t k = cap; k < sizeof buf; k++) assert((unsigned char)buf[k] == 0x5A);
+        }
+        assert(need > 0 && strcmp(he.h_name, "First.example") == 0 && strcmp(he.h_aliases[0], "alias") == 0);
+        assert(strcmp(he.h_aliases[1], "other") == 0 && he.h_aliases[2] == 0 && he.h_addr_list[1] == 0);
+        assert(memcmp(he.h_addr_list[0], a4, 4) == 0 && ((uintptr_t)he.h_aliases % sizeof(char *)) == 0);
+        for (size_t k = need; k < sizeof buf; k++) assert((unsigned char)buf[k] == 0x5A);
+    }
+
     /* gethostbyname2 without /etc/hosts (the host test has no file system): a literal answers only its own family, AF_INET6 has no
      * resolver fallback, another family is NO_DATA; AF_INET resolves through the kernel like gethostbyname (glibc, measured). */
     {

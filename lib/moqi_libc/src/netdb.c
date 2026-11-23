@@ -367,17 +367,17 @@ size_t hosts_reverse6(const char *text, size_t len, const uint8_t want[16], cons
 }
 
 /* The host test links netdb.o without the file system: there /etc/hosts is never read. */
+#define ETC_HOSTS_MAX 8192
 #ifdef MOQI_HOST_TEST_SYSCALL
-static size_t etc_hosts_read(void) { return 0; }
-static char etc_hosts_buf[1];
+static size_t etc_hosts_read_into(char *buf, size_t cap) { (void)buf; (void)cap; return 0; }
 #else
-static char etc_hosts_buf[8192];
-static size_t etc_hosts_read(void) {
+/* Read up to `cap` bytes of /etc/hosts into `buf`; 0 when there is no file. The reentrant lookups pass a buffer of their own. */
+static size_t etc_hosts_read_into(char *buf, size_t cap) {
     long fd = syscall3(SYS_open, (long)"/etc/hosts", 0 /* O_RDONLY */, 0);
     if (fd < 0) return 0;
     long n = 0;
-    while (n < (long)sizeof(etc_hosts_buf)) {
-        long r = syscall3(SYS_read, fd, (long)(etc_hosts_buf + n), (long)sizeof(etc_hosts_buf) - n);
+    while (n < (long)cap) {
+        long r = syscall3(SYS_read, fd, (long)(buf + n), (long)cap - n);
         if (r <= 0) break;
         n += r;
     }
@@ -385,6 +385,8 @@ static size_t etc_hosts_read(void) {
     return (size_t)n;
 }
 #endif
+static char etc_hosts_buf[ETC_HOSTS_MAX];
+static size_t etc_hosts_read(void) { return etc_hosts_read_into(etc_hosts_buf, sizeof etc_hosts_buf); }
 
 /* /etc/hosts first, then the kernel resolver (glibc's "files dns" order). When the file answers and `names` is given, the
  * matching line's names (canonical name first, then aliases, separated by blanks) are copied there NUL-terminated, cut to `cap`;
@@ -448,169 +450,301 @@ long tcp_connect_host(const char *host, uint16_t port) {
 
 /* ---- gethostbyname ------------------------------------------------------------------------------------------ */
 
+#include "../include/errno.h"
+
 int h_errno;
 
 #define HOSTENT_NAME_MAX 256
-
-static struct hostent hostent_result;
-static char hostent_name[HOSTENT_NAME_MAX];
 #define HOSTENT_ADDRS_MAX 16
-static char hostent_addrs[HOSTENT_ADDRS_MAX][16];
 #define HOSTENT_ALIASES_MAX 16
-static char *hostent_aliases[HOSTENT_ALIASES_MAX + 1];
-static char *hostent_addr_list[HOSTENT_ADDRS_MAX + 1];
 
-static void hostent_split_aliases(void) {
-    int naliases = 0;
-    char *p = hostent_name;
+int hostent_pack(struct hostent *he, char *buf, size_t buf_len, const char *names, size_t names_len, int af,
+                 const char *const *addrs, size_t naddrs) {
+    size_t alen = af == AF_INET6 ? 16 : 4;
+    size_t naliases = 0;
+    for (size_t i = 0; i < names_len;) {
+        while (i < names_len && (names[i] == ' ' || names[i] == '\t')) i++;
+        if (i >= names_len) break;
+        naliases++;
+        while (i < names_len && names[i] != ' ' && names[i] != '\t') i++;
+    }
+    if (naliases) naliases--; /* the first name is h_name */
+    size_t lead = (size_t)(-(uintptr_t)buf & (sizeof(char *) - 1));
+    size_t ptrs = (naliases + 1 + naddrs + 1) * sizeof(char *);
+    size_t need = lead + ptrs + naddrs * alen + names_len + 1;
+    if (!buf || need > buf_len) return ERANGE;
+    char **aliases = (char **)(void *)(buf + lead);
+    char **list = aliases + naliases + 1;
+    char *data = (char *)(list + naddrs + 1);
+    for (size_t k = 0; k < naddrs; k++) {
+        memcpy(data, addrs[k], alen);
+        list[k] = data;
+        data += alen;
+    }
+    list[naddrs] = (char *)0;
+    memcpy(data, names, names_len);
+    data[names_len] = 0;
+    /* Split in place: the first field is the name, the others are aliases. */
+    char *p = data;
+    while (*p == ' ' || *p == '\t') p++;
+    char *name = p;
+    size_t a = 0;
     while (*p && *p != ' ' && *p != '\t') p++;
     while (*p) {
         *p++ = 0;
         while (*p == ' ' || *p == '\t') p++;
         if (!*p) break;
-        if (naliases < HOSTENT_ALIASES_MAX) hostent_aliases[naliases++] = p;
+        aliases[a++] = p;
         while (*p && *p != ' ' && *p != '\t') p++;
     }
-    hostent_aliases[naliases] = (char *)0;
+    aliases[a] = (char *)0;
+    he->h_name = name;
+    he->h_aliases = aliases;
+    he->h_addrtype = af;
+    he->h_length = (int)alen;
+    he->h_addr_list = list;
+    return 0;
 }
 
-struct hostent *gethostbyname2(const char *name, int af) {
+/* The answer of a lookup before it is laid out: the names field (canonical name, then aliases) and the addresses. `herr` is
+ * the h_errno value and `rc` the reentrant return value (0, EAFNOSUPPORT or EAGAIN); `names` is NULL on a failure. */
+struct host_answer {
+    const char *names;
+    size_t names_len;
+    char name_store[HOSTENT_NAME_MAX];
+    uint8_t addrs[HOSTENT_ADDRS_MAX][16];
+    size_t naddrs;
+    int af;
+    int herr;
+    int rc;
+};
+
+/* `hosts`/`hosts_cap` is the scratch space for /etc/hosts text: the static functions pass etc_hosts_buf, the reentrant ones a
+ * buffer of their own, so the two never share state. */
+static void lookup_name(const char *name, int af, char *hosts, size_t hosts_cap, struct host_answer *ans) {
+    ans->names = (const char *)0;
+    ans->names_len = 0;
+    ans->naddrs = 0;
+    ans->af = af;
+    ans->rc = 0;
     if (!name) {
-        h_errno = HOST_NOT_FOUND;
-        return (struct hostent *)0;
+        ans->herr = HOST_NOT_FOUND;
+        return;
     }
     if (af != AF_INET && af != AF_INET6) {
-        h_errno = NO_DATA; /* glibc answers another family with NO_DATA (measured) */
-        return (struct hostent *)0;
+        ans->herr = NO_DATA; /* glibc answers another family with NO_DATA (measured) */
+        ans->rc = EAFNOSUPPORT;
+        return;
     }
-    int alen = af == AF_INET6 ? 16 : 4;
-    struct hosts_addr found[HOSTENT_ADDRS_MAX];
-    size_t naddrs = 0;
-    hostent_name[0] = 0;
+    size_t alen = af == AF_INET6 ? 16 : 4;
     uint8_t lit[16];
     int is_v4 = ipv4_from_text(name, lit), is_v6 = !is_v4 && ipv6_from_text(name, lit);
     if (is_v4 || is_v6) {
-        /* A literal answers only its own family. */
+        /* A literal answers only its own family, and is its own name. */
         if ((af == AF_INET) != is_v4) {
-            h_errno = HOST_NOT_FOUND;
-            return (struct hostent *)0;
+            ans->herr = HOST_NOT_FOUND;
+            return;
         }
-        memcpy(found[0].addr, lit, (size_t)alen);
-        naddrs = 1;
+        memcpy(ans->addrs[0], lit, alen);
+        ans->naddrs = 1;
     } else {
         /* Every /etc/hosts line of this family in file order; the names come from the first one. */
-        size_t n = etc_hosts_read();
+        size_t n = etc_hosts_read_into(hosts, hosts_cap);
+        struct hosts_addr found[HOSTENT_ADDRS_MAX];
         const char *names = (const char *)0;
         size_t names_len = 0;
-        if (n) naddrs = hosts_collect(etc_hosts_buf, n, name, af, found, HOSTENT_ADDRS_MAX, &names, &names_len);
-        if (naddrs) {
+        size_t k = n ? hosts_collect(hosts, n, name, af, found, HOSTENT_ADDRS_MAX, &names, &names_len) : 0;
+        if (k) {
+            for (size_t i = 0; i < k; i++) memcpy(ans->addrs[i], found[i].addr, alen);
+            ans->naddrs = k;
             if (names_len >= HOSTENT_NAME_MAX) names_len = HOSTENT_NAME_MAX - 1;
-            memcpy(hostent_name, names, names_len);
-            hostent_name[names_len] = 0;
+            memcpy(ans->name_store, names, names_len);
+            ans->names = ans->name_store;
+            ans->names_len = names_len;
         } else if (af == AF_INET6) {
-            h_errno = HOST_NOT_FOUND; /* the kernel resolver has no AAAA records */
-            return (struct hostent *)0;
+            ans->herr = HOST_NOT_FOUND; /* the kernel resolver has no AAAA records */
+            return;
         } else {
-            long r = gethostbyname_ipv4(name, found[0].addr);
+            long r = gethostbyname_ipv4(name, ans->addrs[0]);
             if (r < 0) {
-                /* A name that does not exist, is malformed, or is too long is a definitive "no such host"; a timeout
-                 * or any other failure is worth retrying. */
-                h_errno = (r == -2 /* ENOENT */ || r == -22 /* EINVAL */ || r == -36 /* ENAMETOOLONG */)
-                              ? HOST_NOT_FOUND
-                              : TRY_AGAIN;
-                return (struct hostent *)0;
+                /* A name that does not exist, is malformed, or is too long is a definitive "no such host"; a timeout or any
+                 * other failure is worth retrying. */
+                if (r == -2 /* ENOENT */ || r == -22 /* EINVAL */ || r == -36 /* ENAMETOOLONG */) {
+                    ans->herr = HOST_NOT_FOUND;
+                } else {
+                    ans->herr = TRY_AGAIN;
+                    ans->rc = EAGAIN;
+                }
+                return;
             }
-            naddrs = 1;
+            ans->naddrs = 1;
         }
     }
-    if (!hostent_name[0]) {
+    if (!ans->names) {
         size_t n = 0;
-        while (name[n] && n + 1 < HOSTENT_NAME_MAX) {
-            hostent_name[n] = name[n];
-            n++;
-        }
-        hostent_name[n] = 0;
+        while (name[n] && n + 1 < HOSTENT_NAME_MAX) n++;
+        memcpy(ans->name_store, name, n);
+        ans->names = ans->name_store;
+        ans->names_len = n;
     }
-    /* From /etc/hosts: the canonical name, then the line's other names as aliases (glibc, measured). */
-    hostent_split_aliases();
-    for (size_t k = 0; k < naddrs; k++) {
-        memcpy(hostent_addrs[k], found[k].addr, (size_t)alen);
-        hostent_addr_list[k] = hostent_addrs[k];
-    }
-    hostent_addr_list[naddrs] = (char *)0;
-    hostent_result.h_name = hostent_name;
-    hostent_result.h_aliases = hostent_aliases;
-    hostent_result.h_addrtype = af;
-    hostent_result.h_length = alen;
-    hostent_result.h_addr_list = hostent_addr_list;
-    h_errno = 0;
-    return &hostent_result;
+    ans->herr = 0;
 }
 
-struct hostent *gethostbyname(const char *name) { return gethostbyname2(name, AF_INET); }
-
-#include "../include/errno.h"
-
-struct hostent *gethostbyaddr(const void *addr, unsigned int len, int family) {
+static void lookup_addr(const void *addr, unsigned int len, int family, char *hosts, size_t hosts_cap, struct host_answer *ans) {
+    ans->names = (const char *)0;
+    ans->names_len = 0;
+    ans->naddrs = 0;
+    ans->rc = 0;
     int requested_family = family;
     if (family == AF_UNSPEC) {
         if (len == 4) family = AF_INET;
         else if (len == 16) family = AF_INET6;
     }
+    ans->af = family;
     if (family != AF_INET && family != AF_INET6) {
-        h_errno = NETDB_INTERNAL;
-        errno = EAFNOSUPPORT;
-        return (struct hostent *)0;
+        ans->herr = NETDB_INTERNAL;
+        ans->rc = EAFNOSUPPORT;
+        return;
     }
-    int alen = family == AF_INET6 ? 16 : 4;
-    if (len < (unsigned int)alen) {
-        h_errno = NETDB_INTERNAL;
-        errno = EAFNOSUPPORT;
-        return (struct hostent *)0;
+    size_t alen = family == AF_INET6 ? 16 : 4;
+    if (len < alen) {
+        ans->herr = NETDB_INTERNAL;
+        ans->rc = EAFNOSUPPORT;
+        return;
     }
-    if (len > (unsigned int)alen) {
-        h_errno = TRY_AGAIN;
-        return (struct hostent *)0;
+    if (len > alen) {
+        ans->herr = TRY_AGAIN;
+        return;
     }
     if (!addr) {
         /* glibc dereferences this; fail cleanly instead. */
-        h_errno = HOST_NOT_FOUND;
-        return (struct hostent *)0;
+        ans->herr = HOST_NOT_FOUND;
+        return;
     }
-
     const uint8_t *query = (const uint8_t *)addr;
     int query_family = family;
     static const uint8_t mapped_prefix[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
     if (family == AF_INET6 && memcmp(query, mapped_prefix, 12) == 0) {
+        /* ::ffff:a.b.c.d is named from the IPv4 lines but answered with the address asked for (glibc, measured). */
         query_family = AF_INET;
         query += 12;
     }
-    size_t n = etc_hosts_read();
+    size_t n = etc_hosts_read_into(hosts, hosts_cap);
     const char *names = (const char *)0;
-    size_t names_len = n ? hosts_reverse_names(etc_hosts_buf, n, query_family, query, &names) : 0;
+    size_t names_len = n ? hosts_reverse_names(hosts, n, query_family, query, &names) : 0;
     if (!names_len) {
         if (requested_family == AF_UNSPEC) {
-            h_errno = NETDB_INTERNAL;
-            errno = EAFNOSUPPORT;
+            ans->herr = NETDB_INTERNAL;
+            ans->rc = EAFNOSUPPORT;
         } else {
-            h_errno = HOST_NOT_FOUND;
+            ans->herr = HOST_NOT_FOUND;
         }
-        return (struct hostent *)0;
+        return;
     }
     if (names_len >= HOSTENT_NAME_MAX) names_len = HOSTENT_NAME_MAX - 1;
-    memcpy(hostent_name, names, names_len);
-    hostent_name[names_len] = 0;
-    hostent_split_aliases();
-    memcpy(hostent_addrs[0], addr, (size_t)alen);
-    hostent_addr_list[0] = hostent_addrs[0];
-    hostent_addr_list[1] = (char *)0;
-    hostent_result.h_name = hostent_name;
-    hostent_result.h_aliases = hostent_aliases;
-    hostent_result.h_addrtype = family;
-    hostent_result.h_length = alen;
-    hostent_result.h_addr_list = hostent_addr_list;
+    memcpy(ans->name_store, names, names_len);
+    ans->names = ans->name_store;
+    ans->names_len = names_len;
+    memcpy(ans->addrs[0], addr, alen);
+    ans->naddrs = 1;
+    ans->herr = 0;
+}
+
+/* The static functions: one result in static storage, overwritten by the next call (as in glibc); not thread-safe. Its buffer
+ * is large enough for any answer (16 addresses of 16 bytes, a 255-byte names field). */
+static struct hostent hostent_result;
+static union {
+    char *align;
+    char bytes[(HOSTENT_NAME_MAX / 2 + 2 + HOSTENT_ADDRS_MAX + 1) * sizeof(char *) + HOSTENT_ADDRS_MAX * 16 + HOSTENT_NAME_MAX + 8];
+} hostent_store;
+
+/* The static result keeps the first HOSTENT_ALIASES_MAX aliases: the length of `names` up to the field after them. */
+static size_t names_capped(const char *names, size_t len) {
+    size_t fields = 0;
+    for (size_t i = 0; i < len;) {
+        while (i < len && (names[i] == ' ' || names[i] == '\t')) i++;
+        if (i >= len) break;
+        if (fields == HOSTENT_ALIASES_MAX + 1) return i;
+        fields++;
+        while (i < len && names[i] != ' ' && names[i] != '\t') i++;
+    }
+    return len;
+}
+
+static struct hostent *static_result(struct host_answer *ans) {
+    if (!ans->names) {
+        h_errno = ans->herr;
+        if (ans->rc == EAFNOSUPPORT && ans->herr == NETDB_INTERNAL) errno = EAFNOSUPPORT;
+        return (struct hostent *)0;
+    }
+    const char *list[HOSTENT_ADDRS_MAX];
+    for (size_t k = 0; k < ans->naddrs; k++) list[k] = (const char *)ans->addrs[k];
+    size_t len = names_capped(ans->names, ans->names_len);
+    if (hostent_pack(&hostent_result, hostent_store.bytes, sizeof hostent_store.bytes, ans->names, len, ans->af, list,
+                     ans->naddrs) != 0) {
+        h_errno = NETDB_INTERNAL; /* cannot happen: the store holds the largest answer */
+        return (struct hostent *)0;
+    }
     h_errno = 0;
     return &hostent_result;
+}
+
+struct hostent *gethostbyname2(const char *name, int af) {
+    struct host_answer ans;
+    lookup_name(name, af, etc_hosts_buf, sizeof etc_hosts_buf, &ans);
+    return static_result(&ans);
+}
+
+struct hostent *gethostbyname(const char *name) { return gethostbyname2(name, AF_INET); }
+
+struct hostent *gethostbyaddr(const void *addr, unsigned int len, int family) {
+    struct host_answer ans;
+    lookup_addr(addr, len, family, etc_hosts_buf, sizeof etc_hosts_buf, &ans);
+    return static_result(&ans);
+}
+
+/* Turn an answer into the reentrant return value: lay it out in the caller's buffer, or report ERANGE when it does not fit. */
+static int reentrant_result(struct host_answer *ans, struct hostent *ret, char *buf, size_t buflen, struct hostent **result,
+                            int *h_errnop) {
+    if (result) *result = (struct hostent *)0;
+    int rc = ans->rc;
+    int herr = ans->herr;
+    if (ans->names) {
+        const char *list[HOSTENT_ADDRS_MAX];
+        for (size_t k = 0; k < ans->naddrs; k++) list[k] = (const char *)ans->addrs[k];
+        if (ret && hostent_pack(ret, buf, buflen, ans->names, ans->names_len, ans->af, list, ans->naddrs) == 0) {
+            if (result) *result = ret;
+            herr = 0;
+        } else {
+            rc = ERANGE;
+            herr = NETDB_INTERNAL;
+        }
+    }
+    if (h_errnop) *h_errnop = herr;
+    if (rc) errno = rc;
+    return rc;
+}
+
+/* The reentrant functions read /etc/hosts into ETC_HOSTS_MAX bytes of their own stack (the 64 KiB pthread stacks have room),
+ * so concurrent calls share no state. */
+int gethostbyname2_r(const char *name, int af, struct hostent *ret, char *buf, size_t buflen, struct hostent **result,
+                     int *h_errnop) {
+    char hosts[ETC_HOSTS_MAX];
+    struct host_answer ans;
+    lookup_name(name, af, hosts, sizeof hosts, &ans);
+    return reentrant_result(&ans, ret, buf, buflen, result, h_errnop);
+}
+
+int gethostbyname_r(const char *name, struct hostent *ret, char *buf, size_t buflen, struct hostent **result, int *h_errnop) {
+    return gethostbyname2_r(name, AF_INET, ret, buf, buflen, result, h_errnop);
+}
+
+int gethostbyaddr_r(const void *addr, unsigned int len, int family, struct hostent *ret, char *buf, size_t buflen,
+                    struct hostent **result, int *h_errnop) {
+    char hosts[ETC_HOSTS_MAX];
+    struct host_answer ans;
+    lookup_addr(addr, len, family, hosts, sizeof hosts, &ans);
+    return reentrant_result(&ans, ret, buf, buflen, result, h_errnop);
 }
 
 /* ---- getaddrinfo --------------------------------------------------------------------------------------------- */

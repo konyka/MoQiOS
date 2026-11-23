@@ -67,6 +67,15 @@ size_t hosts_reverse6(const char *text, size_t len, const uint8_t addr[16], cons
  * field (canonical name and aliases, separated by blanks) rather than only its first name. */
 size_t hosts_reverse_names(const char *text, size_t len, int family, const uint8_t *addr, const char **names);
 
+struct hostent;
+
+/* Lay a hostent out in the caller's buffer, as the *_r functions do: the alias and address pointer arrays (pointer-aligned),
+ * the address bytes (4 or 16 per address for `af`), then the `names_len` bytes of `names` split at blanks into h_name and
+ * h_aliases. Returns 0, or ERANGE (34) when `buf_len` bytes are not enough, in which case neither `he` nor bytes of `buf`
+ * at or past `buf_len` are written. */
+int hostent_pack(struct hostent *he, char *buf, size_t buf_len, const char *names, size_t names_len, int af,
+                 const char *const *addrs, size_t naddrs);
+
 /* Build a Linux `struct sockaddr_in` (16 bytes) for bind/connect/sendto: family AF_INET (2) as a little-endian
  * u16, `port` in network byte order, the 4 address bytes, 8 bytes of zero padding. */
 void ipv4_sockaddr(const uint8_t addr[4], uint16_t port, uint8_t out[16]);
@@ -122,6 +131,19 @@ struct hostent *gethostbyname2(const char *name, int af);
  * reports NETDB_INTERNAL/EAFNOSUPPORT on a miss. An unsupported family or short length is NETDB_INTERNAL with errno
  * EAFNOSUPPORT, and a long length is TRY_AGAIN. NULL is rejected with HOST_NOT_FOUND. */
 struct hostent *gethostbyaddr(const void *addr, unsigned int len, int family);
+
+/* Reentrant forms (glibc signatures). The answer is laid out in `buf` and `*ret` (see hostent_pack); `*result` is `ret` on a
+ * hit and NULL otherwise, and `*h_errnop` takes the h_errno value; the global h_errno and the static gethostbyname storage are
+ * not touched. Return value: 0 for a hit and for a definite miss (*h_errnop HOST_NOT_FOUND, or TRY_AGAIN for a long
+ * gethostbyaddr length); ERANGE when `buflen` cannot hold the answer (*h_errnop NETDB_INTERNAL, errno ERANGE; retry with a
+ * larger buffer); EAFNOSUPPORT for an unsupported family (*h_errnop NO_DATA for the name forms, NETDB_INTERNAL for
+ * gethostbyaddr_r, which also reports short lengths and AF_UNSPEC misses this way); EAGAIN when the resolver did not answer
+ * (*h_errnop TRY_AGAIN). errno is set to any non-zero return value. Unlike glibc, a miss never needs a minimum buffer size. */
+int gethostbyname_r(const char *name, struct hostent *ret, char *buf, size_t buflen, struct hostent **result, int *h_errnop);
+int gethostbyname2_r(const char *name, int af, struct hostent *ret, char *buf, size_t buflen, struct hostent **result,
+                     int *h_errnop);
+int gethostbyaddr_r(const void *addr, unsigned int len, int family, struct hostent *ret, char *buf, size_t buflen,
+                    struct hostent **result, int *h_errnop);
 
 /* ---- getaddrinfo() ------------------------------------------------------------------------------------------- */
 

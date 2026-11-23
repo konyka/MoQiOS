@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello509`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello510`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -492,6 +492,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello495 | net.ipv4.ip_local_reserved_ports：写入并读回 52000,52002-52004，保留端口仍可显式 bind（B）；限制自动范围为 52000–52010 后 UDP/TCP 都分到未保留端口（C、D）；倒置范围和 65536 为 EINVAL 且不改值（E）；换行清空（F），最后恢复两个 sysctl（G） |
 | hello496 | TCP ICMP 差错的 IP_MINTTL / IPV6_MINHOPCOUNT：阈值 2、连接保持 SYN_SENT 时，低于阈值的 host-unreachable 被忽略，达到阈值才报告 EHOSTUNREACH；IPv4 改变被引用报文的 TTL（A），IPv6 改变 ICMPv6 外层 hop limit（B），与 Linux 两条错误路径的实际数据来源一致 |
 | hello498 | clone 的 CLONE_SIGHAND / CLONE_FS：不带 CLONE_VM 的 CLONE_SIGHAND、不带 CLONE_SIGHAND 的 CLONE_THREAD 为 EINVAL（A）；CLONE_VM\|FS\|FILES\|SIGHAND\|THREAD 线程看到创建者之后的 chdir 和 sigaction（B），创建者也看到线程的修改（C） |
+| hello510 | 可重入解析函数：写入 IPv4、IPv6 行（A）；`gethostbyname_r` 按别名查到时，规范名、别名和地址都放在调用方的 `hostent` 与缓冲区里（B）；`gethostbyname2_r(AF_INET6)` 列出两条 IPv6 行（C）；`gethostbyaddr_r` 反查 IPv4 与 IPv6 地址（D）；16 字节缓冲区为 `ERANGE`、`NETDB_INTERNAL`、结果 NULL，逐字节加大后成功（E）；未命中返回 0、结果 NULL、`HOST_NOT_FOUND`，其它家族为 `EAFNOSUPPORT`/`NO_DATA`（F）；静态 `gethostbyname` 结果和全局 `h_errno` 不受影响（G）；两个线程各解析 200 次不同名字，结果互不干扰（H）；清理（I） |
 | hello509 | `gethostbyaddr` 经 /etc/hosts 反查：写入 IPv4、IPv6 与回环行（A）；IPv4 地址返回首个匹配行的规范名和两个别名（B）；IPv6 地址同样返回名字与别名（C）；`::ffff:a.b.c.d` 用 IPv4 行命名，但返回原 16 字节地址（D）；127.0.0.1 与 ::1 命中回环行（E）；文件中没有的地址为 `HOST_NOT_FOUND`（F）；短长度和不支持的家族为 `NETDB_INTERNAL`/`EAFNOSUPPORT`，过长长度为 `TRY_AGAIN`（G）；`AF_UNSPEC` 按长度选择家族，未命中为 `NETDB_INTERNAL`/`EAFNOSUPPORT`（H）；清理（I） |
 | hello508 | `gethostbyname2` 与 /etc/hosts 多地址：写入同名的两条 IPv4、两条 IPv6 行（A）；`gethostbyname` 按文件顺序列出两个 IPv4 地址（B）；`gethostbyname2(AF_INET6)` 列出两个 16 字节 IPv6 地址（C）；`AF_INET6` 下 IPv6 字面量得到自身，IPv4 字面量为 `HOST_NOT_FOUND`（D）；`AF_INET` 下 IPv6 字面量、`AF_INET6` 下未知名字为 `HOST_NOT_FOUND`，其它家族为 `NO_DATA`（E）；清理（F） |
 | hello507 | `getnameinfo` 接受 `sockaddr_in6`：写入含 IPv6 与 IPv4 行的 /etc/hosts（A）；IPv6 行上的地址给出该行第一个名字，`NI_NAMEREQD` 下也成功，端口 443 为 https（B）；::1 取 /etc/hosts 的名字，`::ffff:10.5.0.7` 按 IPv4 行命名（C）；文件里没有的地址为 `inet_ntop` 文本，`NI_NAMEREQD` 下 `EAI_NONAME`（D）；非零 scope 追加 `%N`（E）；27 字节地址为 `EAI_FAMILY`，缓冲区差一字节为 `EAI_OVERFLOW`（F）；真实 IPv6 套接字绑定 ::1 后 `getsockname` 的地址读回 `::1` 与端口（G）；清理（H） |
