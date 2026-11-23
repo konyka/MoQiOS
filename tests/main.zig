@@ -9802,9 +9802,9 @@ test "the ramdisk file-count limit leaves room to grow" {
     const k_pos = std.mem.indexOf(u8, rd, "pub const MAX_FILES: u32 = ").?;
     const k_end = std.mem.indexOfScalarPos(u8, rd, k_pos, ';').?;
     const kernel_limit = try std.fmt.parseInt(u32, rd[k_pos + "pub const MAX_FILES: u32 = ".len .. k_end], 10);
-    // About 250 programs are packed today and the limit was reached once already (the 257th probe could not be packed); a limit with no
-    // headroom stops the next test program.
-    try std.testing.expect(kernel_limit >= 512);
+    // The limit has been reached twice (the 257th and the 513th probe could not be packed); a limit with no headroom stops the next
+    // test program. Over 510 programs are packed today.
+    try std.testing.expect(kernel_limit >= 1024);
 }
 
 test "namespace errno policy: unlink, rmdir, mkdir and open on an existing object" {

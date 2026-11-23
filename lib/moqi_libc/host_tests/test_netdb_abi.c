@@ -57,6 +57,7 @@ long stub_last_connect_addr[2];
  * looks the NUL-terminated name up, SIOCGIFNAME the index at byte 16; an unknown one is -ENODEV. */
 static const char *const stub_ifnames[] = {"lo", "eth0"};
 int stub_ifs = 2;
+unsigned char stub_eth0_ip[4];
 static long stub_ioctl(long cmd, unsigned char *req) {
     if (cmd == 0x8933) {
         for (int i = 0; i < stub_ifs; i++) {
@@ -70,19 +71,24 @@ static long stub_ioctl(long cmd, unsigned char *req) {
         return -19;
     }
     if (cmd == 0x8912) {
-        /* SIOCGIFCONF: struct ifconf { int len; char *buf; }; one 40-byte record for lo (127.0.0.1). */
+        /* SIOCGIFCONF: struct ifconf { int len; char *buf; }; one 40-byte record per interface that fits. lo is 127.0.0.1;
+         * eth0 is listed with address 0.0.0.0 unless stub_eth0_ip is set, so by default no IPv4 address is "configured". */
         int len;
         unsigned char *buf;
         memcpy(&len, req, 4);
         memcpy(&buf, req + 8, 8);
         int wrote = 0;
-        if (buf && len >= 40) {
-            memset(buf, 0, 40);
-            memcpy(buf, "lo", 2);
-            buf[16] = 2;
-            buf[20] = 127;
-            buf[23] = 1;
-            wrote = 40;
+        if (!buf) {
+            wrote = 40 * stub_ifs;
+        } else {
+            for (int i = 0; i < stub_ifs && wrote + 40 <= len; i++) {
+                unsigned char *r = buf + wrote;
+                memset(r, 0, 40);
+                strcpy((char *)r, stub_ifnames[i]);
+                r[16] = 2;
+                if (i == 0) { r[20] = 127; r[23] = 1; } else memcpy(r + 20, stub_eth0_ip, 4);
+                wrote += 40;
+            }
         }
         memcpy(req, &wrote, 4);
         return 0;
@@ -394,6 +400,9 @@ int main(void) {
         assert(ifconf_has_nonloopback4(conf, 80));
         conf[60] = 127;
         assert(!ifconf_has_nonloopback4(conf, 80));
+        /* eth0 before DHCP is listed with 0.0.0.0: that is no address (Linux lists no IPv4 record for it at all). */
+        memset(conf + 60, 0, 4);
+        assert(!ifconf_has_nonloopback4(conf, 80));
 
         /* The rule: both or neither configured keeps AF_UNSPEC as it is; with exactly one, the other family is removed. An
          * explicit family that is not configured is EAI_NONAME (neither configured included). */
@@ -423,6 +432,38 @@ int main(void) {
         res = 0;
         assert(getaddrinfo("::1", "80", &hints, &res) == 0);
         freeaddrinfo(res);
+        stub_reset();
+    }
+
+    /* if_nameindex (glibc, measured): every interface in index order, then {0, NULL}; struct if_nameindex is 16 bytes. The array
+     * and the names are malloc'd and if_freenameindex releases all of them; NULL is a no-op here (glibc crashes on it). */
+    {
+        assert(sizeof(struct if_nameindex) == 16 && offsetof(struct if_nameindex, if_index) == 0 &&
+               offsetof(struct if_nameindex, if_name) == 8);
+        stub_reset();
+        int live0 = live_allocs;
+        errno = 0;
+        struct if_nameindex *ni = if_nameindex();
+        assert(ni && errno == 0);
+        assert(ni[0].if_index == 1 && strcmp(ni[0].if_name, "lo") == 0);
+        assert(ni[1].if_index == 2 && strcmp(ni[1].if_name, "eth0") == 0);
+        assert(ni[2].if_index == 0 && ni[2].if_name == 0);
+        assert(stub_count(SYS_socket) == 1 && stub_count(SYS_close) == 1);
+        if_freenameindex(ni);
+        assert(live_allocs == live0);
+        if_freenameindex((struct if_nameindex *)0);
+        /* Only lo: one entry. */
+        stub_ifs = 1;
+        ni = if_nameindex();
+        assert(ni && ni[0].if_index == 1 && ni[1].if_index == 0 && ni[1].if_name == 0);
+        if_freenameindex(ni);
+        stub_ifs = 2;
+        /* No socket: NULL with the socket's error. */
+        stub_reset();
+        stub_socket_reply = -24;
+        errno = 0;
+        assert(if_nameindex() == 0 && errno == EMFILE);
+        assert(live_allocs == live0);
         stub_reset();
     }
 

@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello512`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello513`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -492,6 +492,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello495 | net.ipv4.ip_local_reserved_ports：写入并读回 52000,52002-52004，保留端口仍可显式 bind（B）；限制自动范围为 52000–52010 后 UDP/TCP 都分到未保留端口（C、D）；倒置范围和 65536 为 EINVAL 且不改值（E）；换行清空（F），最后恢复两个 sysctl（G） |
 | hello496 | TCP ICMP 差错的 IP_MINTTL / IPV6_MINHOPCOUNT：阈值 2、连接保持 SYN_SENT 时，低于阈值的 host-unreachable 被忽略，达到阈值才报告 EHOSTUNREACH；IPv4 改变被引用报文的 TTL（A），IPv6 改变 ICMPv6 外层 hop limit（B），与 Linux 两条错误路径的实际数据来源一致 |
 | hello498 | clone 的 CLONE_SIGHAND / CLONE_FS：不带 CLONE_VM 的 CLONE_SIGHAND、不带 CLONE_SIGHAND 的 CLONE_THREAD 为 EINVAL（A）；CLONE_VM\|FS\|FILES\|SIGHAND\|THREAD 线程看到创建者之后的 chdir 和 sigaction（B），创建者也看到线程的修改（C） |
+| hello513 | `if_nameindex`/`if_freenameindex`：列表以 `{0, NULL}` 结尾，lo 在索引 1，每一项都与 `if_nametoindex`、`if_indextoname` 一致（A）；索引递增、不重复（B）；网卡启用时 eth0 在列表里（C）；200 轮申请与释放后堆不增长，数组和名字都被释放（D）；`if_freenameindex(NULL)` 正常返回（glibc 会崩溃，宿主机不测）（E） |
 | hello512 | `/proc/net/if_inet6` 与 `AI_ADDRCONFIG`：文件列出 lo 的 `::1`，格式与 Linux 的 `if6_seq_show` 相同（A）；eth0 启用时还有按 MAC 生成的 EUI-64 链路本地地址，接口索引与 `SIOCGIFINDEX` 一致、前缀 0x40、范围 0x20、永久（B）；文件只读，写打开为 `EACCES`（C）；两族都有非回环地址时 `AI_ADDRCONFIG` 不改变结果：/etc/hosts 中的双族名字在 `AF_UNSPEC` 下两族都有，`AF_INET`/`AF_INET6` 各得自己的，字面量照旧（D）；清理（E） |
 | hello511 | 接口名与索引：`if_nametoindex("lo")` 为 1，与 `SIOCGIFINDEX` 一致（A）；未知、空、大小写不同、带空格、过长的名字为 0、`ENODEV`（B）；`if_indextoname(1)` 写入 `lo` 并返回缓冲区，索引 0 和未知索引为 NULL、`ENXIO`（C）；`getaddrinfo` 在链路本地和链路/接口范围组播地址上接受 `%lo`，`sin6_scope_id` 为 1，全局地址的数字 scope 照旧（D）；全局、站点范围地址上的 `%lo`、未知接口、空 scope 为 `EAI_NONAME`（E）；`getnameinfo` 对 scope 1 的链路本地和链路范围组播地址输出 `%lo`，其它地址输出 `%1`，没有接口的索引输出 `%99`（F） |
 | hello510 | 可重入解析函数：写入 IPv4、IPv6 行（A）；`gethostbyname_r` 按别名查到时，规范名、别名和地址都放在调用方的 `hostent` 与缓冲区里（B）；`gethostbyname2_r(AF_INET6)` 列出两条 IPv6 行（C）；`gethostbyaddr_r` 反查 IPv4 与 IPv6 地址（D）；16 字节缓冲区为 `ERANGE`、`NETDB_INTERNAL`、结果 NULL，逐字节加大后成功（E）；未命中返回 0、结果 NULL、`HOST_NOT_FOUND`，其它家族为 `EAFNOSUPPORT`/`NO_DATA`（F）；静态 `gethostbyname` 结果和全局 `h_errno` 不受影响（G）；两个线程各解析 200 次不同名字，结果互不干扰（H）；清理（I） |

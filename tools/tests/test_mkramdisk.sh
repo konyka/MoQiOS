@@ -22,10 +22,11 @@ if [ -n "$kernel_limit" ] && [ "$kernel_limit" = "$script_limit" ]; then
 else
     bad "packer limit '$script_limit' differs from the kernel's '$kernel_limit'"
 fi
-if [ "${kernel_limit:-0}" -ge 256 ]; then
-    ok "the limit leaves headroom beyond the current ~250 programs"
+packed="$(grep -o 'hello[0-9]*\|syslogd\|devmgr\| sh ' "$PROJECT_DIR/tools/qemu_run.sh" | wc -l)"
+if [ "${kernel_limit:-0}" -ge $((packed + 256)) ]; then
+    ok "the limit ($kernel_limit) leaves at least 256 files of headroom beyond the $packed programs qemu_run.sh packs"
 else
-    bad "limit $kernel_limit leaves no headroom"
+    bad "limit $kernel_limit leaves less than 256 files of headroom beyond the $packed packed programs"
 fi
 
 make_dir() {

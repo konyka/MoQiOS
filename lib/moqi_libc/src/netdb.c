@@ -482,6 +482,71 @@ char *if_indextoname(unsigned int index, char *buf) {
     return buf;
 }
 
+#include "../include/stdlib.h"
+
+#define IFNAMEINDEX_MAX 16
+
+void if_freenameindex(struct if_nameindex *ptr) {
+    if (!ptr) return;
+    for (struct if_nameindex *p = ptr; p->if_index != 0 || p->if_name; p++) free(p->if_name);
+    free(ptr);
+}
+
+struct if_nameindex *if_nameindex(void) {
+    uint8_t conf[IFNAMEINDEX_MAX * IFREQ_BYTES];
+    uint8_t hdr[16];
+    memset(hdr, 0, sizeof hdr);
+    int len = (int)sizeof conf;
+    uint8_t *p = conf;
+    memcpy(hdr, &len, 4);
+    memcpy(hdr + 8, &p, sizeof p);
+    long s = NETDB_SYSCALL3(SYS_socket, AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) {
+        errno = (int)-s;
+        return (struct if_nameindex *)0;
+    }
+    long rc = NETDB_SYSCALL3(SYS_ioctl, s, 0x8912 /* SIOCGIFCONF */, (long)hdr);
+    int got = 0;
+    if (rc == 0) memcpy(&got, hdr, 4);
+    size_t count = rc == 0 && got > 0 ? (size_t)got / IFREQ_BYTES : 0;
+    struct if_nameindex *out = (struct if_nameindex *)malloc((count + 1) * sizeof(struct if_nameindex));
+    if (!out) {
+        NETDB_SYSCALL1(SYS_close, s);
+        errno = ENOMEM;
+        return (struct if_nameindex *)0;
+    }
+    size_t n = 0;
+    for (size_t k = 0; k < count; k++) {
+        uint8_t req[IFREQ_BYTES];
+        memset(req, 0, sizeof req);
+        memcpy(req, conf + k * IFREQ_BYTES, IF_NAMESIZE - 1);
+        if (NETDB_SYSCALL3(SYS_ioctl, s, SIOCGIFINDEX_REQ, (long)req) != 0) continue; /* gone meanwhile */
+        size_t nl = strlen((const char *)req);
+        char *name = (char *)malloc(nl + 1);
+        if (!name) {
+            out[n].if_index = 0;
+            out[n].if_name = (char *)0;
+            if_freenameindex(out);
+            NETDB_SYSCALL1(SYS_close, s);
+            errno = ENOMEM;
+            return (struct if_nameindex *)0;
+        }
+        memcpy(name, req, nl + 1);
+        out[n].if_index = (unsigned)req[16] | (unsigned)req[17] << 8 | (unsigned)req[18] << 16 | (unsigned)req[19] << 24;
+        out[n].if_name = name;
+        n++;
+    }
+    NETDB_SYSCALL1(SYS_close, s);
+    if (rc < 0) {
+        free(out);
+        errno = (int)-rc;
+        return (struct if_nameindex *)0;
+    }
+    out[n].if_index = 0;
+    out[n].if_name = (char *)0;
+    return out;
+}
+
 /* Scopes that glibc writes and reads as an interface name: link-local unicast fe80::/10 and link-scope multicast ff02 (measured;
  * getaddrinfo also takes a name on interface-local multicast ff01, getnameinfo prints a number there). */
 static int scope_is_link_local(const uint8_t a[16]) { return a[0] == 0xFE && (a[1] & 0xC0) == 0x80; }
@@ -954,7 +1019,9 @@ static int scoped_ipv6(const char *node, uint8_t out[16], uint32_t *scope) {
 int ifconf_has_nonloopback4(const uint8_t *conf, size_t len) {
     for (size_t off = 0; conf && off + IFREQ_BYTES <= len; off += IFREQ_BYTES) {
         const uint8_t *r = conf + off;
-        if (r[16] == AF_INET && r[17] == 0 && r[20] != 127) return 1;
+        /* 0.0.0.0 is an interface with no address yet (MoQiOS lists eth0 before DHCP; Linux omits it). */
+        int unset = r[20] == 0 && r[21] == 0 && r[22] == 0 && r[23] == 0;
+        if (r[16] == AF_INET && r[17] == 0 && r[20] != 127 && !unset) return 1;
     }
     return 0;
 }

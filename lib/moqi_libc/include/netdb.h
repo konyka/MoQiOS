@@ -158,6 +158,18 @@ unsigned int if_nametoindex(const char *name);
  * with errno ENXIO when no interface has that index (index 0 included), or with the socket error. */
 char *if_indextoname(unsigned int index, char *buf);
 
+struct if_nameindex {
+    unsigned int if_index; /* 0 in the terminating entry */
+    char        *if_name;  /* NULL in the terminating entry */
+};
+
+/* Every interface (SIOCGIFCONF for the names, SIOCGIFINDEX for each index) in a malloc'd array ending with {0, NULL}; NULL with
+ * errno set (ENOMEM, or the socket/ioctl error) on failure. Free it with if_freenameindex. */
+struct if_nameindex *if_nameindex(void);
+
+/* Release an array from if_nameindex, names included. NULL is a no-op (glibc crashes on it). */
+void if_freenameindex(struct if_nameindex *ptr);
+
 /* ---- getaddrinfo() ------------------------------------------------------------------------------------------- */
 
 #define AF_UNSPEC 0
