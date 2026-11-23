@@ -25,6 +25,13 @@ pub fn portAvailable(port: u16, in_use: []const u16) bool {
     return true;
 }
 
+/// reserved is empty or the complete 65536-bit ip_local_reserved_ports bitmap.
+pub fn portAvailableWithReserved(port: u16, in_use: []const u16, reserved: []const u8) bool {
+    if (reserved.len != 0 and reserved.len != 65536 / 8) return false;
+    if (reserved.len != 0 and reserved[port / 8] & (@as(u8, 1) << @intCast(port % 8)) != 0) return false;
+    return portAvailable(port, in_use);
+}
+
 pub const PortRange = struct { first: u16, last: u16 };
 
 /// inet_sk_get_local_port_range: a socket's IP_LOCAL_PORT_RANGE narrows system_range (ip_local_port_range). Each nonzero endpoint
@@ -41,16 +48,16 @@ pub fn localPortRange(raw: u32, system_range: u32) PortRange {
 /// First available ephemeral port at or after `start` (wrapping), or null
 /// when every port of the range is taken. Bounded by the range size.
 pub fn pickEphemeralPort(start: u16, in_use: []const u16) ?u16 {
-    return pickEphemeralPortInRange(start, in_use, 0, EPHEMERAL_RANGE);
+    return pickEphemeralPortInRange(start, in_use, 0, EPHEMERAL_RANGE, &.{});
 }
 
-pub fn pickEphemeralPortInRange(start: u16, in_use: []const u16, raw_range: u32, system_range: u32) ?u16 {
+pub fn pickEphemeralPortInRange(start: u16, in_use: []const u16, raw_range: u32, system_range: u32, reserved: []const u8) ?u16 {
     const range = localPortRange(raw_range, system_range);
     var port: u16 = if (start < range.first or start > range.last) range.first else start;
     const count: u32 = @as(u32, range.last) - range.first + 1;
     var tries: u32 = 0;
     while (tries < count) : (tries += 1) {
-        if (portAvailable(port, in_use)) return port;
+        if (portAvailableWithReserved(port, in_use, reserved)) return port;
         port = if (port == range.last) range.first else port + 1;
     }
     return null;

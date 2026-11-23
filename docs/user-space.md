@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello494`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello496`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -489,6 +489,8 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello492 | net.ipv4.ip_nonlocal_bind / net.ipv6.ip_nonlocal_bind：默认均为 0（A），未开启时目标机拒绝非本机 UDP bind（B）；打开 IPv4 只放行 IPv4 与 IPv4 映射地址，原生 IPv6 仍拒绝（C），打开 IPv6 后原生地址可 bind（D）；256/-1 写入为 EINVAL 且不改值（E），恢复 0 后规则复原（F） |
 | hello493 | net.ipv4.ip_local_port_range：保存原值（A），写入 52000–52010 后读回并检查 UDP 自动端口（B）；套接字 IP_LOCAL_PORT_RANGE 进一步收窄到 52004–52006（C）；TCP 客户端同样遵守系统范围且 accept 成功（D）；倒置、低于 1024、超过 65535 的写入为 EINVAL 且不改值（E）；恢复原值（F） |
 | hello494 | net.ipv4.ip_unprivileged_port_start：只保留 CAP_NET_ADMIN、移除 CAP_NET_BIND_SERVICE；默认 1024 时 UDP/TCP 80 为 EACCES（A），写 0 后成功（B），边界 100 时 99 拒绝、100 成功（C）；负数、65536 及与自动端口范围重叠的写入为 EINVAL 且不改值（D）；恢复 1024 后拒绝复原（E） |
+| hello495 | net.ipv4.ip_local_reserved_ports：写入并读回 52000,52002-52004，保留端口仍可显式 bind（B）；限制自动范围为 52000–52010 后 UDP/TCP 都分到未保留端口（C、D）；倒置范围和 65536 为 EINVAL 且不改值（E）；换行清空（F），最后恢复两个 sysctl（G） |
+| hello496 | TCP ICMP 差错的 IP_MINTTL / IPV6_MINHOPCOUNT：阈值 2、连接保持 SYN_SENT 时，低于阈值的 host-unreachable 被忽略，达到阈值才报告 EHOSTUNREACH；IPv4 改变被引用报文的 TTL（A），IPv6 改变 ICMPv6 外层 hop limit（B），与 Linux 两条错误路径的实际数据来源一致 |
 | hello303 | MoQiOS 原生 IPC（无 Linux 对应）：没有 send 能力时发给自己的端点返回 `invalid_endpoint`（-1），给自己授予后返回 `would_deadlock`（-3）（A）；子进程创建端点并给父进程授予 send 能力，父进程发 30 条消息子进程按序收到（B）；阻塞在 `moqipc_recv` 里的子进程收到 `SIGSTOP` 立即停下（E，30 轮），事件之后的可变延迟停止 200 轮也全部停下（F）；被 `SIGKILL` 后 2 秒内被收尸，状态 9（C）；之后发给它的端点立即失败（D）。在 `hello304` 之后运行 |
 | hello230 / hello231 | hello227 用的小探针：`hello230` 是 `cat` 的替身（标准输入拷到标准输出，或 `count` 只统计字节数），`hello231` 检查环境变量 `H231V` |
 

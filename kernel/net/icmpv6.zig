@@ -139,6 +139,7 @@ pub fn handlePacketMeta(src_ip: [16]u8, dst_ip: [16]u8, data: [*]const u8, len: 
                 .info = if (icmp_type == PACKET_TOO_BIG) bo.readU32BeAt(data, 4) else 0,
                 .offender = src_ip,
                 .l4 = data[8 + inner.off ..][0..8].*,
+                .outer_hops = meta6.hops,
             });
         }
         const q = unreach.parseErrorQuote6(data[0..len]) orelse return;

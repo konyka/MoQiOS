@@ -361,8 +361,9 @@ pub fn tcpReqAborts6(icmp_type: u8, code: u8) bool {
     };
 }
 
-/// What an ICMP error quotes of a TCP segment: its ports, sequence number, source (this host) and destination.
-pub const TcpQuote = struct { src_port: u16, dst_port: u16, seq: u32, src4: [4]u8 = @splat(0), dst4: [4]u8 = @splat(0), src: [16]u8 = @splat(0), dst: [16]u8 = @splat(0) };
+/// What an ICMP error quotes of a TCP segment: its ports, sequence number, source (this host) and destination. For IPv4, ttl is
+/// from the quoted header as well: tcp_v4_err advances skb->data to that header before checking IP_MINTTL.
+pub const TcpQuote = struct { src_port: u16, dst_port: u16, seq: u32, src4: [4]u8 = @splat(0), dst4: [4]u8 = @splat(0), src: [16]u8 = @splat(0), dst: [16]u8 = @splat(0), ttl: u8 = 0 };
 
 /// The TCP segment quoted by an ICMP error (`msg` starts at the ICMP header): the quoted IPv4 header, then at least 8 bytes of TCP.
 pub fn parseTcpQuote(msg: []const u8) ?TcpQuote {
@@ -376,6 +377,7 @@ pub fn parseTcpQuote(msg: []const u8) ?TcpQuote {
         .seq = std.mem.readInt(u32, msg[p + 4 ..][0..4], .big),
         .src4 = msg[8 + 12 ..][0..4].*,
         .dst4 = msg[8 + 16 ..][0..4].*,
+        .ttl = msg[8 + 8],
     };
 }
 

@@ -113,15 +113,15 @@ pub const EPHEMERAL_HIGH: u16 = 65535;
 /// no name), else the first ephemeral port no named socket holds. `named` lists the port numbers of the named sockets. Null when
 /// every ephemeral port is held (EAGAIN).
 pub fn pickAutobindPort(current: u16, named: []const u16) ?u16 {
-    return pickAutobindPortInRange(current, named, 0, tcp_port_policy.EPHEMERAL_RANGE);
+    return pickAutobindPortInRange(current, named, 0, tcp_port_policy.EPHEMERAL_RANGE, &.{});
 }
 
-pub fn pickAutobindPortInRange(current: u16, named: []const u16, raw_range: u32, system_range: u32) ?u16 {
+pub fn pickAutobindPortInRange(current: u16, named: []const u16, raw_range: u32, system_range: u32, reserved: []const u8) ?u16 {
     const range = tcp_port_policy.localPortRange(raw_range, system_range);
-    if (current >= range.first and current <= range.last and std.mem.indexOfScalar(u16, named, current) == null) return current;
+    if (current >= range.first and current <= range.last and tcp_port_policy.portAvailableWithReserved(current, named, reserved)) return current;
     var p: u32 = range.first;
     while (p <= range.last) : (p += 1) {
-        if (std.mem.indexOfScalar(u16, named, @intCast(p)) == null) return @intCast(p);
+        if (tcp_port_policy.portAvailableWithReserved(@intCast(p), named, reserved)) return @intCast(p);
     }
     return null;
 }

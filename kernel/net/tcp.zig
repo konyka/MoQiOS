@@ -1169,7 +1169,10 @@ fn allocEphemeralPort(self: *const TcpTcb) u16 {
         in_use[n] = tcbs[i].local_port;
         n += 1;
     }
-    const port = tcp_port_policy.pickEphemeralPortInRange(next_ephemeral_port, in_use[0..n], self.options.ip.port_range4, @import("local_port_sysctl.zig").get()) orelse return 0;
+    const reserved_ports = @import("reserved_port_policy.zig");
+    reserved_ports.readLock();
+    defer reserved_ports.readUnlock();
+    const port = tcp_port_policy.pickEphemeralPortInRange(next_ephemeral_port, in_use[0..n], self.options.ip.port_range4, @import("local_port_sysctl.zig").get(), reserved_ports.bytes()) orelse return 0;
     // Wrapping advance: saturating (+|=) would park at 65535 forever,
     // aliasing every later connection's 4-tuple.
     next_ephemeral_port = tcp_port_policy.nextEphemeralPort(port);
@@ -1325,14 +1328,16 @@ pub fn tcpPendingSoError(tcb_idx: u32) i32 {
 /// carries the quoted sequence number; `err` is its errno (0: none, as for fragmentation needed, which icmp.zig handles as path
 /// MTU), `req_abort` whether a connection still waiting in a listener's queue is dropped.
 /// What an ICMP error carried, for the error-queue entry a failed connect with IP_RECVERR keeps: the ICMP type, code and info, its
-/// sender, and the quoted TCP header (8 bytes).
-pub const IcmpErrCtx = struct { icmp_type: u8, icmp_code: u8, info: u32 = 0, offender: [16]u8, l4: [8]u8 };
+/// sender, the quoted TCP header (8 bytes), and for IPv6 the outer packet's hop limit (tcp_v6_err checks IPV6_MINHOPCOUNT there).
+pub const IcmpErrCtx = struct { icmp_type: u8, icmp_code: u8, info: u32 = 0, offender: [16]u8, l4: [8]u8, outer_hops: u8 = 0 };
 
 pub fn icmpError(q: @import("icmp_unreach_policy.zig").TcpQuote, err: i32, req_abort: bool, ctx: IcmpErrCtx) void {
     const idx = blk: {
         const lock_flags = tcp_lock.acquire();
         defer tcp_lock.release(lock_flags);
         const tcb = findTcbByTuple(q.src4, q.src_port, q.dst_port, q.dst4) orelse return;
+        // tcp_v4_err handles TCP_NEW_SYN_RECV before this check; q.ttl belongs to the quoted datagram, not the ICMP outer header.
+        if (tcb.state != .syn_received and q.ttl < tcb.options.ip.min_ttl4) return;
         if (!applyIcmpError(tcb, q.seq, err, req_abort, ctx)) return;
         break :blk tcbIdx(tcb);
     };
@@ -1345,6 +1350,7 @@ pub fn icmpError6(q: @import("icmp_unreach_policy.zig").TcpQuote, err: i32, req_
         const lock_flags = tcp_lock.acquire();
         defer tcp_lock.release(lock_flags);
         const tcb = findTcbByTupleV6(q.src, q.src_port, q.dst_port, q.dst) orelse return;
+        if (tcb.state != .syn_received and ctx.outer_hops < tcb.options.ip.min_hops6) return;
         if (!applyIcmpError(tcb, q.seq, err, req_abort, ctx)) return;
         break :blk tcbIdx(tcb);
     };

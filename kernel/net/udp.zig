@@ -933,7 +933,10 @@ pub fn autobind(key: u32, out_port: *u16, out_disc: *u16) i64 {
         named_buf[n] = portNumber(ports[j]);
         n += 1;
     }
-    const want = @import("udp_port_policy.zig").pickAutobindPortInRange(portNumber(key), named_buf[0..n], port_opts[oi].ip.port_range4, @import("local_port_sysctl.zig").get()) orelse return -11; // EAGAIN
+    const reserved_ports = @import("reserved_port_policy.zig");
+    reserved_ports.readLock();
+    defer reserved_ports.readUnlock();
+    const want = @import("udp_port_policy.zig").pickAutobindPortInRange(portNumber(key), named_buf[0..n], port_opts[oi].ip.port_range4, @import("local_port_sysctl.zig").get(), reserved_ports.bytes()) orelse return -11; // EAGAIN
     if (portNumber(key) == want) {
         port_named[oi] = true;
         out_port.* = want;
