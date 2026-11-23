@@ -310,6 +310,23 @@ pub fn connect6(idx: u32, peer: ?[16]u8) bool {
     return true;
 }
 
+/// connect of an IPv6 socket to `peer`%`scope_id` (__ip6_datagram_connect): bind_addr_policy.connectDev6 checks the scope (EINVAL) and
+/// the route (ENETUNREACH). The peer is recorded only when both pass; a failed route check leaves the previous peer
+/// (ip6_datagram_dst_update failing restores it). A v4-mapped peer is taken as given: sending to it then fails.
+pub fn connectChecked6(idx: u32, peer: [16]u8, scope_id: u32) i64 {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return -9;
+    const s = &sockets[idx];
+    if (!policy.isMapped6(peer)) {
+        const r = @import("bind_addr_policy.zig").connectDev6(peer, scope_id, 0, s.opts.ip.mc_if);
+        if (r.err != 0) return r.err;
+    }
+    s.peer6 = peer;
+    s.connected = true;
+    return 0;
+}
+
 pub fn isV6(idx: u32) bool {
     const saved = raw_lock.acquire();
     defer raw_lock.release(saved);

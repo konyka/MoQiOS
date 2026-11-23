@@ -340,8 +340,7 @@ fn rawConnect6(d: *vfs_mod.FileDescriptor, addr_ptr: u64, addr_len: u32) i64 {
         .ok => |v| v,
         .err => |e| return e,
     };
-    _ = @import("raw_icmp.zig").connect6(d.raw_idx, parsed.addr);
-    return 0;
+    return @import("raw_icmp.zig").connectChecked6(d.raw_idx, parsed.addr, parsed.scope);
 }
 
 /// bind on a raw ICMP socket: a whole sockaddr_in naming this host (or the wildcard); the protocol stays the port.
