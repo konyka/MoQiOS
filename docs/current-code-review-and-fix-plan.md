@@ -12257,3 +12257,13 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 **局限**：每次 `_r` 调用在栈上用约 8.5 KiB（文件缓冲 8192 字节加答案），64 KiB 的 pthread 栈够用，但很深的调用链要留意；glibc 即使未命中也要求最小缓冲区（实测 544 字节以下返回 `ERANGE`），这里未命中不需要缓冲区，算是更宽松的偏差；成功时 `*h_errnop` 清零，而 glibc 不保证；`_r` 结果不像静态结果那样截到 16 个别名，缓冲区够就全部列出；仍没有反向 DNS 和 AAAA。
 
 **验证**：`sh lib/moqi_libc/host_tests/run_tests.sh`、手动以 `-fsanitize=undefined` 编译运行的 `test_netdb_abi`、`zig build test`、`zig build`、`git diff --check` 均通过；SMP=2 QEMU smoke 通过（`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=2)`）。
+
+## 补充：hello418 T 把重传的数据段当成多出来的一段（CI 6e3755f）
+
+**现象**：hello509 的提交 `6e3755f` 在 CI 的 SMP=2 smoke 里失败，唯一的失败是 `hello418: FAIL T: 4 data segments, ids 61033 61034 61035, DF 111 (one apart, DF)`；同一份里 N、U、R、S、E、P 都通过，SMP=1 和另外两个 job 通过。那次提交只改了 moqi_libc 的 netdb，hello418 是原始系统调用探针，不链接 netdb。
+
+**分析**：T 段发 3 个 4 字节的段，然后统计 raw 套接字抓到的、目的端口 40522、有载荷的 TCP 段，要求正好 3 个。CI 抓到 4 个，而且打印出的前三个 id 依次加 1，说明 id 计数本身是对的，多出来的是第 4 个有载荷的段。测试原来只打印前三个 id，也不记录序号，所以第 4 段是什么看不到。最可能的是重传或尾部丢失探测（TLP）：负载高的宿主机上 ACK 来晚，`sendTlpProbe` 等路径把未确认的数据经 `sendSegmentSeq` 再发一次，这一段同样取连接的下一个 id——Linux 也是这样（`ip_select_ident_segs` 每发一段取一个 id，重传也不例外）。所以“3 次 send 正好 3 个数据段”这个断言本身是错的，它把重传当成了缺陷。这是推断：CI 没有保留串口日志里 raw 抓包的细节，我没有直接看到第 4 段的序号。
+
+**修复（只改测试）**：T 段为每个抓到的段记录 TCP 序号；断言改为“正好 3 个不同的序号、所有数据段的 id 依次加 1、都带 DF”，重传重复某个序号、取下一个 id，仍然通过；失败时打印每一段的 `id/seq`，下次如果多出来的段不是重传（新的序号，或者 id 不连续），能直接看出来。
+
+**验证**：宿主机 Linux（`-DHOST`、`unshare -n`）连续 4 次 PASS（3 段、3 个序号）；目标机 SMP=2 下在开机后单独连跑 hello418 8 次，全部 PASS，每次都是 3 段、3 个序号，没有复现那次的第 4 段。`zig build test`、`zig build`、`git diff --check` 通过；完整 SMP=2 smoke 通过（`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=2)`）。

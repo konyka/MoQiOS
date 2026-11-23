@@ -4,7 +4,8 @@
  *   N. two datagrams of an unconnected UDP socket carry DF and different ids (the hashed counter, which jumps ahead after a pause);
  *   U. three datagrams of a connected UDP socket carry DF and ids one apart (the socket's own counter, random at connect);
  *   R. a second connected UDP socket counts from its own starting point;
- *   T. three data segments of a TCP connection carry DF and ids that grow by one per segment the client sent;
+ *   T. three data segments of a TCP connection carry DF and ids that grow by one per segment the client sent (a retransmission
+ *      included: it repeats a sequence number and takes the next id);
  *   S. the SYN-ACK and the RST answering a SYN to a closed port carry DF and id 0;
  *   E. two ICMP port unreachables carry no DF and ids one apart (the hashed counter of their addresses);
  *   P. an echo request sent on a raw socket carries DF, the kernel's echo reply has none. */
@@ -56,7 +57,7 @@ static void check(int ok, const char *w) {
     if (!ok) failures++;
 }
 /* One captured datagram: for UDP/TCP the ports, for ICMP the type and (errors) the quoted destination port or (echo) the ident. */
-struct rec { int proto, sport, dport, tflags, len, id, df, itype; };
+struct rec { int proto, sport, dport, tflags, len, id, df, itype; unsigned seq; };
 static struct rec recs[256];
 static int nrecs;
 static long raws[3];
@@ -85,7 +86,11 @@ static void drain(void) {
                 } else {
                     r->sport = (l4[0] << 8) | l4[1];
                     r->dport = (l4[2] << 8) | l4[3];
-                    if (r->proto == 6) { r->tflags = l4[13]; r->len = tot - ihl - (l4[12] >> 4) * 4; } else r->len = tot - ihl - 8;
+                    if (r->proto == 6) {
+                        r->tflags = l4[13];
+                        r->len = tot - ihl - (l4[12] >> 4) * 4;
+                        r->seq = (unsigned)l4[4] << 24 | (unsigned)l4[5] << 16 | (unsigned)l4[6] << 8 | l4[7];
+                    } else r->len = tot - ihl - 8;
                 }
             }
         }
@@ -184,11 +189,31 @@ int main(void) {
     check(sa >= 0 && recs[sa].id == 0 && recs[sa].df, msg);
     int base = nrecs;
     for (int i = 0; i < 3; i++) { send_(c, "t418", 4); drain(); }
+    /* A retransmission or tail-loss probe (a loaded host can delay the ACK) is one more segment with the same sequence number;
+     * it takes the next id too (Linux, ip_select_ident_segs), so every data segment is one apart and three sequences are sent. */
     n = 0;
-    for (int i = base; i < nrecs && n < 8; i++)
-        if (recs[i].proto == 6 && recs[i].dport == 40522 && recs[i].len > 0) { ids[n] = recs[i].id; df[n] = recs[i].df; n++; }
-    snprintf(msg, sizeof msg, "T: %d data segments, ids %d %d %d, DF %d%d%d (one apart, DF)", n, ids[0], ids[1], ids[2], df[0], df[1], df[2]);
-    check(n == 3 && step(ids[0], ids[1]) == 1 && step(ids[1], ids[2]) == 1 && df[0] && df[1] && df[2], msg);
+    unsigned seqs[8];
+    int nseq = 0, ones = 1, alldf = 1;
+    for (int i = base; i < nrecs && n < 8; i++) {
+        if (recs[i].proto != 6 || recs[i].dport != 40522 || recs[i].len <= 0) continue;
+        ids[n] = recs[i].id;
+        df[n] = recs[i].df;
+        if (n > 0 && step(ids[n - 1], ids[n]) != 1) ones = 0;
+        if (!df[n]) alldf = 0;
+        int seen = 0;
+        for (int j = 0; j < nseq; j++) if (seqs[j] == recs[i].seq) seen = 1;
+        if (!seen) seqs[nseq++] = recs[i].seq;
+        n++;
+    }
+    char idtext[200] = "";
+    for (int i = 0, o = 0, k = base; i < n && k < nrecs; k++) {
+        if (recs[k].proto != 6 || recs[k].dport != 40522 || recs[k].len <= 0) continue;
+        o += snprintf(idtext + o, sizeof idtext - (size_t)o, "%s%d/seq%u", i ? " " : "", ids[i], recs[k].seq);
+        i++;
+    }
+    snprintf(msg, sizeof msg, "T: %d data segments with %d sequences, ids %s, one apart %d, DF %d (3 sequences, ids one apart, DF)", n, nseq,
+             idtext, ones, alldf);
+    check(n >= 3 && nseq == 3 && ones && alldf, msg);
     char b[16];
     recv_(p, b, sizeof b);
     close_(c);
