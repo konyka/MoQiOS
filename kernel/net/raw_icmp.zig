@@ -85,9 +85,31 @@ const Socket = struct {
     /// value, even an empty one (raw_send_hdrinc refuses an IP_HDRINCL send while inet_opt exists).
     ipopts: iop.SendOpts = .{},
     ipopts_set: bool = false,
+    /// IPV6_ADD_MEMBERSHIP / IP_ADD_MEMBERSHIP groups (ipv6_sock_mc_join, ip_mc_join_group work for every inet socket).
+    mc6: @import("mcast_policy.zig").Membership = .{},
+    mc4: @import("mcast_policy.zig").Membership4 = .{},
 };
 
 var sockets: [MAX_SOCKETS]Socket = @splat(.{});
+
+/// IPV6_ADD_MEMBERSHIP / IPV6_DROP_MEMBERSHIP on raw socket `idx` (mcast_policy.join / drop); -9 when the socket is gone.
+pub fn mcMembership6(idx: u32, add: bool, group: [16]u8, ifindex: u32, nic_active: bool) i64 {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return -9;
+    const mc = @import("mcast_policy.zig");
+    return if (add) mc.join(&sockets[idx].mc6, group, ifindex, nic_active) else mc.drop(&sockets[idx].mc6, group, ifindex);
+}
+
+/// IP_ADD_MEMBERSHIP / IP_DROP_MEMBERSHIP on raw socket `idx` (mcast_policy.join4 / drop4); -9 when the socket is gone.
+pub fn mcMembership4(idx: u32, add: bool, group: [4]u8, addr: [4]u8, index: u32, nic_active: bool, our: [4]u8) i64 {
+    const saved = raw_lock.acquire();
+    defer raw_lock.release(saved);
+    if (idx >= MAX_SOCKETS or !sockets[idx].used) return -9;
+    const mc = @import("mcast_policy.zig");
+    const s = &sockets[idx];
+    return if (add) mc.join4(&s.mc4, group, addr, index, nic_active, our) else mc.drop4(&s.mc4, group, addr, index, nic_active, our);
+}
 var raw_lock: IrqSpinlock = .{};
 
 /// Store `bytes` in queue entry `e` (raw_lock held): inline when it fits, else in a free big buffer, else cut to RAW_QUEUE_LEN.

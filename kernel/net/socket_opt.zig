@@ -711,17 +711,19 @@ fn setIpOpt(ref: SockRef, v6_hint: bool, level: u64, optname: u64, optval_ptr: u
 }
 
 /// IPV6_ADD_MEMBERSHIP / IPV6_DROP_MEMBERSHIP with a struct ipv6_mreq (group, then a 32-bit interface index): shorter is EINVAL,
-/// a TCP socket EPROTO (Linux checks the length first); a UDP socket joins or leaves through udp.mcJoin / udp.mcDrop.
+/// a TCP socket EPROTO (Linux checks the length first); a UDP socket joins or leaves through udp.mcJoin / udp.mcDrop, a raw one
+/// through raw_icmp.mcMembership6 (hello500).
 fn setMembership(ref: SockRef, optname: u64, optval_ptr: u64, optlen: u64) i64 {
     if (optlen < 20) return -22;
     if (ref == .tcp) return -71;
-    if (ref != .udp) return -92;
+    if (ref != .udp and ref != .raw) return -92;
     const copy_mod = @import("../mm/copy_from_user.zig");
     if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;
     var mreq: [20]u8 = undefined;
     if (copy_mod.copyFromUser(&mreq, @ptrFromInt(optval_ptr), 20) != 20) return -14;
     const group: [16]u8 = mreq[0..16].*;
     const ifindex = bo.readU32Le(mreq[16..20]);
+    if (ref == .raw) return @import("raw_icmp.zig").mcMembership6(ref.raw, optname == ipo.IPV6_ADD_MEMBERSHIP, group, ifindex, @import("nic.zig").isActive());
     const udp_mod = @import("udp.zig");
     return if (optname == ipo.IPV6_ADD_MEMBERSHIP)
         udp_mod.mcJoin(ref.udp, group, ifindex, @import("nic.zig").isActive())
@@ -735,7 +737,7 @@ fn setMembership4(ref: SockRef, optname: u64, optval_ptr: u64, optlen: u64) i64 
     if (ref == .tcp) return -71;
     // do_ip_setsockopt checks optlen against struct ip_mreq for every socket type first.
     if (optlen < 8) return -22;
-    if (ref != .udp) return -92;
+    if (ref != .udp and ref != .raw) return -92;
     const copy_mod = @import("../mm/copy_from_user.zig");
     if (optval_ptr == 0 or optval_ptr >= 0x0000_8000_0000_0000) return -14;
     var mreq: [12]u8 = @splat(0);
@@ -747,6 +749,7 @@ fn setMembership4(ref: SockRef, optname: u64, optval_ptr: u64, optlen: u64) i64 
     const udp_mod = @import("udp.zig");
     const nic_on = @import("nic.zig").isActive();
     const our = @import("netif.zig").getOurIp();
+    if (ref == .raw) return @import("raw_icmp.zig").mcMembership4(ref.raw, optname == ipo.IP_ADD_MEMBERSHIP, group, addr, index, nic_on, our);
     return if (optname == ipo.IP_ADD_MEMBERSHIP)
         udp_mod.mcJoin4(ref.udp, group, addr, index, nic_on, our)
     else
@@ -754,8 +757,8 @@ fn setMembership4(ref: SockRef, optname: u64, optval_ptr: u64, optlen: u64) i64 
 }
 
 /// Answers a raw socket gives where it differs from a datagram one (measured with CAP_NET_RAW): a raw socket is already "bound" to
-/// its protocol (inet_num), so IPV6_V6ONLY is EINVAL; IP_ROUTER_ALERT is taken (ip_ra_control) and IP_NODEFRAG too; multicast
-/// group membership on an ICMP raw socket is EINVAL (no matching interface); IP_MULTICAST_IF with an address of no interface is
+/// its protocol (inet_num), so IPV6_V6ONLY is EINVAL; IP_ROUTER_ALERT is taken (ip_ra_control) and IP_NODEFRAG too (group
+/// membership goes through setMembership / setMembership4, as for UDP); IP_MULTICAST_IF with an address of no interface is
 /// EADDRNOTAVAIL. Null: as for any socket.
 fn rawSetErrno(level: u64, optname: u64) ?i64 {
     if (level == ipo.SOL_IPV6 and optname == ipo.IPV6_V6ONLY) return -22;

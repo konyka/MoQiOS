@@ -4640,7 +4640,7 @@ test "IPv4 UDP multicast: IP_MULTICAST_* options, group membership, member-only 
     try std.testing.expect(std.mem.indexOf(u8, us, "            port_mc4[i] = port_mc4[num_ports];\n") != null);
     const so = kt.socket_opt_source;
     try std.testing.expect(std.mem.indexOf(u8, so, "(optname == ipo.IP_ADD_MEMBERSHIP or optname == ipo.IP_DROP_MEMBERSHIP)) return setMembership4(ref, optname, optval_ptr, optlen);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, so, "    if (ref == .tcp) return -71;\n    // do_ip_setsockopt checks optlen against struct ip_mreq for every socket type first.\n    if (optlen < 8) return -22;\n    if (ref != .udp) return -92;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "    if (ref == .tcp) return -71;\n    // do_ip_setsockopt checks optlen against struct ip_mreq for every socket type first.\n    if (optlen < 8) return -22;\n    if (ref != .udp and ref != .raw) return -92;\n") != null);
 }
 
 test "multicast outgoing interface: IP_MULTICAST_IF lo sends out lo only, IPV6_MULTICAST_IF lo is ENETUNREACH, IPv4 group delivery checks the arrival interface, each sharing socket sends with its own options (hello363)" {
