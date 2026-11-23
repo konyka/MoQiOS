@@ -11953,7 +11953,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - TDD：hello488 给监听者设阈值 2，给客户端设 TTL / hop-limit 1 和 200 ms SO_SNDTIMEO。宿主机上低值连接返回 EINPROGRESS，阈值 2 的正向连接成功。未修复 MoQiOS 的 A、B 负向项都错误地返回 0，正向项通过。第一版宿主机用例误把 IP_MINTTL 写成 34，得到一次无效失败；按 Linux uapi 改为 21 后 A–B 全部通过。
 - 实现：`handlePacketOpts` 用已有的 `RxMeta.ttl` 过滤已有 IPv4 TCB，`handleIncomingSyn` 过滤监听者的 SYN；`handlePacketV6` / `handleIncomingSynV6` 新增 hop-limit 参数并做同样检查，值由 `net/mod.zig` 的 IPv6 头传入。过滤发生在状态机改变之前。hello488 接入 build、init、qemu_run 和 qemu_smoke，文档中的自动序列终点升至 hello488。
 - 验证：host 全量测试、`zig build`、SMP=2 定向 hello488 和 SMP=2 完整 smoke（到达 shell）均通过。
-- 范围：本次覆盖 TCP 主接收与监听 SYN 路径；Linux 在 `tcp_v4_err` / `tcp_v6_err` 中也检查阈值，本内核的 ICMP 差错路径尚未携带 TTL/hop-limit，这条差异保留为后续项。
+- 范围：本次覆盖 TCP 主接收与监听 SYN 路径；Linux 在 `tcp_v4_err` / `tcp_v6_err` 中也检查阈值，本内核的 ICMP 差错路径当时尚未携带 TTL/hop-limit（后来在 hello496 一节补上）。
 
 
 ## 补充：IP_LOCAL_PORT_RANGE 参与 UDP/TCP 自动端口分配（hello489）
@@ -12007,7 +12007,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：新增 `local_port_sysctl`，以原子 u32 保存范围，默认 49152–65535；写入复用 `devconf_policy.writeInt` 依次解析最多两个整数，只有高 >= 低 >= 1024 且两者不超过 65535 才一次提交，错误不改变原值。procfs/vfs 注册 0644 文件、目录项、读出与写入，fsuid 0 或 CAP_NET_ADMIN 可写。
 - 分配路径：`tcp_port_policy.localPortRange`、UDP/TCP 的范围分配函数显式接收系统范围，再按 inet_sk_get_local_port_range 裁剪套接字端点；生产调用从该 sysctl 读取，原有无范围函数保留默认范围包装。hello493 同时验证无套接字选项的 UDP/TCP 和进一步收窄到 52004–52006 的 UDP。
 - 验证：hello493 宿主机对照、host 全量测试、`zig build` 和 SMP=2 定向 QEMU 均通过；测试结束后恢复 49152–65535；最终 SMP=2 完整 smoke 到达 shell，0 FAIL。
-- 范围：`ip_unprivileged_port_start` 随后由 hello494 补上；`ip_local_reserved_ports` 未实现。
+- 范围：`ip_unprivileged_port_start` 随后由 hello494 补上，`ip_local_reserved_ports` 由 hello495 补上。
 
 
 ## 补充：/proc/sys/net/ipv4/ip_unprivileged_port_start（hello494）
