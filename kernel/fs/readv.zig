@@ -7,12 +7,52 @@ const task_mod = @import("../proc/task.zig");
 const bo = @import("../lib/byte_order.zig");
 const vfs_mod = @import("vfs.zig");
 
+const iov_policy = @import("iovec_policy.zig");
+
 const EBADF: i64 = -9;
 const EFAULT: i64 = 14;
 
+/// The iovec array as Linux's import_iovec sees it before any data moves: its total length, and for a source the readable bytes
+/// from its start up to the first hole. `err` is the call's result when the array itself is unreadable (EFAULT), or an entry has a
+/// negative length (EINVAL) or leaves user space (EFAULT).
+const Scan = struct { err: ?i64 = null, total: usize = 0, readable: usize = 0 };
+
+fn scanIovecs(iov_ptr: u64, iovcnt: u32, want_readable: bool) Scan {
+    var s: Scan = .{};
+    var hole = false;
+    for (0..iovcnt) |i| {
+        var iov_buf: [16]u8 = undefined;
+        if (copy.copyFromUser(&iov_buf, @ptrFromInt(iov_ptr +% @as(u64, @intCast(i)) * 16), 16) < 16) return .{ .err = -EFAULT };
+        const base: u64 = bo.readU64At(&iov_buf, 0);
+        const len: u64 = bo.readU64At(&iov_buf, 8);
+        if (iov_policy.entryError(base, len)) |e| return .{ .err = e };
+        const n: usize = @intCast(@min(len, 0x7FFFFFFF));
+        s.total +|= n;
+        if (want_readable and !hole and n != 0) {
+            const r = copy.readablePrefix(base, n);
+            s.readable += r;
+            hole = r < n;
+        }
+    }
+    return s;
+}
+
+/// The checks every vectored call makes first, in Linux's order: a bad descriptor (EBADF), too many iovecs (EINVAL), none at all
+/// (0, nothing moves), an unreadable array or bad entry (scanIovecs). null means go ahead with `scan`.
+fn precheck(fd: u32, iov_ptr: u64, iovcnt: u32, want_readable: bool, scan: *Scan) ?i64 {
+    const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
+    const cur = task_mod.getTask(cur_idx) orelse return -1;
+    if (fd >= cur.fd_table.fds.len or cur.fd_table.fds[fd].fd_type == .none) return EBADF;
+    if (iovcnt > 1024) return -22;
+    if (iovcnt == 0) return 0;
+    scan.* = scanIovecs(iov_ptr, iovcnt, want_readable);
+    return scan.err;
+}
+
 /// readv(fd, iov_ptr, iovcnt) -> bytes read or -errno.
 pub fn readv(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
-    if (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000 or iovcnt == 0 or iovcnt > 1024) return -22;
+    var scan: Scan = .{};
+    if (precheck(fd, iov_ptr, iovcnt, false, &scan)) |r| return r;
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
@@ -29,7 +69,8 @@ pub fn readv(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
         const iov_base: u64 = bo.readU64At(&iov_buf, 0);
         const iov_len: u64 = bo.readU64At(&iov_buf, 8);
 
-        if (iov_base == 0 or iov_base >= 0x0000_8000_0000_0000 or iov_len == 0) continue;
+        // A NULL base is not skipped: it faults when reached (precheck already refused bases outside user space).
+        if (iov_len == 0) continue;
 
         const n: usize = @intCast(@min(iov_len, 0x7FFFFFFF));
         var pos: usize = 0;
@@ -61,7 +102,8 @@ pub fn readv(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
 
 /// writev(fd, iov_ptr, iovcnt) -> bytes written or -errno.
 pub fn writev(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
-    if (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000 or iovcnt == 0 or iovcnt > 1024) return -22;
+    var scan: Scan = .{};
+    if (precheck(fd, iov_ptr, iovcnt, true, &scan)) |r| return r;
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
 
@@ -71,18 +113,12 @@ pub fn writev(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
     // One writev() covers one contiguous range of a shared description: its offset lock is held across every iovec.
     const held = if (fd < vfs_mod.MAX_FDS) vfs_mod.lockOffset(&cur.fd_table.fds[fd]) else 0;
     defer vfs_mod.unlockOffset(held);
-    // A pipe accounts for the whole writev() as one write (anon_pipe_write sees one iov_iter): its total length, summed first.
+    // A pipe accounts for the whole writev() as one write (anon_pipe_write sees one iov_iter). It copies the source a page at a time
+    // and drops a page whose copy faults, so a source that runs into a hole goes in only as whole pages before the hole (EFAULT when
+    // there are none), however the iovecs split it: the amount is settled before any of it goes in.
     const to_pipe = fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .pipe_write and cur.fd_table.fds[fd].writable;
-    var whole: usize = 0;
-    if (to_pipe) {
-        for (0..iovcnt) |i| {
-            var iov_buf: [16]u8 = undefined;
-            if (copy.copyFromUser(&iov_buf, @ptrFromInt(iov_ptr + @as(u64, @intCast(i)) * 16), 16) < 16) break;
-            const b: u64 = bo.readU64At(&iov_buf, 0);
-            if (b == 0 or b >= 0x0000_8000_0000_0000) continue;
-            whole +|= @intCast(@min(bo.readU64At(&iov_buf, 8), 0x7FFFFFFF));
-        }
-    }
+    const whole: usize = if (to_pipe and scan.readable < scan.total) @import("pipe_slot_policy.zig").faultedWriteTakes(scan.readable) else scan.total;
+    if (to_pipe and whole == 0 and scan.total != 0) return -EFAULT;
     var pipe_part: vfs_mod.PipeWritePart = .{ .total = whole };
     var total: usize = 0;
     for (0..iovcnt) |i| {
@@ -94,15 +130,20 @@ pub fn writev(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
         const iov_base: u64 = bo.readU64At(&iov_buf, 0);
         const iov_len: u64 = bo.readU64At(&iov_buf, 8);
 
-        if (iov_base == 0 or iov_base >= 0x0000_8000_0000_0000 or iov_len == 0) continue;
+        // A NULL base is not skipped: it faults when reached (precheck already refused bases outside user space).
+        if (iov_len == 0) continue;
 
         const n: usize = @intCast(@min(iov_len, 0x7FFFFFFF));
         var pos: usize = 0;
         while (pos < n) {
-            const chunk = @min(n - pos, 4096);
+            const left = if (to_pipe) whole - total - pos else n - pos;
+            if (left == 0) break;
+            const chunk = @min(n - pos, left, 4096);
             var kbuf: [4096]u8 = undefined;
-            const from_user = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(iov_base + pos), chunk);
-            if (from_user == 0) break;
+            // The readable part of the piece: a source that runs into a hole is a short write of the bytes before it, and nothing
+            // readable at all is EFAULT (not 0).
+            const from_user = copy.copyFromUserPrefix(kbuf[0..chunk], iov_base + pos, chunk);
+            if (from_user == 0) return if (total == 0 and pos == 0) -EFAULT else @intCast(total + pos);
             const result = if (to_pipe)
                 vfs_mod.pipeWritePart(cur.fd_table.fds[fd].pipe_idx, &kbuf, from_user, cur.fd_table.fds[fd].status_flags, &pipe_part)
             else
@@ -113,6 +154,7 @@ pub fn writev(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
             }
             pos += @intCast(result);
             if (result < @as(i64, @intCast(from_user))) break;
+            if (from_user < chunk) break;
         }
         total += pos;
         if (pos < n) break;
@@ -122,12 +164,10 @@ pub fn writev(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
 
 /// preadv(fd, iov_ptr, iovcnt, pos_l) -> bytes read or -errno.
 pub fn preadv(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64) i64 {
-    if (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000 or iovcnt == 0 or iovcnt > 1024) return -22;
+    var scan: Scan = .{};
+    if (precheck(fd, iov_ptr, iovcnt, false, &scan)) |r| return r;
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
-
-    // Validate untrusted fd number before indexing the descriptor array.
-    if (fd >= cur.fd_table.fds.len or cur.fd_table.fds[fd].fd_type == .none) return EBADF;
 
     var current_offset = pos_l;
     var total: usize = 0;
@@ -140,7 +180,8 @@ pub fn preadv(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64) i64 {
         const iov_base: u64 = bo.readU64At(&iov_buf, 0);
         const iov_len: u64 = bo.readU64At(&iov_buf, 8);
 
-        if (iov_base == 0 or iov_base >= 0x0000_8000_0000_0000 or iov_len == 0) continue;
+        // A NULL base is not skipped: it faults when reached (precheck already refused bases outside user space).
+        if (iov_len == 0) continue;
 
         const n: usize = @intCast(@min(iov_len, 0x7FFFFFFF));
         var pos: usize = 0;
@@ -176,12 +217,10 @@ pub fn pwritev(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64) i64 {
 }
 
 fn pwritevMode(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64, mode: vfs_mod.FdTable.AppendMode) i64 {
-    if (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000 or iovcnt == 0 or iovcnt > 1024) return -22;
+    var scan: Scan = .{};
+    if (precheck(fd, iov_ptr, iovcnt, false, &scan)) |r| return r;
     const cur_idx = sched_mod.currentTaskIndex() orelse return -1;
     const cur = task_mod.getTask(cur_idx) orelse return -1;
-
-    // Validate untrusted fd number before indexing the descriptor array.
-    if (fd >= cur.fd_table.fds.len or cur.fd_table.fds[fd].fd_type == .none) return EBADF;
 
     const append_call = switch (mode) {
         .descriptor => cur.fd_table.isAppendFile(fd),
@@ -201,15 +240,16 @@ fn pwritevMode(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64, mode: vfs_mod.FdT
         const iov_base: u64 = bo.readU64At(&iov_buf, 0);
         const iov_len: u64 = bo.readU64At(&iov_buf, 8);
 
-        if (iov_base == 0 or iov_base >= 0x0000_8000_0000_0000 or iov_len == 0) continue;
+        // A NULL base is not skipped: it faults when reached (precheck already refused bases outside user space).
+        if (iov_len == 0) continue;
 
         const n: usize = @intCast(@min(iov_len, 0x7FFFFFFF));
         var pos: usize = 0;
         while (pos < n) {
             const chunk = @min(n - pos, 4096);
             var kbuf: [4096]u8 = undefined;
-            const ucopy = copy.copyFromUser(kbuf[0..chunk], @ptrFromInt(iov_base + pos), chunk);
-            if (ucopy == 0) break;
+            const ucopy = copy.copyFromUserPrefix(kbuf[0..chunk], iov_base + pos, chunk);
+            if (ucopy == 0) return if (total == 0 and pos == 0) -EFAULT else @intCast(total + pos);
             const result = cur.fd_table.writeAtOffsetMode(fd, &kbuf, ucopy, current_offset, mode);
             if (result < 0) return if (total == 0 and pos == 0) result else @intCast(total + pos);
             if (result == 0) break;
@@ -218,6 +258,7 @@ fn pwritevMode(fd: u32, iov_ptr: u64, iovcnt: u32, pos_l: u64, mode: vfs_mod.FdT
             if (overflow != 0) return if (total == 0 and pos == 0) -22 else @intCast(total + pos);
             current_offset = advanced;
             if (result < @as(i64, @intCast(ucopy))) break;
+            if (ucopy < chunk) break;
         }
         total += pos;
         if (pos < n) break;

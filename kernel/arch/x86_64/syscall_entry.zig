@@ -6607,6 +6607,12 @@ fn syscallSetitimer(which: u32, new_value_ptr: u64, old_value_ptr: u64) i64 {
 /// store the 4-byte IPv4 address at `out_ptr`. 0 on success; -EFAULT for a bad pointer, -ENOENT for an empty
 /// name or one that did not resolve, -ENAMETOOLONG, -EINVAL for a malformed hostname. The output is written
 /// only on success.
+/// The DNS waits of dns_resolve / dns_resolve_via sleep 1 ms between polls instead of spinning, so a DNS server running on this
+/// CPU (or anything else) gets to run; false when a signal ends the sleep, which ends the query.
+fn dnsSleep() bool {
+    return sleepUntil(@import("../../arch/x86_64/tsc.zig").nanos() + 1_000_000, 0) == 0;
+}
+
 fn syscallDnsResolve(name_ptr: u64, out_ptr: u64) i64 {
     const copy = @import("../../mm/copy_from_user.zig");
     const hp = @import("../../net/hostname_policy.zig");
@@ -6623,7 +6629,7 @@ fn syscallDnsResolve(name_ptr: u64, out_ptr: u64) i64 {
         .too_long => return -36, // ENAMETOOLONG
         .invalid => return -22, // EINVAL
     }
-    const ip = @import("../../net/dns.zig").resolve(hp.stripTrailingDot(name));
+    const ip = @import("../../net/dns.zig").resolveYield(hp.stripTrailingDot(name), dnsSleep);
     if (ip[0] == 0 and ip[1] == 0 and ip[2] == 0 and ip[3] == 0) return -2; // ENOENT: did not resolve
     if (copy.copyToUser(@ptrFromInt(out_ptr), &ip, 4) != 4) return -14;
     return 0;
@@ -6650,7 +6656,7 @@ fn syscallDnsResolveVia(name_ptr: u64, out_ptr: u64, server_ptr: u64) i64 {
         .too_long => return -36, // ENAMETOOLONG
         .invalid => return -22, // EINVAL
     }
-    const ip = @import("../../net/dns.zig").resolveVia(hp.stripTrailingDot(name), server);
+    const ip = @import("../../net/dns.zig").resolveVia(hp.stripTrailingDot(name), server, dnsSleep);
     if (ip[0] == 0 and ip[1] == 0 and ip[2] == 0 and ip[3] == 0) return -2; // ENOENT: did not resolve
     if (copy.copyToUser(@ptrFromInt(out_ptr), &ip, 4) != 4) return -14;
     return 0;

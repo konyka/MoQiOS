@@ -52,6 +52,16 @@ fn newQueryId() u16 {
 /// kernel knows authoritatively (localhost, the slirp gateway) without
 /// depending on a reachable DNS server.
 pub fn resolve(hostname: []const u8) [4]u8 {
+    return resolveYield(hostname, null);
+}
+
+/// How a query waits between polls. A system call passes a function that sleeps for a moment and returns false when a signal
+/// ends the wait: the reply may come from a process on this very CPU (a local DNS server), and spinning inside the system call
+/// would keep it from running until the timeout. null spins (kernel-internal callers, which cannot sleep).
+pub const Yield = ?*const fn () bool;
+
+/// resolve() whose waits go through `yield`.
+pub fn resolveYield(hostname: []const u8, yield: Yield) [4]u8 {
     if (hostname.len == 0 or hostname.len > 63) return .{ 0, 0, 0, 0 };
 
     // Static built-in names first: no NIC, server, or ~2s query timeout.
@@ -78,14 +88,14 @@ pub fn resolve(hostname: []const u8) [4]u8 {
         if (dhcp.isConfigured()) {
             const dhcp_dns = dhcp.getDnsServer();
             if (dhcp_dns[0] != 0) {
-                return queryDns(hostname, dhcp_dns);
+                return queryDns(hostname, dhcp_dns, yield);
             }
         }
         // Fallback to Google DNS
-        return queryDns(hostname, .{ 8, 8, 8, 8 });
+        return queryDns(hostname, .{ 8, 8, 8, 8 }, yield);
     }
 
-    return queryDns(hostname, dns_server);
+    return queryDns(hostname, dns_server, yield);
 }
 
 /// Get the DNS server address (from DHCP or default).
@@ -100,20 +110,20 @@ pub fn getDnsServer() [4]u8 {
 /// Resolve `hostname` through `server` (a nameserver from /etc/resolv.conf, dns_resolve_via). The static table and dotted
 /// literals still answer first, as in resolve(); the shared cache is neither read nor written: an answer from a server one
 /// caller chose must not reach other processes, and a cached answer would not have come from `server`.
-pub fn resolveVia(hostname: []const u8, server: [4]u8) [4]u8 {
+pub fn resolveVia(hostname: []const u8, server: [4]u8, yield: Yield) [4]u8 {
     if (hostname.len == 0 or hostname.len > 63) return .{ 0, 0, 0, 0 };
     if (@import("static_hosts.zig").lookup(hostname)) |ip| return ip;
     if (isIpV4(hostname)) return parseIpV4(hostname);
-    return queryDnsCache(hostname, server, false);
+    return queryDnsCache(hostname, server, false, yield);
 }
 
 /// Send a DNS query and wait for response; the answer goes into the shared cache.
-fn queryDns(hostname: []const u8, dns_server: [4]u8) [4]u8 {
-    return queryDnsCache(hostname, dns_server, true);
+fn queryDns(hostname: []const u8, dns_server: [4]u8, yield: Yield) [4]u8 {
+    return queryDnsCache(hostname, dns_server, true, yield);
 }
 
 /// Send a DNS query and wait for response, caching the answer only when `cache_result`.
-fn queryDnsCache(hostname: []const u8, dns_server: [4]u8, cache_result: bool) [4]u8 {
+fn queryDnsCache(hostname: []const u8, dns_server: [4]u8, cache_result: bool, yield: Yield) [4]u8 {
     var pkt: [512]u8 = @splat(0);
     var offset: usize = 0;
 
@@ -153,7 +163,7 @@ fn queryDnsCache(hostname: []const u8, dns_server: [4]u8, cache_result: bool) [4
         sent = udp.sendTo(dns_server, DNS_PORT, 12345, &pkt, @intCast(offset));
         if (sent) break;
         pumpRx();
-        cpu.pause();
+        if (yield) |y| (if (!y()) return .{ 0, 0, 0, 0 }) else cpu.pause();
     }
     if (!sent) {
         serial.writeString("[DNS] Failed to send query\n");
@@ -181,7 +191,7 @@ fn queryDnsCache(hostname: []const u8, dns_server: [4]u8, cache_result: bool) [4
                 return result;
             }
         }
-        cpu.pause();
+        if (yield) |y| (if (!y()) return .{ 0, 0, 0, 0 }) else cpu.pause();
     }
 
     serial.writeString("[DNS] Query timeout for ");

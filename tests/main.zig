@@ -2013,7 +2013,7 @@ test "dns_resolve: hostname syntax, error codes, and the order of checks" {
     const out_ok = std.mem.indexOf(u8, body, "if (!copy.validateUserBufferWritable(out_ptr, 4)) return -14;").?;
     const name_in = std.mem.indexOf(u8, body, "const name = switch (userPathResult(name_ptr, &buf)) {").?;
     const verdict = std.mem.indexOf(u8, body, "switch (hp.check(name)) {").?;
-    const resolve = std.mem.indexOf(u8, body, "@import(\"../../net/dns.zig\").resolve(hp.stripTrailingDot(name))").?;
+    const resolve = std.mem.indexOf(u8, body, "@import(\"../../net/dns.zig\").resolveYield(hp.stripTrailingDot(name), dnsSleep)").?;
     const write = std.mem.indexOf(u8, body, "if (copy.copyToUser(@ptrFromInt(out_ptr), &ip, 4) != 4) return -14;").?;
     try std.testing.expect(out_ok < name_in and name_in < verdict and verdict < resolve and resolve < write);
     try std.testing.expect(std.mem.indexOf(u8, body, ".empty => return -2, // ENOENT") != null);
@@ -2022,6 +2022,23 @@ test "dns_resolve: hostname syntax, error codes, and the order of checks" {
     try std.testing.expect(std.mem.indexOf(u8, body, "return -2; // ENOENT: did not resolve") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "495 => { // dns_resolve(name, out4)") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.moqi_syscalls_header, "#define SYS_dns_resolve 495") != null);
+}
+
+test "dns: the wait for a reply gives the CPU away, so a server on the same CPU can answer (hello514, CI 0023b86)" {
+    // CI's SMP=1 smoke failed hello514 B/F: the query was sent to a DNS server in another process on the same CPU, and the kernel
+    // waited for the reply by spinning inside the system call (pumpRx + pause, interrupts masked), so the server never ran until
+    // the 2 s timeout; it then answered a query nobody was waiting for any more. The wait now sleeps 1 ms between polls when the
+    // system call supplies a way to sleep (the x86_64 syscall layer passes sleepUntil); kernel-internal callers keep the spin.
+    const dns = kt.dns_source;
+    try std.testing.expect(std.mem.indexOf(u8, dns, "pub const Yield = ?*const fn () bool;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn resolveVia(hostname: []const u8, server: [4]u8, yield: Yield) [4]u8 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn resolveYield(hostname: []const u8, yield: Yield) [4]u8 {") != null);
+    // Both waits (sending through ARP, and the reply) yield, and a fatal/handled signal during the sleep ends the query.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, dns, "if (yield) |y| (if (!y()) return .{ 0, 0, 0, 0 }) else cpu.pause();"));
+    const se = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, se, "@import(\"../../net/dns.zig\").resolveYield(hp.stripTrailingDot(name), dnsSleep)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "@import(\"../../net/dns.zig\").resolveVia(hp.stripTrailingDot(name), server, dnsSleep)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "fn dnsSleep() bool {\n    return sleepUntil(@import(\"../../arch/x86_64/tsc.zig\").nanos() + 1_000_000, 0) == 0;\n}") != null);
 }
 
 test "dns: a reply that answers the query ends the wait, also when it says there is no such name (hello514)" {
@@ -2063,7 +2080,7 @@ test "dns_resolve_via: a caller-chosen nameserver, and the shared cache stays ou
     const srv_in = std.mem.indexOf(u8, body, "if (copy.copyFromUser(&server, @ptrFromInt(server_ptr), 4) != 4) return -14;").?;
     const srv_ok = std.mem.indexOf(u8, body, "if (!dp.serverUsable(server)) return -22;").?;
     const name_in = std.mem.indexOf(u8, body, "const name = switch (userPathResult(name_ptr, &buf)) {").?;
-    const res = std.mem.indexOf(u8, body, "@import(\"../../net/dns.zig\").resolveVia(hp.stripTrailingDot(name), server)").?;
+    const res = std.mem.indexOf(u8, body, "@import(\"../../net/dns.zig\").resolveVia(hp.stripTrailingDot(name), server, dnsSleep)").?;
     try std.testing.expect(out_ok < srv_in and srv_in < srv_ok and srv_ok < name_in and name_in < res);
     try std.testing.expect(std.mem.indexOf(u8, src, "506 => { // dns_resolve_via(name, out4, server4)") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.moqi_syscalls_header, "#define SYS_dns_resolve_via 506") != null);
@@ -2073,7 +2090,7 @@ test "dns_resolve_via: a caller-chosen nameserver, and the shared cache stays ou
     const rv_end = std.mem.indexOfPos(u8, dns, rv, "\n}\n").?;
     const rv_body = dns[rv..rv_end];
     try std.testing.expect(std.mem.indexOf(u8, rv_body, "lookupCache(") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rv_body, "return queryDnsCache(hostname, server, false);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rv_body, "return queryDnsCache(hostname, server, false, yield);") != null);
     // queryDns keeps caching for the default path only.
     try std.testing.expect(std.mem.indexOf(u8, dns, "if (cache_result) addToCache(hostname, result, 300);") != null);
 }
@@ -18282,4 +18299,24 @@ test "if_inet6 policy: /proc/net/if_inet6 lines use if6_seq_show's layout (Linux
     try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".net_if_inet6 => @intCast(@import(\"../net/ndp.zig\").formatIfInet6(buf[0..max_len], @import(\"../net/nic.zig\").isActive(), @import(\"../net/netif.zig\").getMac())),") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".{ .name = \"if_inet6\", .dtype = DT_REG }") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "} else if (str.eql(rest, \"net/if_inet6\")) {") != null);
+}
+
+test "vectored calls check the whole iovec array first and fault instead of returning 0 (hello517)" {
+    const ip = kt.iovec_policy;
+    try std.testing.expectEqual(@as(?i64, null), ip.entryError(0, 8));
+    try std.testing.expectEqual(@as(?i64, null), ip.entryError(0x1000, 0));
+    try std.testing.expectEqual(@as(?i64, -14), ip.entryError(0xffff_8000_0000_0000, 8));
+    try std.testing.expectEqual(@as(?i64, -14), ip.entryError(0xffff_8000_0000_0000, 0));
+    try std.testing.expectEqual(@as(?i64, -14), ip.entryError(0x7fff_ffff_f000, 0x2000));
+    try std.testing.expectEqual(@as(?i64, -22), ip.entryError(0x1000, @as(u64, 1) << 63));
+    try std.testing.expectEqual(@as(?i64, -14), ip.entryError(0x1000, @as(u64, 1) << 62));
+    const r = kt.readv_source;
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, r, "iov_base == 0 or"));
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, r, "if (precheck(fd, iov_ptr, iovcnt, "));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, r, "if (from_user == 0) break;"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, r, "if (ucopy == 0) break;"));
+    try std.testing.expect(std.mem.indexOf(u8, r, "const from_user = copy.copyFromUserPrefix(kbuf[0..chunk], iov_base + pos, chunk);\n            if (from_user == 0) return if (total == 0 and pos == 0) -EFAULT else @intCast(total + pos);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "const ucopy = copy.copyFromUserPrefix(kbuf[0..chunk], iov_base + pos, chunk);\n            if (ucopy == 0) return if (total == 0 and pos == 0) -EFAULT else @intCast(total + pos);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "const whole: usize = if (to_pipe and scan.readable < scan.total) @import(\"pipe_slot_policy.zig\").faultedWriteTakes(scan.readable) else scan.total;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.copy_from_user_source, "pub fn readablePrefix(addr: u64, len: usize) usize {") != null);
 }

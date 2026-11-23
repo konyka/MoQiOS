@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello516`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello517`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -492,6 +492,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello495 | net.ipv4.ip_local_reserved_ports：写入并读回 52000,52002-52004，保留端口仍可显式 bind（B）；限制自动范围为 52000–52010 后 UDP/TCP 都分到未保留端口（C、D）；倒置范围和 65536 为 EINVAL 且不改值（E）；换行清空（F），最后恢复两个 sysctl（G） |
 | hello496 | TCP ICMP 差错的 IP_MINTTL / IPV6_MINHOPCOUNT：阈值 2、连接保持 SYN_SENT 时，低于阈值的 host-unreachable 被忽略，达到阈值才报告 EHOSTUNREACH；IPv4 改变被引用报文的 TTL（A），IPv6 改变 ICMPv6 外层 hop limit（B），与 Linux 两条错误路径的实际数据来源一致 |
 | hello498 | clone 的 CLONE_SIGHAND / CLONE_FS：不带 CLONE_VM 的 CLONE_SIGHAND、不带 CLONE_SIGHAND 的 CLONE_THREAD 为 EINVAL（A）；CLONE_VM\|FS\|FILES\|SIGHAND\|THREAD 线程看到创建者之后的 chdir 和 sigaction（B），创建者也看到线程的修改（C） |
+| hello517 | `writev`/`pwritev`/`pwritev2` 的源不可读：普通文件 `writev` 的 {可读 8, 坏地址 8} 写 8、{坏, 可读} 为 `EFAULT`（不是 0）、iovec 跨进空洞写到空洞前（A）；`pwritev` 相同（B）；`pwritev2` 偏移 0 与 -1 相同（E）；管道 `writev` 只收空洞前的整页：{可读 8, 坏 8} 和 {坏, 可读} 都是 `EFAULT`，{可读一页, 坏 8} 收 4096（C）；`readv`/`preadv` 先读进可读的那个，第一个坏为 `EFAULT`（D）；整个 iovec 数组先检查：基址为 NULL 不跳过（到它时 `EFAULT`）、基址在用户空间之外为 `EFAULT`、长度为负为 `EINVAL`、0 个 iovec 返回 0（F） |
 | hello516 | 系统调用读取进程还没碰过的栈页：从未写过的栈页经 `write()` 发出 64 个零（A）；从已写的页跨进未写的页，先是数据后是零（B）；从未映射地址和 `PROT_NONE` 映射 `write()` 为 `EFAULT`（不是 0）（C）；源缓冲区跨进空洞：写普通文件（`write`、`pwrite`）为短写 4 字节，写管道为 `EFAULT`（D）；空管道只收空洞之前的整页：8192 字节收 8192，4096 字节收 4096（E） |
 | hello515 | 系统调用写入进程还没碰过的栈页：管道读到 32 KiB 以下、从未写过的栈页（A）；`getcwd` 写到这样的页（B）；管道读到新 `MAP_ANONYMOUS` 映射的第 5 页（C）；跨越已写页与未写页边界的管道读（D）；`PROT_READ`、未映射地址和 `PROT_NONE` 仍为 `EFAULT`（E） |
 | hello514 | `/etc/resolv.conf` 的 nameserver：写入只列 127.0.0.1 的 resolv.conf，并在子进程里于 127.0.0.1:53 起一个一次性 DNS 服务器（A）；`gethostbyname` 一个未知名字由这个服务器回答 10.5.14.1，说明查询走的是 resolv.conf 的服务器而不是 DHCP 的（B）；服务器收到的正是这两个名字的 A 查询（C）；`dns_resolve_via`（506）对 0.0.0.0、广播、组播服务器为 `EINVAL`，NULL 服务器为 `EFAULT`（D）；服务器回答 NXDOMAIN 的名字为 `HOST_NOT_FOUND`，并立即返回（E）；第一个服务器不应答时用第二个（F）；清理（G） |

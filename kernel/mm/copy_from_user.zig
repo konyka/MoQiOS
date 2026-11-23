@@ -177,6 +177,20 @@ pub fn copyFromUserPrefix(dst: []u8, src_user: u64, count: usize) usize {
     return done;
 }
 
+/// How many bytes from `addr` can be read before the first page that cannot (faulting in untouched pages as a copy would), up to
+/// `len`, without copying them. writev() to a pipe uses it to size the write before any of it goes in.
+pub fn readablePrefix(addr: u64, len: usize) usize {
+    const root = activeRoot();
+    var done: usize = 0;
+    while (done < len) {
+        const a = addr +% done;
+        if (!validateUserRange(a, 1)) break;
+        if (!userPageMapped(root, a & ~@as(u64, 0xFFF))) break;
+        done += @min(0x1000 - @as(usize, @intCast(a & 0xFFF)), len - done);
+    }
+    return done;
+}
+
 /// Copy a user C string into `dst`, stopping at the NUL or when `dst` is full.
 ///
 /// A fixed-count copy fails outright when the string ends near the end of a
