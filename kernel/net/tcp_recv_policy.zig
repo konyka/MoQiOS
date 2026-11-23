@@ -520,24 +520,43 @@ pub fn zeroWindowState(state: TcpState) bool {
 /// tcp_notsent_lowat: the socket's value, or the sysctl default (UINT_MAX: no limit) when it is 0. The value is kept as the int the
 /// caller gave and used as a u32, so a negative one is a very large limit.
 pub fn notsentLimit(lowat: i32) u32 {
-    return if (lowat == 0) std.math.maxInt(u32) else @bitCast(lowat);
+    return notsentLimitWith(lowat, std.math.maxInt(u32));
+}
+
+/// notsentLimit with the net.ipv4.tcp_notsent_lowat value `sysctl` taking the place of an unset (0) socket value.
+pub fn notsentLimitWith(lowat: i32, sysctl: u32) u32 {
+    return if (lowat == 0) sysctl else @bitCast(lowat);
 }
 
 /// sk_stream_memory_free (wake 0): a send may queue more while the bytes written but not yet sent are below the limit.
 pub fn notsentAllowsQueue(unsent: u32, lowat: i32) bool {
-    return unsent < notsentLimit(lowat);
+    return notsentAllowsQueueWith(unsent, lowat, std.math.maxInt(u32));
+}
+
+pub fn notsentAllowsQueueWith(unsent: u32, lowat: i32, sysctl: u32) bool {
+    return unsent < notsentLimitWith(lowat, sysctl);
 }
 
 /// tcp_poll (__sk_stream_is_writeable with wake 1): the socket reports writable only while twice the unsent bytes are below it.
 pub fn notsentWritable(unsent: u32, lowat: i32) bool {
-    return (@as(u64, unsent) << 1) < notsentLimit(lowat);
+    return notsentWritableWith(unsent, lowat, std.math.maxInt(u32));
+}
+
+pub fn notsentWritableWith(unsent: u32, lowat: i32, sysctl: u32) bool {
+    return (@as(u64, unsent) << 1) < notsentLimitWith(lowat, sysctl);
 }
 
 /// tcp_event_new_data_sent -> tcp_check_space -> sk_stream_write_space: data that just went out (a window opened, cwnd grew) lowered
 /// the unsent bytes from `before` to `after`; blocked writers and pollers are told when that made the socket writable by the
 /// TCP_NOTSENT_LOWAT poll rule. Without a limit the ACK that freed ring space already told them.
 pub fn notsentWakeOnSend(before: u32, after: u32, lowat: i32) bool {
-    return lowat != 0 and after < before and !notsentWritable(before, lowat) and notsentWritable(after, lowat);
+    return notsentWakeOnSendWith(before, after, lowat, std.math.maxInt(u32));
+}
+
+/// notsentWakeOnSend with the net.ipv4.tcp_notsent_lowat value: a socket limited only by the sysctl is woken the same way.
+pub fn notsentWakeOnSendWith(before: u32, after: u32, lowat: i32, sysctl: u32) bool {
+    if (notsentLimitWith(lowat, sysctl) == std.math.maxInt(u32)) return false;
+    return after < before and !notsentWritableWith(before, lowat, sysctl) and notsentWritableWith(after, lowat, sysctl);
 }
 
 // ── TCP_LINGER2 and the orphan in FIN_WAIT2 (Linux do_tcp_setsockopt, tcp_fin_time, tcp_close, tcp_rcv_state_process) ──

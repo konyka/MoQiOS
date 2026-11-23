@@ -94,6 +94,7 @@ test {
     _ = @import("icmp_min_ttl_test.zig");
     _ = @import("tcp_ack_window_test.zig");
     _ = @import("raw_mc_match_test.zig");
+    _ = @import("notsent_sysctl_test.zig");
 }
 
 test "sync syscall propagates aggregate writeback failure as EIO" {
@@ -14313,7 +14314,7 @@ test "procfs: /proc/net, /proc/sys, /proc/sys/net and /proc/sys/net/ipv4 are dir
     try std.testing.expect(std.mem.indexOf(u8, pf, ".net_dir => &.{.{ .name = \"arp\", .dtype = DT_REG }},") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_dir => &.{ .{ .name = \"fs\", .dtype = DT_DIR }, .{ .name = \"net\", .dtype = DT_DIR } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_net_dir => &.{ .{ .name = \"ipv4\", .dtype = DT_DIR }, .{ .name = \"ipv6\", .dtype = DT_DIR } },") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ip_local_port_range\", .dtype = DT_REG }, .{ .name = \"ip_local_reserved_ports\", .dtype = DT_REG }, .{ .name = \"ip_unprivileged_port_start\", .dtype = DT_REG }, .{ .name = \"ip_nonlocal_bind\", .dtype = DT_REG }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ip_local_port_range\", .dtype = DT_REG }, .{ .name = \"ip_local_reserved_ports\", .dtype = DT_REG }, .{ .name = \"ip_unprivileged_port_start\", .dtype = DT_REG }, .{ .name = \"ip_nonlocal_bind\", .dtype = DT_REG }, .{ .name = \"ping_group_range\", .dtype = DT_REG }, .{ .name = \"tcp_notsent_lowat\", .dtype = DT_REG } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "return file == .root_dir or file == .pid_dir or file == .mount_dir or file == .fd_dir or isSubdir(file);") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "if (std.mem.eql(u8, body, \"sys/net/ipv4\")) return .sys_ipv4_dir;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.getdents_source, "procfs.subdirEntryAt(desc.proc_file_type, pos)") != null);
@@ -14475,7 +14476,7 @@ test "devconf policy: net.ipv4.conf.<dev>.proxy_arp paths, proc_dointvec writes,
     try std.testing.expect(std.mem.indexOf(u8, io, ".toggle => |d| {") != null);
     try std.testing.expect(std.mem.indexOf(u8, io, "arp.setProxyArp(arp.confDev(d), if (cmd == ap.SIOCSARP) 1 else 0);") != null);
     const pf = kt.procfs_source;
-    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ip_local_port_range\", .dtype = DT_REG }, .{ .name = \"ip_local_reserved_ports\", .dtype = DT_REG }, .{ .name = \"ip_unprivileged_port_start\", .dtype = DT_REG }, .{ .name = \"ip_nonlocal_bind\", .dtype = DT_REG }, .{ .name = \"ping_group_range\", .dtype = DT_REG } },") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ip_local_port_range\", .dtype = DT_REG }, .{ .name = \"ip_local_reserved_ports\", .dtype = DT_REG }, .{ .name = \"ip_unprivileged_port_start\", .dtype = DT_REG }, .{ .name = \"ip_nonlocal_bind\", .dtype = DT_REG }, .{ .name = \"ping_group_range\", .dtype = DT_REG }, .{ .name = \"tcp_notsent_lowat\", .dtype = DT_REG } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".conf_file => @intCast(@import(\"../net/arp.zig\").confRead(@import(\"../net/devconf_policy.zig\").decode(pid), buf[0..@min(max_len, 16)])),") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, "pub fn isSysctl(file: ProcFile) bool {") != null);
     const vs = kt.vfs_source;
@@ -15908,8 +15909,8 @@ test "TCP_NOTSENT_LOWAT (hello416): Linux tcp_stream_memory_free / tcp_poll / do
     const ts = kt.tcp_source;
     // Every path that queues send data, and the blocking writer's wait, use the same room.
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, ts, "sendRoom(tcb)"));
-    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!tcp_recv_policy.notsentAllowsQueue(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat)) return 0;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!tcp_recv_policy.notsentWritable(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat)) 0 else") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!tcp_recv_policy.notsentAllowsQueueWith(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat, @import(\"notsent_lowat_sysctl.zig\").get())) return 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!tcp_recv_policy.notsentWritableWith(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat, @import(\"notsent_lowat_sysctl.zig\").get())) 0 else") != null);
 }
 
 test "TCP_NOTSENT_LOWAT wake on new data sent (hello420): Linux tcp_event_new_data_sent -> tcp_check_space -> sk_stream_write_space" {
@@ -15923,7 +15924,7 @@ test "TCP_NOTSENT_LOWAT wake on new data sent (hello420): Linux tcp_event_new_da
     try std.testing.expect(!rp.notsentWakeOnSend(1500, 0, 0));
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "const unsent_before = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ts, "defer if (tcp_recv_policy.notsentWakeOnSend(unsent_before, ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat)) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "defer if (tcp_recv_policy.notsentWakeOnSendWith(unsent_before, ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat, @import(\"notsent_lowat_sysctl.zig\").get())) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "write_space_pending.set(tcbIdx(tcb));") != null);
     // The EPOLLOUT notes are sent after tcp_lock is released, wherever the lock is released.
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (!write_space_pending.isEmpty()) ws = write_space_pending.takeAll();") != null);

@@ -618,6 +618,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello499"); /* IPv6 raw connect scope and route */
     run_test("hello500"); /* multicast membership on raw sockets */
     run_test("hello501"); /* writable /proc/<pid>/comm */
+    run_test("hello502"); /* net.ipv4.tcp_notsent_lowat */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

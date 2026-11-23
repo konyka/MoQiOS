@@ -139,6 +139,28 @@ pub fn writeInt(text: []const u8) IntWrite {
 }
 
 /// The text a conf file reads: the value and a newline. Returns the bytes written.
+pub const UintWrite = struct { ret: i64, value: ?u32 = null };
+
+/// proc_douintvec's parse of one unsigned int: as writeInt, but a minus sign is EINVAL and the limit is UINT_MAX.
+pub fn writeUint(text: []const u8) UintWrite {
+    if (text.len == 0) return .{ .ret = 0 };
+    const p = text[0..@min(text.len, 4095)];
+    var i: usize = 0;
+    while (i < p.len and isSpace(p[i])) i += 1;
+    if (i >= p.len) return .{ .ret = EINVAL };
+    const left = p.len - i;
+    const window = p[i .. i + @min(left, 21)];
+    var j: usize = 0;
+    if (!std.ascii.isDigit(window[0])) return .{ .ret = EINVAL };
+    const u = parseUlong(window, &j) orelse return .{ .ret = EINVAL };
+    if (j == 21) return .{ .ret = EINVAL };
+    if (j < left and !isSep(window[j])) return .{ .ret = EINVAL };
+    if (u > std.math.maxInt(u32)) return .{ .ret = EINVAL };
+    i += j;
+    while (i < p.len and isSpace(p[i])) i += 1;
+    return .{ .ret = @intCast(text.len - (p.len - i)), .value = @intCast(u) };
+}
+
 pub fn formatInt(out: []u8, v: i32) usize {
     const s = std.fmt.bufPrint(out, "{d}\n", .{v}) catch return 0;
     return s.len;

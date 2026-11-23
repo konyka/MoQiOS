@@ -3968,7 +3968,7 @@ fn sendFromUser(tcb_idx: u32, user_addr: u64, len: u32, oob: bool) i64 {
 /// When TCP_CORK is set, only full MSS segments are sent (partial segments are held).
 fn flushSendBuffer(tcb: *TcpTcb) void {
     const unsent_before = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
-    defer if (tcp_recv_policy.notsentWakeOnSend(unsent_before, ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat)) {
+    defer if (tcp_recv_policy.notsentWakeOnSendWith(unsent_before, ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat, @import("notsent_lowat_sysctl.zig").get())) {
         markSendWake(tcb);
         write_space_pending.set(tcbIdx(tcb));
     };
@@ -5309,7 +5309,7 @@ fn sendLimit(tcb: *const TcpTcb) u32 {
 /// Room a send may fill now: the ring's free space under sendLimit, and none once the bytes not yet sent reach TCP_NOTSENT_LOWAT
 /// (sk_stream_memory_free).
 fn sendRoom(tcb: *const TcpTcb) u32 {
-    if (!tcp_recv_policy.notsentAllowsQueue(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat)) return 0;
+    if (!tcp_recv_policy.notsentAllowsQueueWith(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat, @import("notsent_lowat_sysctl.zig").get())) return 0;
     return tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb));
 }
 
@@ -5424,7 +5424,7 @@ pub fn tcpReadiness(tcb_idx: u32) u32 {
         .state = tcb.state,
         .recv_bytes = readableLocked(tcb),
         .urgent = tcb.urg_state == .valid,
-        .send_space = if (!tcp_recv_policy.notsentWritable(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat)) 0 else tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb)),
+        .send_space = if (!tcp_recv_policy.notsentWritableWith(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat, @import("notsent_lowat_sysctl.zig").get())) 0 else tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb)),
         .reset_by_peer = tcb.reset_by_peer,
         .shut_rd = tcb.shut_rd,
         .fin_pending = tcb.fin_pending,

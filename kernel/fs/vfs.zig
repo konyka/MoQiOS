@@ -1205,6 +1205,7 @@ fn sysctlWrite(desc: *FileDescriptor, buf: [*]const u8, count: usize, offset: u6
         .ip_local_port_range => @import("../net/local_port_sysctl.zig").write(text),
         .ip_local_reserved_ports => @import("../net/reserved_port_policy.zig").write(text, offset == 0),
         .ip_unprivileged_port_start => @import("../net/local_port_sysctl.zig").writeUnprivilegedStart(text),
+        .tcp_notsent_lowat => @import("../net/notsent_lowat_sysctl.zig").write(text),
         .auto_flowlabels => autoFlowlabelsWrite(text),
         .pipe_max_size => blk: {
             const w = @import("fcntl_policy.zig").parsePipeMaxSize(text);
@@ -2027,7 +2028,7 @@ pub const FdTable = struct {
                     return -13; // EACCES
                 }
                 pfile = if (str.eql(rest, "sys/fs/pipe-max-size")) .pipe_max_size else if (str.eql(rest, "sys/fs/pipe-user-pages-hard")) .pipe_user_pages_hard else .pipe_user_pages_soft;
-            } else if (str.eql(rest, "sys/net/ipv4/ip_local_port_range") or str.eql(rest, "sys/net/ipv4/ip_unprivileged_port_start") or str.eql(rest, "sys/net/ipv4/ip_local_reserved_ports")) {
+            } else if (str.eql(rest, "sys/net/ipv4/ip_local_port_range") or str.eql(rest, "sys/net/ipv4/ip_unprivileged_port_start") or str.eql(rest, "sys/net/ipv4/ip_local_reserved_ports") or str.eql(rest, "sys/net/ipv4/tcp_notsent_lowat")) {
                 if (is_writable and euid != 0 and !effective_caps.cap_net_admin) {
                     self.freeFd(slot);
                     return -13; // EACCES
@@ -2036,6 +2037,8 @@ pub const FdTable = struct {
                     .ip_local_port_range
                 else if (str.eql(rest, "sys/net/ipv4/ip_unprivileged_port_start"))
                     .ip_unprivileged_port_start
+                else if (str.eql(rest, "sys/net/ipv4/tcp_notsent_lowat"))
+                    .tcp_notsent_lowat
                 else
                     .ip_local_reserved_ports;
             } else if (str.eql(rest, "sys/net/ipv4/ip_nonlocal_bind") or str.eql(rest, "sys/net/ipv6/ip_nonlocal_bind")) {
