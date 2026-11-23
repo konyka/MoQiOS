@@ -6685,15 +6685,15 @@ fn syscallDnsQuery(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_ms: u64
 
 /// dns_query (507, A records, `out` 4 bytes) or dns_query6 (509, AAAA records, `out` 16 bytes): the same checks and results. An IPv4
 /// literal or a static name has no AAAA record (-ENODATA).
-fn syscallDnsQueryType(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_ms: u64, ans_ptr: u64, ans_len: u64, v6: bool) i64 {
+fn syscallDnsQueryType(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_arg: u64, ans_ptr: u64, ans_len: u64, v6: bool) i64 {
     const copy = @import("../../mm/copy_from_user.zig");
     const hp = @import("../../net/hostname_policy.zig");
     const dp = @import("../../net/dns_policy.zig");
     const out_len: usize = if (v6) 16 else 4;
     if (!copy.validateUserBufferWritable(out_ptr, out_len)) return -14; // EFAULT, before any network wait
-    var server: [4]u8 = undefined;
-    if (copy.copyFromUser(&server, @ptrFromInt(server_ptr), 4) != 4) return -14;
-    if (!dp.serverUsable(server)) return -22;
+    const timeout_ms = timeout_arg & ~dp.SERVER6_FLAG;
+    const server = readDnsServer(server_ptr, timeout_arg) orelse return -22;
+    if (server == .fault) return -14;
     if (!dp.timeoutValid(timeout_ms)) return -22;
     if (ans_len != 0 and ans_len < 256) return -34; // ERANGE
     if (ans_len != 0 and !copy.validateUserBufferWritable(ans_ptr, @intCast(@min(ans_len, 4096)))) return -14;
@@ -6712,9 +6712,9 @@ fn syscallDnsQueryType(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_ms:
     var ans: da.Answer = .{};
     const dns = @import("../../net/dns.zig");
     const r = if (v6)
-        dns.queryVia6(hp.stripTrailingDot(name), server, timeout_ms * 1_000_000, dnsSleep, &ans)
+        dns.queryVia6(hp.stripTrailingDot(name), server.ok, timeout_ms * 1_000_000, dnsSleep, &ans)
     else
-        dns.queryVia(hp.stripTrailingDot(name), server, timeout_ms * 1_000_000, dnsSleep, &ans);
+        dns.queryVia(hp.stripTrailingDot(name), server.ok, timeout_ms * 1_000_000, dnsSleep, &ans);
     if (r.outcome != .answer) return dp.queryResult(r.outcome);
     if (copy.copyToUser(@ptrFromInt(out_ptr), ans.addrs[0][0..out_len], out_len) != out_len) return -14;
     if (ans_len != 0) {
@@ -6725,11 +6725,33 @@ fn syscallDnsQueryType(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_ms:
     return 0;
 }
 
+/// The nameserver of dns_query, dns_query6 or dns_ptr: 4 bytes at `server_ptr`, or 16 when SERVER6_FLAG is set in `timeout_arg`
+/// (an IPv4-mapped one is asked over IPv4). null for an address that is not a unicast server (EINVAL); .fault for a bad pointer.
+const DnsServerArg = union(enum) { ok: @import("../../net/dns.zig").Server, fault };
+fn readDnsServer(server_ptr: u64, timeout_arg: u64) ?DnsServerArg {
+    const copy = @import("../../mm/copy_from_user.zig");
+    const dp = @import("../../net/dns_policy.zig");
+    if (timeout_arg & dp.SERVER6_FLAG != 0) {
+        var s6: [16]u8 = undefined;
+        if (copy.copyFromUser(&s6, @ptrFromInt(server_ptr), 16) != 16) return .fault;
+        if (dp.mappedV4(s6)) |s4| {
+            if (!dp.serverUsable(s4)) return null;
+            return .{ .ok = .{ .v4 = s4 } };
+        }
+        if (!dp.serverUsable6(s6)) return null;
+        return .{ .ok = .{ .v6 = s6 } };
+    }
+    var s4: [4]u8 = undefined;
+    if (copy.copyFromUser(&s4, @ptrFromInt(server_ptr), 4) != 4) return .fault;
+    if (!dp.serverUsable(s4)) return null;
+    return .{ .ok = .{ .v4 = s4 } };
+}
+
 /// dns_ptr(addr, family, server4, timeout_ms, name_out, name_len): the host name of `addr` (4 bytes for AF_INET 2, 16 for
 /// AF_INET6 10) from a PTR query to `server4`, NUL-terminated into `name_out`. Results as dns_query: 0, -ENOENT, -ENODATA, -EAGAIN,
 /// -ECONNREFUSED, -EPROTO (a reply with no PTR for the name), -ETIMEDOUT, -EINTR; -EAFNOSUPPORT for another family, -ERANGE when
 /// `name_len` is under 256 (before any query), EINVAL/EFAULT as dns_query.
-fn syscallDnsPtr(addr_ptr: u64, family: u64, server_ptr: u64, timeout_ms: u64, out_ptr: u64, out_len: u64) i64 {
+fn syscallDnsPtr(addr_ptr: u64, family: u64, server_ptr: u64, timeout_arg: u64, out_ptr: u64, out_len: u64) i64 {
     const copy = @import("../../mm/copy_from_user.zig");
     const dp = @import("../../net/dns_policy.zig");
     const alen: usize = switch (family) {
@@ -6741,13 +6763,13 @@ fn syscallDnsPtr(addr_ptr: u64, family: u64, server_ptr: u64, timeout_ms: u64, o
     if (!copy.validateUserBufferWritable(out_ptr, 256)) return -14;
     var addr: [16]u8 = undefined;
     if (copy.copyFromUser(addr[0..alen], @ptrFromInt(addr_ptr), alen) != alen) return -14;
-    var server: [4]u8 = undefined;
-    if (copy.copyFromUser(&server, @ptrFromInt(server_ptr), 4) != 4) return -14;
-    if (!dp.serverUsable(server)) return -22;
+    const timeout_ms = timeout_arg & ~dp.SERVER6_FLAG;
+    const server = readDnsServer(server_ptr, timeout_arg) orelse return -22;
+    if (server == .fault) return -14;
     if (!dp.timeoutValid(timeout_ms)) return -22;
     const da = @import("../../net/dns_answer.zig");
     var ans: da.Answer = .{};
-    const r = @import("../../net/dns.zig").queryPtr(addr[0..alen], server, timeout_ms * 1_000_000, dnsSleep, &ans);
+    const r = @import("../../net/dns.zig").queryPtr(addr[0..alen], server.ok, timeout_ms * 1_000_000, dnsSleep, &ans);
     if (r.outcome != .answer) return dp.queryResult(r.outcome);
     const name = ans.canonName();
     var nb: [256]u8 = undefined;

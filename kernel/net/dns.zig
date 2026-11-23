@@ -138,6 +138,9 @@ fn queryDnsCache(hostname: []const u8, dns_server: [4]u8, cache_result: bool, yi
     return r.ip;
 }
 
+/// A nameserver: IPv4, or IPv6 (/etc/resolv.conf "nameserver ::1"; glibc asks it over IPv6, measured).
+pub const Server = union(enum) { v4: [4]u8, v6: [16]u8 };
+
 /// How one query ended, with the address when it answered.
 pub const Result = struct { outcome: dns_policy.Outcome, ip: [4]u8 = .{ 0, 0, 0, 0 } };
 
@@ -145,19 +148,19 @@ pub const Result = struct { outcome: dns_policy.Outcome, ip: [4]u8 = .{ 0, 0, 0,
 /// user space that applies resolv.conf's timeout, attempts and server order itself. Literals and the static table answer
 /// first, as in resolveVia; the shared cache is neither read nor written.
 /// `ans` receives every address of the reply and the CNAME chain (dns_answer), or the one address of a literal or static name.
-pub fn queryVia(hostname: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {
+pub fn queryVia(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {
     if (hostname.len == 0 or hostname.len > MAX_NAME) return .{ .outcome = .nxdomain };
     const local: ?[4]u8 = @import("static_hosts.zig").lookup(hostname) orelse if (isIpV4(hostname)) parseIpV4(hostname) else null;
     if (local) |ip| {
         dns_answer.single(ans, hostname, ip);
         return .{ .outcome = .answer, .ip = ip };
     }
-    return queryCore(hostname, server, timeout_ns, yield, ans);
+    return queryType(hostname, server, timeout_ns, yield, ans, TYPE_A_Q);
 }
 
 /// queryVia for AAAA records (dns_query6, 509): every IPv6 address of the reply lands in `ans` (alen 16). An IPv4 literal or a static
 /// name has no AAAA record: NODATA, as for a name that exists without one.
-pub fn queryVia6(hostname: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {
+pub fn queryVia6(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {
     if (hostname.len == 0 or hostname.len > MAX_NAME) return .{ .outcome = .nxdomain };
     if (@import("static_hosts.zig").lookup(hostname) != null or isIpV4(hostname)) return .{ .outcome = .nodata };
     return queryType(hostname, server, timeout_ns, yield, ans, TYPE_AAAA);
@@ -165,7 +168,7 @@ pub fn queryVia6(hostname: []const u8, server: [4]u8, timeout_ns: u64, yield: Yi
 
 /// A PTR query to `server` for `addr` (4 bytes IPv4 or 16 bytes IPv6), waiting at most `timeout_ns` (dns_ptr, 508): the host name
 /// lands in ans.canonName(). The shared cache is not used.
-pub fn queryPtr(addr: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {
+pub fn queryPtr(addr: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {
     var nb: [80]u8 = undefined;
     const qname = if (addr.len == 4) dns_answer.reverseName4(addr[0..4].*, &nb) else dns_answer.reverseName6(addr[0..16].*, &nb);
     return queryType(qname, server, timeout_ns, yield, ans, TYPE_PTR);
@@ -176,10 +179,10 @@ const TYPE_PTR: u16 = 12;
 const TYPE_AAAA: u16 = 28;
 
 fn queryCore(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {
-    return queryType(hostname, dns_server, timeout_ns, yield, ans, TYPE_A_Q);
+    return queryType(hostname, .{ .v4 = dns_server }, timeout_ns, yield, ans, TYPE_A_Q);
 }
 
-fn queryType(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16) Result {
+fn queryType(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16) Result {
     const r = queryUdp(hostname, dns_server, timeout_ns, yield, ans, qtype);
     // A truncated reply is not used: the same query goes to the same server over TCP (glibc res_send, measured).
     if (r.outcome == .truncated) return queryTcp(hostname, dns_server, timeout_ns, yield, ans, qtype);
@@ -216,7 +219,7 @@ fn readReply(msg: []const u8, hostname: []const u8, qtype: u16, ans: *dns_answer
 
 /// The query over TCP to `dns_server`:53 (RFC 1035 4.2.2: a 2-byte length, then the message), waiting at most `timeout_ns` for the
 /// connection and the whole reply. A refused, reset or closed connection is `tcp_failed`.
-fn queryTcp(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16) Result {
+fn queryTcp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16) Result {
     const tcp = @import("tcp.zig");
     const sched = @import("../proc/sched.zig");
     var pkt: [2 + 512]u8 = undefined;
@@ -224,9 +227,23 @@ fn queryTcp(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yie
     const qlen = buildQuery(pkt[2..], hostname, qtype, query_id);
     dns_policy.tcpLength(&pkt, @intCast(qlen));
     const owner = sched.currentTaskIndex() orelse 0;
-    const raw = tcp.tcpConnect(dns_server, DNS_PORT, owner);
-    if (raw < 0) return .{ .outcome = .tcp_failed };
-    const idx: u32 = @intCast(raw);
+    const idx: u32 = switch (dns_server) {
+        .v4 => |s4| blk: {
+            const raw = tcp.tcpConnect(s4, DNS_PORT, owner);
+            if (raw < 0) return .{ .outcome = .tcp_failed };
+            break :blk @intCast(raw);
+        },
+        .v6 => |s6| blk: {
+            const raw = tcp.tcpSocket(owner);
+            if (raw < 0) return .{ .outcome = .tcp_failed };
+            const i: u32 = @intCast(raw);
+            if (tcp.tcpSetIpv6(i) != 0 or tcp.tcpConnectSocketV6(i, s6, DNS_PORT) != 0) {
+                _ = tcp.tcpClose(i);
+                return .{ .outcome = .tcp_failed };
+            }
+            break :blk i;
+        },
+    };
     defer _ = tcp.tcpClose(idx);
     const start = tsc.nanos();
     var iters: u32 = 0;
@@ -269,14 +286,14 @@ fn queryTcp(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yie
     return .{ .outcome = .timeout };
 }
 
-fn queryUdp(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16) Result {
+fn queryUdp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16) Result {
     var pkt: [512]u8 = @splat(0);
     var offset: usize = 0;
 
     // Register the reply port first — without it the UDP demux drops the
     // response before recvFrom can ever see it.
     // A port of its own for this query: two queries at once (two threads, two processes) must not take each other's replies.
-    const src_port = udp.reserveEphemeral() orelse {
+    const src_port = udp.reserveEphemeralFor(dns_server == .v6) orelse {
         serial.writeString("[DNS] Failed to register reply port\n");
         return .{ .outcome = .failed };
     };
@@ -292,7 +309,10 @@ fn queryUdp(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yie
     var send_iters: u32 = 0;
     var sent = false;
     while (!sent and !dns_policy.waitExpiredAfter(send_start, tsc.nanos(), send_iters, timeout_ns)) : (send_iters += 1) {
-        sent = udp.sendTo(dns_server, DNS_PORT, src_port, &pkt, @intCast(offset));
+        sent = switch (dns_server) {
+            .v4 => |s4| udp.sendTo(s4, DNS_PORT, src_port, &pkt, @intCast(offset)),
+            .v6 => |s6| udp.sendToV6(s6, DNS_PORT, src_port, &pkt, @intCast(offset)),
+        };
         if (sent) break;
         pumpRx();
         if (yield) |y| (if (!y()) return .{ .outcome = .interrupted }) else cpu.pause();
@@ -309,10 +329,18 @@ fn queryUdp(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yie
         pumpRx(); // replies only reach the UDP queue when the NIC is polled
         var buf: [MAX_REPLY]u8 = undefined;
         var from_ip: [4]u8 = .{ 0, 0, 0, 0 };
+        var from6: [16]u8 = @splat(0);
         var from_port: u16 = 0;
-
-        const n = udp.recvFrom(src_port, &buf, @intCast(buf.len), &from_ip, &from_port);
-        if (n >= 12 and dns_policy.acceptResponse(from_ip, from_port, dns_server, bo.readU16BeAt(&buf, 0), query_id)) {
+        var full: u16 = 0;
+        const n = switch (dns_server) {
+            .v4 => udp.recvFrom(src_port, &buf, @intCast(buf.len), &from_ip, &from_port),
+            .v6 => udp.recvFromV6Ex(src_port, &buf, @intCast(buf.len), &from6, &from_port, &full, false),
+        };
+        const accepted = n >= 12 and switch (dns_server) {
+            .v4 => |s4| dns_policy.acceptResponse(from_ip, from_port, s4, bo.readU16BeAt(&buf, 0), query_id),
+            .v6 => |s6| dns_policy.acceptResponse6(from6, from_port, s6, bo.readU16BeAt(&buf, 0), query_id),
+        };
+        if (accepted) {
             // Any reply settles the query, without waiting out the limit for another.
             if (readReply(buf[0..@intCast(n)], hostname, qtype, ans)) |res| return res;
         }

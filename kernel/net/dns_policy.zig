@@ -19,6 +19,33 @@ pub fn acceptResponse(
     return resp_id == query_id;
 }
 
+/// acceptResponse for a server with an IPv6 address.
+pub fn acceptResponse6(src_ip: [16]u8, src_port: u16, server_ip: [16]u8, resp_id: u16, query_id: u16) bool {
+    if (src_port != DNS_PORT) return false;
+    for (src_ip, server_ip) |a, b| {
+        if (a != b) return false;
+    }
+    return resp_id == query_id;
+}
+
+/// Whether an IPv6 nameserver from /etc/resolv.conf is an address a query can go to: unicast. :: and multicast (ff00::/8) are not.
+pub fn serverUsable6(ip: [16]u8) bool {
+    if (ip[0] == 0xff) return false;
+    for (ip) |b| if (b != 0) return true;
+    return false;
+}
+
+/// The IPv4 address of an IPv4-mapped IPv6 address (::ffff:a.b.c.d), else null: such a nameserver is asked over IPv4.
+pub fn mappedV4(ip: [16]u8) ?[4]u8 {
+    for (ip[0..10]) |b| if (b != 0) return null;
+    if (ip[10] != 0xff or ip[11] != 0xff) return null;
+    return ip[12..16].*;
+}
+
+/// Bit 31 of the timeout_ms argument of dns_query, dns_query6 and dns_ptr: `server` points to 16 bytes (an IPv6 nameserver)
+/// instead of 4. The limit is the low bits.
+pub const SERVER6_FLAG: u64 = 0x8000_0000;
+
 /// What an accepted reply (right server, port and id) means for the query: it carries answers to look through, it settles that
 /// there is no address (an error RCODE such as NXDOMAIN, SERVFAIL or REFUSED, or NOERROR with no answers), or it is not a response.
 pub const Verdict = enum { answer, no_address, ignore };

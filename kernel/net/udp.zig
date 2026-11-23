@@ -894,6 +894,11 @@ pub fn ensurePort(port: u16) u16 {
 /// resolver's per-query source port: two queries at once must not read each other's replies). Starts at a random point of the
 /// range, like the source port glibc's resolver picks. null when every port of the range is taken or the table is full.
 pub fn reserveEphemeral() ?u16 {
+    return reserveEphemeralFor(false);
+}
+
+/// reserveEphemeral for an IPv6 (`v6`) or IPv4 socket.
+pub fn reserveEphemeralFor(v6: bool) ?u16 {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     if (num_ports >= MAX_PORTS) return null;
@@ -910,7 +915,7 @@ pub fn reserveEphemeral() ?u16 {
     reserved_ports.readLock();
     defer reserved_ports.readUnlock();
     const port = @import("tcp_port_policy.zig").pickEphemeralPortInRange(start, in_use[0..num_ports], 0, range, reserved_ports.bytes()) orelse return null;
-    _ = newSlotLocked(port, false, 0);
+    _ = newSlotLocked(port, v6, 0);
     return port;
 }
 
@@ -1041,6 +1046,8 @@ pub fn rebind(old_key: u32, new_port: u16, addr: [4]u8, addr6: [16]u8, dev6: u8,
         used[nu] = @intCast((ports[j] >> 16) & 0x7fff);
         nu += 1;
         if (!port_named[j]) continue;
+        // An IPv6 socket and an IPv4 one never conflict: every AF_INET6 socket here is v6-only (as for TCP, tcp_port_policy).
+        if (!@import("tcp_port_policy.zig").familiesConflict(port_v6[oi], port_v6[j])) continue;
         if (!port_v6[j] and !port_v6[oi] and !@import("tcp_port_policy.zig").addrsConflict(addr, port_local_ip[j])) continue;
         if (port_v6[j] and port_v6[oi] and !@import("bind_addr_policy.zig").boundDevsConflict(dev6, port_dev6[j])) continue;
         if (port_v6[j] and port_v6[oi] and !@import("tcp_port_policy.zig").addrsConflict6(addr6, port_local_ip6[j])) continue;

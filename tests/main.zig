@@ -5547,7 +5547,7 @@ test "an IPv6 UDP socket keeps the address it was bound to: getsockname reports 
 
 test "UDP sockets on one port are told apart by their bound IPv4 address: bind conflicts and receive dispatch (hello348)" {
     const us = kt.udp_source;
-    try std.testing.expect(std.mem.indexOf(u8, us, "        if (!port_named[j]) continue;\n        if (!port_v6[j] and !port_v6[oi] and !@import(\"tcp_port_policy.zig\").addrsConflict(addr, port_local_ip[j])) continue;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "        if (!port_v6[j] and !port_v6[oi] and !@import(\"tcp_port_policy.zig\").addrsConflict(addr, port_local_ip[j])) continue;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    port_opts[ni] = mine;\n    port_local_ip[ni] = addr;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "            port_local_ip[i] = port_local_ip[num_ports];\n            port_local_ip[num_ports] = .{ 0, 0, 0, 0 };\n            port_local_ip6[i] = port_local_ip6[num_ports];\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "                else\n                    @import(\"tcp_port_policy.zig\").listenerTakes(port_local_ip[i], dst_ip, r[0]);\n                if (!takes) continue;\n") != null);
@@ -18381,9 +18381,10 @@ test "dns_query (507): a reply's RCODE and answers decide the outcome, and the w
     try std.testing.expect(std.mem.indexOf(u8, se, "if (ans_len != 0 and ans_len < 256) return -34; // ERANGE") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "const n = da.encode(&ans, enc[0..@intCast(@min(ans_len, enc.len))]) orelse return -90; // EMSGSIZE") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "if (!dp.timeoutValid(timeout_ms)) return -22;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, se, "dns.queryVia(hp.stripTrailingDot(name), server, timeout_ms * 1_000_000, dnsSleep, &ans);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "const timeout_ms = timeout_arg & ~dp.SERVER6_FLAG;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "dns.queryVia(hp.stripTrailingDot(name), server.ok, timeout_ms * 1_000_000, dnsSleep, &ans);") != null);
     const dns = kt.dns_source;
-    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryVia(hostname: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryVia(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {") != null);
     // hello520: answers with no address for the name (only a CNAME, or records for other owners) are NO_RECOVERY in glibc, so the
     // kernel reports them as `failed`; NODATA is only NOERROR without answers.
     try std.testing.expect(std.mem.indexOf(u8, dns, "if (!dns_answer.parseType(msg, hostname, qtype, ans)) return .{ .outcome = .failed };") != null);
@@ -18579,9 +18580,9 @@ test "dns_answer: CNAME chains, several A records and the canonical name, as gli
 test "every kernel DNS query sends from a port of its own, so queries at the same time do not take each other's replies (hello520 I)" {
     const d = kt.dns_source;
     try std.testing.expect(std.mem.indexOf(u8, d, "12345") == null);
-    try std.testing.expect(std.mem.indexOf(u8, d, "const src_port = udp.reserveEphemeral() orelse {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "const src_port = udp.reserveEphemeralFor(dns_server == .v6) orelse {") != null);
     try std.testing.expect(std.mem.indexOf(u8, d, "defer udp.releasePort(src_port);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, d, "const n = udp.recvFrom(src_port, &buf, @intCast(buf.len), &from_ip, &from_port);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "        .v4 => udp.recvFrom(src_port, &buf, @intCast(buf.len), &from_ip, &from_port),") != null);
     const u = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, u, "pub fn reserveEphemeral() ?u16 {") != null);
 }
@@ -18670,7 +18671,7 @@ test "dns_answer.parsePtr: the names a PTR reply gives for an address, after its
     const se = kt.syscall_entry_source;
     try std.testing.expect(std.mem.indexOf(u8, se, "508 => { // dns_ptr(addr, family, server4, timeout_ms, name_out, name_len)") != null);
     const dns = kt.dns_source;
-    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryPtr(addr: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryPtr(addr: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {") != null);
 }
 
 test "a DNS reply over 512 bytes is read whole, and up to 64 addresses and 16 aliases are kept (glibc 2.44 took 60 and 12, measured) (hello523)" {
@@ -18736,7 +18737,7 @@ test "a DNS reply with TC set is not used: the query is asked again over TCP to 
     // Wiring: queryType retries over TCP on a truncated reply, for A and PTR alike; the TCP wait uses the same limit and yield.
     const dns = kt.dns_source;
     try std.testing.expect(std.mem.indexOf(u8, dns, "if (r.outcome == .truncated) return queryTcp(hostname, dns_server, timeout_ns, yield, ans, qtype);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, dns, "fn queryTcp(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16) Result {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "fn queryTcp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16) Result {") != null);
 }
 
 test "AAAA answers: dns_answer reads type-28 records of 16 bytes for an AAAA query, A records for an A query (hello525)" {
@@ -18790,5 +18791,42 @@ test "AAAA answers: dns_answer reads type-28 records of 16 bytes for an AAAA que
     const se = kt.syscall_entry_source;
     try std.testing.expect(std.mem.indexOf(u8, se, "509 => { // dns_query6(name, out16, server4, timeout_ms, ans, ans_len)") != null);
     const dns = kt.dns_source;
-    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryVia6(hostname: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryVia6(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {") != null);
+}
+
+test "an IPv6 nameserver: dns_query/dns_query6/dns_ptr take a 16-byte server when bit 31 of timeout_ms is set (hello526)" {
+    const dp = kt.dns_policy;
+    // Which IPv6 servers a query may go to: a unicast address. :: and multicast (ff00::/8) are not servers.
+    try std.testing.expect(dp.serverUsable6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }));
+    try std.testing.expect(dp.serverUsable6(.{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 }));
+    try std.testing.expect(!dp.serverUsable6(@splat(0)));
+    try std.testing.expect(!dp.serverUsable6(.{ 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }));
+    // An IPv4-mapped server (::ffff:a.b.c.d) is the IPv4 server a.b.c.d.
+    try std.testing.expectEqual(@as(?[4]u8, .{ 10, 0, 2, 3 }), dp.mappedV4(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 2, 3 }));
+    try std.testing.expectEqual(@as(?[4]u8, null), dp.mappedV4(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }));
+    // The flag and the limit share timeout_ms.
+    try std.testing.expectEqual(@as(u64, 0x8000_0000), dp.SERVER6_FLAG);
+    try std.testing.expect(dp.timeoutValid(0x8000_0000 | 1000) == false); // the caller strips the flag first
+    // A reply from an IPv6 server is accepted from that address and port 53 with the query's id.
+    const srv6 = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    try std.testing.expect(dp.acceptResponse6(srv6, 53, srv6, 7, 7));
+    try std.testing.expect(!dp.acceptResponse6(srv6, 54, srv6, 7, 7));
+    try std.testing.expect(!dp.acceptResponse6(@splat(0), 53, srv6, 7, 7));
+    try std.testing.expect(!dp.acceptResponse6(srv6, 53, srv6, 7, 8));
+    // Wiring: the three system calls read the server with readServer, and dns.zig takes a Server for every query.
+    const se = kt.syscall_entry_source;
+    // dns_query and dns_query6 share one path; dns_ptr has the other.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, se, "const server = readDnsServer(server_ptr, timeout_arg) orelse return -22;"));
+    const dns = kt.dns_source;
+    try std.testing.expect(std.mem.indexOf(u8, dns, "pub const Server = union(enum) { v4: [4]u8, v6: [16]u8 };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "udp.sendToV6(s6, DNS_PORT, src_port, &pkt, @intCast(offset))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "udp.recvFromV6Ex(src_port, &buf, @intCast(buf.len), &from6, &from_port, &full, false)") != null);
+}
+
+test "UDP bind: an IPv6 socket and an IPv4 one may share a port, as for TCP (every AF_INET6 socket here is v6-only) (hello526)" {
+    // Linux 7.2, measured: [::1]:p then 127.0.0.1:p binds, and either order; with IPV6_V6ONLY, [::]:p and 0.0.0.0:p share too.
+    const us = kt.udp_source;
+    const r = std.mem.indexOf(u8, us, "pub fn rebind(") orelse return error.TestUnexpectedResult;
+    const body = us[r .. r + 2500];
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (!@import(\"tcp_port_policy.zig\").familiesConflict(port_v6[oi], port_v6[j])) continue;") != null);
 }

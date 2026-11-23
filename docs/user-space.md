@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello525`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello526`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -492,6 +492,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello495 | net.ipv4.ip_local_reserved_ports：写入并读回 52000,52002-52004，保留端口仍可显式 bind（B）；限制自动范围为 52000–52010 后 UDP/TCP 都分到未保留端口（C、D）；倒置范围和 65536 为 EINVAL 且不改值（E）；换行清空（F），最后恢复两个 sysctl（G） |
 | hello496 | TCP ICMP 差错的 IP_MINTTL / IPV6_MINHOPCOUNT：阈值 2、连接保持 SYN_SENT 时，低于阈值的 host-unreachable 被忽略，达到阈值才报告 EHOSTUNREACH；IPv4 改变被引用报文的 TTL（A），IPv6 改变 ICMPv6 外层 hop limit（B），与 Linux 两条错误路径的实际数据来源一致 |
 | hello498 | clone 的 CLONE_SIGHAND / CLONE_FS：不带 CLONE_VM 的 CLONE_SIGHAND、不带 CLONE_SIGHAND 的 CLONE_THREAD 为 EINVAL（A）；CLONE_VM\|FS\|FILES\|SIGHAND\|THREAD 线程看到创建者之后的 chdir 和 sigaction（B），创建者也看到线程的修改（C） |
+| hello526 | `/etc/resolv.conf` 的 IPv6 nameserver（与 glibc 2.44 实测相同）：[::1]:53 和 127.0.0.1:53 上各一个本机 DNS 服务器；只写 `nameserver ::1` 时经 IPv6 查询并得到应答（A）；`::1` 在前时只问 IPv6 服务器（B）；不应答的 IPv6 服务器在前时换到 IPv4 服务器（C）；`gethostbyaddr` 也经 IPv6 服务器（D）；`::ffff:127.0.0.1` 按 IPv4 服务器询问（E）；两个服务器能在同一端口分别绑定 [::1] 和 127.0.0.1 |
 | hello525 | AAAA 记录（与 glibc 2.44 实测相同）：本机服务器知道双栈、只有 IPv4、只有 IPv6 三个名字；`gethostbyname2(AF_INET6)` 发 AAAA 查询并返回 16 字节地址（A）；只有 A 记录的名字在 `AF_INET6` 下为 `NO_DATA`（B）；`getaddrinfo` 的 `AF_UNSPEC` 发 AAAA 和 A 两个查询，IPv6 地址在前（C）；单栈名字只给那个族（D）；`AF_INET6` 对只有 IPv4 的名字为 `EAI_NODATA`，带 `AI_V4MAPPED` 时给映射地址（E）；不存在的名字为 `EAI_NONAME`（F） |
 | hello524 | 截断应答改用 TCP（与 glibc 2.44 `res_send` 实测相同）：本机服务器的 UDP 应答都带 TC 位，TCP（2 字节长度加报文）按名字回答；`gethostbyname` 先问 UDP、再问 TCP，得到 TCP 的三个地址（A）；UDP 应答带 TC 且有记录时也不用，用 TCP 的结果（B）；TCP 回 NXDOMAIN 为 `HOST_NOT_FOUND`（C）；TCP 连接在应答前关闭为 `TRY_AGAIN`（D）；服务器没有 TCP 监听时立即 `TRY_AGAIN`（E） |
 | hello523 | 大 DNS 应答（与 glibc 2.44 实测相同）：本机服务器对 `many.test` 回 60 个 A 记录（987 字节，超过 512 字节，不用 EDNS），对 `w.test` 回 12 级 CNAME 链；`gethostbyname` 按应答顺序列出全部 60 个地址（A）；`getaddrinfo` 给出 60 项（B）；`h_name` 为 `w12.test`，12 个别名按顺序（C）；`gethostbyname_r` 缓冲区不够时为 `ERANGE`，够时放下全部地址（D） |

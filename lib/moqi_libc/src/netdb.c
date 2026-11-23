@@ -58,6 +58,57 @@ size_t resolv_conf_servers(const char *text, size_t len, uint8_t out[][4], size_
 }
 
 #define RESOLV_MAXNS 3
+
+size_t resolv_conf_servers_any(const char *text, size_t len, struct resolv_server *out, size_t cap) {
+    static const char kw[] = "nameserver";
+    const size_t kl = sizeof kw - 1;
+    size_t count = 0, pos = 0;
+    while (text && pos < len && count < cap) {
+        size_t end = pos;
+        while (end < len && text[end] != '\n') end++;
+        if (end - pos > kl && memcmp(text + pos, kw, kl) == 0 && resolv_blank(text[pos + kl])) {
+            size_t i = pos + kl;
+            while (i < end && resolv_blank(text[i])) i++;
+            size_t a = i;
+            while (i < end && !resolv_blank(text[i])) i++;
+            char addr[64];
+            if (i > a && i - a < sizeof addr) {
+                memcpy(addr, text + a, i - a);
+                addr[i - a] = 0;
+                uint8_t ip[16];
+                struct resolv_server *o = &out[count];
+                memset(o, 0, sizeof *o);
+                if (ipv4_from_text(addr, ip)) {
+                    int unicast = (ip[0] | ip[1] | ip[2] | ip[3]) != 0 && (ip[0] & ip[1] & ip[2] & ip[3]) != 255 && !(ip[0] >= 224 && ip[0] <= 239);
+                    if (unicast) {
+                        o->v6 = 0;
+                        memcpy(o->addr, ip, 4);
+                        count++;
+                    }
+                } else if (!strchr(addr, '%') && ipv6_from_text(addr, ip)) {
+                    /* glibc keeps every IPv6 nameserver line; ::, multicast (the kernel refuses them) and a "%scope" one (no
+                     * interface routing for it here) are left out. */
+                    int nonzero = 0;
+                    for (int k = 0; k < 16; k++) nonzero |= ip[k];
+                    if (nonzero && ip[0] != 0xff) {
+                        o->v6 = 1;
+                        memcpy(o->addr, ip, 16);
+                        count++;
+                    }
+                }
+            }
+        }
+        pos = end + 1;
+    }
+    return count;
+}
+
+/* Ask `out` of server `sv` through `nr` (507, 508 or 509), with its address in the form the kernel takes: 4 bytes, or 16 with
+ * SERVER6_FLAG in the timeout argument. */
+#define RESOLV_SERVER6_FLAG 0x80000000L
+static long resolv_ask(long nr, long a1, long a2, const struct resolv_server *sv, long wait_ms, long a5, long a6) {
+    return NETDB_SYSCALL6(nr, a1, a2, (long)sv->addr, wait_ms | (sv->v6 ? RESOLV_SERVER6_FLAG : 0), a5, a6);
+}
 #define RESOLV_NAME_MAX 253
 #define RESOLV_LABEL_MAX 63
 
@@ -252,7 +303,7 @@ static size_t resolv_first_server(const struct resolv_opts *opt, size_t nns) {
     return __atomic_fetch_add(&resolv_rotate_next, 1u, __ATOMIC_ACQ_REL) % nns;
 }
 
-static long resolve_one(const char *name, uint8_t *out, uint8_t ns[][4], size_t nns, const struct resolv_opts *opt,
+static long resolve_one(const char *name, uint8_t *out, struct resolv_server *ns, size_t nns, const struct resolv_opts *opt,
                         struct resolv_answer *ans, int af) {
     if (ans) ans->len = 0;
     /* The kernel's own server (no nameserver line) answers A queries only. */
@@ -262,8 +313,8 @@ static long resolve_one(const char *name, uint8_t *out, uint8_t ns[][4], size_t 
     size_t first = resolv_first_server(opt, nns);
     for (int a = 0; a < opt->attempts; a++) {
         for (size_t i = 0; i < nns; i++) {
-            long r = NETDB_SYSCALL6(nr, (long)name, (long)out, (long)ns[(first + i) % nns], resolv_wait_ms(opt->timeout, i, nns),
-                                    ans ? (long)ans->buf : 0, ans ? (long)sizeof ans->buf : 0);
+            long r = resolv_ask(nr, (long)name, (long)out, &ns[(first + i) % nns], resolv_wait_ms(opt->timeout, i, nns),
+                                ans ? (long)ans->buf : 0, ans ? (long)sizeof ans->buf : 0);
             if (r == 0 && ans) ans->len = sizeof ans->buf;
             if (r == -11 || r == -111) last_reply = r; /* SERVFAIL; NOTIMP or REFUSED: the last reply is what res_search sees */
             if (r == -11 || r == -111 || r == -110) continue;
@@ -292,8 +343,8 @@ long resolv_lookup_af(const char *name, int af, uint8_t *out, char *found, size_
     struct resolv_answer local;
     if (!ans && found && found_cap) ans = &local; /* the canonical name comes from the answer */
     size_t len = resolv_conf_read(resolv_conf_buf, sizeof resolv_conf_buf);
-    uint8_t ns[RESOLV_MAXNS][4];
-    size_t nns = resolv_conf_servers(resolv_conf_buf, len, ns, RESOLV_MAXNS);
+    struct resolv_server ns[RESOLV_MAXNS];
+    size_t nns = resolv_conf_servers_any(resolv_conf_buf, len, ns, RESOLV_MAXNS);
     struct resolv_opts opt;
     const char *unused_word[1];
     size_t unused_len[1];
@@ -362,8 +413,8 @@ long resolv_ptr(const void *addr, int family, char *name, size_t cap) {
     if (family != AF_INET && family != AF_INET6) return -97;
     char conf[2048];
     size_t len = resolv_conf_read(conf, sizeof conf);
-    uint8_t ns[RESOLV_MAXNS][4];
-    size_t nns = resolv_conf_servers(conf, len, ns, RESOLV_MAXNS);
+    struct resolv_server ns[RESOLV_MAXNS];
+    size_t nns = resolv_conf_servers_any(conf, len, ns, RESOLV_MAXNS);
     /* Only the resolv.conf nameservers are asked (no search list applies to an address); without one there is no reverse DNS. */
     if (nns == 0) return -2;
     struct resolv_opts opt;
@@ -375,7 +426,7 @@ long resolv_ptr(const void *addr, int family, char *name, size_t cap) {
     size_t first = resolv_first_server(&opt, nns);
     for (int a = 0; a < opt.attempts; a++) {
         for (size_t i = 0; i < nns; i++) {
-            long r = NETDB_SYSCALL6(SYS_dns_ptr, (long)addr, family, (long)ns[(first + i) % nns], resolv_wait_ms(opt.timeout, i, nns), (long)buf, (long)sizeof buf);
+            long r = resolv_ask(SYS_dns_ptr, (long)addr, family, &ns[(first + i) % nns], resolv_wait_ms(opt.timeout, i, nns), (long)buf, (long)sizeof buf);
             if (r == -11 || r == -111) last = r;
             if (r == -11 || r == -111 || r == -110) continue;
             if (r == 0) {

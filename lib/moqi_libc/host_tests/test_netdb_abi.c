@@ -49,7 +49,8 @@ long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, lo
         size_t l = strlen(q_log);
         const unsigned char *ad = (const unsigned char *)a1;
         unsigned last = a2 == 2 ? ad[3] : ad[15];
-        int w = snprintf(q_log + l, sizeof q_log - l, "ptr%ld:%u@%u;", a2, last, ((const unsigned char *)a3)[3]);
+        int six = (a4 & 0x80000000L) != 0;
+        int w = snprintf(q_log + l, sizeof q_log - l, "ptr%ld:%u@%s%u;", a2, last, six ? "v" : "", six ? ((const unsigned char *)a3)[15] : ((const unsigned char *)a3)[3]);
         (void)w;
         (void)a4;
         if (r == 0) {
@@ -69,9 +70,12 @@ long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, lo
         l += k;
         if (nr == SYS_dns_query6) { q_log[l++] = '/'; q_log[l++] = '6'; }
         q_log[l++] = '@';
-        q_log[l++] = (char)('0' + srv[3] % 10);
+        /* An IPv6 server (bit 31 of the timeout) is logged as "v" and its last byte. */
+        int six = (a4 & 0x80000000L) != 0;
+        if (six) q_log[l++] = 'v';
+        q_log[l++] = (char)('0' + (six ? srv[15] : srv[3]) % 10);
         q_log[l++] = '/';
-        long ms = a4 / 1000;
+        long ms = (a4 & 0x7fffffffL) / 1000;
         if (ms >= 10) q_log[l++] = (char)('0' + ms / 10 % 10);
         q_log[l++] = (char)('0' + ms % 10);
         q_log[l++] = ';';
@@ -1024,6 +1028,33 @@ int main(void) {
         q_script(one, ok, 1);
         assert(getaddrinfo("v4.test", 0, &hints, &res) == 0 && strcmp(q_log, "v4.test@1/5;") == 0);
         freeaddrinfo(res);
+        moqi_test_resolv_conf = (const char *)0;
+    }
+
+    /* hello526: IPv6 nameservers. They are kept with the IPv4 ones in file order, up to three (glibc res_init, measured); the kernel
+     * gets the 16-byte address with bit 31 of the timeout set. ::, multicast and "%scope" lines are left out. */
+    {
+        struct resolv_server sv[3];
+        static const char mix[] = "nameserver ::1\nnameserver 10.0.0.1\nnameserver 2001:db8::53 # x\nnameserver 10.0.0.2\n";
+        assert(resolv_conf_servers_any(mix, sizeof mix - 1, sv, 3) == 3);
+        assert(sv[0].v6 && sv[0].addr[15] == 1 && !sv[1].v6 && sv[1].addr[3] == 1 && sv[2].v6 && sv[2].addr[15] == 0x53);
+        static const char odd[] = "nameserver ::\nnameserver ff02::1\nnameserver fe80::1%lo\nnameserver 2001:db8::zz\nnameserver [::1]\n"
+                                  "nameserver ::ffff:10.0.0.5\n";
+        assert(resolv_conf_servers_any(odd, sizeof odd - 1, sv, 3) == 1 && sv[0].v6 && sv[0].addr[10] == 0xff && sv[0].addr[15] == 5);
+        /* The IPv4-only list is unchanged. */
+        uint8_t n4[3][4];
+        assert(resolv_conf_servers(mix, sizeof mix - 1, n4, 3) == 2 && n4[0][3] == 1 && n4[1][3] == 2);
+        /* Queries go to the IPv6 server first, then the IPv4 one, with the usual waits; PTR the same. */
+        static const char conf6[] = "nameserver ::1\nnameserver 10.0.0.2\noptions attempts:1 timeout:2\n";
+        static const long t_ok[] = {-110, 0}, ok[] = {0};
+        uint8_t a4[4];
+        q_script(conf6, t_ok, 2);
+        assert(gethostbyname_ipv4("x.y", a4) == 0 && strcmp(q_log, "x.y@v1/2;x.y@2/2;") == 0);
+        q_script(conf6, ok, 1);
+        uint8_t pa[4] = {10, 2, 3, 4};
+        q_ptr_name = "p.test";
+        assert(gethostbyaddr(pa, 4, AF_INET) && strcmp(q_log, "ptr2:4@v1;") == 0);
+        q_ptr_name = "ptr.test";
         moqi_test_resolv_conf = (const char *)0;
     }
 
