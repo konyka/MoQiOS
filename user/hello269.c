@@ -211,7 +211,17 @@ void _start(void) {
             pump(30);
             syscall1(SYS_CLOSE, (uint64_t)c);
             pump(30);
-            if (b == 0 && (rc == 0 || rc == -115) && ac >= 0 && n == 1 && got[0] == msg[0]) same_ok++;
+            if (b == 0 && (rc == 0 || rc == -115) && ac >= 0 && n == 1 && got[0] == msg[0]) {
+                same_ok++;
+            } else {
+                /* Which step of this round went wrong: the bind, the connect, the accept or the read, and how long it took. */
+                print_num("hello269:   .. same-port round failed: round ", r);
+                print_num("hello269:   ..   bind ", b);
+                print_num("hello269:   ..   connect ", rc);
+                print_num("hello269:   ..   accept ", ac);
+                print_num("hello269:   ..   read ", n);
+                print_num("hello269:   ..   ms ", now_ms() - rt0);
+            }
             if (n > 1 || (n == 1 && got[0] != msg[0])) leaked++;
         }
         {
