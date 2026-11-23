@@ -69,6 +69,24 @@ static long stub_ioctl(long cmd, unsigned char *req) {
         }
         return -19;
     }
+    if (cmd == 0x8912) {
+        /* SIOCGIFCONF: struct ifconf { int len; char *buf; }; one 40-byte record for lo (127.0.0.1). */
+        int len;
+        unsigned char *buf;
+        memcpy(&len, req, 4);
+        memcpy(&buf, req + 8, 8);
+        int wrote = 0;
+        if (buf && len >= 40) {
+            memset(buf, 0, 40);
+            memcpy(buf, "lo", 2);
+            buf[16] = 2;
+            buf[20] = 127;
+            buf[23] = 1;
+            wrote = 40;
+        }
+        memcpy(req, &wrote, 4);
+        return 0;
+    }
     if (cmd == 0x8910) {
         unsigned idx = (unsigned)req[16] | (unsigned)req[17] << 8 | (unsigned)req[18] << 16 | (unsigned)req[19] << 24;
         if (idx < 1 || idx > (unsigned)stub_ifs) return -19;
@@ -350,6 +368,61 @@ int main(void) {
         errno = 0;
         assert(if_indextoname(0xFFFFFFFFu, nb) == 0 && errno == ENXIO);
         assert(if_indextoname(1, (char *)0) == 0);
+        stub_reset();
+    }
+
+    /* AI_ADDRCONFIG (glibc, measured with dummy interfaces in `unshare -n`, see the hello512 section of the review document):
+     * a family counts as configured when a non-loopback address of it exists, and an IPv6 link-local address counts. */
+    {
+        /* /proc/net/if_inet6 text: ::1 alone is not IPv6; a link-local or global address is. */
+        static const char only_lo[] = "00000000000000000000000000000001 01 80 10 80       lo\n";
+        static const char with_ll[] = "fe80000000000000505400fffe123456 02 40 20 80     eth0\n00000000000000000000000000000001 01 80 10 80       lo\n";
+        static const char with_global[] = "20010db8000000000000000000000051 02 40 00 00     eth0\n";
+        assert(!if_inet6_has_nonloopback(only_lo, sizeof only_lo - 1));
+        assert(if_inet6_has_nonloopback(with_ll, sizeof with_ll - 1));
+        assert(if_inet6_has_nonloopback(with_global, sizeof with_global - 1));
+        assert(!if_inet6_has_nonloopback("", 0));
+        assert(!if_inet6_has_nonloopback("zz80000000000000505400fffe123456 02 40 20 80     eth0\n", 54)); /* not hex */
+        /* SIOCGIFCONF records (40 bytes: name, then a sockaddr_in at 16): 127/8 is loopback. */
+        uint8_t conf[2 * 40];
+        memset(conf, 0, sizeof conf);
+        memcpy(conf, "lo", 2);
+        conf[16] = AF_INET; conf[20] = 127; conf[23] = 1;
+        assert(!ifconf_has_nonloopback4(conf, 40));
+        memcpy(conf + 40, "eth0", 4);
+        conf[56] = AF_INET; conf[60] = 10; conf[62] = 2; conf[63] = 15;
+        assert(ifconf_has_nonloopback4(conf, 80));
+        conf[60] = 127;
+        assert(!ifconf_has_nonloopback4(conf, 80));
+
+        /* The rule: both or neither configured keeps AF_UNSPEC as it is; with exactly one, the other family is removed. An
+         * explicit family that is not configured is EAI_NONAME (neither configured included). */
+        assert(addrconfig_rule(AF_UNSPEC, 1, 1) == ADDRCONFIG_KEEP_ALL);
+        assert(addrconfig_rule(AF_UNSPEC, 0, 0) == ADDRCONFIG_KEEP_ALL);
+        assert(addrconfig_rule(AF_UNSPEC, 1, 0) == ADDRCONFIG_ONLY_INET);
+        assert(addrconfig_rule(AF_UNSPEC, 0, 1) == ADDRCONFIG_ONLY_INET6);
+        assert(addrconfig_rule(AF_INET, 1, 0) == ADDRCONFIG_KEEP_ALL && addrconfig_rule(AF_INET, 1, 1) == ADDRCONFIG_KEEP_ALL);
+        assert(addrconfig_rule(AF_INET, 0, 1) == ADDRCONFIG_NONAME && addrconfig_rule(AF_INET, 0, 0) == ADDRCONFIG_NONAME);
+        assert(addrconfig_rule(AF_INET6, 0, 1) == ADDRCONFIG_KEEP_ALL && addrconfig_rule(AF_INET6, 1, 0) == ADDRCONFIG_NONAME);
+        assert(addrconfig_rule(AF_INET6, 0, 0) == ADDRCONFIG_NONAME);
+
+        /* Through getaddrinfo on the host stub: SIOCGIFCONF answers lo only and there is no /proc file, so neither family is
+         * configured: AF_UNSPEC is unchanged, an explicit family is EAI_NONAME, without the flag nothing changes. */
+        struct addrinfo hints, *res;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags = AI_ADDRCONFIG;
+        res = 0;
+        assert(getaddrinfo("::1", "80", &hints, &res) == 0 && res && res->ai_family == AF_INET6);
+        freeaddrinfo(res);
+        hints.ai_family = AF_INET;
+        assert(getaddrinfo("127.0.0.1", "80", &hints, &res) == EAI_NONAME);
+        hints.ai_family = AF_INET6;
+        assert(getaddrinfo("::1", "80", &hints, &res) == EAI_NONAME);
+        hints.ai_flags = 0;
+        res = 0;
+        assert(getaddrinfo("::1", "80", &hints, &res) == 0);
+        freeaddrinfo(res);
         stub_reset();
     }
 

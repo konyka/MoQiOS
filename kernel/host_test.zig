@@ -220,6 +220,7 @@ pub const ipid_policy = @import("net/ipid_policy.zig");
 pub const ipid_source = @embedFile("net/ipid.zig");
 pub const raw_icmp_source = @embedFile("net/raw_icmp.zig");
 pub const arp_policy = @import("net/arp_policy.zig");
+pub const if_inet6_policy = @import("net/if_inet6_policy.zig");
 pub const devconf_policy = @import("net/devconf_policy.zig");
 pub const arp_source = @embedFile("net/arp.zig");
 pub const ndp_queue_source = @embedFile("net/ndp_queue.zig");

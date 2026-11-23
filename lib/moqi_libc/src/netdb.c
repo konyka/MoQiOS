@@ -949,6 +949,86 @@ static int scoped_ipv6(const char *node, uint8_t out[16], uint32_t *scope) {
 
 #define GAI_MAX_ADDRS 16
 
+/* ---- AI_ADDRCONFIG ------------------------------------------------------------------------------------------- */
+
+int ifconf_has_nonloopback4(const uint8_t *conf, size_t len) {
+    for (size_t off = 0; conf && off + IFREQ_BYTES <= len; off += IFREQ_BYTES) {
+        const uint8_t *r = conf + off;
+        if (r[16] == AF_INET && r[17] == 0 && r[20] != 127) return 1;
+    }
+    return 0;
+}
+
+int if_inet6_has_nonloopback(const char *text, size_t len) {
+    size_t pos = 0;
+    while (text && pos < len) {
+        size_t end = pos;
+        while (end < len && text[end] != '\n') end++;
+        /* Each line starts with the address as 32 hex digits. */
+        if (end - pos >= 32) {
+            int ok = 1, loopback = 1;
+            for (size_t k = 0; k < 32; k++) {
+                int d = hex_digit(text[pos + k]);
+                if (d < 0) { ok = 0; break; }
+                if (d != (k == 31 ? 1 : 0)) loopback = 0;
+            }
+            if (ok && !loopback) return 1;
+        }
+        pos = end + 1;
+    }
+    return 0;
+}
+
+int addrconfig_rule(int family, int have4, int have6) {
+    if (family == AF_INET) return have4 ? ADDRCONFIG_KEEP_ALL : ADDRCONFIG_NONAME;
+    if (family == AF_INET6) return have6 ? ADDRCONFIG_KEEP_ALL : ADDRCONFIG_NONAME;
+    if (have4 == have6) return ADDRCONFIG_KEEP_ALL;
+    return have4 ? ADDRCONFIG_ONLY_INET : ADDRCONFIG_ONLY_INET6;
+}
+
+#ifdef MOQI_HOST_TEST_SYSCALL
+static size_t if_inet6_read(char *buf, size_t cap) { (void)buf; (void)cap; return 0; }
+#else
+static size_t if_inet6_read(char *buf, size_t cap) {
+    long fd = syscall3(SYS_open, (long)"/proc/net/if_inet6", 0 /* O_RDONLY */, 0);
+    if (fd < 0) return 0;
+    long n = 0;
+    while (n < (long)cap) {
+        long r = syscall3(SYS_read, fd, (long)(buf + n), (long)cap - n);
+        if (r <= 0) break;
+        n += r;
+    }
+    syscall1(SYS_close, fd);
+    return (size_t)n;
+}
+#endif
+
+/* Which families have a non-loopback address. errno is left as it was. */
+static void addrconfig_probe(int *have4, int *have6) {
+    int saved = errno;
+    uint8_t conf[8 * IFREQ_BYTES];
+    uint8_t hdr[16];
+    memset(hdr, 0, sizeof hdr);
+    int len = (int)sizeof conf;
+    uint8_t *p = conf;
+    memcpy(hdr, &len, 4);
+    memcpy(hdr + 8, &p, sizeof p);
+    *have4 = 0;
+    long s = NETDB_SYSCALL3(SYS_socket, AF_INET, SOCK_DGRAM, 0);
+    if (s >= 0) {
+        if (NETDB_SYSCALL3(SYS_ioctl, s, 0x8912 /* SIOCGIFCONF */, (long)hdr) == 0) {
+            int got;
+            memcpy(&got, hdr, 4);
+            if (got > 0) *have4 = ifconf_has_nonloopback4(conf, (size_t)got);
+        }
+        NETDB_SYSCALL1(SYS_close, s);
+    }
+    char text[1024];
+    size_t n = if_inet6_read(text, sizeof text);
+    *have6 = if_inet6_has_nonloopback(text, n);
+    errno = saved;
+}
+
 int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
     int flags = 0, family = AF_UNSPEC, socktype = 0, protocol = 0;
     if (hints) {
@@ -957,7 +1037,7 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
         socktype = hints->ai_socktype;
         protocol = hints->ai_protocol;
     }
-    /* The caller's flags are validated; AI_ADDRCONFIG is accepted and ignored. */
+    /* The caller's flags are validated. */
     const int known_flags = AI_PASSIVE | AI_CANONNAME | AI_NUMERICHOST | AI_NUMERICSERV | AI_V4MAPPED | AI_ALL | AI_ADDRCONFIG;
     if (flags & ~known_flags) return EAI_BADFLAGS;
     /* With no hints at all glibc echoes 0x40 in the entries (its internal default); mirror that. */
@@ -965,6 +1045,18 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
     if ((flags & AI_CANONNAME) && !node) return EAI_BADFLAGS;
     if (!node && !service) return EAI_NONAME;
     if (family != AF_UNSPEC && family != AF_INET && family != AF_INET6) return EAI_FAMILY;
+    if (flags & AI_ADDRCONFIG) {
+        /* With exactly one family configured, an AF_UNSPEC lookup becomes a lookup for that family, so the other family's
+         * addresses go away and its literals are EAI_ADDRFAMILY (glibc, measured); the entries still echo the caller's hints. */
+        int have4, have6;
+        addrconfig_probe(&have4, &have6);
+        switch (addrconfig_rule(family, have4, have6)) {
+        case ADDRCONFIG_NONAME: return EAI_NONAME;
+        case ADDRCONFIG_ONLY_INET: family = AF_INET; break;
+        case ADDRCONFIG_ONLY_INET6: family = AF_INET6; break;
+        default: break;
+        }
+    }
 
     /* Which socket types to emit: (socktype, protocol) pairs, in glibc order. */
     int types[3], protos[3], ntypes = 0;

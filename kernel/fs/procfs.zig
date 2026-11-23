@@ -59,6 +59,8 @@ pub const ProcFile = enum(u8) {
     conf_file,
     /// /proc/net/arp: the IPv4 neighbour table (arp.formatProc).
     net_arp,
+    /// /proc/net/if_inet6: the IPv6 addresses of each interface (ndp.formatIfInet6).
+    net_if_inet6,
     /// The /proc directory itself and /proc/<pid> (also reached as /proc/self): directories, listed by getdents64.
     root_dir,
     pid_dir,
@@ -118,7 +120,7 @@ const conf_devs = [_]SubEntry{
 
 fn subdirChildren(dir: ProcFile) []const SubEntry {
     return switch (dir) {
-        .net_dir => &.{.{ .name = "arp", .dtype = DT_REG }},
+        .net_dir => &.{ .{ .name = "arp", .dtype = DT_REG }, .{ .name = "if_inet6", .dtype = DT_REG } },
         .sys_dir => &.{ .{ .name = "fs", .dtype = DT_DIR }, .{ .name = "net", .dtype = DT_DIR } },
         .sys_fs_dir => &.{ .{ .name = "pipe-max-size", .dtype = DT_REG }, .{ .name = "pipe-user-pages-hard", .dtype = DT_REG }, .{ .name = "pipe-user-pages-soft", .dtype = DT_REG } },
         .sys_net_dir => &.{ .{ .name = "ipv4", .dtype = DT_DIR }, .{ .name = "ipv6", .dtype = DT_DIR } },
@@ -300,6 +302,7 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
         .tcp_notsent_lowat => @intCast(@import("../net/notsent_lowat_sysctl.zig").format(buf[0..@min(max_len, 16)])),
         .conf_file => @intCast(@import("../net/arp.zig").confRead(@import("../net/devconf_policy.zig").decode(pid), buf[0..@min(max_len, 16)])),
         .net_arp => @intCast(@import("../net/arp.zig").formatProc(buf[0..max_len])),
+        .net_if_inet6 => @intCast(@import("../net/ndp.zig").formatIfInet6(buf[0..max_len], @import("../net/nic.zig").isActive(), @import("../net/netif.zig").getMac())),
         .root_dir, .pid_dir, .mount_dir, .fd_dir, .net_dir, .sys_dir, .sys_net_dir, .sys_ipv4_dir, .sys_ipv6_dir, .sys_conf_dir, .conf_dev_dir, .sys_fs_dir => 0,
         .pipe_max_size => blk: {
             const st = std.fmt.bufPrint(buf[0..@min(max_len, 16)], "{d}\n", .{@import("fcntl_policy.zig").pipeMaxSize()}) catch break :blk 0;

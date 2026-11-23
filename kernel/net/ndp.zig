@@ -697,6 +697,36 @@ pub fn hasLocalAddress(addr: [16]u8) bool {
     return false;
 }
 
+/// /proc/net/if_inet6 (if_inet6_policy.formatLine): with the NIC up, its configured addresses and then its link-local address
+/// (index 2, eth0), then ::1 on lo (index 1) — Linux lists the newest interface first. The caller passes the NIC state, so this
+/// module keeps no dependency on the device.
+pub fn formatIfInet6(out: []u8, nic_active: bool, mac: [6]u8) usize {
+    const p = @import("if_inet6_policy.zig");
+    var snap: [MAX_LOCAL_ADDRS]LocalAddr = undefined;
+    {
+        const flags = ndp_lock.acquire();
+        defer ndp_lock.release(flags);
+        snap = local_addrs;
+    }
+    var n: usize = 0;
+    if (nic_active) {
+        for (snap) |e| {
+            if (!e.valid) continue;
+            const fl: u8 = switch (e.state) {
+                .tentative => p.IFA_F_TENTATIVE,
+                .preferred => 0,
+                .deprecated => p.IFA_F_DEPRECATED,
+            };
+            n += p.formatLine(out[n..], e.addr, 2, e.prefix_len, p.scopeOf(e.addr), fl, "eth0");
+        }
+        const ll = generateLinkLocal(mac);
+        n += p.formatLine(out[n..], ll, 2, 64, p.scopeOf(ll), p.IFA_F_PERMANENT, "eth0");
+    }
+    const loopback = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    n += p.formatLine(out[n..], loopback, 1, 128, p.scopeOf(loopback), p.IFA_F_PERMANENT, "lo");
+    return n;
+}
+
 /// True when `addr` is one of this host's own addresses: a configured one or the link-local address formed from `mac`.
 pub fn isOwnAddress(addr: [16]u8, mac: [6]u8) bool {
     return hasLocalAddress(addr) or ipv6.addrEq(addr, generateLinkLocal(mac));

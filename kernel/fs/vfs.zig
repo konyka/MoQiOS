@@ -2070,6 +2070,13 @@ pub const FdTable = struct {
                     return -13; // EACCES
                 }
                 pfile = .net_arp;
+            } else if (str.eql(rest, "net/if_inet6")) {
+                // Mode 0444, like /proc/net/arp.
+                if (is_writable) {
+                    self.freeFd(slot);
+                    return -13; // EACCES
+                }
+                pfile = .net_if_inet6;
             } else if (@import("../net/devconf_policy.zig").lookup(rest, @import("../net/nic.zig").isActive())) |cp| {
                 // /proc/sys/net/ipv4/conf, conf/<dev> (directories, mode 0555) and conf/<dev>/{proxy_arp,route_localnet} (mode 0644 like
                 // ping_group_range). The device rides in proc_pid.

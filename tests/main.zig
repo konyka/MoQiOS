@@ -14311,7 +14311,7 @@ test "arp policy: /proc/net/arp lines use arp_format_neigh_entry's layout (Linux
 test "procfs: /proc/net, /proc/sys, /proc/sys/net and /proc/sys/net/ipv4 are directories listing their files (Linux measured, hello379)" {
     const pf = kt.procfs_source;
     try std.testing.expect(std.mem.indexOf(u8, pf, "const root_dirs = [_][]const u8{ \"net\", \"sys\" };") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pf, ".net_dir => &.{.{ .name = \"arp\", .dtype = DT_REG }},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pf, ".net_dir => &.{ .{ .name = \"arp\", .dtype = DT_REG }, .{ .name = \"if_inet6\", .dtype = DT_REG } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_dir => &.{ .{ .name = \"fs\", .dtype = DT_DIR }, .{ .name = \"net\", .dtype = DT_DIR } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_net_dir => &.{ .{ .name = \"ipv4\", .dtype = DT_DIR }, .{ .name = \"ipv6\", .dtype = DT_DIR } },") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf, ".sys_ipv4_dir => &.{ .{ .name = \"conf\", .dtype = DT_DIR }, .{ .name = \"ip_local_port_range\", .dtype = DT_REG }, .{ .name = \"ip_local_reserved_ports\", .dtype = DT_REG }, .{ .name = \"ip_unprivileged_port_start\", .dtype = DT_REG }, .{ .name = \"ip_nonlocal_bind\", .dtype = DT_REG }, .{ .name = \"ping_group_range\", .dtype = DT_REG }, .{ .name = \"tcp_notsent_lowat\", .dtype = DT_REG } },") != null);
@@ -18142,4 +18142,36 @@ test "ip_unprivileged_port_start controls bind and cannot overlap the automatic 
     try std.testing.expectEqual(@as(i64, -22), lp.writeUnprivilegedStart("50000\n"));
     try std.testing.expectEqual(@as(u32, 100), lp.unprivilegedStart());
     try std.testing.expectEqual(@as(i64, 5), lp.writeUnprivilegedStart("1024\n"));
+}
+
+test "if_inet6 policy: /proc/net/if_inet6 lines use if6_seq_show's layout (Linux measured, hello512)" {
+    const ip = kt.if_inet6_policy;
+    var buf: [256]u8 = undefined;
+    // Copied from the host's /proc/net/if_inet6 (kernel 7.2: dummy d0 with MAC 52:54:00:12:34:56, and lo).
+    const ll = [16]u8{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x50, 0x54, 0x00, 0xff, 0xfe, 0x12, 0x34, 0x56 };
+    const n = ip.formatLine(&buf, ll, 2, 64, ip.scopeOf(ll), ip.IFA_F_PERMANENT, "d0");
+    try std.testing.expectEqualStrings("fe80000000000000505400fffe123456 02 40 20 80       d0\n", buf[0..n]);
+    const lo6 = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    const m = ip.formatLine(&buf, lo6, 1, 128, ip.scopeOf(lo6), ip.IFA_F_PERMANENT, "lo");
+    try std.testing.expectEqualStrings("00000000000000000000000000000001 01 80 10 80       lo\n", buf[0..m]);
+    // A name longer than the %8s field is printed in full, as printf does.
+    const g = [16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x51 };
+    const k = ip.formatLine(&buf, g, 2, 64, ip.scopeOf(g), 0, "eth0long9");
+    try std.testing.expectEqualStrings("20010db8000000000000000000000051 02 40 00 00 eth0long9\n", buf[0..k]);
+    // Linux scope values (ipv6_addr_scope folded to IFA_*): host 0x10 for ::1, link 0x20 for fe80::/10, site 0x40, global 0.
+    try std.testing.expectEqual(@as(u8, 0x10), ip.scopeOf(lo6));
+    try std.testing.expectEqual(@as(u8, 0x20), ip.scopeOf(.{ 0xfe, 0xbf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }));
+    try std.testing.expectEqual(@as(u8, 0x40), ip.scopeOf(.{ 0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }));
+    try std.testing.expectEqual(@as(u8, 0x00), ip.scopeOf(g));
+    // Too small a buffer writes nothing.
+    try std.testing.expectEqual(@as(usize, 0), ip.formatLine(buf[0..20], lo6, 1, 128, 0x10, 0x80, "lo"));
+    // IFA_F_* bits of the low byte (include/uapi/linux/if_addr.h).
+    try std.testing.expectEqual(@as(u8, 0x80), ip.IFA_F_PERMANENT);
+    try std.testing.expectEqual(@as(u8, 0x40), ip.IFA_F_TENTATIVE);
+    try std.testing.expectEqual(@as(u8, 0x20), ip.IFA_F_DEPRECATED);
+
+    // Wiring: the file is listed in /proc/net, read through ndp, and opened read-only like /proc/net/arp.
+    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".net_if_inet6 => @intCast(@import(\"../net/ndp.zig\").formatIfInet6(buf[0..max_len], @import(\"../net/nic.zig\").isActive(), @import(\"../net/netif.zig\").getMac())),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".{ .name = \"if_inet6\", .dtype = DT_REG }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "} else if (str.eql(rest, \"net/if_inet6\")) {") != null);
 }

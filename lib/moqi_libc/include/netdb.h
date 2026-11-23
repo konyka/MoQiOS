@@ -205,6 +205,17 @@ struct addrinfo {
  * (free it with freeaddrinfo), or an EAI_* code. glibc-compatible in the cases that were measured: see test_netdb_abi.c. */
 int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res);
 
+/* AI_ADDRCONFIG helpers, exported for the host tests. A family is configured when it has a non-loopback address (glibc,
+ * measured): an IPv4 address outside 127/8 in the SIOCGIFCONF records (`conf`, `len` bytes of 40-byte ifreq), or an IPv6
+ * address other than ::1 in the text of /proc/net/if_inet6 (a link-local address counts). */
+int ifconf_has_nonloopback4(const uint8_t *conf, size_t len);
+int if_inet6_has_nonloopback(const char *text, size_t len);
+
+/* What AI_ADDRCONFIG does to a lookup for `family` given which families are configured: nothing, keep only one family (the
+ * other one's addresses are dropped and its literals are EAI_ADDRFAMILY), or EAI_NONAME for the whole lookup. */
+enum { ADDRCONFIG_KEEP_ALL, ADDRCONFIG_ONLY_INET, ADDRCONFIG_ONLY_INET6, ADDRCONFIG_NONAME };
+int addrconfig_rule(int family, int have4, int have6);
+
 /* Release a list returned by getaddrinfo. NULL is a no-op. */
 void freeaddrinfo(struct addrinfo *res);
 
