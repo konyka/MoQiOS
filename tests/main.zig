@@ -2192,7 +2192,8 @@ test "a kernel read of user memory faults in untouched pages and reports EFAULT,
     try std.testing.expectEqual(@as(usize, 4096), ps.faultedWriteTakes(5000));
     try std.testing.expectEqual(@as(usize, 4096), ps.faultedWriteTakes(8191));
     try std.testing.expectEqual(@as(usize, 8192), ps.faultedWriteTakes(8192));
-    try std.testing.expect(std.mem.indexOf(u8, f, "const copied = if (to_pipe and readable < chunk) @import(\"pipe_slot_policy.zig\").faultedWriteTakes(readable) else readable;") != null);
+    // hello527: the pipe's share is now settled for the whole write from the pipe's buffers (vfs.pipeFaultedTakes).
+    try std.testing.expect(std.mem.indexOf(u8, f, "limit = vfs_mod.pipeFaultedTakes(cur.fd_table.fds[fdIndex(fd)].pipe_idx, n, readable);") != null);
 }
 
 test "hostile user pointers cannot panic the copy helpers, and huge ranges skip absent page tables" {
@@ -18323,7 +18324,7 @@ test "vectored calls check the whole iovec array first and fault instead of retu
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, r, "if (ucopy == 0) break;"));
     try std.testing.expect(std.mem.indexOf(u8, r, "const from_user = copy.copyFromUserPrefix(kbuf[0..chunk], iov_base + pos, chunk);\n            if (from_user == 0) return if (total == 0 and pos == 0) -EFAULT else @intCast(total + pos);") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "const ucopy = copy.copyFromUserPrefix(kbuf[0..chunk], iov_base + pos, chunk);\n            if (ucopy == 0) return if (total == 0 and pos == 0) -EFAULT else @intCast(total + pos);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r, "const whole: usize = if (to_pipe and scan.readable < scan.total) @import(\"pipe_slot_policy.zig\").faultedWriteTakes(scan.readable) else scan.total;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "const whole: usize = if (to_pipe and scan.readable < scan.total) vfs_mod.pipeFaultedTakes(cur.fd_table.fds[fd].pipe_idx, scan.total, scan.readable) else scan.total;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.copy_from_user_source, "pub fn readablePrefix(addr: u64, len: usize) usize {") != null);
 }
 
@@ -18829,4 +18830,80 @@ test "UDP bind: an IPv6 socket and an IPv4 one may share a port, as for TCP (eve
     const r = std.mem.indexOf(u8, us, "pub fn rebind(") orelse return error.TestUnexpectedResult;
     const body = us[r .. r + 2500];
     try std.testing.expect(std.mem.indexOf(u8, body, "if (!@import(\"tcp_port_policy.zig\").familiesConflict(port_v6[oi], port_v6[j])) continue;") != null);
+}
+
+test "a pipe write whose source runs into a hole, into a pipe that already holds data: Linux 7.2 anon_pipe_write, measured (hello527)" {
+    const ps = kt.pipe_slot_policy;
+    // { bytes already in an empty-started pipe (one write), readable bytes before the hole, the write's length, the result }.
+    // The write's remainder (length % 4096) first merges into the last buffer when it fits, all or nothing; then fresh pages,
+    // and a page that faults is dropped. Nothing taken is EFAULT (-14).
+    const rows = [_][4]i64{
+        .{ 0, 4, 20, -14 },
+        .{ 0, 100, 116, -14 },
+        .{ 0, 3996, 4012, -14 },
+        .{ 0, 4000, 4016, -14 },
+        .{ 0, 4096, 4112, 4096 },
+        .{ 0, 5000, 5016, 4096 },
+        .{ 0, 8191, 8207, 4096 },
+        .{ 0, 8192, 8208, 8192 },
+        .{ 100, 4, 20, -14 },
+        .{ 100, 100, 116, -14 },
+        .{ 100, 3996, 4012, -14 },
+        .{ 100, 4000, 4016, -14 },
+        .{ 100, 4096, 4112, 16 },
+        .{ 100, 5000, 5016, 920 },
+        .{ 100, 8191, 8207, 4111 },
+        .{ 100, 8192, 8208, 4112 },
+        .{ 4000, 4, 20, -14 },
+        .{ 4000, 100, 116, -14 },
+        .{ 4000, 3996, 4012, -14 },
+        .{ 4000, 4000, 4016, -14 },
+        .{ 4000, 4096, 4112, 16 },
+        .{ 4000, 5000, 5016, 4096 },
+        .{ 4000, 8191, 8207, 4111 },
+        .{ 4000, 8192, 8208, 4112 },
+        .{ 4095, 4, 20, -14 },
+        .{ 4095, 100, 116, -14 },
+        .{ 4095, 3996, 4012, -14 },
+        .{ 4095, 4000, 4016, -14 },
+        .{ 4095, 4096, 4112, 4096 },
+        .{ 4095, 5000, 5016, 4096 },
+        .{ 4095, 8191, 8207, 4096 },
+        .{ 4095, 8192, 8208, 8192 },
+        .{ 4096, 4, 20, -14 },
+        .{ 4096, 100, 116, -14 },
+        .{ 4096, 3996, 4012, -14 },
+        .{ 4096, 4000, 4016, -14 },
+        .{ 4096, 4096, 4112, 4096 },
+        .{ 4096, 5000, 5016, 4096 },
+        .{ 4096, 8191, 8207, 4096 },
+        .{ 4096, 8192, 8208, 8192 },
+        .{ 5000, 4, 20, -14 },
+        .{ 5000, 100, 116, -14 },
+        .{ 5000, 3996, 4012, -14 },
+        .{ 5000, 4000, 4016, -14 },
+        .{ 5000, 4096, 4112, 16 },
+        .{ 5000, 5000, 5016, 920 },
+        .{ 5000, 8191, 8207, 4111 },
+        .{ 5000, 8192, 8208, 4112 },
+    };
+    for (rows) |r| {
+        var s: ps.Slots = .{};
+        // The earlier write of r[0] bytes into the empty pipe: full pages, then its last part.
+        var pre: usize = @intCast(r[0]);
+        while (pre > 0) {
+            const n = @min(pre, 4096);
+            s.push(n);
+            pre -= n;
+        }
+        const take = ps.faultedWriteTakesInto(&s, @intCast(r[2]), @intCast(r[1]));
+        const got: i64 = if (take == 0) -14 else @intCast(take);
+        std.testing.expectEqual(r[3], got) catch |e| {
+            std.debug.print("pre {d} good {d} total {d}: want {d} got {d}\n", .{ r[0], r[1], r[2], r[3], got });
+            return e;
+        };
+    }
+    // write() and writev() to a pipe size the write with it before any byte goes in.
+    try std.testing.expect(std.mem.indexOf(u8, kt.file_io_source, "vfs_mod.pipeFaultedTakes(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.readv_source, "vfs_mod.pipeFaultedTakes(") != null);
 }

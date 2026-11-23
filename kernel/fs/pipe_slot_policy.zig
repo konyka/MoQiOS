@@ -12,10 +12,34 @@ pub const MAX_SLOTS: usize = 1024;
 
 /// How many of `readable` source bytes, followed by an unreadable page, a write takes into an empty pipe: whole page-sized slots
 /// only, since Linux fills a fresh slot with one copy and drops a slot whose copy faults (measured: 4095 readable bytes before a hole
-/// are EFAULT, 4096..8191 take 4096, 8192 take 8192). 0 means EFAULT when nothing went in before. (With a partly filled last slot
-/// Linux first merges into it; that case is not modelled.)
+/// are EFAULT, 4096..8191 take 4096, 8192 take 8192). 0 means EFAULT when nothing went in before. faultedWriteTakesInto is the
+/// general rule, with a partly filled last slot.
 pub fn faultedWriteTakes(readable: usize) usize {
     return readable & ~@as(usize, PAGE - 1);
+}
+
+/// How many bytes of a write of `total` bytes, of which only the first `readable` can be read, go into a pipe whose buffers are `s`
+/// (Linux 7.2 anon_pipe_write, measured): the remainder (total % 4096) is copied into the last buffer first when the pipe holds
+/// something and it fits there, and a fault in that copy is EFAULT for the whole write; then the bytes fill fresh pages, and a page
+/// whose copy comes up short while more of the write is left is dropped, ending the write. 0 means EFAULT. A write that can be read
+/// whole takes all of it (the pipe's room is the waiting loop's business, not this).
+pub fn faultedWriteTakesInto(s: *const Slots, total: usize, readable: usize) usize {
+    if (readable >= total) return total;
+    var got: usize = 0;
+    var rest = total;
+    const chars = total & (PAGE - 1);
+    if (chars != 0 and s.mergeable(chars)) {
+        if (readable < chars) return 0;
+        got = chars;
+        rest -= chars;
+    }
+    while (rest > 0) {
+        const want = @min(rest, PAGE);
+        if (readable - got < want) return got;
+        got += want;
+        rest -= want;
+    }
+    return got;
 }
 
 pub const Slots = struct {

@@ -152,6 +152,15 @@ fn pipeWritable(pipe: *const PipeBuffer) bool {
     return !pipe.slots.full(pipeSlots(pipe));
 }
 
+/// How many bytes of a write of `total` bytes whose source can be read for only its first `readable` the pipe takes, from its buffers
+/// as they are now (pipe_slot_policy.faultedWriteTakesInto); 0 means EFAULT.
+pub fn pipeFaultedTakes(pipe_idx: u32, total: usize, readable: usize) usize {
+    if (pipe_idx >= MAX_PIPES) return @import("pipe_slot_policy.zig").faultedWriteTakes(readable);
+    const flags = pipe_lock.acquire();
+    defer pipe_lock.release(flags);
+    return @import("pipe_slot_policy.zig").faultedWriteTakesInto(&pipes[pipe_idx].slots, total, readable);
+}
+
 /// How many page-sized buffers `pipe` has (pipe->max_usage).
 fn pipeSlots(pipe: *const PipeBuffer) usize {
     return pipe.cap / PIPE_BUF_SIZE;

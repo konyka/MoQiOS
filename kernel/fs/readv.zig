@@ -115,9 +115,10 @@ pub fn writev(fd: u32, iov_ptr: u64, iovcnt: u32) i64 {
     defer vfs_mod.unlockOffset(held);
     // A pipe accounts for the whole writev() as one write (anon_pipe_write sees one iov_iter). It copies the source a page at a time
     // and drops a page whose copy faults, so a source that runs into a hole goes in only as whole pages before the hole (EFAULT when
-    // there are none), however the iovecs split it: the amount is settled before any of it goes in.
+    // there are none; with a partly filled last buffer the remainder merges first, vfs.pipeFaultedTakes), however the iovecs split it:
+    // the amount is settled before any of it goes in.
     const to_pipe = fd < vfs_mod.MAX_FDS and cur.fd_table.fds[fd].fd_type == .pipe_write and cur.fd_table.fds[fd].writable;
-    const whole: usize = if (to_pipe and scan.readable < scan.total) @import("pipe_slot_policy.zig").faultedWriteTakes(scan.readable) else scan.total;
+    const whole: usize = if (to_pipe and scan.readable < scan.total) vfs_mod.pipeFaultedTakes(cur.fd_table.fds[fd].pipe_idx, scan.total, scan.readable) else scan.total;
     if (to_pipe and whole == 0 and scan.total != 0) return -EFAULT;
     var pipe_part: vfs_mod.PipeWritePart = .{ .total = whole };
     var total: usize = 0;

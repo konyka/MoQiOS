@@ -59,16 +59,24 @@ pub fn write(fd: u64, buf: u64, count: u64) i64 {
             const held = if (fdIndex(fd) < vfs_mod.MAX_FDS) vfs_mod.lockOffset(&cur.fd_table.fds[fdIndex(fd)]) else 0;
             defer vfs_mod.unlockOffset(held);
             var pos: usize = 0;
-            var pipe_part: vfs_mod.PipeWritePart = .{ .total = n };
-            while (pos < n) {
-                const chunk = @min(n - pos, 4096);
+            const to_pipe = fdIndex(fd) < vfs_mod.MAX_FDS and cur.fd_table.fds[fdIndex(fd)].fd_type == .pipe_write;
+            // A pipe takes a source that runs into a hole by anon_pipe_write's rule (the remainder merged into the last buffer,
+            // then whole pages, a page that faults dropped): how much goes in is settled before any of it does, from the pipe as it
+            // is now (vfs.pipeFaultedTakes); nothing is EFAULT.
+            var limit: usize = n;
+            if (to_pipe) {
+                const readable = copy.readablePrefix(buf, n);
+                if (readable < n) {
+                    limit = vfs_mod.pipeFaultedTakes(cur.fd_table.fds[fdIndex(fd)].pipe_idx, n, readable);
+                    if (limit == 0) return -14;
+                }
+            }
+            var pipe_part: vfs_mod.PipeWritePart = .{ .total = limit };
+            while (pos < limit) {
+                const chunk = @min(limit - pos, 4096);
                 var kbuf: [4096]u8 = undefined;
-                const to_pipe = fdIndex(fd) < vfs_mod.MAX_FDS and cur.fd_table.fds[fdIndex(fd)].fd_type == .pipe_write;
-                // The readable part of the piece: a source that runs into a hole is a short write of what came before it. A pipe
-                // takes only whole source pages of it (Linux pipe_write copies a page at a time and drops a page that faults), so
-                // a small write that runs into a hole is EFAULT there, not a short write.
-                const readable = copy.copyFromUserPrefix(kbuf[0..chunk], buf + pos, chunk);
-                const copied = if (to_pipe and readable < chunk) @import("pipe_slot_policy.zig").faultedWriteTakes(readable) else readable;
+                // The readable part of the piece: a source that runs into a hole is a short write of what came before it.
+                const copied = copy.copyFromUserPrefix(kbuf[0..chunk], buf + pos, chunk);
                 if (copied == 0) return if (pos == 0) -14 else @intCast(pos); // EFAULT only when nothing was read
                 // A pipe accounts for the whole write() at once (vfs.pipeWritePart), not for each 4 KiB piece.
                 const result = if (fdIndex(fd) < vfs_mod.MAX_FDS and cur.fd_table.fds[fdIndex(fd)].fd_type == .pipe_write and cur.fd_table.fds[fdIndex(fd)].writable)
