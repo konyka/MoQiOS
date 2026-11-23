@@ -188,6 +188,17 @@ pub fn prrCwnd(pipe: u32, sndcnt: u32, smss: u32) u32 {
 /// every snd_una >= 2^31 in serial arithmetic, so an idle connection with a
 /// high ISS looked permanently "unacked", fired spurious RTOs (cwnd reset,
 /// backoff) and was finally closed after six of them.
+/// The bytes a cumulative ACK of `ack` newly acknowledges, or null when it acknowledges nothing new (a duplicate, an old ACK) or
+/// something never sent. The upper bound is `snd_max`, the highest sequence ever sent: after an RTO rewinds `snd_nxt` to the first
+/// hole, the peer may still acknowledge everything sent before the rewind (Linux tcp_ack bounds by tp->snd_nxt, which never moves
+/// back). Bounding by the rewound `snd_nxt` dropped those ACKs and stalled the connection with data queued (hello174 C).
+pub fn ackAdvance(ack: u32, snd_una: u32, snd_nxt: u32, snd_max: u32) ?u32 {
+    const high = if (seqLt(snd_max, snd_nxt)) snd_nxt else snd_max;
+    const acked = ack -% snd_una;
+    if (acked == 0 or acked > high -% snd_una) return null;
+    return acked;
+}
+
 pub fn unackedPending(snd_una: u32, snd_nxt: u32, snd_max: u32) bool {
     return seqLt(snd_una, snd_max) or snd_nxt != snd_una;
 }

@@ -92,6 +92,7 @@ test {
     _ = @import("wait_status_test.zig");
     _ = @import("reserved_ports_test.zig");
     _ = @import("icmp_min_ttl_test.zig");
+    _ = @import("tcp_ack_window_test.zig");
 }
 
 test "sync syscall propagates aggregate writeback failure as EIO" {

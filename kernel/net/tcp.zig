@@ -2883,10 +2883,12 @@ fn driveTcbStateMachine(
             if (flags & ACK != 0) {
                 if (ack_num != tcb.snd_una) {
                     // New ACK — advance send window
-                    const acked = ack_num -% tcb.snd_una;
-                    // v53.3: ack_num must be within [snd_una+1, snd_nxt] range
-                    const in_flight = tcb.snd_nxt -% tcb.snd_una;
-                    if (acked > 0 and acked <= in_flight and acked <= SEND_BUF_SIZE) {
+                    // ack_num must be within [snd_una+1, snd_max]: after an RTO rewound snd_nxt the peer may acknowledge everything
+                    // sent before the rewind (tcp_util.ackAdvance).
+                    const acked = tcp_util.ackAdvance(ack_num, tcb.snd_una, tcb.snd_nxt, tcb.snd_max) orelse 0;
+                    if (acked > 0 and acked <= SEND_BUF_SIZE and acked <= ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE)) {
+                        // The ACK passed the rewound send cursor: what lies below it was delivered, so sending resumes at the ACK.
+                        const past_cursor = tcp_util.seqLt(tcb.snd_nxt, ack_num);
                         // SK-115: detect DSACK before scoreboard clips below-ACK ranges.
                         if (opts.sack_block_count > 0 and
                             probeIsDsack(ack_num, opts.sack_blocks[0..opts.sack_block_count]))
@@ -2898,6 +2900,10 @@ fn driveTcbStateMachine(
                         // v53.2: advance send_head to free acknowledged buffer space
                         // Without this, the ring buffer permanently fills → connection deadlock
                         tcb.send_head = (tcb.send_head + acked) % SEND_BUF_SIZE;
+                        if (past_cursor) {
+                            tcb.snd_nxt = ack_num;
+                            tcb.send_unacked = tcb.send_head;
+                        }
                         markSendWake(tcb);
                         // send_unacked must NOT advance here: it tracks snd_nxt's
                         // ring position (send_head + (snd_nxt -% snd_una)) and an
