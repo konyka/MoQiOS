@@ -53,9 +53,35 @@ long stub_connect_replies[8];    /* successive connect() results; the last one r
 int stub_connect_n, stub_connect_calls;
 long stub_last_connect_addr[2];
 
+/* The kernel's netdevice ioctls (kernel/fs/ioctl.zig netdeviceIoctl) over two interfaces, lo = 1 and eth0 = 2: SIOCGIFINDEX
+ * looks the NUL-terminated name up, SIOCGIFNAME the index at byte 16; an unknown one is -ENODEV. */
+static const char *const stub_ifnames[] = {"lo", "eth0"};
+int stub_ifs = 2;
+static long stub_ioctl(long cmd, unsigned char *req) {
+    if (cmd == 0x8933) {
+        for (int i = 0; i < stub_ifs; i++) {
+            if (memchr(req, 0, 16) && strcmp((const char *)req, stub_ifnames[i]) == 0) {
+                unsigned idx = (unsigned)i + 1;
+                memset(req + 16, 0, 24);
+                req[16] = (unsigned char)idx;
+                return 0;
+            }
+        }
+        return -19;
+    }
+    if (cmd == 0x8910) {
+        unsigned idx = (unsigned)req[16] | (unsigned)req[17] << 8 | (unsigned)req[18] << 16 | (unsigned)req[19] << 24;
+        if (idx < 1 || idx > (unsigned)stub_ifs) return -19;
+        memset(req, 0, 16);
+        strcpy((char *)req, stub_ifnames[idx - 1]);
+        return 0;
+    }
+    return -25;
+}
+
 long moqi_test_syscall3(long nr, long a1, long a2, long a3) {
-    (void)a3;
     if (stub_log_n < STUB_LOG_MAX) stub_log[stub_log_n++] = nr;
+    if (nr == SYS_ioctl) return stub_ioctl(a2, (unsigned char *)a3);
     if (nr == SYS_socket) return stub_socket_reply;
     if (nr == SYS_connect) {
         stub_last_connect_addr[0] = a1;
@@ -283,6 +309,98 @@ int main(void) {
         res = (struct hostent *)1; herr = 12345; errno = 0;
         assert(gethostbyaddr_r(addr4, 4, AF_UNSPEC, &he, buf, sizeof buf, &res, &herr) == EAFNOSUPPORT && res == 0 && herr == NETDB_INTERNAL);
         assert(h_errno == 77);
+    }
+
+    /* if_nametoindex / if_indextoname over SIOCGIFINDEX / SIOCGIFNAME (glibc, measured): 0 with ENODEV, NULL with ENXIO; a name of
+     * IF_NAMESIZE characters or more never reaches the kernel; the socket used for the ioctl is closed every time. */
+    {
+        assert(IF_NAMESIZE == 16);
+        stub_reset();
+        errno = 0;
+        assert(if_nametoindex("lo") == 1 && errno == 0);
+        assert(if_nametoindex("eth0") == 2);
+        assert(stub_count(SYS_socket) == 2 && stub_count(SYS_close) == 2 && stub_count(SYS_ioctl) == 2);
+        errno = 0;
+        assert(if_nametoindex("nosuch0") == 0 && errno == ENODEV);
+        errno = 0;
+        assert(if_nametoindex("LO") == 0 && errno == ENODEV);
+        errno = 0;
+        assert(if_nametoindex("") == 0 && errno == ENODEV);
+        stub_reset();
+        errno = 0;
+        assert(if_nametoindex("0123456789abcdef") == 0 && errno == ENODEV && stub_count(SYS_ioctl) == 0);
+        errno = 0;
+        assert(if_nametoindex((const char *)0) == 0 && errno == ENODEV && stub_count(SYS_ioctl) == 0);
+        /* No socket: the socket error, as glibc reports it. */
+        stub_reset();
+        stub_socket_reply = -24; /* EMFILE */
+        errno = 0;
+        assert(if_nametoindex("lo") == 0 && errno == EMFILE && stub_count(SYS_close) == 0);
+        stub_reset();
+        char nb[IF_NAMESIZE + 4];
+        memset(nb, 'X', sizeof nb);
+        errno = 0;
+        assert(if_indextoname(1, nb) == nb && strcmp(nb, "lo") == 0 && errno == 0);
+        assert(if_indextoname(2, nb) == nb && strcmp(nb, "eth0") == 0);
+        assert(stub_count(SYS_socket) == 2 && stub_count(SYS_close) == 2);
+        errno = 0;
+        assert(if_indextoname(0, nb) == 0 && errno == ENXIO);
+        errno = 0;
+        assert(if_indextoname(3, nb) == 0 && errno == ENXIO);
+        errno = 0;
+        assert(if_indextoname(0xFFFFFFFFu, nb) == 0 && errno == ENXIO);
+        assert(if_indextoname(1, (char *)0) == 0);
+        stub_reset();
+    }
+
+    /* Interface-name scopes: getaddrinfo takes "%name" on fe80::/10 and on multicast of scope 1 or 2 (glibc, measured), getnameinfo
+     * prints "%name" for fe80::/10 and multicast of scope 2 whose index names an interface, otherwise the number. */
+    {
+        struct addrinfo hints, *res;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_INET6;
+        hints.ai_socktype = SOCK_STREAM;
+        #define SCOPE(p) ((unsigned)(p)->ai_addr[24] | (unsigned)(p)->ai_addr[25] << 8 | (unsigned)(p)->ai_addr[26] << 16 | (unsigned)(p)->ai_addr[27] << 24)
+        static const char *const ok_nodes[] = {"fe80::1%lo", "febf::1%eth0", "ff02::1%lo", "ff01::1%lo", "ff12::1%eth0"};
+        static const unsigned ok_scope[] = {1, 2, 1, 1, 2};
+        for (unsigned i = 0; i < sizeof ok_nodes / sizeof ok_nodes[0]; i++) {
+            res = 0;
+            assert(getaddrinfo(ok_nodes[i], "80", &hints, &res) == 0 && res && SCOPE(res) == ok_scope[i]);
+            freeaddrinfo(res);
+        }
+        static const char *const bad_nodes[] = {"2001:db8::1%lo", "fec0::1%lo", "ff05::1%lo", "fe80::1%nosuch0", "fe80::1%LO", "fe80::1%",
+                                                "fe80::1%lo%1", "fe80::1%0123456789abcdef", "1.2.3.4%lo"};
+        for (unsigned i = 0; i < sizeof bad_nodes / sizeof bad_nodes[0]; i++) {
+            res = 0;
+            assert(getaddrinfo(bad_nodes[i], "80", &hints, &res) == EAI_NONAME);
+        }
+        /* A numeric scope works on any address, as before. */
+        res = 0;
+        assert(getaddrinfo("2001:db8::1%1", "80", &hints, &res) == 0 && SCOPE(res) == 1);
+        freeaddrinfo(res);
+
+        uint8_t sa6[28];
+        char host[64];
+        struct { const char *addr; unsigned scope; const char *want; } rows[] = {
+            {"fe80::1", 1, "fe80::1%lo"}, {"febf::1", 2, "febf::1%eth0"}, {"ff02::1", 1, "ff02::1%lo"}, {"ff12::1", 2, "ff12::1%eth0"},
+            {"ff01::1", 1, "ff01::1%1"}, {"ff05::1", 1, "ff05::1%1"}, {"fec0::1", 1, "fec0::1%1"}, {"2001:db8::1", 1, "2001:db8::1%1"},
+            {"::1", 1, "::1%1"}, {"fe80::1", 99, "fe80::1%99"},
+        };
+        for (unsigned i = 0; i < sizeof rows / sizeof rows[0]; i++) {
+            memset(sa6, 0, sizeof sa6);
+            sa6[0] = AF_INET6;
+            assert(ipv6_from_text(rows[i].addr, sa6 + 8));
+            sa6[24] = (uint8_t)rows[i].scope;
+            assert(getnameinfo(sa6, 28, host, sizeof host, 0, 0, NI_NUMERICHOST) == 0 && strcmp(host, rows[i].want) == 0);
+        }
+        /* The name has to fit: "fe80::1%lo" is 10 bytes, so 10 is EAI_OVERFLOW and 11 fits. */
+        memset(sa6, 0, sizeof sa6);
+        sa6[0] = AF_INET6;
+        assert(ipv6_from_text("fe80::1", sa6 + 8));
+        sa6[24] = 1;
+        assert(getnameinfo(sa6, 28, host, 10, 0, 0, NI_NUMERICHOST) == EAI_OVERFLOW);
+        assert(getnameinfo(sa6, 28, host, 11, 0, 0, NI_NUMERICHOST) == 0 && strcmp(host, "fe80::1%lo") == 0);
+        #undef SCOPE
     }
 
     /* Packing a whole line into the caller's buffer: the exact size is what decides ERANGE, and nothing is written past it. */

@@ -428,6 +428,67 @@ extern long moqi_test_syscall3(long nr, long a1, long a2, long a3);
 #define NETDB_SYSCALL1(nr, a1) syscall1((nr), (a1))
 #endif
 
+/* ---- interface names ---------------------------------------------------------------------------------------- */
+
+#include "../include/errno.h"
+
+#define SIOCGIFNAME_REQ  0x8910
+#define SIOCGIFINDEX_REQ 0x8933
+#define IFREQ_BYTES 40
+
+/* One netdevice ioctl on a scratch UDP socket: 0 and the answered ifreq, or the -errno of socket() or ioctl(). */
+static long ifreq_ask(long cmd, uint8_t req[IFREQ_BYTES]) {
+    long s = NETDB_SYSCALL3(SYS_socket, AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return s;
+    long rc = NETDB_SYSCALL3(SYS_ioctl, s, cmd, (long)req);
+    NETDB_SYSCALL1(SYS_close, s);
+    return rc;
+}
+
+unsigned int if_nametoindex(const char *name) {
+    uint8_t req[IFREQ_BYTES];
+    memset(req, 0, sizeof req);
+    size_t n = 0;
+    while (name && name[n] && n < IF_NAMESIZE) n++;
+    if (!name || n == 0 || n >= IF_NAMESIZE) {
+        errno = ENODEV;
+        return 0;
+    }
+    memcpy(req, name, n);
+    long rc = ifreq_ask(SIOCGIFINDEX_REQ, req);
+    if (rc < 0) {
+        errno = (int)-rc;
+        return 0;
+    }
+    return (unsigned)req[16] | (unsigned)req[17] << 8 | (unsigned)req[18] << 16 | (unsigned)req[19] << 24;
+}
+
+char *if_indextoname(unsigned int index, char *buf) {
+    if (!buf) {
+        errno = EINVAL;
+        return (char *)0;
+    }
+    uint8_t req[IFREQ_BYTES];
+    memset(req, 0, sizeof req);
+    for (int k = 0; k < 4; k++) req[16 + k] = (uint8_t)(index >> (8 * k));
+    long rc = index ? ifreq_ask(SIOCGIFNAME_REQ, req) : -ENODEV;
+    if (rc < 0) {
+        /* glibc reports an index with no interface as ENXIO, though the kernel answers ENODEV (measured). */
+        errno = rc == -ENODEV ? ENXIO : (int)-rc;
+        return (char *)0;
+    }
+    req[IF_NAMESIZE - 1] = 0;
+    memcpy(buf, req, IF_NAMESIZE);
+    return buf;
+}
+
+/* Scopes that glibc writes and reads as an interface name: link-local unicast fe80::/10 and link-scope multicast ff02 (measured;
+ * getaddrinfo also takes a name on interface-local multicast ff01, getnameinfo prints a number there). */
+static int scope_is_link_local(const uint8_t a[16]) { return a[0] == 0xFE && (a[1] & 0xC0) == 0x80; }
+static int scope_is_mcast(const uint8_t a[16], int scope) { return a[0] == 0xFF && (a[1] & 0x0F) == scope; }
+static int scope_name_accepted(const uint8_t a[16]) { return scope_is_link_local(a) || scope_is_mcast(a, 1) || scope_is_mcast(a, 2); }
+static int scope_name_printed(const uint8_t a[16]) { return scope_is_link_local(a) || scope_is_mcast(a, 2); }
+
 long tcp_connect_host(const char *host, uint16_t port) {
     uint8_t sa[16];
     long r = resolve_ipv4_sockaddr(host, port, sa);
@@ -449,8 +510,6 @@ long tcp_connect_host(const char *host, uint16_t port) {
 }
 
 /* ---- gethostbyname ------------------------------------------------------------------------------------------ */
-
-#include "../include/errno.h"
 
 int h_errno;
 
@@ -855,7 +914,8 @@ static void map_v4(struct hosts_addr *a) {
     a->family = AF_INET6;
 }
 
-/* "addr%scope" with a numeric scope (inet_pton plus glibc's strtoul check). 1 = parsed, 0 = not this form. */
+/* "addr%scope": a numeric scope (inet_pton plus glibc's strtoul check) on any address, or an interface name (if_nametoindex) on
+ * the link-local and multicast scopes glibc accepts it for. 1 = parsed, 0 = not this form. */
 static int scoped_ipv6(const char *node, uint8_t out[16], uint32_t *scope) {
     const char *pct = strchr(node, '%');
     if (!pct) return 0;
@@ -866,13 +926,23 @@ static int scoped_ipv6(const char *node, uint8_t out[16], uint32_t *scope) {
     text[n] = 0;
     const char *d = pct + 1;
     if (*d == 0) return 0;
+    uint8_t addr[16];
+    if (!ipv6_from_text(text, addr)) return 0;
     uint64_t v = 0;
-    for (; *d; d++) {
-        if (*d < '0' || *d > '9') return 0;
-        v = v * 10 + (uint64_t)(*d - '0');
+    int numeric = 1;
+    for (const char *p = d; *p; p++) {
+        if (*p < '0' || *p > '9') { numeric = 0; break; }
+        v = v * 10 + (uint64_t)(*p - '0');
         if (v > 0xFFFFFFFFu) return 0;
     }
-    if (!ipv6_from_text(text, out)) return 0;
+    if (!numeric) {
+        if (!scope_name_accepted(addr)) return 0;
+        int saved = errno;
+        v = if_nametoindex(d);
+        errno = saved;
+        if (v == 0) return 0;
+    }
+    memcpy(out, addr, 16);
     *scope = (uint32_t)v;
     return 1;
 }
@@ -963,7 +1033,7 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
         if (flags & AI_CANONNAME) canon = node;
     } else {
         if (flags & AI_NUMERICHOST) return EAI_NONAME;
-        if (strchr(node, '%')) return EAI_NONAME; /* a scope this library cannot parse (interface names need if_nametoindex) */
+        if (strchr(node, '%')) return EAI_NONAME; /* a scope that is neither a number nor an interface allowed for the address */
         /* /etc/hosts first. Under AF_INET6, IPv4 lines are used only with AI_V4MAPPED: when there is no IPv6 line, or always
          * with AI_ALL, and then as ::ffff:a.b.c.d after the IPv6 ones (glibc, measured). */
         size_t n = etc_hosts_read();
@@ -1077,12 +1147,21 @@ int getnameinfo(const uint8_t *sa, unsigned int salen, char *host, unsigned int 
             long len = v6 ? ipv6_to_text(addr, numeric, sizeof(numeric)) : ipv4_to_text(addr, numeric, sizeof(numeric));
             uint32_t scope = v6 ? ((uint32_t)sa[24] | (uint32_t)sa[25] << 8 | (uint32_t)sa[26] << 16 | (uint32_t)sa[27] << 24) : 0;
             if (scope) {
-                /* A non-zero sin6_scope_id is appended as "%N" (numeric; interface names need if_indextoname). */
-                char d[11];
-                int nd = 0;
-                do { d[nd++] = (char)('0' + scope % 10); scope /= 10; } while (scope);
+                /* A non-zero sin6_scope_id is appended as "%name" for a link-local or link-scope multicast address whose index
+                 * names an interface, otherwise as "%N" (glibc, measured). */
+                char ifname[IF_NAMESIZE];
+                int saved = errno;
+                const char *named = scope_name_printed(addr) ? if_indextoname(scope, ifname) : (const char *)0;
+                errno = saved;
                 numeric[len++] = '%';
-                while (nd) numeric[len++] = d[--nd];
+                if (named) {
+                    for (size_t k = 0; named[k]; k++) numeric[len++] = named[k];
+                } else {
+                    char d[11];
+                    int nd = 0;
+                    do { d[nd++] = (char)('0' + scope % 10); scope /= 10; } while (scope);
+                    while (nd) numeric[len++] = d[--nd];
+                }
                 numeric[len] = 0;
             }
             text = numeric;

@@ -145,6 +145,19 @@ int gethostbyname2_r(const char *name, int af, struct hostent *ret, char *buf, s
 int gethostbyaddr_r(const void *addr, unsigned int len, int family, struct hostent *ret, char *buf, size_t buflen,
                     struct hostent **result, int *h_errnop);
 
+/* ---- interface names (glibc puts these in <net/if.h>) --------------------------------------------------------- */
+
+#define IF_NAMESIZE 16
+
+/* The index of the interface called `name` (SIOCGIFINDEX on a scratch UDP socket), or 0 with errno ENODEV when there is none.
+ * Names are case-sensitive; one of IF_NAMESIZE characters or more, and a NULL name, are ENODEV without asking the kernel.
+ * When no socket can be opened, 0 with that error. */
+unsigned int if_nametoindex(const char *name);
+
+/* Write the name of interface `index` (SIOCGIFNAME) into `buf`, which holds at least IF_NAMESIZE bytes, and return `buf`; NULL
+ * with errno ENXIO when no interface has that index (index 0 included), or with the socket error. */
+char *if_indextoname(unsigned int index, char *buf);
+
 /* ---- getaddrinfo() ------------------------------------------------------------------------------------------- */
 
 #define AF_UNSPEC 0

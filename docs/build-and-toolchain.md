@@ -183,13 +183,15 @@ SECTIONS {
 `addCUserProgram(b, name)`：用 `zig cc` 交叉编译为静态 freestanding ELF，保存为 `<name>.bin`
 装载镜像（输出目录由 `build.zig` 决定，当前为 `user/`）。这些 `.bin` 文件实际仍是 ELF，
 内核 loader 会自动识别 ELF/flat binary。
-Windows 兼容构建路径不再依赖外部 `strip`；后续可在 CI 中按工具可用性重新启用体积优化。
+构建不依赖外部 `strip`：调试信息由链接器的 `-Wl,--strip-debug` 直接去掉（只去 `.debug_*`，保留符号表）。
+ramdisk 在整个启动期间都留在内存里，去掉之前每个程序带约 600 KiB DWARF，511 个程序的 ramdisk 达到 227 MiB，
+512 MiB 的客户机里 swap 测试（hello96/98/99/101）拿不到 192 MiB 空闲内存；去掉之后约 35 MiB，代码和数据段不变。
 
 ```
 zig cc \
     -target x86_64-freestanding-none \
     -static -nostdlib -ffreestanding -O2 \
-    -mstackrealign -Wl,--gc-sections -Wl,-z,norelro \
+    -mstackrealign -Wl,--gc-sections -Wl,--strip-debug -Wl,-z,norelro \
     -o <name>.bin user/<name>.c
 ```
 
@@ -215,7 +217,7 @@ C 实现）源文件位于 `servers/init/main.c`，同样安装为 `zig-out/user
 zig cc \
     -target x86_64-freestanding-none \
     -static -nostdlib -ffreestanding -O2 \
-    -mstackrealign -Wl,--gc-sections -Wl,-z,norelro \
+    -mstackrealign -Wl,--gc-sections -Wl,--strip-debug -Wl,-z,norelro \
     -Ilib/moqi_libc/include \
     -o <name>.bin user/<name>.c lib/moqi_libc/src/*.c
 ```
