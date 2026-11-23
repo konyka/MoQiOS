@@ -32,6 +32,60 @@ long ipv4_to_text(const uint8_t addr[4], char *buf, size_t buf_len) {
     return (long)n;
 }
 
+long ipv6_to_text(const uint8_t addr[16], char *buf, size_t buf_len) {
+    static const char hex[] = "0123456789abcdef";
+    unsigned g[8];
+    for (int i = 0; i < 8; i++) g[i] = (unsigned)addr[2 * i] << 8 | addr[2 * i + 1];
+    /* The first longest run of at least two zero groups becomes "::". */
+    int best = -1, best_len = 0;
+    for (int i = 0; i < 8;) {
+        if (g[i] != 0) { i++; continue; }
+        int j = i;
+        while (j < 8 && g[j] == 0) j++;
+        if (j - i > best_len && j - i >= 2) { best = i; best_len = j - i; }
+        i = j;
+    }
+    /* The last 32 bits stay a dotted quad for ::ffff:a.b.c.d, and for ::a.b.c.d when the seventh group is not zero (so ::2 and
+     * ::ffff stay hex; glibc, measured). */
+    int quad = 0;
+    if (g[0] == 0 && g[1] == 0 && g[2] == 0 && g[3] == 0 && g[4] == 0) {
+        if (g[5] == 0xFFFF) quad = 1;
+        else if (g[5] == 0 && g[6] != 0) quad = 1;
+    }
+    int groups = quad ? 6 : 8;
+    if (best >= 0 && best + best_len > groups) best_len = groups - best;
+    if (best_len < 2) best = -1;
+    char tmp[46];
+    size_t n = 0;
+    for (int i = 0; i < groups;) {
+        if (i == best) {
+            /* "::" stands for the run; it also supplies the separator on both sides. */
+            tmp[n++] = ':';
+            tmp[n++] = ':';
+            i += best_len;
+            continue;
+        }
+        if (n > 0 && tmp[n - 1] != ':') tmp[n++] = ':';
+        unsigned v = g[i];
+        int started = 0;
+        for (int shift = 12; shift >= 0; shift -= 4) {
+            unsigned d = (v >> shift) & 0xF;
+            if (d || started || shift == 0) { tmp[n++] = hex[d]; started = 1; }
+        }
+        i++;
+    }
+    if (quad) {
+        if (n > 0 && tmp[n - 1] != ':') tmp[n++] = ':';
+        char q[16];
+        long k = ipv4_to_text(addr + 12, q, sizeof q);
+        for (long t = 0; t < k; t++) tmp[n++] = q[t];
+    }
+    if (n + 1 > buf_len) return -34; /* ERANGE */
+    for (size_t i = 0; i < n; i++) buf[i] = tmp[i];
+    buf[n] = 0;
+    return (long)n;
+}
+
 int ipv4_from_text(const char *text, uint8_t out[4]) {
     if (!text || !out) return 0;
     uint8_t parsed[4];
@@ -55,6 +109,70 @@ int ipv4_from_text(const char *text, uint8_t out[4]) {
     }
     if (*text != 0) return 0;
     for (int i = 0; i < 4; i++) out[i] = parsed[i];
+    return 1;
+}
+
+static int hex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+int ipv6_from_text(const char *text, uint8_t out[16]) {
+    if (!text || !out) return 0;
+    uint8_t v[16];
+    int n = 0;      /* bytes written */
+    int gap = -1;   /* byte position of "::" */
+    const char *p = text;
+    if (p[0] == ':') {
+        if (p[1] != ':') return 0;
+        gap = 0;
+        p += 2;
+        if (*p == 0) goto done;
+    }
+    for (;;) {
+        /* One group: hex digits, or a dotted quad that ends the address. */
+        const char *start = p;
+        unsigned val = 0;
+        int digits = 0;
+        while (hex_digit(*p) >= 0) {
+            if (++digits > 4) return 0;
+            val = (val << 4) | (unsigned)hex_digit(*p);
+            p++;
+        }
+        if (*p == '.') {
+            if (n > 12) return 0;
+            uint8_t q[4];
+            if (!ipv4_from_text(start, q)) return 0;
+            for (int k = 0; k < 4; k++) v[n++] = q[k];
+            break;
+        }
+        if (digits == 0 || n > 14) return 0;
+        v[n++] = (uint8_t)(val >> 8);
+        v[n++] = (uint8_t)val;
+        if (*p == 0) break;
+        if (*p != ':') return 0;
+        p++;
+        if (*p == ':') {
+            if (gap >= 0) return 0;
+            gap = n;
+            p++;
+            if (*p == 0) break;
+        } else if (*p == 0) {
+            return 0;
+        }
+    }
+done:
+    if (gap < 0) {
+        if (n != 16) return 0;
+    } else {
+        if (n > 14) return 0;
+        int tail = n - gap;
+        for (int k = 0; k < tail; k++) v[15 - k] = v[n - 1 - k];
+        for (int k = gap; k < 16 - tail; k++) v[k] = 0;
+    }
+    for (int k = 0; k < 16; k++) out[k] = v[k];
     return 1;
 }
 
@@ -127,7 +245,66 @@ int hosts_find(const char *text, size_t len, const char *name, uint8_t out[4]) {
     return hosts_find_names(text, len, name, out, &names) > 0;
 }
 
-size_t hosts_reverse(const char *text, size_t len, const uint8_t want[4], const char **name) {
+size_t hosts_collect(const char *text, size_t len, const char *name, int family, struct hosts_addr *out, size_t cap,
+                     const char **names, size_t *names_len) {
+    if (!text || !name || !out || name[0] == 0) return 0;
+    size_t count = 0;
+    int have_names = 0;
+    /* Pass 0 takes the IPv6 lines, pass 1 the IPv4 lines; the names come from the first matching line in file order. */
+    for (int pass = 0; pass < 2; pass++) {
+        int want = pass == 0 ? AF_INET6 : AF_INET;
+        if (family != AF_UNSPEC && family != want) continue;
+        size_t pos = 0;
+        while (pos < len) {
+            size_t end = pos;
+            while (end < len && text[end] != '\n') end++;
+            size_t stop = pos;
+            while (stop < end && text[stop] != '#') stop++;
+            size_t i = pos;
+            while (i < stop && hosts_space(text[i])) i++;
+            size_t a = i;
+            while (i < stop && !hosts_space(text[i])) i++;
+            char addr_text[48];
+            struct hosts_addr h;
+            int ok = 0;
+            if (i > a && i - a < sizeof(addr_text)) {
+                for (size_t k = 0; k < i - a; k++) addr_text[k] = text[a + k];
+                addr_text[i - a] = 0;
+                memset(&h, 0, sizeof h);
+                if (want == AF_INET && ipv4_from_text(addr_text, h.addr)) ok = 1;
+                if (want == AF_INET6 && ipv6_from_text(addr_text, h.addr)) ok = 1;
+                h.family = want;
+            }
+            if (ok) {
+                while (i < stop && hosts_space(text[i])) i++;
+                size_t first = i, last = i;
+                int hit = 0;
+                while (i < stop) {
+                    while (i < stop && hosts_space(text[i])) i++;
+                    size_t f = i;
+                    while (i < stop && !hosts_space(text[i])) i++;
+                    if (i > f) {
+                        last = i;
+                        if (hosts_field_is(text, f, i, name)) hit = 1;
+                    }
+                }
+                if (hit) {
+                    if (count < cap) out[count++] = h;
+                    if (names && names_len && (!have_names || a < (size_t)(*names - text))) {
+                        *names = text + first;
+                        *names_len = last - first;
+                        have_names = 1;
+                    }
+                }
+            }
+            pos = end + 1;
+        }
+    }
+    return count;
+}
+
+/* The first name of the first line whose address, parsed for `family`, is the `alen` bytes of `want`. */
+static size_t hosts_reverse_any(const char *text, size_t len, int family, const uint8_t *want, size_t alen, const char **name) {
     if (!text || !want || !name) return 0;
     size_t pos = 0;
     while (pos < len) {
@@ -139,13 +316,13 @@ size_t hosts_reverse(const char *text, size_t len, const uint8_t want[4], const 
         while (i < stop && hosts_space(text[i])) i++;
         size_t a = i;
         while (i < stop && !hosts_space(text[i])) i++;
-        char addr_text[16];
-        uint8_t addr[4];
+        char addr_text[48];
+        uint8_t addr[16];
         if (i > a && i - a < sizeof(addr_text)) {
             for (size_t k = 0; k < i - a; k++) addr_text[k] = text[a + k];
             addr_text[i - a] = 0;
-            if (ipv4_from_text(addr_text, addr) && addr[0] == want[0] && addr[1] == want[1] && addr[2] == want[2] &&
-                addr[3] == want[3]) {
+            int ok = family == AF_INET6 ? ipv6_from_text(addr_text, addr) : ipv4_from_text(addr_text, addr);
+            if (ok && memcmp(addr, want, alen) == 0) {
                 while (i < stop && hosts_space(text[i])) i++;
                 size_t f = i;
                 while (i < stop && !hosts_space(text[i])) i++;
@@ -158,6 +335,14 @@ size_t hosts_reverse(const char *text, size_t len, const uint8_t want[4], const 
         pos = end + 1;
     }
     return 0;
+}
+
+size_t hosts_reverse(const char *text, size_t len, const uint8_t want[4], const char **name) {
+    return hosts_reverse_any(text, len, AF_INET, want, 4, name);
+}
+
+size_t hosts_reverse6(const char *text, size_t len, const uint8_t want[16], const char **name) {
+    return hosts_reverse_any(text, len, AF_INET6, want, 16, name);
 }
 
 /* The host test links netdb.o without the file system: there /etc/hosts is never read. */
@@ -361,19 +546,31 @@ void freeaddrinfo(struct addrinfo *res) {
     }
 }
 
-static struct addrinfo *make_entry(const uint8_t addr[4], uint16_t port, int socktype, int protocol, int flags,
-                                   const char *canon) {
+static struct addrinfo *make_entry(const struct hosts_addr *a, uint32_t scope, uint16_t port, int socktype, int protocol,
+                                   int flags, const char *canon) {
     struct addrinfo *e = (struct addrinfo *)malloc(sizeof(struct addrinfo));
     if (!e) return (struct addrinfo *)0;
     memset(e, 0, sizeof(*e));
-    e->ai_addr = (uint8_t *)malloc(16);
+    unsigned int len = a->family == AF_INET6 ? 28 : 16;
+    e->ai_addr = (uint8_t *)malloc(len);
     if (!e->ai_addr) { free(e); return (struct addrinfo *)0; }
-    ipv4_sockaddr(addr, port, e->ai_addr);
+    if (a->family == AF_INET6) {
+        /* Linux struct sockaddr_in6: family (u16, host order), port (network order), flowinfo, address, scope id (host order). */
+        memset(e->ai_addr, 0, len);
+        e->ai_addr[0] = AF_INET6;
+        uint16_t be = htons(port);
+        e->ai_addr[2] = (uint8_t)(be & 0xFF);
+        e->ai_addr[3] = (uint8_t)(be >> 8);
+        memcpy(e->ai_addr + 8, a->addr, 16);
+        for (int k = 0; k < 4; k++) e->ai_addr[24 + k] = (uint8_t)(scope >> (8 * k));
+    } else {
+        ipv4_sockaddr(a->addr, port, e->ai_addr);
+    }
     e->ai_flags = flags;
-    e->ai_family = AF_INET;
+    e->ai_family = a->family;
     e->ai_socktype = socktype;
     e->ai_protocol = protocol;
-    e->ai_addrlen = 16;
+    e->ai_addrlen = len;
     if (canon) {
         size_t n = strlen(canon);
         e->ai_canonname = (char *)malloc(n + 1);
@@ -383,6 +580,47 @@ static struct addrinfo *make_entry(const uint8_t addr[4], uint16_t port, int soc
     return e;
 }
 
+static void set_v4(struct hosts_addr *a, uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3) {
+    memset(a, 0, sizeof(*a));
+    a->family = AF_INET;
+    a->addr[0] = b0; a->addr[1] = b1; a->addr[2] = b2; a->addr[3] = b3;
+}
+
+/* ::ffff:a.b.c.d for an IPv4 address (AI_V4MAPPED). */
+static void map_v4(struct hosts_addr *a) {
+    uint8_t v4[4];
+    memcpy(v4, a->addr, 4);
+    memset(a->addr, 0, 16);
+    a->addr[10] = 0xFF;
+    a->addr[11] = 0xFF;
+    memcpy(a->addr + 12, v4, 4);
+    a->family = AF_INET6;
+}
+
+/* "addr%scope" with a numeric scope (inet_pton plus glibc's strtoul check). 1 = parsed, 0 = not this form. */
+static int scoped_ipv6(const char *node, uint8_t out[16], uint32_t *scope) {
+    const char *pct = strchr(node, '%');
+    if (!pct) return 0;
+    size_t n = (size_t)(pct - node);
+    char text[48];
+    if (n == 0 || n >= sizeof(text)) return 0;
+    memcpy(text, node, n);
+    text[n] = 0;
+    const char *d = pct + 1;
+    if (*d == 0) return 0;
+    uint64_t v = 0;
+    for (; *d; d++) {
+        if (*d < '0' || *d > '9') return 0;
+        v = v * 10 + (uint64_t)(*d - '0');
+        if (v > 0xFFFFFFFFu) return 0;
+    }
+    if (!ipv6_from_text(text, out)) return 0;
+    *scope = (uint32_t)v;
+    return 1;
+}
+
+#define GAI_MAX_ADDRS 16
+
 int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
     int flags = 0, family = AF_UNSPEC, socktype = 0, protocol = 0;
     if (hints) {
@@ -391,14 +629,14 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
         socktype = hints->ai_socktype;
         protocol = hints->ai_protocol;
     }
-    /* The caller's flags are validated; AI_V4MAPPED (8), AI_ALL (16) and AI_ADDRCONFIG (32) are accepted and ignored. */
-    const int known_flags = AI_PASSIVE | AI_CANONNAME | AI_NUMERICHOST | AI_NUMERICSERV | 0x08 | 0x10 | 0x20;
+    /* The caller's flags are validated; AI_ADDRCONFIG is accepted and ignored. */
+    const int known_flags = AI_PASSIVE | AI_CANONNAME | AI_NUMERICHOST | AI_NUMERICSERV | AI_V4MAPPED | AI_ALL | AI_ADDRCONFIG;
     if (flags & ~known_flags) return EAI_BADFLAGS;
     /* With no hints at all glibc echoes 0x40 in the entries (its internal default); mirror that. */
     int echoed_flags = hints ? flags : 0x40;
     if ((flags & AI_CANONNAME) && !node) return EAI_BADFLAGS;
     if (!node && !service) return EAI_NONAME;
-    if (family != AF_UNSPEC && family != AF_INET) return EAI_FAMILY;
+    if (family != AF_UNSPEC && family != AF_INET && family != AF_INET6) return EAI_FAMILY;
 
     /* Which socket types to emit: (socktype, protocol) pairs, in glibc order. */
     int types[3], protos[3], ntypes = 0;
@@ -432,36 +670,97 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
         if (!parse_numeric_service(service, &tmp)) return EAI_SERVICE;
     }
 
-    uint8_t addr[4];
+    struct hosts_addr addrs[GAI_MAX_ADDRS];
+    size_t naddrs = 0;
+    uint32_t scope = 0;
     const char *canon = (const char *)0;
     char canon_buf[256];
+    uint8_t v4[4];
     if (!node) {
-        if (flags & AI_PASSIVE) { addr[0] = addr[1] = addr[2] = addr[3] = 0; }
-        else { addr[0] = 127; addr[1] = 0; addr[2] = 0; addr[3] = 1; }
-    } else if (ipv4_from_text(node, addr)) {
+        /* Loopback, or the wildcard with AI_PASSIVE; AF_UNSPEC gives both families in glibc's order (loopback interface up). */
+        int passive = (flags & AI_PASSIVE) != 0;
+        struct hosts_addr six;
+        memset(&six, 0, sizeof six);
+        six.family = AF_INET6;
+        if (!passive) six.addr[15] = 1;
+        struct hosts_addr four;
+        if (passive) set_v4(&four, 0, 0, 0, 0);
+        else set_v4(&four, 127, 0, 0, 1);
+        if (family == AF_INET6) addrs[naddrs++] = six;
+        else if (family == AF_INET) addrs[naddrs++] = four;
+        else if (passive) { addrs[naddrs++] = four; addrs[naddrs++] = six; }
+        else { addrs[naddrs++] = six; addrs[naddrs++] = four; }
+    } else if (ipv4_from_text(node, v4)) {
+        set_v4(&addrs[0], v4[0], v4[1], v4[2], v4[3]);
+        if (family == AF_INET6) {
+            if (!(flags & AI_V4MAPPED)) return EAI_ADDRFAMILY;
+            map_v4(&addrs[0]);
+        }
+        naddrs = 1;
+        if (flags & AI_CANONNAME) canon = node;
+    } else if (ipv6_from_text(node, addrs[0].addr) || scoped_ipv6(node, addrs[0].addr, &scope)) {
+        if (family == AF_INET) return EAI_ADDRFAMILY;
+        addrs[0].family = AF_INET6;
+        naddrs = 1;
         if (flags & AI_CANONNAME) canon = node;
     } else {
         if (flags & AI_NUMERICHOST) return EAI_NONAME;
-        long r = lookup_ipv4(node, addr, canon_buf, sizeof(canon_buf));
-        if (r < 0) {
-            return (r == -2 || r == -22 || r == -36) ? EAI_NONAME : EAI_AGAIN;
+        if (strchr(node, '%')) return EAI_NONAME; /* a scope this library cannot parse (interface names need if_nametoindex) */
+        /* /etc/hosts first. Under AF_INET6, IPv4 lines are used only with AI_V4MAPPED: when there is no IPv6 line, or always
+         * with AI_ALL, and then as ::ffff:a.b.c.d after the IPv6 ones (glibc, measured). */
+        size_t n = etc_hosts_read();
+        const char *names = (const char *)0;
+        size_t names_len = 0;
+        if (n) {
+            if (family == AF_INET6) {
+                naddrs = hosts_collect(etc_hosts_buf, n, node, AF_INET6, addrs, GAI_MAX_ADDRS, &names, &names_len);
+                if ((flags & AI_V4MAPPED) && (naddrs == 0 || (flags & AI_ALL))) {
+                    const char *names4 = (const char *)0;
+                    size_t len4 = 0;
+                    size_t m = hosts_collect(etc_hosts_buf, n, node, AF_INET, addrs + naddrs, GAI_MAX_ADDRS - naddrs, &names4, &len4);
+                    for (size_t k = 0; k < m; k++) map_v4(&addrs[naddrs + k]);
+                    if (m && (!names || names4 < names)) { names = names4; names_len = len4; }
+                    naddrs += m;
+                }
+            } else {
+                naddrs = hosts_collect(etc_hosts_buf, n, node, family, addrs, GAI_MAX_ADDRS, &names, &names_len);
+            }
+        }
+        if (naddrs == 0) {
+            /* The kernel resolver answers A records only. */
+            if (family == AF_INET6 && !(flags & AI_V4MAPPED)) return EAI_NONAME;
+            long r = gethostbyname_ipv4(node, v4);
+            if (r < 0) return (r == -2 || r == -22 || r == -36) ? EAI_NONAME : EAI_AGAIN;
+            set_v4(&addrs[0], v4[0], v4[1], v4[2], v4[3]);
+            if (family == AF_INET6) map_v4(&addrs[0]);
+            naddrs = 1;
+            names = (const char *)0;
         }
         if (flags & AI_CANONNAME) {
             /* A name from /etc/hosts is canonicalised to the line's first name, as glibc does. */
-            size_t k = 0;
-            while (canon_buf[k] && canon_buf[k] != ' ' && canon_buf[k] != '\t') k++;
-            canon_buf[k] = 0;
-            canon = canon_buf[0] ? canon_buf : node;
+            canon = node;
+            if (names) {
+                size_t k = 0;
+                while (k < names_len && k + 1 < sizeof(canon_buf) && names[k] != ' ' && names[k] != '\t') {
+                    canon_buf[k] = names[k];
+                    k++;
+                }
+                canon_buf[k] = 0;
+                if (k) canon = canon_buf;
+            }
         }
     }
 
     struct addrinfo *head = (struct addrinfo *)0, **tail = &head;
-    for (int i = 0; i < ntypes; i++) {
-        /* Only the first entry carries the canonical name, as in glibc. */
-        struct addrinfo *e = make_entry(addr, port, types[i], protos[i], echoed_flags, i == 0 ? canon : (const char *)0);
-        if (!e) { freeaddrinfo(head); return EAI_MEMORY; }
-        *tail = e;
-        tail = &e->ai_next;
+    for (size_t a = 0; a < naddrs; a++) {
+        for (int i = 0; i < ntypes; i++) {
+            /* Only the first entry carries the canonical name, as in glibc. */
+            int first = a == 0 && i == 0;
+            struct addrinfo *e = make_entry(&addrs[a], scope, port, types[i], protos[i], echoed_flags, first ? canon : (const char *)0);
+            if (!e) { freeaddrinfo(head); return EAI_MEMORY; }
+            *tail = e;
+            tail = &e->ai_next;
+        }
     }
     *res = head;
     return 0;
@@ -481,30 +780,54 @@ static int copy_text(char *dst, unsigned int dst_len, const char *text) {
 int getnameinfo(const uint8_t *sa, unsigned int salen, char *host, unsigned int hostlen, char *serv,
                 unsigned int servlen, int flags) {
     if ((unsigned int)flags & ~(unsigned int)NI_KNOWN_FLAGS) return EAI_BADFLAGS;
-    if (!sa || salen < 16 || sa[0] != 2 || sa[1] != 0) return EAI_FAMILY;
+    if (!sa || salen < 2) return EAI_FAMILY;
+    int v6 = sa[0] == AF_INET6 && sa[1] == 0;
+    if (v6 ? salen < 28 : (salen < 16 || sa[0] != AF_INET || sa[1] != 0)) return EAI_FAMILY;
     uint16_t port = (uint16_t)(((unsigned)sa[2] << 8) | sa[3]);
-    const uint8_t *addr = sa + 4;
+    const uint8_t *addr = v6 ? sa + 8 : sa + 4;
 
     if (host && hostlen > 0) {
         const char *text = (const char *)0;
-        char dotted[16];
+        char numeric[64];
         char found[NI_MAXHOST];
         if (!(flags & NI_NUMERICHOST)) {
             size_t n = etc_hosts_read();
             const char *name = (const char *)0;
-            size_t k = n ? hosts_reverse(etc_hosts_buf, n, addr, &name) : 0;
+            size_t k = 0;
+            static const uint8_t mapped_prefix[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
+            static const uint8_t loop6[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+            if (!v6) {
+                k = n ? hosts_reverse(etc_hosts_buf, n, addr, &name) : 0;
+            } else if (memcmp(addr, mapped_prefix, 12) == 0) {
+                /* ::ffff:a.b.c.d is named from the IPv4 lines (glibc, measured). */
+                k = n ? hosts_reverse(etc_hosts_buf, n, addr + 12, &name) : 0;
+            } else {
+                k = n ? hosts_reverse6(etc_hosts_buf, n, addr, &name) : 0;
+            }
             if (k > 0 && k < sizeof(found)) {
                 memcpy(found, name, k);
                 found[k] = 0;
                 text = found;
-            } else if (addr[0] == 127 && addr[1] == 0 && addr[2] == 0 && addr[3] == 1) {
+            } else if (!v6 && addr[0] == 127 && addr[1] == 0 && addr[2] == 0 && addr[3] == 1) {
+                text = "localhost";
+            } else if (v6 && memcmp(addr, loop6, 16) == 0) {
                 text = "localhost";
             }
         }
         if (!text) {
             if (flags & NI_NAMEREQD) return EAI_NONAME;
-            ipv4_to_text(addr, dotted, sizeof(dotted));
-            text = dotted;
+            long len = v6 ? ipv6_to_text(addr, numeric, sizeof(numeric)) : ipv4_to_text(addr, numeric, sizeof(numeric));
+            uint32_t scope = v6 ? ((uint32_t)sa[24] | (uint32_t)sa[25] << 8 | (uint32_t)sa[26] << 16 | (uint32_t)sa[27] << 24) : 0;
+            if (scope) {
+                /* A non-zero sin6_scope_id is appended as "%N" (numeric; interface names need if_indextoname). */
+                char d[11];
+                int nd = 0;
+                do { d[nd++] = (char)('0' + scope % 10); scope /= 10; } while (scope);
+                numeric[len++] = '%';
+                while (nd) numeric[len++] = d[--nd];
+                numeric[len] = 0;
+            }
+            text = numeric;
         }
         int rc = copy_text(host, hostlen, text);
         if (rc) return rc;

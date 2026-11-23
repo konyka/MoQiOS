@@ -623,6 +623,8 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello503"); /* /etc/hosts before the resolver */
     run_test("hello504"); /* getnameinfo names addresses from /etc/hosts */
     run_test("hello505"); /* canonical names and aliases from /etc/hosts */
+    run_test("hello506"); /* getaddrinfo with AF_INET6 */
+    run_test("hello507"); /* getnameinfo with sockaddr_in6 */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

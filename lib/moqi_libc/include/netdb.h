@@ -22,10 +22,20 @@ long gethostbyname_ipv4(const char *name, uint8_t out[4]);
  * (-34) when `buf` cannot hold the text plus its NUL, in which case `buf` is not written. */
 long ipv4_to_text(const uint8_t addr[4], char *buf, size_t buf_len);
 
+/* Format a 16-byte IPv6 address like inet_ntop(AF_INET6): lower-case hex groups without leading zeros, the first longest run of
+ * two or more zero groups as "::", and a trailing dotted quad for ::ffff:a.b.c.d and for ::a.b.c.d whose seventh group is not zero. Returns the
+ * text length, or -ERANGE (-34) when `buf` cannot hold the text plus its NUL, in which case `buf` is not written. */
+long ipv6_to_text(const uint8_t addr[16], char *buf, size_t buf_len);
+
 /* Parse "a.b.c.d" into 4 bytes (network order), with inet_pton(AF_INET) semantics: exactly four decimal fields of
  * 0..255, no leading zeros, no whitespace, no trailing text. Returns 1 on success, 0 when `text` is not an IPv4
  * address (NULL arguments included). `out` is written only on success. */
 int ipv4_from_text(const char *text, uint8_t out[4]);
+
+/* Parse an IPv6 address into 16 bytes (network order) with inet_pton(AF_INET6) semantics: eight groups of up to four hex digits,
+ * one "::" for a run of zero groups, an optional trailing dotted IPv4 quad in the last 32 bits; no scope, no whitespace.
+ * Returns 1 and writes `out`, or 0 and leaves `out` untouched (also for NULL arguments). */
+int ipv6_from_text(const char *text, uint8_t out[16]);
 
 /* Look `name` up in the text of an /etc/hosts file (`len` bytes): the first line with a dotted IPv4 address that lists the name
  * (ASCII case-insensitive, whole field) wins; '#' starts a comment. Returns 1 and writes the address, or 0. gethostbyname,
@@ -36,9 +46,22 @@ int hosts_find(const char *text, size_t len, const char *name, uint8_t out[4]);
  * separated by spaces or tabs) and the return value is the length of that run up to the comment or line end; 0 means no match. */
 size_t hosts_find_names(const char *text, size_t len, const char *name, uint8_t out[4], const char **names);
 
+/* Every address /etc/hosts gives `name`, for getaddrinfo: IPv6 lines first, then IPv4 lines, each in file order (glibc's order
+ * for these, measured), filtered by `family` (AF_INET, AF_INET6 or AF_UNSPEC); at most `cap` entries. *names (may be NULL) gets the
+ * first matching line's names as in hosts_find_names and *names_len their length. Returns the number of addresses written. */
+struct hosts_addr {
+    int     family;    /* AF_INET or AF_INET6 */
+    uint8_t addr[16];  /* the first 4 bytes for AF_INET */
+};
+size_t hosts_collect(const char *text, size_t len, const char *name, int family, struct hosts_addr *out, size_t cap,
+                     const char **names, size_t *names_len);
+
 /* The reverse lookup getnameinfo uses: the canonical name (first name field) of the first line in the /etc/hosts text whose
  * dotted IPv4 address is `addr` and that lists a name. Returns the name's length and points *name into `text`, or 0. */
 size_t hosts_reverse(const char *text, size_t len, const uint8_t addr[4], const char **name);
+
+/* hosts_reverse for a 16-byte IPv6 address: the first IPv6 line with the same address (in any textual form). */
+size_t hosts_reverse6(const char *text, size_t len, const uint8_t addr[16], const char **name);
 
 /* Build a Linux `struct sockaddr_in` (16 bytes) for bind/connect/sendto: family AF_INET (2) as a little-endian
  * u16, `port` in network byte order, the 4 address bytes, 8 bytes of zero padding. */
@@ -58,6 +81,7 @@ long tcp_connect_host(const char *host, uint16_t port);
 /* ---- glibc-compatible gethostbyname() (IPv4 only) ----------------------------------------------------------- */
 
 #define AF_INET 2
+#define AF_INET6 10
 
 /* h_errno values (glibc numbering). */
 #define HOST_NOT_FOUND 1
@@ -96,6 +120,9 @@ struct hostent *gethostbyname(const char *name);
 #define AI_PASSIVE     0x0001
 #define AI_CANONNAME   0x0002
 #define AI_NUMERICHOST 0x0004
+#define AI_V4MAPPED    0x0008
+#define AI_ALL         0x0010
+#define AI_ADDRCONFIG  0x0020
 #define AI_NUMERICSERV 0x0400
 
 #define EAI_BADFLAGS -1
@@ -105,6 +132,7 @@ struct hostent *gethostbyname(const char *name);
 #define EAI_FAMILY   -6
 #define EAI_SOCKTYPE -7
 #define EAI_SERVICE  -8
+#define EAI_ADDRFAMILY -9
 #define EAI_MEMORY   -10
 #define EAI_OVERFLOW -12
 
@@ -114,14 +142,15 @@ struct addrinfo {
     int              ai_socktype;
     int              ai_protocol;
     unsigned int     ai_addrlen;
-    uint8_t         *ai_addr;       /* a 16-byte sockaddr_in */
+    uint8_t         *ai_addr;       /* a 16-byte sockaddr_in, or a 28-byte sockaddr_in6 for AF_INET6 */
     char            *ai_canonname;
     struct addrinfo *ai_next;
 };
 
-/* Resolve `node` and `service` into a list of addresses for socket()/connect()/bind(). IPv4 only: AF_UNSPEC and
- * AF_INET are served, anything else is EAI_FAMILY. Returns 0 and a list in *res (free it with freeaddrinfo), or
- * an EAI_* code. glibc-compatible in the cases that were measured: see test_netdb_abi.c. */
+/* Resolve `node` and `service` into a list of addresses for socket()/connect()/bind(). AF_UNSPEC, AF_INET and AF_INET6 are
+ * served, anything else is EAI_FAMILY. IPv6 comes from literals (with an optional numeric "%scope") and /etc/hosts lines; the
+ * kernel resolver answers IPv4 only, which AF_INET6 uses as ::ffff:a.b.c.d under AI_V4MAPPED. Returns 0 and a list in *res
+ * (free it with freeaddrinfo), or an EAI_* code. glibc-compatible in the cases that were measured: see test_netdb_abi.c. */
 int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res);
 
 /* Release a list returned by getaddrinfo. NULL is a no-op. */
@@ -141,13 +170,15 @@ const char *gai_strerror(int code);
 #define NI_MAXHOST 1025
 #define NI_MAXSERV 32
 
-/* Turn a 16-byte sockaddr_in into text. `host` and `serv` are optional: NULL or a zero length means "do not
- * return that part". The host is "localhost" for 127.0.0.1 and dotted decimal otherwise (there is no reverse DNS);
- * NI_NUMERICHOST forces the dotted form and NI_NAMEREQD turns "no name" into EAI_NONAME. The service is a known
- * name (see getaddrinfo) unless NI_NUMERICSERV, else the decimal port. NI_NOFQDN, NI_DGRAM and the IDN bits
- * (0x20, 0x40, 0x80) are accepted and change nothing; any other bit is EAI_BADFLAGS. A NULL, short (< 16 bytes) or
- * non-AF_INET address is EAI_FAMILY; a buffer too small for the text plus its NUL is EAI_OVERFLOW. The host is
- * written before the service is looked at. Returns 0 or an EAI_* code. */
+/* Turn a 16-byte sockaddr_in or a 28-byte sockaddr_in6 into text. `host` and `serv` are optional: NULL or a zero length
+ * means "do not return that part". The host is the first name of the /etc/hosts line with the address (::ffff:a.b.c.d is
+ * looked up as a.b.c.d), else "localhost" for 127.0.0.1 and ::1, else the numeric form (there is no reverse DNS): dotted
+ * decimal, or inet_ntop text with "%N" for a non-zero sin6_scope_id. NI_NUMERICHOST forces the numeric form and NI_NAMEREQD
+ * turns "no name" into EAI_NONAME. The service is a known name (see getaddrinfo) unless NI_NUMERICSERV, else the decimal
+ * port. NI_NOFQDN, NI_DGRAM and the IDN bits (0x20, 0x40, 0x80) are accepted and change nothing; any other bit is
+ * EAI_BADFLAGS. A NULL address, a short one (< 16 bytes for AF_INET, < 28 for AF_INET6) or another family is EAI_FAMILY; a
+ * buffer too small for the text plus its NUL is EAI_OVERFLOW. The host is written before the service is looked at.
+ * Returns 0 or an EAI_* code. */
 int getnameinfo(const uint8_t *sa, unsigned int salen, char *host, unsigned int hostlen, char *serv,
                 unsigned int servlen, int flags);
 

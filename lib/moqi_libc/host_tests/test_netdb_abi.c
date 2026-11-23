@@ -131,6 +131,25 @@ int main(void) {
         assert(hosts_find_names(hosts, sizeof(hosts) - 1, "none", h, &names) == 0 && names == 0);
     }
 
+    /* Every address of a name, for getaddrinfo: IPv6 lines first, then IPv4 lines, each in file order (glibc, measured). */
+    {
+        static const char hosts[] = "2001:db8::6 dup\n10.5.0.6 Dup other\n2001:db8::7 x dup\n10.5.0.7 dup\nbad::addr::x dup\n10.5.0.8 nodup\n";
+        struct hosts_addr got[8];
+        const char *names = 0;
+        size_t nl = 0;
+        size_t k = hosts_collect(hosts, sizeof(hosts) - 1, "DUP", AF_UNSPEC, got, 8, &names, &nl);
+        assert(k == 4 && got[0].family == AF_INET6 && got[0].addr[15] == 6 && got[1].family == AF_INET6 && got[1].addr[15] == 7);
+        assert(got[2].family == AF_INET && got[2].addr[3] == 6 && got[3].family == AF_INET && got[3].addr[3] == 7);
+        assert(nl == 3 && memcmp(names, "dup", 3) == 0); /* the first matching line in the file */
+        assert(hosts_collect(hosts, sizeof(hosts) - 1, "dup", AF_INET6, got, 8, &names, &nl) == 2 && got[1].addr[15] == 7);
+        assert(hosts_collect(hosts, sizeof(hosts) - 1, "dup", AF_INET, got, 8, (const char **)0, (size_t *)0) == 2 && got[0].addr[3] == 6);
+        assert(hosts_collect(hosts, sizeof(hosts) - 1, "other", AF_INET6, got, 8, &names, &nl) == 0);
+        k = hosts_collect(hosts, sizeof(hosts) - 1, "other", AF_UNSPEC, got, 8, &names, &nl);
+        assert(k == 1 && got[0].family == AF_INET && nl == 9 && memcmp(names, "Dup other", 9) == 0);
+        assert(hosts_collect(hosts, sizeof(hosts) - 1, "dup", AF_UNSPEC, got, 3, &names, &nl) == 3);
+        assert(hosts_collect(hosts, sizeof(hosts) - 1, "missing", AF_UNSPEC, got, 8, &names, &nl) == 0);
+    }
+
     /* Reverse: the first matching line's first name (glibc getnameinfo with /etc/hosts, measured). */
     {
         static const char hosts[] =
@@ -148,6 +167,22 @@ int main(void) {
         n = 0;
         assert(hosts_reverse(hosts, sizeof(hosts) - 1, (const uint8_t[]){10, 5, 0, 7}, &n) == 0 && n == 0);
         assert(hosts_reverse(hosts, 0, (const uint8_t[]){10, 5, 0, 4}, &n) == 0);
+    }
+
+    /* Reverse for IPv6: an IPv6 line with the same 16 bytes, written in any form (glibc, measured). */
+    {
+        static const char hosts[] = "::1 localhost6 ip6-localhost\n2001:DB8:0::6 Six.example s6\n10.5.0.6 four\n2001:db8::6 later\n";
+        static const uint8_t six[16] = {32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6};
+        static const uint8_t lo[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+        static const uint8_t nine[16] = {32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9};
+        const char *n = 0;
+        assert(hosts_reverse6(hosts, sizeof(hosts) - 1, six, &n) == 11 && memcmp(n, "Six.example", 11) == 0);
+        assert(hosts_reverse6(hosts, sizeof(hosts) - 1, lo, &n) == 10 && memcmp(n, "localhost6", 10) == 0);
+        n = 0;
+        assert(hosts_reverse6(hosts, sizeof(hosts) - 1, nine, &n) == 0 && n == 0);
+        /* An IPv4 line never answers an IPv6 address: ::ffff:a.b.c.d is looked up as a.b.c.d by getnameinfo itself. */
+        static const uint8_t mapped[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 10, 5, 0, 6};
+        assert(hosts_reverse6(hosts, sizeof(hosts) - 1, mapped, &n) == 0);
     }
 
     /* A NULL name or output never reaches the kernel: the wrapper refuses it first with EINVAL. */
@@ -207,6 +242,107 @@ int main(void) {
     }
     assert(ipv4_from_text((const char *)0, ip) == 0);
     assert(ipv4_from_text("1.2.3.4", (uint8_t *)0) == 0);
+
+    /* inet_pton(AF_INET6) semantics; every expected value below is glibc's inet_pton output for the same text. */
+    {
+        static const struct { const char *text; int ok; uint8_t v[16]; } cases6[] = {
+        {"::", 1, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {"::1", 1, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}},
+        {"1::", 1, {0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {"2001:db8::6", 1, {32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6}},
+        {"2001:DB8:0:0:0:0:0:1", 1, {32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}},
+        {"1:2:3:4:5:6:7:8", 1, {0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8}},
+        {"1:2:3:4:5:6:7::", 1, {0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 0}},
+        {"::2:3:4:5:6:7:8", 1, {0, 0, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8}},
+        {"1:2:3:4:5:6:7:8:9", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {"1::2::3", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {":1::", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {":::", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {"1:::2", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {"12345::", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {"fffff::", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {"g::", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {"::ffff:1.2.3.4", 1, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 1, 2, 3, 4}},
+        {"::1.2.3.4", 1, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4}},
+        {"1:2:3:4:5:6:1.2.3.4", 1, {0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 1, 2, 3, 4}},
+        {"1:2:3:4:5:6:7:1.2.3.4", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {"::ffff:1.2.3", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {"::ffff:01.2.3.4", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {"::1.2.3.4:5", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {"1::2:3:4:5:6:7", 1, {0, 1, 0, 0, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7}},
+        {"1:2:3:4:5:6:7", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {"", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {"1:", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {"::1 ", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {"0000:0000::00001", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {"0:0::0001", 1, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}},
+        {"fe80::1%lo", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {"::ffff:256.1.1.1", 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        };
+        for (unsigned i = 0; i < sizeof(cases6) / sizeof(cases6[0]); i++) {
+            uint8_t got[16];
+            memset(got, 0xAA, sizeof got);
+            int r = ipv6_from_text(cases6[i].text, got);
+            assert(r == cases6[i].ok);
+            if (r) assert(memcmp(got, cases6[i].v, 16) == 0);
+            else for (int k = 0; k < 16; k++) assert(got[k] == 0xAA);
+        }
+        /* inet_ntop(AF_INET6): every expected text is glibc's for the same bytes. */
+        static const struct { uint8_t v[16]; const char *text; } ntop[] = {
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "::"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, "::1"},
+        {{0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "1::"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}, "::2"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, "::1"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4}, "::1.2.3.4"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 1, 2, 3, 4}, "::ffff:1.2.3.4"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0, 1, 2, 3, 4}, "::ffff:0:102:304"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0}, "::1:0:0"},
+        {{0, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3}, "1:0:0:2::3"},
+        {{0, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 3, 0, 4}, "1::2:0:0:3:4"},
+        {{0, 1, 0, 0, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7}, "1:0:2:3:4:5:6:7"},
+        {{0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 0}, "1:2:3:4:5:6:7:0"},
+        {{0, 0, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7}, "0:1:2:3:4:5:6:7"},
+        {{32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, "2001:db8::1"},
+        {{32, 1, 13, 184, 171, 205, 0, 18, 0, 0, 0, 0, 0, 0, 0, 255}, "2001:db8:abcd:12::ff"},
+        {{254, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, "fe80::1"},
+        {{0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8}, "1:2:3:4:5:6:7:8"},
+        {{0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "0:0:1::"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 254, 1, 2, 3, 4}, "::fffe:102:304"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0}, "::1:0:0:0"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0, 0, 0}, "::ffff:0.0.0.0"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0, 0, 0}, "::ffff:0.0.0.0"},
+        {{0, 100, 255, 155, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4}, "64:ff9b::102:304"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0}, "::1.0.0.0"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1}, "::1.0.0.1"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255}, "::ffff"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0}, "::0.1.0.0"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0}, "::100"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0, 0, 1}, "::ffff:0.0.0.1"},
+        };
+        for (unsigned i = 0; i < sizeof(ntop) / sizeof(ntop[0]); i++) {
+            char t[46];
+            long n = ipv6_to_text(ntop[i].v, t, sizeof t);
+            assert(n == (long)strlen(ntop[i].text) && strcmp(t, ntop[i].text) == 0);
+        }
+        {
+            /* "2001:db8::1" is 11 characters: 12 bytes fit, 11 is -ERANGE and leaves the buffer alone (glibc NULL for <= 11). */
+            static const uint8_t d[16] = {32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+            char t[16];
+            memset(t, 'X', sizeof t);
+            assert(ipv6_to_text(d, t, 11) == -34 && t[0] == 'X');
+            assert(ipv6_to_text(d, t, 12) == 11 && strcmp(t, "2001:db8::1") == 0);
+        }
+        uint8_t six[16];
+        assert(ipv6_from_text((const char *)0, six) == 0);
+        /* Edges also measured on glibc: "::" must stand for at least one zero group, a dotted quad needs the 96 bits before it. */
+        assert(ipv6_from_text("1::2:3:4:5:6:7:8", six) == 0);
+        assert(ipv6_from_text("::1:2:3:4:5:6:7", six) == 1 && six[0] == 0 && six[1] == 0 && six[15] == 7);
+        assert(ipv6_from_text("1:2:3:4:5:6::1.2.3.4", six) == 0);
+        assert(ipv6_from_text("::1.2.3.4.5", six) == 0);
+        assert(ipv6_from_text("1.2.3.4", six) == 0);
+        assert(ipv6_from_text("::1", (uint8_t *)0) == 0);
+    }
 
     /* sockaddr_in builder: Linux layout, 16 bytes: family (u16 little-endian) = AF_INET, port in network byte
      * order, 4 address bytes, 8 zero bytes. */
@@ -439,15 +575,93 @@ int main(void) {
     HINTS(AF_INET, 77, 0, 0);
     assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == EAI_SOCKTYPE);
 
-    /* Family: UNSPEC and INET work, anything else is EAI_FAMILY (glibc says -9 for INET6 + a v4 name; this stack
-     * has no IPv6 so it is EAI_FAMILY too). */
+    /* Family: UNSPEC, INET and INET6 are served, anything else is EAI_FAMILY. An IPv4 literal under AF_INET6 is
+     * EAI_ADDRFAMILY (-9) unless AI_V4MAPPED maps it (glibc, measured). */
     HINTS(AF_UNSPEC, SOCK_STREAM, 0, 0);
     assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == 0);
     freeaddrinfo(res);
     HINTS(1 /* AF_UNIX */, SOCK_STREAM, 0, 0);
     assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == EAI_FAMILY);
-    HINTS(10 /* AF_INET6 */, SOCK_STREAM, 0, 0);
-    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == EAI_FAMILY);
+    HINTS(AF_INET6, SOCK_STREAM, 0, 0);
+    assert(getaddrinfo("1.2.3.4", "80", &hints, &res) == EAI_ADDRFAMILY);
+    assert(strcmp(gai_strerror(EAI_ADDRFAMILY), "Address family for hostname not supported") == 0);
+
+    /* IPv6 literals: a 28-byte sockaddr_in6 (family 10 little-endian, port big-endian, flowinfo 0, the address, scope id),
+     * the bytes glibc writes for 2001:db8::1 port 443. */
+    {
+        static const uint8_t want[28] = {10, 0, 1, 187, 0, 0, 0, 0, 32, 1, 13, 184, 0, 0, 0, 0,
+                                         0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0};
+        HINTS(AF_INET6, SOCK_STREAM, 0, 0);
+        assert(getaddrinfo("2001:db8::1", "443", &hints, &res) == 0);
+        assert(res->ai_family == AF_INET6 && res->ai_addrlen == 28 && res->ai_protocol == IPPROTO_TCP && res->ai_flags == 0);
+        assert(memcmp(res->ai_addr, want, 28) == 0 && res->ai_next == (struct addrinfo *)0);
+        freeaddrinfo(res);
+        /* AF_UNSPEC takes it as IPv6 too; AF_INET refuses it with EAI_ADDRFAMILY. */
+        HINTS(AF_UNSPEC, SOCK_STREAM, 0, 0);
+        assert(getaddrinfo("2001:db8::1", "443", &hints, &res) == 0 && res->ai_family == AF_INET6 && memcmp(res->ai_addr, want, 28) == 0);
+        freeaddrinfo(res);
+        HINTS(AF_INET, SOCK_STREAM, 0, 0);
+        assert(getaddrinfo("2001:db8::1", "443", &hints, &res) == EAI_ADDRFAMILY);
+        /* A literal never reaches the resolver, also under AI_NUMERICHOST; AI_CANONNAME echoes the text. */
+        stub_reset();
+        HINTS(AF_INET6, SOCK_STREAM, 0, AI_NUMERICHOST | AI_CANONNAME);
+        assert(getaddrinfo("2001:db8::7", "80", &hints, &res) == 0 && moqi_test_last_nr == 0);
+        assert(res->ai_canonname && strcmp(res->ai_canonname, "2001:db8::7") == 0);
+        freeaddrinfo(res);
+        /* A mapped literal stays IPv6. */
+        HINTS(AF_INET6, SOCK_STREAM, 0, 0);
+        assert(getaddrinfo("::ffff:1.2.3.4", "80", &hints, &res) == 0 && SA(res)[18] == 255 && SA(res)[19] == 255 && SA(res)[20] == 1 && SA(res)[23] == 4);
+        freeaddrinfo(res);
+        /* AI_V4MAPPED turns an IPv4 literal into ::ffff:a.b.c.d under AF_INET6. */
+        HINTS(AF_INET6, SOCK_STREAM, 0, AI_V4MAPPED);
+        assert(getaddrinfo("10.5.0.6", "80", &hints, &res) == 0 && res->ai_family == AF_INET6 && res->ai_addrlen == 28);
+        assert(SA(res)[8] == 0 && SA(res)[17] == 0 && SA(res)[18] == 255 && SA(res)[19] == 255 && SA(res)[20] == 10 && SA(res)[23] == 6);
+        assert(res->ai_flags == AI_V4MAPPED);
+        freeaddrinfo(res);
+    }
+    /* Numeric scope ids: "%N" sets sin6_scope_id (decimal, leading zeros allowed, up to 2^32-1); an empty, negative, too large or
+     * non-numeric scope, or a scope on an IPv4 literal, is EAI_NONAME (glibc, measured with AI_NUMERICHOST). Interface names
+     * after '%' need if_nametoindex, which this library does not have: they are EAI_NONAME too. */
+    {
+        static const struct { const char *text; int rc; uint32_t scope; } scopes[] = {
+            {"fe80::1%1", 0, 1}, {"fe80::1%99", 0, 99}, {"fe80::1%01", 0, 1}, {"fe80::1%4294967295", 0, 4294967295u},
+            {"::ffff:1.2.3.4%2", 0, 2}, {"2001:db8::7%1", 0, 1},
+            {"fe80::1%", EAI_NONAME, 0}, {"fe80::1%-1", EAI_NONAME, 0}, {"fe80::1%4294967296", EAI_NONAME, 0},
+            {"fe80::1%1x", EAI_NONAME, 0}, {"10.0.0.1%1", EAI_NONAME, 0},
+        };
+        for (unsigned i = 0; i < sizeof(scopes) / sizeof(scopes[0]); i++) {
+            HINTS(AF_UNSPEC, SOCK_STREAM, 0, AI_NUMERICHOST);
+            int rc = getaddrinfo(scopes[i].text, "80", &hints, &res);
+            assert(rc == scopes[i].rc);
+            if (rc == 0) {
+                uint32_t got = (uint32_t)SA(res)[24] | (uint32_t)SA(res)[25] << 8 | (uint32_t)SA(res)[26] << 16 | (uint32_t)SA(res)[27] << 24;
+                assert(res->ai_family == AF_INET6 && got == scopes[i].scope);
+                freeaddrinfo(res);
+            }
+        }
+    }
+    /* NULL node under AF_INET6: ::1, or :: with AI_PASSIVE. AF_UNSPEC gives both families: ::1 then 127.0.0.1, and with
+     * AI_PASSIVE 0.0.0.0 then :: (glibc's order with the loopback interface up). */
+    {
+        static const uint8_t zero16[16] = {0};
+        HINTS(AF_INET6, SOCK_STREAM, 0, 0);
+        assert(getaddrinfo((const char *)0, "80", &hints, &res) == 0 && res->ai_family == AF_INET6 && SA(res)[23] == 1 && SA(res)[22] == 0 && SA(res)[8] == 0);
+        assert(res->ai_next == (struct addrinfo *)0);
+        freeaddrinfo(res);
+        HINTS(AF_INET6, SOCK_STREAM, 0, AI_PASSIVE);
+        assert(getaddrinfo((const char *)0, "80", &hints, &res) == 0 && memcmp(SA(res) + 8, zero16, 16) == 0 && PORT(res) == 80);
+        freeaddrinfo(res);
+        HINTS(AF_UNSPEC, SOCK_STREAM, 0, 0);
+        assert(getaddrinfo((const char *)0, "80", &hints, &res) == 0);
+        assert(res->ai_family == AF_INET6 && SA(res)[23] == 1 && res->ai_next && res->ai_next->ai_family == AF_INET && SA(res->ai_next)[4] == 127);
+        assert(res->ai_next->ai_next == (struct addrinfo *)0);
+        freeaddrinfo(res);
+        HINTS(AF_UNSPEC, SOCK_STREAM, 0, AI_PASSIVE);
+        assert(getaddrinfo((const char *)0, "80", &hints, &res) == 0);
+        assert(res->ai_family == AF_INET && SA(res)[4] == 0 && res->ai_next && res->ai_next->ai_family == AF_INET6);
+        assert(memcmp(SA(res->ai_next) + 8, zero16, 16) == 0 && res->ai_next->ai_next == (struct addrinfo *)0);
+        freeaddrinfo(res);
+    }
 
     /* Services: numeric (decimal, leading/trailing forms the strtol accepts), a small name table, NULL is port 0. */
     HINTS(AF_INET, SOCK_STREAM, 0, 0);
@@ -690,17 +904,52 @@ int main(void) {
             assert(getnameinfo(sa, 8, host, sizeof(host), serv, sizeof(serv), 0x8000) == EAI_BADFLAGS);
         }
 
-        /* Address validation: NULL, short, or non-AF_INET sockaddrs are EAI_FAMILY; a longer one is fine. */
+        /* Address validation: NULL, short, or other-family sockaddrs are EAI_FAMILY; a longer one is fine. */
         assert(getnameinfo((const uint8_t *)0, 16, host, sizeof(host), serv, sizeof(serv), 0) == EAI_FAMILY);
         assert(getnameinfo(sa, 0, host, sizeof(host), serv, sizeof(serv), 0) == EAI_FAMILY);
         assert(getnameinfo(sa, 8, host, sizeof(host), serv, sizeof(serv), 0) == EAI_FAMILY);
         assert(getnameinfo(sa, 15, host, sizeof(host), serv, sizeof(serv), 0) == EAI_FAMILY);
         assert(getnameinfo(sa, 100, host, sizeof(host), serv, sizeof(serv), 0) == 0 && strcmp(host, "10.0.2.2") == 0);
         {
+            /* sockaddr_in6 (glibc, measured): a 28-byte address formats like inet_ntop, a non-zero scope id appends "%N" to the
+             * numeric form, the service comes from the port as for IPv4; shorter than 28 bytes is EAI_FAMILY. Without
+             * /etc/hosts (the host test has no file system) an unnamed address is numeric and NI_NAMEREQD is EAI_NONAME; ::1 is
+             * "localhost" as 127.0.0.1 is. */
             uint8_t v6[28];
             memset(v6, 0, sizeof(v6));
             v6[0] = 10;
-            assert(getnameinfo(v6, 28, host, sizeof(host), serv, sizeof(serv), NI_NUMERICHOST) == EAI_FAMILY);
+            v6[2] = 0x01; v6[3] = 0xBB; /* port 443 */
+            static const uint8_t a1[16] = {32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9};
+            memcpy(v6 + 8, a1, 16);
+            assert(getnameinfo(v6, 28, host, sizeof(host), serv, sizeof(serv), 0) == 0 && strcmp(host, "2001:db8::9") == 0 && strcmp(serv, "https") == 0);
+            assert(getnameinfo(v6, 28, host, sizeof(host), serv, sizeof(serv), NI_NUMERICHOST) == 0 && strcmp(host, "2001:db8::9") == 0);
+            assert(getnameinfo(v6, 28, host, sizeof(host), serv, sizeof(serv), NI_NAMEREQD) == EAI_NONAME);
+            assert(getnameinfo(v6, 27, host, sizeof(host), serv, sizeof(serv), NI_NUMERICHOST) == EAI_FAMILY);
+            assert(getnameinfo(v6, 24, host, sizeof(host), serv, sizeof(serv), NI_NUMERICHOST) == EAI_FAMILY);
+            /* "2001:db8::9" is 11 characters: a 12-byte buffer fits, 11 is EAI_OVERFLOW. */
+            assert(getnameinfo(v6, 28, host, 12, serv, sizeof(serv), NI_NUMERICHOST) == 0);
+            assert(getnameinfo(v6, 28, host, 11, serv, sizeof(serv), NI_NUMERICHOST) == EAI_OVERFLOW);
+            /* Scope ids: "%N" on the numeric form of any address, for 99 as well as 3. */
+            static const uint8_t ll[16] = {254, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+            memcpy(v6 + 8, ll, 16);
+            v6[24] = 3;
+            assert(getnameinfo(v6, 28, host, sizeof(host), (char *)0, 0, NI_NUMERICHOST) == 0 && strcmp(host, "fe80::1%3") == 0);
+            v6[24] = 99;
+            assert(getnameinfo(v6, 28, host, sizeof(host), (char *)0, 0, NI_NUMERICHOST) == 0 && strcmp(host, "fe80::1%99") == 0);
+            memcpy(v6 + 8, a1, 16);
+            v6[24] = 5;
+            assert(getnameinfo(v6, 28, host, sizeof(host), (char *)0, 0, NI_NUMERICHOST) == 0 && strcmp(host, "2001:db8::9%5") == 0);
+            v6[24] = 0;
+            /* ::1 names localhost; :: and a mapped address are numeric without a file entry. */
+            memset(v6 + 8, 0, 16);
+            v6[23] = 1;
+            assert(getnameinfo(v6, 28, host, sizeof(host), (char *)0, 0, 0) == 0 && strcmp(host, "localhost") == 0);
+            assert(getnameinfo(v6, 28, host, sizeof(host), (char *)0, 0, NI_NUMERICHOST) == 0 && strcmp(host, "::1") == 0);
+            v6[23] = 0;
+            assert(getnameinfo(v6, 28, host, sizeof(host), (char *)0, 0, 0) == 0 && strcmp(host, "::") == 0);
+            v6[18] = 0xFF; v6[19] = 0xFF; v6[20] = 10; v6[21] = 5; v6[22] = 0; v6[23] = 6;
+            assert(getnameinfo(v6, 28, host, sizeof(host), (char *)0, 0, NI_NUMERICHOST) == 0 && strcmp(host, "::ffff:10.5.0.6") == 0);
+            /* A 16-byte buffer whose family field is not 2 or 10 is still EAI_FAMILY. */
             memcpy(v6, sa, 16);
             v6[1] = 1; /* family 0x0102 */
             assert(getnameinfo(v6, 16, host, sizeof(host), serv, sizeof(serv), NI_NUMERICHOST) == EAI_FAMILY);
