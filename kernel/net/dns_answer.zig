@@ -10,6 +10,7 @@ pub const MAX_NAME: usize = 253;
 
 const TYPE_A: u16 = 1;
 const TYPE_CNAME: u16 = 5;
+const TYPE_PTR: u16 = 12;
 const CLASS_IN: u16 = 1;
 
 pub const Answer = struct {
@@ -138,6 +139,103 @@ pub fn parse(msg: []const u8, qname: []const u8, out: *Answer) bool {
         }
     }
     return out.naddr > 0;
+}
+
+/// Read a reply to a PTR query for `qname` (an in-addr.arpa or ip6.arpa name), as glibc's getanswer_ptr does (glibc 2.44, measured):
+/// a CNAME for the expected name moves it on (RFC 2317 classless delegation), and the first PTR record whose owner is the expected
+/// name gives the host name, without a trailing dot, its case kept. Other records, other owners and further PTRs are skipped. The
+/// name lands in out.canonName(); true when one was found.
+pub fn parsePtr(msg: []const u8, qname: []const u8, out: *Answer) bool {
+    out.* = .{};
+    if (msg.len < 12 or qname.len == 0 or qname.len > MAX_NAME) return false;
+    const qdcount = be16(msg, 4);
+    const ancount = be16(msg, 6);
+    var pos: usize = 12;
+    var scratch: [MAX_NAME + 1]u8 = undefined;
+    for (0..qdcount) |_| {
+        const d = readName(msg, pos, &scratch) orelse return false;
+        pos = d.next + 4;
+        if (pos > msg.len) return false;
+    }
+    var expected: [MAX_NAME + 1]u8 = undefined;
+    @memcpy(expected[0..qname.len], qname);
+    var exp_len = qname.len;
+    for (0..ancount) |_| {
+        var owner: [MAX_NAME + 1]u8 = undefined;
+        const od = readName(msg, pos, &owner) orelse return false;
+        pos = od.next;
+        if (pos + 10 > msg.len) return false;
+        const rtype = be16(msg, pos);
+        const rclass = be16(msg, pos + 2);
+        const rdlen = be16(msg, pos + 8);
+        pos += 10;
+        if (pos + rdlen > msg.len) return false;
+        const rdata = pos;
+        pos += rdlen;
+        if (rclass != CLASS_IN or !eqlIgnoreCase(owner[0..od.len], expected[0..exp_len])) continue;
+        var target: [MAX_NAME + 1]u8 = undefined;
+        if (rtype == TYPE_CNAME) {
+            const td = readName(msg, rdata, &target) orelse return false;
+            @memcpy(expected[0..td.len], target[0..td.len]);
+            exp_len = td.len;
+            continue;
+        }
+        if (rtype == TYPE_PTR) {
+            const td = readName(msg, rdata, &target) orelse return false;
+            if (td.len == 0) continue;
+            @memcpy(out.names[0..td.len], target[0..td.len]);
+            out.ends[0] = @intCast(td.len);
+            return true;
+        }
+    }
+    return false;
+}
+
+const hex = "0123456789abcdef";
+
+/// "d.c.b.a.in-addr.arpa" for a.b.c.d, into `buf`.
+pub fn reverseName4(ip: [4]u8, buf: []u8) []const u8 {
+    var n: usize = 0;
+    var i: usize = 4;
+    while (i > 0) {
+        i -= 1;
+        var v = ip[i];
+        var digits: [3]u8 = undefined;
+        var k: usize = 0;
+        while (true) {
+            digits[k] = '0' + v % 10;
+            k += 1;
+            v /= 10;
+            if (v == 0) break;
+        }
+        while (k > 0) {
+            k -= 1;
+            buf[n] = digits[k];
+            n += 1;
+        }
+        buf[n] = '.';
+        n += 1;
+    }
+    const tail = "in-addr.arpa";
+    @memcpy(buf[n..][0..tail.len], tail);
+    return buf[0 .. n + tail.len];
+}
+
+/// The 32 nibbles of `ip` from the last, dot-separated, then "ip6.arpa" (RFC 3596), into `buf` (at least 73 bytes).
+pub fn reverseName6(ip: [16]u8, buf: []u8) []const u8 {
+    var n: usize = 0;
+    var i: usize = 16;
+    while (i > 0) {
+        i -= 1;
+        buf[n] = hex[ip[i] & 0xF];
+        buf[n + 1] = '.';
+        buf[n + 2] = hex[ip[i] >> 4];
+        buf[n + 3] = '.';
+        n += 4;
+    }
+    const tail = "ip6.arpa";
+    @memcpy(buf[n..][0..tail.len], tail);
+    return buf[0 .. n + tail.len];
 }
 
 /// An answer of one address under `name` (a literal or a static name, answered without a query).

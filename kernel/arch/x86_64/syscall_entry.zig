@@ -2615,6 +2615,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         507 => { // dns_query(name, out4, server4, timeout_ms, ans, ans_len) — one query to one server, and how it ended (a resolver in libc)
             frame.rax = @bitCast(syscallDnsQuery(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
         },
+        508 => { // dns_ptr(addr, family, server4, timeout_ms, name_out, name_len) — a reverse (PTR) query to one server
+            frame.rax = @bitCast(syscallDnsPtr(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
+        },
         494 => { // pselect6(nfds, readfds, writefds, exceptfds, timespec, {sigmask, size})
             frame.rax = @bitCast(select_mod.pselect6(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
             checkSignalsOnSyscallReturn(frame);
@@ -6705,6 +6708,38 @@ fn syscallDnsQuery(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_ms: u64
         const n = da.encode(&ans, enc[0..@intCast(@min(ans_len, enc.len))]) orelse return -90; // EMSGSIZE
         if (copy.copyToUser(@ptrFromInt(ans_ptr), enc[0..n], n) != n) return -14;
     }
+    return 0;
+}
+
+/// dns_ptr(addr, family, server4, timeout_ms, name_out, name_len): the host name of `addr` (4 bytes for AF_INET 2, 16 for
+/// AF_INET6 10) from a PTR query to `server4`, NUL-terminated into `name_out`. Results as dns_query: 0, -ENOENT, -ENODATA, -EAGAIN,
+/// -ECONNREFUSED, -EPROTO (a reply with no PTR for the name), -ETIMEDOUT, -EINTR; -EAFNOSUPPORT for another family, -ERANGE when
+/// `name_len` is under 256 (before any query), EINVAL/EFAULT as dns_query.
+fn syscallDnsPtr(addr_ptr: u64, family: u64, server_ptr: u64, timeout_ms: u64, out_ptr: u64, out_len: u64) i64 {
+    const copy = @import("../../mm/copy_from_user.zig");
+    const dp = @import("../../net/dns_policy.zig");
+    const alen: usize = switch (family) {
+        2 => 4,
+        10 => 16,
+        else => return -97, // EAFNOSUPPORT
+    };
+    if (out_len < 256) return -34; // ERANGE
+    if (!copy.validateUserBufferWritable(out_ptr, 256)) return -14;
+    var addr: [16]u8 = undefined;
+    if (copy.copyFromUser(addr[0..alen], @ptrFromInt(addr_ptr), alen) != alen) return -14;
+    var server: [4]u8 = undefined;
+    if (copy.copyFromUser(&server, @ptrFromInt(server_ptr), 4) != 4) return -14;
+    if (!dp.serverUsable(server)) return -22;
+    if (!dp.timeoutValid(timeout_ms)) return -22;
+    const da = @import("../../net/dns_answer.zig");
+    var ans: da.Answer = .{};
+    const r = @import("../../net/dns.zig").queryPtr(addr[0..alen], server, timeout_ms * 1_000_000, dnsSleep, &ans);
+    if (r.outcome != .answer) return dp.queryResult(r.outcome);
+    const name = ans.canonName();
+    var nb: [256]u8 = undefined;
+    @memcpy(nb[0..name.len], name);
+    nb[name.len] = 0;
+    if (copy.copyToUser(@ptrFromInt(out_ptr), nb[0 .. name.len + 1], name.len + 1) != name.len + 1) return -14;
     return 0;
 }
 

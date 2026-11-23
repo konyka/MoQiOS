@@ -37,6 +37,11 @@ long resolv_lookup(const char *name, uint8_t out[4], char *found, size_t found_c
  * the number of addresses; 0 when `ans` holds none. */
 size_t resolv_answer_unpack(const struct resolv_answer *ans, uint8_t addrs[][4], size_t cap, char *names, size_t names_cap);
 
+/* The host name of `addr` (4 bytes for AF_INET, 16 for AF_INET6) from a PTR query to the nameservers of /etc/resolv.conf, with
+ * its timeout and attempts, through dns_ptr (508); NUL-terminated and cut to `cap`. 0 or the dns_query results; -ENOENT also when
+ * the file names no nameserver. gethostbyaddr and getnameinfo use it for an address /etc/hosts does not name. */
+long resolv_ptr(const void *addr, int family, char *name, size_t cap);
+
 /* The nameservers of an /etc/resolv.conf text (`len` bytes), as glibc's res_init takes them (measured): "nameserver" at the start of
  * a line, in lower case, a blank or tab, a dotted IPv4 address, then nothing or blanks and anything; '#' and ';' lines, a leading
  * blank, a CR before the newline and IPv6 addresses do not count, nor 0.0.0.0, 255.255.255.255 or multicast (the kernel refuses

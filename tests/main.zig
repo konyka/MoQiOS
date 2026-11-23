@@ -18581,3 +18581,90 @@ test "every kernel DNS query sends from a port of its own, so queries at the sam
     const u = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, u, "pub fn reserveEphemeral() ?u16 {") != null);
 }
+
+test "dns_answer.parsePtr: the names a PTR reply gives for an address, after its CNAMEs (glibc 2.44 getanswer_ptr, measured) (hello521)" {
+    const da = kt.dns_answer;
+    var buf: [512]u8 = undefined;
+    // A hand-built reply: header (id, flags, qd 1, an n), the question, then records.
+    const W = struct {
+        b: *[512]u8,
+        n: usize = 0,
+        fn bytes(self: *@This(), x: []const u8) void {
+            @memcpy(self.b[self.n..][0..x.len], x);
+            self.n += x.len;
+        }
+        fn name(self: *@This(), text: []const u8) void {
+            var it = std.mem.splitScalar(u8, text, '.');
+            while (it.next()) |l| {
+                if (l.len == 0) continue;
+                self.b[self.n] = @intCast(l.len);
+                @memcpy(self.b[self.n + 1 ..][0..l.len], l);
+                self.n += 1 + l.len;
+            }
+            self.b[self.n] = 0;
+            self.n += 1;
+        }
+        fn rr(self: *@This(), owner: []const u8, t: u8, target: []const u8) void {
+            self.name(owner);
+            self.bytes(&.{ 0, t, 0, 1, 0, 0, 0, 60 });
+            const at = self.n;
+            self.n += 2;
+            const start = self.n;
+            if (t == 1) self.bytes(&.{ 1, 2, 3, 4 }) else self.name(target);
+            const l = self.n - start;
+            self.b[at] = 0;
+            self.b[at + 1] = @intCast(l);
+        }
+        fn head(self: *@This(), q: []const u8, an: u8) void {
+            self.n = 0;
+            self.bytes(&.{ 0x12, 0x34, 0x81, 0x80, 0, 1, 0, an, 0, 0, 0, 0 });
+            self.name(q);
+            self.bytes(&.{ 0, 12, 0, 1 });
+        }
+    };
+    var w: W = .{ .b = &buf };
+    var a: da.Answer = .{};
+    const q = "4.3.2.10.in-addr.arpa";
+    w.head(q, 1);
+    w.rr(q, 12, "host4.test");
+    try std.testing.expect(da.parsePtr(buf[0..w.n], q, &a));
+    try std.testing.expectEqualStrings("host4.test", a.canonName());
+    // Two PTR records: the first is the name (glibc keeps the others out of h_aliases).
+    w.head(q, 2);
+    w.rr(q, 12, "a5.test");
+    w.rr(q, 12, "b5.test");
+    try std.testing.expect(da.parsePtr(buf[0..w.n], q, &a));
+    try std.testing.expectEqualStrings("a5.test", a.canonName());
+    // A CNAME (RFC 2317 classless delegation) is followed; a trailing dot is dropped and the case is kept.
+    w.head(q, 2);
+    w.rr(q, 5, "4.0-24.3.2.10.in-addr.arpa");
+    w.rr("4.0-24.3.2.10.in-addr.arpa", 12, "E8.Test.");
+    try std.testing.expect(da.parsePtr(buf[0..w.n], q, &a));
+    try std.testing.expectEqualStrings("E8.Test", a.canonName());
+    // A PTR for another owner, a CNAME with nothing after it, and no answers are no name.
+    w.head(q, 1);
+    w.rr("other.in-addr.arpa", 12, "d7.test");
+    try std.testing.expect(!da.parsePtr(buf[0..w.n], q, &a));
+    w.head(q, 1);
+    w.rr(q, 5, "x.in-addr.arpa");
+    try std.testing.expect(!da.parsePtr(buf[0..w.n], q, &a));
+    w.head(q, 0);
+    try std.testing.expect(!da.parsePtr(buf[0..w.n], q, &a));
+    // Other record types are skipped.
+    w.head(q, 2);
+    w.rr(q, 1, "");
+    w.rr(q, 12, "f12.test");
+    try std.testing.expect(da.parsePtr(buf[0..w.n], q, &a));
+    try std.testing.expectEqualStrings("f12.test", a.canonName());
+
+    // The query names: in-addr.arpa with the octets reversed, ip6.arpa with the nibbles reversed.
+    var nb: [80]u8 = undefined;
+    try std.testing.expectEqualStrings("4.3.2.10.in-addr.arpa", da.reverseName4(.{ 10, 2, 3, 4 }, &nb));
+    try std.testing.expectEqualStrings("1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa", da.reverseName6(.{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, &nb));
+
+    // dns_ptr (508): checks before any wait, the query is type 12, the shared cache is not used.
+    const se = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, se, "508 => { // dns_ptr(addr, family, server4, timeout_ms, name_out, name_len)") != null);
+    const dns = kt.dns_source;
+    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryPtr(addr: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {") != null);
+}

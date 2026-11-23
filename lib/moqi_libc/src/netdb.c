@@ -323,6 +323,38 @@ long gethostbyname_ipv4(const char *name, uint8_t out[4]) {
     return gethostbyname_ipv4_name(name, out, (char *)0, 0);
 }
 
+long resolv_ptr(const void *addr, int family, char *name, size_t cap) {
+    if (!addr || !name || cap == 0) return -22;
+    if (family != AF_INET && family != AF_INET6) return -97;
+    char conf[2048];
+    size_t len = resolv_conf_read(conf, sizeof conf);
+    uint8_t ns[RESOLV_MAXNS][4];
+    size_t nns = resolv_conf_servers(conf, len, ns, RESOLV_MAXNS);
+    /* Only the resolv.conf nameservers are asked (no search list applies to an address); without one there is no reverse DNS. */
+    if (nns == 0) return -2;
+    struct resolv_opts opt;
+    const char *unused_word[1];
+    size_t unused_len[1];
+    resolv_conf_search(conf, len, unused_word, unused_len, 1, &opt);
+    char buf[256];
+    long last = -110;
+    for (int a = 0; a < opt.attempts; a++) {
+        for (size_t i = 0; i < nns; i++) {
+            long r = NETDB_SYSCALL6(SYS_dns_ptr, (long)addr, family, (long)ns[i], resolv_wait_ms(opt.timeout, i, nns), (long)buf, (long)sizeof buf);
+            if (r == -11 || r == -111) last = r;
+            if (r == -11 || r == -111 || r == -110) continue;
+            if (r == 0) {
+                size_t k = strnlen(buf, sizeof buf);
+                if (k >= cap) k = cap - 1;
+                memcpy(name, buf, k);
+                name[k] = 0;
+            }
+            return r;
+        }
+    }
+    return last;
+}
+
 size_t resolv_answer_unpack(const struct resolv_answer *ans, uint8_t addrs[][4], size_t cap, char *names, size_t names_cap) {
     if (names && names_cap) names[0] = 0;
     if (!ans || !ans->len) return 0;
@@ -1093,6 +1125,26 @@ static void lookup_addr(const void *addr, unsigned int len, int family, char *ho
     size_t n = etc_hosts_read_into(hosts, hosts_cap);
     const char *names = (const char *)0;
     size_t names_len = n ? hosts_reverse_names(hosts, n, query_family, query, &names) : 0;
+    if (!names_len && requested_family != AF_UNSPEC) {
+        /* Not in /etc/hosts: a PTR query to the resolv.conf nameservers ("files dns"). A mapped ::ffff:a.b.c.d asks the
+         * in-addr.arpa name and is answered as the IPv4 host it names: AF_INET, 4 bytes (glibc 2.44, measured; its /etc/hosts
+         * answer keeps the 16 bytes instead). */
+        long r = resolv_ptr(query, query_family, ans->name_store, HOSTENT_NAME_MAX);
+        if (r == 0) {
+            ans->names = ans->name_store;
+            ans->names_len = strlen(ans->name_store);
+            ans->af = query_family;
+            memcpy(ans->addrs[0], query, query_family == AF_INET ? 4 : 16);
+            ans->naddrs = 1;
+            ans->herr = 0;
+            return;
+        }
+        if (r != -2 /* no reverse DNS configured, or NXDOMAIN */) {
+            ans->herr = netdb_herr_of(r);
+            if (ans->herr == TRY_AGAIN) ans->rc = EAGAIN;
+            return;
+        }
+    }
     if (!names_len) {
         if (requested_family == AF_UNSPEC) {
             ans->herr = NETDB_INTERNAL;
@@ -1656,6 +1708,11 @@ int getnameinfo(const uint8_t *sa, unsigned int salen, char *host, unsigned int 
                 text = "localhost";
             } else if (v6 && memcmp(addr, loop6, 16) == 0) {
                 text = "localhost";
+            } else {
+                /* Not in /etc/hosts: a PTR query (glibc's gethostbyaddr_r under getnameinfo); a mapped address asks for its
+                 * IPv4 name. Any failure leaves the numeric form (or EAI_NONAME with NI_NAMEREQD). */
+                int mapped = v6 && memcmp(addr, mapped_prefix, 12) == 0;
+                if (resolv_ptr(mapped ? addr + 12 : addr, v6 && !mapped ? AF_INET6 : AF_INET, found, sizeof found) == 0) text = found;
             }
         }
         if (!text) {

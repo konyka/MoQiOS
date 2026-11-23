@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "../include/moqi_syscalls.h"
 #include "../include/netdb.h"
@@ -36,8 +37,26 @@ static char q_log[2048];
 static const unsigned char *q_answer;
 static size_t q_answer_len;
 static long q_last_anslen;
+/* dns_ptr (508): the next scripted reply, the family and the asked address's last byte logged as "ptr<fam>:<byte>@<server>;";
+ * a reply of 0 writes q_ptr_name. */
+static const char *q_ptr_name = "ptr.test";
 long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
     q_last_anslen = a6;
+    if (nr == SYS_dns_ptr) {
+        long r = q_calls < q_n ? q_reply[q_calls] : -38;
+        q_calls++;
+        size_t l = strlen(q_log);
+        const unsigned char *ad = (const unsigned char *)a1;
+        unsigned last = a2 == 2 ? ad[3] : ad[15];
+        int w = snprintf(q_log + l, sizeof q_log - l, "ptr%ld:%u@%u;", a2, last, ((const unsigned char *)a3)[3]);
+        (void)w;
+        (void)a4;
+        if (r == 0) {
+            if (a6 < 256) return -34;
+            strcpy((char *)a5, q_ptr_name);
+        }
+        return r;
+    }
     long r = nr == SYS_dns_query && q_calls < q_n ? q_reply[q_calls] : -38;
     q_calls++;
     size_t l = strlen(q_log);
@@ -874,6 +893,58 @@ int main(void) {
         hc = gethostbyname("plain.test");
         assert(hc && strcmp(hc->h_name, "plain.test") == 0 && hc->h_aliases[0] == 0 && hc->h_addr_list[1] == 0);
         assert(q_last_anslen >= 256);
+        moqi_test_resolv_conf = (const char *)0;
+    }
+
+    /* hello521: reverse DNS. An address /etc/hosts does not name gets a PTR query (dns_ptr, 508) to the resolv.conf nameservers,
+     * with their timeout and attempts; a mapped ::ffff:a.b.c.d asks the IPv4 name. h_errno and getnameinfo follow glibc. */
+    {
+        static const char one[] = "nameserver 10.0.0.1\noptions attempts:1\n";
+        static const char two[] = "nameserver 10.0.0.1\nnameserver 10.0.0.2\noptions attempts:1\n";
+        static const long ok[] = {0}, nx[] = {-2}, nd[] = {-61}, fe[] = {-71}, sf_ok[] = {-11, 0}, to[] = {-110};
+        uint8_t a4[4] = {10, 2, 3, 4};
+        uint8_t m6[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 2, 3, 9};
+        uint8_t v6[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7};
+        q_script(one, ok, 1);
+        q_ptr_name = "host4.test";
+        struct hostent *hp = gethostbyaddr(a4, 4, AF_INET);
+        assert(hp && strcmp(hp->h_name, "host4.test") == 0 && hp->h_aliases[0] == 0 && (unsigned char)hp->h_addr_list[0][3] == 4);
+        assert(strcmp(q_log, "ptr2:4@1;") == 0);
+        q_script(one, ok, 1);
+        hp = gethostbyaddr(m6, 16, AF_INET6);
+        assert(hp && strcmp(hp->h_name, "host4.test") == 0 && hp->h_addrtype == AF_INET && hp->h_length == 4 && (unsigned char)hp->h_addr_list[0][3] == 9);
+        assert(strcmp(q_log, "ptr2:9@1;") == 0);
+        q_script(one, ok, 1);
+        q_ptr_name = "v6.test";
+        hp = gethostbyaddr(v6, 16, AF_INET6);
+        assert(hp && strcmp(hp->h_name, "v6.test") == 0 && strcmp(q_log, "ptr10:7@1;") == 0);
+        q_script(two, sf_ok, 2);
+        hp = gethostbyaddr(a4, 4, AF_INET);
+        assert(hp && strcmp(q_log, "ptr2:4@1;ptr2:4@2;") == 0);
+        q_script(one, nx, 1);
+        assert(gethostbyaddr(a4, 4, AF_INET) == 0 && h_errno == HOST_NOT_FOUND);
+        q_script(one, nd, 1);
+        assert(gethostbyaddr(a4, 4, AF_INET) == 0 && h_errno == NO_DATA);
+        q_script(one, fe, 1);
+        assert(gethostbyaddr(a4, 4, AF_INET) == 0 && h_errno == NO_RECOVERY);
+        q_script(one, to, 1);
+        assert(gethostbyaddr(a4, 4, AF_INET) == 0 && h_errno == TRY_AGAIN);
+        /* No nameserver line: no query, HOST_NOT_FOUND as before. */
+        q_script("search x.test\n", ok, 1);
+        assert(gethostbyaddr(a4, 4, AF_INET) == 0 && h_errno == HOST_NOT_FOUND && q_calls == 0);
+        /* getnameinfo: the PTR name; any failure is the numeric form, or EAI_NONAME with NI_NAMEREQD. */
+        uint8_t sa[16] = {2, 0, 0, 80, 10, 2, 3, 4};
+        char hb[64];
+        q_script(one, ok, 1);
+        q_ptr_name = "gni.test";
+        assert(getnameinfo(sa, 16, hb, sizeof hb, 0, 0, 0) == 0 && strcmp(hb, "gni.test") == 0);
+        q_script(one, nx, 1);
+        assert(getnameinfo(sa, 16, hb, sizeof hb, 0, 0, 0) == 0 && strcmp(hb, "10.2.3.4") == 0);
+        q_script(one, to, 1);
+        assert(getnameinfo(sa, 16, hb, sizeof hb, 0, 0, NI_NAMEREQD) == EAI_NONAME);
+        q_script(one, ok, 1);
+        assert(getnameinfo(sa, 16, hb, sizeof hb, 0, 0, NI_NUMERICHOST) == 0 && strcmp(hb, "10.2.3.4") == 0 && q_calls == 0);
+        q_ptr_name = "ptr.test";
         moqi_test_resolv_conf = (const char *)0;
     }
 

@@ -151,7 +151,22 @@ pub fn queryVia(hostname: []const u8, server: [4]u8, timeout_ns: u64, yield: Yie
     return queryCore(hostname, server, timeout_ns, yield, ans);
 }
 
+/// A PTR query to `server` for `addr` (4 bytes IPv4 or 16 bytes IPv6), waiting at most `timeout_ns` (dns_ptr, 508): the host name
+/// lands in ans.canonName(). The shared cache is not used.
+pub fn queryPtr(addr: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {
+    var nb: [80]u8 = undefined;
+    const qname = if (addr.len == 4) dns_answer.reverseName4(addr[0..4].*, &nb) else dns_answer.reverseName6(addr[0..16].*, &nb);
+    return queryType(qname, server, timeout_ns, yield, ans, TYPE_PTR);
+}
+
+const TYPE_A_Q: u16 = 1;
+const TYPE_PTR: u16 = 12;
+
 fn queryCore(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {
+    return queryType(hostname, dns_server, timeout_ns, yield, ans, TYPE_A_Q);
+}
+
+fn queryType(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16) Result {
     var pkt: [512]u8 = @splat(0);
     var offset: usize = 0;
 
@@ -176,8 +191,7 @@ fn queryCore(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yi
     offset += encodeDnsName(hostname, pkt[offset..]);
 
     // Question type and class
-    pkt[offset] = 0x00;
-    pkt[offset + 1] = 0x01; // TYPE_A
+    bo.writeU16BeAt(&pkt, offset, qtype); // TYPE_A or TYPE_PTR
     pkt[offset + 2] = 0x00;
     pkt[offset + 3] = 0x01; // CLASS_IN
     offset += 4;
@@ -216,6 +230,10 @@ fn queryCore(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yi
             const o = dns_policy.classify(bo.readU16BeAt(&buf, 2), bo.readU16BeAt(&buf, 6));
             if (o != .ignore) {
                 if (o != .answer) return .{ .outcome = o };
+                if (qtype == TYPE_PTR) {
+                    if (!dns_answer.parsePtr(buf[0..@intCast(n)], hostname, ans)) return .{ .outcome = .failed };
+                    return .{ .outcome = .answer };
+                }
                 if (!dns_answer.parse(buf[0..@intCast(n)], hostname, ans)) return .{ .outcome = .failed };
                 return .{ .outcome = .answer, .ip = ans.addrs[0] };
             }
