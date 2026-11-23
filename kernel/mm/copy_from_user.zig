@@ -37,8 +37,10 @@ fn userPageMapped(root: u64, page: u64) bool {
     if (paging.isUserAccessible(root, page)) return true;
     if (comptime builtin.cpu.arch == .x86_64) {
         if (paging.getPageEntryRaw(root, page)) |raw| {
-            return @import("swap.zig").isSwapEntry(raw);
+            if (@import("swap.zig").isSwapEntry(raw)) return true;
         }
+        // A stack page with no entry yet reads as zeros once faulted in (Linux faults it in from copy_from_user).
+        if (prefaultForKernelAccess(root, page)) return paging.isUserAccessible(root, page);
     }
     return false;
 }
@@ -56,15 +58,15 @@ fn userPageWritable(root: u64, page: u64) bool {
             const swap = @import("swap.zig");
             if (swap.isSwapEntry(raw)) return (raw & 0xC) != 0;
         }
-        if (prefaultForKernelWrite(root, page)) return paging.isUserWritable(root, page);
+        if (prefaultForKernelAccess(root, page)) return paging.isUserWritable(root, page);
     }
     return false;
 }
 
 /// Fault in one not-present page of the current task's own address space the way a user access would (stack growth, file
-/// backing), so a kernel write into it can go ahead. Only a page with no entry at all: a swap entry or a PROT_NONE reservation is
+/// backing), so a kernel read or write of it can go ahead. Only a page with no entry at all: a swap entry or a PROT_NONE reservation is
 /// a live non-present entry and keeps its own handling, and the demand path refuses holes, the stack floor and RLIMIT_STACK.
-fn prefaultForKernelWrite(root: u64, page: u64) bool {
+fn prefaultForKernelAccess(root: u64, page: u64) bool {
     if (root != activeRoot()) return false;
     if (paging.getPageEntryRaw(root, page)) |raw| if (raw != 0) return false;
     return @import("../arch/x86_64/idt.zig").prefaultUserPage(page);
@@ -155,6 +157,24 @@ pub fn copyFromUser(dst: []u8, src_user: [*]allowzero const u8, count: usize) us
     const copied = copyBytes(dst.ptr, @ptrCast(src_user), copy_len);
     paging.userAccessEnd();
     return copied;
+}
+
+/// copyFromUser that copies the readable prefix instead of all or nothing: the bytes up to the first page that cannot be read
+/// (Linux's copy_from_user short count). Returns how many were copied, 0 when the first byte is unreadable. write() uses it so a
+/// source that runs into a hole is a short write of the bytes before it.
+pub fn copyFromUserPrefix(dst: []u8, src_user: u64, count: usize) usize {
+    const want = @min(count, dst.len);
+    var done: usize = 0;
+    while (done < want) {
+        const addr = src_user +% done;
+        if (!validateUserRange(addr, 1)) break;
+        const in_page: usize = 0x1000 - @as(usize, @intCast(addr & 0xFFF));
+        const piece = @min(in_page, want - done);
+        const got = copyFromUser(dst[done..], @ptrFromInt(addr), piece);
+        done += got;
+        if (got < piece) break;
+    }
+    return done;
 }
 
 /// Copy a user C string into `dst`, stopping at the NUL or when `dst` is full.

@@ -298,8 +298,9 @@ fn executePwrite(iocb: *const IoCb) i64 {
     while (remaining > 0) {
         const chunk = @min(remaining, 4096);
         var kbuf: [4096]u8 = undefined;
-        const copied = copy_mod.copyFromUser(kbuf[0..chunk], @ptrFromInt(src), chunk);
-        if (copied == 0) break;
+        // As write(): the readable prefix is written, and nothing readable at the start is EFAULT.
+        const copied = copy_mod.copyFromUserPrefix(kbuf[0..chunk], src, chunk);
+        if (copied == 0) return if (total == 0) EFAULT else @intCast(total);
         const n = if (positioned) cur.fd_table.writeAtOffset(fd, &kbuf, copied, at) else cur.fd_table.write(fd, &kbuf, copied);
         if (n <= 0) break;
         total += @intCast(n);

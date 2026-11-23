@@ -10,6 +10,14 @@ pub const PAGE: u16 = 4096;
 /// Slots of the largest pipe (vfs: 4 MiB, fcntl_policy.PIPE_HARD_MAX).
 pub const MAX_SLOTS: usize = 1024;
 
+/// How many of `readable` source bytes, followed by an unreadable page, a write takes into an empty pipe: whole page-sized slots
+/// only, since Linux fills a fresh slot with one copy and drops a slot whose copy faults (measured: 4095 readable bytes before a hole
+/// are EFAULT, 4096..8191 take 4096, 8192 take 8192). 0 means EFAULT when nothing went in before. (With a partly filled last slot
+/// Linux first merges into it; that case is not modelled.)
+pub fn faultedWriteTakes(readable: usize) usize {
+    return readable & ~@as(usize, PAGE - 1);
+}
+
 pub const Slots = struct {
     /// Index of the oldest slot in `ends`, how many are in use, and how far the oldest one has been read.
     first: u16 = 0,

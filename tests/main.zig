@@ -2132,10 +2132,10 @@ test "a kernel write into a not-yet-faulted user stack page faults it in first (
     const w = std.mem.indexOf(u8, c, "fn userPageWritable(root: u64, page: u64) bool {").?;
     const w_end = std.mem.indexOfPos(u8, c, w, "\n}\n").?;
     const body = c[w..w_end];
-    const pre = std.mem.indexOf(u8, body, "if (prefaultForKernelWrite(root, page)) return paging.isUserWritable(root, page);").?;
+    const pre = std.mem.indexOf(u8, body, "if (prefaultForKernelAccess(root, page)) return paging.isUserWritable(root, page);").?;
     const first = std.mem.indexOf(u8, body, "if (paging.isUserWritable(root, page)) return true;").?;
     try std.testing.expect(first < pre);
-    const pf = std.mem.indexOf(u8, c, "fn prefaultForKernelWrite(root: u64, page: u64) bool {").?;
+    const pf = std.mem.indexOf(u8, c, "fn prefaultForKernelAccess(root: u64, page: u64) bool {").?;
     const pf_end = std.mem.indexOfPos(u8, c, pf, "\n}\n").?;
     const pf_body = c[pf..pf_end];
     // Only the current task's own address space, only a page with no entry at all (a swap entry or a PROT_NONE reservation is a
@@ -2143,6 +2143,37 @@ test "a kernel write into a not-yet-faulted user stack page faults it in first (
     try std.testing.expect(std.mem.indexOf(u8, pf_body, "if (root != activeRoot()) return false;") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf_body, "if (paging.getPageEntryRaw(root, page)) |raw| if (raw != 0) return false;") != null);
     try std.testing.expect(std.mem.indexOf(u8, pf_body, "return @import(\"../arch/x86_64/idt.zig\").prefaultUserPage(page);") != null);
+}
+
+test "a kernel read of user memory faults in untouched pages and reports EFAULT, not 0 (hello516)" {
+    // The read direction: a stack page the process never touched is faulted in (Linux reads it as zeros) exactly as the write
+    // direction does, through the same prefault helper.
+    const c = kt.copy_from_user_source;
+    const m = std.mem.indexOf(u8, c, "fn userPageMapped(root: u64, page: u64) bool {").?;
+    const m_end = std.mem.indexOfPos(u8, c, m, "\n}\n").?;
+    const body = c[m..m_end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (prefaultForKernelAccess(root, page)) return paging.isUserAccessible(root, page);") != null);
+    // A copy that stops at an unreadable page returns what it copied before it (Linux's copy_from_user short count): the
+    // page-aligned prefix that is readable, so write() into a file is a short write up to the hole.
+    try std.testing.expect(std.mem.indexOf(u8, c, "pub fn copyFromUserPrefix(dst: []u8, src_user: u64, count: usize) usize {") != null);
+
+    // write(), pwrite() and aio writes: nothing readable at the very start is EFAULT, not a 0-byte write; a source that becomes
+    // unreadable later is a short write of what was read.
+    const f = kt.file_io_source;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, f, "if (copied == 0) return if (pos == 0) -14 else @intCast(pos); // EFAULT only when nothing was read"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, f, "if (copied == 0) break;"));
+    const aio = kt.aio_source;
+    try std.testing.expect(std.mem.indexOf(u8, aio, "if (copied == 0) return if (total == 0) EFAULT else @intCast(total);") != null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, aio, "if (copied == 0) break;"));
+    // A pipe takes whole 4096-byte buffers of a source that runs into a hole (Linux pipe_write into an empty pipe, measured).
+    const ps = kt.pipe_slot_policy;
+    try std.testing.expectEqual(@as(usize, 0), ps.faultedWriteTakes(4));
+    try std.testing.expectEqual(@as(usize, 0), ps.faultedWriteTakes(4095));
+    try std.testing.expectEqual(@as(usize, 4096), ps.faultedWriteTakes(4096));
+    try std.testing.expectEqual(@as(usize, 4096), ps.faultedWriteTakes(5000));
+    try std.testing.expectEqual(@as(usize, 4096), ps.faultedWriteTakes(8191));
+    try std.testing.expectEqual(@as(usize, 8192), ps.faultedWriteTakes(8192));
+    try std.testing.expect(std.mem.indexOf(u8, f, "const copied = if (to_pipe and readable < chunk) @import(\"pipe_slot_policy.zig\").faultedWriteTakes(readable) else readable;") != null);
 }
 
 test "hostile user pointers cannot panic the copy helpers, and huge ranges skip absent page tables" {
