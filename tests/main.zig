@@ -12857,7 +12857,7 @@ test "a process's name (comm) is set by the loader, exec, clone and PR_SET_NAME,
     try std.testing.expect(std.mem.indexOf(u8, kt.execve_source, "cur.comm = @import(\"comm_policy.zig\").fromProgram(name);") != null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, kt.loader_source, "t.comm = @import(\"comm_policy.zig\").fromProgram(name);"));
     try std.testing.expect(std.mem.indexOf(u8, kt.clone_source, "child.comm = parent.comm;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.pid_status_source, "o.str(\"Name:\\t\");\n    o.str(s.name);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.pid_status_source, "o.str(\"Name:\\t\");") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, "st.name = name[0..@import(\"../proc/comm_policy.zig\").textLen(&name)];") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, "\"Name:\\t\\tprocess") == null);
     try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, "\" (process) \"") == null);

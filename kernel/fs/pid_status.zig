@@ -145,7 +145,13 @@ const Out = struct {
 pub fn render(buf: [*]u8, max_len: u32, s: Status) u32 {
     var o: Out = .{ .buf = buf, .max = max_len };
     o.str("Name:\t");
-    o.str(s.name);
+    // proc_task_name(escape=true) → seq_escape_str(.., ESCAPE_SPACE | ESCAPE_SPECIAL, "\n\\"): only a newline and a backslash in
+    // the name are escaped, so one line per field holds whatever PR_SET_NAME stored.
+    for (s.name) |c| switch (c) {
+        '\n' => o.str("\\n"),
+        '\\' => o.str("\\\\"),
+        else => o.char(c),
+    };
     o.str("\nUmask:\t");
     o.octal4(s.umask);
     o.str("\nState:\t");
@@ -256,6 +262,24 @@ test "status text: the output is cut at the buffer size and never overruns it" {
     const n = render(&buf, 10, sample());
     try std.testing.expectEqual(@as(u32, 10), n);
     try std.testing.expectEqualStrings("Name:\tcat\n", buf[0..10]);
+}
+
+test "status Name escapes newline and backslash only, as proc_task_name(escape=true) does" {
+    // Measured on Linux 7.3: "a\nb" -> Name:\ta\\nb, "a\\b" -> Name:\ta\\\\b; a tab, control bytes, 0x7f and UTF-8 pass through.
+    const cases = [_]struct { name: []const u8, want: []const u8 }{
+        .{ .name = "a\nb", .want = "Name:\ta\\nb\n" },
+        .{ .name = "a\\b", .want = "Name:\ta\\\\b\n" },
+        .{ .name = "a\tb c", .want = "Name:\ta\tb c\n" },
+        .{ .name = "a\x07\x1b\x7fz", .want = "Name:\ta\x07\x1b\x7fz\n" },
+        .{ .name = "a\xc3\xa9z", .want = "Name:\ta\xc3\xa9z\n" },
+    };
+    for (cases) |c| {
+        var s = sample();
+        s.name = c.name;
+        var buf: [512]u8 = undefined;
+        const n = render(&buf, buf.len, s);
+        try std.testing.expectEqualStrings(c.want, buf[0..@min(n, c.want.len)]);
+    }
 }
 
 test "status state: stopped beats blocked, zombie beats everything, a ready task is running" {
