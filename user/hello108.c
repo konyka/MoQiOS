@@ -88,6 +88,7 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 
 #define CLONE_VM     0x100
 #define CLONE_FILES  0x400
+#define CLONE_SIGHAND 0x800
 #define CLONE_THREAD 0x10000
 
 #define PAGE        4096
@@ -159,7 +160,7 @@ static int thread_phase(void) {
         int64_t tid = -1;
         /* A just-exited thread's slot is freed by the next reap pass. */
         for (int tries = 0; tries < 100; tries++) {
-            tid = syscall6(SYS_CLONE, CLONE_VM | CLONE_FILES | CLONE_THREAD,
+            tid = syscall6(SYS_CLONE, CLONE_VM | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD,
                            (uint64_t)(stack + TSTACK - 16), 0, 0, 0, 0);
             if (tid >= 0) break;
             sleep_ms(10);

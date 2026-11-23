@@ -20,7 +20,9 @@
 #define ARCH_SET_FS     0x1002
 
 #define CLONE_VM        0x100
+#define CLONE_FS        0x200
 #define CLONE_FILES     0x400
+#define CLONE_SIGHAND   0x800
 #define CLONE_THREAD    0x10000
 #define CLONE_SETTLS    0x80000
 #define CLONE_CHILD_CLEARTID 0x200000
@@ -224,7 +226,7 @@ int pthread_create(pthread_t *thread, const void *attr,
 
     long sp = (long)t + sizeof(TCB) + THREAD_STACK_SIZE;
     sp &= ~15L;
-    long ret = clone_call(CLONE_VM | CLONE_FILES | CLONE_THREAD | CLONE_SETTLS | CLONE_CHILD_CLEARTID,
+    long ret = clone_call(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SETTLS | CLONE_CHILD_CLEARTID,
                           sp, 0, (long)&t->tid_word, (long)t);
     if (ret == 0) {
         /* 子线程：不经 pthread_create 帧（父可能已返回），经 FS 自取 TCB。 */

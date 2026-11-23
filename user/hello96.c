@@ -88,6 +88,7 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 #define CLONE_VM     0x100
 #define CLONE_FS     0x200
 #define CLONE_FILES  0x400
+#define CLONE_SIGHAND 0x800
 #define CLONE_THREAD 0x10000
 
 #define PROT_READ     0x1
@@ -311,7 +312,7 @@ void _start(void) {
                                  MAP_PRIVATE | MAP_ANONYMOUS, (uint64_t)-1, 0);
         if (stack <= 0) fail_exit("thread stack mmap");
         int64_t tid = syscall5(SYS_CLONE,
-                               CLONE_VM | CLONE_FILES | CLONE_THREAD,
+                               CLONE_VM | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD,
                                (uint64_t)(stack + THREAD_STACK - 16), 0, 0, 0);
         if (tid == 0) {
             const int w = (int)__sync_fetch_and_add(&next_worker_id, 1);

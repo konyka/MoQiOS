@@ -247,7 +247,7 @@ void _start(void) {
             for (int t = 0; t < NTHREADS; t++) {
                 int64_t stack = syscall6(SYS_MMAP, 0, TSTACK, 3, 0x22, (uint64_t)-1, 0);
                 if (stack <= 0) break;
-                int64_t tid = syscall6(SYS_CLONE, CLONE_VM | CLONE_FILES | CLONE_THREAD | CLONE_SIGHAND,
+                int64_t tid = syscall6(SYS_CLONE, CLONE_VM | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD,
                                        (uint64_t)(stack + TSTACK - 16), 0, 0, 0, 0);
                 if (tid == 0) thread_main(seq, t + 1);
                 if (tid > 0) started++;

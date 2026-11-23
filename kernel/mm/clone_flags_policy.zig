@@ -9,11 +9,11 @@ pub const CLONE_SETTLS: u64 = 0x80000;
 pub const CLONE_PARENT_SETTID: u64 = 0x100000;
 pub const CLONE_CHILD_CLEARTID: u64 = 0x200000;
 
-// CLONE_FS/CLONE_SIGHAND do not yet have shared-object lifetimes, so
-// accepting them would silently provide copy semantics. CLONE_THREAD is the
-// thread-group membership (`Task.is_thread`: getpid reports the tgid, waitpid
-// skips the member, exec is refused) and requires the group's address space.
-pub const IMPLEMENTED_FLAGS: u64 = CLONE_VM | CLONE_FILES | CLONE_THREAD | CLONE_SETTLS;
+// CLONE_THREAD is the thread-group membership (`Task.is_thread`: getpid reports the tgid, waitpid skips the member, exec is
+// refused). Signal handlers (CLONE_SIGHAND) and the fs context (CLONE_FS) live in the Mm's group page (mm/group_state.zig), so a
+// CLONE_VM child shares them by construction and a child without CLONE_VM cannot: those flags need CLONE_VM here (Linux allows
+// CLONE_FS alone, which this kernel has no separate object for).
+pub const IMPLEMENTED_FLAGS: u64 = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SETTLS;
 pub const TID_FLAGS: u64 = CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
 
 /// The low byte of clone's flags is the signal the parent gets when the child exits (Linux CSIGNAL, copy_process exit_signal): any
@@ -46,7 +46,9 @@ pub fn clone3Flags(flags: u64, exit_signal: u64) ?u64 {
 pub fn valid(flags: u64, has_mm: bool) bool {
     if (!exitSignalOk(flags)) return false;
     if (flags & ~(IMPLEMENTED_FLAGS | TID_FLAGS | CSIGNAL) != 0) return false;
-    if (flags & (TID_FLAGS | CLONE_THREAD) != 0 and flags & CLONE_VM == 0) return false;
+    if (flags & (TID_FLAGS | CLONE_THREAD | CLONE_SIGHAND | CLONE_FS) != 0 and flags & CLONE_VM == 0) return false;
+    // copy_process: thread groups must share signals.
+    if (flags & CLONE_THREAD != 0 and flags & CLONE_SIGHAND == 0) return false;
     if (flags & CLONE_VM != 0 and !has_mm) return false;
     return true;
 }
@@ -84,8 +86,9 @@ test "clone pointer policy rejects unusable stack and tls values" {
 
 test "clone policy rejects ignored TID flags and incoherent thread combinations" {
     const std = @import("std");
-    try std.testing.expect(!valid(CLONE_VM | CLONE_THREAD | CLONE_SIGHAND, true));
-    try std.testing.expect(valid(CLONE_VM | CLONE_FILES | CLONE_THREAD | CLONE_SETTLS, true));
+    try std.testing.expect(valid(CLONE_VM | CLONE_THREAD | CLONE_SIGHAND, true));
+    try std.testing.expect(!valid(CLONE_VM | CLONE_FILES | CLONE_THREAD | CLONE_SETTLS, true));
+    try std.testing.expect(valid(CLONE_VM | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SETTLS, true));
     try std.testing.expect(!valid(CLONE_THREAD, true));
     try std.testing.expect(!valid(CLONE_SIGHAND, true));
     try std.testing.expect(valid(CLONE_VM | CLONE_PARENT_SETTID, true));

@@ -951,10 +951,13 @@ const SchedStats = struct {
 
 文件: `task.zig`, `syscall_entry.zig`, `arch/x86_64/clone.zig`
 
-- syscall #56，Phase-0 只接受已实现的 `CLONE_VM`、`CLONE_FILES`、`CLONE_THREAD`、
-  `CLONE_SETTLS` 与 `CLONE_PARENT_SETTID`/`CLONE_CHILD_CLEARTID`；`CLONE_THREAD` 与 TID
-  标志必须与 `CLONE_VM` 同时出现。`CLONE_SIGHAND`/`CLONE_FS` 的共享对象（信号处理表、
-  fs_struct）尚未实现，接受它们会静默退化为拷贝语义，因此返回 `EINVAL`。
+- syscall #56，Phase-0 只接受已实现的 `CLONE_VM`、`CLONE_FS`、`CLONE_FILES`、`CLONE_SIGHAND`、
+  `CLONE_THREAD`、`CLONE_SETTLS` 与 `CLONE_PARENT_SETTID`/`CLONE_CHILD_CLEARTID`；`CLONE_THREAD`、
+  `CLONE_SIGHAND`、`CLONE_FS` 与 TID 标志必须与 `CLONE_VM` 同时出现，`CLONE_THREAD` 还必须带
+  `CLONE_SIGHAND`（Linux `copy_process`）。信号处理表和 cwd/umask 存在 Mm 的组状态页
+  （`mm/group_state.zig`），`CLONE_VM` 子任务天然共享；不带 `CLONE_VM` 的 `CLONE_FS` 没有独立对象，
+  仍返回 `EINVAL`（Linux 接受）。hello498 验证双方的 chdir 与 sigaction 互相可见，moqi_libc
+  `pthread_create` 与各线程测试改用 glibc 的 `CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD`。
   （2026-10：7b811ff 的门禁曾把 `CLONE_THREAD` 一并拒绝，导致 moqi_libc pthread 与
   hello35/36/57/69/96/98/101 全部失败；现恢复为“仅随 `CLONE_VM` 接受”。）
 - `CLONE_VM`：共享地址空间路径仅作为生命周期迁移中的受控能力，完整线程组语义仍待启用。
@@ -2258,8 +2261,8 @@ siginfo 是 `SI_TIMER`，`si_timerid` 为定时器 id，`si_value` 为 `sigev_va
   `SIGEV_NONE`。
 - POSIX timer ownership 按进程/线程组记录；`CLONE_THREAD` 工作线程退出不会删除线程组定时器，只有线程组 leader 退出时才清理。
 
-Clone Phase-0 safety gate：当前只接受已实现的 flags；`CLONE_THREAD` 必须与 `CLONE_VM`
-  同时出现，`CLONE_SIGHAND`/`CLONE_FS` 仍返回 `EINVAL`；`CLONE_PARENT_SETTID` 在 child publish 前写回 child TID，`CLONE_CHILD_CLEARTID` 在 exit 时清零用户 word 并 wake private futex。其他未实现 flags 仍返回 `EINVAL`。
+Clone Phase-0 safety gate：当前只接受已实现的 flags；`CLONE_THREAD`、`CLONE_SIGHAND`、`CLONE_FS` 必须与 `CLONE_VM`
+  同时出现，`CLONE_THREAD` 必须带 `CLONE_SIGHAND`（hello498）；`CLONE_PARENT_SETTID` 在 child publish 前写回 child TID，`CLONE_CHILD_CLEARTID` 在 exit 时清零用户 word 并 wake private futex。其他未实现 flags 仍返回 `EINVAL`。
 
 `clock_settime` 仅允许持有 `CAP_SYS_TIME` 的任务调用；它接受 `CLOCK_REALTIME`，要求
 `tv_nsec < 1_000_000_000`，并拒绝纳秒总数无法表示为有符号 64 位值的输入。非法权限返回

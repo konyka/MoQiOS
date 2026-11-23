@@ -66,6 +66,7 @@ static inline int64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a
 
 #define CLONE_VM     0x100
 #define CLONE_FILES  0x400
+#define CLONE_SIGHAND 0x800
 #define CLONE_THREAD 0x10000
 
 #define PROT_READ     0x1
@@ -161,7 +162,7 @@ void _start(void) {
     const int64_t stack = syscall6(SYS_MMAP, 0, STACK_SIZE, PROT_READ | PROT_WRITE,
                                    MAP_PRIVATE | MAP_ANONYMOUS, (uint64_t)-1, 0);
     if (stack <= 0) { print("hello107: FAIL stack\nhello107 done\n"); syscall1(SYS_EXIT, 1); }
-    const int64_t tid = syscall6(SYS_CLONE, CLONE_VM | CLONE_FILES | CLONE_THREAD,
+    const int64_t tid = syscall6(SYS_CLONE, CLONE_VM | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD,
                                  (uint64_t)(stack + STACK_SIZE - 16), 0, 0, 0, 0);
     if (tid == 0) thread_main();
     if (tid < 0) { print("hello107: FAIL clone\nhello107 done\n"); syscall1(SYS_EXIT, 1); }

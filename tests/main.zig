@@ -826,19 +826,21 @@ test "clone rejects ignored TID flags and incoherent thread combinations" {
     try std.testing.expect(clone_flags_policy.valid(clone_flags_policy.CLONE_VM | clone_flags_policy.CLONE_PARENT_SETTID, true));
 }
 
-test "clone accepts pthread-style CLONE_THREAD only inside a shared address space" {
+test "clone accepts pthread-style CLONE_THREAD only with CLONE_SIGHAND in a shared address space (hello498)" {
     const p = clone_flags_policy;
-    // moqi_libc pthread_create.
-    try std.testing.expect(p.valid(p.CLONE_VM | p.CLONE_FILES | p.CLONE_THREAD | p.CLONE_SETTLS, true));
-    try std.testing.expect(p.valid(p.CLONE_VM | p.CLONE_FILES | p.CLONE_THREAD, true));
-    try std.testing.expect(p.valid(p.CLONE_VM | p.CLONE_THREAD | p.CLONE_CHILD_CLEARTID, true));
-    // A thread group member without the group's address space is incoherent.
-    try std.testing.expect(!p.valid(p.CLONE_THREAD, true));
-    try std.testing.expect(!p.valid(p.CLONE_FILES | p.CLONE_THREAD, true));
-    try std.testing.expect(!p.valid(p.CLONE_VM | p.CLONE_THREAD, false));
-    // Shared signal-handler and fs_struct objects are still unimplemented.
-    try std.testing.expect(!p.valid(p.CLONE_VM | p.CLONE_THREAD | p.CLONE_SIGHAND, true));
-    try std.testing.expect(!p.valid(p.CLONE_VM | p.CLONE_FS | p.CLONE_FILES | p.CLONE_THREAD, true));
+    // moqi_libc pthread_create (glibc's flag set without CLONE_SYSVSEM / CLONE_PARENT_SETTID).
+    try std.testing.expect(p.valid(p.CLONE_VM | p.CLONE_FS | p.CLONE_FILES | p.CLONE_SIGHAND | p.CLONE_THREAD | p.CLONE_SETTLS | p.CLONE_CHILD_CLEARTID, true));
+    try std.testing.expect(p.valid(p.CLONE_VM | p.CLONE_FILES | p.CLONE_SIGHAND | p.CLONE_THREAD, true));
+    // copy_process: a thread group shares signal handlers, and shared handlers need the shared VM.
+    try std.testing.expect(!p.valid(p.CLONE_VM | p.CLONE_FILES | p.CLONE_THREAD, true));
+    try std.testing.expect(!p.valid(p.CLONE_VM | p.CLONE_THREAD, true));
+    try std.testing.expect(!p.valid(p.CLONE_SIGHAND | p.CLONE_THREAD, true));
+    try std.testing.expect(!p.valid(p.CLONE_VM | p.CLONE_SIGHAND | p.CLONE_THREAD, false));
+    // The handlers and the fs context live in the Mm's group page, so only a CLONE_VM child can share them.
+    try std.testing.expect(p.valid(p.CLONE_VM | p.CLONE_SIGHAND, true));
+    try std.testing.expect(p.valid(p.CLONE_VM | p.CLONE_FS, true));
+    try std.testing.expect(!p.valid(p.CLONE_FS, true));
+    try std.testing.expect(!p.valid(p.CLONE_FS | p.CLONE_SIGHAND, true));
 }
 
 test "pidfd_open accepts only PIDFD_NONBLOCK and PIDFD_THREAD (hello460 A; zero flags only before it)" {
@@ -17011,7 +17013,7 @@ test "clone takes SIGCHLD (or 0) as its exit signal, so clone(SIGCHLD) is fork (
     try std.testing.expect(cfp.valid(0, true));
     try std.testing.expect(cfp.valid(10, true));
     try std.testing.expect(!cfp.valid(65, true));
-    try std.testing.expect(cfp.valid(cfp.CLONE_VM | cfp.CLONE_FILES | cfp.CLONE_THREAD | cfp.CLONE_SETTLS | cfp.CLONE_CHILD_CLEARTID, true));
+    try std.testing.expect(cfp.valid(cfp.CLONE_VM | cfp.CLONE_FS | cfp.CLONE_FILES | cfp.CLONE_SIGHAND | cfp.CLONE_THREAD | cfp.CLONE_SETTLS | cfp.CLONE_CHILD_CLEARTID, true));
 }
 
 test "a new pipe gets a 16-page ring like Linux (hello448)" {
