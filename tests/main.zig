@@ -18320,3 +18320,12 @@ test "vectored calls check the whole iovec array first and fault instead of retu
     try std.testing.expect(std.mem.indexOf(u8, r, "const whole: usize = if (to_pipe and scan.readable < scan.total) @import(\"pipe_slot_policy.zig\").faultedWriteTakes(scan.readable) else scan.total;") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.copy_from_user_source, "pub fn readablePrefix(addr: u64, len: usize) usize {") != null);
 }
+
+test "the kernel resolver takes names up to 253 characters, not 63, so a search domain can be appended (hello518)" {
+    const d = kt.dns_source;
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, d, "hostname.len > 63"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, d, "if (hostname.len == 0 or hostname.len > MAX_NAME) return .{ 0, 0, 0, 0 };"));
+    try std.testing.expect(std.mem.indexOf(u8, d, "const MAX_NAME: usize = @import(\"hostname_policy.zig\").MAX_NAME;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "    name: [MAX_NAME]u8,") != null);
+    try std.testing.expectEqual(@as(usize, 253), kt.hostname_policy.MAX_NAME);
+}

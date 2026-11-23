@@ -574,6 +574,99 @@ int main(void) {
         assert(resolv_conf_servers(odd, sizeof odd - 1, ns, 3) == 1 && ns[0][3] == 1);
     }
 
+    /* /etc/resolv.conf "search", "domain" and "options ndots:N" (glibc res_init and res_search, measured): the names to ask for, in
+     * order. Fewer dots than ndots (default 1): each search domain, then the name as given; at least ndots: the name first, then the
+     * domains. A trailing dot is the name alone. The last search or domain line wins, a domain line is a one-entry search list, and
+     * an empty one clears it; "." and "#" are words like any other except that a domain of "." adds nothing; options ndots takes a
+     * plain number, the last one wins, a bad one is ignored. */
+    {
+        char c[8][256];
+        static const char ab[] = "nameserver 127.0.0.1\nsearch a.test b.test\n";
+        size_t k = resolv_conf_candidates(ab, sizeof ab - 1, "x", c, 8);
+        assert(k == 3 && strcmp(c[0], "x.a.test") == 0 && strcmp(c[1], "x.b.test") == 0 && strcmp(c[2], "x") == 0);
+        k = resolv_conf_candidates(ab, sizeof ab - 1, "x.y", c, 8);
+        assert(k == 3 && strcmp(c[0], "x.y") == 0 && strcmp(c[1], "x.y.a.test") == 0 && strcmp(c[2], "x.y.b.test") == 0);
+        k = resolv_conf_candidates(ab, sizeof ab - 1, "x.", c, 8);
+        assert(k == 1 && strcmp(c[0], "x") == 0);
+        assert(resolv_conf_candidates(ab, sizeof ab - 1, "x", c, 1) == 1 && strcmp(c[0], "x.a.test") == 0);
+        static const char none[] = "nameserver 127.0.0.1\n";
+        assert(resolv_conf_candidates(none, sizeof none - 1, "x", c, 8) == 1 && strcmp(c[0], "x") == 0);
+        assert(resolv_conf_candidates("", 0, "x", c, 8) == 1 && strcmp(c[0], "x") == 0);
+        static const char dom[] = "domain d.test\n";
+        k = resolv_conf_candidates(dom, sizeof dom - 1, "x", c, 8);
+        assert(k == 2 && strcmp(c[0], "x.d.test") == 0 && strcmp(c[1], "x") == 0);
+        static const char last1[] = "domain d.test\nsearch s.test\n";
+        k = resolv_conf_candidates(last1, sizeof last1 - 1, "x", c, 8);
+        assert(k == 2 && strcmp(c[0], "x.s.test") == 0);
+        static const char last2[] = "search s.test\ndomain d.test\n";
+        k = resolv_conf_candidates(last2, sizeof last2 - 1, "x", c, 8);
+        assert(k == 2 && strcmp(c[0], "x.d.test") == 0);
+        static const char twice[] = "search a.test\nsearch b.test\n";
+        k = resolv_conf_candidates(twice, sizeof twice - 1, "x", c, 8);
+        assert(k == 2 && strcmp(c[0], "x.b.test") == 0);
+        static const char cleared[] = "search a.test\nsearch\n";
+        assert(resolv_conf_candidates(cleared, sizeof cleared - 1, "x", c, 8) == 1);
+        static const char blank[] = "search a.test\nsearch \n";
+        assert(resolv_conf_candidates(blank, sizeof blank - 1, "x", c, 8) == 1);
+        static const char ddot[] = "domain .\n";
+        assert(resolv_conf_candidates(ddot, sizeof ddot - 1, "x", c, 8) == 1);
+        static const char sdot[] = "search .\n";
+        assert(resolv_conf_candidates(sdot, sizeof sdot - 1, "x", c, 8) == 1 && strcmp(c[0], "x") == 0);
+        static const char fq[] = "search a.test.\n";
+        k = resolv_conf_candidates(fq, sizeof fq - 1, "x", c, 8);
+        assert(k == 2 && strcmp(c[0], "x.a.test") == 0);
+        static const char indented[] = " search a.test\n";
+        assert(resolv_conf_candidates(indented, sizeof indented - 1, "x", c, 8) == 1);
+        static const char words[] = "search  a.test\tb.test  # c\n";
+        k = resolv_conf_candidates(words, sizeof words - 1, "x", c, 8);
+        assert(k == 5 && strcmp(c[1], "x.b.test") == 0 && strcmp(c[2], "x.#") == 0 && strcmp(c[3], "x.c") == 0);
+        static const char n2[] = "search a.test\noptions ndots:2\n";
+        k = resolv_conf_candidates(n2, sizeof n2 - 1, "x.y", c, 8);
+        assert(k == 2 && strcmp(c[0], "x.y.a.test") == 0 && strcmp(c[1], "x.y") == 0);
+        static const char n0[] = "search a.test\noptions ndots:0\n";
+        k = resolv_conf_candidates(n0, sizeof n0 - 1, "x", c, 8);
+        assert(k == 2 && strcmp(c[0], "x") == 0 && strcmp(c[1], "x.a.test") == 0);
+        static const char nlast[] = "search a.test\noptions ndots:3 ndots:0\n";
+        assert(resolv_conf_candidates(nlast, sizeof nlast - 1, "x", c, 8) == 2 && strcmp(c[0], "x") == 0);
+        static const char nx[] = "search a.test\noptions ndots:x\n";
+        assert(resolv_conf_candidates(nx, sizeof nx - 1, "x", c, 8) == 2 && strcmp(c[0], "x") == 0);
+        static const char nneg[] = "search a.test\noptions ndots:-1\n";
+        assert(resolv_conf_candidates(nneg, sizeof nneg - 1, "a.b.c", c, 8) == 2 && strcmp(c[0], "a.b.c.a.test") == 0);
+        static const char n2x[] = "search a.test\noptions ndots:2x\n";
+        assert(resolv_conf_candidates(n2x, sizeof n2x - 1, "x.y", c, 8) == 2 && strcmp(c[0], "x.y.a.test") == 0);
+        static const char nother[] = "search a.test\noptions\tfoo  ndots:2\n";
+        assert(resolv_conf_candidates(nother, sizeof nother - 1, "x.y", c, 8) == 2 && strcmp(c[0], "x.y.a.test") == 0);
+        static const char nbig[] = "search a.test\noptions ndots:20\n";
+        k = resolv_conf_candidates(nbig, sizeof nbig - 1, "a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p", c, 8);
+        assert(k == 2 && strcmp(c[0], "a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p") == 0);
+        /* A domain that would make the name longer than 253 characters is skipped. */
+        char longconf[400];
+        strcpy(longconf, "search ");
+        for (int i = 0; i < 4; i++) {
+            strcat(longconf, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            if (i < 3) strcat(longconf, ".");
+        }
+        strcat(longconf, ".aaaaaaaaaa s.test\n"); /* a 254-character domain */
+        k = resolv_conf_candidates(longconf, strlen(longconf), "x", c, 8);
+        assert(k == 2 && strcmp(c[0], "x.s.test") == 0 && strcmp(c[1], "x") == 0);
+        /* At the limit (measured): a 250-character domain takes "xx" (253) but not "xxx" (254). A label over 63 is skipped. */
+        char edge[300] = "search ";
+        size_t e = strlen(edge);
+        for (int i = 0; i < 250; i++) edge[e++] = (i % 61 == 60) ? '.' : 'a';
+        edge[e++] = '\n';
+        edge[e] = 0;
+        assert(resolv_conf_candidates(edge, e, "xx", c, 8) == 2 && strlen(c[0]) == 253);
+        assert(resolv_conf_candidates(edge, e, "xxx", c, 8) == 1 && strcmp(c[0], "xxx") == 0);
+        char lab64[100] = "search d.";
+        e = strlen(lab64);
+        for (int i = 0; i < 64; i++) lab64[e++] = 'q';
+        strcpy(lab64 + e, " s.test\n");
+        k = resolv_conf_candidates(lab64, strlen(lab64), "x", c, 8);
+        assert(k == 2 && strcmp(c[0], "x.s.test") == 0);
+        assert(resolv_conf_candidates(ab, sizeof ab - 1, (const char *)0, c, 8) == 0);
+        assert(resolv_conf_candidates(ab, sizeof ab - 1, "", c, 8) == 0);
+    }
+
     /* A NULL name or output never reaches the kernel: the wrapper refuses it first with EINVAL. */
     moqi_test_last_nr = 0;
     assert(gethostbyname_ipv4((const char *)0, ip) == -22);

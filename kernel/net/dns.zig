@@ -22,9 +22,13 @@ const DNS_CACHE_SIZE: u32 = 16;
 const TYPE_A: u16 = 1;
 const CLASS_IN: u16 = 1;
 
+/// Longest name the resolver takes, as text without the trailing dot (hostname_policy.MAX_NAME: 253; a 255-octet wire name).
+/// A name with a search domain appended (/etc/resolv.conf "search") easily passes the old 63.
+const MAX_NAME: usize = @import("hostname_policy.zig").MAX_NAME;
+
 /// DNS cache entry
 const DnsCacheEntry = struct {
-    name: [64]u8,
+    name: [MAX_NAME]u8,
     name_len: u8,
     ip: [4]u8,
     ttl: u64, // Expiry tick count
@@ -62,7 +66,7 @@ pub const Yield = ?*const fn () bool;
 
 /// resolve() whose waits go through `yield`.
 pub fn resolveYield(hostname: []const u8, yield: Yield) [4]u8 {
-    if (hostname.len == 0 or hostname.len > 63) return .{ 0, 0, 0, 0 };
+    if (hostname.len == 0 or hostname.len > MAX_NAME) return .{ 0, 0, 0, 0 };
 
     // Static built-in names first: no NIC, server, or ~2s query timeout.
     const static_hosts = @import("static_hosts.zig");
@@ -111,7 +115,7 @@ pub fn getDnsServer() [4]u8 {
 /// literals still answer first, as in resolve(); the shared cache is neither read nor written: an answer from a server one
 /// caller chose must not reach other processes, and a cached answer would not have come from `server`.
 pub fn resolveVia(hostname: []const u8, server: [4]u8, yield: Yield) [4]u8 {
-    if (hostname.len == 0 or hostname.len > 63) return .{ 0, 0, 0, 0 };
+    if (hostname.len == 0 or hostname.len > MAX_NAME) return .{ 0, 0, 0, 0 };
     if (@import("static_hosts.zig").lookup(hostname)) |ip| return ip;
     if (isIpV4(hostname)) return parseIpV4(hostname);
     return queryDnsCache(hostname, server, false, yield);
@@ -401,7 +405,7 @@ fn addToCache(hostname: []const u8, ip: [4]u8, ttl_seconds: u32) void {
     }
 
     const s = slot orelse return;
-    @memset(cache[s].name[0..64], 0);
+    @memset(&cache[s].name, 0);
     @memcpy(cache[s].name[0..hostname.len], hostname);
     cache[s].name_len = @intCast(hostname.len);
     cache[s].ip = ip;

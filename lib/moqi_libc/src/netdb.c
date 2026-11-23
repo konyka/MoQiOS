@@ -55,6 +55,111 @@ size_t resolv_conf_servers(const char *text, size_t len, uint8_t out[][4], size_
 }
 
 #define RESOLV_MAXNS 3
+#define RESOLV_NAME_MAX 253
+#define RESOLV_LABEL_MAX 63
+
+/* The words of the last "search" or "domain" line (a keyword at the start of the line, then a blank or the end of the line); 0
+ * words when the last one has none. *ndots: the last "ndots:N" of an options line, 1 when there is none. */
+static size_t resolv_conf_search(const char *text, size_t len, const char **word, size_t *word_len, size_t cap, unsigned *ndots) {
+    static const char kw_search[] = "search", kw_domain[] = "domain", kw_options[] = "options";
+    size_t count = 0, pos = 0;
+    *ndots = 1;
+    while (text && pos < len) {
+        size_t end = pos;
+        while (end < len && text[end] != '\n') end++;
+        size_t kl = 0;
+        int list = 0;
+        if (end - pos >= 6 && (memcmp(text + pos, kw_search, 6) == 0 || memcmp(text + pos, kw_domain, 6) == 0)) {
+            kl = 6;
+            list = 1;
+        } else if (end - pos >= 7 && memcmp(text + pos, kw_options, 7) == 0) {
+            kl = 7;
+        }
+        if (kl && (pos + kl == end || resolv_blank(text[pos + kl]))) {
+            int is_domain = list && text[pos] == 'd';
+            if (list) count = 0;
+            size_t i = pos + kl;
+            while (i < end) {
+                while (i < end && resolv_blank(text[i])) i++;
+                size_t a = i;
+                while (i < end && !resolv_blank(text[i])) i++;
+                if (i == a) break;
+                if (list) {
+                    /* "domain" names one domain; a domain of "." is none. */
+                    if (is_domain && count == 1) break;
+                    if (is_domain && i - a == 1 && text[a] == '.') break;
+                    if (count < cap) {
+                        word[count] = text + a;
+                        word_len[count] = i - a;
+                        count++;
+                    }
+                } else if (i - a >= 6 && memcmp(text + a, "ndots:", 6) == 0) {
+                    /* glibc: atoi of the rest, anything above 15 is 15, and the value lands in a 4-bit field ("2x" is 2, "x" is 0,
+                     * "-1" is 15; measured). */
+                    size_t d = a + 6;
+                    int neg = d < i && (text[d] == '-' || text[d] == '+') ? text[d++] == '-' : 0;
+                    long v = 0;
+                    while (d < i && text[d] >= '0' && text[d] <= '9' && v < 100000) v = v * 10 + (text[d++] - '0');
+                    if (neg) v = -v;
+                    *ndots = v > 15 ? 15u : (unsigned)v & 15u;
+                }
+            }
+        }
+        pos = end + 1;
+    }
+    return count;
+}
+
+/* Whether `name` (`len` bytes) can be sent as a DNS name: at most 253 characters, no label longer than 63 (glibc skips such a
+ * search candidate without asking). */
+static int resolv_name_fits(const char *name, size_t len) {
+    if (len == 0 || len > RESOLV_NAME_MAX) return 0;
+    size_t label = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (name[i] == '.') label = 0;
+        else if (++label > RESOLV_LABEL_MAX) return 0;
+    }
+    return 1;
+}
+
+static int resolv_add(char out[][256], size_t *n, size_t cap, const char *name, size_t name_len, const char *dom, size_t dom_len) {
+    if (*n >= cap) return 0;
+    if (dom_len && dom[dom_len - 1] == '.') dom_len--;
+    if (dom && dom_len == 0) return 1;
+    size_t total = name_len + (dom ? 1 + dom_len : 0);
+    char *o = out[*n];
+    if (total >= 256) return 1;
+    memcpy(o, name, name_len);
+    if (dom) {
+        o[name_len] = '.';
+        memcpy(o + name_len + 1, dom, dom_len);
+    }
+    o[total] = 0;
+    if (!resolv_name_fits(o, total)) return 1;
+    (*n)++;
+    return 1;
+}
+
+size_t resolv_conf_candidates(const char *text, size_t len, const char *name, char out[][256], size_t cap) {
+    if (!name || !name[0] || !out || cap == 0) return 0;
+    size_t name_len = strlen(name);
+    size_t n = 0;
+    /* A trailing dot: the name is fully qualified and asked for alone. */
+    if (name[name_len - 1] == '.') {
+        if (name_len > 1) resolv_add(out, &n, cap, name, name_len - 1, (const char *)0, 0);
+        return n;
+    }
+    const char *word[64];
+    size_t word_len[64];
+    unsigned ndots;
+    size_t nw = resolv_conf_search(text, len, word, word_len, 64, &ndots);
+    unsigned dots = 0;
+    for (size_t i = 0; i < name_len; i++) dots += name[i] == '.';
+    if (dots >= ndots) resolv_add(out, &n, cap, name, name_len, (const char *)0, 0);
+    for (size_t i = 0; i < nw; i++) resolv_add(out, &n, cap, name, name_len, word[i], word_len[i]);
+    if (dots < ndots) resolv_add(out, &n, cap, name, name_len, (const char *)0, 0);
+    return n;
+}
 
 #ifdef MOQI_HOST_TEST_SYSCALL
 static size_t resolv_conf_read(char *buf, size_t cap) { (void)buf; (void)cap; return 0; }
@@ -73,13 +178,9 @@ static size_t resolv_conf_read(char *buf, size_t cap) {
 }
 #endif
 
-long gethostbyname_ipv4(const char *name, uint8_t out[4]) {
-    if (!name || !out) return -22; /* EINVAL */
-    /* The nameservers of /etc/resolv.conf, tried in order until one answers (glibc moves to the next on a timeout); without a
-     * usable line the kernel's own server (DHCP's) is asked. */
-    char conf[2048];
-    uint8_t ns[RESOLV_MAXNS][4];
-    size_t nns = resolv_conf_servers(conf, resolv_conf_read(conf, sizeof conf), ns, RESOLV_MAXNS);
+/* One name through the nameservers of /etc/resolv.conf in order until one answers (glibc moves to the next on a timeout); with no
+ * usable nameserver line, the kernel's own server (DHCP's). */
+static long resolve_one(const char *name, uint8_t out[4], uint8_t ns[][4], size_t nns) {
     if (nns == 0) return NETDB_SYSCALL2(SYS_dns_resolve, (long)name, (long)out);
     long r = -2;
     for (size_t i = 0; i < nns; i++) {
@@ -89,6 +190,51 @@ long gethostbyname_ipv4(const char *name, uint8_t out[4]) {
         if (r == 0 || r == -22 || r == -36 || r == -14) break;
     }
     return r;
+}
+
+#define RESOLV_MAX_CANDIDATES 8
+
+static char resolv_conf_buf[2048];
+static char resolv_cand[RESOLV_MAX_CANDIDATES][256];
+
+long gethostbyname_ipv4_name(const char *name, uint8_t out[4], char *found, size_t found_cap) {
+    if (!name || !out) return -22; /* EINVAL */
+    size_t len = resolv_conf_read(resolv_conf_buf, sizeof resolv_conf_buf);
+    uint8_t ns[RESOLV_MAXNS][4];
+    size_t nns = resolv_conf_servers(resolv_conf_buf, len, ns, RESOLV_MAXNS);
+    /* A dotted IPv4 literal is an address, not a name: no search domain is tried (glibc answers it without a query, measured). A
+     * name with no candidate (malformed, over-long) goes to the kernel as given for its own errno. */
+    uint8_t lit[4];
+    size_t nc = name[0] && !ipv4_from_text(name, lit) ? resolv_conf_candidates(resolv_conf_buf, len, name, resolv_cand, RESOLV_MAX_CANDIDATES) : 0;
+    long direct = -2;
+    int direct_tried = 0;
+    for (size_t i = 0; i < nc; i++) {
+        int is_name = strcmp(resolv_cand[i], name) == 0 || (strlen(name) == strlen(resolv_cand[i]) + 1 && name[strlen(name) - 1] == '.');
+        long r = resolve_one(is_name ? name : resolv_cand[i], out, ns, nns);
+        if (is_name) {
+            direct = r;
+            direct_tried = 1;
+        }
+        if (r == 0) {
+            if (found && found_cap) {
+                size_t k = strlen(resolv_cand[i]);
+                if (k >= found_cap) k = found_cap - 1;
+                memcpy(found, resolv_cand[i], k);
+                found[k] = 0;
+            }
+            return 0;
+        }
+        /* Only "no such name" moves on to the next candidate; a bad pointer is final. */
+        if (r == -14) return r;
+    }
+    /* Report what the name itself got (glibc: the error of the as-is query); a name with no candidate at all (too long, a
+     * malformed label) goes to the kernel for its errno. */
+    if (!direct_tried) return resolve_one(name, out, ns, nns);
+    return direct;
+}
+
+long gethostbyname_ipv4(const char *name, uint8_t out[4]) {
+    return gethostbyname_ipv4_name(name, out, (char *)0, 0);
 }
 
 long ipv4_to_text(const uint8_t addr[4], char *buf, size_t buf_len) {
@@ -756,7 +902,13 @@ static void lookup_name(const char *name, int af, char *hosts, size_t hosts_cap,
             ans->herr = HOST_NOT_FOUND; /* the kernel resolver has no AAAA records */
             return;
         } else {
-            long r = gethostbyname_ipv4(name, ans->addrs[0]);
+            /* The name that answered (a search domain may have been appended) is the canonical name (glibc, measured). */
+            ans->name_store[0] = 0;
+            long r = gethostbyname_ipv4_name(name, ans->addrs[0], ans->name_store, HOSTENT_NAME_MAX);
+            if (r == 0 && ans->name_store[0]) {
+                ans->names = ans->name_store;
+                ans->names_len = strlen(ans->name_store);
+            }
             if (r < 0) {
                 /* A name that does not exist, is malformed, or is too long is a definitive "no such host"; a timeout or any
                  * other failure is worth retrying. */
@@ -1283,12 +1435,18 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
         if (naddrs == 0) {
             /* The kernel resolver answers A records only. */
             if (family == AF_INET6 && !(flags & AI_V4MAPPED)) return EAI_NONAME;
-            long r = gethostbyname_ipv4(node, v4);
+            canon_buf[0] = 0;
+            long r = gethostbyname_ipv4_name(node, v4, canon_buf, sizeof canon_buf);
             if (r < 0) return (r == -2 || r == -22 || r == -36) ? EAI_NONAME : EAI_AGAIN;
             set_v4(&addrs[0], v4[0], v4[1], v4[2], v4[3]);
             if (family == AF_INET6) map_v4(&addrs[0]);
             naddrs = 1;
             names = (const char *)0;
+            /* The name that answered (with a search domain, when one was appended) is the canonical name. */
+            if (canon_buf[0]) {
+                names = canon_buf;
+                names_len = strlen(canon_buf);
+            }
         }
         if (flags & AI_CANONNAME) {
             /* A name from /etc/hosts is canonicalised to the line's first name, as glibc does. */

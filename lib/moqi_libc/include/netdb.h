@@ -1,7 +1,8 @@
 /* netdb.h — hostname resolution for moqi_libc.
  *
  * gethostbyname_ipv4() is a thin wrapper over the kernel's dns_resolve system call (495): static host table
- * (localhost, gateway), dotted decimal, the resolver cache, then a DNS query. IPv4 A records only. Failures are
+ * (localhost, gateway), dotted decimal, the resolver cache, then a DNS query. /etc/resolv.conf's nameservers go through
+ * dns_resolve_via (506), and its search list decides which names are asked (resolv_conf_candidates). IPv4 A records only. Failures are
  * the kernel's -errno, returned unchanged: -ENOENT (empty name or did not resolve), -ENAMETOOLONG, -EINVAL
  * (malformed hostname), -EFAULT. The output is written only on success.
  */
@@ -18,12 +19,23 @@
  * `out` is -EINVAL and never reaches the kernel. */
 long gethostbyname_ipv4(const char *name, uint8_t out[4]);
 
+/* gethostbyname_ipv4 that also reports the name that answered (`name` with a search domain appended, or as given), NUL-terminated
+ * and cut to `found_cap`, into `found` (may be NULL). Written only on success. */
+long gethostbyname_ipv4_name(const char *name, uint8_t out[4], char *found, size_t found_cap);
+
 /* The nameservers of an /etc/resolv.conf text (`len` bytes), as glibc's res_init takes them (measured): "nameserver" at the start of
  * a line, in lower case, a blank or tab, a dotted IPv4 address, then nothing or blanks and anything; '#' and ';' lines, a leading
  * blank, a CR before the newline and IPv6 addresses do not count, nor 0.0.0.0, 255.255.255.255 or multicast (the kernel refuses
  * those). Up to `cap` servers in file order into `out`; returns how many. gethostbyname_ipv4 asks them in order through
  * dns_resolve_via (506) and, when the file has none, falls back to the kernel's own server (DHCP's) through dns_resolve. */
 size_t resolv_conf_servers(const char *text, size_t len, uint8_t out[][4], size_t cap);
+
+/* The names gethostbyname_ipv4 asks for `name`, in order, as glibc's res_search builds them from an /etc/resolv.conf text
+ * (measured): with fewer dots than "options ndots:N" (default 1) each "search" domain appended, then the name itself; with at least
+ * ndots the name first, then the domains. The last "search" or "domain" line gives the list ("domain" names one; an empty line
+ * clears it). A trailing dot asks for the name alone. A candidate longer than 253 characters or with a label over 63 is skipped.
+ * Up to `cap` NUL-terminated names into `out`; returns how many, 0 for a NULL or empty name. */
+size_t resolv_conf_candidates(const char *text, size_t len, const char *name, char out[][256], size_t cap);
 
 /* Format `addr` as "a.b.c.d" into `buf` (NUL-terminated). Returns the text length (without the NUL), or -ERANGE
  * (-34) when `buf` cannot hold the text plus its NUL, in which case `buf` is not written. */
