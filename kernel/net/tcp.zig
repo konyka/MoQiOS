@@ -5064,7 +5064,8 @@ pub fn tcpBindAddr(tcb_idx: u32, port: u16, addr: [4]u8) i64 {
     return tcpBindAddr46(tcb_idx, port, addr, @splat(0), 0);
 }
 
-/// Bind a TCB to a local address and port: `addr` for an IPv4 socket, `addr6` for an IPv6 one. Returns 0 or -errno.
+/// Bind a TCB to a local address and port: `addr` for an IPv4 socket, `addr6` for an IPv6 one. Port zero allocates immediately,
+/// as inet_csk_get_port does, so getsockname and listen see the chosen port. Returns 0 or -errno.
 pub fn tcpBindAddr46(tcb_idx: u32, port: u16, addr: [4]u8, addr6: [16]u8, dev6: u8) i64 {
     const lock_flags = tcp_lock.acquire();
     defer tcp_lock.release(lock_flags);
@@ -5084,8 +5085,15 @@ pub fn tcpBindAddr46(tcb_idx: u32, port: u16, addr: [4]u8, addr6: [16]u8, dev6: 
         return tcp_port_policy.BIND_EADDRINUSE;
     }
 
-    tcb.local_port = port;
-    tcb.bound_explicitly = port != 0;
+    const bound_port = if (port == 0) allocEphemeralPort(tcb) else port;
+    if (bound_port == 0) {
+        tcb.local_ip = saved_ip;
+        tcb.local_ip6 = saved_ip6;
+        return tcp_port_policy.BIND_EADDRINUSE;
+    }
+    tcb.local_port = bound_port;
+    // Either kind of successful bind owns the chosen port; an unbound socket's stale slot value is the only connect() reallocates.
+    tcb.bound_explicitly = true;
     tcb.bound_dev6 = dev6;
     return 0;
 }

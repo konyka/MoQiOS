@@ -171,7 +171,7 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // fs.pipe-max-size: root opens the sysctl for writing (mode 0644), without CAP_SYS_RESOURCE so the limit applies to it.
         return .{ .uid = 0, .gid = 0, .caps = NO_CAPS, .initial_init = false };
     }
-    if (std.mem.eql(u8, name, "hello495")) {
+    if (std.mem.eql(u8, name, "hello495") or std.mem.eql(u8, name, "hello497")) {
         // Root/CAP_NET_ADMIN writes the reserved-port bitmap and local port range.
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_admin = true }, .initial_init = false };
     }
