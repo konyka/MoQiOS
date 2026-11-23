@@ -78,7 +78,7 @@ long resolve_ipv4_sockaddr(const char *host, uint16_t port, uint8_t out[16]);
  * socket that fails to connect is closed, never leaked. */
 long tcp_connect_host(const char *host, uint16_t port);
 
-/* ---- glibc-compatible gethostbyname() (IPv4 only) ----------------------------------------------------------- */
+/* ---- glibc-compatible gethostbyname()/gethostbyname2() ------------------------------------------------------ */
 
 #define AF_INET 2
 #define AF_INET6 10
@@ -92,9 +92,9 @@ long tcp_connect_host(const char *host, uint16_t port);
 struct hostent {
     char  *h_name;       /* the canonical name from /etc/hosts, else the name asked for */
     char **h_aliases;    /* NULL-terminated; the /etc/hosts line's other names (up to 16), else empty */
-    int    h_addrtype;   /* AF_INET */
-    int    h_length;     /* 4 */
-    char **h_addr_list;  /* NULL-terminated; exactly one address */
+    int    h_addrtype;   /* AF_INET, or AF_INET6 from gethostbyname2 */
+    int    h_length;     /* 4 or 16 */
+    char **h_addr_list;  /* NULL-terminated; every /etc/hosts address of the family, else one */
 };
 #define h_addr h_addr_list[0]
 
@@ -106,7 +106,12 @@ extern int h_errno;
  * not answer or the lookup failed for another reason. h_errno is reset to 0 on success. */
 struct hostent *gethostbyname(const char *name);
 
-/* ---- getaddrinfo() (IPv4 only) ------------------------------------------------------------------------------ */
+/* gethostbyname for a family: AF_INET (what gethostbyname does) or AF_INET6. Every /etc/hosts line of that family for the name
+ * is listed in file order (up to 16 addresses), with h_length 4 or 16; a literal answers only its own family; AF_INET6 has no
+ * DNS fallback (the kernel resolver has no AAAA), so a name not in /etc/hosts is HOST_NOT_FOUND. Another family is NO_DATA. */
+struct hostent *gethostbyname2(const char *name, int af);
+
+/* ---- getaddrinfo() ------------------------------------------------------------------------------------------- */
 
 #define AF_UNSPEC 0
 
@@ -159,7 +164,7 @@ void freeaddrinfo(struct addrinfo *res);
 /* Text for an EAI_* code (never NULL). */
 const char *gai_strerror(int code);
 
-/* ---- getnameinfo() (IPv4 only) ------------------------------------------------------------------------------ */
+/* ---- getnameinfo() ------------------------------------------------------------------------------------------- */
 
 #define NI_NUMERICHOST 1
 #define NI_NUMERICSERV 2

@@ -185,6 +185,22 @@ int main(void) {
         assert(hosts_reverse6(hosts, sizeof(hosts) - 1, mapped, &n) == 0);
     }
 
+    /* gethostbyname2 without /etc/hosts (the host test has no file system): a literal answers only its own family, AF_INET6 has no
+     * resolver fallback, another family is NO_DATA; AF_INET resolves through the kernel like gethostbyname (glibc, measured). */
+    {
+        struct hostent *h = gethostbyname2("2001:db8::9", AF_INET6);
+        assert(h && h->h_addrtype == AF_INET6 && h->h_length == 16 && (unsigned char)h->h_addr_list[0][15] == 9 && h->h_addr_list[1] == 0);
+        assert(strcmp(h->h_name, "2001:db8::9") == 0 && h->h_aliases[0] == 0 && h_errno == 0);
+        assert(gethostbyname2("10.1.1.1", AF_INET6) == 0 && h_errno == HOST_NOT_FOUND);
+        assert(gethostbyname2("2001:db8::9", AF_INET) == 0 && h_errno == HOST_NOT_FOUND);
+        moqi_test_last_nr = 0;
+        assert(gethostbyname2("nosuch.invalid", AF_INET6) == 0 && h_errno == HOST_NOT_FOUND && moqi_test_last_nr == 0);
+        assert(gethostbyname2("x", 1) == 0 && h_errno == NO_DATA);
+        assert(gethostbyname2((const char *)0, AF_INET6) == 0 && h_errno == HOST_NOT_FOUND);
+        h = gethostbyname2("10.1.1.1", AF_INET);
+        assert(h && h->h_addrtype == AF_INET && h->h_length == 4 && (unsigned char)h->h_addr_list[0][3] == 1 && h->h_addr_list[1] == 0);
+    }
+
     /* A NULL name or output never reaches the kernel: the wrapper refuses it first with EINVAL. */
     moqi_test_last_nr = 0;
     assert(gethostbyname_ipv4((const char *)0, ip) == -22);

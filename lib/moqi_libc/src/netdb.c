@@ -433,27 +433,59 @@ int h_errno;
 
 static struct hostent hostent_result;
 static char hostent_name[HOSTENT_NAME_MAX];
-static char hostent_addr[4];
+#define HOSTENT_ADDRS_MAX 16
+static char hostent_addrs[HOSTENT_ADDRS_MAX][16];
 #define HOSTENT_ALIASES_MAX 16
 static char *hostent_aliases[HOSTENT_ALIASES_MAX + 1];
-static char *hostent_addr_list[2];
+static char *hostent_addr_list[HOSTENT_ADDRS_MAX + 1];
 
-struct hostent *gethostbyname(const char *name) {
+struct hostent *gethostbyname2(const char *name, int af) {
     if (!name) {
         h_errno = HOST_NOT_FOUND;
         return (struct hostent *)0;
     }
-    uint8_t addr[4];
+    if (af != AF_INET && af != AF_INET6) {
+        h_errno = NO_DATA; /* glibc answers another family with NO_DATA (measured) */
+        return (struct hostent *)0;
+    }
+    int alen = af == AF_INET6 ? 16 : 4;
+    struct hosts_addr found[HOSTENT_ADDRS_MAX];
+    size_t naddrs = 0;
     hostent_name[0] = 0;
-    if (!ipv4_from_text(name, addr)) {
-        long r = lookup_ipv4(name, addr, hostent_name, HOSTENT_NAME_MAX);
-        if (r < 0) {
-            /* A name that does not exist, is malformed, or is too long is a definitive "no such host"; a timeout
-             * or any other failure is worth retrying. */
-            h_errno = (r == -2 /* ENOENT */ || r == -22 /* EINVAL */ || r == -36 /* ENAMETOOLONG */)
-                          ? HOST_NOT_FOUND
-                          : TRY_AGAIN;
+    uint8_t lit[16];
+    int is_v4 = ipv4_from_text(name, lit), is_v6 = !is_v4 && ipv6_from_text(name, lit);
+    if (is_v4 || is_v6) {
+        /* A literal answers only its own family. */
+        if ((af == AF_INET) != is_v4) {
+            h_errno = HOST_NOT_FOUND;
             return (struct hostent *)0;
+        }
+        memcpy(found[0].addr, lit, (size_t)alen);
+        naddrs = 1;
+    } else {
+        /* Every /etc/hosts line of this family in file order; the names come from the first one. */
+        size_t n = etc_hosts_read();
+        const char *names = (const char *)0;
+        size_t names_len = 0;
+        if (n) naddrs = hosts_collect(etc_hosts_buf, n, name, af, found, HOSTENT_ADDRS_MAX, &names, &names_len);
+        if (naddrs) {
+            if (names_len >= HOSTENT_NAME_MAX) names_len = HOSTENT_NAME_MAX - 1;
+            memcpy(hostent_name, names, names_len);
+            hostent_name[names_len] = 0;
+        } else if (af == AF_INET6) {
+            h_errno = HOST_NOT_FOUND; /* the kernel resolver has no AAAA records */
+            return (struct hostent *)0;
+        } else {
+            long r = gethostbyname_ipv4(name, found[0].addr);
+            if (r < 0) {
+                /* A name that does not exist, is malformed, or is too long is a definitive "no such host"; a timeout
+                 * or any other failure is worth retrying. */
+                h_errno = (r == -2 /* ENOENT */ || r == -22 /* EINVAL */ || r == -36 /* ENAMETOOLONG */)
+                              ? HOST_NOT_FOUND
+                              : TRY_AGAIN;
+                return (struct hostent *)0;
+            }
+            naddrs = 1;
         }
     }
     int naliases = 0;
@@ -476,18 +508,22 @@ struct hostent *gethostbyname(const char *name) {
         }
         hostent_name[n] = 0;
     }
-    for (int i = 0; i < 4; i++) hostent_addr[i] = (char)addr[i];
     hostent_aliases[naliases] = (char *)0;
-    hostent_addr_list[0] = hostent_addr;
-    hostent_addr_list[1] = (char *)0;
+    for (size_t k = 0; k < naddrs; k++) {
+        memcpy(hostent_addrs[k], found[k].addr, (size_t)alen);
+        hostent_addr_list[k] = hostent_addrs[k];
+    }
+    hostent_addr_list[naddrs] = (char *)0;
     hostent_result.h_name = hostent_name;
     hostent_result.h_aliases = hostent_aliases;
-    hostent_result.h_addrtype = AF_INET;
-    hostent_result.h_length = 4;
+    hostent_result.h_addrtype = af;
+    hostent_result.h_length = alen;
     hostent_result.h_addr_list = hostent_addr_list;
     h_errno = 0;
     return &hostent_result;
 }
+
+struct hostent *gethostbyname(const char *name) { return gethostbyname2(name, AF_INET); }
 
 /* ---- getaddrinfo --------------------------------------------------------------------------------------------- */
 
