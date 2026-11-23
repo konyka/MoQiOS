@@ -890,6 +890,30 @@ pub fn ensurePort(port: u16) u16 {
     return newSlotLocked(port, false, 0);
 }
 
+/// A port of the ephemeral range (net.ipv4.ip_local_port_range) that no socket has, registered for the caller alone (the kernel
+/// resolver's per-query source port: two queries at once must not read each other's replies). Starts at a random point of the
+/// range, like the source port glibc's resolver picks. null when every port of the range is taken or the table is full.
+pub fn reserveEphemeral() ?u16 {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    if (num_ports >= MAX_PORTS) return null;
+    var in_use: [MAX_PORTS]u16 = undefined;
+    for (0..num_ports) |j| in_use[j] = portNumber(ports[j]);
+    var rb: [2]u8 = undefined;
+    @import("../drivers/random.zig").getRandomBytes(&rb, 2);
+    const range = @import("local_port_sysctl.zig").get();
+    const first: u16 = @truncate(range);
+    const last: u16 = @truncate(range >> 16);
+    const span: u32 = if (last >= first) @as(u32, last) - first + 1 else 1;
+    const start: u16 = @intCast(first + (@as(u32, rb[0]) << 8 | rb[1]) % span);
+    const reserved_ports = @import("reserved_port_policy.zig");
+    reserved_ports.readLock();
+    defer reserved_ports.readUnlock();
+    const port = @import("tcp_port_policy.zig").pickEphemeralPortInRange(start, in_use[0..num_ports], 0, range, reserved_ports.bytes()) orelse return null;
+    _ = newSlotLocked(port, false, 0);
+    return port;
+}
+
 /// Register `port` only when no socket owns it yet. Returns the new slot
 /// index, 0xFFFE when the port is already registered, 0xFFFF when full.
 pub fn ensurePortExclusive(port: u16, is_v6: bool, uid: u32) u16 {

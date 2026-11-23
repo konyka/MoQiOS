@@ -19,9 +19,23 @@
  * `out` is -EINVAL and never reaches the kernel. */
 long gethostbyname_ipv4(const char *name, uint8_t out[4]);
 
-/* gethostbyname_ipv4 that also reports the name that answered (`name` with a search domain appended, or as given), NUL-terminated
- * and cut to `found_cap`, into `found` (may be NULL). Written only on success. */
+/* gethostbyname_ipv4 that also reports the canonical name of the answer (the end of its CNAME chain; `name` with a search domain
+ * appended, or as given, when there was none), NUL-terminated and cut to `found_cap`, into `found` (may be NULL). Written only on
+ * success. */
 long gethostbyname_ipv4_name(const char *name, uint8_t out[4], char *found, size_t found_cap);
+
+/* The whole answer of a lookup through a nameserver of /etc/resolv.conf, as dns_query (507) hands it over: the address count,
+ * the alias count, the addresses, then the canonical name (the end of the CNAME chain) and the aliases (the names before it),
+ * NUL-terminated (glibc getanswer_r, measured). `len` is 0 when the answer did not come from such a query (a literal or the
+ * kernel's DHCP server through dns_resolve). */
+struct resolv_answer { uint8_t buf[1024]; size_t len; };
+
+/* gethostbyname_ipv4_name that also fills `ans` (may be NULL). Everything it uses is per call, so threads may resolve at once. */
+long resolv_lookup(const char *name, uint8_t out[4], char *found, size_t found_cap, struct resolv_answer *ans);
+
+/* Up to `cap` addresses of `ans` in reply order into `addrs`, and in `names` (may be NULL) "canonical alias alias...". Returns
+ * the number of addresses; 0 when `ans` holds none. */
+size_t resolv_answer_unpack(const struct resolv_answer *ans, uint8_t addrs[][4], size_t cap, char *names, size_t names_cap);
 
 /* The nameservers of an /etc/resolv.conf text (`len` bytes), as glibc's res_init takes them (measured): "nameserver" at the start of
  * a line, in lower case, a blank or tab, a dotted IPv4 address, then nothing or blanks and anything; '#' and ';' lines, a leading

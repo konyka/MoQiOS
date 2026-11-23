@@ -193,6 +193,7 @@ pub const ndp_na_policy = @import("net/ndp_na_policy.zig");
 pub const ps2_policy = @import("drivers/ps2_policy.zig");
 pub const dns_policy = @import("net/dns_policy.zig");
 pub const dns_policy_source = @embedFile("net/dns_policy.zig");
+pub const dns_answer = @import("net/dns_answer.zig");
 pub const dns_source = @embedFile("net/dns.zig");
 pub const hostname_policy = @import("net/hostname_policy.zig");
 pub const host_test_source = @embedFile("host_test.zig");

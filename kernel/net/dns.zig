@@ -14,13 +14,11 @@ const idt = @import("../arch/arch.zig").interrupts;
 const tsc = @import("../arch/arch.zig").tsc;
 const bo = @import("../lib/byte_order.zig");
 const dns_policy = @import("dns_policy.zig");
+const dns_answer = @import("dns_answer.zig");
 
 const DNS_PORT: u16 = dns_policy.DNS_PORT;
 const DNS_CACHE_SIZE: u32 = 16;
 
-// DNS record types
-const TYPE_A: u16 = 1;
-const CLASS_IN: u16 = 1;
 
 /// Longest name the resolver takes, as text without the trailing dot (hostname_policy.MAX_NAME: 253; a 255-octet wire name).
 /// A name with a search domain appended (/etc/resolv.conf "search") easily passes the old 63.
@@ -128,7 +126,8 @@ fn queryDns(hostname: []const u8, dns_server: [4]u8, yield: Yield) [4]u8 {
 
 /// Send a DNS query and wait for response, caching the answer only when `cache_result`.
 fn queryDnsCache(hostname: []const u8, dns_server: [4]u8, cache_result: bool, yield: Yield) [4]u8 {
-    const r = queryCore(hostname, dns_server, dns_policy.QUERY_TIMEOUT_NS, yield);
+    var ans: dns_answer.Answer = .{};
+    const r = queryCore(hostname, dns_server, dns_policy.QUERY_TIMEOUT_NS, yield, &ans);
     if (r.outcome != .answer) return .{ 0, 0, 0, 0 };
     // Default TTL 5 minutes.
     if (cache_result) addToCache(hostname, r.ip, 300);
@@ -141,24 +140,29 @@ pub const Result = struct { outcome: dns_policy.Outcome, ip: [4]u8 = .{ 0, 0, 0,
 /// One query for `hostname` to `server`, waiting at most `timeout_ns` (dns_query, 507): what the reply said, for a resolver in
 /// user space that applies resolv.conf's timeout, attempts and server order itself. Literals and the static table answer
 /// first, as in resolveVia; the shared cache is neither read nor written.
-pub fn queryVia(hostname: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield) Result {
+/// `ans` receives every address of the reply and the CNAME chain (dns_answer), or the one address of a literal or static name.
+pub fn queryVia(hostname: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {
     if (hostname.len == 0 or hostname.len > MAX_NAME) return .{ .outcome = .nxdomain };
-    if (@import("static_hosts.zig").lookup(hostname)) |ip| return .{ .outcome = .answer, .ip = ip };
-    if (isIpV4(hostname)) return .{ .outcome = .answer, .ip = parseIpV4(hostname) };
-    return queryCore(hostname, server, timeout_ns, yield);
+    const local: ?[4]u8 = @import("static_hosts.zig").lookup(hostname) orelse if (isIpV4(hostname)) parseIpV4(hostname) else null;
+    if (local) |ip| {
+        dns_answer.single(ans, hostname, ip);
+        return .{ .outcome = .answer, .ip = ip };
+    }
+    return queryCore(hostname, server, timeout_ns, yield, ans);
 }
 
-fn queryCore(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yield) Result {
+fn queryCore(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {
     var pkt: [512]u8 = @splat(0);
     var offset: usize = 0;
 
     // Register the reply port first — without it the UDP demux drops the
     // response before recvFrom can ever see it.
-    if (udp.ensurePort(12345) == 0xFFFF) {
+    // A port of its own for this query: two queries at once (two threads, two processes) must not take each other's replies.
+    const src_port = udp.reserveEphemeral() orelse {
         serial.writeString("[DNS] Failed to register reply port\n");
         return .{ .outcome = .failed };
-    }
-    defer udp.releasePort(12345);
+    };
+    defer udp.releasePort(src_port);
 
     // DNS Header (big-endian / network byte order)
     const query_id = newQueryId();
@@ -185,7 +189,7 @@ fn queryCore(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yi
     var send_iters: u32 = 0;
     var sent = false;
     while (!sent and !dns_policy.waitExpiredAfter(send_start, tsc.nanos(), send_iters, timeout_ns)) : (send_iters += 1) {
-        sent = udp.sendTo(dns_server, DNS_PORT, 12345, &pkt, @intCast(offset));
+        sent = udp.sendTo(dns_server, DNS_PORT, src_port, &pkt, @intCast(offset));
         if (sent) break;
         pumpRx();
         if (yield) |y| (if (!y()) return .{ .outcome = .interrupted }) else cpu.pause();
@@ -201,19 +205,19 @@ fn queryCore(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yi
     while (!dns_policy.waitExpiredAfter(start, tsc.nanos(), wait_iters, timeout_ns)) : (wait_iters += 1) {
         pumpRx(); // replies only reach the UDP queue when the NIC is polled
         var buf: [512]u8 = @splat(0);
-        var src_ip: [4]u8 = .{ 0, 0, 0, 0 };
-        var src_port: u16 = 0;
+        var from_ip: [4]u8 = .{ 0, 0, 0, 0 };
+        var from_port: u16 = 0;
 
-        const n = udp.recvFrom(12345, &buf, @intCast(buf.len), &src_ip, &src_port);
-        if (n >= 12 and dns_policy.acceptResponse(src_ip, src_port, dns_server, bo.readU16BeAt(&buf, 0), query_id)) {
+        const n = udp.recvFrom(src_port, &buf, @intCast(buf.len), &from_ip, &from_port);
+        if (n >= 12 and dns_policy.acceptResponse(from_ip, from_port, dns_server, bo.readU16BeAt(&buf, 0), query_id)) {
             // Any reply settles the query, without waiting out the limit for another: an error RCODE (NXDOMAIN, SERVFAIL, ...), a
-            // reply with no answers, or answers with no A record among them (NODATA).
+            // reply with no answers (NODATA), or answers with no address for the name after following its CNAMEs (glibc's
+            // NO_RECOVERY: `failed`).
             const o = dns_policy.classify(bo.readU16BeAt(&buf, 2), bo.readU16BeAt(&buf, 6));
             if (o != .ignore) {
                 if (o != .answer) return .{ .outcome = o };
-                const ip = parseResponse(&buf, @intCast(n), query_id);
-                if (ip[0] == 0 and ip[1] == 0 and ip[2] == 0 and ip[3] == 0) return .{ .outcome = .nodata };
-                return .{ .outcome = .answer, .ip = ip };
+                if (!dns_answer.parse(buf[0..@intCast(n)], hostname, ans)) return .{ .outcome = .failed };
+                return .{ .outcome = .answer, .ip = ans.addrs[0] };
             }
         }
         if (yield) |y| (if (!y()) return .{ .outcome = .interrupted }) else cpu.pause();
@@ -239,75 +243,6 @@ fn pumpRx() void {
         net_mod.handleRxPacket(&rx_tmp, n);
         poll_limit += 1;
     }
-}
-
-/// Parse DNS response, extract first A record answer.
-fn parseResponse(data: [*]const u8, len: u16, expected_id: u16) [4]u8 {
-    if (len < 12) return .{ 0, 0, 0, 0 };
-
-    // Read DNS header fields in big-endian
-    const resp_id = bo.readU16BeAt(data, 0);
-    const flags = bo.readU16BeAt(data, 2);
-    const qdcount = bo.readU16BeAt(data, 4);
-    const ancount = bo.readU16BeAt(data, 6);
-
-    // Verify ID matches
-    if (resp_id != expected_id) return .{ 0, 0, 0, 0 };
-
-    // Check for response (QR bit = 1) and no error (RCODE = 0)
-    if ((flags & 0x8000) == 0) return .{ 0, 0, 0, 0 }; // Not a response
-    if ((flags & 0x000F) != 0) return .{ 0, 0, 0, 0 }; // Error
-
-    if (ancount == 0) return .{ 0, 0, 0, 0 };
-
-    var offset: usize = 12;
-
-    // Skip question section
-    for (0..qdcount) |_| {
-        offset = skipName(data, len, offset);
-        if (offset + 4 > len) return .{ 0, 0, 0, 0 };
-        offset += 4; // QTYPE + QCLASS
-    }
-
-    // Parse answer section
-    for (0..ancount) |_| {
-        offset = skipName(data, len, offset);
-        if (offset + 10 > len) return .{ 0, 0, 0, 0 };
-
-        const atype = bo.readU16BeAt(data, offset);
-        const aclass = bo.readU16BeAt(data, offset + 2);
-        // const attl = bo.readU32BeAt(data, offset + 4);
-        const rdlength = bo.readU16BeAt(data, offset + 8);
-        offset += 10;
-
-        if (atype == TYPE_A and aclass == CLASS_IN and rdlength == 4) {
-            if (offset + 4 > len) return .{ 0, 0, 0, 0 };
-            return .{ data[offset], data[offset + 1], data[offset + 2], data[offset + 3] };
-        }
-
-        offset += rdlength;
-    }
-
-    return .{ 0, 0, 0, 0 };
-}
-
-/// Skip a DNS name (handles compression pointers).
-fn skipName(data: [*]const u8, len: u16, start: usize) usize {
-    var offset = start;
-    while (offset < len) {
-        const b = data[offset];
-        if (b == 0) {
-            offset += 1;
-            break;
-        }
-        if ((b & 0xC0) == 0xC0) {
-            // Compression pointer
-            offset += 2;
-            break;
-        }
-        offset += 1 + @as(usize, b); // label length + label
-    }
-    return offset;
 }
 
 /// Encode a hostname into DNS name format (length-prefixed labels).

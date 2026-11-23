@@ -32,7 +32,12 @@ const char *moqi_test_resolv_conf;
 static long q_reply[32];
 static int q_n, q_calls;
 static char q_log[2048];
-long moqi_test_syscall4(long nr, long a1, long a2, long a3, long a4) {
+/* When set, the next successful dns_query also writes this encoded answer (count bytes, addresses, names) to its buffer. */
+static const unsigned char *q_answer;
+static size_t q_answer_len;
+static long q_last_anslen;
+long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
+    q_last_anslen = a6;
     long r = nr == SYS_dns_query && q_calls < q_n ? q_reply[q_calls] : -38;
     q_calls++;
     size_t l = strlen(q_log);
@@ -54,6 +59,18 @@ long moqi_test_syscall4(long nr, long a1, long a2, long a3, long a4) {
     if (r == 0) {
         unsigned char *out = (unsigned char *)a2;
         out[0] = 10; out[1] = 0; out[2] = 0; out[3] = (unsigned char)q_calls;
+        if (a6 >= 256 && a5) {
+            unsigned char *ans = (unsigned char *)a5;
+            if (q_answer && q_answer_len <= (size_t)a6) {
+                memcpy(ans, q_answer, q_answer_len);
+                memcpy(out, q_answer + 2, 4);
+            } else {
+                /* The kernel's form for one address under the asked name. */
+                ans[0] = 1; ans[1] = 0;
+                memcpy(ans + 2, out, 4);
+                strcpy((char *)ans + 6, name);
+            }
+        }
     }
     return r;
 }
@@ -63,6 +80,8 @@ static void q_script(const char *conf, const long *replies, int n) {
     q_n = n;
     q_calls = 0;
     q_log[0] = 0;
+    q_answer = 0;
+    q_answer_len = 0;
 }
 
 /* getaddrinfo allocates through malloc/free; the host test links only netdb.o, so it supplies a counting bump
@@ -820,6 +839,41 @@ int main(void) {
         q_script(one, r_nx, 1);
         assert(gethostbyname("x.y") == 0 && h_errno == HOST_NOT_FOUND);
         assert(strcmp(gai_strerror(EAI_NODATA), "No address associated with hostname") == 0);
+
+        /* hello520: the whole answer of dns_query. a.test CNAME b.test, two addresses: h_name is b.test, h_aliases {a.test}, both
+         * addresses in h_addr_list; getaddrinfo lists both, with ai_canonname b.test. */
+        static const unsigned char cn[] = {2, 1, 10, 9, 9, 1, 10, 9, 9, 2, 'b', '.', 't', 'e', 's', 't', 0, 'a', '.', 't', 'e', 's', 't', 0};
+        static const long ok1[] = {0};
+        q_script(one, ok1, 1);
+        q_answer = cn;
+        q_answer_len = sizeof cn;
+        struct hostent *hc = gethostbyname("a.test");
+        assert(hc && strcmp(hc->h_name, "b.test") == 0);
+        assert(hc->h_aliases[0] && strcmp(hc->h_aliases[0], "a.test") == 0 && hc->h_aliases[1] == 0);
+        assert(hc->h_addr_list[0] && (unsigned char)hc->h_addr_list[0][3] == 1 && (unsigned char)hc->h_addr_list[1][3] == 2 && hc->h_addr_list[2] == 0);
+        q_script(one, ok1, 1);
+        q_answer = cn;
+        q_answer_len = sizeof cn;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags = AI_CANONNAME;
+        assert(getaddrinfo("a.test", 0, &hints, &res) == 0);
+        assert(res && res->ai_canonname && strcmp(res->ai_canonname, "b.test") == 0);
+        assert(res->ai_next && res->ai_next->ai_addr[7] == 2 && res->ai_next->ai_next == 0 && res->ai_addr[7] == 1);
+        freeaddrinfo(res);
+        /* A search domain and a CNAME together: the canonical name is the chain's end, the asked name (with its domain) an alias. */
+        static const unsigned char cn2[] = {1, 1, 10, 9, 9, 3, 'z', '.', 't', 'e', 's', 't', 0, 'x', '.', 'a', '.', 't', 'e', 's', 't', 0};
+        q_script("nameserver 10.0.0.1\nsearch a.test\noptions attempts:1\n", ok1, 1);
+        q_answer = cn2;
+        q_answer_len = sizeof cn2;
+        hc = gethostbyname("x");
+        assert(hc && strcmp(hc->h_name, "z.test") == 0 && strcmp(hc->h_aliases[0], "x.a.test") == 0 && strcmp(q_log, "x.a.test@1/5;") == 0);
+        /* Without a CNAME the asked name is canonical and there are no aliases. 507 gets an answer buffer of at least 256 bytes. */
+        q_script(one, ok1, 1);
+        hc = gethostbyname("plain.test");
+        assert(hc && strcmp(hc->h_name, "plain.test") == 0 && hc->h_aliases[0] == 0 && hc->h_addr_list[1] == 0);
+        assert(q_last_anslen >= 256);
         moqi_test_resolv_conf = (const char *)0;
     }
 

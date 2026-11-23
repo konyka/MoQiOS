@@ -13,13 +13,13 @@ extern long moqi_test_syscall2(long nr, long a1, long a2);
 /* The socket syscalls only exist on the target; the host unit test links a recording stub instead. */
 #ifdef MOQI_HOST_TEST_SYSCALL
 extern long moqi_test_syscall3(long nr, long a1, long a2, long a3);
-extern long moqi_test_syscall4(long nr, long a1, long a2, long a3, long a4);
+extern long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, long a6);
 #define NETDB_SYSCALL3(nr, a1, a2, a3) moqi_test_syscall3((nr), (a1), (a2), (a3))
-#define NETDB_SYSCALL4(nr, a1, a2, a3, a4) moqi_test_syscall4((nr), (a1), (a2), (a3), (a4))
+#define NETDB_SYSCALL6(nr, a1, a2, a3, a4, a5, a6) moqi_test_syscall6((nr), (a1), (a2), (a3), (a4), (a5), (a6))
 #define NETDB_SYSCALL1(nr, a1) moqi_test_syscall3((nr), (a1), 0, 0)
 #else
 #define NETDB_SYSCALL3(nr, a1, a2, a3) syscall3((nr), (a1), (a2), (a3))
-#define NETDB_SYSCALL4(nr, a1, a2, a3, a4) syscall4((nr), (a1), (a2), (a3), (a4))
+#define NETDB_SYSCALL6(nr, a1, a2, a3, a4, a5, a6) syscall6((nr), (a1), (a2), (a3), (a4), (a5), (a6))
 #define NETDB_SYSCALL1(nr, a1) syscall1((nr), (a1))
 #endif
 
@@ -226,12 +226,16 @@ static long resolv_wait_ms(int timeout, size_t i, size_t nns) {
  * in file order, each waiting resolv_wait_ms; NXDOMAIN, NODATA and an address end it at once; SERVFAIL, NOTIMP, REFUSED and no
  * reply move on to the next server. -ETIMEDOUT when nobody replied, else the last reply's -EAGAIN (SERVFAIL) or -ECONNREFUSED. With no
  * usable nameserver line, the kernel's own server (DHCP's) through dns_resolve. */
-static long resolve_one(const char *name, uint8_t out[4], uint8_t ns[][4], size_t nns, const struct resolv_opts *opt) {
+static long resolve_one(const char *name, uint8_t out[4], uint8_t ns[][4], size_t nns, const struct resolv_opts *opt,
+                        struct resolv_answer *ans) {
+    if (ans) ans->len = 0;
     if (nns == 0) return NETDB_SYSCALL2(SYS_dns_resolve, (long)name, (long)out);
     long last_reply = -110; /* ETIMEDOUT: no server replied (or attempts:0 asked nobody) */
     for (int a = 0; a < opt->attempts; a++) {
         for (size_t i = 0; i < nns; i++) {
-            long r = NETDB_SYSCALL4(SYS_dns_query, (long)name, (long)out, (long)ns[i], resolv_wait_ms(opt->timeout, i, nns));
+            long r = NETDB_SYSCALL6(SYS_dns_query, (long)name, (long)out, (long)ns[i], resolv_wait_ms(opt->timeout, i, nns),
+                                    ans ? (long)ans->buf : 0, ans ? (long)sizeof ans->buf : 0);
+            if (r == 0 && ans) ans->len = sizeof ans->buf;
             if (r == -11 || r == -111) last_reply = r; /* SERVFAIL; NOTIMP or REFUSED: the last reply is what res_search sees */
             if (r == -11 || r == -111 || r == -110) continue;
             return r; /* an answer, NXDOMAIN, NODATA, another RCODE, or a bad argument */
@@ -242,11 +246,17 @@ static long resolve_one(const char *name, uint8_t out[4], uint8_t ns[][4], size_
 
 #define RESOLV_MAX_CANDIDATES 8
 
-static char resolv_conf_buf[2048];
-static char resolv_cand[RESOLV_MAX_CANDIDATES][256];
-
 long gethostbyname_ipv4_name(const char *name, uint8_t out[4], char *found, size_t found_cap) {
+    return resolv_lookup(name, out, found, found_cap, (struct resolv_answer *)0);
+}
+
+/* The file text and the candidate names are per call (on the stack): two threads resolving at once share nothing. */
+long resolv_lookup(const char *name, uint8_t out[4], char *found, size_t found_cap, struct resolv_answer *ans) {
     if (!name || !out) return -22; /* EINVAL */
+    char resolv_conf_buf[2048];
+    char resolv_cand[RESOLV_MAX_CANDIDATES][256];
+    struct resolv_answer local;
+    if (!ans && found && found_cap) ans = &local; /* the canonical name comes from the answer */
     size_t len = resolv_conf_read(resolv_conf_buf, sizeof resolv_conf_buf);
     uint8_t ns[RESOLV_MAXNS][4];
     size_t nns = resolv_conf_servers(resolv_conf_buf, len, ns, RESOLV_MAXNS);
@@ -263,18 +273,21 @@ long gethostbyname_ipv4_name(const char *name, uint8_t out[4], char *found, size
      * long to send) ends the domain list, though the name as given is still asked if it has not been. With nothing found the
      * result is the as-given query's when it came first, else NODATA if a domain had it, else SERVFAIL if one had that, else the
      * last query's. */
-    if (nc == 0) return resolve_one(name, out, ns, nns, &opt);
+    if (nc == 0) return resolve_one(name, out, ns, nns, &opt, ans);
     long saved = 0, last = -2;
     int asis_first = 0, got_nodata = 0, got_servfail = 0, done = 0;
     for (size_t i = 0; i < nc; i++) {
         int is_name = strcmp(resolv_cand[i], name) == 0 || (strlen(name) == strlen(resolv_cand[i]) + 1 && name[strlen(name) - 1] == '.');
         if (!is_name && done) continue;
-        long r = resolve_one(is_name ? name : resolv_cand[i], out, ns, nns, &opt);
+        long r = resolve_one(is_name ? name : resolv_cand[i], out, ns, nns, &opt, ans);
         if (r == 0) {
             if (found && found_cap) {
-                size_t k = strlen(resolv_cand[i]);
+                /* The canonical name of the answer (the end of its CNAME chain), else the name that was asked. */
+                const char *canon = resolv_cand[i];
+                if (ans && ans->len) canon = (const char *)ans->buf + 2 + 4 * ans->buf[0];
+                size_t k = strlen(canon);
                 if (k >= found_cap) k = found_cap - 1;
-                memcpy(found, resolv_cand[i], k);
+                memcpy(found, canon, k);
                 found[k] = 0;
             }
             return 0;
@@ -308,6 +321,30 @@ static int netdb_herr_of(long r) {
 
 long gethostbyname_ipv4(const char *name, uint8_t out[4]) {
     return gethostbyname_ipv4_name(name, out, (char *)0, 0);
+}
+
+size_t resolv_answer_unpack(const struct resolv_answer *ans, uint8_t addrs[][4], size_t cap, char *names, size_t names_cap) {
+    if (names && names_cap) names[0] = 0;
+    if (!ans || !ans->len) return 0;
+    size_t na = ans->buf[0], nal = ans->buf[1];
+    if (na == 0 || 2 + 4 * na >= ans->len) return 0;
+    for (size_t i = 0; i < na && i < cap; i++) memcpy(addrs[i], ans->buf + 2 + 4 * i, 4);
+    if (names && names_cap) {
+        /* "canonical alias alias ...": the canonical name, then the aliases in the order the chain met them. */
+        const char *p = (const char *)ans->buf + 2 + 4 * na;
+        const char *end = (const char *)ans->buf + ans->len;
+        size_t o = 0;
+        for (size_t k = 0; k <= nal && p < end; k++) {
+            size_t l = strnlen(p, (size_t)(end - p));
+            if (o + l + 2 > names_cap) break;
+            if (o) names[o++] = ' ';
+            memcpy(names + o, p, l);
+            o += l;
+            p += l + 1;
+        }
+        names[o] = 0;
+    }
+    return na < cap ? na : cap;
 }
 
 long ipv4_to_text(const uint8_t addr[4], char *buf, size_t buf_len) {
@@ -975,9 +1012,21 @@ static void lookup_name(const char *name, int af, char *hosts, size_t hosts_cap,
             ans->herr = HOST_NOT_FOUND; /* the kernel resolver has no AAAA records */
             return;
         } else {
-            /* The name that answered (a search domain may have been appended) is the canonical name (glibc, measured). */
+            /* The name that answered (a search domain may have been appended, and the end of a CNAME chain) is the canonical
+             * name, the names before it in the chain the aliases, and every address of the reply is listed (glibc, measured). */
             ans->name_store[0] = 0;
-            long r = gethostbyname_ipv4_name(name, ans->addrs[0], ans->name_store, HOSTENT_NAME_MAX);
+            struct resolv_answer ra;
+            long r = resolv_lookup(name, ans->addrs[0], ans->name_store, HOSTENT_NAME_MAX, &ra);
+            if (r == 0) {
+                uint8_t all[HOSTENT_ADDRS_MAX][4];
+                char chain[HOSTENT_NAME_MAX];
+                size_t k = resolv_answer_unpack(&ra, all, HOSTENT_ADDRS_MAX, chain, sizeof chain);
+                if (k) {
+                    for (size_t i = 0; i < k; i++) memcpy(ans->addrs[i], all[i], 4);
+                    memcpy(ans->name_store, chain, strlen(chain) + 1);
+                }
+                ans->naddrs = k ? k : 1;
+            }
             if (r == 0 && ans->name_store[0]) {
                 ans->names = ans->name_store;
                 ans->names_len = strlen(ans->name_store);
@@ -990,7 +1039,6 @@ static void lookup_name(const char *name, int af, char *hosts, size_t hosts_cap,
                 if (ans->herr == TRY_AGAIN) ans->rc = EAGAIN;
                 return;
             }
-            ans->naddrs = 1;
         }
     }
     if (!ans->names) {
@@ -1506,15 +1554,25 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
             /* The kernel resolver answers A records only. */
             if (family == AF_INET6 && !(flags & AI_V4MAPPED)) return EAI_NONAME;
             canon_buf[0] = 0;
-            long r = gethostbyname_ipv4_name(node, v4, canon_buf, sizeof canon_buf);
+            struct resolv_answer ra;
+            long r = resolv_lookup(node, v4, canon_buf, sizeof canon_buf, &ra);
             if (r < 0) {
                 int h = netdb_herr_of(r);
                 /* glibc (measured): NO_DATA is EAI_NODATA, NO_RECOVERY like HOST_NOT_FOUND is EAI_NONAME, TRY_AGAIN EAI_AGAIN. */
                 return h == NO_DATA ? EAI_NODATA : h == TRY_AGAIN ? EAI_AGAIN : EAI_NONAME;
             }
-            set_v4(&addrs[0], v4[0], v4[1], v4[2], v4[3]);
-            if (family == AF_INET6) map_v4(&addrs[0]);
-            naddrs = 1;
+            /* Every address of the reply, in its order (glibc, measured); canon_buf holds the end of the CNAME chain. */
+            uint8_t all[GAI_MAX_ADDRS][4];
+            size_t k = resolv_answer_unpack(&ra, all, GAI_MAX_ADDRS, (char *)0, 0);
+            if (k == 0) {
+                memcpy(all[0], v4, 4);
+                k = 1;
+            }
+            for (size_t i = 0; i < k; i++) {
+                set_v4(&addrs[i], all[i][0], all[i][1], all[i][2], all[i][3]);
+                if (family == AF_INET6) map_v4(&addrs[i]);
+            }
+            naddrs = k;
             names = (const char *)0;
             /* The name that answered (with a search domain, when one was appended) is the canonical name. */
             if (canon_buf[0]) {

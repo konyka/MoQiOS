@@ -4254,7 +4254,7 @@ test "dns query wait expires on TSC time or an iteration backstop, never on time
     try std.testing.expect(std.mem.indexOf(u8, body, "getTickCount") == null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, body, "dns_policy.waitExpiredAfter("));
     // dns_resolve and dns_resolve_via keep the 2 s limit.
-    try std.testing.expect(std.mem.indexOf(u8, src, "const r = queryCore(hostname, dns_server, dns_policy.QUERY_TIMEOUT_NS, yield);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const r = queryCore(hostname, dns_server, dns_policy.QUERY_TIMEOUT_NS, yield, &ans);") != null);
 }
 
 test "tcp receiver accepts no more payload than the window it advertised" {
@@ -18373,10 +18373,211 @@ test "dns_query (507): a reply's RCODE and answers decide the outcome, and the w
     // Wiring: the system call is 507; it checks the output, the server, the limit and the name before any wait, answers literals
     // and the static table first and never touches the shared cache; a reply with answers but no A record is NODATA.
     const se = kt.syscall_entry_source;
-    try std.testing.expect(std.mem.indexOf(u8, se, "507 => { // dns_query(name, out4, server4, timeout_ms)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "507 => { // dns_query(name, out4, server4, timeout_ms, ans, ans_len)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "if (ans_len != 0 and ans_len < 256) return -34; // ERANGE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "const n = da.encode(&ans, enc[0..@intCast(@min(ans_len, enc.len))]) orelse return -90; // EMSGSIZE") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "if (!dp.timeoutValid(timeout_ms)) return -22;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, se, "@import(\"../../net/dns.zig\").queryVia(hp.stripTrailingDot(name), server, timeout_ms * 1_000_000, dnsSleep)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "@import(\"../../net/dns.zig\").queryVia(hp.stripTrailingDot(name), server, timeout_ms * 1_000_000, dnsSleep, &ans)") != null);
     const dns = kt.dns_source;
-    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryVia(hostname: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield) Result {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, dns, "if (ip[0] == 0 and ip[1] == 0 and ip[2] == 0 and ip[3] == 0) return .{ .outcome = .nodata };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryVia(hostname: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {") != null);
+    // hello520: answers with no address for the name (only a CNAME, or records for other owners) are NO_RECOVERY in glibc, so the
+    // kernel reports them as `failed`; NODATA is only NOERROR without answers.
+    try std.testing.expect(std.mem.indexOf(u8, dns, "if (!dns_answer.parse(buf[0..@intCast(n)], hostname, ans)) return .{ .outcome = .failed };") != null);
+}
+
+test "dns_answer: CNAME chains, several A records and the canonical name, as glibc's getanswer_r reads them (hello520)" {
+    const da = kt.dns_answer;
+    const B = struct {
+        buf: [512]u8 = undefined,
+        n: usize = 0,
+        fn name(self: *@This(), text: []const u8) void {
+            var it = std.mem.splitScalar(u8, text, '.');
+            while (it.next()) |l| {
+                self.buf[self.n] = @intCast(l.len);
+                @memcpy(self.buf[self.n + 1 ..][0..l.len], l);
+                self.n += 1 + l.len;
+            }
+            self.buf[self.n] = 0;
+            self.n += 1;
+        }
+        fn u16be(self: *@This(), v: u16) void {
+            self.buf[self.n] = @intCast(v >> 8);
+            self.buf[self.n + 1] = @intCast(v & 0xff);
+            self.n += 2;
+        }
+        fn header(self: *@This(), q: []const u8, ancount: u16) void {
+            self.n = 0;
+            self.u16be(0x1234);
+            self.u16be(0x8180);
+            self.u16be(1);
+            self.u16be(ancount);
+            self.u16be(0);
+            self.u16be(0);
+            self.name(q);
+            self.u16be(1);
+            self.u16be(1);
+        }
+        fn rr(self: *@This(), owner: []const u8, t: u16, data: []const u8, is_name: bool) void {
+            self.name(owner);
+            self.u16be(t);
+            self.u16be(1);
+            self.u16be(0);
+            self.u16be(60);
+            if (is_name) {
+                const at = self.n;
+                self.n += 2;
+                const start = self.n;
+                self.name(data);
+                const l: u16 = @intCast(self.n - start);
+                self.buf[at] = @intCast(l >> 8);
+                self.buf[at + 1] = @intCast(l & 0xff);
+            } else {
+                self.u16be(@intCast(data.len));
+                @memcpy(self.buf[self.n..][0..data.len], data);
+                self.n += data.len;
+            }
+        }
+    };
+    var b: B = .{};
+    var a: da.Answer = .{};
+
+    // A plain answer: the queried name is canonical, no aliases.
+    b.header("i.test", 2);
+    b.rr("i.test", 1, &.{ 10, 9, 9, 4 }, false);
+    b.rr("i.test", 1, &.{ 10, 9, 9, 5 }, false);
+    try std.testing.expect(da.parse(b.buf[0..b.n], "i.test", &a));
+    try std.testing.expectEqual(@as(u8, 2), a.naddr);
+    try std.testing.expectEqual(@as(u8, 5), a.addrs[1][3]);
+    try std.testing.expectEqualStrings("i.test", a.canonName());
+    try std.testing.expectEqual(@as(u8, 0), a.nalias);
+
+    // a CNAME b, A of b: b is the canonical name, a an alias.
+    b.header("a.test", 2);
+    b.rr("a.test", 5, "b.test", true);
+    b.rr("b.test", 1, &.{ 10, 9, 9, 1 }, false);
+    try std.testing.expect(da.parse(b.buf[0..b.n], "a.test", &a));
+    try std.testing.expectEqual(@as(u8, 1), a.naddr);
+    try std.testing.expectEqualStrings("b.test", a.canonName());
+    try std.testing.expectEqual(@as(u8, 1), a.nalias);
+    try std.testing.expectEqualStrings("a.test", a.alias(0));
+
+    // A two-step chain keeps both earlier names as aliases, in order.
+    b.header("e.test", 3);
+    b.rr("e.test", 5, "f.test", true);
+    b.rr("f.test", 5, "g.test", true);
+    b.rr("g.test", 1, &.{ 10, 9, 9, 2 }, false);
+    try std.testing.expect(da.parse(b.buf[0..b.n], "e.test", &a));
+    try std.testing.expectEqualStrings("g.test", a.canonName());
+    try std.testing.expectEqual(@as(u8, 2), a.nalias);
+    try std.testing.expectEqualStrings("f.test", a.alias(1));
+
+    // Records for another owner are skipped; a CNAME with no address after it is no answer (NODATA).
+    b.header("h.test", 1);
+    b.rr("other.test", 1, &.{ 10, 9, 9, 3 }, false);
+    try std.testing.expect(!da.parse(b.buf[0..b.n], "h.test", &a));
+    b.header("c.test", 1);
+    b.rr("c.test", 5, "d.test", true);
+    try std.testing.expect(!da.parse(b.buf[0..b.n], "c.test", &a));
+
+    // Owners match without regard to case; the canonical name is spelled as the CNAME target is.
+    b.header("k.test", 2);
+    b.rr("k.test", 5, "L.Test", true);
+    b.rr("l.test", 1, &.{ 10, 9, 9, 8 }, false);
+    try std.testing.expect(da.parse(b.buf[0..b.n], "k.test", &a));
+    try std.testing.expectEqualStrings("L.Test", a.canonName());
+
+    // An A for the old name before the CNAME still counts; one after the switch does not.
+    b.header("m.test", 3);
+    b.rr("m.test", 1, &.{ 10, 9, 9, 9 }, false);
+    b.rr("m.test", 5, "n.test", true);
+    b.rr("n.test", 1, &.{ 10, 9, 9, 10 }, false);
+    try std.testing.expect(da.parse(b.buf[0..b.n], "m.test", &a));
+    try std.testing.expectEqual(@as(u8, 2), a.naddr);
+    try std.testing.expectEqualStrings("n.test", a.canonName());
+    b.header("o.test", 3);
+    b.rr("o.test", 5, "p.test", true);
+    b.rr("p.test", 1, &.{ 10, 9, 9, 11 }, false);
+    b.rr("o.test", 1, &.{ 10, 9, 9, 12 }, false);
+    try std.testing.expect(da.parse(b.buf[0..b.n], "o.test", &a));
+    try std.testing.expectEqual(@as(u8, 1), a.naddr);
+    try std.testing.expectEqual(@as(u8, 11), a.addrs[0][3]);
+
+    // Every CNAME moves the expected name on, whatever its owner, and the name it leaves becomes an alias (glibc 2.44, measured):
+    // s CNAME t, s CNAME u, A t, A u gives u with aliases s and t and only u's address; v6 CNAME t, zz CNAME u gives u too.
+    b.header("s.test", 4);
+    b.rr("s.test", 5, "t.test", true);
+    b.rr("s.test", 5, "u.test", true);
+    b.rr("t.test", 1, &.{ 10, 9, 9, 13 }, false);
+    b.rr("u.test", 1, &.{ 10, 9, 9, 14 }, false);
+    try std.testing.expect(da.parse(b.buf[0..b.n], "s.test", &a));
+    try std.testing.expectEqualStrings("u.test", a.canonName());
+    try std.testing.expectEqual(@as(u8, 2), a.nalias);
+    try std.testing.expectEqualStrings("s.test", a.alias(0));
+    try std.testing.expectEqualStrings("t.test", a.alias(1));
+    try std.testing.expectEqual(@as(u8, 1), a.naddr);
+    try std.testing.expectEqual(@as(u8, 14), a.addrs[0][3]);
+    b.header("v6.test", 4);
+    b.rr("v6.test", 5, "t.test", true);
+    b.rr("zz.test", 5, "u.test", true);
+    b.rr("u.test", 1, &.{ 10, 9, 9, 28 }, false);
+    b.rr("t.test", 1, &.{ 10, 9, 9, 29 }, false);
+    try std.testing.expect(da.parse(b.buf[0..b.n], "v6.test", &a));
+    try std.testing.expectEqualStrings("u.test", a.canonName());
+    try std.testing.expectEqual(@as(u8, 28), a.addrs[0][3]);
+    try std.testing.expectEqual(@as(u8, 1), a.naddr);
+    // A CNAME for an unrelated name before the A: the A for the queried name no longer counts (v2 in the measurement).
+    b.header("v2.test", 2);
+    b.rr("x.test", 5, "y.test", true);
+    b.rr("v2.test", 1, &.{ 10, 9, 9, 23 }, false);
+    try std.testing.expect(!da.parse(b.buf[0..b.n], "v2.test", &a));
+
+    // A CNAME to itself makes no progress and yields no address.
+    b.header("q.test", 1);
+    b.rr("q.test", 5, "q.test", true);
+    try std.testing.expect(!da.parse(b.buf[0..b.n], "q.test", &a));
+
+    // At most MAX_ADDRS addresses are kept.
+    b.header("r.test", 20);
+    for (0..20) |i| b.rr("r.test", 1, &.{ 10, 9, 9, @intCast(i + 1) }, false);
+    try std.testing.expect(da.parse(b.buf[0..b.n], "r.test", &a));
+    try std.testing.expectEqual(@as(u8, da.MAX_ADDRS), a.naddr);
+
+    // Compression pointers in owners and CNAME targets; a pointer loop or a truncated record is no answer.
+    var c = [_]u8{ 0x12, 0x34, 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0 } ++
+        [_]u8{ 1, 'a', 4, 't', 'e', 's', 't', 0, 0, 1, 0, 1 } ++
+        [_]u8{ 0xc0, 12, 0, 5, 0, 1, 0, 0, 0, 60, 0, 4, 1, 'b', 0xc0, 14 } ++
+        [_]u8{ 0xc0, 36, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 10, 9, 9, 1 };
+    try std.testing.expect(da.parse(&c, "a.test", &a));
+    try std.testing.expectEqualStrings("b.test", a.canonName());
+    // The CNAME target at offset 36 becomes a pointer to itself: a loop, which ends the parse with no address.
+    c[36] = 0xc0;
+    c[37] = 36;
+    try std.testing.expect(!da.parse(&c, "a.test", &a));
+    try std.testing.expect(!da.parse(c[0..30], "a.test", &a));
+    try std.testing.expect(!da.parse(c[0..5], "a.test", &a));
+
+    // The form dns_query (507) hands to user space: address count, alias count, the addresses, then the canonical name and each
+    // alias NUL-terminated. A buffer that cannot hold it all is refused (null).
+    b.header("e.test", 4);
+    b.rr("e.test", 5, "f.test", true);
+    b.rr("f.test", 5, "g.test", true);
+    b.rr("g.test", 1, &.{ 10, 9, 9, 2 }, false);
+    b.rr("g.test", 1, &.{ 10, 9, 9, 3 }, false);
+    try std.testing.expect(da.parse(b.buf[0..b.n], "e.test", &a));
+    var out: [64]u8 = undefined;
+    const n = da.encode(&a, &out) orelse return error.TestUnexpectedResult;
+    const want = [_]u8{ 2, 2, 10, 9, 9, 2, 10, 9, 9, 3 } ++ "g.test".* ++ [_]u8{0} ++ "e.test".* ++ [_]u8{0} ++ "f.test".* ++ [_]u8{0};
+    try std.testing.expectEqualSlices(u8, &want, out[0..n]);
+    try std.testing.expect(da.encode(&a, out[0 .. want.len - 1]) == null);
+    try std.testing.expect(da.encode(&a, out[0..want.len]) != null);
+}
+
+test "every kernel DNS query sends from a port of its own, so queries at the same time do not take each other's replies (hello520 I)" {
+    const d = kt.dns_source;
+    try std.testing.expect(std.mem.indexOf(u8, d, "12345") == null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "const src_port = udp.reserveEphemeral() orelse {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "defer udp.releasePort(src_port);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "const n = udp.recvFrom(src_port, &buf, @intCast(buf.len), &from_ip, &from_port);") != null);
+    const u = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, u, "pub fn reserveEphemeral() ?u16 {") != null);
 }

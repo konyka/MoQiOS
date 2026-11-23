@@ -2612,8 +2612,8 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         506 => { // dns_resolve_via(name, out4, server4) — the same through a caller-named nameserver (/etc/resolv.conf)
             frame.rax = @bitCast(syscallDnsResolveVia(frame.rdi, frame.rsi, frame.rdx));
         },
-        507 => { // dns_query(name, out4, server4, timeout_ms) — one query to one server, and how it ended (a resolver in libc)
-            frame.rax = @bitCast(syscallDnsQuery(frame.rdi, frame.rsi, frame.rdx, frame.r10));
+        507 => { // dns_query(name, out4, server4, timeout_ms, ans, ans_len) — one query to one server, and how it ended (a resolver in libc)
+            frame.rax = @bitCast(syscallDnsQuery(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
         },
         494 => { // pselect6(nfds, readfds, writefds, exceptfds, timespec, {sigmask, size})
             frame.rax = @bitCast(select_mod.pselect6(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
@@ -6670,8 +6670,10 @@ fn syscallDnsResolveVia(name_ptr: u64, out_ptr: u64, server_ptr: u64) i64 {
 /// on an answer; -ENOENT for NXDOMAIN, -ENODATA for a name without an A record, -EAGAIN for SERVFAIL, -ECONNREFUSED for
 /// NOTIMP/REFUSED (both: ask the next server), -EPROTO for another error RCODE, -ETIMEDOUT for no reply, -EINTR when a signal ends the wait. The argument
 /// checks are dns_resolve_via's, plus EINVAL for a limit out of range. Literals and the static table answer at once; the
-/// shared cache is not used.
-fn syscallDnsQuery(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_ms: u64) i64 {
+/// shared cache is not used. With a nonzero `ans_len`, `ans` receives the whole answer on success (dns_answer.encode: the
+/// addresses, the canonical name and the CNAME aliases); -ERANGE (before any query) when ans_len is under 256 bytes, -EMSGSIZE
+/// when the answer does not fit.
+fn syscallDnsQuery(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_ms: u64, ans_ptr: u64, ans_len: u64) i64 {
     const copy = @import("../../mm/copy_from_user.zig");
     const hp = @import("../../net/hostname_policy.zig");
     const dp = @import("../../net/dns_policy.zig");
@@ -6680,6 +6682,8 @@ fn syscallDnsQuery(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_ms: u64
     if (copy.copyFromUser(&server, @ptrFromInt(server_ptr), 4) != 4) return -14;
     if (!dp.serverUsable(server)) return -22;
     if (!dp.timeoutValid(timeout_ms)) return -22;
+    if (ans_len != 0 and ans_len < 256) return -34; // ERANGE
+    if (ans_len != 0 and !copy.validateUserBufferWritable(ans_ptr, @intCast(@min(ans_len, 4096)))) return -14;
     var buf: [256]u8 = undefined;
     const name = switch (userPathResult(name_ptr, &buf)) {
         .ok => |n| n,
@@ -6691,9 +6695,16 @@ fn syscallDnsQuery(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_ms: u64
         .too_long => return -36, // ENAMETOOLONG
         .invalid => return -22, // EINVAL
     }
-    const r = @import("../../net/dns.zig").queryVia(hp.stripTrailingDot(name), server, timeout_ms * 1_000_000, dnsSleep);
+    const da = @import("../../net/dns_answer.zig");
+    var ans: da.Answer = .{};
+    const r = @import("../../net/dns.zig").queryVia(hp.stripTrailingDot(name), server, timeout_ms * 1_000_000, dnsSleep, &ans);
     if (r.outcome != .answer) return dp.queryResult(r.outcome);
     if (copy.copyToUser(@ptrFromInt(out_ptr), &r.ip, 4) != 4) return -14;
+    if (ans_len != 0) {
+        var enc: [4096]u8 = undefined;
+        const n = da.encode(&ans, enc[0..@intCast(@min(ans_len, enc.len))]) orelse return -90; // EMSGSIZE
+        if (copy.copyToUser(@ptrFromInt(ans_ptr), enc[0..n], n) != n) return -14;
+    }
     return 0;
 }
 

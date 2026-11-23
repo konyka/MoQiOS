@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello519`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello520`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -492,6 +492,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello495 | net.ipv4.ip_local_reserved_ports：写入并读回 52000,52002-52004，保留端口仍可显式 bind（B）；限制自动范围为 52000–52010 后 UDP/TCP 都分到未保留端口（C、D）；倒置范围和 65536 为 EINVAL 且不改值（E）；换行清空（F），最后恢复两个 sysctl（G） |
 | hello496 | TCP ICMP 差错的 IP_MINTTL / IPV6_MINHOPCOUNT：阈值 2、连接保持 SYN_SENT 时，低于阈值的 host-unreachable 被忽略，达到阈值才报告 EHOSTUNREACH；IPv4 改变被引用报文的 TTL（A），IPv6 改变 ICMPv6 外层 hop limit（B），与 Linux 两条错误路径的实际数据来源一致 |
 | hello498 | clone 的 CLONE_SIGHAND / CLONE_FS：不带 CLONE_VM 的 CLONE_SIGHAND、不带 CLONE_SIGHAND 的 CLONE_THREAD 为 EINVAL（A）；CLONE_VM\|FS\|FILES\|SIGHAND\|THREAD 线程看到创建者之后的 chdir 和 sigaction（B），创建者也看到线程的修改（C） |
+| hello520 | CNAME 链与多个地址（与 glibc 2.44 `getanswer_r` 实测相同）：本机 DNS 服务器按固定表应答；`a.test CNAME b.test` 时 `h_name` 为 `b.test`、`h_aliases` 为 `a.test`（A）；两级链 e→f→g 的别名为 e、f（B）；两个 A 记录都在 `h_addr_list`，按应答顺序（C）；`getaddrinfo` 的 `ai_canonname` 是链的终点，每个地址一项（D）；只有 CNAME、没有地址，或 A 记录属于别的名字，为 `NO_RECOVERY`/`EAI_NONAME`（E）；名字比较不分大小写，规范名保留 CNAME 目标的写法（F）；CNAME 之后旧名字的 A 记录不再算（G）；两个线程同时用 `gethostbyname_r` 解析不同的 CNAME 名字，各自得到自己的结果（I） |
 | hello519 | `/etc/resolv.conf` 的 `options timeout`、`attempts` 和应答码（与 glibc 实测相同）：127.0.0.1、127.0.0.2 上两个本机 DNS 服务器，第一个按名字里的标记不应答或回 SERVFAIL/REFUSED/FORMERR/NODATA/NXDOMAIN，第二个都回答；`timeout:1 attempts:3` 下不应答的服务器被问 3 次、约 3 秒后 `TRY_AGAIN`（A）；第一个不应答时约 1 秒后第二个回答（B）；SERVFAIL、REFUSED 立即换到第二个（C）；NXDOMAIN、NODATA、FORMERR 只问第一个，分别是 `HOST_NOT_FOUND`、`NO_DATA`、`NO_RECOVERY`（D）；`getaddrinfo` 的 NODATA 为 `EAI_NODATA`，不应答为 `EAI_AGAIN`（E）；搜索域回 REFUSED 时停止域名列表，但仍问原名（F） |
 | hello518 | `/etc/resolv.conf` 的 `search`、`domain`、`options ndots`（与 glibc `res_search` 实测相同）：本机 DNS 服务器只认 `x518.b.test` 等名字并记录每个查询；`search a518.test b.test` 下 `gethostbyname("x518")` 先问 `x518.a518.test` 再问 `x518.b.test`，`h_name` 为后者（A）；带点的名字先按原样问（B）；尾部带点只问它本身（C）；`ndots:2` 让一点的名字先加域名（D）；`domain` 是只有一项的搜索列表（E）；`getaddrinfo` 的 `AI_CANONNAME` 报告应答的名字（F）；点分地址不搜索，谁都不认识的名字每个域都问一遍、再问原名，失败（G/H） |
 | hello517 | `writev`/`pwritev`/`pwritev2` 的源不可读：普通文件 `writev` 的 {可读 8, 坏地址 8} 写 8、{坏, 可读} 为 `EFAULT`（不是 0）、iovec 跨进空洞写到空洞前（A）；`pwritev` 相同（B）；`pwritev2` 偏移 0 与 -1 相同（E）；管道 `writev` 只收空洞前的整页：{可读 8, 坏 8} 和 {坏, 可读} 都是 `EFAULT`，{可读一页, 坏 8} 收 4096（C）；`readv`/`preadv` 先读进可读的那个，第一个坏为 `EFAULT`（D）；整个 iovec 数组先检查：基址为 NULL 不跳过（到它时 `EFAULT`）、基址在用户空间之外为 `EFAULT`、长度为负为 `EINVAL`、0 个 iovec 返回 0（F） |
