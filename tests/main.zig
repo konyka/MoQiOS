@@ -2034,7 +2034,7 @@ test "dns: the wait for a reply gives the CPU away, so a server on the same CPU 
     try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn resolveVia(hostname: []const u8, server: [4]u8, yield: Yield) [4]u8 {") != null);
     try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn resolveYield(hostname: []const u8, yield: Yield) [4]u8 {") != null);
     // Both waits (sending through ARP, and the reply) yield, and a fatal/handled signal during the sleep ends the query.
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, dns, "if (yield) |y| (if (!y()) return .{ 0, 0, 0, 0 }) else cpu.pause();"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, dns, "if (yield) |y| (if (!y()) return .{ .outcome = .interrupted }) else cpu.pause();"));
     const se = kt.syscall_entry_source;
     try std.testing.expect(std.mem.indexOf(u8, se, "@import(\"../../net/dns.zig\").resolveYield(hp.stripTrailingDot(name), dnsSleep)") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "@import(\"../../net/dns.zig\").resolveVia(hp.stripTrailingDot(name), server, dnsSleep)") != null);
@@ -2055,7 +2055,7 @@ test "dns: a reply that answers the query ends the wait, also when it says there
     try std.testing.expectEqual(dp.Verdict.ignore, dp.verdict(0x0100, 1)); // a query, not a response
     // The wait loop stops on either verdict.
     const dns = kt.dns_source;
-    try std.testing.expect(std.mem.indexOf(u8, dns, "if (dns_policy.verdict(bo.readU16BeAt(&buf, 2), bo.readU16BeAt(&buf, 6)) == .no_address) return .{ 0, 0, 0, 0 };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "const o = dns_policy.classify(bo.readU16BeAt(&buf, 2), bo.readU16BeAt(&buf, 6));\n            if (o != .ignore) {\n                if (o != .answer) return .{ .outcome = o };") != null);
 }
 
 test "dns_resolve_via: a caller-chosen nameserver, and the shared cache stays out of it (hello514)" {
@@ -2092,7 +2092,7 @@ test "dns_resolve_via: a caller-chosen nameserver, and the shared cache stays ou
     try std.testing.expect(std.mem.indexOf(u8, rv_body, "lookupCache(") == null);
     try std.testing.expect(std.mem.indexOf(u8, rv_body, "return queryDnsCache(hostname, server, false, yield);") != null);
     // queryDns keeps caching for the default path only.
-    try std.testing.expect(std.mem.indexOf(u8, dns, "if (cache_result) addToCache(hostname, result, 300);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "if (cache_result) addToCache(hostname, r.ip, 300);") != null);
 }
 
 test "setitimer: Linux validation, saturating arithmetic, and the check order" {
@@ -4249,10 +4249,12 @@ test "dns query wait expires on TSC time or an iteration backstop, never on time
     try std.testing.expect(dp.waitExpired(std.math.maxInt(u64) - 5, 10 + dp.QUERY_TIMEOUT_NS, 0));
     // Wiring: neither wait loop in queryDns consults the tick counter any more.
     const src = kt.dns_source;
-    const q = std.mem.indexOf(u8, src, "fn queryDns(") orelse return error.TestUnexpectedResult;
+    const q = std.mem.indexOf(u8, src, "fn queryCore(") orelse return error.TestUnexpectedResult;
     const body = src[q .. q + 5000];
     try std.testing.expect(std.mem.indexOf(u8, body, "getTickCount") == null);
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, body, "dns_policy.waitExpired("));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, body, "dns_policy.waitExpiredAfter("));
+    // dns_resolve and dns_resolve_via keep the 2 s limit.
+    try std.testing.expect(std.mem.indexOf(u8, src, "const r = queryCore(hostname, dns_server, dns_policy.QUERY_TIMEOUT_NS, yield);") != null);
 }
 
 test "tcp receiver accepts no more payload than the window it advertised" {
@@ -18328,4 +18330,53 @@ test "the kernel resolver takes names up to 253 characters, not 63, so a search 
     try std.testing.expect(std.mem.indexOf(u8, d, "const MAX_NAME: usize = @import(\"hostname_policy.zig\").MAX_NAME;") != null);
     try std.testing.expect(std.mem.indexOf(u8, d, "    name: [MAX_NAME]u8,") != null);
     try std.testing.expectEqual(@as(usize, 253), kt.hostname_policy.MAX_NAME);
+}
+
+test "dns_query (507): a reply's RCODE and answers decide the outcome, and the wait has a caller-chosen limit (hello519)" {
+    const dp = kt.dns_policy;
+    // RFC 1035 4.1.1, and what glibc's res_send/res_search do with each (measured): NOERROR with an address answers; NOERROR
+    // without one is NODATA; NXDOMAIN (3) is "no such name"; SERVFAIL (2), NOTIMP (4) and REFUSED (5) send the resolver on to the
+    // next server, and SERVFAIL also lets a search list go on to the next domain while NOTIMP/REFUSED stop it; any other RCODE
+    // (FORMERR 1, 6..15) ends the query for that name.
+    try std.testing.expectEqual(dp.Outcome.answer, dp.classify(0x8180, 1));
+    try std.testing.expectEqual(dp.Outcome.nodata, dp.classify(0x8180, 0));
+    try std.testing.expectEqual(dp.Outcome.nxdomain, dp.classify(0x8183, 0));
+    try std.testing.expectEqual(dp.Outcome.nxdomain, dp.classify(0x8183, 2));
+    try std.testing.expectEqual(dp.Outcome.next_server, dp.classify(0x8182, 0));
+    try std.testing.expectEqual(dp.Outcome.refused, dp.classify(0x8184, 0));
+    try std.testing.expectEqual(dp.Outcome.refused, dp.classify(0x8185, 0));
+    try std.testing.expectEqual(dp.Outcome.failed, dp.classify(0x8181, 0));
+    try std.testing.expectEqual(dp.Outcome.failed, dp.classify(0x8189, 1));
+    try std.testing.expectEqual(dp.Outcome.failed, dp.classify(0x818f, 0));
+    try std.testing.expectEqual(dp.Outcome.ignore, dp.classify(0x0100, 1));
+    // The system call's result for each: 0, -ENOENT, -ENODATA, -EAGAIN, -ECONNREFUSED, -EPROTO, -ETIMEDOUT, -EINTR.
+    try std.testing.expectEqual(@as(i64, 0), dp.queryResult(.answer));
+    try std.testing.expectEqual(@as(i64, -2), dp.queryResult(.nxdomain));
+    try std.testing.expectEqual(@as(i64, -61), dp.queryResult(.nodata));
+    try std.testing.expectEqual(@as(i64, -11), dp.queryResult(.next_server));
+    try std.testing.expectEqual(@as(i64, -111), dp.queryResult(.refused));
+    try std.testing.expectEqual(@as(i64, -71), dp.queryResult(.failed));
+    try std.testing.expectEqual(@as(i64, -110), dp.queryResult(.timeout));
+    try std.testing.expectEqual(@as(i64, -4), dp.queryResult(.interrupted));
+    // The limit: 1 ms to 60 s (glibc's longest single wait is 40 s: options timeout is at most 30 s, and the third of three
+    // servers waits (30 << 2) / 3); anything else is EINVAL.
+    try std.testing.expect(dp.timeoutValid(1));
+    try std.testing.expect(dp.timeoutValid(40_000));
+    try std.testing.expect(dp.timeoutValid(60_000));
+    try std.testing.expect(!dp.timeoutValid(0));
+    try std.testing.expect(!dp.timeoutValid(60_001));
+    try std.testing.expect(!dp.waitExpiredAfter(1_000, 1_000 + 999_999, 5, 1_000_000));
+    try std.testing.expect(dp.waitExpiredAfter(1_000, 1_000 + 1_000_000, 5, 1_000_000));
+    try std.testing.expect(dp.waitExpiredAfter(0, 0, dp.MAX_POLL_ITERS, 30_000_000_000));
+    // The old wait is the same rule with the 2 s limit.
+    try std.testing.expect(std.mem.indexOf(u8, kt.dns_policy_source, "return waitExpiredAfter(start_ns, now_ns, iters, QUERY_TIMEOUT_NS);") != null);
+    // Wiring: the system call is 507; it checks the output, the server, the limit and the name before any wait, answers literals
+    // and the static table first and never touches the shared cache; a reply with answers but no A record is NODATA.
+    const se = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, se, "507 => { // dns_query(name, out4, server4, timeout_ms)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "if (!dp.timeoutValid(timeout_ms)) return -22;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "@import(\"../../net/dns.zig\").queryVia(hp.stripTrailingDot(name), server, timeout_ms * 1_000_000, dnsSleep)") != null);
+    const dns = kt.dns_source;
+    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryVia(hostname: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield) Result {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "if (ip[0] == 0 and ip[1] == 0 and ip[2] == 0 and ip[3] == 0) return .{ .outcome = .nodata };") != null);
 }

@@ -128,6 +128,27 @@ fn queryDns(hostname: []const u8, dns_server: [4]u8, yield: Yield) [4]u8 {
 
 /// Send a DNS query and wait for response, caching the answer only when `cache_result`.
 fn queryDnsCache(hostname: []const u8, dns_server: [4]u8, cache_result: bool, yield: Yield) [4]u8 {
+    const r = queryCore(hostname, dns_server, dns_policy.QUERY_TIMEOUT_NS, yield);
+    if (r.outcome != .answer) return .{ 0, 0, 0, 0 };
+    // Default TTL 5 minutes.
+    if (cache_result) addToCache(hostname, r.ip, 300);
+    return r.ip;
+}
+
+/// How one query ended, with the address when it answered.
+pub const Result = struct { outcome: dns_policy.Outcome, ip: [4]u8 = .{ 0, 0, 0, 0 } };
+
+/// One query for `hostname` to `server`, waiting at most `timeout_ns` (dns_query, 507): what the reply said, for a resolver in
+/// user space that applies resolv.conf's timeout, attempts and server order itself. Literals and the static table answer
+/// first, as in resolveVia; the shared cache is neither read nor written.
+pub fn queryVia(hostname: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield) Result {
+    if (hostname.len == 0 or hostname.len > MAX_NAME) return .{ .outcome = .nxdomain };
+    if (@import("static_hosts.zig").lookup(hostname)) |ip| return .{ .outcome = .answer, .ip = ip };
+    if (isIpV4(hostname)) return .{ .outcome = .answer, .ip = parseIpV4(hostname) };
+    return queryCore(hostname, server, timeout_ns, yield);
+}
+
+fn queryCore(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yield) Result {
     var pkt: [512]u8 = @splat(0);
     var offset: usize = 0;
 
@@ -135,7 +156,7 @@ fn queryDnsCache(hostname: []const u8, dns_server: [4]u8, cache_result: bool, yi
     // response before recvFrom can ever see it.
     if (udp.ensurePort(12345) == 0xFFFF) {
         serial.writeString("[DNS] Failed to register reply port\n");
-        return .{ 0, 0, 0, 0 };
+        return .{ .outcome = .failed };
     }
     defer udp.releasePort(12345);
 
@@ -163,21 +184,21 @@ fn queryDnsCache(hostname: []const u8, dns_server: [4]u8, cache_result: bool, yi
     const send_start = tsc.nanos();
     var send_iters: u32 = 0;
     var sent = false;
-    while (!sent and !dns_policy.waitExpired(send_start, tsc.nanos(), send_iters)) : (send_iters += 1) {
+    while (!sent and !dns_policy.waitExpiredAfter(send_start, tsc.nanos(), send_iters, timeout_ns)) : (send_iters += 1) {
         sent = udp.sendTo(dns_server, DNS_PORT, 12345, &pkt, @intCast(offset));
         if (sent) break;
         pumpRx();
-        if (yield) |y| (if (!y()) return .{ 0, 0, 0, 0 }) else cpu.pause();
+        if (yield) |y| (if (!y()) return .{ .outcome = .interrupted }) else cpu.pause();
     }
     if (!sent) {
         serial.writeString("[DNS] Failed to send query\n");
-        return .{ 0, 0, 0, 0 };
+        return .{ .outcome = .timeout };
     }
 
     // Wait for response
     const start = tsc.nanos();
     var wait_iters: u32 = 0;
-    while (!dns_policy.waitExpired(start, tsc.nanos(), wait_iters)) : (wait_iters += 1) {
+    while (!dns_policy.waitExpiredAfter(start, tsc.nanos(), wait_iters, timeout_ns)) : (wait_iters += 1) {
         pumpRx(); // replies only reach the UDP queue when the NIC is polled
         var buf: [512]u8 = @splat(0);
         var src_ip: [4]u8 = .{ 0, 0, 0, 0 };
@@ -185,23 +206,23 @@ fn queryDnsCache(hostname: []const u8, dns_server: [4]u8, cache_result: bool, yi
 
         const n = udp.recvFrom(12345, &buf, @intCast(buf.len), &src_ip, &src_port);
         if (n >= 12 and dns_policy.acceptResponse(src_ip, src_port, dns_server, bo.readU16BeAt(&buf, 0), query_id)) {
-            // An error reply (NXDOMAIN, SERVFAIL, ...) or one with no answers settles the query: no address, without waiting
-            // out the timeout for a reply that will not come.
-            if (dns_policy.verdict(bo.readU16BeAt(&buf, 2), bo.readU16BeAt(&buf, 6)) == .no_address) return .{ 0, 0, 0, 0 };
-            const result = parseResponse(&buf, @intCast(n), query_id);
-            if (result[0] != 0 or result[1] != 0 or result[2] != 0 or result[3] != 0) {
-                // Default TTL 5 minutes.
-                if (cache_result) addToCache(hostname, result, 300);
-                return result;
+            // Any reply settles the query, without waiting out the limit for another: an error RCODE (NXDOMAIN, SERVFAIL, ...), a
+            // reply with no answers, or answers with no A record among them (NODATA).
+            const o = dns_policy.classify(bo.readU16BeAt(&buf, 2), bo.readU16BeAt(&buf, 6));
+            if (o != .ignore) {
+                if (o != .answer) return .{ .outcome = o };
+                const ip = parseResponse(&buf, @intCast(n), query_id);
+                if (ip[0] == 0 and ip[1] == 0 and ip[2] == 0 and ip[3] == 0) return .{ .outcome = .nodata };
+                return .{ .outcome = .answer, .ip = ip };
             }
         }
-        if (yield) |y| (if (!y()) return .{ 0, 0, 0, 0 }) else cpu.pause();
+        if (yield) |y| (if (!y()) return .{ .outcome = .interrupted }) else cpu.pause();
     }
 
     serial.writeString("[DNS] Query timeout for ");
     serial.writeString(hostname);
     serial.writeString("\n");
-    return .{ 0, 0, 0, 0 };
+    return .{ .outcome = .timeout };
 }
 
 /// Drain pending NIC RX frames into the network stack so replies reach the

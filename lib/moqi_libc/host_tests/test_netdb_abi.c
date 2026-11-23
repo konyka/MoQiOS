@@ -26,6 +26,45 @@ long moqi_test_syscall2(long nr, long a1, long a2) {
     return moqi_test_reply;
 }
 
+/* /etc/resolv.conf for netdb.c (NULL: no file), and dns_query (507) replies from a script: each call takes the next entry,
+ * logging the name, server's last octet and limit. A reply of 0 writes 10.0.0.<call number>. */
+const char *moqi_test_resolv_conf;
+static long q_reply[32];
+static int q_n, q_calls;
+static char q_log[2048];
+long moqi_test_syscall4(long nr, long a1, long a2, long a3, long a4) {
+    long r = nr == SYS_dns_query && q_calls < q_n ? q_reply[q_calls] : -38;
+    q_calls++;
+    size_t l = strlen(q_log);
+    const char *name = (const char *)a1;
+    const unsigned char *srv = (const unsigned char *)a3;
+    size_t k = strlen(name);
+    if (l + k + 16 < sizeof q_log) {
+        memcpy(q_log + l, name, k);
+        l += k;
+        q_log[l++] = '@';
+        q_log[l++] = (char)('0' + srv[3] % 10);
+        q_log[l++] = '/';
+        long ms = a4 / 1000;
+        if (ms >= 10) q_log[l++] = (char)('0' + ms / 10 % 10);
+        q_log[l++] = (char)('0' + ms % 10);
+        q_log[l++] = ';';
+        q_log[l] = 0;
+    }
+    if (r == 0) {
+        unsigned char *out = (unsigned char *)a2;
+        out[0] = 10; out[1] = 0; out[2] = 0; out[3] = (unsigned char)q_calls;
+    }
+    return r;
+}
+static void q_script(const char *conf, const long *replies, int n) {
+    moqi_test_resolv_conf = conf;
+    for (int i = 0; i < n; i++) q_reply[i] = replies[i];
+    q_n = n;
+    q_calls = 0;
+    q_log[0] = 0;
+}
+
 /* getaddrinfo allocates through malloc/free; the host test links only netdb.o, so it supplies a counting bump
  * allocator. (It cannot forward to the host malloc: with -fno-builtin that would call back into this function.) */
 #include <stdlib.h>
@@ -639,7 +678,7 @@ int main(void) {
         static const char nbig[] = "search a.test\noptions ndots:20\n";
         k = resolv_conf_candidates(nbig, sizeof nbig - 1, "a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p", c, 8);
         assert(k == 2 && strcmp(c[0], "a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p") == 0);
-        /* A domain that would make the name longer than 253 characters is skipped. */
+        /* A domain that would make the name longer than 253 characters ends the list: later domains are not asked (glibc). */
         char longconf[400];
         strcpy(longconf, "search ");
         for (int i = 0; i < 4; i++) {
@@ -648,6 +687,9 @@ int main(void) {
         }
         strcat(longconf, ".aaaaaaaaaa s.test\n"); /* a 254-character domain */
         k = resolv_conf_candidates(longconf, strlen(longconf), "x", c, 8);
+        assert(k == 1 && strcmp(c[0], "x") == 0);
+        static const char before[] = "search s.test d.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa t.test\n";
+        k = resolv_conf_candidates(before, sizeof before - 1, "x", c, 8);
         assert(k == 2 && strcmp(c[0], "x.s.test") == 0 && strcmp(c[1], "x") == 0);
         /* At the limit (measured): a 250-character domain takes "xx" (253) but not "xxx" (254). A label over 63 is skipped. */
         char edge[300] = "search ";
@@ -662,9 +704,123 @@ int main(void) {
         for (int i = 0; i < 64; i++) lab64[e++] = 'q';
         strcpy(lab64 + e, " s.test\n");
         k = resolv_conf_candidates(lab64, strlen(lab64), "x", c, 8);
-        assert(k == 2 && strcmp(c[0], "x.s.test") == 0);
+        assert(k == 1 && strcmp(c[0], "x") == 0);
         assert(resolv_conf_candidates(ab, sizeof ab - 1, (const char *)0, c, 8) == 0);
         assert(resolv_conf_candidates(ab, sizeof ab - 1, "", c, 8) == 0);
+    }
+
+    /* resolv.conf timeout and attempts, and what each reply means (glibc res_send/res_search, measured). Replies: 0 an address,
+     * -2 NXDOMAIN, -61 NODATA, -11 SERVFAIL, -111 NOTIMP/REFUSED, -71 another RCODE, -110 no reply. */
+    {
+        uint8_t a4[4];
+        static const char three[] = "nameserver 10.0.0.1\nnameserver 10.0.0.2\nnameserver 10.0.0.3\noptions timeout:2 attempts:2\n";
+        static const long silent6[] = {-110, -110, -110, -110, -110, -110};
+        q_script(three, silent6, 6);
+        /* Rounds over the servers; server i waits (timeout << i) / nservers seconds: 2, 1 (4/3), 2 (8/3). */
+        assert(gethostbyname_ipv4("x.y", a4) == -110);
+        assert(strcmp(q_log, "x.y@1/2;x.y@2/1;x.y@3/2;x.y@1/2;x.y@2/1;x.y@3/2;") == 0);
+        static const long late[] = {-110, -110, 0};
+        q_script(three, late, 3);
+        assert(gethostbyname_ipv4("x.y", a4) == 0 && a4[3] == 3 && q_calls == 3);
+        /* SERVFAIL and REFUSED move on to the next server; NXDOMAIN, NODATA and an address end the query. */
+        static const long sf[] = {-11, -111, 0};
+        q_script(three, sf, 3);
+        assert(gethostbyname_ipv4("x.y", a4) == 0 && q_calls == 3);
+        static const long nx[] = {-11, -2};
+        q_script(three, nx, 2);
+        assert(gethostbyname_ipv4("x.y", a4) == -2 && q_calls == 2);
+        static const long nd[] = {-61};
+        q_script(three, nd, 1);
+        assert(gethostbyname_ipv4("x.y", a4) == -61 && q_calls == 1);
+        static const long fe[] = {-71};
+        q_script(three, fe, 1);
+        assert(gethostbyname_ipv4("x.y", a4) == -71 && q_calls == 1);
+        /* Every server failing: EAGAIN when any replied with a server error, ETIMEDOUT when none replied. */
+        static const long sfall[] = {-11, -110, -110, -110, -110, -110};
+        q_script(three, sfall, 6);
+        assert(gethostbyname_ipv4("x.y", a4) == -11 && q_calls == 6);
+        /* Defaults: timeout 5, attempts 2. One server waits 5 s each time. */
+        static const long two[] = {-110, -110};
+        q_script("nameserver 10.0.0.1\n", two, 2);
+        assert(gethostbyname_ipv4("x.y", a4) == -110 && strcmp(q_log, "x.y@1/5;x.y@1/5;") == 0);
+        /* Limits: attempts at most 5, 0 asks nobody; timeout at most 30, 0 is the 1 s minimum. */
+        static const long many[] = {-110, -110, -110, -110, -110, -110, -110, -110};
+        q_script("nameserver 10.0.0.1\noptions attempts:9 timeout:99\n", many, 8);
+        assert(gethostbyname_ipv4("x.y", a4) == -110 && q_calls == 5 && strncmp(q_log, "x.y@1/30;", 9) == 0);
+        q_script("nameserver 10.0.0.1\noptions attempts:0\n", many, 8);
+        assert(gethostbyname_ipv4("x.y", a4) == -110 && q_calls == 0);
+        q_script("nameserver 10.0.0.1\noptions timeout:0 attempts:1\n", many, 8);
+        assert(gethostbyname_ipv4("x.y", a4) == -110 && strcmp(q_log, "x.y@1/1;") == 0);
+        q_script("nameserver 10.0.0.1\noptions timeout:3\noptions attempts:1\n", many, 8);
+        assert(gethostbyname_ipv4("x.y", a4) == -110 && strcmp(q_log, "x.y@1/3;") == 0);
+        /* The last reply decides between SERVFAIL and REFUSED when every server fails. */
+        static const long sfref[] = {-11, -111, -110, -110, -110, -110};
+        q_script(three, sfref, 6);
+        assert(gethostbyname_ipv4("x.y", a4) == -111 && q_calls == 6);
+        /* The search list: NXDOMAIN, NODATA and SERVFAIL go on to the next domain; REFUSED, another RCODE or no reply ends the
+         * domain list, but the name as given is still asked. With nothing found: NODATA if a domain had it, else SERVFAIL if one
+         * had that, else the as-given query's result. */
+        static const char srch[] = "nameserver 10.0.0.1\nsearch a.test b.test\noptions attempts:1\n";
+        static const long s1[] = {-61, -2, -11};
+        q_script(srch, s1, 3);
+        assert(gethostbyname_ipv4("x", a4) == -61 && strcmp(q_log, "x.a.test@1/5;x.b.test@1/5;x@1/5;") == 0);
+        static const long s2[] = {-11, -2, -2};
+        q_script(srch, s2, 3);
+        assert(gethostbyname_ipv4("x", a4) == -11 && q_calls == 3);
+        static const long s3[] = {-2, -2, -2};
+        q_script(srch, s3, 3);
+        assert(gethostbyname_ipv4("x", a4) == -2 && q_calls == 3);
+        static const long s4[] = {-111, -2};
+        q_script(srch, s4, 2);
+        assert(gethostbyname_ipv4("x", a4) == -2 && strcmp(q_log, "x.a.test@1/5;x@1/5;") == 0);
+        static const long s5[] = {-2, -71, -2};
+        q_script(srch, s5, 3);
+        assert(gethostbyname_ipv4("x", a4) == -2 && strcmp(q_log, "x.a.test@1/5;x.b.test@1/5;x@1/5;") == 0);
+        static const long s6[] = {-110, -110};
+        q_script(srch, s6, 2);
+        assert(gethostbyname_ipv4("x", a4) == -110 && strcmp(q_log, "x.a.test@1/5;x@1/5;") == 0);
+        static const long s7[] = {-2, -11, 0};
+        q_script(srch, s7, 3);
+        assert(gethostbyname_ipv4("x", a4) == 0 && q_calls == 3);
+        static const long s8[] = {-61, -71, -2};
+        q_script(srch, s8, 3);
+        assert(gethostbyname_ipv4("x", a4) == -61 && q_calls == 3);
+        /* The name as given first (ndots:0): its result is the lookup's when nothing answers. */
+        static const char first[] = "nameserver 10.0.0.1\nsearch a.test\noptions attempts:1 ndots:0\n";
+        static const long f1[] = {-11, -2};
+        q_script(first, f1, 2);
+        assert(gethostbyname_ipv4("x", a4) == -11 && strcmp(q_log, "x@1/5;x.a.test@1/5;") == 0);
+        static const long f2[] = {-2, -61};
+        q_script(first, f2, 2);
+        assert(gethostbyname_ipv4("x", a4) == -2 && q_calls == 2);
+        static const long f3[] = {-2, 0};
+        q_script(first, f3, 2);
+        assert(gethostbyname_ipv4("x", a4) == 0 && a4[3] == 2);
+        /* h_errno and getaddrinfo for each (glibc): NODATA is NO_DATA / EAI_NODATA, another RCODE NO_RECOVERY / EAI_NONAME,
+         * SERVFAIL and no reply TRY_AGAIN / EAI_AGAIN. */
+        static const long r_nd[] = {-61}, r_fe[] = {-71}, r_sf[] = {-11}, r_to[] = {-110}, r_nx[] = {-2};
+        static const char one[] = "nameserver 10.0.0.1\noptions attempts:1\n";
+        struct addrinfo hints, *res = 0;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_INET;
+        q_script(one, r_nd, 1);
+        assert(gethostbyname("x.y") == 0 && h_errno == NO_DATA);
+        q_script(one, r_nd, 1);
+        assert(getaddrinfo("x.y", 0, &hints, &res) == EAI_NODATA);
+        q_script(one, r_fe, 1);
+        assert(gethostbyname("x.y") == 0 && h_errno == NO_RECOVERY);
+        q_script(one, r_fe, 1);
+        assert(getaddrinfo("x.y", 0, &hints, &res) == EAI_NONAME);
+        q_script(one, r_sf, 1);
+        assert(gethostbyname("x.y") == 0 && h_errno == TRY_AGAIN);
+        q_script(one, r_sf, 1);
+        assert(getaddrinfo("x.y", 0, &hints, &res) == EAI_AGAIN);
+        q_script(one, r_to, 1);
+        assert(gethostbyname("x.y") == 0 && h_errno == TRY_AGAIN);
+        q_script(one, r_nx, 1);
+        assert(gethostbyname("x.y") == 0 && h_errno == HOST_NOT_FOUND);
+        assert(strcmp(gai_strerror(EAI_NODATA), "No address associated with hostname") == 0);
+        moqi_test_resolv_conf = (const char *)0;
     }
 
     /* A NULL name or output never reaches the kernel: the wrapper refuses it first with EINVAL. */

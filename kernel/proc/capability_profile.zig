@@ -171,7 +171,7 @@ pub fn profileForLaunch(name: []const u8, initial_init_caller: bool, initial_ini
         // Root creates /etc/hosts (the root directory is not writable by the default user).
         return .{ .uid = 0, .gid = 0, .caps = NO_CAPS, .initial_init = false };
     }
-    if (std.mem.eql(u8, name, "hello514") or std.mem.eql(u8, name, "hello518")) {
+    if (std.mem.eql(u8, name, "hello514") or std.mem.eql(u8, name, "hello518") or std.mem.eql(u8, name, "hello519")) {
         // Root creates /etc/resolv.conf, and its stand-in DNS server binds 127.0.0.1:53 (a privileged port).
         return .{ .uid = 0, .gid = 0, .caps = .{ .cap_net_bind = true }, .initial_init = false };
     }

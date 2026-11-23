@@ -13,10 +13,13 @@ extern long moqi_test_syscall2(long nr, long a1, long a2);
 /* The socket syscalls only exist on the target; the host unit test links a recording stub instead. */
 #ifdef MOQI_HOST_TEST_SYSCALL
 extern long moqi_test_syscall3(long nr, long a1, long a2, long a3);
+extern long moqi_test_syscall4(long nr, long a1, long a2, long a3, long a4);
 #define NETDB_SYSCALL3(nr, a1, a2, a3) moqi_test_syscall3((nr), (a1), (a2), (a3))
+#define NETDB_SYSCALL4(nr, a1, a2, a3, a4) moqi_test_syscall4((nr), (a1), (a2), (a3), (a4))
 #define NETDB_SYSCALL1(nr, a1) moqi_test_syscall3((nr), (a1), 0, 0)
 #else
 #define NETDB_SYSCALL3(nr, a1, a2, a3) syscall3((nr), (a1), (a2), (a3))
+#define NETDB_SYSCALL4(nr, a1, a2, a3, a4) syscall4((nr), (a1), (a2), (a3), (a4))
 #define NETDB_SYSCALL1(nr, a1) syscall1((nr), (a1))
 #endif
 
@@ -59,11 +62,25 @@ size_t resolv_conf_servers(const char *text, size_t len, uint8_t out[][4], size_
 #define RESOLV_LABEL_MAX 63
 
 /* The words of the last "search" or "domain" line (a keyword at the start of the line, then a blank or the end of the line); 0
- * words when the last one has none. *ndots: the last "ndots:N" of an options line, 1 when there is none. */
-static size_t resolv_conf_search(const char *text, size_t len, const char **word, size_t *word_len, size_t cap, unsigned *ndots) {
+ * words when the last one has none. `opt`: the last ndots:, timeout: and attempts: of the options lines (defaults 1, 5, 2). */
+struct resolv_opts { unsigned ndots; int timeout; int attempts; };
+
+/* "name:N" in an options line: glibc's atoi of what follows the colon (a sign, digits, anything after them ignored). */
+static int resolv_opt_value(const char *text, size_t a, size_t i, size_t kl, long *v) {
+    size_t d = a + kl;
+    int neg = d < i && (text[d] == '-' || text[d] == '+') ? text[d++] == '-' : 0;
+    long x = 0;
+    while (d < i && text[d] >= '0' && text[d] <= '9' && x < 100000) x = x * 10 + (text[d++] - '0');
+    *v = neg ? -x : x;
+    return 1;
+}
+
+static size_t resolv_conf_search(const char *text, size_t len, const char **word, size_t *word_len, size_t cap, struct resolv_opts *opt) {
     static const char kw_search[] = "search", kw_domain[] = "domain", kw_options[] = "options";
     size_t count = 0, pos = 0;
-    *ndots = 1;
+    opt->ndots = 1;
+    opt->timeout = 5;
+    opt->attempts = 2;
     while (text && pos < len) {
         size_t end = pos;
         while (end < len && text[end] != '\n') end++;
@@ -94,14 +111,20 @@ static size_t resolv_conf_search(const char *text, size_t len, const char **word
                         count++;
                     }
                 } else if (i - a >= 6 && memcmp(text + a, "ndots:", 6) == 0) {
-                    /* glibc: atoi of the rest, anything above 15 is 15, and the value lands in a 4-bit field ("2x" is 2, "x" is 0,
-                     * "-1" is 15; measured). */
-                    size_t d = a + 6;
-                    int neg = d < i && (text[d] == '-' || text[d] == '+') ? text[d++] == '-' : 0;
-                    long v = 0;
-                    while (d < i && text[d] >= '0' && text[d] <= '9' && v < 100000) v = v * 10 + (text[d++] - '0');
-                    if (neg) v = -v;
-                    *ndots = v > 15 ? 15u : (unsigned)v & 15u;
+                    /* glibc (measured): above 15 is 15, and the value lands in a 4-bit field ("2x" is 2, "x" is 0, "-1" is 15). */
+                    long v;
+                    resolv_opt_value(text, a, i, 6, &v);
+                    opt->ndots = v > 15 ? 15u : (unsigned)v & 15u;
+                } else if (i - a >= 8 && memcmp(text + a, "timeout:", 8) == 0) {
+                    /* Seconds, at most 30 (RES_MAXRETRANS); 0 or less waits the 1 s minimum. */
+                    long v;
+                    resolv_opt_value(text, a, i, 8, &v);
+                    opt->timeout = v > 30 ? 30 : (int)v;
+                } else if (i - a >= 9 && memcmp(text + a, "attempts:", 9) == 0) {
+                    /* Rounds over the servers, at most 5 (RES_MAXRETRY); 0 or less asks nobody. */
+                    long v;
+                    resolv_opt_value(text, a, i, 9, &v);
+                    opt->attempts = v > 5 ? 5 : (int)v;
                 }
             }
         }
@@ -122,20 +145,22 @@ static int resolv_name_fits(const char *name, size_t len) {
     return 1;
 }
 
+/* Append `name` (with ".dom" when `dom`) to `out`. 0 when the result cannot be a DNS name (over 253 characters or a label over
+ * 63): glibc's res_search stops the search list at such a domain (res_querydomain fails, measured). A domain of "" adds nothing. */
 static int resolv_add(char out[][256], size_t *n, size_t cap, const char *name, size_t name_len, const char *dom, size_t dom_len) {
-    if (*n >= cap) return 0;
+    if (*n >= cap) return 1;
     if (dom_len && dom[dom_len - 1] == '.') dom_len--;
     if (dom && dom_len == 0) return 1;
     size_t total = name_len + (dom ? 1 + dom_len : 0);
     char *o = out[*n];
-    if (total >= 256) return 1;
+    if (total >= 256) return 0;
     memcpy(o, name, name_len);
     if (dom) {
         o[name_len] = '.';
         memcpy(o + name_len + 1, dom, dom_len);
     }
     o[total] = 0;
-    if (!resolv_name_fits(o, total)) return 1;
+    if (!resolv_name_fits(o, total)) return 0;
     (*n)++;
     return 1;
 }
@@ -151,18 +176,28 @@ size_t resolv_conf_candidates(const char *text, size_t len, const char *name, ch
     }
     const char *word[64];
     size_t word_len[64];
-    unsigned ndots;
-    size_t nw = resolv_conf_search(text, len, word, word_len, 64, &ndots);
+    struct resolv_opts opt;
+    size_t nw = resolv_conf_search(text, len, word, word_len, 64, &opt);
+    unsigned ndots = opt.ndots;
     unsigned dots = 0;
     for (size_t i = 0; i < name_len; i++) dots += name[i] == '.';
     if (dots >= ndots) resolv_add(out, &n, cap, name, name_len, (const char *)0, 0);
-    for (size_t i = 0; i < nw; i++) resolv_add(out, &n, cap, name, name_len, word[i], word_len[i]);
+    for (size_t i = 0; i < nw; i++)
+        if (!resolv_add(out, &n, cap, name, name_len, word[i], word_len[i])) break;
     if (dots < ndots) resolv_add(out, &n, cap, name, name_len, (const char *)0, 0);
     return n;
 }
 
 #ifdef MOQI_HOST_TEST_SYSCALL
-static size_t resolv_conf_read(char *buf, size_t cap) { (void)buf; (void)cap; return 0; }
+/* The host test supplies the file's text (NULL: no file). */
+extern const char *moqi_test_resolv_conf;
+static size_t resolv_conf_read(char *buf, size_t cap) {
+    if (!moqi_test_resolv_conf) return 0;
+    size_t n = strlen(moqi_test_resolv_conf);
+    if (n > cap) n = cap;
+    memcpy(buf, moqi_test_resolv_conf, n);
+    return n;
+}
 #else
 static size_t resolv_conf_read(char *buf, size_t cap) {
     long fd = syscall3(SYS_open, (long)"/etc/resolv.conf", 0 /* O_RDONLY */, 0);
@@ -178,18 +213,31 @@ static size_t resolv_conf_read(char *buf, size_t cap) {
 }
 #endif
 
-/* One name through the nameservers of /etc/resolv.conf in order until one answers (glibc moves to the next on a timeout); with no
- * usable nameserver line, the kernel's own server (DHCP's). */
-static long resolve_one(const char *name, uint8_t out[4], uint8_t ns[][4], size_t nns) {
+/* How long glibc's res_send waits for server `i` of `nns` in one round (measured): `timeout` seconds for the first, then
+ * (timeout << i) / nns, at least 1 s. In milliseconds. */
+static long resolv_wait_ms(int timeout, size_t i, size_t nns) {
+    long t = timeout;
+    if (i > 0 && nns > 0) t = ((long)timeout << i) / (long)nns;
+    if (t <= 0) t = 1;
+    return t * 1000;
+}
+
+/* One name through the nameservers of /etc/resolv.conf with glibc's res_send rules (measured): `attempts` rounds over the servers
+ * in file order, each waiting resolv_wait_ms; NXDOMAIN, NODATA and an address end it at once; SERVFAIL, NOTIMP, REFUSED and no
+ * reply move on to the next server. -ETIMEDOUT when nobody replied, else the last reply's -EAGAIN (SERVFAIL) or -ECONNREFUSED. With no
+ * usable nameserver line, the kernel's own server (DHCP's) through dns_resolve. */
+static long resolve_one(const char *name, uint8_t out[4], uint8_t ns[][4], size_t nns, const struct resolv_opts *opt) {
     if (nns == 0) return NETDB_SYSCALL2(SYS_dns_resolve, (long)name, (long)out);
-    long r = -2;
-    for (size_t i = 0; i < nns; i++) {
-        r = NETDB_SYSCALL3(SYS_dns_resolve_via, (long)name, (long)out, (long)ns[i]);
-        /* A malformed name is the same at every server. The kernel reports "no such name" and "no reply" both as ENOENT
-         * (a NXDOMAIN reply returns at once, a silent server after the timeout), so the next server is tried either way. */
-        if (r == 0 || r == -22 || r == -36 || r == -14) break;
+    long last_reply = -110; /* ETIMEDOUT: no server replied (or attempts:0 asked nobody) */
+    for (int a = 0; a < opt->attempts; a++) {
+        for (size_t i = 0; i < nns; i++) {
+            long r = NETDB_SYSCALL4(SYS_dns_query, (long)name, (long)out, (long)ns[i], resolv_wait_ms(opt->timeout, i, nns));
+            if (r == -11 || r == -111) last_reply = r; /* SERVFAIL; NOTIMP or REFUSED: the last reply is what res_search sees */
+            if (r == -11 || r == -111 || r == -110) continue;
+            return r; /* an answer, NXDOMAIN, NODATA, another RCODE, or a bad argument */
+        }
     }
-    return r;
+    return last_reply;
 }
 
 #define RESOLV_MAX_CANDIDATES 8
@@ -202,19 +250,26 @@ long gethostbyname_ipv4_name(const char *name, uint8_t out[4], char *found, size
     size_t len = resolv_conf_read(resolv_conf_buf, sizeof resolv_conf_buf);
     uint8_t ns[RESOLV_MAXNS][4];
     size_t nns = resolv_conf_servers(resolv_conf_buf, len, ns, RESOLV_MAXNS);
+    struct resolv_opts opt;
+    const char *unused_word[1];
+    size_t unused_len[1];
+    resolv_conf_search(resolv_conf_buf, len, unused_word, unused_len, 1, &opt);
     /* A dotted IPv4 literal is an address, not a name: no search domain is tried (glibc answers it without a query, measured). A
      * name with no candidate (malformed, over-long) goes to the kernel as given for its own errno. */
     uint8_t lit[4];
     size_t nc = name[0] && !ipv4_from_text(name, lit) ? resolv_conf_candidates(resolv_conf_buf, len, name, resolv_cand, RESOLV_MAX_CANDIDATES) : 0;
-    long direct = -2;
-    int direct_tried = 0;
+    /* glibc res_search (measured, and its code): the name as given first when it has ndots dots, else last. A search domain that
+     * answers NXDOMAIN, NODATA or SERVFAIL lets the list go on; any other failure (REFUSED, another RCODE, no reply, a name too
+     * long to send) ends the domain list, though the name as given is still asked if it has not been. With nothing found the
+     * result is the as-given query's when it came first, else NODATA if a domain had it, else SERVFAIL if one had that, else the
+     * last query's. */
+    if (nc == 0) return resolve_one(name, out, ns, nns, &opt);
+    long saved = 0, last = -2;
+    int asis_first = 0, got_nodata = 0, got_servfail = 0, done = 0;
     for (size_t i = 0; i < nc; i++) {
         int is_name = strcmp(resolv_cand[i], name) == 0 || (strlen(name) == strlen(resolv_cand[i]) + 1 && name[strlen(name) - 1] == '.');
-        long r = resolve_one(is_name ? name : resolv_cand[i], out, ns, nns);
-        if (is_name) {
-            direct = r;
-            direct_tried = 1;
-        }
+        if (!is_name && done) continue;
+        long r = resolve_one(is_name ? name : resolv_cand[i], out, ns, nns, &opt);
         if (r == 0) {
             if (found && found_cap) {
                 size_t k = strlen(resolv_cand[i]);
@@ -224,13 +279,31 @@ long gethostbyname_ipv4_name(const char *name, uint8_t out[4], char *found, size
             }
             return 0;
         }
-        /* Only "no such name" moves on to the next candidate; a bad pointer is final. */
-        if (r == -14) return r;
+        if (r == -14) return r; /* a bad pointer is final */
+        last = r;
+        if (is_name) {
+            if (i == 0 && nc > 1) {
+                asis_first = 1;
+                saved = r;
+            }
+            continue;
+        }
+        if (r == -61) got_nodata = 1;
+        else if (r == -11) got_servfail = 1;
+        else if (r != -2) done = 1;
     }
-    /* Report what the name itself got (glibc: the error of the as-is query); a name with no candidate at all (too long, a
-     * malformed label) goes to the kernel for its errno. */
-    if (!direct_tried) return resolve_one(name, out, ns, nns);
-    return direct;
+    if (asis_first) return saved;
+    if (got_nodata) return -61;
+    if (got_servfail) return -11;
+    return last;
+}
+
+/* h_errno for a gethostbyname_ipv4 failure. */
+static int netdb_herr_of(long r) {
+    if (r == -2 /* ENOENT */ || r == -22 /* EINVAL */ || r == -36 /* ENAMETOOLONG */) return HOST_NOT_FOUND;
+    if (r == -61 /* ENODATA */) return NO_DATA;
+    if (r == -71 /* EPROTO */) return NO_RECOVERY;
+    return TRY_AGAIN;
 }
 
 long gethostbyname_ipv4(const char *name, uint8_t out[4]) {
@@ -910,14 +983,11 @@ static void lookup_name(const char *name, int af, char *hosts, size_t hosts_cap,
                 ans->names_len = strlen(ans->name_store);
             }
             if (r < 0) {
-                /* A name that does not exist, is malformed, or is too long is a definitive "no such host"; a timeout or any
-                 * other failure is worth retrying. */
-                if (r == -2 /* ENOENT */ || r == -22 /* EINVAL */ || r == -36 /* ENAMETOOLONG */) {
-                    ans->herr = HOST_NOT_FOUND;
-                } else {
-                    ans->herr = TRY_AGAIN;
-                    ans->rc = EAGAIN;
-                }
+                /* glibc (measured): a name that does not exist, is malformed or too long is HOST_NOT_FOUND; one that exists without
+                 * an address NO_DATA; an error RCODE other than SERVFAIL/NOTIMP/REFUSED NO_RECOVERY; no reply, a server error or
+                 * any other failure TRY_AGAIN. */
+                ans->herr = netdb_herr_of(r);
+                if (ans->herr == TRY_AGAIN) ans->rc = EAGAIN;
                 return;
             }
             ans->naddrs = 1;
@@ -1437,7 +1507,11 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
             if (family == AF_INET6 && !(flags & AI_V4MAPPED)) return EAI_NONAME;
             canon_buf[0] = 0;
             long r = gethostbyname_ipv4_name(node, v4, canon_buf, sizeof canon_buf);
-            if (r < 0) return (r == -2 || r == -22 || r == -36) ? EAI_NONAME : EAI_AGAIN;
+            if (r < 0) {
+                int h = netdb_herr_of(r);
+                /* glibc (measured): NO_DATA is EAI_NODATA, NO_RECOVERY like HOST_NOT_FOUND is EAI_NONAME, TRY_AGAIN EAI_AGAIN. */
+                return h == NO_DATA ? EAI_NODATA : h == TRY_AGAIN ? EAI_AGAIN : EAI_NONAME;
+            }
             set_v4(&addrs[0], v4[0], v4[1], v4[2], v4[3]);
             if (family == AF_INET6) map_v4(&addrs[0]);
             naddrs = 1;

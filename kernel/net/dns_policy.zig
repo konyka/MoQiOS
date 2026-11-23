@@ -50,6 +50,59 @@ pub const MAX_POLL_ITERS: u32 = 50_000_000;
 /// Whether a wait that began at clock reading `start_ns` has run out at reading `now_ns`, after `iters` polls.
 /// Wrapping subtraction keeps a counter that wrapped from either expiring at once or lasting forever.
 pub fn waitExpired(start_ns: u64, now_ns: u64, iters: u32) bool {
+    return waitExpiredAfter(start_ns, now_ns, iters, QUERY_TIMEOUT_NS);
+}
+
+/// waitExpired with a limit of `limit_ns` instead of QUERY_TIMEOUT_NS.
+pub fn waitExpiredAfter(start_ns: u64, now_ns: u64, iters: u32, limit_ns: u64) bool {
     if (iters >= MAX_POLL_ITERS) return true;
-    return now_ns -% start_ns >= QUERY_TIMEOUT_NS;
+    return now_ns -% start_ns >= limit_ns;
+}
+
+/// Longest wait dns_query (507) accepts for one query, in milliseconds. glibc caps resolv.conf "options timeout" at 30 s, and
+/// res_send waits (timeout << i) / nservers for server i > 0: up to 40 s for the third of three servers.
+pub const MAX_QUERY_TIMEOUT_MS: u64 = 60_000;
+
+pub fn timeoutValid(ms: u64) bool {
+    return ms >= 1 and ms <= MAX_QUERY_TIMEOUT_MS;
+}
+
+/// How one query to one server ended, as a resolver acting on it (glibc res_send/res_search, measured) needs to know:
+/// - answer: NOERROR with an address;
+/// - nodata: NOERROR without an A record (the name exists);
+/// - nxdomain: RCODE 3, the name does not exist;
+/// - next_server: SERVFAIL (2), which glibc takes as "ask the next server" and, in a search list, as "try the next domain";
+/// - refused: NOTIMP (4) or REFUSED (5): the next server too, but a search list stops there;
+/// - failed: any other RCODE (FORMERR 1, 6..15), which ends the query for this name;
+/// - timeout, interrupted: no reply in time, or a signal ended the wait;
+/// - ignore: the packet is not a response (keep waiting).
+pub const Outcome = enum { answer, nodata, nxdomain, next_server, refused, failed, timeout, interrupted, ignore };
+
+/// The outcome of an accepted reply from its header: `flags` the second header word, `ancount` the answer count. `answer` only
+/// says there are answers to look through; the caller turns it into `nodata` when none of them is an A record.
+pub fn classify(flags: u16, ancount: u16) Outcome {
+    if ((flags & 0x8000) == 0) return .ignore;
+    return switch (flags & 0x000F) {
+        0 => if (ancount == 0) .nodata else .answer,
+        3 => .nxdomain,
+        2 => .next_server,
+        4, 5 => .refused,
+        else => .failed,
+    };
+}
+
+/// The result of dns_query for `o`: 0, or -ENOENT, -ENODATA, -EAGAIN (SERVFAIL), -ECONNREFUSED (NOTIMP, REFUSED), -EPROTO,
+/// -ETIMEDOUT, -EINTR.
+pub fn queryResult(o: Outcome) i64 {
+    return switch (o) {
+        .answer => 0,
+        .nxdomain => -2,
+        .nodata => -61,
+        .next_server => -11,
+        .refused => -111,
+        .failed => -71,
+        .timeout => -110,
+        .interrupted => -4,
+        .ignore => -110,
+    };
 }

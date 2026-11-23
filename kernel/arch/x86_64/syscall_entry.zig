@@ -2612,6 +2612,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         506 => { // dns_resolve_via(name, out4, server4) — the same through a caller-named nameserver (/etc/resolv.conf)
             frame.rax = @bitCast(syscallDnsResolveVia(frame.rdi, frame.rsi, frame.rdx));
         },
+        507 => { // dns_query(name, out4, server4, timeout_ms) — one query to one server, and how it ended (a resolver in libc)
+            frame.rax = @bitCast(syscallDnsQuery(frame.rdi, frame.rsi, frame.rdx, frame.r10));
+        },
         494 => { // pselect6(nfds, readfds, writefds, exceptfds, timespec, {sigmask, size})
             frame.rax = @bitCast(select_mod.pselect6(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
             checkSignalsOnSyscallReturn(frame);
@@ -6659,6 +6662,38 @@ fn syscallDnsResolveVia(name_ptr: u64, out_ptr: u64, server_ptr: u64) i64 {
     const ip = @import("../../net/dns.zig").resolveVia(hp.stripTrailingDot(name), server, dnsSleep);
     if (ip[0] == 0 and ip[1] == 0 and ip[2] == 0 and ip[3] == 0) return -2; // ENOENT: did not resolve
     if (copy.copyToUser(@ptrFromInt(out_ptr), &ip, 4) != 4) return -14;
+    return 0;
+}
+
+/// dns_query(name, out4, server4, timeout_ms): one A query for `name` to `server4`, waiting at most `timeout_ms` (1..60000),
+/// for a resolver in user space that applies /etc/resolv.conf's timeout, attempts and server order itself. 0 and the address
+/// on an answer; -ENOENT for NXDOMAIN, -ENODATA for a name without an A record, -EAGAIN for SERVFAIL, -ECONNREFUSED for
+/// NOTIMP/REFUSED (both: ask the next server), -EPROTO for another error RCODE, -ETIMEDOUT for no reply, -EINTR when a signal ends the wait. The argument
+/// checks are dns_resolve_via's, plus EINVAL for a limit out of range. Literals and the static table answer at once; the
+/// shared cache is not used.
+fn syscallDnsQuery(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_ms: u64) i64 {
+    const copy = @import("../../mm/copy_from_user.zig");
+    const hp = @import("../../net/hostname_policy.zig");
+    const dp = @import("../../net/dns_policy.zig");
+    if (!copy.validateUserBufferWritable(out_ptr, 4)) return -14; // EFAULT, before any network wait
+    var server: [4]u8 = undefined;
+    if (copy.copyFromUser(&server, @ptrFromInt(server_ptr), 4) != 4) return -14;
+    if (!dp.serverUsable(server)) return -22;
+    if (!dp.timeoutValid(timeout_ms)) return -22;
+    var buf: [256]u8 = undefined;
+    const name = switch (userPathResult(name_ptr, &buf)) {
+        .ok => |n| n,
+        .err => |e| return e,
+    };
+    switch (hp.check(name)) {
+        .ok => {},
+        .empty => return -2, // ENOENT
+        .too_long => return -36, // ENAMETOOLONG
+        .invalid => return -22, // EINVAL
+    }
+    const r = @import("../../net/dns.zig").queryVia(hp.stripTrailingDot(name), server, timeout_ms * 1_000_000, dnsSleep);
+    if (r.outcome != .answer) return dp.queryResult(r.outcome);
+    if (copy.copyToUser(@ptrFromInt(out_ptr), &r.ip, 4) != 4) return -14;
     return 0;
 }
 
