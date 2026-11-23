@@ -12064,7 +12064,7 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 
 - 问题：raw 套接字上的 IPV6_ADD/DROP_MEMBERSHIP 和 IP_ADD/DROP_MEMBERSHIP 一律返回 ENOPROTOOPT（`setMembership` 只接受 UDP），而 Linux 的 `ipv6_sock_mc_join`、`ip_mc_join_group` 对所有 inet 套接字都可用。
 - TDD：hello500 先在 Linux 网络命名空间通过：IPv6 加入 lo 0、重复 EADDRINUSE、不存在的接口 ENODEV、退出 0、再退出 EADDRNOTAVAIL、非组播 EINVAL；IPv4 同理。（宿主机对照最初用了接口 0，在只有 lo 的命名空间里 Linux 返回 ENODEV 而 MoQiOS 有网卡会成功；改用不存在的接口 99 后两边语义一致。）未实现目标机 A/B 全部 ENOPROTOOPT。
-- 实现：`raw_icmp.Socket` 增加 `mc6`/`mc4` 成员表，`mcMembership6`/`mcMembership4` 在 raw_lock 内调用 `mcast_policy.join/drop/join4/drop4`；`setMembership`/`setMembership4` 对 raw 套接字分派到这两个函数。未绑定地址的 raw 套接字照旧收下所有组播（与 Linux 相同）；Linux 还让绑在单播地址上的套接字经 `inet6_mc_check`（成员资格或 IPV6_MULTICAST_ALL）收组播，这一分支尚未接入投递路径，已在文档中注明。
+- 实现：`raw_icmp.Socket` 增加 `mc6`/`mc4` 成员表，`mcMembership6`/`mcMembership4` 在 raw_lock 内调用 `mcast_policy.join/drop/join4/drop4`；`setMembership`/`setMembership4` 对 raw 套接字分派到这两个函数。未绑定地址的 raw 套接字照旧收下所有组播（与 Linux 相同）；Linux 还让绑在单播地址上的套接字经 `inet6_mc_check`（成员资格或 IPV6_MULTICAST_ALL）收组播；这一分支随后以 `raw_icmp_policy.matches6Mc` 接入 IPv6 投递、以 `mcAllow4` 接入 IPv4 投递（见下一节）。
 - 验证：Linux 对照与目标机 A/B 全绿；hello362 的源码断言随新规则更新；host 全量、`zig build` 通过；SMP=2 完整 smoke 中 UDP 组播 hello360–369 与 hello495–500 均 PASS，到达 shell、退出码 0。
 
 ## 记录：`9685e21` 的 CI 失败是 hello174 C 的已知偶发项
@@ -12081,3 +12081,12 @@ Plan section: `docs/realtime-security-hardening-plan.md` §8. Host tests live in
 - 实现：`tcp_util.ackAdvance` 以 `max(snd_nxt, snd_max)` 为上界计算新确认的字节数；ESTABLISHED 的 ACK 处理改用它，并另以发送环中的字节数为上限。ACK 越过回退后的 `snd_nxt` 时把 `snd_nxt` 和 `send_unacked` 前移到 ACK 处（其下的数据已送达，不能用已确认的序号再发）。其他状态（CLOSE_WAIT、FIN_WAIT_1、LAST_ACK）走的 `absorbDataAckBeforeFin` 在 FIN 发出后本来就以整个发送环为上限，这次没有改。
 - 局限（如实）：这是根据一次失败现场和代码推出的根因，没有在本地确定性地复现停滞（它依赖 RTO 恰好发生在大量数据在途时）；修复后的验证靠 host 单元测试和完整 smoke，后续 CI 是否不再出现 hello174 C 才是更强的证据。
 - 验证：新单元测试转绿；host 全量、`zig build` 通过；SMP=2 完整 smoke 到达 shell、退出码 0，其中 hello170–179（含 hello174）、TCP 重传/定时器/窗口相关的 hello406–420、紧急数据 hello443 与 hello495–500 均 PASS，无 FAIL。
+
+## 补充：IPv6 raw 套接字绑在单播地址时接收加入的组播（hello500 续）
+
+- 问题：`deliver6Skb` 用 `matches6` 要求绑定地址等于目的地址，所以绑在 ::1 等单播地址上的 raw 套接字收不到任何组播；Linux `raw_v6_match` 在绑定地址不等于目的地址时，对组播目的再调 `inet6_mc_check`：加入了该组则收，未加入时看 IPV6_MULTICAST_ALL（默认开）。
+- TDD：`tests/raw_mc_match_test.zig` 先因缺少 `raw_icmp_policy.matches6Mc` 红灯；覆盖未加入时由 IPV6_MULTICAST_ALL 决定、加入后关掉 ALL 仍收、另一个组不收、单播目的保持原规则、已连接对端仍按源过滤、未绑定套接字不变。
+- 实现：新增 `matches6Mc`，`deliver6Skb` 改用它并传入套接字的 `mc6` 表和 `opts.ip.mc_all`。源过滤（MCAST_INCLUDE/EXCLUDE）未实现，加入的组一律放行。ICMP 差错路径的 `matches6` 不变（差错引用的地址不会是组播）。
+- 局限（如实）：没有运行时用例。在 Linux 网络命名空间里试过把组播经 lo 回送给 raw 套接字（ICMPv6、UDP 两种发送方，补了 `ff00::/8` 本地路由），连未绑定的 raw 套接字也收不到，无法取得宿主对照，所以只以策略单元测试对照 Linux 源码。
+- IPv4：Linux `raw_v4_local_deliver` 在 `raw_v4_match`（地址规则与原来相同）之后用 `ip_mc_sf_allow` 判断组播：在到达接口上加入过则收，否则看 IP_MULTICAST_ALL；未通过时仍记为已投递。新增 `raw_icmp_policy.mcAllow4`，`deliverHdr` 在 ICMP_FILTER 之后调用它（单元测试先因缺少该函数红灯，覆盖单播恒通过、未加入由 ALL 决定、加入后在该接口通过、在另一接口不通过）。
+- 验证：两条单元测试均红转绿；host 全量、`zig build` 通过；SMP=2 完整 smoke 到达 shell、退出码 0，UDP 组播 hello360–369、raw 套接字 hello389–404 与 hello425–430、hello495–500 均 PASS，无 FAIL。

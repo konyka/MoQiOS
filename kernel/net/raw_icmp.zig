@@ -614,6 +614,8 @@ pub fn deliverHdr(protocol: u8, hdr: []const u8, payload: []const u8, src: [4]u8
             if (!policy.matches(s.bound, s.peer, src, dst)) continue;
             took = true;
             if (protocol == policy.IPPROTO_ICMP) if (icmpType(hdr, payload)) |ty| if (policy.icmpFilterBlocks(s.icmp_filter, ty)) continue;
+            // raw_v4_local_deliver: ip_mc_sf_allow after the match, so a group the socket did not join still counts as delivered.
+            if (!policy.mcAllow4(&s.mc4, s.opts.ip.mc4_all, dst, meta.ifindex)) continue;
             const e = newEntry(s) orelse continue;
             store2(e, hdr, payload);
             charge(s, e);
@@ -665,7 +667,7 @@ pub fn deliver6Skb(protocol: u8, msg: []const u8, src: [16]u8, dst: [16]u8, ifin
         for (&sockets, 0..) |*s, i| {
             if (!s.used or !s.v6) continue;
             if (s.protocol != protocol) continue;
-            if (!policy.matches6(s.bound6, s.peer6, src, dst)) continue;
+            if (!policy.matches6Mc(s.bound6, s.peer6, src, dst, &s.mc6, s.opts.ip.mc_all)) continue;
             took = true;
             if (protocol == policy.IPPROTO_ICMPV6 and (msg.len < 4 or policy.filterBlocks(s.filter, msg[0]))) continue;
             if (s.csum_off != null and policy.sum6(src, dst, s.protocol, msg) != 0) continue;

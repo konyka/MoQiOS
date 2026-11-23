@@ -369,6 +369,24 @@ pub fn matches6(bound: [16]u8, peer: [16]u8, src: [16]u8, dst: [16]u8) bool {
     return true;
 }
 
+/// raw_v6_match's address checks: a connected socket takes only its peer's packets; a socket bound to `bound` takes packets to that
+/// address, and a packet to a group when inet6_mc_check passes (it joined the group, or IPV6_MULTICAST_ALL is on). Source filters
+/// are not implemented, so a joined group always passes.
+pub fn matches6Mc(bound: [16]u8, peer: [16]u8, src: [16]u8, dst: [16]u8, mc: *const @import("mcast_policy.zig").Membership, mc_all: bool) bool {
+    const any: [16]u8 = @splat(0);
+    if (!eql6(peer, any) and !eql6(peer, src)) return false;
+    if (eql6(bound, any) or eql6(bound, dst)) return true;
+    return dst[0] == 0xff and @import("mcast_policy.zig").socketAccepts(mc, mc_all, dst);
+}
+
+/// ip_mc_sf_allow without source filters: a packet to a unicast address always passes; one to a group passes when the socket joined
+/// it on the interface it arrived on (`ifindex`), else only with IP_MULTICAST_ALL.
+pub fn mcAllow4(mc: *const @import("mcast_policy.zig").Membership4, mc_all: bool, dst: [4]u8, ifindex: u8) bool {
+    const mp = @import("mcast_policy.zig");
+    if (!mp.isMulticast4(dst)) return true;
+    return mp.socketAccepts4(mc, mc_all, dst, ifindex);
+}
+
 /// icmpv6_filter: whether ICMP6_FILTER blocks ICMPv6 type `icmp_type` (bit `type & 31` of 32-bit word `type >> 5`).
 pub fn filterBlocks(filter: [FILTER_LEN]u8, icmp_type: u8) bool {
     const word = @as(u32, filter[(icmp_type >> 5) * 4]) | (@as(u32, filter[(icmp_type >> 5) * 4 + 1]) << 8) |
