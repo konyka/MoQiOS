@@ -30,6 +30,7 @@ long moqi_test_syscall2(long nr, long a1, long a2) {
 /* /etc/resolv.conf for netdb.c (NULL: no file), and dns_query (507) replies from a script: each call takes the next entry,
  * logging the name, server's last octet and limit. A reply of 0 writes 10.0.0.<call number>. */
 const char *moqi_test_resolv_conf;
+unsigned moqi_test_rotate_seed = 1;
 static long q_reply[32];
 static int q_n, q_calls;
 static char q_log[2048];
@@ -893,6 +894,33 @@ int main(void) {
         hc = gethostbyname("plain.test");
         assert(hc && strcmp(hc->h_name, "plain.test") == 0 && hc->h_aliases[0] == 0 && hc->h_addr_list[1] == 0);
         assert(q_last_anslen >= 256);
+        moqi_test_resolv_conf = (const char *)0;
+    }
+
+    /* options rotate (glibc res_send, measured): each query starts at the next server, the first one of the process at a random
+     * one (the host test's seed is 1: the second server); the rest follow in file order with the usual waits. PTR queries share
+     * the counter. Without rotate every query starts at the first server. */
+    {
+        static const char rot[] = "nameserver 10.0.0.1\nnameserver 10.0.0.2\nnameserver 10.0.0.3\noptions rotate attempts:1 timeout:3\n";
+        static const long silent3[] = {-110, -110, -110}, ok[] = {0};
+        uint8_t a4[4];
+        q_script(rot, silent3, 3);
+        assert(gethostbyname_ipv4("x.y", a4) == -110);
+        assert(strcmp(q_log, "x.y@2/3;x.y@3/2;x.y@1/4;") == 0);
+        q_script(rot, ok, 1);
+        assert(gethostbyname_ipv4("x.y", a4) == 0 && strcmp(q_log, "x.y@3/3;") == 0);
+        q_script(rot, ok, 1);
+        assert(gethostbyname_ipv4("x.y", a4) == 0 && strcmp(q_log, "x.y@1/3;") == 0);
+        static const char rot2[] = "nameserver 10.0.0.1\nnameserver 10.0.0.2\nnameserver 10.0.0.3\noptions rotate attempts:2 timeout:1\n";
+        static const long silent6[] = {-110, -110, -110, -110, -110, -110};
+        q_script(rot2, silent6, 6);
+        assert(gethostbyname_ipv4("x.y", a4) == -110 && strcmp(q_log, "x.y@2/1;x.y@3/1;x.y@1/1;x.y@2/1;x.y@3/1;x.y@1/1;") == 0);
+        /* rotate as a word among others, and a word that only starts with it, are told apart. */
+        q_script("nameserver 10.0.0.1\nnameserver 10.0.0.2\noptions attempts:1 rotatex\n", ok, 1);
+        assert(gethostbyname_ipv4("x.y", a4) == 0 && strcmp(q_log, "x.y@1/5;") == 0);
+        /* The counter has moved four times since the seed (1): the fifth rotated query starts at 5 % 2, the second server. */
+        q_script("nameserver 10.0.0.1\nnameserver 10.0.0.2\noptions attempts:1 timeout:1 rotate\n", ok, 1);
+        assert(gethostbyname_ipv4("x.y", a4) == 0 && strcmp(q_log, "x.y@2/1;") == 0);
         moqi_test_resolv_conf = (const char *)0;
     }
 

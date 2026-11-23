@@ -63,7 +63,7 @@ size_t resolv_conf_servers(const char *text, size_t len, uint8_t out[][4], size_
 
 /* The words of the last "search" or "domain" line (a keyword at the start of the line, then a blank or the end of the line); 0
  * words when the last one has none. `opt`: the last ndots:, timeout: and attempts: of the options lines (defaults 1, 5, 2). */
-struct resolv_opts { unsigned ndots; int timeout; int attempts; };
+struct resolv_opts { unsigned ndots; int timeout; int attempts; int rotate; };
 
 /* "name:N" in an options line: glibc's atoi of what follows the colon (a sign, digits, anything after them ignored). */
 static int resolv_opt_value(const char *text, size_t a, size_t i, size_t kl, long *v) {
@@ -81,6 +81,7 @@ static size_t resolv_conf_search(const char *text, size_t len, const char **word
     opt->ndots = 1;
     opt->timeout = 5;
     opt->attempts = 2;
+    opt->rotate = 0;
     while (text && pos < len) {
         size_t end = pos;
         while (end < len && text[end] != '\n') end++;
@@ -115,6 +116,8 @@ static size_t resolv_conf_search(const char *text, size_t len, const char **word
                     long v;
                     resolv_opt_value(text, a, i, 6, &v);
                     opt->ndots = v > 15 ? 15u : (unsigned)v & 15u;
+                } else if (i - a == 6 && memcmp(text + a, "rotate", 6) == 0) {
+                    opt->rotate = 1;
                 } else if (i - a >= 8 && memcmp(text + a, "timeout:", 8) == 0) {
                     /* Seconds, at most 30 (RES_MAXRETRANS); 0 or less waits the 1 s minimum. */
                     long v;
@@ -191,6 +194,7 @@ size_t resolv_conf_candidates(const char *text, size_t len, const char *name, ch
 #ifdef MOQI_HOST_TEST_SYSCALL
 /* The host test supplies the file's text (NULL: no file). */
 extern const char *moqi_test_resolv_conf;
+extern unsigned moqi_test_rotate_seed;
 static size_t resolv_conf_read(char *buf, size_t cap) {
     if (!moqi_test_resolv_conf) return 0;
     size_t n = strlen(moqi_test_resolv_conf);
@@ -226,14 +230,37 @@ static long resolv_wait_ms(int timeout, size_t i, size_t nns) {
  * in file order, each waiting resolv_wait_ms; NXDOMAIN, NODATA and an address end it at once; SERVFAIL, NOTIMP, REFUSED and no
  * reply move on to the next server. -ETIMEDOUT when nobody replied, else the last reply's -EAGAIN (SERVFAIL) or -ECONNREFUSED. With no
  * usable nameserver line, the kernel's own server (DHCP's) through dns_resolve. */
+/* "options rotate" (glibc res_send, measured): each query starts at the next server, the first one of the process at a random
+ * one; the servers after it follow in file order, and the wait for the i-th asked is as without rotate. Without the option every
+ * query starts at the first server. The counter is shared by the threads of a process (glibc keeps it in the resolver state). */
+static unsigned resolv_rotate_next;
+static int resolv_rotate_seeded;
+static size_t resolv_first_server(const struct resolv_opts *opt, size_t nns) {
+    if (!opt->rotate || nns < 2) return 0;
+    if (!__atomic_load_n(&resolv_rotate_seeded, __ATOMIC_ACQUIRE)) {
+        unsigned seed = 0;
+#ifdef MOQI_HOST_TEST_SYSCALL
+        seed = moqi_test_rotate_seed;
+#else
+        if (syscall3(SYS_getrandom, (long)&seed, (long)sizeof seed, 0) != (long)sizeof seed) seed = 0;
+#endif
+        /* Two threads seeding at once both store a random start: either one is fine. */
+        int expected = 0;
+        if (__atomic_compare_exchange_n(&resolv_rotate_seeded, &expected, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            __atomic_store_n(&resolv_rotate_next, seed, __ATOMIC_RELEASE);
+    }
+    return __atomic_fetch_add(&resolv_rotate_next, 1u, __ATOMIC_ACQ_REL) % nns;
+}
+
 static long resolve_one(const char *name, uint8_t out[4], uint8_t ns[][4], size_t nns, const struct resolv_opts *opt,
                         struct resolv_answer *ans) {
     if (ans) ans->len = 0;
     if (nns == 0) return NETDB_SYSCALL2(SYS_dns_resolve, (long)name, (long)out);
     long last_reply = -110; /* ETIMEDOUT: no server replied (or attempts:0 asked nobody) */
+    size_t first = resolv_first_server(opt, nns);
     for (int a = 0; a < opt->attempts; a++) {
         for (size_t i = 0; i < nns; i++) {
-            long r = NETDB_SYSCALL6(SYS_dns_query, (long)name, (long)out, (long)ns[i], resolv_wait_ms(opt->timeout, i, nns),
+            long r = NETDB_SYSCALL6(SYS_dns_query, (long)name, (long)out, (long)ns[(first + i) % nns], resolv_wait_ms(opt->timeout, i, nns),
                                     ans ? (long)ans->buf : 0, ans ? (long)sizeof ans->buf : 0);
             if (r == 0 && ans) ans->len = sizeof ans->buf;
             if (r == -11 || r == -111) last_reply = r; /* SERVFAIL; NOTIMP or REFUSED: the last reply is what res_search sees */
@@ -338,9 +365,10 @@ long resolv_ptr(const void *addr, int family, char *name, size_t cap) {
     resolv_conf_search(conf, len, unused_word, unused_len, 1, &opt);
     char buf[256];
     long last = -110;
+    size_t first = resolv_first_server(&opt, nns);
     for (int a = 0; a < opt.attempts; a++) {
         for (size_t i = 0; i < nns; i++) {
-            long r = NETDB_SYSCALL6(SYS_dns_ptr, (long)addr, family, (long)ns[i], resolv_wait_ms(opt.timeout, i, nns), (long)buf, (long)sizeof buf);
+            long r = NETDB_SYSCALL6(SYS_dns_ptr, (long)addr, family, (long)ns[(first + i) % nns], resolv_wait_ms(opt.timeout, i, nns), (long)buf, (long)sizeof buf);
             if (r == -11 || r == -111) last = r;
             if (r == -11 || r == -111 || r == -110) continue;
             if (r == 0) {
