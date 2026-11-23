@@ -1171,8 +1171,29 @@ pub fn statusFlagsOf(desc: *FileDescriptor) u32 {
 /// `kind` is the F_SETOWN_EX type (fcntl_policy.F_OWNER_*): a TID owner is signalled as that thread, a PID owner as its process.
 /// Write one of the procfs entries recognized by isSysctl. At an offset past 0 the write is swallowed whole and changes nothing
 /// (sysctl_writes_strict, measured in hello383); the rest of /proc is read-only.
+/// comm_write: the first 15 bytes of a write to /proc/<pid>/comm become the name of task `pid` (zero-filled), when the caller is in
+/// its thread group; another process's is EINVAL, a vanished one ESRCH. The whole count is reported written.
+/// `buf` is the kernel copy file_io made of the user's data.
+fn commWrite(pid: u32, buf: [*]const u8, count: usize) i64 {
+    const n = @min(count, 15);
+    const raw = buf[0..n];
+    const task_mod = @import("../proc/task.zig");
+    const caller = @import("../proc/process_mgmt.zig").getpid();
+    var i: u32 = 0;
+    while (i < task_mod.MAX_TASKS) : (i += 1) {
+        const t = task_mod.getTask(i) orelse continue;
+        if (t.tid != pid) continue;
+        const tgid: i64 = if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid;
+        if (tgid != caller) return -22;
+        t.comm = @import("../proc/comm_policy.zig").fromBytes(raw);
+        return @intCast(count);
+    }
+    return -3; // ESRCH
+}
+
 fn sysctlWrite(desc: *FileDescriptor, buf: [*]const u8, count: usize, offset: u64) i64 {
     const procfs = @import("procfs.zig");
+    if (desc.proc_file_type == .pid_comm) return commWrite(desc.proc_pid, buf, count);
     if (!procfs.isSysctl(desc.proc_file_type)) return -1;
     if (count > 4095) return -22;
     if (procfs.isSysctl(desc.proc_file_type) and offset != 0 and desc.proc_file_type != .ip_local_reserved_ports) return @intCast(count);
@@ -2168,8 +2189,9 @@ pub const FdTable = struct {
                 .proc_file_type = pfile,
                 .proc_pid = pid,
                 .status_flags = status,
-                // The writable /proc files are the sysctls; every other one refuses a write before it gets here (writeInner's EBADF gate).
-                .writable = is_writable and procfs.isSysctl(pfile),
+                // The writable /proc files are the sysctls and /proc/<pid>/comm (mode 0644, comm_write); every other one refuses a write
+                // before it gets here (writeInner's EBADF gate).
+                .writable = is_writable and (procfs.isSysctl(pfile) or pfile == .pid_comm),
             };
             self.publishFd(slot);
             return @intCast(slot);

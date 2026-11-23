@@ -4973,7 +4973,7 @@ test "net.ipv4.ping_group_range: who may create a ping socket, read and written 
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (!udp.pingGroupAllowed(t.egid, t.groups[0..t.ngroups])) return -13; // EACCES") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "str.eql(rest, \"sys/net/ipv4/ping_group_range\")") != null);
     // Opened for writing, the descriptor is writable (writeInner refuses any other with EBADF before the procfs write is reached).
-    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "                .writable = is_writable and procfs.isSysctl(pfile),\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.vfs_source, "                .writable = is_writable and (procfs.isSysctl(pfile) or pfile == .pid_comm),\n") != null);
 }
 
 test "IPv6 ping sockets: SOCK_DGRAM/IPPROTO_ICMPV6 share the ident table but only take replies of their own family (hello374)" {
