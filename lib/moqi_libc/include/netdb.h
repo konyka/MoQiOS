@@ -63,6 +63,10 @@ size_t hosts_reverse(const char *text, size_t len, const uint8_t addr[4], const 
 /* hosts_reverse for a 16-byte IPv6 address: the first IPv6 line with the same address (in any textual form). */
 size_t hosts_reverse6(const char *text, size_t len, const uint8_t addr[16], const char **name);
 
+/* Reverse lookup for gethostbyaddr: like hosts_reverse/hosts_reverse6, but returns the matching line's whole names
+ * field (canonical name and aliases, separated by blanks) rather than only its first name. */
+size_t hosts_reverse_names(const char *text, size_t len, int family, const uint8_t *addr, const char **names);
+
 /* Build a Linux `struct sockaddr_in` (16 bytes) for bind/connect/sendto: family AF_INET (2) as a little-endian
  * u16, `port` in network byte order, the 4 address bytes, 8 bytes of zero padding. */
 void ipv4_sockaddr(const uint8_t addr[4], uint16_t port, uint8_t out[16]);
@@ -84,6 +88,7 @@ long tcp_connect_host(const char *host, uint16_t port);
 #define AF_INET6 10
 
 /* h_errno values (glibc numbering). */
+#define NETDB_INTERNAL -1
 #define HOST_NOT_FOUND 1
 #define TRY_AGAIN      2
 #define NO_RECOVERY    3
@@ -110,6 +115,13 @@ struct hostent *gethostbyname(const char *name);
  * is listed in file order (up to 16 addresses), with h_length 4 or 16; a literal answers only its own family; AF_INET6 has no
  * DNS fallback (the kernel resolver has no AAAA), so a name not in /etc/hosts is HOST_NOT_FOUND. Another family is NO_DATA. */
 struct hostent *gethostbyname2(const char *name, int af);
+
+/* Reverse an IPv4/IPv6 address through /etc/hosts. The result shares gethostbyname's static storage. A mapped IPv6
+ * address is named from the IPv4 lines but returned unchanged. AF_UNSPEC selects AF_INET for len 4 and AF_INET6 for
+ * len 16. An unknown address under an explicit family is HOST_NOT_FOUND (there is no reverse DNS); AF_UNSPEC instead
+ * reports NETDB_INTERNAL/EAFNOSUPPORT on a miss. An unsupported family or short length is NETDB_INTERNAL with errno
+ * EAFNOSUPPORT, and a long length is TRY_AGAIN. NULL is rejected with HOST_NOT_FOUND. */
+struct hostent *gethostbyaddr(const void *addr, unsigned int len, int family);
 
 /* ---- getaddrinfo() ------------------------------------------------------------------------------------------- */
 

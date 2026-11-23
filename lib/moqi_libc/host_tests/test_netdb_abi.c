@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -183,6 +184,42 @@ int main(void) {
         /* An IPv4 line never answers an IPv6 address: ::ffff:a.b.c.d is looked up as a.b.c.d by getnameinfo itself. */
         static const uint8_t mapped[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 10, 5, 0, 6};
         assert(hosts_reverse6(hosts, sizeof(hosts) - 1, mapped, &n) == 0);
+    }
+
+    /* gethostbyaddr needs the whole names field, not only the canonical name that getnameinfo returns (glibc, measured). */
+    {
+        static const char hosts[] = "10.5.0.9 First.example alias other\n10.5.0.9 second\n2001:db8::9 Six.example s6\n";
+        static const uint8_t four[4] = {10, 5, 0, 9};
+        static const uint8_t six[16] = {32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9};
+        const char *n = 0;
+        size_t k = hosts_reverse_names(hosts, sizeof(hosts) - 1, AF_INET, four, &n);
+        assert(k == 25 && memcmp(n, "First.example alias other", 25) == 0);
+        k = hosts_reverse_names(hosts, sizeof(hosts) - 1, AF_INET6, six, &n);
+        assert(k == 14 && memcmp(n, "Six.example s6", 14) == 0);
+        n = 0;
+        assert(hosts_reverse_names(hosts, sizeof(hosts) - 1, AF_INET6, four, &n) == 0 && n == 0);
+        assert(hosts_reverse_names(hosts, sizeof(hosts) - 1, 1, four, &n) == 0 && n == 0);
+    }
+
+    /* Without /etc/hosts a valid reverse lookup is HOST_NOT_FOUND. Bad families and short lengths are
+     * NETDB_INTERNAL/EAFNOSUPPORT; a length greater than the family needs is TRY_AGAIN (glibc, measured). */
+    {
+        static const uint8_t addr[16] = {10, 5, 0, 9};
+        errno = 0; h_errno = 0;
+        assert(gethostbyaddr(addr, 3, AF_INET) == 0 && h_errno == NETDB_INTERNAL && errno == EAFNOSUPPORT);
+        errno = 0; h_errno = 0;
+        assert(gethostbyaddr(addr, 5, AF_INET) == 0 && h_errno == TRY_AGAIN && errno == 0);
+        errno = 0; h_errno = 0;
+        assert(gethostbyaddr(addr, 4, AF_INET6) == 0 && h_errno == NETDB_INTERNAL && errno == EAFNOSUPPORT);
+        errno = 0; h_errno = 0;
+        assert(gethostbyaddr(addr, 17, AF_INET6) == 0 && h_errno == TRY_AGAIN && errno == 0);
+        errno = 0; h_errno = 0;
+        assert(gethostbyaddr(addr, 4, 1) == 0 && h_errno == NETDB_INTERNAL && errno == EAFNOSUPPORT);
+        errno = 0; h_errno = 0;
+        assert(gethostbyaddr(addr, 16, AF_UNSPEC) == 0 && h_errno == NETDB_INTERNAL && errno == EAFNOSUPPORT);
+        errno = 0; h_errno = 0;
+        assert(gethostbyaddr(addr, 4, AF_UNSPEC) == 0 && h_errno == NETDB_INTERNAL && errno == EAFNOSUPPORT);
+        assert(gethostbyaddr((const void *)0, 4, AF_INET) == 0 && h_errno == HOST_NOT_FOUND);
     }
 
     /* gethostbyname2 without /etc/hosts (the host test has no file system): a literal answers only its own family, AF_INET6 has no

@@ -303,9 +303,9 @@ size_t hosts_collect(const char *text, size_t len, const char *name, int family,
     return count;
 }
 
-/* The first name of the first line whose address, parsed for `family`, is the `alen` bytes of `want`. */
-static size_t hosts_reverse_any(const char *text, size_t len, int family, const uint8_t *want, size_t alen, const char **name) {
-    if (!text || !want || !name) return 0;
+/* The whole names field of the first line whose address, parsed for `family`, is the `alen` bytes of `want`. */
+static size_t hosts_reverse_line(const char *text, size_t len, int family, const uint8_t *want, size_t alen, const char **names) {
+    if (!text || !want || !names) return 0;
     size_t pos = 0;
     while (pos < len) {
         size_t end = pos;
@@ -324,16 +324,37 @@ static size_t hosts_reverse_any(const char *text, size_t len, int family, const 
             int ok = family == AF_INET6 ? ipv6_from_text(addr_text, addr) : ipv4_from_text(addr_text, addr);
             if (ok && memcmp(addr, want, alen) == 0) {
                 while (i < stop && hosts_space(text[i])) i++;
-                size_t f = i;
-                while (i < stop && !hosts_space(text[i])) i++;
-                if (i > f) {
-                    *name = text + f;
-                    return i - f;
+                size_t first = i, last = i;
+                while (i < stop) {
+                    while (i < stop && hosts_space(text[i])) i++;
+                    size_t f = i;
+                    while (i < stop && !hosts_space(text[i])) i++;
+                    if (i > f) last = i;
+                }
+                if (last > first) {
+                    *names = text + first;
+                    return last - first;
                 }
             }
         }
         pos = end + 1;
     }
+    return 0;
+}
+
+static size_t hosts_reverse_any(const char *text, size_t len, int family, const uint8_t *want, size_t alen, const char **name) {
+    const char *names = (const char *)0;
+    size_t n = hosts_reverse_line(text, len, family, want, alen, &names);
+    if (!n) return 0;
+    size_t first = 0;
+    while (first < n && !hosts_space(names[first])) first++;
+    *name = names;
+    return first;
+}
+
+size_t hosts_reverse_names(const char *text, size_t len, int family, const uint8_t *addr, const char **names) {
+    if (family == AF_INET) return hosts_reverse_line(text, len, family, addr, 4, names);
+    if (family == AF_INET6) return hosts_reverse_line(text, len, family, addr, 16, names);
     return 0;
 }
 
@@ -439,6 +460,20 @@ static char hostent_addrs[HOSTENT_ADDRS_MAX][16];
 static char *hostent_aliases[HOSTENT_ALIASES_MAX + 1];
 static char *hostent_addr_list[HOSTENT_ADDRS_MAX + 1];
 
+static void hostent_split_aliases(void) {
+    int naliases = 0;
+    char *p = hostent_name;
+    while (*p && *p != ' ' && *p != '\t') p++;
+    while (*p) {
+        *p++ = 0;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        if (naliases < HOSTENT_ALIASES_MAX) hostent_aliases[naliases++] = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+    }
+    hostent_aliases[naliases] = (char *)0;
+}
+
 struct hostent *gethostbyname2(const char *name, int af) {
     if (!name) {
         h_errno = HOST_NOT_FOUND;
@@ -488,19 +523,7 @@ struct hostent *gethostbyname2(const char *name, int af) {
             naddrs = 1;
         }
     }
-    int naliases = 0;
-    if (hostent_name[0]) {
-        /* From /etc/hosts: the canonical name, then the line's other names as aliases (glibc, measured). */
-        char *p = hostent_name;
-        while (*p && *p != ' ' && *p != '\t') p++;
-        while (*p) {
-            *p++ = 0;
-            while (*p == ' ' || *p == '\t') p++;
-            if (!*p) break;
-            if (naliases < HOSTENT_ALIASES_MAX) hostent_aliases[naliases++] = p;
-            while (*p && *p != ' ' && *p != '\t') p++;
-        }
-    } else {
+    if (!hostent_name[0]) {
         size_t n = 0;
         while (name[n] && n + 1 < HOSTENT_NAME_MAX) {
             hostent_name[n] = name[n];
@@ -508,7 +531,8 @@ struct hostent *gethostbyname2(const char *name, int af) {
         }
         hostent_name[n] = 0;
     }
-    hostent_aliases[naliases] = (char *)0;
+    /* From /etc/hosts: the canonical name, then the line's other names as aliases (glibc, measured). */
+    hostent_split_aliases();
     for (size_t k = 0; k < naddrs; k++) {
         memcpy(hostent_addrs[k], found[k].addr, (size_t)alen);
         hostent_addr_list[k] = hostent_addrs[k];
@@ -524,6 +548,70 @@ struct hostent *gethostbyname2(const char *name, int af) {
 }
 
 struct hostent *gethostbyname(const char *name) { return gethostbyname2(name, AF_INET); }
+
+#include "../include/errno.h"
+
+struct hostent *gethostbyaddr(const void *addr, unsigned int len, int family) {
+    int requested_family = family;
+    if (family == AF_UNSPEC) {
+        if (len == 4) family = AF_INET;
+        else if (len == 16) family = AF_INET6;
+    }
+    if (family != AF_INET && family != AF_INET6) {
+        h_errno = NETDB_INTERNAL;
+        errno = EAFNOSUPPORT;
+        return (struct hostent *)0;
+    }
+    int alen = family == AF_INET6 ? 16 : 4;
+    if (len < (unsigned int)alen) {
+        h_errno = NETDB_INTERNAL;
+        errno = EAFNOSUPPORT;
+        return (struct hostent *)0;
+    }
+    if (len > (unsigned int)alen) {
+        h_errno = TRY_AGAIN;
+        return (struct hostent *)0;
+    }
+    if (!addr) {
+        /* glibc dereferences this; fail cleanly instead. */
+        h_errno = HOST_NOT_FOUND;
+        return (struct hostent *)0;
+    }
+
+    const uint8_t *query = (const uint8_t *)addr;
+    int query_family = family;
+    static const uint8_t mapped_prefix[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
+    if (family == AF_INET6 && memcmp(query, mapped_prefix, 12) == 0) {
+        query_family = AF_INET;
+        query += 12;
+    }
+    size_t n = etc_hosts_read();
+    const char *names = (const char *)0;
+    size_t names_len = n ? hosts_reverse_names(etc_hosts_buf, n, query_family, query, &names) : 0;
+    if (!names_len) {
+        if (requested_family == AF_UNSPEC) {
+            h_errno = NETDB_INTERNAL;
+            errno = EAFNOSUPPORT;
+        } else {
+            h_errno = HOST_NOT_FOUND;
+        }
+        return (struct hostent *)0;
+    }
+    if (names_len >= HOSTENT_NAME_MAX) names_len = HOSTENT_NAME_MAX - 1;
+    memcpy(hostent_name, names, names_len);
+    hostent_name[names_len] = 0;
+    hostent_split_aliases();
+    memcpy(hostent_addrs[0], addr, (size_t)alen);
+    hostent_addr_list[0] = hostent_addrs[0];
+    hostent_addr_list[1] = (char *)0;
+    hostent_result.h_name = hostent_name;
+    hostent_result.h_aliases = hostent_aliases;
+    hostent_result.h_addrtype = family;
+    hostent_result.h_length = alen;
+    hostent_result.h_addr_list = hostent_addr_list;
+    h_errno = 0;
+    return &hostent_result;
+}
 
 /* ---- getaddrinfo --------------------------------------------------------------------------------------------- */
 
