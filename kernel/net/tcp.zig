@@ -3967,8 +3967,8 @@ fn sendFromUser(tcb_idx: u32, user_addr: u64, len: u32, oob: bool) i64 {
 /// Uses min(cwnd, snd_wnd) as the effective send window.
 /// When TCP_CORK is set, only full MSS segments are sent (partial segments are held).
 fn flushSendBuffer(tcb: *TcpTcb) void {
-    const unsent_before = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
-    defer if (tcp_recv_policy.notsentWakeOnSendWith(unsent_before, ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat, @import("notsent_lowat_sysctl.zig").get())) {
+    const unsent_before = notsentBytes(tcb);
+    defer if (tcp_recv_policy.notsentWakeOnSendWith(unsent_before, notsentBytes(tcb), tcb.options.notsent_lowat, @import("notsent_lowat_sysctl.zig").get())) {
         markSendWake(tcb);
         write_space_pending.set(tcbIdx(tcb));
     };
@@ -5301,6 +5301,12 @@ pub fn tcpRecvAvailable(tcb_idx: u32) u32 {
     return tcp_urg_policy.inq(tcb.urg_state, tcb.urg_seq, copiedSeq(tcb), ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE), oobInline(tcb));
 }
 
+/// Bytes written but never sent (write_seq - snd_nxt in Linux): an RTO rewinding the send cursor does not count bytes already sent once
+/// (tcp_util.unsentBytes). TCP_NOTSENT_LOWAT and SIOCOUTQNSD use it.
+fn notsentBytes(tcb: *const TcpTcb) u32 {
+    return tcp_util.unsentBytes(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), tcb.snd_una, tcb.snd_nxt, tcb.snd_max);
+}
+
 /// Payload the send ring may hold: SO_SNDBUF (when set) bounds it.
 fn sendLimit(tcb: *const TcpTcb) u32 {
     return tcp_util.bufferLimit(tcb.options.snd_buf_set, tcb.options.snd_buf_size, SEND_BUF_SIZE);
@@ -5309,7 +5315,7 @@ fn sendLimit(tcb: *const TcpTcb) u32 {
 /// Room a send may fill now: the ring's free space under sendLimit, and none once the bytes not yet sent reach TCP_NOTSENT_LOWAT
 /// (sk_stream_memory_free).
 fn sendRoom(tcb: *const TcpTcb) u32 {
-    if (!tcp_recv_policy.notsentAllowsQueueWith(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat, @import("notsent_lowat_sysctl.zig").get())) return 0;
+    if (!tcp_recv_policy.notsentAllowsQueueWith(notsentBytes(tcb), tcb.options.notsent_lowat, @import("notsent_lowat_sysctl.zig").get())) return 0;
     return tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb));
 }
 
@@ -5401,13 +5407,13 @@ pub fn tcpSendSpace(tcb_idx: u32) u32 {
     return sendRoom(tcb);
 }
 
-/// Bytes written to the send ring that have not been sent yet (SIOCOUTQNSD): the part of the ring past the send cursor.
+/// Bytes written to the send ring that have never been sent (SIOCOUTQNSD): the ring past snd_max (notsentBytes).
 /// Lock-free, like tcpSendQueued.
 pub fn tcpSendUnsent(tcb_idx: u32) u32 {
     if (tcb_idx >= MAX_CONNECTIONS) return 0;
     const tcb = &tcbs[tcb_idx];
     if (!tcb.active) return 0;
-    return ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);
+    return notsentBytes(tcb);
 }
 
 /// poll/epoll readiness of a TCP socket. The snapshot is taken under tcp_lock: a timeout stores so_error and then closes the
@@ -5424,7 +5430,7 @@ pub fn tcpReadiness(tcb_idx: u32) u32 {
         .state = tcb.state,
         .recv_bytes = readableLocked(tcb),
         .urgent = tcb.urg_state == .valid,
-        .send_space = if (!tcp_recv_policy.notsentWritableWith(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat, @import("notsent_lowat_sysctl.zig").get())) 0 else tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb)),
+        .send_space = if (!tcp_recv_policy.notsentWritableWith(notsentBytes(tcb), tcb.options.notsent_lowat, @import("notsent_lowat_sysctl.zig").get())) 0 else tcp_util.roomUnder(ringDataLen(tcb.send_head, tcb.send_tail, SEND_BUF_SIZE), sendLimit(tcb)),
         .reset_by_peer = tcb.reset_by_peer,
         .shut_rd = tcb.shut_rd,
         .fin_pending = tcb.fin_pending,

@@ -199,6 +199,15 @@ pub fn ackAdvance(ack: u32, snd_una: u32, snd_nxt: u32, snd_max: u32) ?u32 {
     return acked;
 }
 
+/// Bytes queued but never sent (Linux write_seq - snd_nxt, whose snd_nxt does not move back on a retransmission): of the `queued`
+/// ring bytes starting at snd_una, those past max(snd_nxt, snd_max). An RTO that rewinds snd_nxt does not turn sent bytes back
+/// into unsent ones; a FIN counted in snd_max past the ring gives 0, never a wrap.
+pub fn unsentBytes(queued: u32, snd_una: u32, snd_nxt: u32, snd_max: u32) u32 {
+    const high = if (seqLt(snd_max, snd_nxt)) snd_nxt else snd_max;
+    const sent = high -% snd_una;
+    return if (sent >= queued) 0 else queued - sent;
+}
+
 pub fn unackedPending(snd_una: u32, snd_nxt: u32, snd_max: u32) bool {
     return seqLt(snd_una, snd_max) or snd_nxt != snd_una;
 }

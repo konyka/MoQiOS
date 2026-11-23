@@ -11474,7 +11474,7 @@ test "ioctl(SIOCOUTQNSD): unsent bytes, TCP only" {
     // The count is the ring past the send cursor: queued minus what is in flight.
     const ts = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, ts, "pub fn tcpSendUnsent(tcb_idx: u32) u32 {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ts, "return ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);\n}\n\n/// poll/epoll readiness of a TCP socket") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "return notsentBytes(tcb);\n}\n\n/// poll/epoll readiness of a TCP socket") != null);
 }
 
 test "TCP delivery-rate samples: only bulk, recent acknowledgements measure the path" {
@@ -15909,8 +15909,8 @@ test "TCP_NOTSENT_LOWAT (hello416): Linux tcp_stream_memory_free / tcp_poll / do
     const ts = kt.tcp_source;
     // Every path that queues send data, and the blocking writer's wait, use the same room.
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, ts, "sendRoom(tcb)"));
-    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!tcp_recv_policy.notsentAllowsQueueWith(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat, @import(\"notsent_lowat_sysctl.zig\").get())) return 0;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!tcp_recv_policy.notsentWritableWith(ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat, @import(\"notsent_lowat_sysctl.zig\").get())) 0 else") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!tcp_recv_policy.notsentAllowsQueueWith(notsentBytes(tcb), tcb.options.notsent_lowat, @import(\"notsent_lowat_sysctl.zig\").get())) return 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "if (!tcp_recv_policy.notsentWritableWith(notsentBytes(tcb), tcb.options.notsent_lowat, @import(\"notsent_lowat_sysctl.zig\").get())) 0 else") != null);
 }
 
 test "TCP_NOTSENT_LOWAT wake on new data sent (hello420): Linux tcp_event_new_data_sent -> tcp_check_space -> sk_stream_write_space" {
@@ -15923,8 +15923,8 @@ test "TCP_NOTSENT_LOWAT wake on new data sent (hello420): Linux tcp_event_new_da
     // No limit set: the ACK path's own wake already covers it.
     try std.testing.expect(!rp.notsentWakeOnSend(1500, 0, 0));
     const ts = kt.tcp_source;
-    try std.testing.expect(std.mem.indexOf(u8, ts, "const unsent_before = ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ts, "defer if (tcp_recv_policy.notsentWakeOnSendWith(unsent_before, ringDataLen(tcb.send_unacked, tcb.send_tail, SEND_BUF_SIZE), tcb.options.notsent_lowat, @import(\"notsent_lowat_sysctl.zig\").get())) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "const unsent_before = notsentBytes(tcb);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts, "defer if (tcp_recv_policy.notsentWakeOnSendWith(unsent_before, notsentBytes(tcb), tcb.options.notsent_lowat, @import(\"notsent_lowat_sysctl.zig\").get())) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts, "write_space_pending.set(tcbIdx(tcb));") != null);
     // The EPOLLOUT notes are sent after tcp_lock is released, wherever the lock is released.
     try std.testing.expect(std.mem.indexOf(u8, ts, "if (!write_space_pending.isEmpty()) ws = write_space_pending.takeAll();") != null);

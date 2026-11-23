@@ -21,3 +21,17 @@ test "a cumulative ACK beyond the rewound snd_nxt but within snd_max is accepted
     const w: u32 = 0xffff_f000;
     try std.testing.expectEqual(@as(u32, 0x2000), tu.ackAdvance(w +% 0x2000, w, w +% 0x100, w +% 0x3000).?);
 }
+
+// TCP_NOTSENT_LOWAT / SIOCOUTQNSD count write_seq - snd_nxt, and Linux's snd_nxt never moves back on a retransmission: bytes already
+// sent once are not "unsent" while they wait to be resent (hello416 limitation 1). Here that is the ring past snd_max.
+test "unsent bytes are those past snd_max, not past the rewound send cursor (hello416)" {
+    // 10000 bytes queued from snd_una, 6000 sent before an RTO rewound snd_nxt to snd_una: 4000 unsent, not 10000.
+    try std.testing.expectEqual(@as(u32, 4000), tu.unsentBytes(10000, 1000, 1000, 7000));
+    // No rewind: snd_max == snd_nxt.
+    try std.testing.expectEqual(@as(u32, 4000), tu.unsentBytes(10000, 1000, 7000, 7000));
+    // Everything sent; and a FIN counted in snd_max past the ring never makes it negative.
+    try std.testing.expectEqual(@as(u32, 0), tu.unsentBytes(6000, 1000, 1000, 7000));
+    try std.testing.expectEqual(@as(u32, 0), tu.unsentBytes(6000, 1000, 7001, 7001));
+    // Wrap.
+    try std.testing.expectEqual(@as(u32, 0x100), tu.unsentBytes(0x300, 0xffff_ff00, 0xffff_ff00, 0x100));
+}
