@@ -12403,4 +12403,4 @@ ramdisk 多了 23.2 MiB，空闲内存正好少了 23.2 MiB。内核在整个启
 
 **局限**：管道里已有数据时 Linux 的合并规则没有模拟（只在源缓冲区跨进空洞时才有区别）；`readv`/`writev` 等其他路径没有逐个检查；`riscv64`、`aarch64` 没有缺页路径（`comptime` 只在 x86_64 编译）。
 
-**验证**：`sh lib/moqi_libc/host_tests/run_tests.sh`、`zig build test`、`zig build`、`git diff --check`、`zig build -Darch=riscv64`、`zig build -Darch=aarch64`、SMP=2 QEMU smoke。
+**验证**：`sh lib/moqi_libc/host_tests/run_tests.sh`、`zig build test`、`zig build`、`git diff --check`、`zig build -Darch=riscv64`、`zig build -Darch=aarch64` 通过；SMP=2 QEMU smoke 通过（`PASS: MoQiOS x86_64 smoke reached shell after init auto-tests (SMP=2)`）。
