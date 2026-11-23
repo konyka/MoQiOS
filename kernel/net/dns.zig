@@ -171,6 +171,96 @@ fn queryCore(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yi
 }
 
 fn queryType(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16) Result {
+    const r = queryUdp(hostname, dns_server, timeout_ns, yield, ans, qtype);
+    // A truncated reply is not used: the same query goes to the same server over TCP (glibc res_send, measured).
+    if (r.outcome == .truncated) return queryTcp(hostname, dns_server, timeout_ns, yield, ans, qtype);
+    return r;
+}
+
+/// The question for `hostname`/`qtype` with id `query_id` into `pkt`; its length.
+fn buildQuery(pkt: []u8, hostname: []const u8, qtype: u16, query_id: u16) usize {
+    @memset(pkt[0..12], 0);
+    bo.writeU16BeAt(pkt.ptr, 0, query_id); // id
+    bo.writeU16BeAt(pkt.ptr, 2, 0x0100); // flags: standard query, recursion desired
+    bo.writeU16BeAt(pkt.ptr, 4, 1); // qdcount
+    var offset: usize = 12;
+    offset += encodeDnsName(hostname, pkt[offset..]);
+    bo.writeU16BeAt(pkt.ptr, offset, qtype); // TYPE_A or TYPE_PTR
+    pkt[offset + 2] = 0x00;
+    pkt[offset + 3] = 0x01; // CLASS_IN
+    return offset + 4;
+}
+
+/// What an accepted reply `msg` says for `hostname`/`qtype`: an error RCODE, NODATA, truncation, or the answer (into `ans`); a
+/// reply with answers but no address for the name after its CNAMEs is glibc's NO_RECOVERY (`failed`). null: not a response.
+fn readReply(msg: []const u8, hostname: []const u8, qtype: u16, ans: *dns_answer.Answer) ?Result {
+    const o = dns_policy.classify(bo.readU16BeAt(msg.ptr, 2), bo.readU16BeAt(msg.ptr, 6));
+    if (o == .ignore) return null;
+    if (o != .answer) return .{ .outcome = o };
+    if (qtype == TYPE_PTR) {
+        if (!dns_answer.parsePtr(msg, hostname, ans)) return .{ .outcome = .failed };
+        return .{ .outcome = .answer };
+    }
+    if (!dns_answer.parse(msg, hostname, ans)) return .{ .outcome = .failed };
+    return .{ .outcome = .answer, .ip = ans.addrs[0] };
+}
+
+/// The query over TCP to `dns_server`:53 (RFC 1035 4.2.2: a 2-byte length, then the message), waiting at most `timeout_ns` for the
+/// connection and the whole reply. A refused, reset or closed connection is `tcp_failed`.
+fn queryTcp(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16) Result {
+    const tcp = @import("tcp.zig");
+    const sched = @import("../proc/sched.zig");
+    var pkt: [2 + 512]u8 = undefined;
+    const query_id = newQueryId();
+    const qlen = buildQuery(pkt[2..], hostname, qtype, query_id);
+    dns_policy.tcpLength(&pkt, @intCast(qlen));
+    const owner = sched.currentTaskIndex() orelse 0;
+    const raw = tcp.tcpConnect(dns_server, DNS_PORT, owner);
+    if (raw < 0) return .{ .outcome = .tcp_failed };
+    const idx: u32 = @intCast(raw);
+    defer _ = tcp.tcpClose(idx);
+    const start = tsc.nanos();
+    var iters: u32 = 0;
+    var sent: usize = 0;
+    var buf: [2 + MAX_REPLY]u8 = undefined;
+    var got: usize = 0;
+    while (!dns_policy.waitExpiredAfter(start, tsc.nanos(), iters, timeout_ns)) : (iters += 1) {
+        pumpRx();
+        _ = @import("lo.zig").drain();
+        const st = tcp.tcpPoll(idx);
+        if (st < 0) return .{ .outcome = .tcp_failed }; // refused or reset
+        if (st == 1 and sent < 2 + qlen) {
+            const w = tcp.tcpSend(idx, pkt[sent..].ptr, @intCast(2 + qlen - sent));
+            if (w < 0) return .{ .outcome = .tcp_failed };
+            sent += @intCast(w);
+            _ = @import("lo.zig").drain();
+        }
+        if (sent == 2 + qlen) {
+            const r = tcp.tcpRecv(idx, buf[got..].ptr, @intCast(buf.len - got));
+            if (r > 0) {
+                got += @intCast(r);
+                if (dns_policy.tcpFrameComplete(buf[0..got])) {
+                    const n = dns_policy.tcpFrameLen(buf[0..got]).?;
+                    const msg = buf[2 .. 2 + n];
+                    if (n < 12 or bo.readU16BeAt(msg.ptr, 0) != query_id) return .{ .outcome = .failed };
+                    if (readReply(msg, hostname, qtype, ans)) |res| {
+                        // A truncated TCP reply has nowhere further to go.
+                        return if (res.outcome == .truncated) .{ .outcome = .failed } else res;
+                    }
+                    return .{ .outcome = .failed };
+                }
+                if (got == buf.len) return .{ .outcome = .failed }; // longer than we read
+                continue;
+            }
+            if (r == 0) return .{ .outcome = .tcp_failed }; // closed before the whole reply
+            if (r != -11) return .{ .outcome = .tcp_failed };
+        }
+        if (yield) |y| (if (!y()) return .{ .outcome = .interrupted }) else cpu.pause();
+    }
+    return .{ .outcome = .timeout };
+}
+
+fn queryUdp(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16) Result {
     var pkt: [512]u8 = @splat(0);
     var offset: usize = 0;
 
@@ -183,22 +273,8 @@ fn queryType(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yi
     };
     defer udp.releasePort(src_port);
 
-    // DNS Header (big-endian / network byte order)
     const query_id = newQueryId();
-    bo.writeU16BeAt(&pkt, 0, query_id); // id
-    bo.writeU16BeAt(&pkt, 2, 0x0100); // flags: standard query, recursion desired
-    bo.writeU16BeAt(&pkt, 4, 1); // qdcount
-    // ancount, nscount, arcount already zero (@splat)
-    offset += 12;
-
-    // Question section: encode hostname as DNS name
-    offset += encodeDnsName(hostname, pkt[offset..]);
-
-    // Question type and class
-    bo.writeU16BeAt(&pkt, offset, qtype); // TYPE_A or TYPE_PTR
-    pkt[offset + 2] = 0x00;
-    pkt[offset + 3] = 0x01; // CLASS_IN
-    offset += 4;
+    offset = buildQuery(&pkt, hostname, qtype, query_id);
 
     // Send query. udp.sendTo does not wait: with no ARP entry for the server it only broadcasts an ARP request
     // and returns false, so the first attempt on a cold ARP cache always fails. Pump the NIC so the reply is
@@ -228,19 +304,8 @@ fn queryType(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yi
 
         const n = udp.recvFrom(src_port, &buf, @intCast(buf.len), &from_ip, &from_port);
         if (n >= 12 and dns_policy.acceptResponse(from_ip, from_port, dns_server, bo.readU16BeAt(&buf, 0), query_id)) {
-            // Any reply settles the query, without waiting out the limit for another: an error RCODE (NXDOMAIN, SERVFAIL, ...), a
-            // reply with no answers (NODATA), or answers with no address for the name after following its CNAMEs (glibc's
-            // NO_RECOVERY: `failed`).
-            const o = dns_policy.classify(bo.readU16BeAt(&buf, 2), bo.readU16BeAt(&buf, 6));
-            if (o != .ignore) {
-                if (o != .answer) return .{ .outcome = o };
-                if (qtype == TYPE_PTR) {
-                    if (!dns_answer.parsePtr(buf[0..@intCast(n)], hostname, ans)) return .{ .outcome = .failed };
-                    return .{ .outcome = .answer };
-                }
-                if (!dns_answer.parse(buf[0..@intCast(n)], hostname, ans)) return .{ .outcome = .failed };
-                return .{ .outcome = .answer, .ip = ans.addrs[0] };
-            }
+            // Any reply settles the query, without waiting out the limit for another.
+            if (readReply(buf[0..@intCast(n)], hostname, qtype, ans)) |res| return res;
         }
         if (yield) |y| (if (!y()) return .{ .outcome = .interrupted }) else cpu.pause();
     }

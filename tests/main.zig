@@ -2034,7 +2034,8 @@ test "dns: the wait for a reply gives the CPU away, so a server on the same CPU 
     try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn resolveVia(hostname: []const u8, server: [4]u8, yield: Yield) [4]u8 {") != null);
     try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn resolveYield(hostname: []const u8, yield: Yield) [4]u8 {") != null);
     // Both waits (sending through ARP, and the reply) yield, and a fatal/handled signal during the sleep ends the query.
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, dns, "if (yield) |y| (if (!y()) return .{ .outcome = .interrupted }) else cpu.pause();"));
+    // The UDP waits (sending through ARP, and the reply) and the TCP wait (hello524) all yield.
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, dns, "if (yield) |y| (if (!y()) return .{ .outcome = .interrupted }) else cpu.pause();"));
     const se = kt.syscall_entry_source;
     try std.testing.expect(std.mem.indexOf(u8, se, "@import(\"../../net/dns.zig\").resolveYield(hp.stripTrailingDot(name), dnsSleep)") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "@import(\"../../net/dns.zig\").resolveVia(hp.stripTrailingDot(name), server, dnsSleep)") != null);
@@ -2055,7 +2056,8 @@ test "dns: a reply that answers the query ends the wait, also when it says there
     try std.testing.expectEqual(dp.Verdict.ignore, dp.verdict(0x0100, 1)); // a query, not a response
     // The wait loop stops on either verdict.
     const dns = kt.dns_source;
-    try std.testing.expect(std.mem.indexOf(u8, dns, "const o = dns_policy.classify(bo.readU16BeAt(&buf, 2), bo.readU16BeAt(&buf, 6));\n            if (o != .ignore) {\n                if (o != .answer) return .{ .outcome = o };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "const o = dns_policy.classify(bo.readU16BeAt(msg.ptr, 2), bo.readU16BeAt(msg.ptr, 6));\n    if (o == .ignore) return null;\n    if (o != .answer) return .{ .outcome = o };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "if (readReply(buf[0..@intCast(n)], hostname, qtype, ans)) |res| return res;") != null);
 }
 
 test "dns_resolve_via: a caller-chosen nameserver, and the shared cache stays out of it (hello514)" {
@@ -4250,9 +4252,11 @@ test "dns query wait expires on TSC time or an iteration backstop, never on time
     // Wiring: neither wait loop in queryDns consults the tick counter any more.
     const src = kt.dns_source;
     const q = std.mem.indexOf(u8, src, "fn queryCore(") orelse return error.TestUnexpectedResult;
-    const body = src[q .. q + 5000];
+    const q_end = std.mem.indexOf(u8, src, "/// Drain pending NIC RX frames") orelse return error.TestUnexpectedResult;
+    const body = src[q..q_end];
     try std.testing.expect(std.mem.indexOf(u8, body, "getTickCount") == null);
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, body, "dns_policy.waitExpiredAfter("));
+    // Two UDP waits and the TCP wait.
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, body, "dns_policy.waitExpiredAfter("));
     // dns_resolve and dns_resolve_via keep the 2 s limit.
     try std.testing.expect(std.mem.indexOf(u8, src, "const r = queryCore(hostname, dns_server, dns_policy.QUERY_TIMEOUT_NS, yield, &ans);") != null);
 }
@@ -18382,7 +18386,7 @@ test "dns_query (507): a reply's RCODE and answers decide the outcome, and the w
     try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryVia(hostname: []const u8, server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {") != null);
     // hello520: answers with no address for the name (only a CNAME, or records for other owners) are NO_RECOVERY in glibc, so the
     // kernel reports them as `failed`; NODATA is only NOERROR without answers.
-    try std.testing.expect(std.mem.indexOf(u8, dns, "if (!dns_answer.parse(buf[0..@intCast(n)], hostname, ans)) return .{ .outcome = .failed };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "if (!dns_answer.parse(msg, hostname, ans)) return .{ .outcome = .failed };") != null);
 }
 
 test "dns_answer: CNAME chains, several A records and the canonical name, as glibc's getanswer_r reads them (hello520)" {
@@ -18708,4 +18712,29 @@ test "a DNS reply over 512 bytes is read whole, and up to 64 addresses and 16 al
     try std.testing.expect(std.mem.indexOf(u8, dns, "var buf: [512]u8") == null);
     try std.testing.expect(std.mem.indexOf(u8, dns, "var buf: [MAX_REPLY]u8 = undefined;") != null);
     try std.testing.expect(std.mem.indexOf(u8, dns, "const MAX_REPLY: usize = 4096;") != null);
+}
+
+test "a DNS reply with TC set is not used: the query is asked again over TCP to the same server (glibc 2.44, measured) (hello524)" {
+    const dp = kt.dns_policy;
+    // The TC bit (0x0200) marks a truncated reply: its answers are not used, whatever they hold.
+    try std.testing.expectEqual(dp.Outcome.truncated, dp.classify(0x8380, 0));
+    try std.testing.expectEqual(dp.Outcome.truncated, dp.classify(0x8380, 3));
+    try std.testing.expectEqual(dp.Outcome.truncated, dp.classify(0x8383, 0)); // TC with NXDOMAIN: still truncated
+    try std.testing.expectEqual(dp.Outcome.answer, dp.classify(0x8180, 1));
+    // TCP framing: a 2-byte big-endian length before the message (RFC 1035 4.2.2); a reply is whole once the bytes the length
+    // promises are in.
+    var f: [4]u8 = undefined;
+    dp.tcpLength(&f, 0x1234);
+    try std.testing.expectEqual(@as(u8, 0x12), f[0]);
+    try std.testing.expectEqual(@as(u8, 0x34), f[1]);
+    try std.testing.expectEqual(@as(?usize, null), dp.tcpFrameLen(&.{0x01}));
+    try std.testing.expectEqual(@as(?usize, 0x01ff), dp.tcpFrameLen(&.{ 0x01, 0xff }));
+    try std.testing.expect(!dp.tcpFrameComplete(&.{ 0, 3, 1, 2 }));
+    try std.testing.expect(dp.tcpFrameComplete(&.{ 0, 3, 1, 2, 3 }));
+    // A refused or closed TCP connection is "no reply from this server" for the resolver: EAGAIN (TRY_AGAIN), at once.
+    try std.testing.expectEqual(@as(i64, -11), dp.queryResult(.tcp_failed));
+    // Wiring: queryType retries over TCP on a truncated reply, for A and PTR alike; the TCP wait uses the same limit and yield.
+    const dns = kt.dns_source;
+    try std.testing.expect(std.mem.indexOf(u8, dns, "if (r.outcome == .truncated) return queryTcp(hostname, dns_server, timeout_ns, yield, ans, qtype);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "fn queryTcp(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16) Result {") != null);
 }

@@ -75,13 +75,16 @@ pub fn timeoutValid(ms: u64) bool {
 /// - refused: NOTIMP (4) or REFUSED (5): the next server too, but a search list stops there;
 /// - failed: any other RCODE (FORMERR 1, 6..15), which ends the query for this name;
 /// - timeout, interrupted: no reply in time, or a signal ended the wait;
-/// - ignore: the packet is not a response (keep waiting).
-pub const Outcome = enum { answer, nodata, nxdomain, next_server, refused, failed, timeout, interrupted, ignore };
+/// - ignore: the packet is not a response (keep waiting);
+/// - truncated: TC is set; the answers are not used and the query is asked again over TCP (glibc, measured);
+/// - tcp_failed: that TCP connection was refused, closed or reset before a whole reply: no reply from this server (TRY_AGAIN).
+pub const Outcome = enum { answer, nodata, nxdomain, next_server, refused, failed, timeout, interrupted, ignore, truncated, tcp_failed };
 
 /// The outcome of an accepted reply from its header: `flags` the second header word, `ancount` the answer count. `answer` only
 /// says there are answers to look through; the caller turns it into `nodata` when none of them is an A record.
 pub fn classify(flags: u16, ancount: u16) Outcome {
     if ((flags & 0x8000) == 0) return .ignore;
+    if ((flags & 0x0200) != 0) return .truncated;
     return switch (flags & 0x000F) {
         0 => if (ancount == 0) .nodata else .answer,
         3 => .nxdomain,
@@ -104,5 +107,25 @@ pub fn queryResult(o: Outcome) i64 {
         .timeout => -110,
         .interrupted => -4,
         .ignore => -110,
+        .truncated => -110,
+        .tcp_failed => -11,
     };
+}
+
+/// The 2-byte big-endian length a DNS message carries over TCP (RFC 1035 4.2.2), into `out[0..2]`.
+pub fn tcpLength(out: []u8, len: u16) void {
+    out[0] = @intCast(len >> 8);
+    out[1] = @intCast(len & 0xff);
+}
+
+/// The message length a TCP stream announces in its first two bytes; null until both have arrived.
+pub fn tcpFrameLen(got: []const u8) ?usize {
+    if (got.len < 2) return null;
+    return @as(usize, got[0]) << 8 | got[1];
+}
+
+/// Whether `got` holds the length prefix and the whole message it announces.
+pub fn tcpFrameComplete(got: []const u8) bool {
+    const n = tcpFrameLen(got) orelse return false;
+    return got.len >= 2 + n;
 }
