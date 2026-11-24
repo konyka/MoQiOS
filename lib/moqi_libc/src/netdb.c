@@ -1016,30 +1016,32 @@ static const char *const nss_databases[] = {
     "passwd_compat", "protocols", "publickey", "rpc", "services", "shadow", "shadow_compat",
 };
 
-/* The database a line names, and the offset just past its colon. `db` is its index in nss_databases, or -1 when the line names
- * none of them (a syntax error, a comment or another database). */
-static size_t nss_line_db(const char *text, size_t pos, size_t end, int *db) {
+/* The database a line names, and the offset where its sources start. `db` is its index in nss_databases, or -1 when the line
+ * names none of them (a syntax error, a comment or another database). glibc's process_line (2.44, measured): the name ends at
+ * the first blank or colon and any mix of blanks and colons follows it, so "hosts files" and "hosts::files" are hosts lines; a
+ * name with nothing after it is one only when its line ended with a newline (`has_nl`), which glibc sees as a blank. */
+static size_t nss_line_db(const char *text, size_t pos, size_t end, int has_nl, int *db) {
     *db = -1;
     size_t i = pos;
     while (i < end && nss_space(text[i])) i++;
     size_t w = i;
     while (i < end && !nss_space(text[i]) && text[i] != ':') i++;
     size_t wl = i - w;
-    while (i < end && nss_space(text[i])) i++;
-    if (i >= end || text[i] != ':' || wl == 0) return 0;
+    if (wl == 0 || (i >= end && !has_nl)) return 0;
+    while (i < end && (nss_space(text[i]) || text[i] == ':')) i++;
     for (size_t k = 0; k < sizeof nss_databases / sizeof nss_databases[0]; k++) {
         if (strlen(nss_databases[k]) == wl && memcmp(text + w, nss_databases[k], wl) == 0) {
             *db = (int)k;
             break;
         }
     }
-    return i + 1;
+    return i;
 }
 
-/* The offset just past "hosts:" when text[pos, end) is a hosts line, else 0. */
-static size_t nss_hosts_line(const char *text, size_t pos, size_t end) {
+/* The offset where the sources start when text[pos, end) is a hosts line, else 0. */
+static size_t nss_hosts_line(const char *text, size_t pos, size_t end, int has_nl) {
     int db;
-    size_t a = nss_line_db(text, pos, end, &db);
+    size_t a = nss_line_db(text, pos, end, has_nl, &db);
     return a && db >= 0 && strcmp(nss_databases[db], "hosts") == 0 ? a : 0;
 }
 
@@ -1050,7 +1052,7 @@ size_t nsswitch_hosts(const char *text, size_t len, struct nss_source *out, size
     for (size_t pos = 0; text && pos < len;) {
         size_t end = pos;
         while (end < len && text[end] != '\n') end++;
-        size_t a = nss_hosts_line(text, pos, end);
+        size_t a = nss_hosts_line(text, pos, end, end < len);
         if (a) {
             found = 1;
             found_a = a;
@@ -1105,7 +1107,7 @@ static void nss_close(long fd) { syscall1(SYS_close, fd); }
  * read in pieces and the last complete hosts line kept, so its length does not matter (glibc 2.44, measured with 100000
  * bytes). */
 static size_t hosts_sources(struct nss_source *out) {
-    char chunk[512], line[NSS_LINE_MAX], last[NSS_LINE_MAX];
+    char chunk[512], line[NSS_LINE_MAX], last[NSS_LINE_MAX + 1];
     size_t ll = 0, last_len = 0;
     int have = 0, voided = 0;
     long fd = nss_open();
@@ -1121,7 +1123,7 @@ static size_t hosts_sources(struct nss_source *out) {
                 }
                 size_t keep = ll < sizeof line ? ll : sizeof line;
                 int db;
-                size_t a = nss_line_db(line, 0, keep, &db);
+                size_t a = nss_line_db(line, 0, keep, 1, &db);
                 if (a && db >= 0) {
                     /* Any known database's line must parse; glibc stops reading the file at the first one that does not. */
                     struct nss_source tmp[NSS_HOSTS_MAX];
@@ -1129,8 +1131,10 @@ static size_t hosts_sources(struct nss_source *out) {
                     nss_parse_list_err(line, a, keep, tmp, NSS_HOSTS_MAX, &bad);
                     if (bad) voided = 1;
                     else if (strcmp(nss_databases[db], "hosts") == 0) {
+                        /* Kept with its newline, so a bare "hosts" stays a hosts line when nsswitch_hosts reads it again. */
                         memcpy(last, line, keep);
-                        last_len = keep;
+                        last[keep] = '\n';
+                        last_len = keep + 1;
                         have = 1;
                     }
                 }

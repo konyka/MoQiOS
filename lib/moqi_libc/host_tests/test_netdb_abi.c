@@ -1274,6 +1274,18 @@ int main(void) {
         assert(NSS("hosts: DNS FILES\n") == 2 && s[0].service == NSS_SERVICE_OTHER && s[1].service == NSS_SERVICE_OTHER);
         assert(NSS("hosts: dns\n#hosts: files\n  # hosts: files\n") == 1 && s[0].service == NSS_SERVICE_DNS);
         assert(NSS("hosts: files\nhosts: dns\n") == 1 && s[0].service == NSS_SERVICE_DNS);
+        /* glibc's process_line (glibc 2.44, measured): the database name ends at the first blank or colon, and any mix of
+         * blanks and colons separates it from the sources, so "hosts files", "hosts::files" and "hosts : : dns files" are
+         * hosts lines and a bare "hosts" is an empty one; ":files" (no name) and "hostsfiles" (another name) are not. */
+        assert(NSS("hosts files\n") == 1 && s[0].service == NSS_SERVICE_FILES);
+        assert(NSS("hosts\tfiles\n") == 1 && s[0].service == NSS_SERVICE_FILES);
+        assert(NSS("hosts::files\n") == 1 && s[0].service == NSS_SERVICE_FILES);
+        assert(NSS("hosts : : dns files\n") == 2 && s[0].service == NSS_SERVICE_DNS && s[1].service == NSS_SERVICE_FILES);
+        assert(NSS("hosts: dns\nhosts files\n") == 1 && s[0].service == NSS_SERVICE_FILES);
+        assert(NSS("hosts: files\nhosts\n") == 0);
+        assert(NSS("hosts: files\nhosts   \n") == 0);
+        assert(NSS("hosts: dns\n:files\n") == 1 && s[0].service == NSS_SERVICE_DNS);
+        assert(NSS("hosts: dns\nhostsfiles\n") == 1 && s[0].service == NSS_SERVICE_DNS);
         assert(NSS("hosts: dns files\nhosts:\n") == 0);
         assert(NSS("hosts:   \n") == 0);
         assert(NSS("hosts: files [NOTFOUND=return] dns\n") == 2 && s[0].stop == (ok_only | 1u << NSS_STATUS_NOTFOUND) && s[1].stop == ok_only);
@@ -1547,7 +1559,7 @@ int main(void) {
                     "hosts: files\npasswd: files [\n", "passwd: files [\nhosts: files\n", "hosts: files\ngroup: x [FOO=bar]\n",
                     "hosts: files\nservices: files [\n", "hosts: files\nshadow: files [UNAVAIL=return\n",
                     "hosts: files\naliases: files [NOTFOUND=foo]\n", "hosts: dns []\nhosts: files\n",
-                    "hosts: files\n  passwd : files [\n", "group_compat: x [\n",
+                    "hosts: files\n  passwd : files [\n", "group_compat: x [\n", "hosts: dns\npasswd files [\n",
                 };
                 for (unsigned v = 0; v < sizeof voids / sizeof voids[0]; v++) {
                     moqi_test_nsswitch_conf = voids[v];
@@ -1591,6 +1603,15 @@ int main(void) {
                     assert(getnameinfo(sal, 16, hbuf, sizeof hbuf, 0, 0, 0) == EAI_SYSTEM);
                     assert(q_calls == 0);
                 }
+                /* Read from the file, "hosts files" is a hosts line and a bare "hosts" an empty one (no source: nothing is
+                 * asked and the lookup fails), not a missing line that would mean "files dns". */
+                moqi_test_nsswitch_conf = "hosts: dns\nhosts files\n";
+                q_script(one, ok, 1);
+                lp = gethostbyname("late534.test");
+                assert(lp && (unsigned char)lp->h_addr_list[0][3] == 1 && q_calls == 0);
+                moqi_test_nsswitch_conf = "hosts: files\nhosts\n";
+                q_script(one, ok, 1);
+                assert(!gethostbyname("late534.test") && q_calls == 0);
                 /* Unknown databases and comments do not void it. */
                 static const char *const kept[] = {"hosts: files\nsudoers: files [\n", "hosts: files\nautomount: x [\n",
                                                    "hosts: files\nunknowndb: x [\n", "hosts: files\n#passwd: files [\n",
