@@ -19077,3 +19077,39 @@ test "dns_query2 (510): an AF_UNSPEC lookup's A and AAAA queries leave together,
     try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryPair(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans4: *dns_answer.Answer, ans6: *dns_answer.Answer, qf: dns_policy.QueryFlags) [2]dns_policy.Outcome {") != null);
     try std.testing.expect(std.mem.indexOf(u8, dns, "const ids = [2]u16{ newQueryId(), newQueryId() };") != null);
 }
+
+test "SO_PEEK_OFF on AF_UNIX sockets: peeks start at the offset and advance it, a read pulls it back (Linux 7.x, measured) (hello549)" {
+    const sp = kt.sockopt_policy;
+    try std.testing.expectEqual(@as(u64, 42), sp.SO_PEEK_OFF);
+    // Off is -1 until set; any negative value set is kept as given (Linux sk_set_peek_off stores the int).
+    var s: sp.Stored = .{};
+    try std.testing.expectEqual(@as(i32, -1), s.peek_off);
+    var out: [16]u8 = undefined;
+    const f: sp.Facts = .{ .id = sp.identity(.unix_stream, false) };
+    try std.testing.expectEqual(@as(?usize, 4), sp.encodeGet(s, f, sp.SO_PEEK_OFF, &out));
+    try std.testing.expectEqual(@as(i32, -1), std.mem.readInt(i32, out[0..4], .little));
+    var three = [_]u8{ 3, 0, 0, 0 };
+    try std.testing.expectEqual(@as(i64, 0), sp.applySet(&s, sp.SO_PEEK_OFF, &three));
+    try std.testing.expectEqual(@as(i32, 3), s.peek_off);
+    var neg5: [4]u8 = undefined;
+    std.mem.writeInt(i32, &neg5, -5, .little);
+    try std.testing.expectEqual(@as(i64, 0), sp.applySet(&s, sp.SO_PEEK_OFF, &neg5));
+    try std.testing.expectEqual(@as(i32, -5), s.peek_off);
+    try std.testing.expectEqual(@as(i64, -22), sp.applySet(&s, sp.SO_PEEK_OFF, three[0..2]));
+
+    // A stream (measured "abcdef"+"ghij"): where a peek starts (null: no offset) and the offset after it, and after a read.
+    try std.testing.expectEqual(@as(?usize, null), sp.peekStart(-1));
+    try std.testing.expectEqual(@as(?usize, 2), sp.peekStart(2));
+    try std.testing.expectEqual(@as(i32, 5), sp.peekAdvance(2, 3));
+    try std.testing.expectEqual(@as(i32, -1), sp.peekAdvance(-1, 3));
+    try std.testing.expectEqual(@as(i32, 1), sp.readPullBack(5, 4));
+    try std.testing.expectEqual(@as(i32, 0), sp.readPullBack(2, 3));
+    try std.testing.expectEqual(@as(i32, 94), sp.readPullBack(100, 6));
+    try std.testing.expectEqual(@as(i32, -1), sp.readPullBack(-1, 6));
+    try std.testing.expectEqual(@as(i32, -5), sp.readPullBack(-5, 6));
+
+    // Wiring: AF_UNIX peeks and reads go through the offset.
+    const us = kt.unix_socket_source;
+    try std.testing.expect(std.mem.indexOf(u8, us, "sp.peekStart(sock.opts.peek_off)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, us, "sock.opts.peek_off = sp.readPullBack(sock.opts.peek_off,") != null);
+}

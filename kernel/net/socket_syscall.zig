@@ -1248,7 +1248,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
                     result = 0;
                     break;
                 }
-                const w = net_mod.unix_socket.unixWaitReadable(unix_idx);
+                const w = net_mod.unix_socket.unixWaitPeekable(unix_idx);
                 if (w != 0) return w;
                 result = net_mod.unix_socket.unixPeek(unix_idx, &tmp_buf, to_read, &full_len_u);
             }
@@ -1864,7 +1864,7 @@ fn unixRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8
                 n = 0;
                 break;
             }
-            const w = net_mod.unix_socket.unixWaitReadable(idx);
+            const w = net_mod.unix_socket.unixWaitPeekable(idx);
             if (w != 0) return w;
             n = net_mod.unix_socket.unixPeek(idx, &data, room, &full);
         }

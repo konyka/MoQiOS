@@ -1072,6 +1072,7 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
     }
     if (level == ipo.SOL_IP or level == ipo.SOL_IPV6) return setIpOpt(ref, resolved_v6, level, optname, optval_ptr, optlen);
     if (level != SOL_SOCKET and level != SOL_TCP) return unknownLevel(ref, resolved_v6, false);
+    if (level == SOL_SOCKET and optname == sp.SO_PEEK_OFF and ref != .unix) return -92;
     switch (ref) {
         .tcp => |idx| {
             if (level == SOL_SOCKET and (sp.storedOnly(optname) or (sp.flagBit(optname) != null and optname != SO_REUSEADDR and optname != SO_KEEPALIVE))) {
@@ -1187,6 +1188,8 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
         },
     }
 
+    // SO_PEEK_OFF is kept and acted on for AF_UNIX only (hello549); the other kinds still refuse it.
+    if (optname == sp.SO_PEEK_OFF and ref != .unix) return -92;
     var val: [16]u8 = undefined;
     const val_len = sp.encodeGet(stored, facts, optname, &val) orelse return -92;
     const to_copy = @min(val_len, user_optlen);

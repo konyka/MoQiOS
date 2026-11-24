@@ -39,6 +39,8 @@ pub const SO_RCVPRIORITY: u64 = 82;
 pub const SO_MARK: u64 = 36;
 pub const SO_PROTOCOL: u64 = 38;
 pub const SO_DOMAIN: u64 = 39;
+/// SO_PEEK_OFF: where the next MSG_PEEK starts (AF_UNIX here; -1, the default, is "no offset").
+pub const SO_PEEK_OFF: u64 = 42;
 
 pub const AF_UNIX: u32 = 1;
 pub const AF_INET: u32 = 2;
@@ -153,7 +155,29 @@ pub const Stored = struct {
     mark: u32 = 0,
     /// SO_BINDTODEVICE: 0 = none, else the interface index it is bound to.
     bound_if: u8 = 0,
+    /// SO_PEEK_OFF as set; negative means peeks start at the head and leave it alone (Linux sk_peek_off).
+    peek_off: i32 = -1,
 };
+
+/// Where a MSG_PEEK starts in the queued bytes under SO_PEEK_OFF `off`, or null when there is no offset (a negative one).
+pub fn peekStart(off: i32) ?usize {
+    return if (off < 0) null else @intCast(off);
+}
+
+/// The offset after a peek that returned `n` bytes: it moves past them (sk_peek_offset_fwd); a negative one stays.
+pub fn peekAdvance(off: i32, n: usize) i32 {
+    if (off < 0) return off;
+    const moved = @as(u64, @intCast(off)) + n;
+    return if (moved > std.math.maxInt(i32)) std.math.maxInt(i32) else @intCast(moved);
+}
+
+/// The offset after a read took `n` bytes off the head (a datagram counts whole): it moves back by them, not below 0
+/// (sk_peek_offset_bwd); a negative one stays.
+pub fn readPullBack(off: i32, n: usize) i32 {
+    if (off < 0) return off;
+    const o: u64 = @intCast(off);
+    return if (n >= o) 0 else @intCast(o - n);
+}
 
 /// SO_PRIORITY above this (or negative) needs CAP_NET_ADMIN.
 pub const MAX_UNPRIVILEGED_PRIORITY: i32 = 6;
@@ -262,6 +286,10 @@ pub fn applySet(s: *Stored, optname: u64, val: []const u8) i64 {
             s.linger_on = rd32(val) != 0;
             s.linger_sec = rd32(val[4..]);
         },
+        SO_PEEK_OFF => {
+            if (val.len < 4) return -22;
+            s.peek_off = std.mem.readInt(i32, val[0..4], .little);
+        },
         else => return -92,
     }
     return 0;
@@ -303,6 +331,10 @@ pub fn encodeGet(s: Stored, f: Facts, optname: u64, out: *[16]u8) ?usize {
             return 4;
         },
         SO_MARK => return put.int(out, s.mark),
+        SO_PEEK_OFF => {
+            std.mem.writeInt(i32, out[0..4], s.peek_off, .little);
+            return 4;
+        },
         SO_SNDLOWAT => return put.int(out, 1),
         SO_BINDTODEVICE => {
             const n = deviceName(s.bound_if);

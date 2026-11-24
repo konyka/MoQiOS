@@ -1185,25 +1185,57 @@ pub fn unixPeek(idx: u32, buf: [*]u8, len: usize, full_len: *usize) i64 {
     defer unix_lock.release(saved);
     const sock = &unix_sockets[idx];
     if (!sock.active) return -9;
-    if (sock.buf_count == 0) {
+    const sp = @import("sockopt_policy.zig");
+    if (!peekReadyLocked(sock)) {
         if (connectionOriented(sock.sock_type) and !sock.connected and !queuedOnBacklogLocked(idx)) return 0;
         if (shutEofLocked(idx)) return 0;
         return -11;
     }
-    if (sock.sock_type == SOCK_STREAM) {
-        const n = @min(len, @as(usize, sock.buf_count));
-        ringRead(&sock.buffer, sock.buf_read, buf, n);
-        full_len.* = sock.buf_count;
-        return @intCast(n);
-    }
-    if (sock.buf_count < 2) return -11;
-    const lo = sock.buffer[sock.buf_read];
-    const hi = sock.buffer[(sock.buf_read + 1) % UNIX_SOCK_BUF_SIZE];
-    const dgram_len: usize = @min(@as(usize, lo) | (@as(usize, hi) << 8), @as(usize, sock.buf_count) - 2);
-    const n = @min(len, dgram_len);
-    ringRead(&sock.buffer, (sock.buf_read + 2) % UNIX_SOCK_BUF_SIZE, buf, n);
-    full_len.* = dgram_len;
+    // SO_PEEK_OFF (hello549): the peek starts that many bytes in and moves the offset past what it copied.
+    const at = peekAtLocked(sock).?;
+    const n = @min(len, at.avail);
+    ringRead(&sock.buffer, at.pos, buf, n);
+    full_len.* = at.avail;
+    sock.opts.peek_off = sp.peekAdvance(sock.opts.peek_off, n);
     return @intCast(n);
+}
+
+/// Where a peek at SO_PEEK_OFF starts in the ring and how many bytes it can see there: for a stream the bytes past the offset,
+/// for datagrams the rest of the record the offset falls in (whole records before it are skipped; Linux unix_dgram_recvmsg with
+/// sk_peek_offset, measured). null when there is nothing there yet.
+const PeekAt = struct { pos: u32, avail: usize };
+fn peekAtLocked(sock: *const UnixSocket) ?PeekAt {
+    const sp = @import("sockopt_policy.zig");
+    const start = sp.peekStart(sock.opts.peek_off) orelse 0;
+    if (sock.buf_count == 0) return null;
+    if (sock.sock_type == SOCK_STREAM) {
+        if (start >= sock.buf_count) return null;
+        return .{ .pos = (sock.buf_read + @as(u32, @intCast(start))) % UNIX_SOCK_BUF_SIZE, .avail = sock.buf_count - start };
+    }
+    var pos = sock.buf_read;
+    var left: usize = sock.buf_count;
+    var skip = start;
+    while (left >= 2) {
+        const lo = sock.buffer[pos];
+        const hi = sock.buffer[(pos + 1) % UNIX_SOCK_BUF_SIZE];
+        const dgram_len: usize = @min(@as(usize, lo) | (@as(usize, hi) << 8), left - 2);
+        if (skip < dgram_len or (skip == 0 and dgram_len == 0)) {
+            return .{ .pos = (pos + 2 + @as(u32, @intCast(skip))) % UNIX_SOCK_BUF_SIZE, .avail = dgram_len - skip };
+        }
+        skip -= dgram_len;
+        pos = (pos + 2 + @as(u32, @intCast(dgram_len))) % UNIX_SOCK_BUF_SIZE;
+        left -= 2 + dgram_len;
+    }
+    return null;
+}
+
+fn peekReadyLocked(sock: *const UnixSocket) bool {
+    return peekAtLocked(sock) != null;
+}
+
+/// Sleep until a peek on `idx` at its SO_PEEK_OFF would find something (or EOF); 0 = look again.
+pub fn unixWaitPeekable(idx: u32) i64 {
+    return parkOn(idx, .peek, 0, null);
 }
 
 /// SIOCOUTQ: bytes socket `idx` has sent that its peer has not read yet — the
@@ -1291,6 +1323,8 @@ pub fn unixRecvRights(idx: u32, buf: [*]u8, len_in: usize, out: ?*RightsOut) i64
         sock.buf_read = (sock.buf_read + @as(u32, @intCast(n))) % UNIX_SOCK_BUF_SIZE;
         sock.buf_count -= @as(u32, @intCast(n));
         sock.rx_pos += n;
+        const sp = @import("sockopt_policy.zig");
+        sock.opts.peek_off = sp.readPullBack(sock.opts.peek_off, n);
         if (n > 0) writeSpaceLocked(idx, &wake);
 
         if (n > 0 and sock.peer_idx < MAX_UNIX_SOCKETS) {
@@ -1326,6 +1360,9 @@ pub fn unixRecvRights(idx: u32, buf: [*]u8, len_in: usize, out: ?*RightsOut) i64
         const dgram_len: usize = @min(@as(usize, lo) | (@as(usize, hi) << 8), @as(usize, sock.buf_count));
 
         const to_read = @min(len, dgram_len);
+        // The whole datagram leaves the queue, so SO_PEEK_OFF moves back by all of it (hello549).
+        const sp = @import("sockopt_policy.zig");
+        sock.opts.peek_off = sp.readPullBack(sock.opts.peek_off, dgram_len);
         ringRead(&sock.buffer, sock.buf_read, buf, to_read);
         sock.buf_read = (sock.buf_read + @as(u32, @intCast(to_read))) % UNIX_SOCK_BUF_SIZE;
         sock.buf_count -= @as(u32, @intCast(to_read));
@@ -1523,7 +1560,7 @@ fn unlinkWaiter(stack: *?*WaitNode, node: *WaitNode) void {
     }
 }
 
-const WaitKind = enum { read, write, accept };
+const WaitKind = enum { read, peek, write, accept };
 
 /// Park the current task on `idx`'s `kind` wait stack if the socket is still
 /// in the state the caller observed. Returns 0 after a wake-up (re-check),
@@ -1547,6 +1584,8 @@ fn parkOn(idx: u32, kind: WaitKind, min_room: u32, deadline: ?u64) i64 {
         // the wake side holds this same lock, so re-testing here loses no wake-up.
         const still = switch (kind) {
 .read => sock.buf_count == 0 and !shutEofLocked(idx) and !dgramReadShutLocked(idx) and (!connectionOriented(sock.sock_type) or sock.connected or queuedOnBacklogLocked(idx)),
+            // A peek past SO_PEEK_OFF waits for bytes beyond the offset (a stream) or for one more record (datagrams).
+            .peek => !peekReadyLocked(sock) and !shutEofLocked(idx) and !dgramReadShutLocked(idx) and (!connectionOriented(sock.sock_type) or sock.connected or queuedOnBacklogLocked(idx)),
             .accept => sock.backlog_count == 0 and sock.listening,
             // A writer waits while the peer's ring has no room; with no peer
             // to wait for the caller re-tries and gets the real error.
@@ -1557,7 +1596,7 @@ fn parkOn(idx: u32, kind: WaitKind, min_room: u32, deadline: ?u64) i64 {
             return 0;
         }
         const stack: *?*WaitNode = switch (kind) {
-            .read => &sock.read_waiters,
+            .read, .peek => &sock.read_waiters,
             .write => &sock.write_waiters,
             .accept => &sock.accept_waiters,
         };
@@ -1590,7 +1629,7 @@ fn parkOn(idx: u32, kind: WaitKind, min_room: u32, deadline: ?u64) i64 {
         const saved = unix_lock.acquire();
         const sock = &unix_sockets[idx];
         const stack: *?*WaitNode = switch (kind) {
-            .read => &sock.read_waiters,
+            .read, .peek => &sock.read_waiters,
             .write => &sock.write_waiters,
             .accept => &sock.accept_waiters,
         };
