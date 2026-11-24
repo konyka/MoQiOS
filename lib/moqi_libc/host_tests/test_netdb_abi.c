@@ -1453,6 +1453,11 @@ int main(void) {
         /* hello546: "myhostname" (systemd's module, case matters) is a service of its own. */
         assert(NSS("hosts: files myhostname dns\n") == 3 && s[1].service == NSS_SERVICE_MYHOSTNAME);
         assert(NSS("hosts: MyHostname\n") == 1 && s[0].service == NSS_SERVICE_OTHER);
+        /* mdns4_minimal, mdns and resolve only answer through avahi-daemon or systemd-resolved, which MoQiOS does not have: they
+         * are other services, as glibc 2.44 treats them when the modules are not installed (measured like "bogus"). */
+        assert(NSS("hosts: files myhostname mdns4_minimal [NOTFOUND=return] resolve [!UNAVAIL=return] dns\n") == 5 &&
+               s[2].service == NSS_SERVICE_OTHER && s[3].service == NSS_SERVICE_OTHER && s[4].service == NSS_SERVICE_DNS &&
+               s[2].stop == (ok_only | 1u << NSS_STATUS_NOTFOUND) && s[3].stop == (0x0Fu & ~(1u << NSS_STATUS_UNAVAIL)));
         assert(NSS("hosts: [NOTFOUND=return] dns files\n") == 0);
         assert(NSS("hosts: dns [NOTFOUND=foo] files\n") == 0);
         assert(NSS("hosts: files [FOO=return] dns\n") == 0);
