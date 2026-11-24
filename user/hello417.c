@@ -3,8 +3,9 @@
  * the tcp_fin_timeout default (60 s), a negative value resets the orphan instead of waiting. A socket still open waits as long as
  * the peer takes. Measured on the host (build with -DHOST, run in `unshare --map-auto --map-root-user -n` with lo up):
  *   V. it reads 60 by default; 5 reads 5, 0 reads 60, 200 reads 120, 120 reads 120, -1 and -7 read -1; an optlen of 2 is EINVAL;
- *   T. linger2 1, the client closes: 300 ms later the server's shutdown still finds it (SO_ERROR 0); after 3 s the orphan is
- *      gone and the server's FIN is answered with a reset (SO_ERROR ECONNRESET, recv still reads EOF);
+ *   T. linger2 1, the client closes: 300 ms later the server's shutdown still finds it (SO_ERROR 0); after 5 s the orphan is
+ *      gone and the server's FIN is answered with a reset (SO_ERROR ECONNRESET, recv still reads EOF); the orphan waits
+ *      max(linger2, 3.5 RTO), so the wait leaves room for an RTO raised by a slow handshake under load;
  *   D. without the option the orphan is still there after 3 s (SO_ERROR 0);
  *   N. linger2 -1: close resets at once, from FIN_WAIT1 once the FIN is acknowledged and directly when already in FIN_WAIT2
  *      after shutdown(SHUT_WR); the server, in CLOSE_WAIT, sees SO_ERROR EPIPE;
@@ -116,8 +117,10 @@ int main(void) {
 
     long f1, f2, f3, f4, f5;
     int t1 = orphan(1, 0, 300, &f1);
-    int t2 = orphan(1, 0, 3000, &f2);
-    snprintf(msg, sizeof msg, "T: linger2 1 orphan: after 300 ms SO_ERROR %d recv %ld; after 3 s SO_ERROR %d recv %ld (0 0; 104 0)", t1, f1, t2, f2);
+    /* The orphan gives up after max(linger2, 3.5 RTO) (tcp_fin_time); a handshake slowed by load raises the RTO, so the second
+     * look waits 5 s, past the timeout of any RTO under about 1.4 s. */
+    int t2 = orphan(1, 0, 5000, &f2);
+    snprintf(msg, sizeof msg, "T: linger2 1 orphan: after 300 ms SO_ERROR %d recv %ld; after 5 s SO_ERROR %d recv %ld (0 0; 104 0)", t1, f1, t2, f2);
     check(t1 == 0 && f1 == 0 && t2 == 104 && f2 == 0, msg);
     int d1 = orphan(999, 0, 3000, &f3);
     snprintf(msg, sizeof msg, "D: no option, orphan after 3 s: SO_ERROR %d recv %ld (0 0)", d1, f3);

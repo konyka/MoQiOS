@@ -227,7 +227,8 @@ int main(void) {
             if (read(p[0], &ready[i], 1) != 1) ready[i] = 0;
         close(p[0]);
     }
-    int wr = write_file("/etc/resolv.conf", "nameserver 127.0.0.1\noptions timeout:3 attempts:1\n");
+    /* The 64029-byte TCP answer of B takes a while to build and read under load: the timeout is only an upper bound. */
+    int wr = write_file("/etc/resolv.conf", "nameserver 127.0.0.1\noptions timeout:10 attempts:1\n");
     int wn = write_file("/etc/nsswitch.conf", "hosts: dns\n");
     char a[64], b[64];
     struct hostent *h = gethostbyname("big539.test");
