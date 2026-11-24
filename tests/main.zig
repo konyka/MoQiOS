@@ -18741,6 +18741,20 @@ test "a DNS reply with TC set is not used: the query is asked again over TCP to 
     try std.testing.expect(std.mem.indexOf(u8, dns, "fn queryTcp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16) Result {") != null);
 }
 
+test "a DNS reply over TCP may be as long as its 2-byte length says, up to 65535 bytes (glibc 2.44, measured) (hello539)" {
+    const dp = kt.dns_policy;
+    // The bytes a TCP reply needs in all, once its length prefix is in: the prefix and the message.
+    try std.testing.expectEqual(@as(?usize, null), dp.tcpFrameNeed(&.{}));
+    try std.testing.expectEqual(@as(?usize, null), dp.tcpFrameNeed(&.{0x12}));
+    try std.testing.expectEqual(@as(?usize, 2 + 4829), dp.tcpFrameNeed(&.{ 0x12, 0xdd }));
+    try std.testing.expectEqual(@as(?usize, 2 + 65535), dp.tcpFrameNeed(&.{ 0xff, 0xff, 1 }));
+    // Wiring: a reply longer than the stack buffer moves to a heap buffer of exactly that size instead of failing.
+    const dns = kt.dns_source;
+    try std.testing.expect(std.mem.indexOf(u8, dns, "if (got == buf.len) return .{ .outcome = .failed }; // longer than we read") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "dns_policy.tcpFrameNeed(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "slab.kmalloc(need)") != null);
+}
+
 test "AAAA answers: dns_answer reads type-28 records of 16 bytes for an AAAA query, A records for an A query (hello525)" {
     const da = kt.dns_answer;
     var msg: [512]u8 = undefined;

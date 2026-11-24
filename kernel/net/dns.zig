@@ -292,7 +292,8 @@ fn readReply(msg: []const u8, hostname: []const u8, qtype: u16, ans: *dns_answer
 }
 
 /// The query over TCP to `dns_server`:53 (RFC 1035 4.2.2: a 2-byte length, then the message), waiting at most `timeout_ns` for the
-/// connection and the whole reply. A refused, reset or closed connection is `tcp_failed`.
+/// connection and the whole reply. A refused, reset or closed connection is `tcp_failed`. A reply longer than the stack buffer
+/// moves to a heap buffer of the length its prefix announces (up to 2 + 65535 bytes), as glibc reads it whole (hello539).
 fn queryTcp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16) Result {
     const tcp = @import("tcp.zig");
     const sched = @import("../proc/sched.zig");
@@ -322,7 +323,11 @@ fn queryTcp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yi
     const start = tsc.nanos();
     var iters: u32 = 0;
     var sent: usize = 0;
-    var buf: [2 + MAX_REPLY]u8 = undefined;
+    const slab = @import("../mm/slab.zig");
+    var small: [2 + MAX_REPLY]u8 = undefined;
+    var buf: []u8 = &small;
+    var big: ?[*]u8 = null;
+    defer if (big) |b| slab.kfree(@ptrCast(b));
     var got: usize = 0;
     while (!dns_policy.waitExpiredAfter(start, tsc.nanos(), iters, timeout_ns)) : (iters += 1) {
         pumpRx();
@@ -339,18 +344,22 @@ fn queryTcp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yi
             const r = tcp.tcpRecv(idx, buf[got..].ptr, @intCast(buf.len - got));
             if (r > 0) {
                 got += @intCast(r);
-                if (dns_policy.tcpFrameComplete(buf[0..got])) {
-                    const n = dns_policy.tcpFrameLen(buf[0..got]).?;
-                    const msg = buf[2 .. 2 + n];
-                    if (n < 12 or bo.readU16BeAt(msg.ptr, 0) != query_id) return .{ .outcome = .failed };
-                    if (readReply(msg, hostname, qtype, ans)) |res| {
-                        // A truncated TCP reply has nowhere further to go.
-                        return if (res.outcome == .truncated) .{ .outcome = .failed } else res;
-                    }
-                    return .{ .outcome = .failed };
+                const need = dns_policy.tcpFrameNeed(buf[0..got]) orelse continue;
+                if (need > buf.len) {
+                    const p: [*]u8 = @ptrCast(slab.kmalloc(need) orelse return .{ .outcome = .failed });
+                    @memcpy(p[0..got], buf[0..got]);
+                    big = p;
+                    buf = p[0..need];
+                    continue;
                 }
-                if (got == buf.len) return .{ .outcome = .failed }; // longer than we read
-                continue;
+                if (got < need) continue;
+                const msg = buf[2..need];
+                if (msg.len < 12 or bo.readU16BeAt(msg.ptr, 0) != query_id) return .{ .outcome = .failed };
+                if (readReply(msg, hostname, qtype, ans)) |res| {
+                    // A truncated TCP reply has nowhere further to go.
+                    return if (res.outcome == .truncated) .{ .outcome = .failed } else res;
+                }
+                return .{ .outcome = .failed };
             }
             if (r == 0) return .{ .outcome = .tcp_failed }; // closed before the whole reply
             if (r != -11) return .{ .outcome = .tcp_failed };

@@ -186,6 +186,13 @@ pub fn tcpFrameLen(got: []const u8) ?usize {
     return @as(usize, got[0]) << 8 | got[1];
 }
 
+/// The bytes a TCP reply takes in all (the prefix and the message, at most 2 + 65535) once its prefix is in; null until then.
+/// glibc 2.44 reads such a reply whole however long it is (measured: 64029 bytes), so the reader sizes its buffer by this.
+pub fn tcpFrameNeed(got: []const u8) ?usize {
+    const n = tcpFrameLen(got) orelse return null;
+    return 2 + n;
+}
+
 /// Whether `got` holds the length prefix and the whole message it announces.
 pub fn tcpFrameComplete(got: []const u8) bool {
     const n = tcpFrameLen(got) orelse return false;
