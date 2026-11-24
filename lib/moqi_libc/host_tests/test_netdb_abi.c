@@ -1633,6 +1633,27 @@ int main(void) {
                     h_errno = 0;
                     errno = 0;
                     assert(!gethostbyname("late534.test") && h_errno == NETDB_INTERNAL && errno == EINVAL && q_calls == 0);
+                    /* A hosts line has no limit on its sources either (glibc 2.44, measured): "files" after twelve unknown
+                     * sources still answers, and twelve DNS sources are all asked before [UNAVAIL=return] on the last ends it. */
+                    static const char many_other[] = "hosts: bogus bogus bogus bogus bogus bogus bogus bogus bogus bogus bogus bogus files\n";
+                    moqi_test_nsswitch_conf = many_other;
+                    q_script(one, ok, 1);
+                    lp = gethostbyname("late534.test");
+                    assert(lp && (unsigned char)lp->h_addr_list[0][3] == 1 && q_calls == 0);
+                    {
+                        struct addrinfo h, *r = (struct addrinfo *)0;
+                        memset(&h, 0, sizeof h);
+                        h.ai_family = AF_INET;
+                        q_script(one, ok, 1);
+                        assert(getaddrinfo("late534.test", 0, &h, &r) == 0 && r && q_calls == 0);
+                        freeaddrinfo(r);
+                    }
+                    static const char many_dns[] = "hosts: dns dns dns dns dns dns dns dns dns dns dns dns [UNAVAIL=return] files\n";
+                    static const long twelve_to[] = {-110, -110, -110, -110, -110, -110, -110, -110, -110, -110, -110, -110, 0};
+                    moqi_test_nsswitch_conf = many_dns;
+                    q_script(one, twelve_to, 13);
+                    h_errno = 0;
+                    assert(!gethostbyname("late534.test") && h_errno == TRY_AGAIN && q_calls == 12);
                 }
                 /* Unknown databases and comments do not void it. */
                 static const char *const kept[] = {"hosts: files\nsudoers: files [\n", "hosts: files\nautomount: x [\n",

@@ -949,8 +949,9 @@ static int nss_word_is(const char *w, size_t n, const char *lit) {
     return 1;
 }
 
-/* glibc's nss_parse_service_list on text[a, b): the sources into `out`, or 0 when the line is refused. `bad`, when given, is
- * set only when the line does not parse, so an empty but valid list ("hosts:" alone) can be told apart. */
+/* glibc's nss_parse_service_list on text[a, b): the first `cap` sources into `out`; returns how many the line has (more than
+ * `cap` when it is longer), or 0 when the line is refused. `bad`, when given, is set only when the line does not parse, so an
+ * empty but valid list ("hosts:" alone) can be told apart. */
 static size_t nss_parse_list_err(const char *t, size_t i, size_t b, struct nss_source *out, size_t cap, int *bad) {
     size_t n = 0;
     if (bad) *bad = 0;
@@ -1001,7 +1002,8 @@ static size_t nss_parse_list_err(const char *t, size_t i, size_t b, struct nss_s
             if (i >= b) { if (bad) *bad = 1; return 0; } /* no ']' */
             i++;
         }
-        if (n < cap) out[n++] = s;
+        if (n < cap) out[n] = s;
+        n++;
     }
     return n;
 }
@@ -1070,7 +1072,8 @@ size_t nsswitch_hosts(const char *text, size_t len, struct nss_source *out, size
         }
         return n;
     }
-    return nss_parse_list(text, found_a, found_b, out, cap);
+    size_t n = nss_parse_list(text, found_a, found_b, out, cap);
+    return n < cap ? n : cap;
 }
 
 #ifdef MOQI_HOST_TEST_SYSCALL
@@ -1106,10 +1109,24 @@ static void nss_close(long fd) { syscall1(SYS_close, fd); }
  * getaddrinfo and getnameinfo EAI_SYSTEM, and no source is asked (glibc 2.44, measured). */
 #define NSS_SOURCES_VOID ((size_t)-1)
 
-/* The hosts sources of /etc/nsswitch.conf, read afresh on every lookup (glibc rereads a changed file too). The whole file is
- * read in pieces and every complete hosts line parsed into `out`, the last one winning, so neither the file's length nor a
- * line's matters (glibc 2.44, measured with a 100000-byte file and 5000-byte lines). */
-static size_t hosts_sources(struct nss_source *out) {
+/* The sources of a hosts line: NSS_HOSTS_MAX in place, more on the heap (glibc 2.44 keeps them all, measured with thousands).
+ * `v` points at `small` or at the heap block; release it with nss_list_free. */
+struct nss_list {
+    struct nss_source small[NSS_HOSTS_MAX];
+    struct nss_source *v;
+};
+static void nss_list_free(struct nss_list *l) {
+    if (l->v != l->small) free(l->v);
+    l->v = l->small;
+}
+
+/* The hosts sources of /etc/nsswitch.conf into `l`, read afresh on every lookup (glibc rereads a changed file too). The whole
+ * file is read in pieces and every complete hosts line parsed, the last one winning, so neither the file's length, a line's,
+ * nor the number of sources matters (glibc 2.44, measured with a 100000-byte file, 5000-byte lines and thousands of sources).
+ * Out of memory, a hosts line keeps its first NSS_HOSTS_MAX sources. */
+static size_t hosts_sources(struct nss_list *l) {
+    struct nss_source *out = l->small;
+    l->v = l->small;
     char chunk[512];
     char small[NSS_LINE_START];
     char *line = small;
@@ -1144,6 +1161,16 @@ static size_t hosts_sources(struct nss_source *out) {
                     size_t k = nss_parse_list_err(line, a, ll, is_hosts ? out : tmp, NSS_HOSTS_MAX, &bad);
                     if (bad) voided = 1;
                     else if (is_hosts) {
+                        nss_list_free(l);
+                        if (k > NSS_HOSTS_MAX) {
+                            struct nss_source *big = (struct nss_source *)malloc(k * sizeof *big);
+                            if (big) {
+                                nss_parse_list_err(line, a, ll, big, k, &bad);
+                                l->v = big;
+                            } else {
+                                k = NSS_HOSTS_MAX;
+                            }
+                        }
                         nsrc = k;
                         have = 1;
                     }
@@ -1156,7 +1183,10 @@ static size_t hosts_sources(struct nss_source *out) {
         nss_close(fd);
     }
     if (line != small) free(line);
-    if (voided) return NSS_SOURCES_VOID;
+    if (voided) {
+        nss_list_free(l);
+        return NSS_SOURCES_VOID;
+    }
     return have ? nsrc : nsswitch_hosts((const char *)0, 0, out, NSS_HOSTS_MAX);
 }
 
@@ -1544,8 +1574,9 @@ static void lookup_name(const char *name, int af, char *hosts, size_t hosts_cap,
         ans->naddrs = 1;
     } else {
         /* The sources of the nsswitch.conf "hosts" line in order; the last one asked decides (glibc 2.44, measured). */
-        struct nss_source src[NSS_HOSTS_MAX];
-        size_t nsrc = hosts_sources(src);
+        struct nss_list nl;
+        size_t nsrc = hosts_sources(&nl);
+        const struct nss_source *src = nl.v;
         int status = NSS_STATUS_UNAVAIL;
         ans->herr = NETDB_INTERNAL; /* no source at all, or only ones this library does not have */
         if (nsrc == NSS_SOURCES_VOID) {
@@ -1560,6 +1591,7 @@ static void lookup_name(const char *name, int af, char *hosts, size_t hosts_cap,
             else status = NSS_STATUS_UNAVAIL;
             if (nss_stops(&src[s], status)) break;
         }
+        nss_list_free(&nl);
         if (status != NSS_STATUS_SUCCESS) {
             ans->names = (const char *)0;
             ans->naddrs = 0;
@@ -1617,8 +1649,9 @@ static void lookup_addr(const void *addr, unsigned int len, int family, char *ho
     }
     /* The nsswitch.conf "hosts" sources in order (glibc 2.44, measured): for an address every DNS failure, a timeout included, is
      * NOTFOUND, and a source this library does not have leaves h_errno as it was. */
-    struct nss_source src[NSS_HOSTS_MAX];
-    size_t nsrc = hosts_sources(src);
+    struct nss_list nl;
+    size_t nsrc = hosts_sources(&nl);
+    const struct nss_source *src = nl.v;
     const char *names = (const char *)0;
     size_t names_len = 0;
     int status = NSS_STATUS_UNAVAIL;
@@ -1646,6 +1679,7 @@ static void lookup_addr(const void *addr, unsigned int len, int family, char *ho
                 ans->naddrs = 1;
                 ans->herr = 0;
                 ans->rc = 0;
+                nss_list_free(&nl);
                 return;
             }
             status = NSS_STATUS_NOTFOUND;
@@ -1656,6 +1690,7 @@ static void lookup_addr(const void *addr, unsigned int len, int family, char *ho
         }
         if (nss_stops(&src[s], status)) break;
     }
+    nss_list_free(&nl);
     if (status != NSS_STATUS_SUCCESS) {
         if (requested_family == AF_UNSPEC) {
             ans->herr = NETDB_INTERNAL;
@@ -2094,8 +2129,9 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
         if (strchr(node, '%')) return EAI_NONAME; /* a scope that is neither a number nor an interface allowed for the address */
         /* The sources of the nsswitch.conf "hosts" line in order; the last one asked decides, and a source this library does not
          * have is EAI_SYSTEM (glibc 2.44, measured). */
-        struct nss_source src[NSS_HOSTS_MAX];
-        size_t nsrc = hosts_sources(src);
+        struct nss_list nl;
+        size_t nsrc = hosts_sources(&nl);
+        const struct nss_source *src = nl.v;
         if (nsrc == NSS_SOURCES_VOID) {
             /* glibc 2.44 (measured): AF_INET without AI_CANONNAME goes through gethostbyname2_r, which sets h_errno to
              * NETDB_INTERNAL and errno to EINVAL. The other requests find no service and leave h_errno alone: EAI_SYSTEM when it
@@ -2166,7 +2202,10 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
                 if (family == AF_UNSPEC) {
                     /* Both at once (hello530): one dns_query2 per candidate and server; IPv6 addresses first. */
                     struct resolv_pair *pr = (struct resolv_pair *)malloc(sizeof *pr); /* 11 KiB: off the 64 KiB thread stacks */
-                    if (!pr) return EAI_MEMORY;
+                    if (!pr) {
+                        nss_list_free(&nl);
+                        return EAI_MEMORY;
+                    }
                     long rp = resolv_lookup_pair(node, pr);
                     r4 = pr->r4;
                     r6 = pr->r6;
@@ -2254,6 +2293,7 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
             }
             if (nss_stops(&src[s], status)) break;
         }
+        nss_list_free(&nl);
         if (status != NSS_STATUS_SUCCESS) return code;
         if (flags & AI_CANONNAME) {
             /* A name from /etc/hosts is canonicalised to the line's first name, as glibc does. */
