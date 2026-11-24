@@ -1125,12 +1125,15 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         // AF_UNIX: connected sockets only (STREAM pair, or DGRAM after
         // connect() set a default peer). An explicit destination address is
         // not supported — unixSend routes through the established peer_idx.
-        if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
+        const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
+        // A zero-length send on a datagram or seqpacket socket is an empty record (unix_dgram_sendmsg, measured: send("", 0) and
+        // send(NULL, 0) both queue one, hello552); on a stream socket it sends nothing and returns 0.
+        if (len == 0 and net_mod.unix_socket.unixIsStream(unix_idx)) return 0;
+        if (len != 0 and (buf == 0 or buf >= 0x0000_8000_0000_0000)) return -14;
         var tmp_unix: [8192]u8 = undefined;
         const to_copy_unix = @min(len, 8192);
-        const n_unix = copy.copyFromUser(&tmp_unix, @ptrFromInt(buf), to_copy_unix);
-        if (n_unix == 0) return -1;
-        const unix_idx = t.fd_table.fds[fd].unix_sock_idx;
+        const n_unix = if (to_copy_unix == 0) 0 else copy.copyFromUser(&tmp_unix, @ptrFromInt(buf), to_copy_unix);
+        if (n_unix != to_copy_unix) return -14;
         // sendto(addr): an explicit destination path (datagram sockets).
         if (addr_ptr != 0 and addr_len != 0) {
             var dest_buf: [110]u8 = undefined;

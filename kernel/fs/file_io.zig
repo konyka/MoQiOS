@@ -29,7 +29,20 @@ fn isMessageSocket(cur: *task_mod.Task, fd: u32) bool {
     return !@import("../net/unix_socket.zig").unixIsStream(d.unix_sock_idx);
 }
 
+/// A UDP socket or an AF_UNIX datagram / seqpacket socket: write() of 0 bytes still sends an empty datagram (Linux sock_write_iter ->
+/// sendmsg, measured, hello552), so it goes to sendto instead of returning 0 at once.
+fn sendsEmptyDatagram(fd: u64) bool {
+    const cur_idx = sched_mod.currentTaskIndex() orelse return false;
+    const cur = task_mod.getTask(cur_idx) orelse return false;
+    const i = fdIndex(fd);
+    if (i >= vfs_mod.MAX_FDS) return false;
+    const d = &cur.fd_table.fds[i];
+    if (d.fd_type == .udp_socket) return !d.udp_ping;
+    return isMessageSocket(cur, i);
+}
+
 pub fn write(fd: u64, buf: u64, count: u64) i64 {
+    if (count == 0 and sendsEmptyDatagram(fd)) return @import("../net/socket_syscall.zig").sendto(fdIndex(fd), buf, 0, 0, 0, 0);
     if (buf == 0 or buf >= 0x0000_8000_0000_0000 or count > 0x7FFFFFFF) return -1;
     const n: usize = @intCast(count);
     if (n == 0) return 0;

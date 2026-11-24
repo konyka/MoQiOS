@@ -19153,3 +19153,11 @@ test "a zero-length UDP send is an empty datagram, and a receive returns it with
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (result2 >= 0) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (result6 >= 0) {") != null);
 }
+
+test "write() of 0 bytes on a UDP or AF_UNIX message socket and a 0-byte AF_UNIX datagram send an empty datagram (Linux 7.x, measured) (hello552)" {
+    const fio = kt.file_io_source;
+    try std.testing.expect(std.mem.indexOf(u8, fio, "if (count == 0 and sendsEmptyDatagram(fd)) return @import(\"../net/socket_syscall.zig\").sendto(fdIndex(fd), buf, 0, 0, 0, 0);") != null);
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (len == 0 and net_mod.unix_socket.unixIsStream(unix_idx)) return 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const n_unix = if (to_copy_unix == 0) 0 else copy.copyFromUser(&tmp_unix, @ptrFromInt(buf), to_copy_unix);") != null);
+}
