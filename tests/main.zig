@@ -18677,6 +18677,14 @@ test "dns_answer.parsePtr: the names a PTR reply gives for an address, after its
     try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryPtr(addr: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qf: dns_policy.QueryFlags) Result {") != null);
 }
 
+test "dns_ptr with no server (NULL) asks the kernel's own nameserver, as names do without a resolv.conf nameserver (hello548)" {
+    const se = kt.syscall_entry_source;
+    // A NULL server pointer is the kernel's server (DHCP's, else the default); any other pointer is read as before.
+    try std.testing.expect(std.mem.indexOf(u8, se, "const server: DnsServerArg = if (server_ptr == 0) .{ .ok = .{ .v4 = @import(\"../../net/dns.zig\").getDnsServer() } } else readDnsServer(server_ptr, timeout_arg) orelse return -22;") != null);
+    const dns = kt.dns_source;
+    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn getDnsServer() [4]u8 {") != null);
+}
+
 test "a DNS reply over 512 bytes is read whole, and up to 64 addresses and 16 aliases are kept (glibc 2.44 took 60 and 12, measured) (hello523)" {
     const da = kt.dns_answer;
     try std.testing.expect(da.MAX_ADDRS >= 64);
@@ -18918,7 +18926,9 @@ test "an IPv6 nameserver: dns_query/dns_query6/dns_ptr take a 16-byte server whe
     // Wiring: the three system calls read the server with readServer, and dns.zig takes a Server for every query.
     const se = kt.syscall_entry_source;
     // dns_query and dns_query6 share one path; dns_ptr and dns_query2 (hello530) have the others.
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, se, "const server = readDnsServer(server_ptr, timeout_arg) orelse return -22;"));
+    // dns_query/dns_query6 and dns_query2 read the server this way; dns_ptr too, unless it is NULL (hello548).
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, se, "const server = readDnsServer(server_ptr, timeout_arg) orelse return -22;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, se, "else readDnsServer(server_ptr, timeout_arg) orelse return -22;"));
     const dns = kt.dns_source;
     try std.testing.expect(std.mem.indexOf(u8, dns, "pub const Server = union(enum) { v4: [4]u8, v6: [16]u8 };") != null);
     try std.testing.expect(std.mem.indexOf(u8, dns, "udp.sendToV6(s6, DNS_PORT, src_port, &pkt, @intCast(offset))") != null);

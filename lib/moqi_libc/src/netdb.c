@@ -580,14 +580,30 @@ long resolv_ptr(const void *addr, int family, char *name, size_t cap) {
     size_t len = resolv_conf_read(conf, sizeof conf);
     struct resolv_server ns[RESOLV_MAXNS];
     size_t nns = resolv_conf_servers_any(conf, len, ns, RESOLV_MAXNS);
-    /* Only the resolv.conf nameservers are asked (no search list applies to an address); without one there is no reverse DNS. */
-    if (nns == 0) return -2;
+    /* The resolv.conf nameservers (no search list applies to an address). Without one, the kernel's own server, as for names
+     * (dns_resolve; glibc 2.44 asks its default 127.0.0.1, measured): a NULL server, with the timeout and attempts of the file. */
     struct resolv_opts opt;
     const char *unused_word[1];
     size_t unused_len[1];
     resolv_conf_search(conf, len, unused_word, unused_len, 1, &opt);
     char buf[256];
     long last = -110;
+    long flags = (opt.use_vc ? RESOLV_VC_FLAG : 0) | (opt.edns0 ? RESOLV_EDNS0_FLAG : 0) | (opt.trust_ad ? RESOLV_AD_FLAG : 0);
+    if (nns == 0) {
+        for (int a = 0; a < opt.attempts; a++) {
+            long r = NETDB_SYSCALL6(SYS_dns_ptr, (long)addr, family, 0, resolv_wait_ms(opt.timeout, 0, 1) | flags, (long)buf, (long)sizeof buf);
+            if (r == -11 || r == -111) last = r;
+            if (r == -11 || r == -111 || r == -110 || r == -101) continue;
+            if (r == 0) {
+                size_t k = strnlen(buf, sizeof buf);
+                if (k >= cap) k = cap - 1;
+                memcpy(name, buf, k);
+                name[k] = 0;
+            }
+            return r;
+        }
+        return last;
+    }
     size_t first = resolv_first_server(&opt, nns);
     for (int a = 0; a < opt.attempts; a++) {
         for (size_t i = 0; i < nns; i++) {

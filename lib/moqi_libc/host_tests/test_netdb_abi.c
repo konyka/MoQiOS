@@ -52,7 +52,8 @@ static const char *q_ptr_name = "ptr.test";
 long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
     q_last_anslen = a6;
     if (nr == SYS_dns_ptr) {
-        long r = q_calls < q_n ? q_reply[q_calls] : -38;
+        /* Past the script the kernel's server has no PTR record (NXDOMAIN): tests that never set one up are not answered. */
+        long r = q_calls < q_n ? q_reply[q_calls] : -2;
         q_calls++;
         size_t l = strlen(q_log);
         const unsigned char *ad = (const unsigned char *)a1;
@@ -64,7 +65,7 @@ long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, lo
             memcpy(&v, (const unsigned char *)a3 + 16, 4);
             snprintf(sc, sizeof sc, "%%%u", v);
         }
-        int w = snprintf(q_log + l, sizeof q_log - l, "ptr%ld:%u@%s%u%s%s%s%s;", a2, last, six ? "v" : "", six ? ((const unsigned char *)a3)[15] : ((const unsigned char *)a3)[3], sc,
+        int w = snprintf(q_log + l, sizeof q_log - l, "ptr%ld:%u@%s%u%s%s%s%s;", a2, last, six ? "v" : "", !a3 ? 0u : six ? ((const unsigned char *)a3)[15] : ((const unsigned char *)a3)[3], sc,
                          (a4 & 0x20000000L) ? "/tcp" : "", (a4 & 0x10000000L) ? "/e" : "", (a4 & 0x08000000L) ? "/ad" : "");
         (void)w;
         (void)a4;
@@ -472,6 +473,8 @@ int main(void) {
         res = (struct hostent *)1; herr = 12345; errno = 0;
         assert(gethostbyaddr_r(addr4, 4, 1, &he, buf, sizeof buf, &res, &herr) == EAFNOSUPPORT && res == 0 && herr == NETDB_INTERNAL);
         res = (struct hostent *)1; herr = 12345;
+        static const long ptr_nx[] = {-2};
+        q_script((const char *)0, ptr_nx, 1); /* no resolv.conf: the kernel's server is asked (hello548) and says NXDOMAIN */
         assert(gethostbyaddr_r(addr4, 4, AF_INET, &he, buf, sizeof buf, &res, &herr) == 0 && res == 0 && herr == HOST_NOT_FOUND);
         res = (struct hostent *)1; herr = 12345; errno = 0;
         assert(gethostbyaddr_r(addr4, 4, AF_UNSPEC, &he, buf, sizeof buf, &res, &herr) == EAFNOSUPPORT && res == 0 && herr == NETDB_INTERNAL);
@@ -1248,7 +1251,7 @@ int main(void) {
     {
         static const char one[] = "nameserver 10.0.0.1\noptions attempts:1\n";
         static const char two[] = "nameserver 10.0.0.1\nnameserver 10.0.0.2\noptions attempts:1\n";
-        static const long ok[] = {0}, nx[] = {-2}, nd[] = {-61}, fe[] = {-71}, sf_ok[] = {-11, 0}, to[] = {-110};
+        static const long ok[] = {0}, nx[] = {-2}, nd[] = {-61}, fe[] = {-71}, sf_ok[] = {-11, 0}, to[] = {-110}, to2[] = {-110, -110};
         uint8_t a4[4] = {10, 2, 3, 4};
         uint8_t m6[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 2, 3, 9};
         uint8_t v6[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7};
@@ -1276,9 +1279,20 @@ int main(void) {
         assert(gethostbyaddr(a4, 4, AF_INET) == 0 && h_errno == NO_RECOVERY);
         q_script(one, to, 1);
         assert(gethostbyaddr(a4, 4, AF_INET) == 0 && h_errno == TRY_AGAIN);
-        /* No nameserver line: no query, HOST_NOT_FOUND as before. */
-        q_script("search x.test\n", ok, 1);
-        assert(gethostbyaddr(a4, 4, AF_INET) == 0 && h_errno == HOST_NOT_FOUND && q_calls == 0);
+        /* hello548: no nameserver line: one PTR query to the kernel's own server (a NULL server, logged as "@0"), with the
+         * resolv.conf timeout and attempts, as names go to it through dns_resolve (glibc 2.44 asks its default 127.0.0.1). */
+        q_script("search x.test\noptions attempts:1 timeout:2\n", ok, 1);
+        q_ptr_name = "k.test";
+        hp = gethostbyaddr(a4, 4, AF_INET);
+        assert(hp && strcmp(hp->h_name, "k.test") == 0 && strcmp(q_log, "ptr2:4@0;") == 0);
+        q_script("search x.test\noptions attempts:2 timeout:1\n", to2, 2);
+        assert(gethostbyaddr(a4, 4, AF_INET) == 0 && h_errno == TRY_AGAIN && strcmp(q_log, "ptr2:4@0;ptr2:4@0;") == 0);
+        q_script("search x.test\n", nx, 1);
+        assert(gethostbyaddr(a4, 4, AF_INET) == 0 && h_errno == HOST_NOT_FOUND && q_calls == 1);
+        q_script((const char *)0, ok, 1);
+        hp = gethostbyaddr(a4, 4, AF_INET);
+        assert(hp && strcmp(hp->h_name, "k.test") == 0 && q_calls == 1);
+        q_ptr_name = "ptr.test";
         /* getnameinfo: the PTR name; any failure is the numeric form, or EAI_NONAME with NI_NAMEREQD. */
         uint8_t sa[16] = {2, 0, 0, 80, 10, 2, 3, 4};
         char hb[64];
@@ -2545,6 +2559,8 @@ int main(void) {
         assert(ipv4_from_text(text, back) == 1 && memcmp(in, back, 4) == 0);
     }
     /* ---- getnameinfo: the values below were measured against glibc 2.x on the host ---------------------------- */
+    /* No resolv.conf and no script: the kernel's server is asked for every PTR and has none (hello548). */
+    q_script((const char *)0, (const long *)0, 0);
     {
         uint8_t sa[16];
         char host[64], serv[32];

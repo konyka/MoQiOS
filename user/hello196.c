@@ -1,5 +1,6 @@
 /* hello196: gethostbyname_ipv4() / ipv4_to_text() from moqi_libc, through the real dns_resolve system call.
- * Only names the kernel answers on its own, so it does not depend on a reachable DNS server. */
+ * Only names the kernel answers on its own, so it does not depend on a reachable DNS server; the two getnameinfo results that
+ * may come from a PTR query accept either answer. */
 #include "../lib/moqi_libc/include/moqi_syscalls.h"
 #include "../lib/moqi_libc/include/stdio.h"
 #include "../lib/moqi_libc/include/netdb.h"
@@ -129,17 +130,20 @@ int main(int argc, char **argv, char **envp) {
             uint8_t lo[4] = {127, 0, 0, 1};
             uint8_t sa[16];
             ipv4_sockaddr(lo, 80, sa);
+            /* No /etc/hosts line names it, so the name comes from a PTR query to the kernel's DNS server (hello548), which may
+             * call it localhost (as the host's resolver does) or have no PTR record; either is what glibc 2.44 gives. */
             int a = getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), 0);
-            check(a == 0 && strcmp(host, "127.0.0.1") == 0 && strcmp(serv, "http") == 0,
-                  "getnameinfo(127.0.0.1:80) without an /etc/hosts line is 127.0.0.1 / http (glibc 2.44)");
+            check(a == 0 && (strcmp(host, "127.0.0.1") == 0 || strcmp(host, "localhost") == 0) && strcmp(serv, "http") == 0,
+                  "getnameinfo(127.0.0.1:80) without an /etc/hosts line is 127.0.0.1 or the PTR name / http (glibc 2.44)");
             int b = getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NUMERICHOST | NI_NUMERICSERV);
             check(b == 0 && strcmp(host, "127.0.0.1") == 0 && strcmp(serv, "80") == 0,
                   "NI_NUMERICHOST|NI_NUMERICSERV give 127.0.0.1 / 80");
             ipv4_sockaddr(gw, 9199, sa);
+            int named = getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NAMEREQD) == 0;
             check(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), 0) == 0 &&
-                      strcmp(host, "10.0.2.2") == 0 && strcmp(serv, "9199") == 0,
+                      (named || strcmp(host, "10.0.2.2") == 0) && strcmp(serv, "9199") == 0,
                   "an address without a name is dotted decimal, a port without a name is decimal");
-            check(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NAMEREQD) == EAI_NONAME &&
+            check((named || getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NAMEREQD) == EAI_NONAME) &&
                       getnameinfo(sa, 16, host, 8, serv, sizeof(serv), NI_NUMERICHOST) == EAI_OVERFLOW &&
                       getnameinfo(sa, 8, host, sizeof(host), serv, sizeof(serv), 0) == EAI_FAMILY,
                   "NI_NAMEREQD, a short host buffer and a short sockaddr are reported");

@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello547`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello548`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -513,6 +513,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello545 | `getnameinfo` 的 `NI_NOFQDN`（与 glibc 2.44 实测相同，`hosts: files`）：本机域名取 localhost 的名字、主机名、主机名查到的名字、127.0.0.1 的名字中第一个带点的名字第一个点之后的部分，每个进程只找一次，之后保留；名字中域名第一次出现在点之后时截去 `.域名`。每种情况在新进程里运行。`localhost.lan.test` 时 web.lan.test 为 `web`，web.other.test、lan.test 不变，a.b.lan.test 为 `a.b`，4 字节缓冲区放得下 `web`、放不下 web.other.test（A）；/etc/hosts 改了之后仍用第一次的域名（B）；主机名 moqios 的行 `moqios.hd.test` 给出域名（C）；127.0.0.1 的行给出域名（D）；没有域名时名字不变（E）；删除临时文件（F）。需要 root |
 | hello546 | nsswitch.conf 的 `myhostname` 源（与 glibc 2.44 下 systemd 的 nss-myhostname 实测相同）：`localhost`、`Foo.LocalHost`、`localhost.localdomain` 为 127.0.0.1 和 ::1，名字是 localhost，`getaddrinfo` 先列 IPv6（A）；主机名 `moqios`（可带末尾的点）得到它自己，`getaddrinfo` 的规范名是主机名，`MOQIOS`（区分大小写）和 `localhost6` 都是 `HOST_NOT_FOUND`/`EAI_NONAME`（B，只比较名字和第一个族，因为 eth0 的地址会代替 127.0.0.2 和 ::1）；反查时 127.0.0.1 和 ::1 为 localhost，127.0.0.2 为主机名，127.0.0.3 没有名字（C）；`myhostname files` 对其他名字继续查 /etc/hosts，`[NOTFOUND=return]` 时不查（D）；删除临时文件（E）。需要 root |
 | hello547 | `/etc/resolv.conf` 的 `options trust-ad`（与 glibc 2.44 实测相同，按前 8 个字符匹配）：127.0.0.1:53 的替身服务器记录每个查询头部的标志。没有该选项时为 0x0100（A）；有时为 0x0120，即带 AD 位（B）；`trust-adx` 也算、`trust-a` 不算（C）；`getaddrinfo(AF_UNSPEC)` 的两个查询都带（D）；和 `edns0 use-vc` 一起时 TCP 查询带 AD 位和 OPT 记录（E）；PTR 查询也带（F）；删除临时文件（G）。需要 root 和 `CAP_NET_BIND_SERVICE` |
+| hello548 | resolv.conf 没有 nameserver 行时的反向 DNS：`dns_ptr`（508）的服务器指针为 NULL 时问内核自己的服务器（DHCP 给的），得到一个 DNS 结果而不是 `EFAULT`/`EINVAL`（A，结果取决于 QEMU 转发的网络，只检查种类）；超出用户空间的服务器指针仍为 `EFAULT`（B）；没有 nameserver、`hosts: dns` 时 `getnameinfo(10.0.2.2)` 给出名字或数字形式，不是 `EAI_SYSTEM`（C）；删除临时文件（D）。需要 root |
 | hello526 | `/etc/resolv.conf` 的 IPv6 nameserver（与 glibc 2.44 实测相同）：[::1]:53 和 127.0.0.1:53 上各一个本机 DNS 服务器；只写 `nameserver ::1` 时经 IPv6 查询并得到应答（A）；`::1` 在前时只问 IPv6 服务器（B）；不应答的 IPv6 服务器在前时换到 IPv4 服务器（C）；`gethostbyaddr` 也经 IPv6 服务器（D）；`::ffff:127.0.0.1` 按 IPv4 服务器询问（E）；两个服务器能在同一端口分别绑定 [::1] 和 127.0.0.1 |
 | hello525 | AAAA 记录（与 glibc 2.44 实测相同）：本机服务器知道双栈、只有 IPv4、只有 IPv6 三个名字；`gethostbyname2(AF_INET6)` 发 AAAA 查询并返回 16 字节地址（A）；只有 A 记录的名字在 `AF_INET6` 下为 `NO_DATA`（B）；`getaddrinfo` 的 `AF_UNSPEC` 发 AAAA 和 A 两个查询，IPv6 地址在前（C）；单栈名字只给那个族（D）；`AF_INET6` 对只有 IPv4 的名字为 `EAI_NODATA`，带 `AI_V4MAPPED` 时给映射地址（E）；不存在的名字为 `EAI_NONAME`（F） |
 | hello524 | 截断应答改用 TCP（与 glibc 2.44 `res_send` 实测相同）：本机服务器的 UDP 应答都带 TC 位，TCP（2 字节长度加报文）按名字回答；`gethostbyname` 先问 UDP、再问 TCP，得到 TCP 的三个地址（A）；UDP 应答带 TC 且有记录时也不用，用 TCP 的结果（B）；TCP 回 NXDOMAIN 为 `HOST_NOT_FOUND`（C）；TCP 连接在应答前关闭为 `TRY_AGAIN`（D）；服务器没有 TCP 监听时立即 `TRY_AGAIN`（E） |

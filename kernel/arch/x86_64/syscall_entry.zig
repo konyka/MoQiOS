@@ -6813,7 +6813,7 @@ fn readDnsServer(server_ptr: u64, timeout_arg: u64) ?DnsServerArg {
 /// dns_ptr(addr, family, server4, timeout_ms, name_out, name_len): the host name of `addr` (4 bytes for AF_INET 2, 16 for
 /// AF_INET6 10) from a PTR query to `server4`, NUL-terminated into `name_out`. Results as dns_query: 0, -ENOENT, -ENODATA, -EAGAIN,
 /// -ECONNREFUSED, -EPROTO (a reply with no PTR for the name), -ETIMEDOUT, -EINTR; -EAFNOSUPPORT for another family, -ERANGE when
-/// `name_len` is under 256 (before any query), EINVAL/EFAULT as dns_query.
+/// `name_len` is under 256 (before any query), EINVAL/EFAULT as dns_query. A NULL `server4` asks the kernel's own nameserver.
 fn syscallDnsPtr(addr_ptr: u64, family: u64, server_ptr: u64, timeout_arg: u64, out_ptr: u64, out_len: u64) i64 {
     const copy = @import("../../mm/copy_from_user.zig");
     const dp = @import("../../net/dns_policy.zig");
@@ -6828,7 +6828,8 @@ fn syscallDnsPtr(addr_ptr: u64, family: u64, server_ptr: u64, timeout_arg: u64, 
     if (copy.copyFromUser(addr[0..alen], @ptrFromInt(addr_ptr), alen) != alen) return -14;
     const timeout_ms = timeout_arg & ~dp.ARG_FLAGS;
     const qf = dp.queryFlags(timeout_arg);
-    const server = readDnsServer(server_ptr, timeout_arg) orelse return -22;
+    // A NULL server is the kernel's own (DHCP's, else the default): libc uses it when /etc/resolv.conf names none (hello548).
+    const server: DnsServerArg = if (server_ptr == 0) .{ .ok = .{ .v4 = @import("../../net/dns.zig").getDnsServer() } } else readDnsServer(server_ptr, timeout_arg) orelse return -22;
     if (server == .fault) return -14;
     if (server == .err) return server.err;
     if (!dp.timeoutValid(timeout_ms)) return -22;
