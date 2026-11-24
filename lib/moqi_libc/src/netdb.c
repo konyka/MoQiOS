@@ -139,6 +139,8 @@ size_t resolv_conf_servers_any(const char *text, size_t len, struct resolv_serve
 #define RESOLV_VC_FLAG 0x20000000L
 /* Bit 28: every query carries an EDNS(0) OPT record ("options edns0"). */
 #define RESOLV_EDNS0_FLAG 0x10000000L
+/* Bit 27: every query has the AD bit set ("options trust-ad"). */
+#define RESOLV_AD_FLAG 0x08000000L
 static long resolv_ask(long nr, long a1, long a2, const struct resolv_server *sv, long wait_ms, long a5, long a6) {
     if (sv->unusable) return -101; /* ENETUNREACH: a link-local server with no interface fails at once, as in glibc */
     long flags = sv->v6 ? RESOLV_SERVER6_FLAG | (sv->scope ? RESOLV_SCOPE6_FLAG : 0) : 0;
@@ -149,7 +151,7 @@ static long resolv_ask(long nr, long a1, long a2, const struct resolv_server *sv
 
 /* The words of the last "search" or "domain" line (a keyword at the start of the line, then a blank or the end of the line); 0
  * words when the last one has none. `opt`: the last ndots:, timeout: and attempts: of the options lines (defaults 1, 5, 2). */
-struct resolv_opts { unsigned ndots; int timeout; int attempts; int rotate; int single_request; int use_vc; int no_tld_query; int edns0; };
+struct resolv_opts { unsigned ndots; int timeout; int attempts; int rotate; int single_request; int use_vc; int no_tld_query; int edns0; int trust_ad; };
 
 /* "name:N" in an options line: glibc's atoi of what follows the colon (a sign, digits, anything after them ignored). */
 static int resolv_opt_value(const char *text, size_t a, size_t i, size_t kl, long *v) {
@@ -172,6 +174,7 @@ static size_t resolv_conf_search(const char *text, size_t len, const char **word
     opt->use_vc = 0;
     opt->no_tld_query = 0;
     opt->edns0 = 0;
+    opt->trust_ad = 0;
     while (text && pos < len) {
         size_t end = pos;
         while (end < len && text[end] != '\n') end++;
@@ -224,6 +227,10 @@ static size_t resolv_conf_search(const char *text, size_t len, const char **word
                     /* glibc matches it by its first 5 characters (measured: "edns0x" counts, "edns" does not): every query, over
                      * UDP or TCP, carries an OPT record advertising 1200 bytes. */
                     opt->edns0 = 1;
+                } else if (i - a >= 8 && memcmp(text + a, "trust-ad", 8) == 0) {
+                    /* glibc matches it by its first 8 characters (measured: "trust-adx" counts, "trust-a" does not): every query
+                     * has the AD bit set (hello547). */
+                    opt->trust_ad = 1;
                 } else if (i - a >= 8 && memcmp(text + a, "timeout:", 8) == 0) {
                     /* Seconds, at most 30 (RES_MAXRETRANS); 0 or less waits the 1 s minimum. */
                     long v;
@@ -428,7 +435,7 @@ static long resolve_one(const char *name, uint8_t *out, struct resolv_server *ns
         return af == AF_INET6 ? -2 : NETDB_SYSCALL2(SYS_dns_resolve, (long)name, (long)out);
     }
     long nr = af == AF_INET6 ? SYS_dns_query6 : SYS_dns_query;
-    long vc = (opt->use_vc ? RESOLV_VC_FLAG : 0) | (opt->edns0 ? RESOLV_EDNS0_FLAG : 0);
+    long vc = (opt->use_vc ? RESOLV_VC_FLAG : 0) | (opt->edns0 ? RESOLV_EDNS0_FLAG : 0) | (opt->trust_ad ? RESOLV_AD_FLAG : 0);
     long last_reply = -110; /* ETIMEDOUT: no server replied (or attempts:0 asked nobody) */
     size_t first = resolv_first_server(opt, nns);
     for (int a = 0; a < opt->attempts; a++) {
@@ -585,7 +592,8 @@ long resolv_ptr(const void *addr, int family, char *name, size_t cap) {
     for (int a = 0; a < opt.attempts; a++) {
         for (size_t i = 0; i < nns; i++) {
             long r = resolv_ask(SYS_dns_ptr, (long)addr, family, &ns[(first + i) % nns],
-                                resolv_wait_ms(opt.timeout, i, nns) | (opt.use_vc ? RESOLV_VC_FLAG : 0) | (opt.edns0 ? RESOLV_EDNS0_FLAG : 0),
+                                resolv_wait_ms(opt.timeout, i, nns) | (opt.use_vc ? RESOLV_VC_FLAG : 0) | (opt.edns0 ? RESOLV_EDNS0_FLAG : 0) |
+                                    (opt.trust_ad ? RESOLV_AD_FLAG : 0),
                                 (long)buf, (long)sizeof buf);
             if (r == -11 || r == -111) last = r;
             if (r == -11 || r == -111 || r == -110 || r == -101) continue;

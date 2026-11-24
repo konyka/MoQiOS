@@ -56,14 +56,22 @@ pub const VC_FLAG: u64 = 0x2000_0000;
 /// alike, measured).
 pub const EDNS0_FLAG: u64 = 0x1000_0000;
 
+/// Bit 27: every query has the AD bit set (/etc/resolv.conf "options trust-ad"; glibc 2.44 sends header flags 0x0120, measured).
+pub const AD_FLAG: u64 = 0x0800_0000;
+
 /// Every flag bit of the timeout argument; the limit is what is left.
-pub const ARG_FLAGS: u64 = SERVER6_FLAG | SCOPE6_FLAG | VC_FLAG | EDNS0_FLAG;
+pub const ARG_FLAGS: u64 = SERVER6_FLAG | SCOPE6_FLAG | VC_FLAG | EDNS0_FLAG | AD_FLAG;
 
 /// The resolv.conf options a query carries in its timeout argument.
-pub const QueryFlags = struct { vc: bool = false, edns0: bool = false };
+pub const QueryFlags = struct { vc: bool = false, edns0: bool = false, ad: bool = false };
 
 pub fn queryFlags(timeout_arg: u64) QueryFlags {
-    return .{ .vc = timeout_arg & VC_FLAG != 0, .edns0 = timeout_arg & EDNS0_FLAG != 0 };
+    return .{ .vc = timeout_arg & VC_FLAG != 0, .edns0 = timeout_arg & EDNS0_FLAG != 0, .ad = timeout_arg & AD_FLAG != 0 };
+}
+
+/// The flags word of a query's header: a standard query with recursion desired, and the AD bit with trust-ad.
+pub fn queryHeaderFlags(qf: QueryFlags) u16 {
+    return if (qf.ad) 0x0120 else 0x0100;
 }
 
 /// The UDP payload size glibc 2.44 advertises in its OPT record (measured: 0x04b0).

@@ -188,7 +188,7 @@ pub fn queryPair(hostname: []const u8, server: Server, timeout_ns: u64, yield: Y
         return .{ .answer, .nodata };
     }
     if (qf.vc) {
-        const r = queryTcpN(2, hostname, server, timeout_ns, yield, .{ ans4, ans6 }, .{ TYPE_A_Q, TYPE_AAAA }, qf.edns0);
+        const r = queryTcpN(2, hostname, server, timeout_ns, yield, .{ ans4, ans6 }, .{ TYPE_A_Q, TYPE_AAAA }, qf);
         return .{ r[0].outcome, r[1].outcome };
     }
     var out: [2]dns_policy.Outcome = .{ .timeout, .timeout };
@@ -200,7 +200,7 @@ pub fn queryPair(hostname: []const u8, server: Server, timeout_ns: u64, yield: Y
     const ids = [2]u16{ newQueryId(), newQueryId() };
     var pkts: [2][512]u8 = undefined;
     var lens: [2]usize = undefined;
-    for (0..2) |k| lens[k] = buildQuery(&pkts[k], hostname, qtypes[k], ids[k], qf.edns0);
+    for (0..2) |k| lens[k] = buildQuery(&pkts[k], hostname, qtypes[k], ids[k], qf);
     // Both go out before any reply is read (see queryUdp for why a send is retried).
     const send_start = tsc.nanos();
     var send_iters: u32 = 0;
@@ -250,7 +250,7 @@ pub fn queryPair(hostname: []const u8, server: Server, timeout_ns: u64, yield: Y
         if (yield) |y| (if (!y()) return .{ if (done[0]) out[0] else .interrupted, if (done[1]) out[1] else .interrupted }) else cpu.pause();
     }
     for (0..2) |k| {
-        if (out[k] == .truncated) out[k] = queryTcp(hostname, server, timeout_ns, yield, answers[k], qtypes[k], qf.edns0).outcome;
+        if (out[k] == .truncated) out[k] = queryTcp(hostname, server, timeout_ns, yield, answers[k], qtypes[k], qf).outcome;
     }
     return out;
 }
@@ -266,18 +266,19 @@ fn queryCore(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yi
 /// One query, over UDP first unless `qf.vc` (options use-vc) sends it straight over TCP; with `qf.edns0` (options edns0) it carries
 /// an OPT record either way.
 fn queryType(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16, qf: dns_policy.QueryFlags) Result {
-    if (qf.vc) return queryTcp(hostname, dns_server, timeout_ns, yield, ans, qtype, qf.edns0);
-    const r = queryUdp(hostname, dns_server, timeout_ns, yield, ans, qtype, qf.edns0);
+    if (qf.vc) return queryTcp(hostname, dns_server, timeout_ns, yield, ans, qtype, qf);
+    const r = queryUdp(hostname, dns_server, timeout_ns, yield, ans, qtype, qf);
     // A truncated reply is not used: the same query goes to the same server over TCP (glibc res_send, measured).
-    if (r.outcome == .truncated) return queryTcp(hostname, dns_server, timeout_ns, yield, ans, qtype, qf.edns0);
+    if (r.outcome == .truncated) return queryTcp(hostname, dns_server, timeout_ns, yield, ans, qtype, qf);
     return r;
 }
 
-/// The question for `hostname`/`qtype` with id `query_id` into `pkt`, followed by an OPT record when `edns0`; its length.
-fn buildQuery(pkt: []u8, hostname: []const u8, qtype: u16, query_id: u16, edns0: bool) usize {
+/// The question for `hostname`/`qtype` with id `query_id` into `pkt` (the AD bit with `qf.ad`), followed by an OPT record when
+/// `qf.edns0`; its length.
+fn buildQuery(pkt: []u8, hostname: []const u8, qtype: u16, query_id: u16, qf: dns_policy.QueryFlags) usize {
     @memset(pkt[0..12], 0);
     bo.writeU16BeAt(pkt.ptr, 0, query_id); // id
-    bo.writeU16BeAt(pkt.ptr, 2, 0x0100); // flags: standard query, recursion desired
+    bo.writeU16BeAt(pkt.ptr, 2, dns_policy.queryHeaderFlags(qf));
     bo.writeU16BeAt(pkt.ptr, 4, 1); // qdcount
     var offset: usize = 12;
     offset += encodeDnsName(hostname, pkt[offset..]);
@@ -285,7 +286,7 @@ fn buildQuery(pkt: []u8, hostname: []const u8, qtype: u16, query_id: u16, edns0:
     pkt[offset + 2] = 0x00;
     pkt[offset + 3] = 0x01; // CLASS_IN
     var len = offset + 4;
-    if (edns0) len = dns_policy.appendOpt(pkt, len);
+    if (qf.edns0) len = dns_policy.appendOpt(pkt, len);
     return len;
 }
 
@@ -305,8 +306,8 @@ fn readReply(msg: []const u8, hostname: []const u8, qtype: u16, ans: *dns_answer
 
 /// The query over TCP to `dns_server`:53 (RFC 1035 4.2.2: a 2-byte length, then the message), waiting at most `timeout_ns` for the
 /// connection and the whole reply: queryTcpN with one query.
-fn queryTcp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16, edns0: bool) Result {
-    return queryTcpN(1, hostname, dns_server, timeout_ns, yield, .{ans}, .{qtype}, edns0)[0];
+fn queryTcp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16, qf: dns_policy.QueryFlags) Result {
+    return queryTcpN(1, hostname, dns_server, timeout_ns, yield, .{ans}, .{qtype}, qf)[0];
 }
 
 /// `n` queries for `hostname` (types `qtypes`, answers into `answers`) on one TCP connection to `dns_server`:53, all sent before
@@ -317,7 +318,7 @@ fn queryTcp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yi
 /// to a heap buffer of the length its prefix announces (up to 2 + 65535 bytes), as glibc reads it whole (hello539). The wait is
 /// at most `timeout_ns`; glibc's read on the connection has no limit (measured: still waiting after 20 s with timeout:1), which is
 /// not copied, so a server that never replies cannot hold the caller forever.
-fn queryTcpN(comptime n: usize, hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, answers: [n]*dns_answer.Answer, qtypes: [n]u16, edns0: bool) [n]Result {
+fn queryTcpN(comptime n: usize, hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, answers: [n]*dns_answer.Answer, qtypes: [n]u16, qf: dns_policy.QueryFlags) [n]Result {
     const tcp = @import("tcp.zig");
     const sched = @import("../proc/sched.zig");
     const slab = @import("../mm/slab.zig");
@@ -337,7 +338,7 @@ fn queryTcpN(comptime n: usize, hostname: []const u8, dns_server: Server, timeou
         // Distinct ids, so each reply has exactly one query.
         ids[k] = newQueryId();
         while (dns_policy.pendingFor(ids[0..k], done[0..k], ids[k]) != null) ids[k] = newQueryId();
-        const qlen = buildQuery(pkt[total + 2 ..][0..512], hostname, qtypes[k], ids[k], edns0);
+        const qlen = buildQuery(pkt[total + 2 ..][0..512], hostname, qtypes[k], ids[k], qf);
         dns_policy.tcpLength(pkt[total..], @intCast(qlen));
         total += 2 + qlen;
     }
@@ -427,7 +428,7 @@ fn queryTcpN(comptime n: usize, hostname: []const u8, dns_server: Server, timeou
     return out;
 }
 
-fn queryUdp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16, edns0: bool) Result {
+fn queryUdp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16, qf: dns_policy.QueryFlags) Result {
     var pkt: [512]u8 = @splat(0);
     var offset: usize = 0;
 
@@ -441,7 +442,7 @@ fn queryUdp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yi
     defer udp.releasePort(src_port);
 
     const query_id = newQueryId();
-    offset = buildQuery(&pkt, hostname, qtype, query_id, edns0);
+    offset = buildQuery(&pkt, hostname, qtype, query_id, qf);
 
     // Send query. udp.sendTo does not wait: with no ARP entry for the server it only broadcasts an ARP request
     // and returns false, so the first attempt on a cold ARP cache always fails. Pump the NIC so the reply is
