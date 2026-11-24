@@ -14,11 +14,11 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_DIR"
 
 SMP_COUNT="${1:-${MOQI_SMP:-1}}"
-# Default 900s: the suite (hello1-100 incl. the swap/reclaim stress tests) took
-# ~190s wall including the build on an unloaded host (§6.49 measurement), and
-# §6.47's host-load incidents needed MOQI_SMOKE_TIMEOUT=900 to pass — make the
-# margin the default instead of an environment override.
-TIMEOUT_SECONDS="${MOQI_SMOKE_TIMEOUT:-900}"
+# Default 1500s, the limit the x86_64 smoke steps of .github/workflows/test.yml
+# use. At hello540 the SMP=1 suite ran past 900s locally (twice stopped in
+# hello193, the syscall fuzzer, with no FAIL line), so a local run without an
+# override needs the same room as CI.
+TIMEOUT_SECONDS="${MOQI_SMOKE_TIMEOUT:-1500}"
 STRICT_SMP="${MOQI_SMOKE_STRICT_SMP:-1}"
 
 if ! [[ "$SMP_COUNT" =~ ^[1-9][0-9]*$ ]]; then

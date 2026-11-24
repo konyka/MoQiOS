@@ -170,11 +170,13 @@ static void serve(int report) {
         /* A pause before each reply: queries asked one after the other take two of them, a parallel pair one less wait for the
          * second question (it is already queued when the first reply goes out). */
         usleep(300000);
-        long len = reply(r, q, n, name, qtype);
-        if (sendto4(s, r, len, from) > 0 && write(report, "r;", 2) != 2) _exit(4);
-        /* A second question already waiting is answered at once: only a pair sent together has one. */
+        /* A second question already waiting is answered at once: only a pair sent together has one. It is looked for before the
+         * first reply goes out, so a question the client sends on receiving that reply is never taken for one (on SMP the client
+         * used to send AAAA before this check ran when it came after the reply). */
         unsigned char q2[512], from2[16];
         long n2 = recvfrom_nb(s, q2, sizeof q2, from2);
+        long len = reply(r, q, n, name, qtype);
+        if (sendto4(s, r, len, from) > 0 && write(report, "r;", 2) != 2) _exit(4);
         if (n2 >= 12 && qname(q2, n2, name, sizeof name, &qtype) == 0) {
             ll = snprintf(line, sizeof line, "%d+;", qtype);
             if (write(report, line, (size_t)ll) != ll) _exit(4);

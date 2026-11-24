@@ -69,5 +69,15 @@ else
     bad "the PASS branch reports PASS without re-running check_fatal_output"
 fi
 
+# 5. A local run with no MOQI_SMOKE_TIMEOUT must get as long as CI gives it. With a 900 s default the SMP=1 suite timed out
+# locally in hello193 (the syscall fuzzer) with no FAIL line, while CI sets 1500 s for both x86_64 smoke steps.
+default_timeout="$(sed -n 's/^TIMEOUT_SECONDS="\${MOQI_SMOKE_TIMEOUT:-\([0-9]*\)}"$/\1/p' "$SMOKE")"
+ci_timeouts="$(sed -n '/zig build smoke/,/MOQI_SMOKE_TIMEOUT/s/^ *MOQI_SMOKE_TIMEOUT: *\([0-9]*\)$/\1/p' "$PROJECT_DIR/.github/workflows/test.yml" | sort -u)"
+if [ -n "$default_timeout" ] && [ -n "$ci_timeouts" ] && [ "$ci_timeouts" = "$default_timeout" ]; then
+    ok "the default MOQI_SMOKE_TIMEOUT ($default_timeout s) equals the x86_64 CI smoke steps' limit"
+else
+    bad "the default MOQI_SMOKE_TIMEOUT (${default_timeout:-none} s) differs from the x86_64 CI smoke steps' limit (${ci_timeouts:-none})"
+fi
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
