@@ -130,8 +130,8 @@ int main(int argc, char **argv, char **envp) {
             uint8_t sa[16];
             ipv4_sockaddr(lo, 80, sa);
             int a = getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), 0);
-            check(a == 0 && strcmp(host, "localhost") == 0 && strcmp(serv, "http") == 0,
-                  "getnameinfo(127.0.0.1:80) is localhost / http");
+            check(a == 0 && strcmp(host, "127.0.0.1") == 0 && strcmp(serv, "http") == 0,
+                  "getnameinfo(127.0.0.1:80) without an /etc/hosts line is 127.0.0.1 / http (glibc 2.44)");
             int b = getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NUMERICHOST | NI_NUMERICSERV);
             check(b == 0 && strcmp(host, "127.0.0.1") == 0 && strcmp(serv, "80") == 0,
                   "NI_NUMERICHOST|NI_NUMERICSERV give 127.0.0.1 / 80");

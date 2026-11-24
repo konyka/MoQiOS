@@ -1345,6 +1345,10 @@ int hostent_pack(struct hostent *he, char *buf, size_t buf_len, const char *name
 
 /* The answer of a lookup before it is laid out: the names field (canonical name, then aliases) and the addresses. `herr` is
  * the h_errno value and `rc` the reentrant return value (0, EAFNOSUPPORT or EAGAIN); `names` is NULL on a failure. */
+/* host_answer.herr when the files source decided without an /etc/hosts: h_errno and *h_errnop are left as they were and the
+ * error is ENOENT (glibc 2.44, measured in a fresh process). */
+#define HERR_KEEP (-100)
+
 struct host_answer {
     const char *names;
     size_t names_len;
@@ -1357,7 +1361,7 @@ struct host_answer {
 };
 
 /* The "files" source for a name: every /etc/hosts line of this family in file order, the names from the first one. NOTFOUND
- * when the file does not name it, UNAVAIL when there is no file (h_errno HOST_NOT_FOUND either way). */
+ * (h_errno HOST_NOT_FOUND) when the file does not name it, UNAVAIL (HERR_KEEP, ENOENT) when there is no file. */
 static int name_from_files(const char *name, int af, char *hosts, size_t hosts_cap, struct host_answer *ans) {
     size_t alen = af == AF_INET6 ? 16 : 4;
     size_t n = etc_hosts_read_into(hosts, hosts_cap);
@@ -1367,8 +1371,13 @@ static int name_from_files(const char *name, int af, char *hosts, size_t hosts_c
     size_t k = n ? hosts_collect(hosts, n, name, af, found, HOSTENT_ADDRS_MAX, &names, &names_len) : 0;
     ans->rc = 0;
     if (!k) {
-        ans->herr = HOST_NOT_FOUND;
-        return n || etc_hosts_exists() ? NSS_STATUS_NOTFOUND : NSS_STATUS_UNAVAIL;
+        if (n || etc_hosts_exists()) {
+            ans->herr = HOST_NOT_FOUND;
+            return NSS_STATUS_NOTFOUND;
+        }
+        ans->herr = HERR_KEEP;
+        ans->rc = ENOENT;
+        return NSS_STATUS_UNAVAIL;
     }
     for (size_t i = 0; i < k; i++) memcpy(ans->addrs[i], found[i].addr, alen);
     ans->naddrs = k;
@@ -1523,8 +1532,8 @@ static void lookup_addr(const void *addr, unsigned int len, int family, char *ho
             size_t n = etc_hosts_read_into(hosts, hosts_cap);
             names_len = n ? hosts_reverse_names(hosts, n, query_family, query, &names) : 0;
             status = names_len ? NSS_STATUS_SUCCESS : n || etc_hosts_exists() ? NSS_STATUS_NOTFOUND : NSS_STATUS_UNAVAIL;
-            ans->herr = names_len ? 0 : HOST_NOT_FOUND;
-            ans->rc = 0;
+            ans->herr = names_len ? 0 : status == NSS_STATUS_UNAVAIL ? HERR_KEEP : HOST_NOT_FOUND;
+            ans->rc = status == NSS_STATUS_UNAVAIL ? ENOENT : 0;
         } else if (src[s].service == NSS_SERVICE_DNS && requested_family != AF_UNSPEC) {
             /* A PTR query to the resolv.conf nameservers. A mapped ::ffff:a.b.c.d asks the in-addr.arpa name and is answered
              * as the IPv4 host it names: AF_INET, 4 bytes (glibc 2.44, measured; its /etc/hosts answer keeps the 16 bytes). */
@@ -1586,8 +1595,9 @@ static size_t names_capped(const char *names, size_t len) {
 
 static struct hostent *static_result(struct host_answer *ans) {
     if (!ans->names) {
-        h_errno = ans->herr;
+        if (ans->herr != HERR_KEEP) h_errno = ans->herr;
         if (ans->rc == EAFNOSUPPORT && ans->herr == NETDB_INTERNAL) errno = EAFNOSUPPORT;
+        if (ans->rc == ENOENT) errno = ENOENT;
         return (struct hostent *)0;
     }
     const char *list[HOSTENT_ADDRS_MAX];
@@ -1633,7 +1643,7 @@ static int reentrant_result(struct host_answer *ans, struct hostent *ret, char *
             herr = NETDB_INTERNAL;
         }
     }
-    if (h_errnop) *h_errnop = herr;
+    if (h_errnop && herr != HERR_KEEP) *h_errnop = herr;
     if (rc) errno = rc;
     return rc;
 }
@@ -2191,10 +2201,6 @@ int getnameinfo(const uint8_t *sa, unsigned int salen, char *host, unsigned int 
             } else if (ans.herr == TRY_AGAIN) {
                 return EAI_AGAIN;
             }
-            /* The loopback address is "localhost" even without an /etc/hosts line (glibc gives the numeric form then). */
-            static const uint8_t loop6[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
-            if (!text && (v6 ? memcmp(addr, loop6, 16) == 0 : (addr[0] == 127 && addr[1] == 0 && addr[2] == 0 && addr[3] == 1)))
-                text = "localhost";
         }
         if (!text) {
             if (flags & NI_NAMEREQD) return EAI_NONAME;

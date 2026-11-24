@@ -1427,6 +1427,44 @@ int main(void) {
         moqi_test_nsswitch_conf = "hosts: files dns\n";
         q_script(one, to, 1);
         assert(getnameinfo(sa4, 16, hb, sizeof hb, 0, 0, 0) == EAI_AGAIN);
+        {
+            /* Without /etc/hosts the files source is UNAVAIL: when it decides, h_errno and *h_errnop are left as they were,
+             * errno is ENOENT and the reentrant functions return it; an unknown source after it, or [UNAVAIL=return], changes
+             * nothing (glibc 2.44, measured in a fresh process). An empty file is HOST_NOT_FOUND. */
+            static const char *const confs[] = {"hosts: files\n", "hosts: files bogus\n", "hosts: bogus files\n",
+                                                "hosts: files [UNAVAIL=return] dns\n"};
+            const char *saved_hosts = moqi_test_etc_hosts;
+            moqi_test_etc_hosts = (const char *)0;
+            for (unsigned i = 0; i < sizeof confs / sizeof confs[0]; i++) {
+                moqi_test_nsswitch_conf = confs[i];
+                q_script(one, ok, 1);
+                struct hostent he, *rp = (struct hostent *)1;
+                char buf[512];
+                int herr = 77;
+                h_errno = 77; errno = 0;
+                assert(!gethostbyaddr(r4, 4, AF_INET) && h_errno == 77 && errno == ENOENT);
+                h_errno = 77; errno = 0;
+                assert(!gethostbyname("a.test") && h_errno == 77 && errno == ENOENT);
+                errno = 0;
+                assert(gethostbyaddr_r(r4, 4, AF_INET, &he, buf, sizeof buf, &rp, &herr) == ENOENT && !rp && herr == 77 &&
+                       errno == ENOENT);
+                rp = (struct hostent *)1;
+                assert(gethostbyname_r("a.test", &he, buf, sizeof buf, &rp, &herr) == ENOENT && !rp && herr == 77);
+                sa4[7] = 4;
+                assert(getnameinfo(sa4, 16, hb, sizeof hb, 0, 0, 0) == 0 && strcmp(hb, "10.2.3.4") == 0);
+                assert(getnameinfo(sa4, 16, hb, sizeof hb, 0, 0, NI_NAMEREQD) == EAI_NONAME);
+                assert(q_calls == 0);
+            }
+            moqi_test_nsswitch_conf = "hosts: files\n";
+            moqi_test_etc_hosts = "";
+            struct hostent he, *rp = (struct hostent *)1;
+            char buf[512];
+            int herr = 77;
+            h_errno = 77;
+            assert(!gethostbyaddr(r4, 4, AF_INET) && h_errno == HOST_NOT_FOUND);
+            assert(gethostbyname_r("a.test", &he, buf, sizeof buf, &rp, &herr) == 0 && !rp && herr == HOST_NOT_FOUND);
+            moqi_test_etc_hosts = saved_hosts;
+        }
         q_ptr_name = "ptr.test";
         moqi_test_nsswitch_conf = (const char *)0;
         moqi_test_etc_hosts = (const char *)0;
@@ -2064,18 +2102,17 @@ int main(void) {
             }
         }
 
-        /* Loopback has a name; NI_NUMERICHOST turns it off. Everything else is numeric (no reverse DNS here). */
+        /* Without /etc/hosts loopback has no name either (glibc 2.44, measured): every address is numeric here. */
         ipv4_sockaddr(lo, 80, sa);
         assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), 0) == 0);
-        assert(strcmp(host, "localhost") == 0 && strcmp(serv, "http") == 0);
+        assert(strcmp(host, "127.0.0.1") == 0 && strcmp(serv, "http") == 0);
         assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NUMERICHOST) == 0);
         assert(strcmp(host, "127.0.0.1") == 0 && strcmp(serv, "http") == 0);
         assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NUMERICHOST | NI_NUMERICSERV) == 0);
         assert(strcmp(host, "127.0.0.1") == 0 && strcmp(serv, "80") == 0);
         assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NUMERICSERV) == 0);
-        assert(strcmp(host, "localhost") == 0 && strcmp(serv, "80") == 0);
-        assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NAMEREQD) == 0);
-        assert(strcmp(host, "localhost") == 0);
+        assert(strcmp(host, "127.0.0.1") == 0 && strcmp(serv, "80") == 0);
+        assert(getnameinfo(sa, 16, host, sizeof(host), serv, sizeof(serv), NI_NAMEREQD) == EAI_NONAME);
         {
             uint8_t other[4] = {127, 0, 0, 2};
             ipv4_sockaddr(other, 80, sa);
@@ -2121,15 +2158,18 @@ int main(void) {
         assert(getnameinfo(sa, 16, host, sizeof(host), serv, 3, NI_NUMERICSERV) == 0 && strcmp(serv, "80") == 0);
         assert(getnameinfo(sa, 16, host, sizeof(host), serv, 1, 0) == EAI_OVERFLOW);
         ipv4_sockaddr(lo, 80, sa);
+        /* Without an /etc/hosts line 127.0.0.1 has no name: the numeric form, and EAI_NONAME under NI_NAMEREQD (glibc 2.44,
+         * measured with "hosts: files" and an empty or missing file). "127.0.0.1" is 9 characters. */
         assert(getnameinfo(sa, 16, host, 9, serv, sizeof(serv), 0) == EAI_OVERFLOW);
-        assert(getnameinfo(sa, 16, host, 10, serv, sizeof(serv), 0) == 0 && strcmp(host, "localhost") == 0);
+        assert(getnameinfo(sa, 16, host, 10, serv, sizeof(serv), 0) == 0 && strcmp(host, "127.0.0.1") == 0);
+        assert(getnameinfo(sa, 16, host, 10, serv, sizeof(serv), NI_NAMEREQD) == EAI_NONAME);
         assert(getnameinfo(sa, 16, host, 10, serv, sizeof(serv), NI_NUMERICHOST) == 0 && strcmp(host, "127.0.0.1") == 0);
 
         /* The host is already written when the service buffer turns out to be too small (glibc order). */
         ipv4_sockaddr(lo, 80, sa);
         memset(host, 'H', sizeof(host));
         assert(getnameinfo(sa, 16, host, sizeof(host), serv, 4, 0) == EAI_OVERFLOW);
-        assert(strcmp(host, "localhost") == 0);
+        assert(strcmp(host, "127.0.0.1") == 0);
         /* ...and a host that does not fit stops before the service is touched. */
         memset(serv, 'S', sizeof(serv));
         assert(getnameinfo(sa, 16, host, 4, serv, sizeof(serv), 0) == EAI_OVERFLOW && serv[0] == 'S');
@@ -2161,8 +2201,8 @@ int main(void) {
         {
             /* sockaddr_in6 (glibc, measured): a 28-byte address formats like inet_ntop, a non-zero scope id appends "%N" to the
              * numeric form, the service comes from the port as for IPv4; shorter than 28 bytes is EAI_FAMILY. Without
-             * /etc/hosts (the host test has no file system) an unnamed address is numeric and NI_NAMEREQD is EAI_NONAME; ::1 is
-             * "localhost" as 127.0.0.1 is. */
+             * /etc/hosts (the host test has no file system) an unnamed address is numeric and NI_NAMEREQD is EAI_NONAME, ::1
+             * as well. */
             uint8_t v6[28];
             memset(v6, 0, sizeof(v6));
             v6[0] = 10;
@@ -2188,10 +2228,11 @@ int main(void) {
             v6[24] = 5;
             assert(getnameinfo(v6, 28, host, sizeof(host), (char *)0, 0, NI_NUMERICHOST) == 0 && strcmp(host, "2001:db8::9%5") == 0);
             v6[24] = 0;
-            /* ::1 names localhost; :: and a mapped address are numeric without a file entry. */
+            /* ::1, :: and a mapped address are numeric without a file entry, ::1 included (glibc 2.44, measured). */
             memset(v6 + 8, 0, 16);
             v6[23] = 1;
-            assert(getnameinfo(v6, 28, host, sizeof(host), (char *)0, 0, 0) == 0 && strcmp(host, "localhost") == 0);
+            assert(getnameinfo(v6, 28, host, sizeof(host), (char *)0, 0, 0) == 0 && strcmp(host, "::1") == 0);
+            assert(getnameinfo(v6, 28, host, sizeof(host), (char *)0, 0, NI_NAMEREQD) == EAI_NONAME);
             assert(getnameinfo(v6, 28, host, sizeof(host), (char *)0, 0, NI_NUMERICHOST) == 0 && strcmp(host, "::1") == 0);
             v6[23] = 0;
             assert(getnameinfo(v6, 28, host, sizeof(host), (char *)0, 0, 0) == 0 && strcmp(host, "::") == 0);
