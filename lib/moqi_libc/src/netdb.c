@@ -1999,6 +1999,8 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
         const char *names = (const char *)0;
         size_t names_len = 0;
         int status = NSS_STATUS_UNAVAIL, code = EAI_SYSTEM;
+        /* The h_errno glibc's getaddrinfo would see: the caller's, then whatever a DNS source left. */
+        int herr_now = h_errno;
         for (size_t s = 0; s < nsrc; s++) {
             naddrs = 0;
             names = (const char *)0;
@@ -2024,6 +2026,18 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
                 }
                 status = naddrs ? NSS_STATUS_SUCCESS : n || etc_hosts_exists() ? NSS_STATUS_NOTFOUND : NSS_STATUS_UNAVAIL;
                 code = EAI_NONAME;
+                if (status == NSS_STATUS_UNAVAIL) {
+                    /* No /etc/hosts: the module leaves h_errno alone, so glibc 2.44 maps the h_errno already there
+                     * (getaddrinfo.c, measured). AF_UNSPEC goes through gethostbyname4_r, which answers NO_DATA;
+                     * AF_INET without AI_CANONNAME through try_simple_gethostbyname, where only NETDB_INTERNAL and
+                     * TRY_AGAIN are not EAI_NODATA; the rest through gethosts, where only NO_DATA is. */
+                    errno = ENOENT;
+                    if (family == AF_UNSPEC) code = EAI_NODATA;
+                    else if (herr_now == NETDB_INTERNAL) code = EAI_SYSTEM;
+                    else if (herr_now == TRY_AGAIN) code = EAI_AGAIN;
+                    else if (family == AF_INET && !(flags & AI_CANONNAME)) code = EAI_NODATA;
+                    else code = herr_now == NO_DATA ? EAI_NODATA : EAI_NONAME;
+                }
             } else if (src[s].service == NSS_SERVICE_DNS) {
                 /* DNS (glibc 2.44, measured): AF_INET asks A records, AF_INET6 AAAA records, AF_UNSPEC both, listing the IPv6 addresses
                  * first. AF_INET6 with AI_V4MAPPED falls back to the A records, mapped, when there is no AAAA; with AI_ALL as well it
@@ -2113,6 +2127,7 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
                      * nsswitch.conf, the others NOTFOUND (glibc 2.44, measured). */
                     code = nx ? EAI_NONAME : nd ? EAI_NODATA : EAI_AGAIN;
                     status = code == EAI_AGAIN ? NSS_STATUS_UNAVAIL : NSS_STATUS_NOTFOUND;
+                    herr_now = code == EAI_AGAIN ? TRY_AGAIN : code == EAI_NODATA ? NO_DATA : HOST_NOT_FOUND;
                 } else {
                     status = NSS_STATUS_SUCCESS;
                 }

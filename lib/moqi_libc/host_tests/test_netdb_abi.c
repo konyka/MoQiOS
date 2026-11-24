@@ -1465,6 +1465,57 @@ int main(void) {
             assert(gethostbyname_r("a.test", &he, buf, sizeof buf, &rp, &herr) == 0 && !rp && herr == HOST_NOT_FOUND);
             moqi_test_etc_hosts = saved_hosts;
         }
+        {
+            /* getaddrinfo when the files source decides without an /etc/hosts (glibc 2.44 getaddrinfo.c, measured in fresh
+             * processes): the module leaves h_errno alone, so the code comes from the h_errno the call started with.
+             * AF_INET without AI_CANONNAME (try_simple_gethostbyname): NETDB_INTERNAL is EAI_SYSTEM, TRY_AGAIN EAI_AGAIN,
+             * anything else EAI_NODATA. AF_INET with AI_CANONNAME and AF_INET6 (gethosts): the same except that only NO_DATA
+             * is EAI_NODATA and the rest EAI_NONAME. AF_UNSPEC (gethostbyname4_r answers NO_DATA): EAI_NODATA. errno is
+             * ENOENT. An empty file is EAI_NONAME whatever h_errno was. */
+            static const struct { int h0, family, flags, want; } rows[] = {
+                {0, AF_INET, 0, EAI_NODATA},             {HOST_NOT_FOUND, AF_INET, 0, EAI_NODATA},
+                {TRY_AGAIN, AF_INET, 0, EAI_AGAIN},      {NO_DATA, AF_INET, 0, EAI_NODATA},
+                {NETDB_INTERNAL, AF_INET, 0, EAI_SYSTEM}, {0, AF_INET, AI_CANONNAME, EAI_NONAME},
+                {TRY_AGAIN, AF_INET, AI_CANONNAME, EAI_AGAIN}, {NO_DATA, AF_INET, AI_CANONNAME, EAI_NODATA},
+                {0, AF_INET6, 0, EAI_NONAME},            {HOST_NOT_FOUND, AF_INET6, 0, EAI_NONAME},
+                {TRY_AGAIN, AF_INET6, 0, EAI_AGAIN},     {NO_DATA, AF_INET6, 0, EAI_NODATA},
+                {NETDB_INTERNAL, AF_INET6, 0, EAI_SYSTEM}, {0, AF_INET6, AI_V4MAPPED, EAI_NONAME},
+                {0, AF_UNSPEC, 0, EAI_NODATA},           {TRY_AGAIN, AF_UNSPEC, 0, EAI_NODATA},
+                {NETDB_INTERNAL, AF_UNSPEC, 0, EAI_NODATA},
+            };
+            const char *saved_hosts = moqi_test_etc_hosts;
+            moqi_test_etc_hosts = (const char *)0;
+            moqi_test_nsswitch_conf = "hosts: files\n";
+            for (unsigned i = 0; i < sizeof rows / sizeof rows[0]; i++) {
+                struct addrinfo h, *r = (struct addrinfo *)0;
+                memset(&h, 0, sizeof h);
+                h.ai_family = rows[i].family;
+                h.ai_flags = rows[i].flags;
+                q_script(one, ok, 1);
+                h_errno = rows[i].h0;
+                errno = 0;
+                assert(getaddrinfo("a.test", 0, &h, &r) == rows[i].want && errno == ENOENT && q_calls == 0);
+            }
+            moqi_test_nsswitch_conf = "hosts: files [UNAVAIL=return] dns\n";
+            {
+                struct addrinfo h, *r = (struct addrinfo *)0;
+                memset(&h, 0, sizeof h);
+                h.ai_family = AF_INET6;
+                q_script(one, ok, 1);
+                h_errno = 0;
+                assert(getaddrinfo("a.test", 0, &h, &r) == EAI_NONAME && q_calls == 0);
+            }
+            moqi_test_nsswitch_conf = "hosts: files\n";
+            moqi_test_etc_hosts = "";
+            {
+                struct addrinfo h, *r = (struct addrinfo *)0;
+                memset(&h, 0, sizeof h);
+                h.ai_family = AF_INET;
+                h_errno = TRY_AGAIN;
+                assert(getaddrinfo("a.test", 0, &h, &r) == EAI_NONAME);
+            }
+            moqi_test_etc_hosts = saved_hosts;
+        }
         q_ptr_name = "ptr.test";
         moqi_test_nsswitch_conf = (const char *)0;
         moqi_test_etc_hosts = (const char *)0;
