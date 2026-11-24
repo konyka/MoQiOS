@@ -1403,7 +1403,17 @@ int main(void) {
                s[0].stop == (ok_only | 1u << NSS_STATUS_NOTFOUND | 1u << NSS_STATUS_TRYAGAIN));
         assert(NSS("hosts: files [SUCCESS=continue] dns\n") == 2 && s[0].stop == 0);
         assert(NSS("hosts: dns [SUCCESS=return NOTFOUND=continue] files\n") == 2 && s[0].stop == ok_only);
-        assert(NSS("hosts: dns [NOTFOUND=merge] files\n") == 2 && s[0].stop == ok_only);
+        assert(NSS("hosts: dns [NOTFOUND=merge] files\n") == 2 && s[0].stop == ok_only && s[0].merge == 1u << NSS_STATUS_NOTFOUND);
+        /* hello544: merge is kept apart from continue, per status; the last action given for a status wins. */
+        assert(NSS("hosts: files [SUCCESS=merge] dns\n") == 2 && s[0].stop == 0 && s[0].merge == ok_only && s[1].merge == 0);
+        assert(NSS("hosts: files [!NOTFOUND=merge] dns\n") == 2 && s[0].stop == 0 && s[0].merge == (0x0Fu & ~(1u << NSS_STATUS_NOTFOUND)));
+        assert(NSS("hosts: files [SUCCESS=merge SUCCESS=return] dns\n") == 2 && s[0].stop == ok_only && s[0].merge == 0);
+        assert(NSS("hosts: files [SUCCESS=return SUCCESS=merge] dns\n") == 2 && s[0].stop == 0 && s[0].merge == ok_only);
+        assert(NSS("hosts: files [!SUCCESS=return NOTFOUND=merge]\n") == 1 &&
+               s[0].stop == (ok_only | 1u << NSS_STATUS_UNAVAIL | 1u << NSS_STATUS_TRYAGAIN) && s[0].merge == 1u << NSS_STATUS_NOTFOUND);
+        assert(NSS("hosts: files [!SUCCESS=merge NOTFOUND=continue]\n") == 1 && s[0].stop == ok_only &&
+               s[0].merge == (1u << NSS_STATUS_UNAVAIL | 1u << NSS_STATUS_TRYAGAIN));
+        assert(nsswitch_hosts((const char *)0, 0, s, NSS_HOSTS_MAX) == 2 && s[0].merge == 0 && s[1].merge == 0);
         assert(NSS("hosts: [NOTFOUND=return] dns files\n") == 0);
         assert(NSS("hosts: dns [NOTFOUND=foo] files\n") == 0);
         assert(NSS("hosts: files [FOO=return] dns\n") == 0);
@@ -1542,6 +1552,117 @@ int main(void) {
         moqi_test_nsswitch_conf = "hosts: files dns\n";
         q_script(one, to, 1);
         assert(getnameinfo(sa4, 16, hb, sizeof hb, 0, 0, 0) == EAI_AGAIN);
+        {
+            /* hello544: "merge" (glibc 2.44, measured; the hosts database has no merge function). gethostbyname* and
+             * gethostbyaddr*: a source that answers under SUCCESS=merge fails the lookup at once, even the last one: no result,
+             * errno EINVAL and the _r functions return it. h_errno is HOST_NOT_FOUND for a name and left alone for an address;
+             * *h_errnop is HOST_NOT_FOUND (name) or left alone (address) after files, 0 after dns. merge for another status is
+             * continue. */
+            struct hostent he, *rp;
+            char buf[512];
+            int herr;
+            moqi_test_nsswitch_conf = "hosts: files [SUCCESS=merge] dns\n";
+            q_script(one, ok, 1);
+            h_errno = 77; errno = 0;
+            assert(!gethostbyname("filehost.test") && h_errno == HOST_NOT_FOUND && errno == EINVAL && q_calls == 0);
+            h_errno = 77; errno = 0;
+            assert(!gethostbyname2("filehost.test", AF_INET) && h_errno == HOST_NOT_FOUND && errno == EINVAL);
+            rp = (struct hostent *)1; herr = 77; errno = 0;
+            assert(gethostbyname_r("filehost.test", &he, buf, sizeof buf, &rp, &herr) == EINVAL && !rp && herr == HOST_NOT_FOUND &&
+                   errno == EINVAL);
+            hp = gethostbyname("other.test");
+            assert(hp && q_calls == 1); /* not in the file: on to dns */
+            h_errno = 77; errno = 0;
+            assert(!gethostbyaddr(r4, 4, AF_INET) && h_errno == 77 && errno == EINVAL);
+            h_errno = 77; errno = 0;
+            assert(!gethostbyaddr(r4, 4, AF_UNSPEC) && h_errno == 77 && errno == EINVAL);
+            rp = (struct hostent *)1; herr = 77;
+            assert(gethostbyaddr_r(r4, 4, AF_INET, &he, buf, sizeof buf, &rp, &herr) == EINVAL && !rp && herr == 77);
+            sa4[7] = 4;
+            assert(getnameinfo(sa4, 16, hb, sizeof hb, 0, 0, NI_NAMEREQD) == EAI_NONAME);
+            assert(getnameinfo(sa4, 16, hb, sizeof hb, 0, 0, 0) == 0 && strcmp(hb, "10.2.3.4") == 0);
+            moqi_test_nsswitch_conf = "hosts: files [SUCCESS=merge]\n";
+            h_errno = 77;
+            assert(!gethostbyname("filehost.test") && h_errno == HOST_NOT_FOUND);
+            moqi_test_nsswitch_conf = "hosts: dns [SUCCESS=merge] files\n";
+            q_script(one, ok, 1);
+            h_errno = 77; errno = 0;
+            assert(!gethostbyname("filehost.test") && h_errno == HOST_NOT_FOUND && errno == EINVAL && q_calls == 1);
+            q_script(one, ok, 1);
+            rp = (struct hostent *)1; herr = 77;
+            assert(gethostbyname2_r("filehost.test", AF_INET6, &he, buf, sizeof buf, &rp, &herr) == EINVAL && !rp && herr == 0);
+            q_script(one, ok, 1);
+            h_errno = 77; errno = 0;
+            assert(!gethostbyaddr(r4, 4, AF_INET) && h_errno == 77 && errno == EINVAL && q_calls == 1);
+            q_script(one, ok, 1);
+            rp = (struct hostent *)1; herr = 77;
+            assert(gethostbyaddr_r(r4, 4, AF_INET, &he, buf, sizeof buf, &rp, &herr) == EINVAL && !rp && herr == 0);
+            q_script(one, nx, 1);
+            hp = gethostbyname("filehost.test");
+            assert(hp && hp->h_addr_list[0][1] == 1); /* NXDOMAIN is NOTFOUND: on to the file */
+            moqi_test_nsswitch_conf = "hosts: files [NOTFOUND=merge] dns\n";
+            q_script(one, ok, 1);
+            assert(gethostbyname("other.test") && q_calls == 1);
+
+            /* getaddrinfo. AF_INET without AI_CANONNAME goes through gethostbyname2_r: EAI_NODATA, errno EINVAL, h_errno its
+             * *h_errnop. Otherwise the source after a merged status ends the lookup: h_errno NETDB_INTERNAL, errno EBUSY, and
+             * EAI_SYSTEM when that status was UNAVAIL or TRYAGAIN, EAI_NODATA when it was NODATA, else EAI_NONAME. On the last
+             * source merge does nothing. */
+            static const long ok2[] = {0, 0}, nx2[] = {-2, -2}, nd2[] = {-61, -61}, to2[] = {-110, -110};
+            struct addrinfo h, *r = (struct addrinfo *)0;
+            memset(&h, 0, sizeof h);
+            h.ai_socktype = SOCK_STREAM;
+            moqi_test_nsswitch_conf = "hosts: files [SUCCESS=merge] dns\n";
+            q_script(one, ok2, 2);
+            errno = 0; h_errno = 77;
+            assert(getaddrinfo("filehost.test", 0, &h, &r) == EAI_NONAME && errno == EBUSY && h_errno == NETDB_INTERNAL && q_calls == 0);
+            h.ai_family = AF_INET;
+            errno = 0; h_errno = 77;
+            assert(getaddrinfo("filehost.test", 0, &h, &r) == EAI_NODATA && errno == EINVAL && h_errno == HOST_NOT_FOUND && q_calls == 0);
+            h.ai_flags = AI_CANONNAME;
+            errno = 0;
+            assert(getaddrinfo("filehost.test", 0, &h, &r) == EAI_NONAME && errno == EBUSY && h_errno == NETDB_INTERNAL);
+            h.ai_flags = 0;
+            h.ai_family = AF_UNSPEC;
+            q_script(one, ok2, 2);
+            assert(getaddrinfo("other.test", 0, &h, &r) == 0 && q_calls == 2);
+            freeaddrinfo(r);
+            moqi_test_nsswitch_conf = "hosts: files [SUCCESS=merge]\n";
+            assert(getaddrinfo("filehost.test", 0, &h, &r) == 0 && ((unsigned char *)r->ai_addr)[7] == 1);
+            freeaddrinfo(r);
+            h.ai_family = AF_INET;
+            errno = 0;
+            assert(getaddrinfo("filehost.test", 0, &h, &r) == EAI_NODATA && errno == EINVAL);
+            moqi_test_nsswitch_conf = "hosts: files [SUCCESS=merge] bogus\n";
+            h.ai_family = AF_UNSPEC;
+            errno = 0;
+            assert(getaddrinfo("filehost.test", 0, &h, &r) == EAI_NONAME && errno == EBUSY);
+            moqi_test_nsswitch_conf = "hosts: dns [SUCCESS=merge] files\n";
+            h.ai_family = AF_INET;
+            q_script(one, ok, 1);
+            h_errno = 77;
+            assert(getaddrinfo("filehost.test", 0, &h, &r) == EAI_NODATA && errno == EINVAL && h_errno == 0 && q_calls == 1);
+            h.ai_family = AF_UNSPEC;
+            q_script(one, ok2, 2);
+            assert(getaddrinfo("filehost.test", 0, &h, &r) == EAI_NONAME && errno == EBUSY && q_calls == 2);
+            moqi_test_nsswitch_conf = "hosts: dns [NOTFOUND=merge] files\n";
+            q_script(one, nx2, 2);
+            assert(getaddrinfo("filehost.test", 0, &h, &r) == EAI_NONAME && errno == EBUSY);
+            q_script(one, nd2, 2);
+            assert(getaddrinfo("filehost.test", 0, &h, &r) == EAI_NODATA && errno == EBUSY);
+            h.ai_family = AF_INET;
+            q_script(one, nx, 1);
+            assert(getaddrinfo("filehost.test", 0, &h, &r) == 0 && ((unsigned char *)r->ai_addr)[5] == 1);
+            freeaddrinfo(r);
+            moqi_test_nsswitch_conf = "hosts: dns [UNAVAIL=merge] files\n";
+            h.ai_family = AF_UNSPEC;
+            q_script(one, to2, 2);
+            assert(getaddrinfo("filehost.test", 0, &h, &r) == EAI_SYSTEM && errno == EBUSY);
+            h.ai_family = AF_INET;
+            q_script(one, to, 1);
+            assert(getaddrinfo("filehost.test", 0, &h, &r) == 0 && ((unsigned char *)r->ai_addr)[5] == 1);
+            freeaddrinfo(r);
+        }
         {
             /* Without /etc/hosts the files source is UNAVAIL: when it decides, h_errno and *h_errnop are left as they were,
              * errno is ENOENT and the reentrant functions return it; an unknown source after it, or [UNAVAIL=return], changes

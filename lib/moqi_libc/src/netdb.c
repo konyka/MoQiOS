@@ -1004,6 +1004,7 @@ static size_t nss_parse_list_err(const char *t, size_t i, size_t b, struct nss_s
         if (i - name == 5 && memcmp(t + name, "files", 5) == 0) s.service = NSS_SERVICE_FILES;
         if (i - name == 3 && memcmp(t + name, "dns", 3) == 0) s.service = NSS_SERVICE_DNS;
         s.stop = 1u << NSS_STATUS_SUCCESS;
+        s.merge = 0;
         while (i < b && nss_space(t[i])) i++;
         if (i < b && t[i] == '[') {
             do i++; while (i < b && nss_space(t[i]));
@@ -1023,17 +1024,18 @@ static size_t nss_parse_list_err(const char *t, size_t i, size_t b, struct nss_s
                 do i++; while (i < b && nss_space(t[i]));
                 w = i;
                 while (i < b && !nss_space(t[i]) && t[i] != '=' && t[i] != ']') i++;
-                int ret;
+                int ret = 0, mrg = 0;
                 if (nss_word_is(t + w, i - w, "return")) ret = 1;
-                else if (nss_word_is(t + w, i - w, "continue") || nss_word_is(t + w, i - w, "merge")) ret = 0;
-                else { if (bad) *bad = 1; return 0; }
+                else if (nss_word_is(t + w, i - w, "merge")) mrg = 1;
+                else if (!nss_word_is(t + w, i - w, "continue")) { if (bad) *bad = 1; return 0; }
                 unsigned bit = 1u << status;
                 if (not) {
-                    unsigned keep = s.stop & bit;
-                    s.stop = (unsigned char)((ret ? 0x0Fu : 0u) & ~bit);
-                    s.stop |= (unsigned char)keep;
+                    /* "!STATUS=action": every other status gets the action, this one keeps its own. */
+                    s.stop = (unsigned char)(((ret ? 0x0Fu : 0u) & ~bit) | (s.stop & bit));
+                    s.merge = (unsigned char)(((mrg ? 0x0Fu : 0u) & ~bit) | (s.merge & bit));
                 } else {
                     s.stop = (unsigned char)(ret ? (s.stop | bit) : (s.stop & ~bit));
+                    s.merge = (unsigned char)(mrg ? (s.merge | bit) : (s.merge & ~bit));
                 }
                 while (i < b && nss_space(t[i])) i++;
             } while (i < b && t[i] != ']');
@@ -1103,9 +1105,11 @@ size_t nsswitch_hosts(const char *text, size_t len, struct nss_source *out, size
     if (!found) {
         size_t n = 0;
         out[n].service = NSS_SERVICE_FILES;
+        out[n].merge = 0;
         out[n++].stop = 1u << NSS_STATUS_SUCCESS;
         if (n < cap) {
             out[n].service = NSS_SERVICE_DNS;
+            out[n].merge = 0;
             out[n++].stop = 1u << NSS_STATUS_SUCCESS;
         }
         return n;
@@ -1230,6 +1234,8 @@ static size_t hosts_sources(struct nss_list *l) {
 
 /* Whether `status` ends the lookup after source `s`. */
 static int nss_stops(const struct nss_source *s, int status) { return (s->stop >> status) & 1; }
+/* Whether the action for `status` after source `s` is merge. */
+static int nss_merges(const struct nss_source *s, int status) { return (s->merge >> status) & 1; }
 
 #define ETC_HOSTS_MAX 8192
 #ifdef MOQI_HOST_TEST_SYSCALL
@@ -1518,6 +1524,7 @@ struct host_answer {
     int af;
     int herr;
     int rc;
+    int merged; /* 1: a name, 2: an address, failed by SUCCESS=merge (the static functions set h_errno their own way) */
 };
 
 /* The "files" source for a name: every /etc/hosts line of this family in file order, the names from the first one. NOTFOUND
@@ -1585,6 +1592,7 @@ static int name_from_dns(const char *name, int af, struct host_answer *ans) {
 /* `hosts`/`hosts_cap` is the scratch space for /etc/hosts text: the static functions pass etc_hosts_buf, the reentrant ones a
  * buffer of their own, so the two never share state. */
 static void lookup_name(const char *name, int af, char *hosts, size_t hosts_cap, struct host_answer *ans) {
+    ans->merged = 0;
     ans->names = (const char *)0;
     ans->names_len = 0;
     ans->naddrs = 0;
@@ -1627,6 +1635,18 @@ static void lookup_name(const char *name, int af, char *hosts, size_t hosts_cap,
             if (src[s].service == NSS_SERVICE_FILES) status = name_from_files(name, af, hosts, hosts_cap, ans);
             else if (src[s].service == NSS_SERVICE_DNS) status = name_from_dns(name, af, ans);
             else status = NSS_STATUS_UNAVAIL;
+            if (status == NSS_STATUS_SUCCESS && nss_merges(&src[s], status)) {
+                /* hello544: the hosts database has no merge function, so an answer under SUCCESS=merge fails the lookup with
+                 * EINVAL, even from the last source; *h_errnop is what the source left: HOST_NOT_FOUND from files, 0 from dns
+                 * (glibc 2.44 getXXbyYY_r.c, measured). */
+                nss_list_free(&nl);
+                ans->names = (const char *)0;
+                ans->naddrs = 0;
+                ans->herr = src[s].service == NSS_SERVICE_FILES ? HOST_NOT_FOUND : 0;
+                ans->rc = EINVAL;
+                ans->merged = 1;
+                return;
+            }
             if (nss_stops(&src[s], status)) break;
         }
         nss_list_free(&nl);
@@ -1647,6 +1667,7 @@ static void lookup_name(const char *name, int af, char *hosts, size_t hosts_cap,
 }
 
 static void lookup_addr(const void *addr, unsigned int len, int family, char *hosts, size_t hosts_cap, struct host_answer *ans) {
+    ans->merged = 0;
     ans->names = (const char *)0;
     ans->names_len = 0;
     ans->naddrs = 0;
@@ -1709,6 +1730,13 @@ static void lookup_addr(const void *addr, unsigned int len, int family, char *ho
             /* A PTR query to the resolv.conf nameservers. A mapped ::ffff:a.b.c.d asks the in-addr.arpa name and is answered
              * as the IPv4 host it names: AF_INET, 4 bytes (glibc 2.44, measured; its /etc/hosts answer keeps the 16 bytes). */
             long r = resolv_ptr(query, query_family, ans->name_store, HOSTENT_NAME_MAX);
+            if (r == 0 && nss_merges(&src[s], NSS_STATUS_SUCCESS)) {
+                nss_list_free(&nl);
+                ans->herr = 0;
+                ans->rc = EINVAL;
+                ans->merged = 2;
+                return;
+            }
             if (r == 0) {
                 ans->names = ans->name_store;
                 ans->names_len = strlen(ans->name_store);
@@ -1725,6 +1753,14 @@ static void lookup_addr(const void *addr, unsigned int len, int family, char *ho
             ans->rc = ans->herr == TRY_AGAIN ? EAGAIN : 0;
         } else {
             status = src[s].service == NSS_SERVICE_DNS ? NSS_STATUS_NOTFOUND : NSS_STATUS_UNAVAIL;
+        }
+        if (status == NSS_STATUS_SUCCESS && nss_merges(&src[s], status)) {
+            /* As for a name (hello544), but h_errno and, after files, *h_errnop are left as they were. */
+            nss_list_free(&nl);
+            ans->herr = HERR_KEEP;
+            ans->rc = EINVAL;
+            ans->merged = 2;
+            return;
         }
         if (nss_stops(&src[s], status)) break;
     }
@@ -1768,7 +1804,8 @@ static size_t names_capped(const char *names, size_t len) {
 
 static struct hostent *static_result(struct host_answer *ans) {
     if (!ans->names) {
-        if (ans->herr != HERR_KEEP) h_errno = ans->herr;
+        if (ans->merged == 1) h_errno = HOST_NOT_FOUND;
+        else if (ans->merged != 2 && ans->herr != HERR_KEEP) h_errno = ans->herr;
         if (ans->rc == EAFNOSUPPORT && ans->herr == NETDB_INTERNAL) errno = EAFNOSUPPORT;
         if (ans->rc == ENOENT || ans->rc == EINVAL) errno = ans->rc;
         return (struct hostent *)0;
@@ -2328,6 +2365,26 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
             } else {
                 status = NSS_STATUS_UNAVAIL;
                 code = EAI_SYSTEM;
+            }
+            if (nss_merges(&src[s], status)) {
+                /* hello544 (glibc 2.44, measured). AF_INET without AI_CANONNAME is gethostbyname2_r's lookup: an answer under
+                 * SUCCESS=merge is EAI_NODATA with errno EINVAL and h_errno what the source left, merge for another status is
+                 * continue. Otherwise the next source, if any, ends the lookup with h_errno NETDB_INTERNAL and errno EBUSY, the
+                 * code from this source's status: EAI_SYSTEM for UNAVAIL or TRYAGAIN, its own for NOTFOUND, else EAI_NONAME. */
+                if (family == AF_INET && !(flags & AI_CANONNAME)) {
+                    if (status == NSS_STATUS_SUCCESS) {
+                        nss_list_free(&nl);
+                        h_errno = src[s].service == NSS_SERVICE_FILES ? HOST_NOT_FOUND : 0;
+                        errno = EINVAL;
+                        return EAI_NODATA;
+                    }
+                } else if (s + 1 < nsrc) {
+                    nss_list_free(&nl);
+                    h_errno = NETDB_INTERNAL;
+                    errno = EBUSY;
+                    if (status == NSS_STATUS_UNAVAIL || status == NSS_STATUS_TRYAGAIN) return EAI_SYSTEM;
+                    return status == NSS_STATUS_NOTFOUND ? code : EAI_NONAME;
+                }
             }
             if (nss_stops(&src[s], status)) break;
         }

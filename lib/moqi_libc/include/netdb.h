@@ -150,6 +150,7 @@ size_t hosts_reverse_names(const char *text, size_t len, int family, const uint8
 struct nss_source {
     unsigned char service; /* NSS_SERVICE_* */
     unsigned char stop;    /* bit NSS_STATUS_x set: that status ends the lookup */
+    unsigned char merge;   /* bit NSS_STATUS_x set: that status's action is merge */
 };
 size_t nsswitch_hosts(const char *text, size_t len, struct nss_source *out, size_t cap);
 
