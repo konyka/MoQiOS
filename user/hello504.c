@@ -51,6 +51,13 @@ int main(void) {
     long md = mkdir("/etc", 0755);
     snprintf(msg, sizeof msg, "setup: mkdir /etc %ld (0 or -17)", md);
     print("hello504:   .. "); print(msg); print("\n");
+    /* Only the "files" source: an address the file does not name must not go to the kernel's DNS server (hello548), whose answer
+     * depends on the network the test runs in. */
+    int nfd = (int)open("/etc/nsswitch.conf", 0x041 | 0x200, 0644);
+    long nw = nfd >= 0 ? (long)write(nfd, "hosts: files\n", 13) : -1;
+    if (nfd >= 0) close(nfd);
+    snprintf(msg, sizeof msg, "setup: nsswitch.conf hosts: files %ld (13)", nw);
+    print("hello504:   .. "); print(msg); print("\n");
 #endif
     int fd = (int)open(HOSTS_PATH, 0x041 | 0x200, 0644);
     long w = fd >= 0 ? (long)write(fd, hosts, sizeof hosts - 1) : -1;
@@ -77,6 +84,7 @@ int main(void) {
     strcpy(h1, "10.5.0.4");
 #else
     long u = unlink(HOSTS_PATH);
+    unlink("/etc/nsswitch.conf");
     int f1 = name_of(4, 0, sizeof h1, h1);
 #endif
     snprintf(msg, sizeof msg, "F: unlink %ld, then 10.5.0.4 %d '%s' (0 0 10.5.0.4)", u, f1, h1);

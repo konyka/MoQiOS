@@ -68,6 +68,13 @@ int main(void) {
     long md = mkdir("/etc", 0755);
     snprintf(msg, sizeof msg, "setup: mkdir /etc %ld (0 or -17)", md);
     print("hello510:   .. "); print(msg); print("\n");
+    /* Only the "files" source: an address the file does not name must not go to the kernel's DNS server (hello548), whose answer
+     * depends on the network the test runs in. */
+    int nfd = (int)open("/etc/nsswitch.conf", 0x041 | 0x200, 0644);
+    long nw = nfd >= 0 ? (long)write(nfd, "hosts: files\n", 13) : -1;
+    if (nfd >= 0) close(nfd);
+    snprintf(msg, sizeof msg, "setup: nsswitch.conf hosts: files %ld (13)", nw);
+    print("hello510:   .. "); print(msg); print("\n");
 #endif
     int fd = (int)open(HOSTS_PATH, 0x041 | 0x200, 0644);
     long w = fd >= 0 ? (long)write(fd, hosts, sizeof hosts - 1) : -1;
@@ -155,6 +162,7 @@ int main(void) {
     long u = 0; /* the host file is a bind-mount target */
 #else
     long u = unlink(HOSTS_PATH);
+    unlink("/etc/nsswitch.conf");
 #endif
     snprintf(msg, sizeof msg, "I: unlink %ld (0)", u);
     check(u == 0, msg);

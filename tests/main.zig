@@ -19140,3 +19140,16 @@ test "SO_PEEK_OFF on UDP sockets: a peek skips whole datagrams before the offset
     const udp = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, udp, "sp.udpPeekAt(") != null);
 }
+
+test "a zero-length UDP send is an empty datagram, and a receive returns it with its sender (Linux 7.x, measured) (hello551)" {
+    const ss = kt.socket_syscall_source;
+    // sendto: only a non-empty send needs a buffer; the copy of 0 bytes is skipped and a short copy is EFAULT.
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (len != 0 and (buf == 0 or buf >= 0x0000_8000_0000_0000)) return -14;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const n2 = if (to_copy2 == 0) 0 else copy.copyFromUser(&tmp_buf2, @ptrFromInt(buf), to_copy2);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const n6 = if (to_copy6 == 0) 0 else copy.copyFromUser(&tmp6, @ptrFromInt(buf), to_copy6);") != null);
+    // sendmsg sends an empty datagram too, instead of returning 0 without sending.
+    try std.testing.expect(std.mem.indexOf(u8, ss, "    if (total == 0) return 0;\n    return udpSendBytesFull(") == null);
+    // recvfrom: once udpWaitForDatagram saw a datagram, 0 bytes is an empty datagram with a sender.
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (result2 >= 0) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (result6 >= 0) {") != null);
+}

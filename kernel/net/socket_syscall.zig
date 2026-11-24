@@ -1033,7 +1033,8 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
         // inet_send_prepare: the socket is named before anything else is checked, so even a send that fails leaves it a port.
         const ab = udpAutobind(&t.fd_table.fds[fd]);
         if (ab != 0) return ab;
-        if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
+        // A zero-length send is an empty datagram (udp_sendmsg, measured: sendto("", 0) and sendto(NULL, 0) both send one, hello551).
+        if (len != 0 and (buf == 0 or buf >= 0x0000_8000_0000_0000)) return -14;
         const is_v6 = t.fd_table.fds[fd].udp_is_v6;
         const src_key = t.fd_table.fds[fd].udpKey();
         // A pending ICMP error (port unreachable) fails this send, once.
@@ -1078,8 +1079,8 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
                 if (copy.copyFromUser(big, @ptrFromInt(buf), len) != len) return -14;
                 return if (udp.sendToV6FromOv(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, oif6, big.ptr, @intCast(len), null, null, sndFlow6(src_key, flow6))) @intCast(len) else -1;
             }
-            const n6 = copy.copyFromUser(&tmp6, @ptrFromInt(buf), to_copy6);
-            if (n6 == 0) return -1;
+            const n6 = if (to_copy6 == 0) 0 else copy.copyFromUser(&tmp6, @ptrFromInt(buf), to_copy6);
+            if (n6 != to_copy6) return -14;
             if (udp.sendToV6FromOv(t.fd_table.fds[fd].udp_local_ip6, dst6, dst_port6, src_key, oif6, &tmp6, @intCast(n6), null, null, sndFlow6(src_key, flow6))) {
                 return @intCast(n6);
             } else {
@@ -1113,8 +1114,8 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
             if (copy.copyFromUser(big, @ptrFromInt(buf), len) != len) return -14;
             return if (udp.sendToFrom(t.fd_table.fds[fd].udp_local_ip, dst_ip, dst_port, src_key, big.ptr, @intCast(len))) @intCast(len) else -1;
         }
-        const n2 = copy.copyFromUser(&tmp_buf2, @ptrFromInt(buf), to_copy2);
-        if (n2 == 0) return -1;
+        const n2 = if (to_copy2 == 0) 0 else copy.copyFromUser(&tmp_buf2, @ptrFromInt(buf), to_copy2);
+        if (n2 != to_copy2) return -14;
         if (udp.sendToFrom(t.fd_table.fds[fd].udp_local_ip, dst_ip, dst_port, src_key, &tmp_buf2, @intCast(n2))) {
             return @intCast(n2);
         } else {
@@ -1354,7 +1355,8 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
             defer if (big6) |bt| udp.releaseBig(bt, msg_peek);
             const result6: i64 = if (big6) |bt| bt.len else udp.recvFromV6Ex(sock_key, &tmp6, @intCast(tmp6.len), &src6, &src_port_out6, &full_len6, msg_peek);
             if (big6) |bt| full_len6 = bt.full;
-            if (result6 > 0) {
+            // udpWaitForDatagram saw a datagram, so 0 bytes is an empty one: it has a sender like any other (hello551).
+            if (result6 >= 0) {
                 const to_write6: u32 = if (big6) |bt| @intCast(@min(@as(u64, bt.len), len)) else @min(@as(u32, @intCast(result6)), to_read6);
                 if (big6) |bt| {
                     if (!copy.validateUserBufferWritable(buf, to_write6)) return -14;
@@ -1395,7 +1397,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         defer if (big) |bt| udp.releaseBig(bt, msg_peek);
         const result2: i64 = if (big) |bt| bt.len else udp.recvFromEx(sock_key, &tmp_buf2, @intCast(tmp_buf2.len), &src_ip, &src_port_out, &full_len, msg_peek);
         if (big) |bt| full_len = bt.full;
-        if (result2 > 0) {
+        if (result2 >= 0) {
             const to_write: u32 = if (big) |bt| @intCast(@min(@as(u64, bt.len), len)) else @min(@as(u32, @intCast(result2)), to_read2);
             if (big) |bt| {
                 if (!copy.validateUserBufferWritable(buf, to_write)) return -14;
@@ -2062,7 +2064,6 @@ fn udpSendmsg(fd: u32, msghdr: *const [56]u8) i64 {
     }
     const got = gatherIov(iov_ptr, iov_len, &data);
     if (got < 0) return got;
-    if (total == 0) return 0;
     return udpSendBytesFull(fd, data[0..@intCast(got)], @intCast(total), name_ptr, name_len, ctl[0..cl]);
 }
 
