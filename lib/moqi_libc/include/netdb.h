@@ -121,6 +121,28 @@ size_t hosts_reverse6(const char *text, size_t len, const uint8_t addr[16], cons
  * field (canonical name and aliases, separated by blanks) rather than only its first name. */
 size_t hosts_reverse_names(const char *text, size_t len, int family, const uint8_t *addr, const char **names);
 
+/* The sources of the "hosts:" line of an /etc/nsswitch.conf text, in order, as glibc 2.44 reads it (measured): the last line whose
+ * keyword is "hosts" (case matters: "Hosts" is another database; blanks allowed before the line and the colon) counts; a line starting with '#' is a comment, but a
+ * '#' later on is part of a service name. "files" and "dns" are known (case matters); any other name is NSS_SERVICE_OTHER, which
+ * always fails with UNAVAIL (and as the last source makes getaddrinfo EAI_SYSTEM). "[STATUS=ACTION ...]" after a service (blanks allowed, "!STATUS" meaning every other status, both
+ * words in any case; "merge" is taken as "continue") sets which statuses end the lookup; the default ends it on SUCCESS only.
+ * With no text, or no "hosts" line, the sources are "files dns". Returns how many were written (at most `cap`), and 0 for a line
+ * glibc refuses as a whole: no service, a '[' before any service, an unknown status or action, or a missing ']'; a lookup then
+ * fails with NETDB_INTERNAL (EAI_SYSTEM). */
+#define NSS_SERVICE_FILES 1
+#define NSS_SERVICE_DNS   2
+#define NSS_SERVICE_OTHER 3
+#define NSS_STATUS_SUCCESS  0
+#define NSS_STATUS_NOTFOUND 1
+#define NSS_STATUS_UNAVAIL  2
+#define NSS_STATUS_TRYAGAIN 3
+#define NSS_HOSTS_MAX 8
+struct nss_source {
+    unsigned char service; /* NSS_SERVICE_* */
+    unsigned char stop;    /* bit NSS_STATUS_x set: that status ends the lookup */
+};
+size_t nsswitch_hosts(const char *text, size_t len, struct nss_source *out, size_t cap);
+
 struct hostent;
 
 /* Lay a hostent out in the caller's buffer, as the *_r functions do: the alias and address pointer arrays (pointer-aligned),
@@ -253,6 +275,7 @@ void if_freenameindex(struct if_nameindex *ptr);
 #define EAI_SERVICE  -8
 #define EAI_ADDRFAMILY -9
 #define EAI_MEMORY   -10
+#define EAI_SYSTEM   -11
 #define EAI_OVERFLOW -12
 
 struct addrinfo {

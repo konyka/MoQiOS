@@ -30,6 +30,9 @@ long moqi_test_syscall2(long nr, long a1, long a2) {
 /* /etc/resolv.conf for netdb.c (NULL: no file), and dns_query (507) replies from a script: each call takes the next entry,
  * logging the name, server's last octet and limit. A reply of 0 writes 10.0.0.<call number>. */
 const char *moqi_test_resolv_conf;
+/* /etc/nsswitch.conf and /etc/hosts for netdb.c (NULL: no file). */
+const char *moqi_test_nsswitch_conf;
+const char *moqi_test_etc_hosts;
 unsigned moqi_test_rotate_seed = 1;
 static long q_reply[32];
 static int q_n, q_calls;
@@ -1103,10 +1106,191 @@ int main(void) {
         q_script(one, nx, 1);
         assert(getnameinfo(sa, 16, hb, sizeof hb, 0, 0, 0) == 0 && strcmp(hb, "10.2.3.4") == 0);
         q_script(one, to, 1);
+        assert(getnameinfo(sa, 16, hb, sizeof hb, 0, 0, NI_NAMEREQD) == EAI_AGAIN);
+        q_script(one, to, 1);
+        assert(getnameinfo(sa, 16, hb, sizeof hb, 0, 0, 0) == EAI_AGAIN);
+        q_script(one, nx, 1);
         assert(getnameinfo(sa, 16, hb, sizeof hb, 0, 0, NI_NAMEREQD) == EAI_NONAME);
         q_script(one, ok, 1);
         assert(getnameinfo(sa, 16, hb, sizeof hb, 0, 0, NI_NUMERICHOST) == 0 && strcmp(hb, "10.2.3.4") == 0 && q_calls == 0);
         q_ptr_name = "ptr.test";
+        moqi_test_resolv_conf = (const char *)0;
+    }
+
+    /* hello528: the "hosts:" line of /etc/nsswitch.conf (glibc 2.44, measured). */
+    {
+        struct nss_source s[NSS_HOSTS_MAX];
+#define NSS(t) nsswitch_hosts((t), sizeof(t) - 1, s, NSS_HOSTS_MAX)
+        const unsigned char ok_only = 1u << NSS_STATUS_SUCCESS;
+        assert(nsswitch_hosts((const char *)0, 0, s, NSS_HOSTS_MAX) == 2 && s[0].service == NSS_SERVICE_FILES &&
+               s[1].service == NSS_SERVICE_DNS && s[0].stop == ok_only && s[1].stop == ok_only);
+        assert(NSS("passwd: files\n") == 2 && s[0].service == NSS_SERVICE_FILES);
+        assert(NSS("hosts: dns files\n") == 2 && s[0].service == NSS_SERVICE_DNS && s[1].service == NSS_SERVICE_FILES);
+        assert(NSS("hosts: files\n") == 1 && s[0].service == NSS_SERVICE_FILES);
+        assert(NSS("hosts:dns") == 1 && s[0].service == NSS_SERVICE_DNS);
+        assert(NSS(" hosts :\tdns  files # c\n") == 4 && s[0].service == NSS_SERVICE_DNS && s[2].service == NSS_SERVICE_OTHER);
+        assert(NSS("Hosts: dns\n") == 2 && s[0].service == NSS_SERVICE_FILES); /* the keyword's case matters */
+        assert(NSS("hosts: dns\nHosts: files\n") == 1 && s[0].service == NSS_SERVICE_DNS);
+        assert(NSS("hosts: files dns#c\n") == 2 && s[1].service == NSS_SERVICE_OTHER);
+        assert(NSS("hosts: DNS FILES\n") == 2 && s[0].service == NSS_SERVICE_OTHER && s[1].service == NSS_SERVICE_OTHER);
+        assert(NSS("hosts: dns\n#hosts: files\n  # hosts: files\n") == 1 && s[0].service == NSS_SERVICE_DNS);
+        assert(NSS("hosts: files\nhosts: dns\n") == 1 && s[0].service == NSS_SERVICE_DNS);
+        assert(NSS("hosts: dns files\nhosts:\n") == 0);
+        assert(NSS("hosts:   \n") == 0);
+        assert(NSS("hosts: files [NOTFOUND=return] dns\n") == 2 && s[0].stop == (ok_only | 1u << NSS_STATUS_NOTFOUND) && s[1].stop == ok_only);
+        assert(NSS("hosts: dns[ notfound = Return ] files\n") == 2 && s[0].stop == (ok_only | 1u << NSS_STATUS_NOTFOUND));
+        /* A second "[" where a service name should be ends the list there. */
+        assert(NSS("hosts: dns [NOTFOUND=return] [UNAVAIL=return] files\n") == 1 && s[0].stop == (ok_only | 1u << NSS_STATUS_NOTFOUND));
+        assert(NSS("hosts: dns [UNAVAIL=return]files\n") == 2 && s[1].service == NSS_SERVICE_FILES);
+        assert(NSS("hosts: dns [UNAVAIL=return]] files\n") == 3 && s[1].service == NSS_SERVICE_OTHER);
+        assert(NSS("hosts: dns [] files\n") == 0 && NSS("hosts: dns [UNAVAIL=]\n") == 0 && NSS("hosts: dns [UNAVAIL return] files\n") == 0);
+        assert(NSS("hosts: dns [UNAVAIL=return SUCCESS]\n") == 0 && NSS("hosts: dns [NOTFOUND=return UNAVAIL=return] files\n") == 2);
+        assert(NSS("hosts: dns [!UNAVAIL=return] files\n") == 2 &&
+               s[0].stop == (ok_only | 1u << NSS_STATUS_NOTFOUND | 1u << NSS_STATUS_TRYAGAIN));
+        assert(NSS("hosts: files [SUCCESS=continue] dns\n") == 2 && s[0].stop == 0);
+        assert(NSS("hosts: dns [SUCCESS=return NOTFOUND=continue] files\n") == 2 && s[0].stop == ok_only);
+        assert(NSS("hosts: dns [NOTFOUND=merge] files\n") == 2 && s[0].stop == ok_only);
+        assert(NSS("hosts: [NOTFOUND=return] dns files\n") == 0);
+        assert(NSS("hosts: dns [NOTFOUND=foo] files\n") == 0);
+        assert(NSS("hosts: files [FOO=return] dns\n") == 0);
+        assert(NSS("hosts: files [NOTFOUND=return dns\n") == 0);
+        assert(NSS("hosts: files files dns\n") == 3);
+        assert(nsswitch_hosts("hosts: dns files", 10, s, NSS_HOSTS_MAX) == 1); /* only `len` bytes are read */
+        assert(nsswitch_hosts("hosts: files dns", 16, s, 1) == 1 && s[0].service == NSS_SERVICE_FILES);
+#undef NSS
+
+        /* The lookups follow the line. */
+        static const char one[] = "nameserver 10.0.0.1\noptions attempts:1\n";
+        static const long ok[] = {0}, nx[] = {-2}, to[] = {-110}, fe[] = {-71}, sf[] = {-11};
+        moqi_test_etc_hosts = "10.1.1.1 filehost.test fh\n10.2.3.4 filerev.test\n";
+        struct hostent *hp;
+        moqi_test_nsswitch_conf = "hosts: files dns\n";
+        q_script(one, ok, 1);
+        hp = gethostbyname("filehost.test");
+        assert(hp && (unsigned char)hp->h_addr_list[0][3] == 1 && q_calls == 0);
+        moqi_test_nsswitch_conf = "hosts: dns files\n";
+        q_script(one, ok, 1);
+        hp = gethostbyname("filehost.test");
+        assert(hp && (unsigned char)hp->h_addr_list[0][0] == 10 && (unsigned char)hp->h_addr_list[0][3] == 1 && q_calls == 1);
+        assert(strcmp(q_log, "filehost.test@1/5;") == 0 && hp->h_addr_list[0][1] == 0); /* 10.0.0.1 from the stub, not 10.1.1.1 */
+        moqi_test_nsswitch_conf = "hosts: dns files\n";
+        q_script(one, nx, 1);
+        hp = gethostbyname("filehost.test");
+        assert(hp && hp->h_addr_list[0][1] == 1 && q_calls == 1); /* NXDOMAIN, then the file */
+        q_script(one, to, 1);
+        hp = gethostbyname("nosuch.test");
+        assert(!hp && h_errno == HOST_NOT_FOUND && q_calls == 1); /* the last source's status */
+        moqi_test_nsswitch_conf = "hosts: dns [UNAVAIL=return] files\n";
+        q_script(one, to, 1);
+        assert(!gethostbyname("filehost.test") && h_errno == TRY_AGAIN);
+        q_script(one, sf, 1);
+        assert(!gethostbyname("filehost.test") && h_errno == TRY_AGAIN);
+        q_script(one, fe, 1);
+        assert(gethostbyname("filehost.test")); /* FORMERR is NOTFOUND */
+        moqi_test_nsswitch_conf = "hosts: dns [NOTFOUND=return] files\n";
+        q_script(one, nx, 1);
+        assert(!gethostbyname("filehost.test") && h_errno == HOST_NOT_FOUND);
+        q_script(one, to, 1);
+        assert(gethostbyname("filehost.test")); /* a timeout is UNAVAIL */
+        moqi_test_nsswitch_conf = "hosts: files\n";
+        q_script(one, ok, 1);
+        assert(!gethostbyname("a.test") && h_errno == HOST_NOT_FOUND && q_calls == 0);
+        moqi_test_nsswitch_conf = "hosts: files [NOTFOUND=return] dns\n";
+        q_script(one, ok, 1);
+        assert(!gethostbyname("a.test") && h_errno == HOST_NOT_FOUND && q_calls == 0);
+        moqi_test_nsswitch_conf = "hosts: files [SUCCESS=continue] dns\n";
+        q_script(one, nx, 1);
+        assert(!gethostbyname("filehost.test") && h_errno == HOST_NOT_FOUND && q_calls == 1);
+        moqi_test_nsswitch_conf = "hosts:\n";
+        q_script(one, ok, 1);
+        assert(!gethostbyname("filehost.test") && h_errno == NETDB_INTERNAL && q_calls == 0);
+        assert(gethostbyname("10.1.1.1")); /* a literal needs no source */
+        moqi_test_nsswitch_conf = "hosts: bogus\n";
+        assert(!gethostbyname("filehost.test") && h_errno == NETDB_INTERNAL);
+        moqi_test_nsswitch_conf = "hosts: files bogus\n";
+        assert(!gethostbyname("a.test") && h_errno == HOST_NOT_FOUND);
+        {
+            struct hostent he, *res = (struct hostent *)0;
+            char buf[512];
+            int herr = 0;
+            moqi_test_nsswitch_conf = "hosts:\n";
+            assert(gethostbyname_r("a.test", &he, buf, sizeof buf, &res, &herr) == 0 && !res && herr == NETDB_INTERNAL);
+        }
+
+        /* getaddrinfo: the last source's code; an unknown service last is EAI_SYSTEM. */
+        struct addrinfo hints, *res = (struct addrinfo *)0;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        moqi_test_nsswitch_conf = "hosts: dns files\n";
+        q_script(one, ok, 1);
+        assert(getaddrinfo("filehost.test", 0, &hints, &res) == 0 && ((unsigned char *)res->ai_addr)[5] == 0 && q_calls == 1);
+        freeaddrinfo(res);
+        q_script(one, nx, 1);
+        assert(getaddrinfo("filehost.test", 0, &hints, &res) == 0 && ((unsigned char *)res->ai_addr)[5] == 1);
+        freeaddrinfo(res);
+        q_script(one, to, 1);
+        assert(getaddrinfo("nosuch.test", 0, &hints, &res) == EAI_NONAME);
+        moqi_test_nsswitch_conf = "hosts: dns [UNAVAIL=return] files\n";
+        q_script(one, to, 1);
+        assert(getaddrinfo("filehost.test", 0, &hints, &res) == EAI_AGAIN);
+        moqi_test_nsswitch_conf = "hosts: files\n";
+        q_script(one, ok, 1);
+        assert(getaddrinfo("a.test", 0, &hints, &res) == EAI_NONAME && q_calls == 0);
+        moqi_test_nsswitch_conf = "hosts: files dns bogus\n";
+        q_script(one, nx, 1);
+        assert(getaddrinfo("nosuch.test", 0, &hints, &res) == EAI_SYSTEM);
+        moqi_test_nsswitch_conf = "hosts: files bogus dns\n";
+        q_script(one, nx, 1);
+        assert(getaddrinfo("nosuch.test", 0, &hints, &res) == EAI_NONAME);
+        moqi_test_nsswitch_conf = "hosts:\n";
+        q_script(one, ok, 1);
+        assert(getaddrinfo("filehost.test", 0, &hints, &res) == EAI_SYSTEM && q_calls == 0);
+        assert(getaddrinfo("10.1.1.1", 0, &hints, &res) == 0);
+        freeaddrinfo(res);
+
+        /* Reverse lookups: every DNS failure is NOTFOUND. */
+        uint8_t r4[4] = {10, 2, 3, 4}, r9[4] = {10, 2, 3, 9};
+        uint8_t sa4[16] = {2, 0, 0, 80, 10, 2, 3, 4};
+        char hb[64];
+        moqi_test_nsswitch_conf = "hosts: dns files\n";
+        q_script(one, ok, 1);
+        q_ptr_name = "host4.test";
+        hp = gethostbyaddr(r4, 4, AF_INET);
+        assert(hp && strcmp(hp->h_name, "host4.test") == 0 && q_calls == 1);
+        moqi_test_nsswitch_conf = "hosts: files\n";
+        q_script(one, ok, 1);
+        assert(!gethostbyaddr(r9, 4, AF_INET) && h_errno == HOST_NOT_FOUND && q_calls == 0);
+        hp = gethostbyaddr(r4, 4, AF_INET);
+        assert(hp && strcmp(hp->h_name, "filerev.test") == 0);
+        moqi_test_nsswitch_conf = "hosts: dns [NOTFOUND=return] files\n";
+        q_script(one, to, 1);
+        assert(!gethostbyaddr(r4, 4, AF_INET) && h_errno == TRY_AGAIN);
+        moqi_test_nsswitch_conf = "hosts: dns [UNAVAIL=return] files\n";
+        q_script(one, sf, 1);
+        hp = gethostbyaddr(r4, 4, AF_INET);
+        assert(hp && strcmp(hp->h_name, "filerev.test") == 0);
+        moqi_test_nsswitch_conf = "hosts:\n";
+        q_script(one, ok, 1);
+        assert(!gethostbyaddr(r4, 4, AF_INET) && h_errno == NETDB_INTERNAL && q_calls == 0);
+        assert(getnameinfo(sa4, 16, hb, sizeof hb, 0, 0, 0) == EAI_SYSTEM);
+        moqi_test_nsswitch_conf = "hosts: dns\n";
+        q_script(one, ok, 1);
+        assert(getnameinfo(sa4, 16, hb, sizeof hb, 0, 0, 0) == 0 && strcmp(hb, "host4.test") == 0 && q_calls == 1);
+        moqi_test_nsswitch_conf = "hosts: files\n";
+        q_script(one, ok, 1);
+        assert(getnameinfo(sa4, 16, hb, sizeof hb, 0, 0, 0) == 0 && strcmp(hb, "filerev.test") == 0 && q_calls == 0);
+        sa4[7] = 9;
+        assert(getnameinfo(sa4, 16, hb, sizeof hb, 0, 0, 0) == 0 && strcmp(hb, "10.2.3.9") == 0 && q_calls == 0);
+        assert(getnameinfo(sa4, 16, hb, sizeof hb, 0, 0, NI_NAMEREQD) == EAI_NONAME);
+        moqi_test_nsswitch_conf = "hosts: files bogus\n";
+        assert(getnameinfo(sa4, 16, hb, sizeof hb, 0, 0, NI_NAMEREQD) == EAI_NONAME);
+        moqi_test_nsswitch_conf = "hosts: files dns\n";
+        q_script(one, to, 1);
+        assert(getnameinfo(sa4, 16, hb, sizeof hb, 0, 0, 0) == EAI_AGAIN);
+        q_ptr_name = "ptr.test";
+        moqi_test_nsswitch_conf = (const char *)0;
+        moqi_test_etc_hosts = (const char *)0;
         moqi_test_resolv_conf = (const char *)0;
     }
 

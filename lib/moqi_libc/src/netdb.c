@@ -816,10 +816,151 @@ size_t hosts_reverse6(const char *text, size_t len, const uint8_t want[16], cons
     return hosts_reverse_any(text, len, AF_INET6, want, 16, name);
 }
 
-/* The host test links netdb.o without the file system: there /etc/hosts is never read. */
+/* ---- /etc/nsswitch.conf ------------------------------------------------------------------------------------------ */
+
+static int nss_space(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\v' || c == '\f'; }
+
+static int nss_word_is(const char *w, size_t n, const char *lit) {
+    if (strlen(lit) != n) return 0;
+    for (size_t i = 0; i < n; i++)
+        if (hosts_lower(w[i]) != hosts_lower(lit[i])) return 0;
+    return 1;
+}
+
+/* glibc's nss_parse_service_list on text[a, b): the sources into `out`, or 0 when the line is refused. */
+static size_t nss_parse_list(const char *t, size_t i, size_t b, struct nss_source *out, size_t cap) {
+    size_t n = 0;
+    for (;;) {
+        while (i < b && nss_space(t[i])) i++;
+        if (i >= b) break;
+        size_t name = i;
+        while (i < b && !nss_space(t[i]) && t[i] != '[') i++;
+        if (i == name) break; /* a '[' where a service name should be ends the list */
+        struct nss_source s;
+        s.service = NSS_SERVICE_OTHER;
+        if (i - name == 5 && memcmp(t + name, "files", 5) == 0) s.service = NSS_SERVICE_FILES;
+        if (i - name == 3 && memcmp(t + name, "dns", 3) == 0) s.service = NSS_SERVICE_DNS;
+        s.stop = 1u << NSS_STATUS_SUCCESS;
+        while (i < b && nss_space(t[i])) i++;
+        if (i < b && t[i] == '[') {
+            do i++; while (i < b && nss_space(t[i]));
+            do {
+                int not = i < b && t[i] == '!';
+                if (not) i++;
+                size_t w = i;
+                while (i < b && !nss_space(t[i]) && t[i] != '=' && t[i] != ']') i++;
+                int status;
+                if (nss_word_is(t + w, i - w, "SUCCESS")) status = NSS_STATUS_SUCCESS;
+                else if (nss_word_is(t + w, i - w, "NOTFOUND")) status = NSS_STATUS_NOTFOUND;
+                else if (nss_word_is(t + w, i - w, "UNAVAIL")) status = NSS_STATUS_UNAVAIL;
+                else if (nss_word_is(t + w, i - w, "TRYAGAIN")) status = NSS_STATUS_TRYAGAIN;
+                else return 0;
+                while (i < b && nss_space(t[i])) i++;
+                if (i >= b || t[i] != '=') return 0;
+                do i++; while (i < b && nss_space(t[i]));
+                w = i;
+                while (i < b && !nss_space(t[i]) && t[i] != '=' && t[i] != ']') i++;
+                int ret;
+                if (nss_word_is(t + w, i - w, "return")) ret = 1;
+                else if (nss_word_is(t + w, i - w, "continue") || nss_word_is(t + w, i - w, "merge")) ret = 0;
+                else return 0;
+                unsigned bit = 1u << status;
+                if (not) {
+                    unsigned keep = s.stop & bit;
+                    s.stop = (unsigned char)((ret ? 0x0Fu : 0u) & ~bit);
+                    s.stop |= (unsigned char)keep;
+                } else {
+                    s.stop = (unsigned char)(ret ? (s.stop | bit) : (s.stop & ~bit));
+                }
+                while (i < b && nss_space(t[i])) i++;
+            } while (i < b && t[i] != ']');
+            if (i >= b) return 0; /* no ']' */
+            i++;
+        }
+        if (n < cap) out[n++] = s;
+    }
+    return n;
+}
+
+size_t nsswitch_hosts(const char *text, size_t len, struct nss_source *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    size_t found_a = 0, found_b = 0;
+    int found = 0;
+    for (size_t pos = 0; text && pos < len;) {
+        size_t end = pos;
+        while (end < len && text[end] != '\n') end++;
+        size_t i = pos;
+        while (i < end && nss_space(text[i])) i++;
+        size_t w = i;
+        while (i < end && !nss_space(text[i]) && text[i] != ':') i++;
+        size_t wl = i - w;
+        while (i < end && nss_space(text[i])) i++;
+        if (i < end && text[i] == ':' && wl == 5 && memcmp(text + w, "hosts", 5) == 0) {
+            found = 1;
+            found_a = i + 1;
+            found_b = end;
+        }
+        pos = end + 1;
+    }
+    if (!found) {
+        size_t n = 0;
+        out[n].service = NSS_SERVICE_FILES;
+        out[n++].stop = 1u << NSS_STATUS_SUCCESS;
+        if (n < cap) {
+            out[n].service = NSS_SERVICE_DNS;
+            out[n++].stop = 1u << NSS_STATUS_SUCCESS;
+        }
+        return n;
+    }
+    return nss_parse_list(text, found_a, found_b, out, cap);
+}
+
+#ifdef MOQI_HOST_TEST_SYSCALL
+extern const char *moqi_test_nsswitch_conf;
+static size_t nsswitch_conf_read(char *buf, size_t cap) {
+    if (!moqi_test_nsswitch_conf) return 0;
+    size_t n = strlen(moqi_test_nsswitch_conf);
+    if (n > cap) n = cap;
+    memcpy(buf, moqi_test_nsswitch_conf, n);
+    return n;
+}
+#else
+static size_t nsswitch_conf_read(char *buf, size_t cap) {
+    long fd = syscall3(SYS_open, (long)"/etc/nsswitch.conf", 0 /* O_RDONLY */, 0);
+    if (fd < 0) return 0;
+    long n = 0;
+    while (n < (long)cap) {
+        long r = syscall3(SYS_read, fd, (long)(buf + n), (long)cap - n);
+        if (r <= 0) break;
+        n += r;
+    }
+    syscall1(SYS_close, fd);
+    return (size_t)n;
+}
+#endif
+
+/* The hosts sources of /etc/nsswitch.conf, read afresh on every lookup (glibc rereads a changed file too). */
+static size_t hosts_sources(struct nss_source *out) {
+    char buf[2048];
+    size_t len = nsswitch_conf_read(buf, sizeof buf);
+    return nsswitch_hosts(len ? buf : (const char *)0, len, out, NSS_HOSTS_MAX);
+}
+
+/* Whether `status` ends the lookup after source `s`. */
+static int nss_stops(const struct nss_source *s, int status) { return (s->stop >> status) & 1; }
+
 #define ETC_HOSTS_MAX 8192
 #ifdef MOQI_HOST_TEST_SYSCALL
-static size_t etc_hosts_read_into(char *buf, size_t cap) { (void)buf; (void)cap; return 0; }
+/* The host test supplies the file's text (NULL: no file). */
+extern const char *moqi_test_etc_hosts;
+static size_t etc_hosts_read_into(char *buf, size_t cap) {
+    if (!moqi_test_etc_hosts) return 0;
+    size_t n = strlen(moqi_test_etc_hosts);
+    if (n > cap) n = cap;
+    memcpy(buf, moqi_test_etc_hosts, n);
+    return n;
+}
+static int etc_hosts_exists(void) { return moqi_test_etc_hosts != (const char *)0; }
 #else
 /* Read up to `cap` bytes of /etc/hosts into `buf`; 0 when there is no file. The reentrant lookups pass a buffer of their own. */
 static size_t etc_hosts_read_into(char *buf, size_t cap) {
@@ -833,6 +974,13 @@ static size_t etc_hosts_read_into(char *buf, size_t cap) {
     }
     syscall1(SYS_close, fd);
     return (size_t)n;
+}
+/* Whether /etc/hosts exists: glibc's files source is UNAVAIL without it, NOTFOUND when it does not name the host (measured). */
+static int etc_hosts_exists(void) {
+    long fd = syscall3(SYS_open, (long)"/etc/hosts", 0 /* O_RDONLY */, 0);
+    if (fd < 0) return 0;
+    syscall1(SYS_close, fd);
+    return 1;
 }
 #endif
 static char etc_hosts_buf[ETC_HOSTS_MAX];
@@ -1086,6 +1234,63 @@ struct host_answer {
     int rc;
 };
 
+/* The "files" source for a name: every /etc/hosts line of this family in file order, the names from the first one. NOTFOUND
+ * when the file does not name it, UNAVAIL when there is no file (h_errno HOST_NOT_FOUND either way). */
+static int name_from_files(const char *name, int af, char *hosts, size_t hosts_cap, struct host_answer *ans) {
+    size_t alen = af == AF_INET6 ? 16 : 4;
+    size_t n = etc_hosts_read_into(hosts, hosts_cap);
+    struct hosts_addr found[HOSTENT_ADDRS_MAX];
+    const char *names = (const char *)0;
+    size_t names_len = 0;
+    size_t k = n ? hosts_collect(hosts, n, name, af, found, HOSTENT_ADDRS_MAX, &names, &names_len) : 0;
+    ans->rc = 0;
+    if (!k) {
+        ans->herr = HOST_NOT_FOUND;
+        return n || etc_hosts_exists() ? NSS_STATUS_NOTFOUND : NSS_STATUS_UNAVAIL;
+    }
+    for (size_t i = 0; i < k; i++) memcpy(ans->addrs[i], found[i].addr, alen);
+    ans->naddrs = k;
+    if (names_len >= HOSTENT_NAME_MAX) names_len = HOSTENT_NAME_MAX - 1;
+    memcpy(ans->name_store, names, names_len);
+    ans->names = ans->name_store;
+    ans->names_len = names_len;
+    ans->herr = 0;
+    return NSS_STATUS_SUCCESS;
+}
+
+/* The "dns" source for a name. AF_INET asks A records, AF_INET6 AAAA records (gethostbyname2, glibc measured). The name that
+ * answered (a search domain may have been appended, and the end of a CNAME chain) is the canonical name, the names before it in
+ * the chain the aliases, and every address of the reply is listed (glibc, measured). A failure that h_errno calls TRY_AGAIN (no
+ * reply, SERVFAIL, REFUSED, NOTIMP) is UNAVAIL, any other NOTFOUND (glibc 2.44 under [UNAVAIL=return] / [NOTFOUND=return],
+ * measured). */
+static int name_from_dns(const char *name, int af, struct host_answer *ans) {
+    ans->name_store[0] = 0;
+    ans->rc = 0;
+    struct resolv_answer ra;
+    long r = resolv_lookup_af(name, af, ans->addrs[0], ans->name_store, HOSTENT_NAME_MAX, &ra);
+    if (r < 0) {
+        /* glibc (measured): a name that does not exist, is malformed or too long is HOST_NOT_FOUND; one that exists without an
+         * address NO_DATA; an error RCODE other than SERVFAIL/NOTIMP/REFUSED NO_RECOVERY; no reply, a server error or any other
+         * failure TRY_AGAIN. */
+        ans->herr = netdb_herr_of(r);
+        if (ans->herr == TRY_AGAIN) {
+            ans->rc = EAGAIN;
+            return NSS_STATUS_UNAVAIL;
+        }
+        return NSS_STATUS_NOTFOUND;
+    }
+    char chain[HOSTENT_NAME_MAX];
+    size_t k = resolv_answer_unpack(&ra, ans->addrs, HOSTENT_ADDRS_MAX, chain, sizeof chain);
+    if (k) memcpy(ans->name_store, chain, strlen(chain) + 1);
+    ans->naddrs = k ? k : 1;
+    if (ans->name_store[0]) {
+        ans->names = ans->name_store;
+        ans->names_len = strlen(ans->name_store);
+    }
+    ans->herr = 0;
+    return NSS_STATUS_SUCCESS;
+}
+
 /* `hosts`/`hosts_cap` is the scratch space for /etc/hosts text: the static functions pass etc_hosts_buf, the reentrant ones a
  * buffer of their own, so the two never share state. */
 static void lookup_name(const char *name, int af, char *hosts, size_t hosts_cap, struct host_answer *ans) {
@@ -1115,45 +1320,23 @@ static void lookup_name(const char *name, int af, char *hosts, size_t hosts_cap,
         memcpy(ans->addrs[0], lit, alen);
         ans->naddrs = 1;
     } else {
-        /* Every /etc/hosts line of this family in file order; the names come from the first one. */
-        size_t n = etc_hosts_read_into(hosts, hosts_cap);
-        struct hosts_addr found[HOSTENT_ADDRS_MAX];
-        const char *names = (const char *)0;
-        size_t names_len = 0;
-        size_t k = n ? hosts_collect(hosts, n, name, af, found, HOSTENT_ADDRS_MAX, &names, &names_len) : 0;
-        if (k) {
-            for (size_t i = 0; i < k; i++) memcpy(ans->addrs[i], found[i].addr, alen);
-            ans->naddrs = k;
-            if (names_len >= HOSTENT_NAME_MAX) names_len = HOSTENT_NAME_MAX - 1;
-            memcpy(ans->name_store, names, names_len);
-            ans->names = ans->name_store;
-            ans->names_len = names_len;
-        } else {
-            /* AF_INET asks A records, AF_INET6 AAAA records (gethostbyname2, glibc measured). The name that answered (a search domain may have been appended, and the end of a CNAME chain) is the canonical
-             * name, the names before it in the chain the aliases, and every address of the reply is listed (glibc, measured). */
-            ans->name_store[0] = 0;
-            struct resolv_answer ra;
-            long r = resolv_lookup_af(name, af, ans->addrs[0], ans->name_store, HOSTENT_NAME_MAX, &ra);
-            if (r == 0) {
-                char chain[HOSTENT_NAME_MAX];
-                size_t k = resolv_answer_unpack(&ra, ans->addrs, HOSTENT_ADDRS_MAX, chain, sizeof chain);
-                if (k) {
-                    memcpy(ans->name_store, chain, strlen(chain) + 1);
-                }
-                ans->naddrs = k ? k : 1;
-            }
-            if (r == 0 && ans->name_store[0]) {
-                ans->names = ans->name_store;
-                ans->names_len = strlen(ans->name_store);
-            }
-            if (r < 0) {
-                /* glibc (measured): a name that does not exist, is malformed or too long is HOST_NOT_FOUND; one that exists without
-                 * an address NO_DATA; an error RCODE other than SERVFAIL/NOTIMP/REFUSED NO_RECOVERY; no reply, a server error or
-                 * any other failure TRY_AGAIN. */
-                ans->herr = netdb_herr_of(r);
-                if (ans->herr == TRY_AGAIN) ans->rc = EAGAIN;
-                return;
-            }
+        /* The sources of the nsswitch.conf "hosts" line in order; the last one asked decides (glibc 2.44, measured). */
+        struct nss_source src[NSS_HOSTS_MAX];
+        size_t nsrc = hosts_sources(src);
+        int status = NSS_STATUS_UNAVAIL;
+        ans->herr = NETDB_INTERNAL; /* no source at all, or only ones this library does not have */
+        for (size_t s = 0; s < nsrc; s++) {
+            ans->names = (const char *)0;
+            ans->naddrs = 0;
+            if (src[s].service == NSS_SERVICE_FILES) status = name_from_files(name, af, hosts, hosts_cap, ans);
+            else if (src[s].service == NSS_SERVICE_DNS) status = name_from_dns(name, af, ans);
+            else status = NSS_STATUS_UNAVAIL;
+            if (nss_stops(&src[s], status)) break;
+        }
+        if (status != NSS_STATUS_SUCCESS) {
+            ans->names = (const char *)0;
+            ans->naddrs = 0;
+            return;
         }
     }
     if (!ans->names) {
@@ -1205,35 +1388,47 @@ static void lookup_addr(const void *addr, unsigned int len, int family, char *ho
         query_family = AF_INET;
         query += 12;
     }
-    size_t n = etc_hosts_read_into(hosts, hosts_cap);
+    /* The nsswitch.conf "hosts" sources in order (glibc 2.44, measured): for an address every DNS failure, a timeout included, is
+     * NOTFOUND, and a source this library does not have leaves h_errno as it was. */
+    struct nss_source src[NSS_HOSTS_MAX];
+    size_t nsrc = hosts_sources(src);
     const char *names = (const char *)0;
-    size_t names_len = n ? hosts_reverse_names(hosts, n, query_family, query, &names) : 0;
-    if (!names_len && requested_family != AF_UNSPEC) {
-        /* Not in /etc/hosts: a PTR query to the resolv.conf nameservers ("files dns"). A mapped ::ffff:a.b.c.d asks the
-         * in-addr.arpa name and is answered as the IPv4 host it names: AF_INET, 4 bytes (glibc 2.44, measured; its /etc/hosts
-         * answer keeps the 16 bytes instead). */
-        long r = resolv_ptr(query, query_family, ans->name_store, HOSTENT_NAME_MAX);
-        if (r == 0) {
-            ans->names = ans->name_store;
-            ans->names_len = strlen(ans->name_store);
-            ans->af = query_family;
-            memcpy(ans->addrs[0], query, query_family == AF_INET ? 4 : 16);
-            ans->naddrs = 1;
-            ans->herr = 0;
-            return;
+    size_t names_len = 0;
+    int status = NSS_STATUS_UNAVAIL;
+    ans->herr = NETDB_INTERNAL;
+    for (size_t s = 0; s < nsrc; s++) {
+        if (src[s].service == NSS_SERVICE_FILES) {
+            size_t n = etc_hosts_read_into(hosts, hosts_cap);
+            names_len = n ? hosts_reverse_names(hosts, n, query_family, query, &names) : 0;
+            status = names_len ? NSS_STATUS_SUCCESS : n || etc_hosts_exists() ? NSS_STATUS_NOTFOUND : NSS_STATUS_UNAVAIL;
+            ans->herr = names_len ? 0 : HOST_NOT_FOUND;
+            ans->rc = 0;
+        } else if (src[s].service == NSS_SERVICE_DNS && requested_family != AF_UNSPEC) {
+            /* A PTR query to the resolv.conf nameservers. A mapped ::ffff:a.b.c.d asks the in-addr.arpa name and is answered
+             * as the IPv4 host it names: AF_INET, 4 bytes (glibc 2.44, measured; its /etc/hosts answer keeps the 16 bytes). */
+            long r = resolv_ptr(query, query_family, ans->name_store, HOSTENT_NAME_MAX);
+            if (r == 0) {
+                ans->names = ans->name_store;
+                ans->names_len = strlen(ans->name_store);
+                ans->af = query_family;
+                memcpy(ans->addrs[0], query, query_family == AF_INET ? 4 : 16);
+                ans->naddrs = 1;
+                ans->herr = 0;
+                ans->rc = 0;
+                return;
+            }
+            status = NSS_STATUS_NOTFOUND;
+            ans->herr = netdb_herr_of(r); /* -2: no reverse DNS configured, or NXDOMAIN */
+            ans->rc = ans->herr == TRY_AGAIN ? EAGAIN : 0;
+        } else {
+            status = src[s].service == NSS_SERVICE_DNS ? NSS_STATUS_NOTFOUND : NSS_STATUS_UNAVAIL;
         }
-        if (r != -2 /* no reverse DNS configured, or NXDOMAIN */) {
-            ans->herr = netdb_herr_of(r);
-            if (ans->herr == TRY_AGAIN) ans->rc = EAGAIN;
-            return;
-        }
+        if (nss_stops(&src[s], status)) break;
     }
-    if (!names_len) {
+    if (status != NSS_STATUS_SUCCESS) {
         if (requested_family == AF_UNSPEC) {
             ans->herr = NETDB_INTERNAL;
             ans->rc = EAFNOSUPPORT;
-        } else {
-            ans->herr = HOST_NOT_FOUND;
         }
         return;
     }
@@ -1665,94 +1860,114 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
     } else {
         if (flags & AI_NUMERICHOST) return EAI_NONAME;
         if (strchr(node, '%')) return EAI_NONAME; /* a scope that is neither a number nor an interface allowed for the address */
-        /* /etc/hosts first. Under AF_INET6, IPv4 lines are used only with AI_V4MAPPED: when there is no IPv6 line, or always
-         * with AI_ALL, and then as ::ffff:a.b.c.d after the IPv6 ones (glibc, measured). */
-        size_t n = etc_hosts_read();
+        /* The sources of the nsswitch.conf "hosts" line in order; the last one asked decides, and a source this library does not
+         * have is EAI_SYSTEM (glibc 2.44, measured). */
+        struct nss_source src[NSS_HOSTS_MAX];
+        size_t nsrc = hosts_sources(src);
         const char *names = (const char *)0;
         size_t names_len = 0;
-        if (n) {
-            if (family == AF_INET6) {
-                naddrs = hosts_collect(etc_hosts_buf, n, node, AF_INET6, addrs, GAI_MAX_ADDRS, &names, &names_len);
-                if ((flags & AI_V4MAPPED) && (naddrs == 0 || (flags & AI_ALL))) {
-                    const char *names4 = (const char *)0;
-                    size_t len4 = 0;
-                    size_t m = hosts_collect(etc_hosts_buf, n, node, AF_INET, addrs + naddrs, GAI_MAX_ADDRS - naddrs, &names4, &len4);
-                    for (size_t k = 0; k < m; k++) map_v4(&addrs[naddrs + k]);
-                    if (m && (!names || names4 < names)) { names = names4; names_len = len4; }
-                    naddrs += m;
+        int status = NSS_STATUS_UNAVAIL, code = EAI_SYSTEM;
+        for (size_t s = 0; s < nsrc; s++) {
+            naddrs = 0;
+            names = (const char *)0;
+            names_len = 0;
+            if (src[s].service == NSS_SERVICE_FILES) {
+                /* /etc/hosts. Under AF_INET6, IPv4 lines are used only with AI_V4MAPPED: when there is no IPv6 line, or always
+                 * with AI_ALL, and then as ::ffff:a.b.c.d after the IPv6 ones (glibc, measured). */
+                size_t n = etc_hosts_read();
+                if (n) {
+                    if (family == AF_INET6) {
+                        naddrs = hosts_collect(etc_hosts_buf, n, node, AF_INET6, addrs, GAI_MAX_ADDRS, &names, &names_len);
+                        if ((flags & AI_V4MAPPED) && (naddrs == 0 || (flags & AI_ALL))) {
+                            const char *names4 = (const char *)0;
+                            size_t len4 = 0;
+                            size_t m = hosts_collect(etc_hosts_buf, n, node, AF_INET, addrs + naddrs, GAI_MAX_ADDRS - naddrs, &names4, &len4);
+                            for (size_t k = 0; k < m; k++) map_v4(&addrs[naddrs + k]);
+                            if (m && (!names || names4 < names)) { names = names4; names_len = len4; }
+                            naddrs += m;
+                        }
+                    } else {
+                        naddrs = hosts_collect(etc_hosts_buf, n, node, family, addrs, GAI_MAX_ADDRS, &names, &names_len);
+                    }
+                }
+                status = naddrs ? NSS_STATUS_SUCCESS : n || etc_hosts_exists() ? NSS_STATUS_NOTFOUND : NSS_STATUS_UNAVAIL;
+                code = EAI_NONAME;
+            } else if (src[s].service == NSS_SERVICE_DNS) {
+                /* DNS (glibc 2.44, measured): AF_INET asks A records, AF_INET6 AAAA records, AF_UNSPEC both, listing the IPv6 addresses
+                 * first. AF_INET6 with AI_V4MAPPED falls back to the A records, mapped, when there is no AAAA; with AI_ALL as well it
+                 * lists both. One family failing while the other answers is fine; when neither answers the lookup is EAI_NONAME if either
+                 * said NXDOMAIN (or the name is malformed), else EAI_NODATA if either said NODATA, else EAI_AGAIN. canon_buf ends up
+                 * holding the end of the CNAME chain of the first answer. */
+                int want6 = family == AF_INET6 || family == AF_UNSPEC;
+                int want4 = family == AF_INET || family == AF_UNSPEC || (family == AF_INET6 && (flags & AI_V4MAPPED));
+                int all = family == AF_INET6 && (flags & AI_V4MAPPED) && (flags & AI_ALL);
+                canon_buf[0] = 0;
+                long r6 = -2, r4 = -2;
+                uint8_t a16[16];
+                struct resolv_answer ra;
+                if (want6) {
+                    r6 = resolv_lookup_af(node, AF_INET6, a16, canon_buf, sizeof canon_buf, &ra);
+                    if (r6 == 0) {
+                        uint8_t got[GAI_MAX_ADDRS][16];
+                        size_t k = resolv_answer_unpack(&ra, got, GAI_MAX_ADDRS, (char *)0, 0);
+                        if (k == 0) {
+                            memcpy(got[0], a16, 16);
+                            k = 1;
+                        }
+                        for (size_t i = 0; i < k && naddrs < GAI_MAX_ADDRS; i++) {
+                            memset(&addrs[naddrs], 0, sizeof addrs[naddrs]);
+                            addrs[naddrs].family = AF_INET6;
+                            memcpy(addrs[naddrs].addr, got[i], 16);
+                            naddrs++;
+                        }
+                    }
+                }
+                /* AF_INET6 + AI_V4MAPPED asks A only when AAAA gave nothing, unless AI_ALL. */
+                if (want4 && (family != AF_INET6 || naddrs == 0 || all)) {
+                    char canon4[256];
+                    canon4[0] = 0;
+                    r4 = resolv_lookup_af(node, AF_INET, v4, canon4, sizeof canon4, &ra);
+                    if (r4 == 0) {
+                        uint8_t got[GAI_MAX_ADDRS][16];
+                        size_t k = resolv_answer_unpack(&ra, got, GAI_MAX_ADDRS, (char *)0, 0);
+                        if (k == 0) {
+                            memcpy(got[0], v4, 4);
+                            k = 1;
+                        }
+                        for (size_t i = 0; i < k && naddrs < GAI_MAX_ADDRS; i++) {
+                            set_v4(&addrs[naddrs], got[i][0], got[i][1], got[i][2], got[i][3]);
+                            if (family == AF_INET6) map_v4(&addrs[naddrs]);
+                            naddrs++;
+                        }
+                        if (!canon_buf[0]) memcpy(canon_buf, canon4, strlen(canon4) + 1);
+                    }
+                }
+                if (naddrs == 0) {
+                    long rs[2] = {want6 ? r6 : 0, want4 ? r4 : 0};
+                    int nx = 0, nd = 0;
+                    for (int i = 0; i < 2; i++) {
+                        if (rs[i] == -2 || rs[i] == -22 || rs[i] == -36 || rs[i] == -71) nx = 1;
+                        if (rs[i] == -61) nd = 1;
+                    }
+                    /* One family asked: its own mapping (NO_RECOVERY like HOST_NOT_FOUND is EAI_NONAME). EAI_AGAIN is UNAVAIL to
+                     * nsswitch.conf, the others NOTFOUND (glibc 2.44, measured). */
+                    code = nx ? EAI_NONAME : nd ? EAI_NODATA : EAI_AGAIN;
+                    status = code == EAI_AGAIN ? NSS_STATUS_UNAVAIL : NSS_STATUS_NOTFOUND;
+                } else {
+                    status = NSS_STATUS_SUCCESS;
+                }
+                names = (const char *)0;
+                if (canon_buf[0]) {
+                    names = canon_buf;
+                    names_len = strlen(canon_buf);
                 }
             } else {
-                naddrs = hosts_collect(etc_hosts_buf, n, node, family, addrs, GAI_MAX_ADDRS, &names, &names_len);
+                status = NSS_STATUS_UNAVAIL;
+                code = EAI_SYSTEM;
             }
+            if (nss_stops(&src[s], status)) break;
         }
-        if (naddrs == 0) {
-            /* DNS (glibc 2.44, measured): AF_INET asks A records, AF_INET6 AAAA records, AF_UNSPEC both, listing the IPv6 addresses
-             * first. AF_INET6 with AI_V4MAPPED falls back to the A records, mapped, when there is no AAAA; with AI_ALL as well it
-             * lists both. One family failing while the other answers is fine; when neither answers the lookup is EAI_NONAME if either
-             * said NXDOMAIN (or the name is malformed), else EAI_NODATA if either said NODATA, else EAI_AGAIN. canon_buf ends up
-             * holding the end of the CNAME chain of the first answer. */
-            int want6 = family == AF_INET6 || family == AF_UNSPEC;
-            int want4 = family == AF_INET || family == AF_UNSPEC || (family == AF_INET6 && (flags & AI_V4MAPPED));
-            int all = family == AF_INET6 && (flags & AI_V4MAPPED) && (flags & AI_ALL);
-            canon_buf[0] = 0;
-            long r6 = -2, r4 = -2;
-            uint8_t a16[16];
-            struct resolv_answer ra;
-            if (want6) {
-                r6 = resolv_lookup_af(node, AF_INET6, a16, canon_buf, sizeof canon_buf, &ra);
-                if (r6 == 0) {
-                    uint8_t got[GAI_MAX_ADDRS][16];
-                    size_t k = resolv_answer_unpack(&ra, got, GAI_MAX_ADDRS, (char *)0, 0);
-                    if (k == 0) {
-                        memcpy(got[0], a16, 16);
-                        k = 1;
-                    }
-                    for (size_t i = 0; i < k && naddrs < GAI_MAX_ADDRS; i++) {
-                        memset(&addrs[naddrs], 0, sizeof addrs[naddrs]);
-                        addrs[naddrs].family = AF_INET6;
-                        memcpy(addrs[naddrs].addr, got[i], 16);
-                        naddrs++;
-                    }
-                }
-            }
-            /* AF_INET6 + AI_V4MAPPED asks A only when AAAA gave nothing, unless AI_ALL. */
-            if (want4 && (family != AF_INET6 || naddrs == 0 || all)) {
-                char canon4[256];
-                canon4[0] = 0;
-                r4 = resolv_lookup_af(node, AF_INET, v4, canon4, sizeof canon4, &ra);
-                if (r4 == 0) {
-                    uint8_t got[GAI_MAX_ADDRS][16];
-                    size_t k = resolv_answer_unpack(&ra, got, GAI_MAX_ADDRS, (char *)0, 0);
-                    if (k == 0) {
-                        memcpy(got[0], v4, 4);
-                        k = 1;
-                    }
-                    for (size_t i = 0; i < k && naddrs < GAI_MAX_ADDRS; i++) {
-                        set_v4(&addrs[naddrs], got[i][0], got[i][1], got[i][2], got[i][3]);
-                        if (family == AF_INET6) map_v4(&addrs[naddrs]);
-                        naddrs++;
-                    }
-                    if (!canon_buf[0]) memcpy(canon_buf, canon4, strlen(canon4) + 1);
-                }
-            }
-            if (naddrs == 0) {
-                long rs[2] = {want6 ? r6 : 0, want4 ? r4 : 0};
-                int nx = 0, nd = 0;
-                for (int i = 0; i < 2; i++) {
-                    if (rs[i] == -2 || rs[i] == -22 || rs[i] == -36 || rs[i] == -71) nx = 1;
-                    if (rs[i] == -61) nd = 1;
-                }
-                /* One family asked: its own mapping (NO_RECOVERY like HOST_NOT_FOUND is EAI_NONAME). */
-                if (nx) return EAI_NONAME;
-                if (nd) return EAI_NODATA;
-                return EAI_AGAIN;
-            }
-            names = (const char *)0;
-            if (canon_buf[0]) {
-                names = canon_buf;
-                names_len = strlen(canon_buf);
-            }
-        }
+        if (status != NSS_STATUS_SUCCESS) return code;
         if (flags & AI_CANONNAME) {
             /* A name from /etc/hosts is canonicalised to the line's first name, as glibc does. */
             canon = node;
@@ -1808,33 +2023,28 @@ int getnameinfo(const uint8_t *sa, unsigned int salen, char *host, unsigned int 
         char numeric[64];
         char found[NI_MAXHOST];
         if (!(flags & NI_NUMERICHOST)) {
-            size_t n = etc_hosts_read();
-            const char *name = (const char *)0;
-            size_t k = 0;
-            static const uint8_t mapped_prefix[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
+            /* gethostbyaddr's lookup through the nsswitch.conf sources (glibc's getnameinfo calls gethostbyaddr_r): its first
+             * name; NETDB_INTERNAL is EAI_SYSTEM and TRY_AGAIN EAI_AGAIN, any other failure the numeric form (glibc 2.44,
+             * measured). A mapped ::ffff:a.b.c.d is named from the IPv4 lines and asks the IPv4 PTR name. */
+            struct host_answer ans;
+            lookup_addr(addr, v6 ? 16 : 4, v6 ? AF_INET6 : AF_INET, etc_hosts_buf, sizeof etc_hosts_buf, &ans);
+            if (ans.names) {
+                size_t k = 0;
+                while (k < ans.names_len && ans.names[k] != ' ' && ans.names[k] != '\t') k++;
+                if (k > 0 && k < sizeof(found)) {
+                    memcpy(found, ans.names, k);
+                    found[k] = 0;
+                    text = found;
+                }
+            } else if (ans.herr == NETDB_INTERNAL) {
+                return EAI_SYSTEM;
+            } else if (ans.herr == TRY_AGAIN) {
+                return EAI_AGAIN;
+            }
+            /* The loopback address is "localhost" even without an /etc/hosts line (glibc gives the numeric form then). */
             static const uint8_t loop6[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
-            if (!v6) {
-                k = n ? hosts_reverse(etc_hosts_buf, n, addr, &name) : 0;
-            } else if (memcmp(addr, mapped_prefix, 12) == 0) {
-                /* ::ffff:a.b.c.d is named from the IPv4 lines (glibc, measured). */
-                k = n ? hosts_reverse(etc_hosts_buf, n, addr + 12, &name) : 0;
-            } else {
-                k = n ? hosts_reverse6(etc_hosts_buf, n, addr, &name) : 0;
-            }
-            if (k > 0 && k < sizeof(found)) {
-                memcpy(found, name, k);
-                found[k] = 0;
-                text = found;
-            } else if (!v6 && addr[0] == 127 && addr[1] == 0 && addr[2] == 0 && addr[3] == 1) {
+            if (!text && (v6 ? memcmp(addr, loop6, 16) == 0 : (addr[0] == 127 && addr[1] == 0 && addr[2] == 0 && addr[3] == 1)))
                 text = "localhost";
-            } else if (v6 && memcmp(addr, loop6, 16) == 0) {
-                text = "localhost";
-            } else {
-                /* Not in /etc/hosts: a PTR query (glibc's gethostbyaddr_r under getnameinfo); a mapped address asks for its
-                 * IPv4 name. Any failure leaves the numeric form (or EAI_NONAME with NI_NAMEREQD). */
-                int mapped = v6 && memcmp(addr, mapped_prefix, 12) == 0;
-                if (resolv_ptr(mapped ? addr + 12 : addr, v6 && !mapped ? AF_INET6 : AF_INET, found, sizeof found) == 0) text = found;
-            }
         }
         if (!text) {
             if (flags & NI_NAMEREQD) return EAI_NONAME;
