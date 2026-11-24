@@ -1096,19 +1096,24 @@ static long nss_read(long fd, char *buf, size_t cap) { return syscall3(SYS_read,
 static void nss_close(long fd) { syscall1(SYS_close, fd); }
 #endif
 
-/* A line of a known database keeps its first NSS_LINE_MAX bytes; other lines are skipped whatever their length. */
-#define NSS_LINE_MAX 1024
+#include "../include/stdlib.h"
+
+/* A line is read into NSS_LINE_START bytes of stack and moves to the heap when it is longer, so no line is cut (glibc's getline
+ * has no limit). */
+#define NSS_LINE_START 1024
 
 /* nsswitch.conf has a line of a known database whose sources do not parse: every lookup is NETDB_INTERNAL with errno EINVAL,
  * getaddrinfo and getnameinfo EAI_SYSTEM, and no source is asked (glibc 2.44, measured). */
 #define NSS_SOURCES_VOID ((size_t)-1)
 
 /* The hosts sources of /etc/nsswitch.conf, read afresh on every lookup (glibc rereads a changed file too). The whole file is
- * read in pieces and the last complete hosts line kept, so its length does not matter (glibc 2.44, measured with 100000
- * bytes). */
+ * read in pieces and every complete hosts line parsed into `out`, the last one winning, so neither the file's length nor a
+ * line's matters (glibc 2.44, measured with a 100000-byte file and 5000-byte lines). */
 static size_t hosts_sources(struct nss_source *out) {
-    char chunk[512], line[NSS_LINE_MAX], last[NSS_LINE_MAX + 1];
-    size_t ll = 0, last_len = 0;
+    char chunk[512];
+    char small[NSS_LINE_START];
+    char *line = small;
+    size_t ll = 0, line_cap = sizeof small, nsrc = 0;
     int have = 0, voided = 0;
     long fd = nss_open();
     if (fd >= 0) {
@@ -1117,24 +1122,29 @@ static size_t hosts_sources(struct nss_source *out) {
             size_t n = r > 0 ? (size_t)r : 0;
             for (size_t i = 0; i < n && !voided; i++) {
                 if (chunk[i] != '\n') {
-                    if (ll < sizeof line) line[ll] = chunk[i];
-                    ll++;
+                    if (ll == line_cap) {
+                        /* Out of memory: the rest of this line is dropped, the earlier part still counts. */
+                        char *grown = (char *)malloc(line_cap * 2);
+                        if (grown) {
+                            memcpy(grown, line, ll);
+                            if (line != small) free(line);
+                            line = grown;
+                            line_cap *= 2;
+                        }
+                    }
+                    if (ll < line_cap) line[ll++] = chunk[i];
                     continue;
                 }
-                size_t keep = ll < sizeof line ? ll : sizeof line;
                 int db;
-                size_t a = nss_line_db(line, 0, keep, 1, &db);
+                size_t a = nss_line_db(line, 0, ll, 1, &db);
                 if (a && db >= 0) {
                     /* Any known database's line must parse; glibc stops reading the file at the first one that does not. */
                     struct nss_source tmp[NSS_HOSTS_MAX];
-                    int bad = 0;
-                    nss_parse_list_err(line, a, keep, tmp, NSS_HOSTS_MAX, &bad);
+                    int is_hosts = strcmp(nss_databases[db], "hosts") == 0, bad = 0;
+                    size_t k = nss_parse_list_err(line, a, ll, is_hosts ? out : tmp, NSS_HOSTS_MAX, &bad);
                     if (bad) voided = 1;
-                    else if (strcmp(nss_databases[db], "hosts") == 0) {
-                        /* Kept with its newline, so a bare "hosts" stays a hosts line when nsswitch_hosts reads it again. */
-                        memcpy(last, line, keep);
-                        last[keep] = '\n';
-                        last_len = keep + 1;
+                    else if (is_hosts) {
+                        nsrc = k;
                         have = 1;
                     }
                 }
@@ -1145,8 +1155,9 @@ static size_t hosts_sources(struct nss_source *out) {
         /* A last line without its newline is not used: glibc's getline loop stops at end of file before parsing it. */
         nss_close(fd);
     }
+    if (line != small) free(line);
     if (voided) return NSS_SOURCES_VOID;
-    return nsswitch_hosts(have ? last : (const char *)0, last_len, out, NSS_HOSTS_MAX);
+    return have ? nsrc : nsswitch_hosts((const char *)0, 0, out, NSS_HOSTS_MAX);
 }
 
 /* Whether `status` ends the lookup after source `s`. */

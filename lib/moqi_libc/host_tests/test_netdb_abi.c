@@ -1612,6 +1612,28 @@ int main(void) {
                 moqi_test_nsswitch_conf = "hosts: files\nhosts\n";
                 q_script(one, ok, 1);
                 assert(!gethostbyname("late534.test") && q_calls == 0);
+                {
+                    /* A line has no length limit (glibc 2.44 getline, measured): "files" after 2000 blanks on the last hosts
+                     * line is a source, and an action that does not parse 5000 bytes into a passwd line still voids the file. */
+                    static char longl[8000];
+                    size_t lo = 0;
+                    memcpy(longl, "hosts: dns\nhosts:", 17);
+                    lo = 17;
+                    while (lo < 17 + 2000) longl[lo++] = ' ';
+                    memcpy(longl + lo, "files\n", 7);
+                    moqi_test_nsswitch_conf = longl;
+                    q_script(one, ok, 1);
+                    lp = gethostbyname("late534.test");
+                    assert(lp && (unsigned char)lp->h_addr_list[0][3] == 1 && q_calls == 0);
+                    memcpy(longl, "hosts: files\npasswd: files", 26);
+                    lo = 26;
+                    while (lo < 26 + 5000) longl[lo++] = ' ';
+                    memcpy(longl + lo, "[NOTFOUND=foo]\n", 16);
+                    q_script(one, ok, 1);
+                    h_errno = 0;
+                    errno = 0;
+                    assert(!gethostbyname("late534.test") && h_errno == NETDB_INTERNAL && errno == EINVAL && q_calls == 0);
+                }
                 /* Unknown databases and comments do not void it. */
                 static const char *const kept[] = {"hosts: files\nsudoers: files [\n", "hosts: files\nautomount: x [\n",
                                                    "hosts: files\nunknowndb: x [\n", "hosts: files\n#passwd: files [\n",
