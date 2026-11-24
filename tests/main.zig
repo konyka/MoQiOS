@@ -19194,3 +19194,10 @@ test "MSG_TRUNC on a TCP recvmsg takes the iovec room without copying, a NULL io
     try std.testing.expect(std.mem.indexOf(u8, ss, "const msg_trunc_tcp = rf_tcp.truncReportsFullLength(flags);") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (msg_trunc_tcp) return @intCast(got);") != null);
 }
+
+test "write() of 0 bytes on a ping socket goes to the send path, which refuses a message without an ICMP header (Linux 7.x, measured) (hello557)" {
+    const fio = kt.file_io_source;
+    try std.testing.expect(std.mem.indexOf(u8, fio, "if (d.fd_type == .udp_socket) return true;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fio, "if (d.fd_type == .udp_socket) return !d.udp_ping;") == null);
+    try std.testing.expectEqual(@as(i64, -22), kt.ping_policy.sendErrno(0, 0, 0));
+}

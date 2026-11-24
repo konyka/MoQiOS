@@ -29,15 +29,15 @@ fn isMessageSocket(cur: *task_mod.Task, fd: u32) bool {
     return !@import("../net/unix_socket.zig").unixIsStream(d.unix_sock_idx);
 }
 
-/// A UDP socket or an AF_UNIX datagram / seqpacket socket: write() of 0 bytes still sends an empty datagram (Linux sock_write_iter ->
-/// sendmsg, measured, hello552), so it goes to sendto instead of returning 0 at once.
+/// A UDP or ping socket, or an AF_UNIX datagram / seqpacket socket: write() of 0 bytes still goes to sendmsg (Linux sock_write_iter,
+/// measured): UDP sends an empty datagram (hello552), a ping socket refuses a message without an ICMP header with EINVAL (hello557).
 fn sendsEmptyDatagram(fd: u64) bool {
     const cur_idx = sched_mod.currentTaskIndex() orelse return false;
     const cur = task_mod.getTask(cur_idx) orelse return false;
     const i = fdIndex(fd);
     if (i >= vfs_mod.MAX_FDS) return false;
     const d = &cur.fd_table.fds[i];
-    if (d.fd_type == .udp_socket) return !d.udp_ping;
+    if (d.fd_type == .udp_socket) return true;
     return isMessageSocket(cur, i);
 }
 
