@@ -147,7 +147,7 @@ static long resolv_ask(long nr, long a1, long a2, const struct resolv_server *sv
 
 /* The words of the last "search" or "domain" line (a keyword at the start of the line, then a blank or the end of the line); 0
  * words when the last one has none. `opt`: the last ndots:, timeout: and attempts: of the options lines (defaults 1, 5, 2). */
-struct resolv_opts { unsigned ndots; int timeout; int attempts; int rotate; int single_request; int use_vc; };
+struct resolv_opts { unsigned ndots; int timeout; int attempts; int rotate; int single_request; int use_vc; int no_tld_query; };
 
 /* "name:N" in an options line: glibc's atoi of what follows the colon (a sign, digits, anything after them ignored). */
 static int resolv_opt_value(const char *text, size_t a, size_t i, size_t kl, long *v) {
@@ -168,6 +168,7 @@ static size_t resolv_conf_search(const char *text, size_t len, const char **word
     opt->rotate = 0;
     opt->single_request = 0;
     opt->use_vc = 0;
+    opt->no_tld_query = 0;
     while (text && pos < len) {
         size_t end = pos;
         while (end < len && text[end] != '\n') end++;
@@ -212,6 +213,10 @@ static size_t resolv_conf_search(const char *text, size_t len, const char **word
                     /* glibc matches it by its first 6 characters (measured: "use-vcx" counts, "use-v" does not): every query
                      * goes over TCP, without a UDP query first. */
                     opt->use_vc = 1;
+                } else if (i - a >= 12 && memcmp(text + a, "no-tld-query", 12) == 0) {
+                    /* glibc matches it by its first 12 characters (measured: "no-tld-queryx" counts, "no-tld-quer" does not): a
+                     * name with no dot is not asked as given after the search list. */
+                    opt->no_tld_query = 1;
                 } else if (i - a >= 8 && memcmp(text + a, "timeout:", 8) == 0) {
                     /* Seconds, at most 30 (RES_MAXRETRANS); 0 or less waits the 1 s minimum. */
                     long v;
@@ -278,10 +283,25 @@ size_t resolv_conf_candidates(const char *text, size_t len, const char *name, ch
     unsigned ndots = opt.ndots;
     unsigned dots = 0;
     for (size_t i = 0; i < name_len; i++) dots += name[i] == '.';
-    if (dots >= ndots) resolv_add(out, &n, cap, name, name_len, (const char *)0, 0);
-    for (size_t i = 0; i < nw; i++)
+    /* glibc res_search (measured): a "." on the list asks the name as given in its place (unless it was already asked first) and
+     * then not again at the end; with "options no-tld-query" a name with no dot is not asked as given after a search list. */
+    int asked = 0, root = 0;
+    if (dots >= ndots) {
+        resolv_add(out, &n, cap, name, name_len, (const char *)0, 0);
+        asked = 1;
+    }
+    for (size_t i = 0; i < nw; i++) {
+        size_t dl = word_len[i];
+        if (dl && word[i][dl - 1] == '.') dl--;
+        if (dl == 0) {
+            root = 1;
+            if (!asked) resolv_add(out, &n, cap, name, name_len, (const char *)0, 0);
+            asked = 1;
+            continue;
+        }
         if (!resolv_add(out, &n, cap, name, name_len, word[i], word_len[i])) break;
-    if (dots < ndots) resolv_add(out, &n, cap, name, name_len, (const char *)0, 0);
+    }
+    if (!asked && !root && (dots || nw == 0 || !opt.no_tld_query)) resolv_add(out, &n, cap, name, name_len, (const char *)0, 0);
     return n;
 }
 
