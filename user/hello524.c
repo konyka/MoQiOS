@@ -36,7 +36,12 @@ static long sendto4(long s, const unsigned char *b, long n, const unsigned char 
     return r < 0 ? -errno : r;
 }
 static void closefd(long s) { close((int)s); }
-static long sock_tcp(void) { int s = socket(AF_INET, SOCK_STREAM, 0); return s < 0 ? -errno : s; }
+/* SO_REUSEADDR: an earlier test's connections to port 53 may still be in TIME_WAIT, which blocks a plain bind. */
+static long sock_tcp(void) {
+    int s = socket(AF_INET, SOCK_STREAM, 0), one = 1;
+    if (s >= 0) setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    return s < 0 ? -errno : s;
+}
 static long listen4(long s) { return listen((int)s, 4) < 0 ? -errno : 0; }
 static long accept4b(long s) { int c = accept((int)s, 0, 0); return c < 0 ? -errno : c; }
 static long rd(long s, void *b, long n) { long r = read((int)s, b, (size_t)n); return r < 0 ? -errno : r; }
@@ -66,7 +71,12 @@ static long recvfrom4(long s, unsigned char *b, long n, unsigned char *sa) {
 }
 static long sendto4(long s, const unsigned char *b, long n, const unsigned char *sa) { return syscall6(NR_SENDTO, s, (long)b, n, 0, (long)sa, 16); }
 static void closefd(long s) { syscall1(SYS_close, s); }
-static long sock_tcp(void) { return syscall3(SYS_socket, 2, 1, 0); }
+static long sock_tcp(void) {
+    long s = syscall3(SYS_socket, 2, 1, 0);
+    int one = 1;
+    if (s >= 0) syscall5(132, s, 1, 2, (long)&one, 4); /* setsockopt(SOL_SOCKET, SO_REUSEADDR) */
+    return s;
+}
 static long listen4(long s) { return syscall2(SYS_listen, s, 4); }
 static long accept4b(long s) {
     for (;;) {

@@ -59,7 +59,8 @@ long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, lo
             memcpy(&v, (const unsigned char *)a3 + 16, 4);
             snprintf(sc, sizeof sc, "%%%u", v);
         }
-        int w = snprintf(q_log + l, sizeof q_log - l, "ptr%ld:%u@%s%u%s;", a2, last, six ? "v" : "", six ? ((const unsigned char *)a3)[15] : ((const unsigned char *)a3)[3], sc);
+        int w = snprintf(q_log + l, sizeof q_log - l, "ptr%ld:%u@%s%u%s%s;", a2, last, six ? "v" : "", six ? ((const unsigned char *)a3)[15] : ((const unsigned char *)a3)[3], sc,
+                         (a4 & 0x20000000L) ? "/tcp" : "");
         (void)w;
         (void)a4;
         if (r == 0) {
@@ -77,8 +78,8 @@ long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, lo
         size_t l2 = strlen(q_log);
         const unsigned char *sv = (const unsigned char *)a2;
         int six2 = (a3 & 0x80000000L) != 0;
-        snprintf(q_log + l2, sizeof q_log - l2, "%s/2@%s%u/%ld;", (const char *)a1, six2 ? "v" : "", (six2 ? sv[15] : sv[3]) % 10,
-                 (a3 & 0x3fffffffL) / 1000);
+        snprintf(q_log + l2, sizeof q_log - l2, "%s/2@%s%u/%ld%s;", (const char *)a1, six2 ? "v" : "", (six2 ? sv[15] : sv[3]) % 10,
+                 (a3 & 0x1fffffffL) / 1000, (a3 & 0x20000000L) ? "/tcp" : "");
         long rr[2] = {ra, rb};
         unsigned char *dst[2] = {(unsigned char *)a4, (unsigned char *)a5};
         for (int k = 0; k < 2; k++) {
@@ -116,9 +117,10 @@ long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, lo
             l += (size_t)snprintf(q_log + l, sizeof q_log - l, "%%%u", v);
         }
         q_log[l++] = '/';
-        long ms = (a4 & 0x3fffffffL) / 1000;
+        long ms = (a4 & 0x1fffffffL) / 1000;
         if (ms >= 10) q_log[l++] = (char)('0' + ms / 10 % 10);
         q_log[l++] = (char)('0' + ms % 10);
+        if (a4 & 0x20000000L) { memcpy(q_log + l, "/tcp", 4); l += 4; }
         q_log[l++] = ';';
         q_log[l] = 0;
     }
@@ -1253,6 +1255,37 @@ int main(void) {
         q_script(one, ok, 1);
         assert(getnameinfo(sa, 16, hb, sizeof hb, 0, 0, NI_NUMERICHOST) == 0 && strcmp(hb, "10.2.3.4") == 0 && q_calls == 0);
         q_ptr_name = "ptr.test";
+        moqi_test_resolv_conf = (const char *)0;
+    }
+
+    /* hello540: "options use-vc" (glibc 2.44, measured; any word starting with it, "use-v" is not it): every query is asked over
+     * TCP only, without a UDP query first: bit 29 of the timeout argument of 507, 509, 510 and 508. */
+    {
+        static const char vc[] = "nameserver 10.0.0.1\noptions attempts:1 use-vc\n";
+        static const char vcx[] = "nameserver 10.0.0.1\noptions attempts:1 timeout:3 use-vcx\n";
+        static const char notvc[] = "nameserver 10.0.0.1\noptions attempts:1 use-v\n";
+        static const long ok[] = {0}, ok2[] = {0, 0};
+        uint8_t a4[4];
+        q_script(vc, ok, 1);
+        assert(gethostbyname_ipv4("v.test", a4) == 0 && strcmp(q_log, "v.test@1/5/tcp;") == 0);
+        q_script(vcx, ok, 1);
+        assert(gethostbyname_ipv4("v.test", a4) == 0 && strcmp(q_log, "v.test@1/3/tcp;") == 0);
+        q_script(notvc, ok, 1);
+        assert(gethostbyname_ipv4("v.test", a4) == 0 && strcmp(q_log, "v.test@1/5;") == 0);
+        q_script(vc, ok, 1);
+        assert(gethostbyname2("v.test", AF_INET6) && strcmp(q_log, "v.test/6@1/5/tcp;") == 0);
+        struct addrinfo hints, *res = (struct addrinfo *)0;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_socktype = SOCK_STREAM;
+        q_script(vc, ok2, 2);
+        assert(getaddrinfo("v.test", 0, &hints, &res) == 0 && strcmp(q_log, "v.test/2@1/5/tcp;") == 0);
+        freeaddrinfo(res);
+        q_script("nameserver 10.0.0.1\noptions attempts:1 use-vc single-request\n", ok2, 2);
+        assert(getaddrinfo("v.test", 0, &hints, &res) == 0 && strcmp(q_log, "v.test@1/5/tcp;v.test/6@1/5/tcp;") == 0);
+        freeaddrinfo(res);
+        uint8_t pa[4] = {10, 2, 3, 4};
+        q_script(vc, ok, 1);
+        assert(gethostbyaddr(pa, 4, AF_INET) && strcmp(q_log, "ptr2:4@1/tcp;") == 0);
         moqi_test_resolv_conf = (const char *)0;
     }
 

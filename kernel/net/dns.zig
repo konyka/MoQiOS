@@ -148,41 +148,47 @@ pub const Result = struct { outcome: dns_policy.Outcome, ip: [4]u8 = .{ 0, 0, 0,
 /// user space that applies resolv.conf's timeout, attempts and server order itself. Literals and the static table answer
 /// first, as in resolveVia; the shared cache is neither read nor written.
 /// `ans` receives every address of the reply and the CNAME chain (dns_answer), or the one address of a literal or static name.
-pub fn queryVia(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {
+pub fn queryVia(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, vc: bool) Result {
     if (hostname.len == 0 or hostname.len > MAX_NAME) return .{ .outcome = .nxdomain };
     const local: ?[4]u8 = @import("static_hosts.zig").lookup(hostname) orelse if (isIpV4(hostname)) parseIpV4(hostname) else null;
     if (local) |ip| {
         dns_answer.single(ans, hostname, ip);
         return .{ .outcome = .answer, .ip = ip };
     }
-    return queryType(hostname, server, timeout_ns, yield, ans, TYPE_A_Q);
+    return queryType(hostname, server, timeout_ns, yield, ans, TYPE_A_Q, vc);
 }
 
 /// queryVia for AAAA records (dns_query6, 509): every IPv6 address of the reply lands in `ans` (alen 16). An IPv4 literal or a static
 /// name has no AAAA record: NODATA, as for a name that exists without one.
-pub fn queryVia6(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {
+pub fn queryVia6(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, vc: bool) Result {
     if (hostname.len == 0 or hostname.len > MAX_NAME) return .{ .outcome = .nxdomain };
     if (@import("static_hosts.zig").lookup(hostname) != null or isIpV4(hostname)) return .{ .outcome = .nodata };
-    return queryType(hostname, server, timeout_ns, yield, ans, TYPE_AAAA);
+    return queryType(hostname, server, timeout_ns, yield, ans, TYPE_AAAA, vc);
 }
 
 /// A PTR query to `server` for `addr` (4 bytes IPv4 or 16 bytes IPv6), waiting at most `timeout_ns` (dns_ptr, 508): the host name
 /// lands in ans.canonName(). The shared cache is not used.
-pub fn queryPtr(addr: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {
+pub fn queryPtr(addr: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, vc: bool) Result {
     var nb: [80]u8 = undefined;
     const qname = if (addr.len == 4) dns_answer.reverseName4(addr[0..4].*, &nb) else dns_answer.reverseName6(addr[0..16].*, &nb);
-    return queryType(qname, server, timeout_ns, yield, ans, TYPE_PTR);
+    return queryType(qname, server, timeout_ns, yield, ans, TYPE_PTR, vc);
 }
 
 /// The A and AAAA queries for `hostname` sent back to back from one port to `server`, as glibc 2.44 sends an AF_UNSPEC lookup's
 /// pair (measured), waiting at most `timeout_ns` for both replies: how each ended, the A half first. A truncated reply asks that
-/// half again over TCP. Literals and static names answer the A half and are NODATA for AAAA, without a query.
-pub fn queryPair(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans4: *dns_answer.Answer, ans6: *dns_answer.Answer) [2]dns_policy.Outcome {
+/// half again over TCP. Literals and static names answer the A half and are NODATA for AAAA, without a query. With `vc`
+/// (options use-vc) both are asked over TCP only, one connection each (glibc sends both on one connection).
+pub fn queryPair(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans4: *dns_answer.Answer, ans6: *dns_answer.Answer, vc: bool) [2]dns_policy.Outcome {
     if (hostname.len == 0 or hostname.len > MAX_NAME) return .{ .nxdomain, .nxdomain };
     const local: ?[4]u8 = @import("static_hosts.zig").lookup(hostname) orelse if (isIpV4(hostname)) parseIpV4(hostname) else null;
     if (local) |ip| {
         dns_answer.single(ans4, hostname, ip);
         return .{ .answer, .nodata };
+    }
+    if (vc) {
+        const a = queryTcp(hostname, server, timeout_ns, yield, ans4, TYPE_A_Q).outcome;
+        if (a == .interrupted) return .{ .interrupted, .interrupted };
+        return .{ a, queryTcp(hostname, server, timeout_ns, yield, ans6, TYPE_AAAA).outcome };
     }
     var out: [2]dns_policy.Outcome = .{ .timeout, .timeout };
     var done = [2]bool{ false, false };
@@ -253,10 +259,12 @@ const TYPE_PTR: u16 = 12;
 const TYPE_AAAA: u16 = 28;
 
 fn queryCore(hostname: []const u8, dns_server: [4]u8, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {
-    return queryType(hostname, .{ .v4 = dns_server }, timeout_ns, yield, ans, TYPE_A_Q);
+    return queryType(hostname, .{ .v4 = dns_server }, timeout_ns, yield, ans, TYPE_A_Q, false);
 }
 
-fn queryType(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16) Result {
+/// One query, over UDP first unless `vc` (options use-vc) sends it straight over TCP.
+fn queryType(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16, vc: bool) Result {
+    if (vc) return queryTcp(hostname, dns_server, timeout_ns, yield, ans, qtype);
     const r = queryUdp(hostname, dns_server, timeout_ns, yield, ans, qtype);
     // A truncated reply is not used: the same query goes to the same server over TCP (glibc res_send, measured).
     if (r.outcome == .truncated) return queryTcp(hostname, dns_server, timeout_ns, yield, ans, qtype);

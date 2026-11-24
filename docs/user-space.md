@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello539`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello540`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -505,6 +505,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello537 | `/etc/nsswitch.conf` 的行不限长度（与 glibc 2.44 实测相同）：`files` 前有 2000 个空格的 hosts 行是最后的 hosts 行，/etc/hosts 应答（A）；5000 字节、末尾动作非法的 passwd 行使文件作废，`gethostbyname` 为 NULL、`h_errno` 为 `NETDB_INTERNAL`、`errno` 为 `EINVAL`（B）；同样长的合法 `files [NOTFOUND=return] dns` 行由 /etc/hosts 应答（C）；删除临时文件（D） |
 | hello538 | `/etc/nsswitch.conf` 的 hosts 行不限源的个数（与 glibc 2.44 实测相同）：12 个未知源之后的 `files` 由 /etc/hosts 应答（A），`getaddrinfo` 同样返回 0（B）；10 个未知源之后的 `files [NOTFOUND=return] dns` 对 /etc/hosts 没有的名字给出 `HOST_NOT_FOUND`，不是 `NETDB_INTERNAL`（C）；删除临时文件（D） |
 | hello539 | 经 TCP 的 DNS 应答可以超过 4096 字节（与 glibc 2.44 实测相同）：127.0.0.1:53 的替身服务器对 UDP 一律回 TC，经 TCP 对 `big539.test` 回 300 个 A 记录（4829 字节），`gethostbyname` 应答，首个地址 10.39.0.1、至少 64 个（A）；`huge539.test` 回 4000 个（64029 字节），同样应答（B）；`getaddrinfo(big539.test, AF_INET)` 返回 0（C）；删除临时文件（D）。需要 root 和 `CAP_NET_BIND_SERVICE` |
+| hello540 | resolv.conf 的 `options use-vc` 让查询只经 TCP（与 glibc 2.44 实测相同）：127.0.0.1:53 的替身服务器经 UDP 回 10.5.40.1、经 TCP 回 10.5.40.2。没有 use-vc 时得到 .1，只有一次 UDP 查询（A）；有 use-vc 时得到 .2，只有一条 TCP 连接（B）；`use-vcx` 算 use-vc，`use-v` 不算（C）；`getaddrinfo(AF_UNSPEC)` 返回 0、地址 10.5.40.2，A 与 AAAA 都经 TCP，没有 UDP（D）；服务器换成只有 UDP 的 127.0.0.2 时 1500 ms 内返回 `TRY_AGAIN`，不发 UDP（E）；删除临时文件（F）。需要 root 和 `CAP_NET_BIND_SERVICE` |
 | hello526 | `/etc/resolv.conf` 的 IPv6 nameserver（与 glibc 2.44 实测相同）：[::1]:53 和 127.0.0.1:53 上各一个本机 DNS 服务器；只写 `nameserver ::1` 时经 IPv6 查询并得到应答（A）；`::1` 在前时只问 IPv6 服务器（B）；不应答的 IPv6 服务器在前时换到 IPv4 服务器（C）；`gethostbyaddr` 也经 IPv6 服务器（D）；`::ffff:127.0.0.1` 按 IPv4 服务器询问（E）；两个服务器能在同一端口分别绑定 [::1] 和 127.0.0.1 |
 | hello525 | AAAA 记录（与 glibc 2.44 实测相同）：本机服务器知道双栈、只有 IPv4、只有 IPv6 三个名字；`gethostbyname2(AF_INET6)` 发 AAAA 查询并返回 16 字节地址（A）；只有 A 记录的名字在 `AF_INET6` 下为 `NO_DATA`（B）；`getaddrinfo` 的 `AF_UNSPEC` 发 AAAA 和 A 两个查询，IPv6 地址在前（C）；单栈名字只给那个族（D）；`AF_INET6` 对只有 IPv4 的名字为 `EAI_NODATA`，带 `AI_V4MAPPED` 时给映射地址（E）；不存在的名字为 `EAI_NONAME`（F） |
 | hello524 | 截断应答改用 TCP（与 glibc 2.44 `res_send` 实测相同）：本机服务器的 UDP 应答都带 TC 位，TCP（2 字节长度加报文）按名字回答；`gethostbyname` 先问 UDP、再问 TCP，得到 TCP 的三个地址（A）；UDP 应答带 TC 且有记录时也不用，用 TCP 的结果（B）；TCP 回 NXDOMAIN 为 `HOST_NOT_FOUND`（C）；TCP 连接在应答前关闭为 `TRY_AGAIN`（D）；服务器没有 TCP 监听时立即 `TRY_AGAIN`（E） |

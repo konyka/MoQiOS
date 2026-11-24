@@ -135,6 +135,8 @@ size_t resolv_conf_servers_any(const char *text, size_t len, struct resolv_serve
  * SERVER6_FLAG in the timeout argument. */
 #define RESOLV_SERVER6_FLAG 0x80000000L
 #define RESOLV_SCOPE6_FLAG 0x40000000L
+/* Bit 29 of the timeout argument: ask over TCP only ("options use-vc"). The limit is the bits below it. */
+#define RESOLV_VC_FLAG 0x20000000L
 static long resolv_ask(long nr, long a1, long a2, const struct resolv_server *sv, long wait_ms, long a5, long a6) {
     if (sv->unusable) return -101; /* ENETUNREACH: a link-local server with no interface fails at once, as in glibc */
     long flags = sv->v6 ? RESOLV_SERVER6_FLAG | (sv->scope ? RESOLV_SCOPE6_FLAG : 0) : 0;
@@ -145,7 +147,7 @@ static long resolv_ask(long nr, long a1, long a2, const struct resolv_server *sv
 
 /* The words of the last "search" or "domain" line (a keyword at the start of the line, then a blank or the end of the line); 0
  * words when the last one has none. `opt`: the last ndots:, timeout: and attempts: of the options lines (defaults 1, 5, 2). */
-struct resolv_opts { unsigned ndots; int timeout; int attempts; int rotate; int single_request; };
+struct resolv_opts { unsigned ndots; int timeout; int attempts; int rotate; int single_request; int use_vc; };
 
 /* "name:N" in an options line: glibc's atoi of what follows the colon (a sign, digits, anything after them ignored). */
 static int resolv_opt_value(const char *text, size_t a, size_t i, size_t kl, long *v) {
@@ -165,6 +167,7 @@ static size_t resolv_conf_search(const char *text, size_t len, const char **word
     opt->attempts = 2;
     opt->rotate = 0;
     opt->single_request = 0;
+    opt->use_vc = 0;
     while (text && pos < len) {
         size_t end = pos;
         while (end < len && text[end] != '\n') end++;
@@ -205,6 +208,10 @@ static size_t resolv_conf_search(const char *text, size_t len, const char **word
                     /* glibc matches the option by its first 14 characters (measured: "single-request-reopen", "single-requestx" count,
                      * "single-req" does not): the pair of an AF_UNSPEC lookup is asked one after the other. */
                     opt->single_request = 1;
+                } else if (i - a >= 6 && memcmp(text + a, "use-vc", 6) == 0) {
+                    /* glibc matches it by its first 6 characters (measured: "use-vcx" counts, "use-v" does not): every query
+                     * goes over TCP, without a UDP query first. */
+                    opt->use_vc = 1;
                 } else if (i - a >= 8 && memcmp(text + a, "timeout:", 8) == 0) {
                     /* Seconds, at most 30 (RES_MAXRETRANS); 0 or less waits the 1 s minimum. */
                     long v;
@@ -394,6 +401,7 @@ static long resolve_one(const char *name, uint8_t *out, struct resolv_server *ns
         return af == AF_INET6 ? -2 : NETDB_SYSCALL2(SYS_dns_resolve, (long)name, (long)out);
     }
     long nr = af == AF_INET6 ? SYS_dns_query6 : SYS_dns_query;
+    long vc = opt->use_vc ? RESOLV_VC_FLAG : 0;
     long last_reply = -110; /* ETIMEDOUT: no server replied (or attempts:0 asked nobody) */
     size_t first = resolv_first_server(opt, nns);
     for (int a = 0; a < opt->attempts; a++) {
@@ -403,7 +411,7 @@ static long resolve_one(const char *name, uint8_t *out, struct resolv_server *ns
                 /* "options single-request": the A query, its reply, then the AAAA query (glibc 2.44, measured); an A query that
                  * gets no reply ends the pair without the AAAA one. */
                 const struct resolv_server *sv = &ns[(first + i) % nns];
-                long w = resolv_wait_ms(opt->timeout, i, nns);
+                long w = resolv_wait_ms(opt->timeout, i, nns) | vc;
                 uint8_t o16[16];
                 pair->r4 = resolv_ask(SYS_dns_query, (long)name, (long)out, sv, w, (long)pair->a4.buf, (long)sizeof pair->a4.buf);
                 pair->a4.len = pair->r4 == 0 ? sizeof pair->a4.buf : 0;
@@ -415,8 +423,8 @@ static long resolve_one(const char *name, uint8_t *out, struct resolv_server *ns
                 }
                 r = resolv_pair_result(pair->r4, pair->r6);
             } else {
-                r = pair ? resolv_ask_pair(name, &ns[(first + i) % nns], resolv_wait_ms(opt->timeout, i, nns), pair)
-                         : resolv_ask(nr, (long)name, (long)out, &ns[(first + i) % nns], resolv_wait_ms(opt->timeout, i, nns),
+                r = pair ? resolv_ask_pair(name, &ns[(first + i) % nns], resolv_wait_ms(opt->timeout, i, nns) | vc, pair)
+                         : resolv_ask(nr, (long)name, (long)out, &ns[(first + i) % nns], resolv_wait_ms(opt->timeout, i, nns) | vc,
                                       ans ? (long)ans->buf : 0, ans ? (long)sizeof ans->buf : 0);
             }
             if (r == 0 && ans) ans->len = sizeof ans->buf;
@@ -548,7 +556,8 @@ long resolv_ptr(const void *addr, int family, char *name, size_t cap) {
     size_t first = resolv_first_server(&opt, nns);
     for (int a = 0; a < opt.attempts; a++) {
         for (size_t i = 0; i < nns; i++) {
-            long r = resolv_ask(SYS_dns_ptr, (long)addr, family, &ns[(first + i) % nns], resolv_wait_ms(opt.timeout, i, nns), (long)buf, (long)sizeof buf);
+            long r = resolv_ask(SYS_dns_ptr, (long)addr, family, &ns[(first + i) % nns],
+                                resolv_wait_ms(opt.timeout, i, nns) | (opt.use_vc ? RESOLV_VC_FLAG : 0), (long)buf, (long)sizeof buf);
             if (r == -11 || r == -111) last = r;
             if (r == -11 || r == -111 || r == -110 || r == -101) continue;
             if (r == 0) {

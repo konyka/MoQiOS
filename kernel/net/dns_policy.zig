@@ -49,6 +49,9 @@ pub const SERVER6_FLAG: u64 = 0x8000_0000;
 /// Bit 30, with SERVER6_FLAG: the 16 bytes are followed by a u32 scope id (/etc/resolv.conf "nameserver fe80::1%eth0").
 pub const SCOPE6_FLAG: u64 = 0x4000_0000;
 
+/// Bit 29: ask only over TCP, with no UDP query first (/etc/resolv.conf "options use-vc"; glibc 2.44 sends no UDP then, measured).
+pub const VC_FLAG: u64 = 0x2000_0000;
+
 /// Whether a scoped IPv6 server can be asked: a link-local one only through the NIC (interface 2 while it is up, the only interface
 /// with a link-local address); glibc 2.44 fails such a server at once otherwise (measured), here -ENETUNREACH. Any other address
 /// ignores the scope.
