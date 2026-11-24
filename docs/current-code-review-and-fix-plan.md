@@ -13349,7 +13349,7 @@ ramdisk 多了 23.2 MiB，空闲内存正好少了 23.2 MiB。内核在整个启
 
 **决定**：保留上限，不跟随 glibc。理由：
 - 应答在三处展开为定长数组：内核的 `dns_answer.Answer`（按 `MAX_ADDRS`×16 字节加 `(MAX_ALIASES+1)`×254 字节名字，约 5.3 KiB，放在系统调用栈上；内核栈为 32 页）、系统调用的编码缓冲区（`MAX_ENCODED`，同样大小），以及 libc 的 `struct resolv_answer`（5376 字节）和 `struct host_answer`，后两者在调用者的栈上，pthread 线程的栈只有 64 KiB。按 glibc 那样不设上限，一个 64 KiB 的 TCP 应答最多 16000 多个地址，需要改成全部堆分配并逐层传递长度，内核每次查询也要多分配几十 KiB。
-- 超出的部分丢弃，不报错：`gethostbyname`/`getaddrinfo` 仍然成功，只是列表较短。实际中一个名字的地址极少超过 64 个，CNAME 链也远短于 16 层（glibc 自己的 `getanswer_r` 也只在一个 `alias_pointers[16]` 之内保留别名；实测 hello523 时 glibc 保留了 12 个）。
+- 超出的部分丢弃，不报错：`gethostbyname`/`getaddrinfo` 仍然成功，只是列表较短。实际中一个名字的地址极少超过 64 个，CNAME 链也远短于 16 层（hello523 一节实测的 60 个地址、12 层 CNAME 都在上限之内，两边结果相同）。
 - 这个上限写在 `docs/kernel-subsystems.md` 的 DNS 段落里，上层可据此判断。
 
 **验证**：只改文档；`git diff --check` 通过。
