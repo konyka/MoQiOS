@@ -36,6 +36,8 @@ const char *moqi_test_etc_hosts;
 /* The host name gethostname gives netdb.c (NULL: it fails), and the reset of the NI_NOFQDN domain netdb.c keeps per process. */
 const char *moqi_test_hostname = "moqios";
 void moqi_test_nofqdn_reset(void);
+/* /proc/net/if_inet6 for netdb.c (NULL: no file). */
+const char *moqi_test_if_inet6;
 unsigned moqi_test_rotate_seed = 1;
 static long q_reply[32];
 static int q_n, q_calls;
@@ -1417,6 +1419,9 @@ int main(void) {
         assert(NSS("hosts: files [!SUCCESS=merge NOTFOUND=continue]\n") == 1 && s[0].stop == ok_only &&
                s[0].merge == (1u << NSS_STATUS_UNAVAIL | 1u << NSS_STATUS_TRYAGAIN));
         assert(nsswitch_hosts((const char *)0, 0, s, NSS_HOSTS_MAX) == 2 && s[0].merge == 0 && s[1].merge == 0);
+        /* hello546: "myhostname" (systemd's module, case matters) is a service of its own. */
+        assert(NSS("hosts: files myhostname dns\n") == 3 && s[1].service == NSS_SERVICE_MYHOSTNAME);
+        assert(NSS("hosts: MyHostname\n") == 1 && s[0].service == NSS_SERVICE_OTHER);
         assert(NSS("hosts: [NOTFOUND=return] dns files\n") == 0);
         assert(NSS("hosts: dns [NOTFOUND=foo] files\n") == 0);
         assert(NSS("hosts: files [FOO=return] dns\n") == 0);
@@ -2759,6 +2764,110 @@ int main(void) {
         moqi_test_hostname = "moqios";
         moqi_test_etc_hosts = (const char *)0;
         moqi_test_nsswitch_conf = (const char *)0;
+    }
+    /* hello546: the "myhostname" source (systemd nss-myhostname, measured through glibc 2.44 with dummy interfaces in
+     * `unshare -r -u -m -n`). "localhost", any name ending in ".localhost", "localhost.localdomain" (any case, a final dot
+     * allowed) are localhost: 127.0.0.1 and ::1. The host name (case matters, a final dot allowed) is every non-loopback address
+     * of its family, else 127.0.0.2 or ::1. In reverse 127.0.0.1 and ::1 are localhost, 127.0.0.2 and the host's own addresses
+     * the host name. Anything else is NOTFOUND with HOST_NOT_FOUND. getaddrinfo lists IPv6 first. */
+    {
+        struct hostent *hp;
+        struct addrinfo hints, *res = (struct addrinfo *)0;
+        char hb[64];
+        uint8_t sa4[16];
+        moqi_test_resolv_conf = (const char *)0;
+        moqi_test_etc_hosts = "";
+        moqi_test_nsswitch_conf = "hosts: myhostname\n";
+        moqi_test_hostname = "me";
+        moqi_test_if_inet6 = (const char *)0;
+        memset(stub_eth0_ip, 0, 4);
+        stub_reset();
+        static const char *const lo_names[] = {"localhost", "LOCALHOST", "localhost.", "foo.localhost", "a.b.localhost",
+                                               "localhost.localdomain", "Foo.LocalHost."};
+        for (unsigned i = 0; i < sizeof lo_names / sizeof lo_names[0]; i++) {
+            hp = gethostbyname(lo_names[i]);
+            assert(hp && strcmp(hp->h_name, "localhost") == 0 && hp->h_aliases[0] == 0 && (unsigned char)hp->h_addr_list[0][0] == 127 &&
+                   (unsigned char)hp->h_addr_list[0][3] == 1 && hp->h_addr_list[1] == 0);
+            hp = gethostbyname2(lo_names[i], AF_INET6);
+            assert(hp && strcmp(hp->h_name, "localhost") == 0 && (unsigned char)hp->h_addr_list[0][15] == 1 && hp->h_addr_list[1] == 0);
+        }
+        static const char *const not_names[] = {"localhost6", "localhost6.localdomain6", "_gateway", "other", "ME", "localhostx", "xlocalhost"};
+        for (unsigned i = 0; i < sizeof not_names / sizeof not_names[0]; i++) {
+            h_errno = 0;
+            assert(!gethostbyname(not_names[i]) && h_errno == HOST_NOT_FOUND);
+            assert(!gethostbyname2(not_names[i], AF_INET6) && h_errno == HOST_NOT_FOUND);
+        }
+        /* The host name with no address of its own: 127.0.0.2 and ::1. */
+        hp = gethostbyname("me");
+        assert(hp && strcmp(hp->h_name, "me") == 0 && (unsigned char)hp->h_addr_list[0][3] == 2 && hp->h_addr_list[1] == 0);
+        hp = gethostbyname("me.");
+        assert(hp && strcmp(hp->h_name, "me") == 0);
+        hp = gethostbyname2("me", AF_INET6);
+        assert(hp && strcmp(hp->h_name, "me") == 0 && (unsigned char)hp->h_addr_list[0][15] == 1);
+        memset(&hints, 0, sizeof hints);
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags = AI_CANONNAME;
+        assert(getaddrinfo("me", 0, &hints, &res) == 0 && strcmp(res->ai_canonname, "me") == 0 && res->ai_family == AF_INET6 &&
+               res->ai_addr[23] == 1 && res->ai_next && res->ai_next->ai_family == AF_INET && res->ai_next->ai_addr[7] == 2 &&
+               res->ai_next->ai_next == 0);
+        freeaddrinfo(res);
+        assert(getaddrinfo("localhost", 0, &hints, &res) == 0 && res->ai_family == AF_INET6 && res->ai_next->ai_addr[7] == 1);
+        freeaddrinfo(res);
+        hints.ai_flags = 0;
+        assert(getaddrinfo("other", 0, &hints, &res) == EAI_NONAME);
+        /* With addresses: eth0's IPv4 one, and the IPv6 ones of /proc/net/if_inet6 other than ::1, in file order. */
+        stub_eth0_ip[0] = 10; stub_eth0_ip[2] = 2; stub_eth0_ip[3] = 15;
+        moqi_test_if_inet6 = "20010db8000000000000000000000005 02 40 00 00     eth0\n"
+                             "fe800000000000005054000000000009 02 40 20 80     eth0\n"
+                             "00000000000000000000000000000001 01 80 10 80       lo\n";
+        hp = gethostbyname("me");
+        assert(hp && (unsigned char)hp->h_addr_list[0][0] == 10 && (unsigned char)hp->h_addr_list[0][3] == 15 && hp->h_addr_list[1] == 0);
+        hp = gethostbyname2("me", AF_INET6);
+        assert(hp && (unsigned char)hp->h_addr_list[0][0] == 0x20 && (unsigned char)hp->h_addr_list[0][15] == 5 &&
+               (unsigned char)hp->h_addr_list[1][0] == 0xfe && hp->h_addr_list[2] == 0);
+        assert(getaddrinfo("me", 0, &hints, &res) == 0 && res->ai_family == AF_INET6 && res->ai_next->ai_family == AF_INET6 &&
+               res->ai_next->ai_next->ai_family == AF_INET && res->ai_next->ai_next->ai_addr[7] == 15 && res->ai_next->ai_next->ai_next == 0);
+        freeaddrinfo(res);
+        hints.ai_family = AF_INET;
+        assert(getaddrinfo("me", 0, &hints, &res) == 0 && res->ai_addr[7] == 15 && res->ai_next == 0);
+        freeaddrinfo(res);
+        hints.ai_family = AF_UNSPEC;
+        /* Reverse. */
+        static const uint8_t lo1[4] = {127, 0, 0, 1}, lo2[4] = {127, 0, 0, 2}, own4[4] = {10, 0, 2, 15}, oth4[4] = {10, 0, 2, 99};
+        static const uint8_t lo6[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+        static const uint8_t own6[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5};
+        hp = gethostbyaddr(lo1, 4, AF_INET);
+        assert(hp && strcmp(hp->h_name, "localhost") == 0 && hp->h_addrtype == AF_INET);
+        hp = gethostbyaddr(lo6, 16, AF_INET6);
+        assert(hp && strcmp(hp->h_name, "localhost") == 0 && hp->h_addrtype == AF_INET6);
+        hp = gethostbyaddr(lo2, 4, AF_INET);
+        assert(hp && strcmp(hp->h_name, "me") == 0);
+        hp = gethostbyaddr(own4, 4, AF_INET);
+        assert(hp && strcmp(hp->h_name, "me") == 0 && (unsigned char)hp->h_addr_list[0][3] == 15);
+        hp = gethostbyaddr(own6, 16, AF_INET6);
+        assert(hp && strcmp(hp->h_name, "me") == 0);
+        h_errno = 0;
+        assert(!gethostbyaddr(oth4, 4, AF_INET) && h_errno == HOST_NOT_FOUND);
+        ipv4_sockaddr(own4, 0, sa4);
+        assert(getnameinfo(sa4, 16, hb, sizeof hb, 0, 0, NI_NAMEREQD) == 0 && strcmp(hb, "me") == 0);
+        ipv4_sockaddr(oth4, 0, sa4);
+        assert(getnameinfo(sa4, 16, hb, sizeof hb, 0, 0, NI_NAMEREQD) == EAI_NONAME);
+        /* A host name with a domain is only itself. */
+        moqi_test_hostname = "me.dom.test";
+        assert(gethostbyname("me.dom.test.") && !gethostbyname("me") && !gethostbyname("ME.dom.test"));
+        /* As one source among others: NOTFOUND goes on. */
+        moqi_test_nsswitch_conf = "hosts: myhostname files\n";
+        moqi_test_etc_hosts = "10.9.9.9 other\n";
+        hp = gethostbyname("other");
+        assert(hp && (unsigned char)hp->h_addr_list[0][3] == 9);
+        moqi_test_nsswitch_conf = "hosts: myhostname [NOTFOUND=return] files\n";
+        assert(!gethostbyname("other") && h_errno == HOST_NOT_FOUND);
+        moqi_test_hostname = "moqios";
+        moqi_test_if_inet6 = (const char *)0;
+        memset(stub_eth0_ip, 0, 4);
+        moqi_test_etc_hosts = (const char *)0;
+        moqi_test_nsswitch_conf = (const char *)0;
+        stub_reset();
     }
     /* Every list that getaddrinfo built was released: nothing leaked, nothing freed twice. */
     assert(live_allocs == 0);

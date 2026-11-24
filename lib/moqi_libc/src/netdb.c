@@ -1003,6 +1003,7 @@ static size_t nss_parse_list_err(const char *t, size_t i, size_t b, struct nss_s
         s.service = NSS_SERVICE_OTHER;
         if (i - name == 5 && memcmp(t + name, "files", 5) == 0) s.service = NSS_SERVICE_FILES;
         if (i - name == 3 && memcmp(t + name, "dns", 3) == 0) s.service = NSS_SERVICE_DNS;
+        if (i - name == 10 && memcmp(t + name, "myhostname", 10) == 0) s.service = NSS_SERVICE_MYHOSTNAME;
         s.stop = 1u << NSS_STATUS_SUCCESS;
         s.merge = 0;
         while (i < b && nss_space(t[i])) i++;
@@ -1273,6 +1274,158 @@ static int etc_hosts_exists(void) {
 #endif
 static char etc_hosts_buf[ETC_HOSTS_MAX];
 static size_t etc_hosts_read(void) { return etc_hosts_read_into(etc_hosts_buf, sizeof etc_hosts_buf); }
+
+/* ---- the "myhostname" source (systemd nss-myhostname, measured through glibc 2.44, hello546) ----------------------- */
+
+#ifdef MOQI_HOST_TEST_SYSCALL
+extern const char *moqi_test_hostname;
+extern const char *moqi_test_if_inet6;
+static int local_hostname(char *buf, size_t cap) {
+    if (!moqi_test_hostname || strlen(moqi_test_hostname) + 1 > cap) return -1;
+    memcpy(buf, moqi_test_hostname, strlen(moqi_test_hostname) + 1);
+    return 0;
+}
+static size_t if_inet6_read(char *buf, size_t cap) {
+    size_t n = moqi_test_if_inet6 ? strlen(moqi_test_if_inet6) : 0;
+    if (n > cap) n = cap;
+    memcpy(buf, moqi_test_if_inet6, n);
+    return n;
+}
+#else
+#include "../include/sysinfo.h"
+static int local_hostname(char *buf, size_t cap) { return gethostname(buf, cap); }
+static size_t if_inet6_read(char *buf, size_t cap) {
+    long fd = syscall3(SYS_open, (long)"/proc/net/if_inet6", 0 /* O_RDONLY */, 0);
+    if (fd < 0) return 0;
+    long n = 0;
+    while (n < (long)cap) {
+        long r = syscall3(SYS_read, fd, (long)(buf + n), (long)cap - n);
+        if (r <= 0) break;
+        n += r;
+    }
+    syscall1(SYS_close, fd);
+    return (size_t)n;
+}
+#endif
+
+static int myh_lower(int c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
+/* `a` (length `n`) equals `b` ignoring ASCII case. */
+static int myh_case_eq(const char *a, size_t n, const char *b) {
+    size_t m = strlen(b);
+    if (n != m) return 0;
+    for (size_t i = 0; i < n; i++)
+        if (myh_lower((unsigned char)a[i]) != myh_lower((unsigned char)b[i])) return 0;
+    return 1;
+}
+/* "localhost", "localhost.localdomain" or a name ending in ".localhost", in any case; `n` excludes one final dot. */
+static int myh_is_localhost(const char *name, size_t n) {
+    if (myh_case_eq(name, n, "localhost") || myh_case_eq(name, n, "localhost.localdomain")) return 1;
+    return n > 10 && myh_case_eq(name + n - 10, 10, ".localhost");
+}
+
+#define MYH_ADDRS_MAX 16
+/* The host's own non-loopback addresses of `af`, at most `cap`: the IPv4 ones of SIOCGIFCONF (not 127/8 or 0.0.0.0) and the
+ * IPv6 ones of /proc/net/if_inet6 other than ::1, in the kernel's order. */
+static size_t myh_own_addrs(int af, uint8_t out[][16], size_t cap) {
+    size_t k = 0;
+    if (af == AF_INET) {
+        uint8_t conf[8 * 40];
+        uint8_t hdr[16];
+        memset(hdr, 0, sizeof hdr);
+        int len = (int)sizeof conf;
+        uint8_t *p = conf;
+        memcpy(hdr, &len, 4);
+        memcpy(hdr + 8, &p, sizeof p);
+        long sk = NETDB_SYSCALL3(SYS_socket, AF_INET, SOCK_DGRAM, 0);
+        if (sk < 0) return 0;
+        int got = 0;
+        if (NETDB_SYSCALL3(SYS_ioctl, sk, 0x8912 /* SIOCGIFCONF */, (long)hdr) == 0) memcpy(&got, hdr, 4);
+        NETDB_SYSCALL1(SYS_close, sk);
+        for (int off = 0; off + 40 <= got && off + 40 <= (int)sizeof conf && k < cap; off += 40) {
+            const uint8_t *r = conf + off;
+            if (r[16] != AF_INET || r[17] != 0 || r[20] == 127 || (r[20] | r[21] | r[22] | r[23]) == 0) continue;
+            memset(out[k], 0, 16);
+            memcpy(out[k], r + 20, 4);
+            k++;
+        }
+        return k;
+    }
+    char text[1024];
+    size_t n = if_inet6_read(text, sizeof text);
+    for (size_t pos = 0; pos < n && k < cap;) {
+        size_t end = pos;
+        while (end < n && text[end] != '\n') end++;
+        if (end - pos >= 32) {
+            uint8_t a[16];
+            int ok = 1;
+            for (size_t i = 0; i < 32 && ok; i++) {
+                int d = hex_digit(text[pos + i]);
+                if (d < 0) ok = 0;
+                else if (i % 2 == 0) a[i / 2] = (uint8_t)(d << 4);
+                else a[i / 2] |= (uint8_t)d;
+            }
+            static const uint8_t lo6[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+            if (ok && memcmp(a, lo6, 16) != 0) memcpy(out[k++], a, 16);
+        }
+        pos = end + 1;
+    }
+    return k;
+}
+
+/* myhostname for a name: SUCCESS with the addresses of `af` in `ans` (name_store holding the answered name), or NOTFOUND with
+ * HOST_NOT_FOUND. The host name matches exactly (one final dot allowed); with no address of its own the host is 127.0.0.2 or ::1. */
+static int name_from_myhostname(const char *name, int af, uint8_t addrs[][16], size_t cap, size_t *naddrs, char *canon, size_t canon_cap) {
+    size_t n = strlen(name);
+    if (n && name[n - 1] == '.') n--;
+    *naddrs = 0;
+    const char *answer = (const char *)0;
+    char hn[256];
+    int local = myh_is_localhost(name, n);
+    if (local) {
+        answer = "localhost";
+    } else if (local_hostname(hn, sizeof hn) == 0 && hn[0] && strlen(hn) == n && memcmp(hn, name, n) == 0) {
+        answer = hn;
+        *naddrs = myh_own_addrs(af, addrs, cap);
+    } else {
+        return NSS_STATUS_NOTFOUND;
+    }
+    if (*naddrs == 0 && cap) {
+        memset(addrs[0], 0, 16);
+        if (af == AF_INET6) addrs[0][15] = 1;
+        else { addrs[0][0] = 127; addrs[0][3] = local ? 1 : 2; }
+        *naddrs = 1;
+    }
+    size_t k = strlen(answer);
+    if (k + 1 > canon_cap) k = canon_cap - 1;
+    memcpy(canon, answer, k);
+    canon[k] = 0;
+    return NSS_STATUS_SUCCESS;
+}
+
+/* myhostname for an address: 127.0.0.1 and ::1 are localhost; 127.0.0.2 and the host's own addresses the host name. */
+static int addr_from_myhostname(int af, const uint8_t *addr, char *out, size_t cap) {
+    static const uint8_t lo6[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    const char *answer = (const char *)0;
+    char hn[256];
+    int own = 0;
+    if (af == AF_INET ? (addr[0] == 127 && addr[1] == 0 && addr[2] == 0 && addr[3] == 1) : memcmp(addr, lo6, 16) == 0) {
+        answer = "localhost";
+    } else {
+        own = af == AF_INET && addr[0] == 127 && addr[1] == 0 && addr[2] == 0 && addr[3] == 2;
+        if (!own) {
+            uint8_t mine[MYH_ADDRS_MAX][16];
+            size_t k = myh_own_addrs(af, mine, MYH_ADDRS_MAX);
+            for (size_t i = 0; i < k && !own; i++) own = memcmp(mine[i], addr, af == AF_INET ? 4 : 16) == 0;
+        }
+        if (own && local_hostname(hn, sizeof hn) == 0 && hn[0]) answer = hn;
+    }
+    if (!answer) return NSS_STATUS_NOTFOUND;
+    size_t k = strlen(answer);
+    if (k + 1 > cap) k = cap - 1;
+    memcpy(out, answer, k);
+    out[k] = 0;
+    return NSS_STATUS_SUCCESS;
+}
 
 /* /etc/hosts first, then the kernel resolver (glibc's "files dns" order). When the file answers and `names` is given, the
  * matching line's names (canonical name first, then aliases, separated by blanks) are copied there NUL-terminated, cut to `cap`;
@@ -1589,6 +1742,22 @@ static int name_from_dns(const char *name, int af, struct host_answer *ans) {
     return NSS_STATUS_SUCCESS;
 }
 
+/* The myhostname source for a name, into a host_answer. */
+static int name_from_myhostname_ans(const char *name, int af, struct host_answer *ans) {
+    size_t k = 0;
+    int status = name_from_myhostname(name, af, ans->addrs, MYH_ADDRS_MAX, &k, ans->name_store, HOSTENT_NAME_MAX);
+    ans->rc = 0;
+    if (status != NSS_STATUS_SUCCESS) {
+        ans->herr = HOST_NOT_FOUND;
+        return status;
+    }
+    ans->naddrs = k;
+    ans->names = ans->name_store;
+    ans->names_len = strlen(ans->name_store);
+    ans->herr = 0;
+    return status;
+}
+
 /* `hosts`/`hosts_cap` is the scratch space for /etc/hosts text: the static functions pass etc_hosts_buf, the reentrant ones a
  * buffer of their own, so the two never share state. */
 static void lookup_name(const char *name, int af, char *hosts, size_t hosts_cap, struct host_answer *ans) {
@@ -1634,6 +1803,7 @@ static void lookup_name(const char *name, int af, char *hosts, size_t hosts_cap,
             ans->naddrs = 0;
             if (src[s].service == NSS_SERVICE_FILES) status = name_from_files(name, af, hosts, hosts_cap, ans);
             else if (src[s].service == NSS_SERVICE_DNS) status = name_from_dns(name, af, ans);
+            else if (src[s].service == NSS_SERVICE_MYHOSTNAME) status = name_from_myhostname_ans(name, af, ans);
             else status = NSS_STATUS_UNAVAIL;
             if (status == NSS_STATUS_SUCCESS && nss_merges(&src[s], status)) {
                 /* hello544: the hosts database has no merge function, so an answer under SUCCESS=merge fails the lookup with
@@ -1751,8 +1921,17 @@ static void lookup_addr(const void *addr, unsigned int len, int family, char *ho
             status = NSS_STATUS_NOTFOUND;
             ans->herr = netdb_herr_of(r); /* -2: no reverse DNS configured, or NXDOMAIN */
             ans->rc = ans->herr == TRY_AGAIN ? EAGAIN : 0;
+        } else if (src[s].service == NSS_SERVICE_MYHOSTNAME && requested_family != AF_UNSPEC) {
+            /* hello546: the address as given (a mapped ::ffff:127.0.0.2 is not the host, glibc 2.44 measured). */
+            status = addr_from_myhostname(family, (const uint8_t *)addr, ans->name_store, HOSTENT_NAME_MAX);
+            if (status == NSS_STATUS_SUCCESS) {
+                names = ans->name_store;
+                names_len = strlen(ans->name_store);
+            }
+            ans->herr = status == NSS_STATUS_SUCCESS ? 0 : HOST_NOT_FOUND;
+            ans->rc = 0;
         } else {
-            status = src[s].service == NSS_SERVICE_DNS ? NSS_STATUS_NOTFOUND : NSS_STATUS_UNAVAIL;
+            status = src[s].service == NSS_SERVICE_DNS || src[s].service == NSS_SERVICE_MYHOSTNAME ? NSS_STATUS_NOTFOUND : NSS_STATUS_UNAVAIL;
         }
         if (status == NSS_STATUS_SUCCESS && nss_merges(&src[s], status)) {
             /* As for a name (hello544), but h_errno and, after files, *h_errnop are left as they were. */
@@ -2062,22 +2241,6 @@ int addrconfig_rule(int family, int have4, int have6) {
     return have4 ? ADDRCONFIG_ONLY_INET : ADDRCONFIG_ONLY_INET6;
 }
 
-#ifdef MOQI_HOST_TEST_SYSCALL
-static size_t if_inet6_read(char *buf, size_t cap) { (void)buf; (void)cap; return 0; }
-#else
-static size_t if_inet6_read(char *buf, size_t cap) {
-    long fd = syscall3(SYS_open, (long)"/proc/net/if_inet6", 0 /* O_RDONLY */, 0);
-    if (fd < 0) return 0;
-    long n = 0;
-    while (n < (long)cap) {
-        long r = syscall3(SYS_read, fd, (long)(buf + n), (long)cap - n);
-        if (r <= 0) break;
-        n += r;
-    }
-    syscall1(SYS_close, fd);
-    return (size_t)n;
-}
-#endif
 
 /* Which families have a non-loopback address. errno is left as it was. */
 static void addrconfig_probe(int *have4, int *have6) {
@@ -2261,6 +2424,37 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
                     else if (family == AF_INET && !(flags & AI_CANONNAME)) code = EAI_NODATA;
                     else code = herr_now == NO_DATA ? EAI_NODATA : EAI_NONAME;
                 }
+            } else if (src[s].service == NSS_SERVICE_MYHOSTNAME) {
+                /* hello546 (glibc 2.44 with nss-myhostname, measured): AF_UNSPEC lists the IPv6 addresses first; AF_INET6 with
+                 * AI_V4MAPPED and AI_ALL adds the IPv4 ones, mapped; the canonical name is "localhost" or the host name. */
+                uint8_t got[MYH_ADDRS_MAX][16];
+                size_t k6 = 0, k4 = 0;
+                status = NSS_STATUS_NOTFOUND;
+                if (family != AF_INET && name_from_myhostname(node, AF_INET6, got, MYH_ADDRS_MAX, &k6, canon_buf, sizeof canon_buf) == NSS_STATUS_SUCCESS) {
+                    status = NSS_STATUS_SUCCESS;
+                    for (size_t i = 0; i < k6 && naddrs < GAI_MAX_ADDRS; i++) {
+                        memset(&addrs[naddrs], 0, sizeof addrs[naddrs]);
+                        addrs[naddrs].family = AF_INET6;
+                        memcpy(addrs[naddrs].addr, got[i], 16);
+                        naddrs++;
+                    }
+                }
+                int want4 = family != AF_INET6 || ((flags & AI_V4MAPPED) && (flags & AI_ALL));
+                if (want4 && name_from_myhostname(node, AF_INET, got, MYH_ADDRS_MAX, &k4, canon_buf, sizeof canon_buf) == NSS_STATUS_SUCCESS) {
+                    status = NSS_STATUS_SUCCESS;
+                    for (size_t i = 0; i < k4 && naddrs < GAI_MAX_ADDRS; i++) {
+                        set_v4(&addrs[naddrs], got[i][0], got[i][1], got[i][2], got[i][3]);
+                        if (family == AF_INET6) map_v4(&addrs[naddrs]);
+                        naddrs++;
+                    }
+                }
+                code = EAI_NONAME;
+                herr_now = HOST_NOT_FOUND;
+                names = (const char *)0;
+                if (status == NSS_STATUS_SUCCESS) {
+                    names = canon_buf;
+                    names_len = strlen(canon_buf);
+                }
             } else if (src[s].service == NSS_SERVICE_DNS) {
                 /* DNS (glibc 2.44, measured): AF_INET asks A records, AF_INET6 AAAA records, AF_UNSPEC both, listing the IPv6 addresses
                  * first. AF_INET6 with AI_V4MAPPED falls back to the A records, mapped, when there is no AAAA; with AI_ALL as well it
@@ -2434,17 +2628,6 @@ static int copy_text(char *dst, unsigned int dst_len, const char *text) {
 /* NI_NOFQDN's local domain (glibc 2.44 nrl_domainname, measured): what follows the first dot of the first dotted name among
  * localhost's name, the host name, the host name's name and 127.0.0.1's name, looked up through the nsswitch.conf sources. It is
  * found once per process, the first time NI_NOFQDN names an address, and kept, even when empty ("localhost." gives ""). */
-#ifdef MOQI_HOST_TEST_SYSCALL
-extern const char *moqi_test_hostname;
-static int nofqdn_hostname(char *buf, size_t cap) {
-    if (!moqi_test_hostname || strlen(moqi_test_hostname) + 1 > cap) return -1;
-    memcpy(buf, moqi_test_hostname, strlen(moqi_test_hostname) + 1);
-    return 0;
-}
-#else
-#include "../include/sysinfo.h"
-static int nofqdn_hostname(char *buf, size_t cap) { return gethostname(buf, cap); }
-#endif
 static int nofqdn_known, nofqdn_have;
 static char nofqdn_domain[256];
 #ifdef MOQI_HOST_TEST_SYSCALL
@@ -2472,7 +2655,7 @@ static void nofqdn_find(void) {
     lookup_name("localhost", AF_INET, etc_hosts_buf, sizeof etc_hosts_buf, &ans);
     if (nofqdn_take(&ans)) return;
     char hn[256];
-    if (nofqdn_hostname(hn, sizeof hn) == 0) {
+    if (local_hostname(hn, sizeof hn) == 0) {
         const char *dot = strchr(hn, '.');
         if (dot) {
             size_t n = strlen(dot + 1);

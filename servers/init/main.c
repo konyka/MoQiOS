@@ -663,6 +663,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello543"); /* use-vc asks an AF_UNSPEC pair on one TCP connection */
     run_test("hello544"); /* nsswitch.conf merge action */
     run_test("hello545"); /* getnameinfo NI_NOFQDN */
+    run_test("hello546"); /* nsswitch.conf myhostname source */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */
