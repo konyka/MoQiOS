@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello557`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello558`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -523,6 +523,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello555 | TCP `recv` 的 `MSG_TRUNC`（与 Linux 7.x `tcp_recvmsg` 实测相同）：排队 "abcdefgh" 时 `recv(buf, 3, MSG_TRUNC)` 返回 3 且不写缓冲区（A）；`recv(NULL, 3, MSG_TRUNC)` 返回 3（B）；`MSG_PEEK \| MSG_TRUNC` 返回 2、不取走数据（C）；之后普通读得到 "gh"（D）；队列为空时为 `EAGAIN`（E） |
 | hello556 | TCP `recvmsg` 的 `MSG_TRUNC`（与 Linux 7.x 实测相同）：排队 "abcdefgh" 时 3 字节的 iovec 带 `MSG_TRUNC` 返回 3、不写 iovec、`msg_flags` 为 0（A）；没有 iovec 时返回 0（B）；`MSG_PEEK \| MSG_TRUNC` 配 NULL 的 2 字节 iovec 返回 2（C）；之后普通 `recvmsg` 得到 "defgh"（D） |
 | hello557 | IPv4 ping 套接字上零字节的发送（与 Linux 7.x `ping_v4_sendmsg` 实测相同：短于 8 字节 ICMP 头的消息为 `EINVAL`）：未连接时 `write(fd, "", 0)`（A）、连接后 `write`（B）、`send("", 0)`（C）、`sendto(127.0.0.1, "", 0)`（D）都是 `EINVAL`。测试把 `net.ipv4.ping_group_range` 设为 "0 0"，结束时恢复。需要 root |
+| hello558 | 未连接的 AF_UNIX 面向连接套接字带地址发送（与 Linux 7.x 实测相同，回归测试）：`SOCK_SEQPACKET` 上带地址的 `sendto`（A）、`send`（B）、带 `msg_name` 的 `sendmsg`（C）都是 `ENOTCONN`；`SOCK_STREAM` 上带地址的 `sendto` 是 `EOPNOTSUPP`（D），不带地址的 `send` 是 `ENOTCONN`（E） |
 | hello526 | `/etc/resolv.conf` 的 IPv6 nameserver（与 glibc 2.44 实测相同）：[::1]:53 和 127.0.0.1:53 上各一个本机 DNS 服务器；只写 `nameserver ::1` 时经 IPv6 查询并得到应答（A）；`::1` 在前时只问 IPv6 服务器（B）；不应答的 IPv6 服务器在前时换到 IPv4 服务器（C）；`gethostbyaddr` 也经 IPv6 服务器（D）；`::ffff:127.0.0.1` 按 IPv4 服务器询问（E）；两个服务器能在同一端口分别绑定 [::1] 和 127.0.0.1 |
 | hello525 | AAAA 记录（与 glibc 2.44 实测相同）：本机服务器知道双栈、只有 IPv4、只有 IPv6 三个名字；`gethostbyname2(AF_INET6)` 发 AAAA 查询并返回 16 字节地址（A）；只有 A 记录的名字在 `AF_INET6` 下为 `NO_DATA`（B）；`getaddrinfo` 的 `AF_UNSPEC` 发 AAAA 和 A 两个查询，IPv6 地址在前（C）；单栈名字只给那个族（D）；`AF_INET6` 对只有 IPv4 的名字为 `EAI_NODATA`，带 `AI_V4MAPPED` 时给映射地址（E）；不存在的名字为 `EAI_NONAME`（F） |
 | hello524 | 截断应答改用 TCP（与 glibc 2.44 `res_send` 实测相同）：本机服务器的 UDP 应答都带 TC 位，TCP（2 字节长度加报文）按名字回答；`gethostbyname` 先问 UDP、再问 TCP，得到 TCP 的三个地址（A）；UDP 应答带 TC 且有记录时也不用，用 TCP 的结果（B）；TCP 回 NXDOMAIN 为 `HOST_NOT_FOUND`（C）；TCP 连接在应答前关闭为 `TRY_AGAIN`（D）；服务器没有 TCP 监听时立即 `TRY_AGAIN`（E） |
