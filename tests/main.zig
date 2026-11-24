@@ -19179,3 +19179,11 @@ test "SO_PEEK_OFF on a raw socket is EOPNOTSUPP for get and set, as Linux sk_set
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, so, "optname == sp.SO_PEEK_OFF and ref == .raw) return -95; // EOPNOTSUPP"));
     try std.testing.expect(std.mem.indexOf(u8, so, "optname == sp.SO_PEEK_OFF and ref == .raw) return -92;") == null);
 }
+
+test "MSG_TRUNC on a TCP recv takes the bytes without copying them, even into NULL (Linux 7.x tcp_recvmsg, measured) (hello555)" {
+    const ss = kt.socket_syscall_source;
+    // The buffer is only needed when something is copied.
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const tcp_trunc = rf.truncReportsFullLength(flags);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (!tcp_trunc and (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0)) return -1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (result > 0 and !tcp_trunc) {") != null);
+}

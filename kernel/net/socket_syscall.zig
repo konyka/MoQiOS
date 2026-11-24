@@ -1292,13 +1292,17 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         return result;
     } else if (t.fd_table.fds[fd].fd_type == .tcp_socket) {
         if (flags & urg.MSG_OOB != 0) return tcpRecvOobTo(t.fd_table.fds[fd].tcb_idx, buf, len, flags);
-        if (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0) return -1;
+        const rf = @import("recv_flags_policy.zig");
+        // MSG_TRUNC (tcp_recvmsg_locked): the bytes are taken (or peeked) and counted but not copied, so no buffer is needed
+        // (measured: recv(fd, NULL, 3, MSG_TRUNC) returns 3 and the next read starts after them; hello555).
+        const tcp_trunc = rf.truncReportsFullLength(flags);
+        if (!tcp_trunc and (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0)) return -1;
+        if (len == 0) return 0;
         var tmp_buf: [4096]u8 = undefined;
         const to_read = @min(len, 4096);
-        if (!copy.validateUserBufferWritable(buf, to_read)) return -14; // EFAULT
+        if (!tcp_trunc and !copy.validateUserBufferWritable(buf, to_read)) return -14; // EFAULT
         const tcb_idx = t.fd_table.fds[fd].tcb_idx;
         const nonblock = net_mod.tcp_recv_policy.nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), flags);
-        const rf = @import("recv_flags_policy.zig");
         var result: i64 = undefined;
         if (rf.peek(flags)) {
             result = net_mod.tcp.tcpPeek(tcb_idx, &tmp_buf, to_read);
@@ -1320,7 +1324,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
                 result = @intCast(got);
             }
         }
-        if (result > 0) {
+        if (result > 0 and !tcp_trunc) {
             const copied = copy.copyToUser(@ptrFromInt(buf), @as([*]const u8, @ptrCast(&tmp_buf))[0..@intCast(result)], @intCast(result));
             if (copied != @as(usize, @intCast(result))) return -14; // EFAULT
         }

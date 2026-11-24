@@ -84,8 +84,9 @@ int main(void) {
     strcpy(h1, "10.5.0.4");
 #else
     long u = unlink(HOSTS_PATH);
-    unlink("/etc/nsswitch.conf");
+    /* Still "hosts: files" until the last lookup: with the file gone it must not fall back to DNS. */
     int f1 = name_of(4, 0, sizeof h1, h1);
+    unlink("/etc/nsswitch.conf");
 #endif
     snprintf(msg, sizeof msg, "F: unlink %ld, then 10.5.0.4 %d '%s' (0 0 10.5.0.4)", u, f1, h1);
     check(u == 0 && f1 == 0 && strcmp(h1, "10.5.0.4") == 0, msg);
