@@ -4216,8 +4216,14 @@ pub fn tcpPeek(tcb_idx: u32, buf: [*]u8, len: u32) i64 {
     if (decision != .read_data) return reportRecvResult(tcb, decision);
     const lim = urgReadLimit(tcb, available, false);
     if (lim.avail == 0) return reportRecvResult(tcb, tcp_recv_policy.decide(tcb.state, 0, tcb.reset_by_peer));
-    const to_read = @min(lim.avail, len);
-    ringRead(&tcb.recv_buf, RECV_BUF_SIZE, (tcb.recv_head + lim.skip) % RECV_BUF_SIZE, buf, to_read);
+    // SO_PEEK_OFF (hello553): the peek starts that many bytes past what a read would return and moves the offset past what it
+    // copied; at or past the end it finds nothing (EAGAIN, or a wait for a blocking peek).
+    const sp = @import("sockopt_policy.zig");
+    const start = sp.peekStart(tcb.options.peek_off) orelse 0;
+    if (start >= lim.avail) return -11;
+    const to_read = @min(lim.avail - @as(u32, @intCast(start)), len);
+    ringRead(&tcb.recv_buf, RECV_BUF_SIZE, (tcb.recv_head + lim.skip + @as(u32, @intCast(start))) % RECV_BUF_SIZE, buf, to_read);
+    tcb.options.peek_off = sp.peekAdvance(tcb.options.peek_off, to_read);
     return @intCast(to_read);
 }
 
@@ -4254,7 +4260,11 @@ pub fn tcpWaitReadable(tcb_idx: u32) i64 {
             const tcb = &tcbs[tcb_idx];
             if (!tcb.active) return -9;
             if (tcp_recv_policy.shutRdEof(tcb.shut_rd)) return 0;
-            const decision = tcp_recv_policy.decide(tcb.state, readableLocked(tcb), tcb.reset_by_peer);
+            // A peek under SO_PEEK_OFF (hello553) waits for bytes past the offset, not just for any byte.
+            const start: u32 = if (@import("sockopt_policy.zig").peekStart(tcb.options.peek_off)) |o| @intCast(@min(o, 0xFFFF_FFFF)) else 0;
+            const readable = readableLocked(tcb);
+            const past = if (readable > start) readable - start else 0;
+            const decision = tcp_recv_policy.decide(tcb.state, past, tcb.reset_by_peer);
             if (decision != .would_block or tcp_recv_policy.liveErrorPending(tcb.state, tcb.options.so_error)) return 0;
         }
         _ = lo_dev.drain();
@@ -4522,6 +4532,8 @@ fn recvLocked(tcb: *TcpTcb, buf: [*]u8, len: u32) i64 {
     const to_read = @min(lim.avail, len);
     ringRead(&tcb.recv_buf, RECV_BUF_SIZE, tcb.recv_head, buf, to_read);
     tcb.recv_head = (tcb.recv_head + to_read) % RECV_BUF_SIZE;
+    const sp = @import("sockopt_policy.zig");
+    tcb.options.peek_off = sp.readPullBack(tcb.options.peek_off, to_read);
     urgPassedCheck(tcb);
 
     tcb.rcv_wnd = tcp_util.rcvWindowFromBuffered(ringDataLen(tcb.recv_head, tcb.recv_tail, RECV_BUF_SIZE), rcvWindowCap(tcb));

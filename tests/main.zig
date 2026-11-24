@@ -12170,9 +12170,9 @@ test "SOL_SOCKET extras: wiring and the hello179 capability profile" {
     // eth0 exists as a device only when the NIC does.
     try std.testing.expect(std.mem.indexOf(u8, so, "return if (@import(\"nic.zig\").isActive()) 2 else 1;") != null);
     // TCP routes the stored-only options through the same round trip as REUSEPORT/BROADCAST/DEBUG, and carries them.
-    try std.testing.expect(std.mem.indexOf(u8, so, "sp.storedOnly(optname) or (sp.flagBit(optname) != null") != null);
-    try std.testing.expect(std.mem.indexOf(u8, so, "        .priority = o.priority,\n        .mark = o.mark,\n        .bound_if = o.bound_if,\n    };") != null);
-    try std.testing.expect(std.mem.indexOf(u8, so, "    o.priority = st.priority;\n    o.mark = st.mark;\n    o.bound_if = st.bound_if;\n}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "sp.storedOnly(optname) or optname == sp.SO_PEEK_OFF or (sp.flagBit(optname) != null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "        .priority = o.priority,\n        .mark = o.mark,\n        .bound_if = o.bound_if,\n        .peek_off = o.peek_off,\n    };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "    o.priority = st.priority;\n    o.mark = st.mark;\n    o.bound_if = st.bound_if;\n    o.peek_off = st.peek_off;\n}") != null);
 }
 
 test "AF_UNIX getsockname / getpeername: address encoding and wiring" {
@@ -19136,7 +19136,8 @@ test "SO_PEEK_OFF on UDP sockets: a peek skips whole datagrams before the offset
     try std.testing.expectEqual(@as(i32, 3), sp.readPullBack(5, 2));
     // Wiring: UDP keeps the offset in its port options and accepts the option.
     const so = kt.socket_opt_source;
-    try std.testing.expect(std.mem.indexOf(u8, so, "if (optname == sp.SO_PEEK_OFF and ref != .unix and ref != .udp) return -92;") != null);
+    // hello553 then took in TCP as well: only raw sockets refuse the option.
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (optname == sp.SO_PEEK_OFF and ref == .raw) return -92;") != null);
     const udp = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, udp, "sp.udpPeekAt(") != null);
 }
@@ -19160,4 +19161,15 @@ test "write() of 0 bytes on a UDP or AF_UNIX message socket and a 0-byte AF_UNIX
     const ss = kt.socket_syscall_source;
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (len == 0 and net_mod.unix_socket.unixIsStream(unix_idx)) return 0;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "const n_unix = if (to_copy_unix == 0) 0 else copy.copyFromUser(&tmp_unix, @ptrFromInt(buf), to_copy_unix);") != null);
+}
+
+test "SO_PEEK_OFF on TCP sockets: peeks start at the offset and advance it, reads pull it back (Linux 7.x tcp_recvmsg, measured) (hello553)" {
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (optname == sp.SO_PEEK_OFF and ref == .raw) return -92;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, ".peek_off = o.peek_off,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "o.peek_off = st.peek_off;") != null);
+    const t = kt.tcp_source;
+    try std.testing.expect(std.mem.indexOf(u8, t, "const start = sp.peekStart(tcb.options.peek_off) orelse 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t, "tcb.options.peek_off = sp.peekAdvance(tcb.options.peek_off, to_read);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t, "tcb.options.peek_off = sp.readPullBack(tcb.options.peek_off, to_read);") != null);
 }
