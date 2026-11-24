@@ -17889,7 +17889,9 @@ test "a UDP socket's datagrams come out in arrival order whichever queue slot ea
     const us = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "fn oldestLocked(port_idx: usize, fam: Fam) ?*UdpEntry {") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "    if (q.tail) |t| t.next = e else q.head = e;\n    q.tail = e;\n") != null);
-    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, us, "oldestLocked(port_idx, "));
+    // The readers take the oldest entry directly or through pickLocked (which keeps it without SO_PEEK_OFF, hello550).
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, us, "oldestLocked(port_idx, "));
+    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, us, "pickLocked(port_idx, "));
 }
 
 test "a UDP socket queues as many datagrams as SO_RCVBUF holds, not a fixed 8 (hello474)" {
@@ -19112,4 +19114,29 @@ test "SO_PEEK_OFF on AF_UNIX sockets: peeks start at the offset and advance it, 
     const us = kt.unix_socket_source;
     try std.testing.expect(std.mem.indexOf(u8, us, "sp.peekStart(sock.opts.peek_off)") != null);
     try std.testing.expect(std.mem.indexOf(u8, us, "sock.opts.peek_off = sp.readPullBack(sock.opts.peek_off,") != null);
+}
+
+test "SO_PEEK_OFF on UDP sockets: a peek skips whole datagrams before the offset, the offset moves by the result (Linux 7.x udp_recvmsg, measured) (hello550)" {
+    const sp = kt.sockopt_policy;
+    // Datagrams of 6 and 4 bytes: where a peek at an offset lands (index, start in it), null past them all. An empty datagram at
+    // the offset is returned (0 bytes) unless it was peeked before (skb->peeked), as __skb_try_recv_from_queue does.
+    const lens = [_]usize{ 6, 4 };
+    try std.testing.expectEqual(sp.DgramAt{ .index = 0, .skip = 0 }, sp.udpPeekAt(&lens, 0, &.{ false, false }).?);
+    try std.testing.expectEqual(sp.DgramAt{ .index = 0, .skip = 4 }, sp.udpPeekAt(&lens, 4, &.{ false, false }).?);
+    try std.testing.expectEqual(sp.DgramAt{ .index = 1, .skip = 0 }, sp.udpPeekAt(&lens, 6, &.{ false, false }).?);
+    try std.testing.expectEqual(sp.DgramAt{ .index = 1, .skip = 3 }, sp.udpPeekAt(&lens, 9, &.{ false, false }).?);
+    try std.testing.expectEqual(@as(?sp.DgramAt, null), sp.udpPeekAt(&lens, 10, &.{ false, false }));
+    const withEmpty = [_]usize{ 0, 2 };
+    try std.testing.expectEqual(sp.DgramAt{ .index = 0, .skip = 0 }, sp.udpPeekAt(&withEmpty, 0, &.{ false, false }).?);
+    try std.testing.expectEqual(sp.DgramAt{ .index = 1, .skip = 0 }, sp.udpPeekAt(&withEmpty, 0, &.{ true, false }).?);
+    // The offset moves by the call's result (skb_consume_udp: forward for a peek, back for a read), and that result is the
+    // datagram's whole length under MSG_TRUNC.
+    try std.testing.expectEqual(@as(i32, 10), sp.peekAdvance(4, 6));
+    try std.testing.expectEqual(@as(i32, 0), sp.readPullBack(2, 3));
+    try std.testing.expectEqual(@as(i32, 3), sp.readPullBack(5, 2));
+    // Wiring: UDP keeps the offset in its port options and accepts the option.
+    const so = kt.socket_opt_source;
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (optname == sp.SO_PEEK_OFF and ref != .unix and ref != .udp) return -92;") != null);
+    const udp = kt.udp_source;
+    try std.testing.expect(std.mem.indexOf(u8, udp, "sp.udpPeekAt(") != null);
 }

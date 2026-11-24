@@ -667,6 +667,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello547"); /* options trust-ad sets the AD bit */
     run_test("hello548"); /* reverse DNS without a resolv.conf nameserver */
     run_test("hello549"); /* SO_PEEK_OFF on AF_UNIX sockets */
+    run_test("hello550"); /* SO_PEEK_OFF on UDP sockets */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

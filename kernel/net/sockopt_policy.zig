@@ -171,6 +171,22 @@ pub fn peekAdvance(off: i32, n: usize) i32 {
     return if (moved > std.math.maxInt(i32)) std.math.maxInt(i32) else @intCast(moved);
 }
 
+/// Where a UDP peek at offset `off` lands among the queued datagrams of lengths `lens` (oldest first): the datagram and how far
+/// into it, null past them all. Whole datagrams the offset reaches past are skipped; an empty one at the offset is skipped only when
+/// it was peeked before (`peeked`), as __skb_try_recv_from_queue does (Linux 7.x, measured).
+pub const DgramAt = struct { index: usize, skip: usize };
+pub fn udpPeekAt(lens: []const usize, off: usize, peeked: []const bool) ?DgramAt {
+    var left = off;
+    for (lens, 0..) |len, i| {
+        if (left >= len and (left > 0 or peeked[i])) {
+            left -= len;
+            continue;
+        }
+        return .{ .index = i, .skip = left };
+    }
+    return null;
+}
+
 /// The offset after a read took `n` bytes off the head (a datagram counts whole): it moves back by them, not below 0
 /// (sk_peek_offset_bwd); a negative one stays.
 pub fn readPullBack(off: i32, n: usize) i32 {

@@ -1156,7 +1156,7 @@ pub fn sendto(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len: 
 /// expired SO_RCVTIMEO, -EINTR when a signal ended the wait. The wait is a
 /// series of short sleeps that also pump the loopback device, so a datagram
 /// sent from another process on 127/8 arrives without an explicit net_poll.
-fn udpWaitForDatagram(port: u32, is_v6: bool, nonblock: bool) i64 {
+fn udpWaitForDatagram(port: u32, is_v6: bool, nonblock: bool, peek: bool) i64 {
     const urp = @import("udp_recv_policy.zig");
     const tsc = @import("../arch/arch.zig").tsc;
     const lo = @import("lo.zig");
@@ -1170,7 +1170,7 @@ fn udpWaitForDatagram(port: u32, is_v6: bool, nonblock: bool) i64 {
             armed = true;
         }
         _ = lo.drain();
-        const step = urp.step(udp.hasQueuedDatagramFor(port, is_v6), nonblock, urp.timedOut(deadline, tsc.nanos()));
+        const step = urp.step(udp.hasQueuedDatagramForPeek(port, is_v6, peek), nonblock, urp.timedOut(deadline, tsc.nanos()));
         switch (step) {
             .deliver => return 0,
             .eagain => return -11,
@@ -1329,7 +1329,7 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         // reported once, before any queued data (Linux: the next call fails).
         const pending = udp.takePendingError(sock_key);
         if (pending != 0) return -@as(i64, pending);
-        const wait_rc = udpWaitForDatagram(sock_key, is_v6, @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), flags));
+        const wait_rc = udpWaitForDatagram(sock_key, is_v6, @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(&t.fd_table.fds[fd]), flags), msg_peek);
         if (wait_rc != 0) return wait_rc;
         var user_addr_len: u32 = 0;
         if (addr_ptr != 0) {
@@ -1353,9 +1353,9 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
             const big6 = udp.takeBig6(sock_key, &src6, &src_port_out6, msg_peek, &big_meta6);
             defer if (big6) |bt| udp.releaseBig(bt, msg_peek);
             const result6: i64 = if (big6) |bt| bt.len else udp.recvFromV6Ex(sock_key, &tmp6, @intCast(tmp6.len), &src6, &src_port_out6, &full_len6, msg_peek);
-            if (big6) |bt| full_len6 = bt.len;
+            if (big6) |bt| full_len6 = bt.full;
             if (result6 > 0) {
-                const to_write6: u32 = if (big6 != null) @intCast(@min(@as(u64, full_len6), len)) else @min(@as(u32, @intCast(result6)), to_read6);
+                const to_write6: u32 = if (big6) |bt| @intCast(@min(@as(u64, bt.len), len)) else @min(@as(u32, @intCast(result6)), to_read6);
                 if (big6) |bt| {
                     if (!copy.validateUserBufferWritable(buf, to_write6)) return -14;
                     if (copy.copyToUser(@ptrFromInt(buf), udp.bigBytes(bt)[0..to_write6], to_write6) != to_write6) return -14;
@@ -1373,7 +1373,9 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
                     };
                     if (copy.copyToUser(@ptrFromInt(addr_len_ptr), &al6, 4) != 4) return -14;
                 }
-                return if (msg_trunc) @as(i64, full_len6) else @intCast(to_write6);
+                const ret6: i64 = if (msg_trunc) @as(i64, full_len6) else @intCast(to_write6);
+                udp.movePeekOffset(sock_key, msg_peek, @intCast(ret6));
+                return ret6;
             }
             return 0;
         }
@@ -1392,9 +1394,9 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
         const big = udp.takeBig(sock_key, &src_ip, &src_port_out, msg_peek, &big_meta);
         defer if (big) |bt| udp.releaseBig(bt, msg_peek);
         const result2: i64 = if (big) |bt| bt.len else udp.recvFromEx(sock_key, &tmp_buf2, @intCast(tmp_buf2.len), &src_ip, &src_port_out, &full_len, msg_peek);
-        if (big) |bt| full_len = bt.len;
+        if (big) |bt| full_len = bt.full;
         if (result2 > 0) {
-            const to_write: u32 = if (big != null) @intCast(@min(@as(u64, full_len), len)) else @min(@as(u32, @intCast(result2)), to_read2);
+            const to_write: u32 = if (big) |bt| @intCast(@min(@as(u64, bt.len), len)) else @min(@as(u32, @intCast(result2)), to_read2);
             if (big) |bt| {
                 if (!copy.validateUserBufferWritable(buf, to_write)) return -14;
                 if (copy.copyToUser(@ptrFromInt(buf), udp.bigBytes(bt)[0..to_write], to_write) != to_write) return -14;
@@ -1409,7 +1411,9 @@ pub fn recvfrom(fd: u32, buf: u64, len: u32, flags: u32, addr_ptr: u64, addr_len
                 var al: [4]u8 = .{ sa.SOCKADDR_IN_LEN, 0, 0, 0 };
                 if (copy.copyToUser(@ptrFromInt(addr_len_ptr), &al, 4) != 4) return -14;
             }
-            return if (msg_trunc) @as(i64, full_len) else @intCast(to_write);
+            const ret4: i64 = if (msg_trunc) @as(i64, full_len) else @intCast(to_write);
+            udp.movePeekOffset(sock_key, msg_peek, @intCast(ret4));
+            return ret4;
         } else {
             return 0;
         }
@@ -2262,7 +2266,7 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
     // __skb_try_recv_datagram: a pending error is reported once, before any queued datagram (as recvfrom does).
     const pending = udp.takePendingError(port);
     if (pending != 0) return -@as(i64, pending);
-    const wait_rc = udpWaitForDatagram(port, is_v6, @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(d), flags));
+    const wait_rc = udpWaitForDatagram(port, is_v6, @import("../fs/namespace_policy.zig").nonblockRequested(vfs_mod.statusFlagsOf(d), flags), (flags & 0x02) != 0);
     if (wait_rc != 0) return wait_rc;
 
     var data: [1472]u8 = undefined;
@@ -2279,13 +2283,13 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
         big = udp.takeBig6(port, &src6, &src_port, peek, &meta6);
         if (big) |bt| {
             got = bt.len;
-            full = bt.len;
+            full = bt.full;
         } else got = udp.recvFromV6Meta(port, &data, @intCast(data.len), &src6, &src_port, &full, peek, &meta6);
     } else {
         big = udp.takeBig(port, &src4, &src_port, peek, &meta);
         if (big) |bt| {
             got = bt.len;
-            full = bt.len;
+            full = bt.full;
         } else got = udp.recvFromMeta(port, &data, @intCast(data.len), &src4, &src_port, &full, peek, &meta);
     }
     defer if (big) |bt| udp.releaseBig(bt, peek);
@@ -2340,7 +2344,9 @@ fn udpRecvmsg(cur: *task_mod.Task, fd: u32, msg_ptr: u64, msghdr: *const [56]u8,
     var fl: [4]u8 = undefined;
     bo.writeU32Le(&fl, (if (truncated) @as(u32, 0x20) else 0) | (if (cm.truncated) @as(u32, 0x08) else 0));
     _ = copy.copyToUser(@ptrFromInt(msg_ptr + 48), &fl, 4);
-    return if ((flags & 0x20) != 0) @as(i64, full) else @intCast(done);
+    const ret: i64 = if ((flags & 0x20) != 0) @as(i64, full) else @intCast(done);
+    udp.movePeekOffset(port, (flags & 0x02) != 0, @intCast(ret));
+    return ret;
 }
 
 const errq = @import("errqueue_policy.zig");

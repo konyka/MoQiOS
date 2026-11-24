@@ -77,6 +77,8 @@ const UdpEntry = struct {
     meta: ip_cmsg_policy.RecvInfo = .{},
     /// The same for an IPv6 datagram (IPV6_RECVPKTINFO / IPV6_RECVHOPLIMIT / IPV6_RECVTCLASS).
     meta6: ip_cmsg_policy.RecvInfo6 = .{},
+    /// A peek has returned this datagram (skb->peeked): an empty one is then skipped by a peek at an offset.
+    peeked: bool = false,
 };
 
 /// Socket key per slot: the local port in the low 16 bits and a discriminator in the high 16 bits. The discriminator is 0 for the first
@@ -114,6 +116,40 @@ var rx_seq: u64 = 0;
 
 /// Which queued datagrams a reader looks at.
 const Fam = enum { any, v4, v6 };
+
+/// The datagram a receive on slot `port_idx` takes or peeks (udp_lock held), and how far into it the copy starts: the oldest one,
+/// or for a peek under SO_PEEK_OFF the one the offset falls in (hello550; whole datagrams before it are skipped, as
+/// __skb_try_recv_from_queue does).
+const Pick = struct { entry: *UdpEntry, skip: usize };
+fn pickLocked(port_idx: usize, fam: Fam, peek: bool) ?Pick {
+    const sp = @import("sockopt_policy.zig");
+    const off = (if (peek) sp.peekStart(port_opts[port_idx].peek_off) else null) orelse
+        return .{ .entry = oldestLocked(port_idx, fam) orelse return null, .skip = 0 };
+    // sp.udpPeekAt's rule, walked over the queue itself (it can hold QUEUE_MAX entries).
+    var left = off;
+    var it = queues[port_idx].head;
+    while (it) |e| : (it = e.next) {
+        if (fam == .v4 and e.is_v6) continue;
+        if (fam == .v6 and !e.is_v6) continue;
+        const one = [_]usize{e.data_len};
+        const at = sp.udpPeekAt(&one, left, &.{e.peeked}) orelse {
+            left -= e.data_len;
+            continue;
+        };
+        return .{ .entry = e, .skip = at.skip };
+    }
+    return null;
+}
+
+/// After a receive on `port` returned `result` bytes to the caller (the datagram's whole length under MSG_TRUNC): SO_PEEK_OFF moves
+/// forward by it for a peek and back for a read (skb_consume_udp), and stays when negative.
+pub fn movePeekOffset(port: u32, peek: bool, result: usize) void {
+    const saved = udp_lock.acquire();
+    defer udp_lock.release(saved);
+    const i = findPortIdxLocked(port) orelse return;
+    const sp = @import("sockopt_policy.zig");
+    port_opts[i].peek_off = if (peek) sp.peekAdvance(port_opts[i].peek_off, result) else sp.readPullBack(port_opts[i].peek_off, result);
+}
 
 /// The oldest queued datagram of slot `port_idx` of family `fam` (udp_lock held), or null.
 fn oldestLocked(port_idx: usize, fam: Fam) ?*UdpEntry {
@@ -1144,10 +1180,15 @@ fn releaseLocked(port: u32) void {
 
 /// True when a datagram of the given address family is queued for `port`.
 pub fn hasQueuedDatagramFor(port: u32, is_v6: bool) bool {
+    return hasQueuedDatagramForPeek(port, is_v6, false);
+}
+
+/// hasQueuedDatagramFor for a receive that peeks: under SO_PEEK_OFF there has to be a datagram at the offset (hello550).
+pub fn hasQueuedDatagramForPeek(port: u32, is_v6: bool, peek: bool) bool {
     const saved = udp_lock.acquire();
     defer udp_lock.release(saved);
     const port_idx = findPortIdxLocked(port) orelse return false;
-    return oldestLocked(port_idx, if (is_v6) .v6 else .v4) != null;
+    return pickLocked(port_idx, if (is_v6) .v6 else .v4, peek) != null;
 }
 
 /// True when a datagram is queued for `port` (epoll readiness).
@@ -1460,20 +1501,23 @@ pub fn recvFromMeta(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[4]u8,
 
     // J1: lookup and dequeue in one critical section (see enqueue).
     const port_idx = findPortIdxLocked(port) orelse return 0;
-    const entry = oldestLocked(port_idx, .v4) orelse return 0;
-    const n = @min(entry.data_len, out_len);
-    @memcpy(out_buf[0..n], entryBytes(entry)[0..n]);
+    const pick = pickLocked(port_idx, .v4, peek) orelse return 0;
+    const entry = pick.entry;
+    const avail: u16 = @intCast(entry.data_len - pick.skip);
+    const n = @min(avail, out_len);
+    @memcpy(out_buf[0..n], entryBytes(entry)[pick.skip..][0..n]);
     out_src_ip.* = entry.src_ip[0..4].*;
     out_src_port.* = entry.src_port;
-    out_full_len.* = entry.data_len;
+    out_full_len.* = entry.data_len; // MSG_TRUNC reports the whole datagram (ulen), whatever the offset
     out_meta.* = entry.meta;
-    if (!peek) dropEntryLocked(port_idx, entry);
+    if (peek) entry.peeked = true else dropEntryLocked(port_idx, entry);
     return n;
 }
 
 /// A big datagram taken off the queue for copy-out: its buffer stays allocated until releaseBig, so recvfrom / recvmsg can
 /// copy it to the user in pieces without holding udp_lock and without a 64 KiB stack buffer.
-pub const BigTake = struct { buf: *BigBuf, len: u16 };
+/// `len` bytes from `skip` on are copied out; `full` is the whole datagram's length (what MSG_TRUNC reports).
+pub const BigTake = struct { buf: *BigBuf, len: u16, skip: u16 = 0, full: u16 = 0 };
 
 /// The next IPv4 datagram on `port` when it is a big one (recvFromMeta's contract otherwise: src, full length, meta): taken off the
 /// queue unless `peek`; the buffer is pinned for `bigBytes` until releaseBig. Null when the next datagram is not big (or none).
@@ -1482,13 +1526,15 @@ pub fn takeBig(port: u32, out_src_ip: *[4]u8, out_src_port: *u16, peek: bool, ou
     defer udp_lock.release(saved);
     const port_idx = findPortIdxLocked(port) orelse return null;
     {
-        const entry = oldestLocked(port_idx, .v4) orelse return null;
+        const pick = pickLocked(port_idx, .v4, peek) orelse return null;
+        const entry = pick.entry;
         const b = entry.big orelse return null;
         out_src_ip.* = entry.src_ip[0..4].*;
         out_src_port.* = entry.src_port;
         out_meta.* = entry.meta;
-        const t: BigTake = .{ .buf = b, .len = entry.data_len };
+        const t: BigTake = .{ .buf = b, .len = @intCast(entry.data_len - pick.skip), .skip = @intCast(pick.skip), .full = entry.data_len };
         if (peek) {
+            entry.peeked = true;
             b.pinned += 1;
         } else {
             // The buffer leaves the entry; releaseBig frees it.
@@ -1505,13 +1551,15 @@ pub fn takeBig6(port: u32, out_src_ip: *[16]u8, out_src_port: *u16, peek: bool, 
     defer udp_lock.release(saved);
     const port_idx = findPortIdxLocked(port) orelse return null;
     {
-        const entry = oldestLocked(port_idx, .v6) orelse return null;
+        const pick = pickLocked(port_idx, .v6, peek) orelse return null;
+        const entry = pick.entry;
         const b = entry.big orelse return null;
         out_src_ip.* = entry.src_ip;
         out_src_port.* = entry.src_port;
         out_meta6.* = entry.meta6;
-        const t: BigTake = .{ .buf = b, .len = entry.data_len };
+        const t: BigTake = .{ .buf = b, .len = @intCast(entry.data_len - pick.skip), .skip = @intCast(pick.skip), .full = entry.data_len };
         if (peek) {
+            entry.peeked = true;
             b.pinned += 1;
         } else {
             entry.big = null;
@@ -1523,7 +1571,7 @@ pub fn takeBig6(port: u32, out_src_ip: *[16]u8, out_src_port: *u16, peek: bool, 
 
 /// The bytes of a taken big datagram (stable until releaseBig).
 pub fn bigBytes(t: BigTake) []const u8 {
-    return t.buf.bytes()[0..t.len];
+    return t.buf.bytes()[t.skip..][0..t.len];
 }
 
 /// End a takeBig: a consumed datagram's buffer becomes free; a peeked one stays with its entry.
@@ -1555,14 +1603,16 @@ pub fn recvFromV6Meta(port: u32, out_buf: [*]u8, out_len: u16, out_src_ip: *[16]
     defer udp_lock.release(saved);
 
     const port_idx = findPortIdxLocked(port) orelse return 0;
-    if (oldestLocked(port_idx, .v6)) |entry| {
-        const n = @min(entry.data_len, out_len);
-        @memcpy(out_buf[0..n], entry.data[0..n]);
+    if (pickLocked(port_idx, .v6, peek)) |pick| {
+        const entry = pick.entry;
+        const avail: u16 = @intCast(entry.data_len - pick.skip);
+        const n = @min(avail, out_len);
+        @memcpy(out_buf[0..n], entry.data[pick.skip..][0..n]);
         out_src_ip.* = entry.src_ip;
         out_src_port.* = entry.src_port;
         out_full_len.* = entry.data_len;
         out_meta6.* = entry.meta6;
-        if (!peek) dropEntryLocked(port_idx, entry);
+        if (peek) entry.peeked = true else dropEntryLocked(port_idx, entry);
         return n;
     }
     return 0;
