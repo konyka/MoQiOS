@@ -6694,8 +6694,8 @@ fn syscallDnsQueryType(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_arg
     const dp = @import("../../net/dns_policy.zig");
     const out_len: usize = if (v6) 16 else 4;
     if (!copy.validateUserBufferWritable(out_ptr, out_len)) return -14; // EFAULT, before any network wait
-    const timeout_ms = timeout_arg & ~(dp.SERVER6_FLAG | dp.SCOPE6_FLAG | dp.VC_FLAG);
-    const vc = timeout_arg & dp.VC_FLAG != 0;
+    const timeout_ms = timeout_arg & ~dp.ARG_FLAGS;
+    const qf = dp.queryFlags(timeout_arg);
     const server = readDnsServer(server_ptr, timeout_arg) orelse return -22;
     if (server == .fault) return -14;
     if (server == .err) return server.err;
@@ -6717,9 +6717,9 @@ fn syscallDnsQueryType(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_arg
     var ans: da.Answer = .{};
     const dns = @import("../../net/dns.zig");
     const r = if (v6)
-        dns.queryVia6(hp.stripTrailingDot(name), server.ok, timeout_ms * 1_000_000, dnsSleep, &ans, vc)
+        dns.queryVia6(hp.stripTrailingDot(name), server.ok, timeout_ms * 1_000_000, dnsSleep, &ans, qf)
     else
-        dns.queryVia(hp.stripTrailingDot(name), server.ok, timeout_ms * 1_000_000, dnsSleep, &ans, vc);
+        dns.queryVia(hp.stripTrailingDot(name), server.ok, timeout_ms * 1_000_000, dnsSleep, &ans, qf);
     if (r.outcome != .answer) return dp.queryResult(r.outcome);
     if (copy.copyToUser(@ptrFromInt(out_ptr), ans.addrs[0][0..out_len], out_len) != out_len) return -14;
     if (ans_len != 0) {
@@ -6738,8 +6738,8 @@ fn syscallDnsQuery2(name_ptr: u64, server_ptr: u64, timeout_arg: u64, ans_a: u64
     const copy = @import("../../mm/copy_from_user.zig");
     const hp = @import("../../net/hostname_policy.zig");
     const dp = @import("../../net/dns_policy.zig");
-    const timeout_ms = timeout_arg & ~(dp.SERVER6_FLAG | dp.SCOPE6_FLAG | dp.VC_FLAG);
-    const vc = timeout_arg & dp.VC_FLAG != 0;
+    const timeout_ms = timeout_arg & ~dp.ARG_FLAGS;
+    const qf = dp.queryFlags(timeout_arg);
     const server = readDnsServer(server_ptr, timeout_arg) orelse return -22;
     if (server == .fault) return -14;
     if (server == .err) return server.err;
@@ -6761,7 +6761,7 @@ fn syscallDnsQuery2(name_ptr: u64, server_ptr: u64, timeout_arg: u64, ans_a: u64
     const da = @import("../../net/dns_answer.zig");
     var ans4: da.Answer = .{};
     var ans6: da.Answer = .{};
-    const r = @import("../../net/dns.zig").queryPair(hp.stripTrailingDot(name), server.ok, timeout_ms * 1_000_000, dnsSleep, &ans4, &ans6, vc);
+    const r = @import("../../net/dns.zig").queryPair(hp.stripTrailingDot(name), server.ok, timeout_ms * 1_000_000, dnsSleep, &ans4, &ans6, qf);
     var res = [2]i64{ dp.queryResult(r[0]), dp.queryResult(r[1]) };
     const dsts = [2]u64{ ans_a, ans_aaaa };
     const answers = [2]*const da.Answer{ &ans4, &ans6 };
@@ -6826,15 +6826,15 @@ fn syscallDnsPtr(addr_ptr: u64, family: u64, server_ptr: u64, timeout_arg: u64, 
     if (!copy.validateUserBufferWritable(out_ptr, 256)) return -14;
     var addr: [16]u8 = undefined;
     if (copy.copyFromUser(addr[0..alen], @ptrFromInt(addr_ptr), alen) != alen) return -14;
-    const timeout_ms = timeout_arg & ~(dp.SERVER6_FLAG | dp.SCOPE6_FLAG | dp.VC_FLAG);
-    const vc = timeout_arg & dp.VC_FLAG != 0;
+    const timeout_ms = timeout_arg & ~dp.ARG_FLAGS;
+    const qf = dp.queryFlags(timeout_arg);
     const server = readDnsServer(server_ptr, timeout_arg) orelse return -22;
     if (server == .fault) return -14;
     if (server == .err) return server.err;
     if (!dp.timeoutValid(timeout_ms)) return -22;
     const da = @import("../../net/dns_answer.zig");
     var ans: da.Answer = .{};
-    const r = @import("../../net/dns.zig").queryPtr(addr[0..alen], server.ok, timeout_ms * 1_000_000, dnsSleep, &ans, vc);
+    const r = @import("../../net/dns.zig").queryPtr(addr[0..alen], server.ok, timeout_ms * 1_000_000, dnsSleep, &ans, qf);
     if (r.outcome != .answer) return dp.queryResult(r.outcome);
     const name = ans.canonName();
     var nb: [256]u8 = undefined;

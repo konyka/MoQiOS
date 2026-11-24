@@ -52,6 +52,36 @@ pub const SCOPE6_FLAG: u64 = 0x4000_0000;
 /// Bit 29: ask only over TCP, with no UDP query first (/etc/resolv.conf "options use-vc"; glibc 2.44 sends no UDP then, measured).
 pub const VC_FLAG: u64 = 0x2000_0000;
 
+/// Bit 28: every query carries an EDNS(0) OPT record (/etc/resolv.conf "options edns0"; glibc 2.44 adds it to UDP and TCP queries
+/// alike, measured).
+pub const EDNS0_FLAG: u64 = 0x1000_0000;
+
+/// Every flag bit of the timeout argument; the limit is what is left.
+pub const ARG_FLAGS: u64 = SERVER6_FLAG | SCOPE6_FLAG | VC_FLAG | EDNS0_FLAG;
+
+/// The resolv.conf options a query carries in its timeout argument.
+pub const QueryFlags = struct { vc: bool = false, edns0: bool = false };
+
+pub fn queryFlags(timeout_arg: u64) QueryFlags {
+    return .{ .vc = timeout_arg & VC_FLAG != 0, .edns0 = timeout_arg & EDNS0_FLAG != 0 };
+}
+
+/// The UDP payload size glibc 2.44 advertises in its OPT record (measured: 0x04b0).
+pub const EDNS_UDP_SIZE: u16 = 1200;
+
+/// Append the OPT record of "options edns0" to the `len`-byte query in `pkt` (RFC 6891 6.1.2: root owner, TYPE 41, CLASS the UDP
+/// payload size, TTL 0 for extended RCODE, version 0 and no DO bit, no options) and count it in ARCOUNT, as glibc 2.44 sends it
+/// (measured). The new length; `len` unchanged when the record does not fit.
+pub fn appendOpt(pkt: []u8, len: usize) usize {
+    if (len < 12 or len + 11 > pkt.len) return len;
+    const rec = [11]u8{ 0, 0, 41, @intCast(EDNS_UDP_SIZE >> 8), @intCast(EDNS_UDP_SIZE & 0xff), 0, 0, 0, 0, 0, 0 };
+    @memcpy(pkt[len..][0..11], &rec);
+    const ar = (@as(u16, pkt[10]) << 8 | pkt[11]) + 1;
+    pkt[10] = @intCast(ar >> 8);
+    pkt[11] = @intCast(ar & 0xff);
+    return len + 11;
+}
+
 /// Whether a scoped IPv6 server can be asked: a link-local one only through the NIC (interface 2 while it is up, the only interface
 /// with a link-local address); glibc 2.44 fails such a server at once otherwise (measured), here -ENETUNREACH. Any other address
 /// ignores the scope.

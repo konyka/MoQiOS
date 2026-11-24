@@ -59,8 +59,8 @@ long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, lo
             memcpy(&v, (const unsigned char *)a3 + 16, 4);
             snprintf(sc, sizeof sc, "%%%u", v);
         }
-        int w = snprintf(q_log + l, sizeof q_log - l, "ptr%ld:%u@%s%u%s%s;", a2, last, six ? "v" : "", six ? ((const unsigned char *)a3)[15] : ((const unsigned char *)a3)[3], sc,
-                         (a4 & 0x20000000L) ? "/tcp" : "");
+        int w = snprintf(q_log + l, sizeof q_log - l, "ptr%ld:%u@%s%u%s%s%s;", a2, last, six ? "v" : "", six ? ((const unsigned char *)a3)[15] : ((const unsigned char *)a3)[3], sc,
+                         (a4 & 0x20000000L) ? "/tcp" : "", (a4 & 0x10000000L) ? "/e" : "");
         (void)w;
         (void)a4;
         if (r == 0) {
@@ -78,8 +78,8 @@ long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, lo
         size_t l2 = strlen(q_log);
         const unsigned char *sv = (const unsigned char *)a2;
         int six2 = (a3 & 0x80000000L) != 0;
-        snprintf(q_log + l2, sizeof q_log - l2, "%s/2@%s%u/%ld%s;", (const char *)a1, six2 ? "v" : "", (six2 ? sv[15] : sv[3]) % 10,
-                 (a3 & 0x1fffffffL) / 1000, (a3 & 0x20000000L) ? "/tcp" : "");
+        snprintf(q_log + l2, sizeof q_log - l2, "%s/2@%s%u/%ld%s%s;", (const char *)a1, six2 ? "v" : "", (six2 ? sv[15] : sv[3]) % 10,
+                 (a3 & 0x0fffffffL) / 1000, (a3 & 0x20000000L) ? "/tcp" : "", (a3 & 0x10000000L) ? "/e" : "");
         long rr[2] = {ra, rb};
         unsigned char *dst[2] = {(unsigned char *)a4, (unsigned char *)a5};
         for (int k = 0; k < 2; k++) {
@@ -101,7 +101,7 @@ long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, lo
     const char *name = (const char *)a1;
     const unsigned char *srv = (const unsigned char *)a3;
     size_t k = strlen(name);
-    if (l + k + 18 < sizeof q_log) {
+    if (l + k + 24 < sizeof q_log) {
         memcpy(q_log + l, name, k);
         l += k;
         if (nr == SYS_dns_query6) { q_log[l++] = '/'; q_log[l++] = '6'; }
@@ -117,10 +117,11 @@ long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, lo
             l += (size_t)snprintf(q_log + l, sizeof q_log - l, "%%%u", v);
         }
         q_log[l++] = '/';
-        long ms = (a4 & 0x1fffffffL) / 1000;
+        long ms = (a4 & 0x0fffffffL) / 1000;
         if (ms >= 10) q_log[l++] = (char)('0' + ms / 10 % 10);
         q_log[l++] = (char)('0' + ms % 10);
         if (a4 & 0x20000000L) { memcpy(q_log + l, "/tcp", 4); l += 4; }
+        if (a4 & 0x10000000L) { memcpy(q_log + l, "/e", 2); l += 2; }
         q_log[l++] = ';';
         q_log[l] = 0;
     }
@@ -1320,6 +1321,39 @@ int main(void) {
         uint8_t pa[4] = {10, 2, 3, 4};
         q_script(vc, ok, 1);
         assert(gethostbyaddr(pa, 4, AF_INET) && strcmp(q_log, "ptr2:4@1/tcp;") == 0);
+        moqi_test_resolv_conf = (const char *)0;
+    }
+
+    /* hello542: "options edns0" (glibc 2.44, measured; matched by its first 5 characters, "edns" is not it): every query carries
+     * an OPT record: bit 28 of the timeout argument of 507, 509, 510 and 508, logged as "/e". */
+    {
+        static const char ed[] = "nameserver 10.0.0.1\noptions attempts:1 edns0\n";
+        static const char edx[] = "nameserver 10.0.0.1\noptions attempts:1 timeout:3 edns0x\n";
+        static const char noted[] = "nameserver 10.0.0.1\noptions attempts:1 edns\n";
+        static const long ok[] = {0}, ok2[] = {0, 0};
+        uint8_t a4[4];
+        q_script(ed, ok, 1);
+        assert(gethostbyname_ipv4("e.test", a4) == 0 && strcmp(q_log, "e.test@1/5/e;") == 0);
+        q_script(edx, ok, 1);
+        assert(gethostbyname_ipv4("e.test", a4) == 0 && strcmp(q_log, "e.test@1/3/e;") == 0);
+        q_script(noted, ok, 1);
+        assert(gethostbyname_ipv4("e.test", a4) == 0 && strcmp(q_log, "e.test@1/5;") == 0);
+        q_script("nameserver 10.0.0.1\noptions attempts:1 edns0 use-vc\n", ok, 1);
+        assert(gethostbyname_ipv4("e.test", a4) == 0 && strcmp(q_log, "e.test@1/5/tcp/e;") == 0);
+        q_script(ed, ok, 1);
+        assert(gethostbyname2("e.test", AF_INET6) && strcmp(q_log, "e.test/6@1/5/e;") == 0);
+        struct addrinfo hints, *res = (struct addrinfo *)0;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_socktype = SOCK_STREAM;
+        q_script(ed, ok2, 2);
+        assert(getaddrinfo("e.test", 0, &hints, &res) == 0 && strcmp(q_log, "e.test/2@1/5/e;") == 0);
+        freeaddrinfo(res);
+        q_script("nameserver 10.0.0.1\noptions attempts:1 edns0 single-request\n", ok2, 2);
+        assert(getaddrinfo("e.test", 0, &hints, &res) == 0 && strcmp(q_log, "e.test@1/5/e;e.test/6@1/5/e;") == 0);
+        freeaddrinfo(res);
+        uint8_t pa[4] = {10, 2, 3, 4};
+        q_script(ed, ok, 1);
+        assert(gethostbyaddr(pa, 4, AF_INET) && strcmp(q_log, "ptr2:4@1/e;") == 0);
         moqi_test_resolv_conf = (const char *)0;
     }
 

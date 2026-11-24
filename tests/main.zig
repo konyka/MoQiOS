@@ -18382,10 +18382,10 @@ test "dns_query (507): a reply's RCODE and answers decide the outcome, and the w
     try std.testing.expect(std.mem.indexOf(u8, se, "if (ans_len != 0 and ans_len < 256) return -34; // ERANGE") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "const n = da.encode(&ans, enc[0..@intCast(@min(ans_len, enc.len))]) orelse return -90; // EMSGSIZE") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "if (!dp.timeoutValid(timeout_ms)) return -22;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, se, "const timeout_ms = timeout_arg & ~(dp.SERVER6_FLAG | dp.SCOPE6_FLAG | dp.VC_FLAG);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, se, "dns.queryVia(hp.stripTrailingDot(name), server.ok, timeout_ms * 1_000_000, dnsSleep, &ans, vc);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "const timeout_ms = timeout_arg & ~dp.ARG_FLAGS;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "dns.queryVia(hp.stripTrailingDot(name), server.ok, timeout_ms * 1_000_000, dnsSleep, &ans, qf);") != null);
     const dns = kt.dns_source;
-    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryVia(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, vc: bool) Result {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryVia(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qf: dns_policy.QueryFlags) Result {") != null);
     // hello520: answers with no address for the name (only a CNAME, or records for other owners) are NO_RECOVERY in glibc, so the
     // kernel reports them as `failed`; NODATA is only NOERROR without answers.
     try std.testing.expect(std.mem.indexOf(u8, dns, "if (!dns_answer.parseType(msg, hostname, qtype, ans)) return .{ .outcome = .failed };") != null);
@@ -18672,7 +18672,7 @@ test "dns_answer.parsePtr: the names a PTR reply gives for an address, after its
     const se = kt.syscall_entry_source;
     try std.testing.expect(std.mem.indexOf(u8, se, "508 => { // dns_ptr(addr, family, server4, timeout_ms, name_out, name_len)") != null);
     const dns = kt.dns_source;
-    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryPtr(addr: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, vc: bool) Result {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryPtr(addr: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qf: dns_policy.QueryFlags) Result {") != null);
 }
 
 test "a DNS reply over 512 bytes is read whole, and up to 64 addresses and 16 aliases are kept (glibc 2.44 took 60 and 12, measured) (hello523)" {
@@ -18737,8 +18737,8 @@ test "a DNS reply with TC set is not used: the query is asked again over TCP to 
     try std.testing.expectEqual(@as(i64, -11), dp.queryResult(.tcp_failed));
     // Wiring: queryType retries over TCP on a truncated reply, for A and PTR alike; the TCP wait uses the same limit and yield.
     const dns = kt.dns_source;
-    try std.testing.expect(std.mem.indexOf(u8, dns, "if (r.outcome == .truncated) return queryTcp(hostname, dns_server, timeout_ns, yield, ans, qtype);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, dns, "fn queryTcp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16) Result {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "if (r.outcome == .truncated) return queryTcp(hostname, dns_server, timeout_ns, yield, ans, qtype, qf.edns0);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "fn queryTcp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16, edns0: bool) Result {") != null);
 }
 
 test "a DNS reply over TCP may be as long as its 2-byte length says, up to 65535 bytes (glibc 2.44, measured) (hello539)" {
@@ -18763,13 +18763,45 @@ test "resolv.conf options use-vc asks every query over TCP, without a UDP query 
     try std.testing.expect(dp.VC_FLAG > dp.MAX_QUERY_TIMEOUT_MS);
     // Wiring: the four system calls strip the bit from the limit and pass it on; a query with it goes straight to TCP.
     const se = kt.syscall_entry_source;
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, se, "const timeout_ms = timeout_arg & ~(dp.SERVER6_FLAG | dp.SCOPE6_FLAG | dp.VC_FLAG);"));
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, se, "const vc = timeout_arg & dp.VC_FLAG != 0;"));
-    try std.testing.expect(std.mem.indexOf(u8, se, "dnsSleep, &ans4, &ans6, vc);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, se, "queryPtr(addr[0..alen], server.ok, timeout_ms * 1_000_000, dnsSleep, &ans, vc);") != null);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, se, "const timeout_ms = timeout_arg & ~dp.ARG_FLAGS;"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, se, "const qf = dp.queryFlags(timeout_arg);"));
+    try std.testing.expect(std.mem.indexOf(u8, se, "dnsSleep, &ans4, &ans6, qf);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "queryPtr(addr[0..alen], server.ok, timeout_ms * 1_000_000, dnsSleep, &ans, qf);") != null);
     const dns = kt.dns_source;
-    try std.testing.expect(std.mem.indexOf(u8, dns, "if (vc) return queryTcp(hostname, dns_server, timeout_ns, yield, ans, qtype);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, dns, "if (vc) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "if (qf.vc) return queryTcp(hostname, dns_server, timeout_ns, yield, ans, qtype, qf.edns0);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "if (qf.vc) {") != null);
+}
+
+test "resolv.conf options edns0 appends an OPT record with a 1200-byte UDP size to every query (glibc 2.44, measured) (hello542)" {
+    const dp = kt.dns_policy;
+    // Bit 28 of the timeout argument of dns_query, dns_query6, dns_query2 and dns_ptr; apart from the other flags and the limit.
+    try std.testing.expectEqual(@as(u64, 0x1000_0000), dp.EDNS0_FLAG);
+    try std.testing.expect(dp.EDNS0_FLAG & (dp.SERVER6_FLAG | dp.SCOPE6_FLAG | dp.VC_FLAG) == 0);
+    try std.testing.expect(dp.EDNS0_FLAG > dp.MAX_QUERY_TIMEOUT_MS);
+    try std.testing.expectEqual(dp.SERVER6_FLAG | dp.SCOPE6_FLAG | dp.VC_FLAG | dp.EDNS0_FLAG, dp.ARG_FLAGS);
+    try std.testing.expectEqual(dp.QueryFlags{ .vc = true, .edns0 = false }, dp.queryFlags(dp.VC_FLAG | 5000));
+    try std.testing.expectEqual(dp.QueryFlags{ .vc = false, .edns0 = true }, dp.queryFlags(dp.EDNS0_FLAG | dp.SERVER6_FLAG | 5000));
+    try std.testing.expectEqual(dp.QueryFlags{}, dp.queryFlags(5000));
+    // The query glibc sends for probe.test A with edns0 (measured): the question, then the OPT record, arcount 1.
+    var pkt: [64]u8 = @splat(0xaa);
+    const q = [_]u8{ 0xa4, 0xdb, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 5, 'p', 'r', 'o', 'b', 'e', 4, 't', 'e', 's', 't', 0, 0, 1, 0, 1 };
+    @memcpy(pkt[0..q.len], &q);
+    const n = dp.appendOpt(&pkt, q.len);
+    const want = q[0..11] ++ [_]u8{1} ++ q[12..] ++ [_]u8{ 0, 0, 0x29, 0x04, 0xb0, 0, 0, 0, 0, 0, 0 };
+    try std.testing.expectEqual(@as(usize, 39), n);
+    try std.testing.expectEqualSlices(u8, want, pkt[0..n]);
+    // No room: the query is left as it was.
+    var small: [30]u8 = undefined;
+    @memcpy(small[0..q.len], &q);
+    try std.testing.expectEqual(@as(usize, q.len), dp.appendOpt(&small, q.len));
+    try std.testing.expectEqual(@as(u8, 0), small[11]);
+    // Wiring: the four system calls strip every flag from the limit and pass both options on; every query builder takes edns0.
+    const se = kt.syscall_entry_source;
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, se, "const timeout_ms = timeout_arg & ~dp.ARG_FLAGS;"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, se, "const qf = dp.queryFlags(timeout_arg);"));
+    const dns = kt.dns_source;
+    try std.testing.expect(std.mem.indexOf(u8, dns, "if (edns0) len = dns_policy.appendOpt(pkt, len);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "fn buildQuery(pkt: []u8, hostname: []const u8, qtype: u16, query_id: u16, edns0: bool) usize {") != null);
 }
 
 test "AAAA answers: dns_answer reads type-28 records of 16 bytes for an AAAA query, A records for an A query (hello525)" {
@@ -18823,7 +18855,7 @@ test "AAAA answers: dns_answer reads type-28 records of 16 bytes for an AAAA que
     const se = kt.syscall_entry_source;
     try std.testing.expect(std.mem.indexOf(u8, se, "509 => { // dns_query6(name, out16, server4, timeout_ms, ans, ans_len)") != null);
     const dns = kt.dns_source;
-    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryVia6(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, vc: bool) Result {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryVia6(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qf: dns_policy.QueryFlags) Result {") != null);
 }
 
 test "an IPv6 nameserver: dns_query/dns_query6/dns_ptr take a 16-byte server when bit 31 of timeout_ms is set (hello526)" {
@@ -18957,7 +18989,7 @@ test "dns_query/dns_query6/dns_ptr take a scoped IPv6 nameserver: a link-local o
     // Wiring: the three system calls strip both flags from the limit, and readDnsServer reads the scope and checks it before any
     // network wait.
     const se = kt.syscall_entry_source;
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, se, "const timeout_ms = timeout_arg & ~(dp.SERVER6_FLAG | dp.SCOPE6_FLAG | dp.VC_FLAG);")); // with dns_query2 (hello530)
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, se, "const timeout_ms = timeout_arg & ~dp.ARG_FLAGS;")); // with dns_query2 (hello530)
     try std.testing.expect(std.mem.indexOf(u8, se, "const e = dp.scopedServerErrno(s6, scope, @import(\"../../net/nic.zig\").isActive());") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "if (timeout_arg & dp.SCOPE6_FLAG != 0 and timeout_arg & dp.SERVER6_FLAG == 0) return null;") != null);
 }
@@ -18994,6 +19026,6 @@ test "dns_query2 (510): an AF_UNSPEC lookup's A and AAAA queries leave together,
     try std.testing.expect(std.mem.indexOf(u8, se, "510 => { // dns_query2(name, server, timeout_ms, ans_a, ans_aaaa, ans_len)") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "if (ans_len < 256) return -34; // ERANGE") != null);
     const dns = kt.dns_source;
-    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryPair(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans4: *dns_answer.Answer, ans6: *dns_answer.Answer, vc: bool) [2]dns_policy.Outcome {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryPair(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans4: *dns_answer.Answer, ans6: *dns_answer.Answer, qf: dns_policy.QueryFlags) [2]dns_policy.Outcome {") != null);
     try std.testing.expect(std.mem.indexOf(u8, dns, "const ids = [2]u16{ newQueryId(), newQueryId() };") != null);
 }
