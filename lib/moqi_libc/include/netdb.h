@@ -335,12 +335,14 @@ const char *gai_strerror(int code);
 #define NI_MAXSERV 32
 
 /* Turn a 16-byte sockaddr_in or a 28-byte sockaddr_in6 into text. `host` and `serv` are optional: NULL or a zero length
- * means "do not return that part". The host is the first name of the /etc/hosts line with the address (::ffff:a.b.c.d is
- * looked up as a.b.c.d), else "localhost" for 127.0.0.1 and ::1, else the numeric form (there is no reverse DNS): dotted
+ * means "do not return that part". The host is the first name gethostbyaddr finds through the nsswitch.conf sources (the
+ * /etc/hosts line with the address, ::ffff:a.b.c.d looked up as a.b.c.d, or a PTR query), else the numeric form: dotted
  * decimal, or inet_ntop text with "%N" for a non-zero sin6_scope_id. NI_NUMERICHOST forces the numeric form and NI_NAMEREQD
  * turns "no name" into EAI_NONAME. The service is a known name (see getaddrinfo) unless NI_NUMERICSERV, else the decimal
- * port. NI_NOFQDN, NI_DGRAM and the IDN bits (0x20, 0x40, 0x80) are accepted and change nothing; any other bit is
- * EAI_BADFLAGS. A NULL address, a short one (< 16 bytes for AF_INET, < 28 for AF_INET6) or another family is EAI_FAMILY; a
+ * port. NI_NOFQDN cuts a found name before ".domain" when the local domain's first occurrence in it follows a dot; the domain
+ * (glibc's nrl_domainname) is what follows the first dot of the first dotted name among localhost's name, the host name, the host
+ * name's name and 127.0.0.1's name, found once per process. NI_DGRAM and the IDN bits (0x20, 0x40, 0x80) are accepted and change
+ * nothing; any other bit is EAI_BADFLAGS. A NULL address, a short one (< 16 bytes for AF_INET, < 28 for AF_INET6) or another family is EAI_FAMILY; a
  * buffer too small for the text plus its NUL is EAI_OVERFLOW. The host is written before the service is looked at.
  * Returns 0 or an EAI_* code. */
 int getnameinfo(const uint8_t *sa, unsigned int salen, char *host, unsigned int hostlen, char *serv,

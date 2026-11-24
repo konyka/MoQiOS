@@ -2431,6 +2431,71 @@ static int copy_text(char *dst, unsigned int dst_len, const char *text) {
     return 0;
 }
 
+/* NI_NOFQDN's local domain (glibc 2.44 nrl_domainname, measured): what follows the first dot of the first dotted name among
+ * localhost's name, the host name, the host name's name and 127.0.0.1's name, looked up through the nsswitch.conf sources. It is
+ * found once per process, the first time NI_NOFQDN names an address, and kept, even when empty ("localhost." gives ""). */
+#ifdef MOQI_HOST_TEST_SYSCALL
+extern const char *moqi_test_hostname;
+static int nofqdn_hostname(char *buf, size_t cap) {
+    if (!moqi_test_hostname || strlen(moqi_test_hostname) + 1 > cap) return -1;
+    memcpy(buf, moqi_test_hostname, strlen(moqi_test_hostname) + 1);
+    return 0;
+}
+#else
+#include "../include/sysinfo.h"
+static int nofqdn_hostname(char *buf, size_t cap) { return gethostname(buf, cap); }
+#endif
+static int nofqdn_known, nofqdn_have;
+static char nofqdn_domain[256];
+#ifdef MOQI_HOST_TEST_SYSCALL
+void moqi_test_nofqdn_reset(void) { nofqdn_known = nofqdn_have = 0; }
+#endif
+
+/* Whether the first name of an answer has a dot; if so its tail becomes the domain. */
+static int nofqdn_take(const struct host_answer *ans) {
+    if (!ans->names) return 0;
+    size_t k = 0;
+    while (k < ans->names_len && ans->names[k] != ' ' && ans->names[k] != '\t' && ans->names[k] != '.') k++;
+    if (k >= ans->names_len || ans->names[k] != '.') return 0;
+    size_t e = ++k;
+    while (e < ans->names_len && ans->names[e] != ' ' && ans->names[e] != '\t') e++;
+    if (e - k >= sizeof nofqdn_domain) e = k + sizeof nofqdn_domain - 1;
+    memcpy(nofqdn_domain, ans->names + k, e - k);
+    nofqdn_domain[e - k] = 0;
+    nofqdn_have = 1;
+    return 1;
+}
+
+static void nofqdn_find(void) {
+    nofqdn_known = 1;
+    struct host_answer ans;
+    lookup_name("localhost", AF_INET, etc_hosts_buf, sizeof etc_hosts_buf, &ans);
+    if (nofqdn_take(&ans)) return;
+    char hn[256];
+    if (nofqdn_hostname(hn, sizeof hn) == 0) {
+        const char *dot = strchr(hn, '.');
+        if (dot) {
+            size_t n = strlen(dot + 1);
+            memcpy(nofqdn_domain, dot + 1, n + 1);
+            nofqdn_have = 1;
+            return;
+        }
+        lookup_name(hn, AF_INET, etc_hosts_buf, sizeof etc_hosts_buf, &ans);
+        if (nofqdn_take(&ans)) return;
+    }
+    static const uint8_t loopback[4] = {127, 0, 0, 1};
+    lookup_addr(loopback, 4, AF_INET, etc_hosts_buf, sizeof etc_hosts_buf, &ans);
+    nofqdn_take(&ans);
+}
+
+/* Cut `name` before ".domain" when the domain's first occurrence in it follows a dot. */
+static void nofqdn_cut(char *name) {
+    if (!nofqdn_known) nofqdn_find();
+    if (!nofqdn_have) return;
+    char *c = strstr(name, nofqdn_domain);
+    if (c && c != name && c[-1] == '.') c[-1] = 0;
+}
+
 int getnameinfo(const uint8_t *sa, unsigned int salen, char *host, unsigned int hostlen, char *serv,
                 unsigned int servlen, int flags) {
     if ((unsigned int)flags & ~(unsigned int)NI_KNOWN_FLAGS) return EAI_BADFLAGS;
@@ -2457,6 +2522,7 @@ int getnameinfo(const uint8_t *sa, unsigned int salen, char *host, unsigned int 
                     memcpy(found, ans.names, k);
                     found[k] = 0;
                     text = found;
+                    if (flags & NI_NOFQDN) nofqdn_cut(found);
                 }
             } else if (ans.herr == NETDB_INTERNAL) {
                 return EAI_SYSTEM;

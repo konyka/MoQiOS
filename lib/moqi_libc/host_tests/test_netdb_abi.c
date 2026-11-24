@@ -33,6 +33,9 @@ const char *moqi_test_resolv_conf;
 /* /etc/nsswitch.conf and /etc/hosts for netdb.c (NULL: no file). */
 const char *moqi_test_nsswitch_conf;
 const char *moqi_test_etc_hosts;
+/* The host name gethostname gives netdb.c (NULL: it fails), and the reset of the NI_NOFQDN domain netdb.c keeps per process. */
+const char *moqi_test_hostname = "moqios";
+void moqi_test_nofqdn_reset(void);
 unsigned moqi_test_rotate_seed = 1;
 static long q_reply[32];
 static int q_n, q_calls;
@@ -2612,7 +2615,8 @@ int main(void) {
         assert(getnameinfo(sa, 16, host, 4, serv, sizeof(serv), 0) == EAI_OVERFLOW && serv[0] == 'S');
         ipv4_sockaddr(gw, 80, sa);
 
-        /* Flags: NOFQDN and the IDN bits are accepted and change nothing; bits glibc rejects are EAI_BADFLAGS. */
+        /* Flags: NOFQDN (nothing to cut in a numeric answer, see hello545 below) and the IDN bits are accepted and change nothing;
+         * bits glibc rejects are EAI_BADFLAGS. */
         ipv4_sockaddr(gw, 80, sa);
         {
             static const int ok[] = {NI_NOFQDN, 0x20, 0x40, 0x80, NI_DGRAM};
@@ -2685,6 +2689,76 @@ int main(void) {
         assert(strcmp(gai_strerror(EAI_OVERFLOW), "Result too large for supplied buffer") == 0);
         assert(strcmp(gai_strerror(-11), "System error") == 0);
         assert(strcmp(gai_strerror(-13), "Unknown error") == 0);
+    }
+    /* hello545: NI_NOFQDN (glibc 2.44 nrl_domainname, measured). The local domain is what follows the first dot of the first dotted
+     * name among: localhost's name, the host name, the host name's name, 127.0.0.1's name. It is found once per process, the first
+     * time NI_NOFQDN names an address, and kept. A name is cut before ".domain" only when the domain's first occurrence in it
+     * follows a dot (so not the domain itself); case matters. */
+    {
+        uint8_t sa[16];
+        char host[64];
+        static const uint8_t w1[4] = {10, 1, 1, 1}, w2[4] = {10, 1, 1, 2}, w3[4] = {10, 1, 1, 3}, w4[4] = {10, 1, 1, 4},
+                             w5[4] = {10, 1, 1, 5}, w6[4] = {10, 1, 1, 6}, w9[4] = {10, 1, 1, 9};
+#define NOFQDN(a, len, fl) (ipv4_sockaddr((a), 0, sa), getnameinfo(sa, 16, host, (len), (char *)0, 0, (fl)))
+        moqi_test_resolv_conf = (const char *)0;
+        moqi_test_nsswitch_conf = "hosts: files\n";
+        moqi_test_hostname = "myhost";
+        moqi_test_nofqdn_reset();
+        moqi_test_etc_hosts = "127.0.0.1 localhost.lan.test localhost\n10.1.1.1 web.lan.test web\n10.1.1.2 web.other.test\n"
+                              "10.1.1.3 x.lan.testing\n10.1.1.4 lan.test\n10.1.1.5 a.b.lan.test\n10.1.1.6 Web.LAN.test\n";
+        assert(NOFQDN(w1, sizeof host, 0) == 0 && strcmp(host, "web.lan.test") == 0);
+        assert(NOFQDN(w1, sizeof host, NI_NOFQDN) == 0 && strcmp(host, "web") == 0);
+        assert(NOFQDN(w1, 4, NI_NOFQDN) == 0 && strcmp(host, "web") == 0);
+        assert(NOFQDN(w2, sizeof host, NI_NOFQDN) == 0 && strcmp(host, "web.other.test") == 0);
+        assert(NOFQDN(w2, 4, NI_NOFQDN) == EAI_OVERFLOW);
+        assert(NOFQDN(w3, sizeof host, NI_NOFQDN) == 0 && strcmp(host, "x") == 0);
+        assert(NOFQDN(w4, sizeof host, NI_NOFQDN) == 0 && strcmp(host, "lan.test") == 0);
+        assert(NOFQDN(w5, sizeof host, NI_NOFQDN) == 0 && strcmp(host, "a.b") == 0);
+        assert(NOFQDN(w6, sizeof host, NI_NOFQDN) == 0 && strcmp(host, "Web.LAN.test") == 0);
+        /* Kept: a later /etc/hosts does not change it. */
+        moqi_test_etc_hosts = "127.0.0.1 localhost.two.test\n10.1.1.1 web.one.test\n10.1.1.2 web.two.test\n";
+        assert(NOFQDN(w2, sizeof host, NI_NOFQDN) == 0 && strcmp(host, "web.two.test") == 0);
+        /* Not found before a name: a numeric answer, or an address without a name, does not look for it. */
+        moqi_test_nofqdn_reset();
+        moqi_test_etc_hosts = "127.0.0.1 localhost.one.test\n10.1.1.1 web.one.test\n10.1.1.2 web.two.test\n";
+        assert(NOFQDN(w1, sizeof host, NI_NOFQDN | NI_NUMERICHOST) == 0 && strcmp(host, "10.1.1.1") == 0);
+        assert(NOFQDN(w9, sizeof host, NI_NOFQDN) == 0 && strcmp(host, "10.1.1.9") == 0);
+        moqi_test_etc_hosts = "127.0.0.1 localhost.two.test\n10.1.1.1 web.one.test\n10.1.1.2 web.two.test\n";
+        assert(NOFQDN(w2, sizeof host, NI_NOFQDN) == 0 && strcmp(host, "web") == 0);
+        assert(NOFQDN(w1, sizeof host, NI_NOFQDN) == 0 && strcmp(host, "web.one.test") == 0);
+        /* The host name's own dot. */
+        moqi_test_nofqdn_reset();
+        moqi_test_hostname = "me.dom.test";
+        moqi_test_etc_hosts = "127.0.0.1 localhost\n10.1.1.1 web.dom.test\n";
+        assert(NOFQDN(w1, sizeof host, NI_NOFQDN) == 0 && strcmp(host, "web") == 0);
+        /* The host name's name. */
+        moqi_test_nofqdn_reset();
+        moqi_test_hostname = "me";
+        moqi_test_etc_hosts = "127.0.0.1 localhost\n10.1.1.9 me.hd.test me\n10.1.1.1 web.hd.test\n";
+        assert(NOFQDN(w1, sizeof host, NI_NOFQDN) == 0 && strcmp(host, "web") == 0);
+        /* 127.0.0.1's name, when nothing names localhost; the first line for 127.0.0.1 decides. */
+        moqi_test_nofqdn_reset();
+        moqi_test_etc_hosts = "127.0.0.1 lo.rv.test\n10.1.1.1 web.rv.test\n";
+        assert(NOFQDN(w1, sizeof host, NI_NOFQDN) == 0 && strcmp(host, "web") == 0);
+        moqi_test_nofqdn_reset();
+        moqi_test_etc_hosts = "127.0.0.1 localhost\n127.0.0.1 lo.rv.test\n10.1.1.1 web.rv.test\n";
+        assert(NOFQDN(w1, sizeof host, NI_NOFQDN) == 0 && strcmp(host, "web.rv.test") == 0);
+        /* No domain anywhere, an empty one ("localhost."), and the first occurrence only. */
+        moqi_test_nofqdn_reset();
+        moqi_test_etc_hosts = "127.0.0.1 localhost\n10.1.1.1 web.none.test\n";
+        assert(NOFQDN(w1, sizeof host, NI_NOFQDN) == 0 && strcmp(host, "web.none.test") == 0);
+        moqi_test_nofqdn_reset();
+        moqi_test_etc_hosts = "127.0.0.1 localhost. localhost\n10.1.1.1 web.x.test\n";
+        assert(NOFQDN(w1, sizeof host, NI_NOFQDN) == 0 && strcmp(host, "web.x.test") == 0);
+        moqi_test_nofqdn_reset();
+        moqi_test_etc_hosts = "127.0.0.1 localhost.a.test\n10.1.1.1 xa.test.a.test\n10.1.1.2 b.a.test.x\n";
+        assert(NOFQDN(w1, sizeof host, NI_NOFQDN) == 0 && strcmp(host, "xa.test.a.test") == 0);
+        assert(NOFQDN(w2, sizeof host, NI_NOFQDN) == 0 && strcmp(host, "b") == 0);
+#undef NOFQDN
+        moqi_test_nofqdn_reset();
+        moqi_test_hostname = "moqios";
+        moqi_test_etc_hosts = (const char *)0;
+        moqi_test_nsswitch_conf = (const char *)0;
     }
     /* Every list that getaddrinfo built was released: nothing leaked, nothing freed twice. */
     assert(live_allocs == 0);
