@@ -1004,6 +1004,18 @@ static size_t nss_parse_list(const char *t, size_t i, size_t b, struct nss_sourc
     return n;
 }
 
+/* The offset just past "hosts:" when text[pos, end) is a hosts line, else 0. */
+static size_t nss_hosts_line(const char *text, size_t pos, size_t end) {
+    size_t i = pos;
+    while (i < end && nss_space(text[i])) i++;
+    size_t w = i;
+    while (i < end && !nss_space(text[i]) && text[i] != ':') i++;
+    size_t wl = i - w;
+    while (i < end && nss_space(text[i])) i++;
+    if (i < end && text[i] == ':' && wl == 5 && memcmp(text + w, "hosts", 5) == 0) return i + 1;
+    return 0;
+}
+
 size_t nsswitch_hosts(const char *text, size_t len, struct nss_source *out, size_t cap) {
     if (!out || cap == 0) return 0;
     size_t found_a = 0, found_b = 0;
@@ -1011,15 +1023,10 @@ size_t nsswitch_hosts(const char *text, size_t len, struct nss_source *out, size
     for (size_t pos = 0; text && pos < len;) {
         size_t end = pos;
         while (end < len && text[end] != '\n') end++;
-        size_t i = pos;
-        while (i < end && nss_space(text[i])) i++;
-        size_t w = i;
-        while (i < end && !nss_space(text[i]) && text[i] != ':') i++;
-        size_t wl = i - w;
-        while (i < end && nss_space(text[i])) i++;
-        if (i < end && text[i] == ':' && wl == 5 && memcmp(text + w, "hosts", 5) == 0) {
+        size_t a = nss_hosts_line(text, pos, end);
+        if (a) {
             found = 1;
-            found_a = i + 1;
+            found_a = a;
             found_b = end;
         }
         pos = end + 1;
@@ -1038,34 +1045,63 @@ size_t nsswitch_hosts(const char *text, size_t len, struct nss_source *out, size
 }
 
 #ifdef MOQI_HOST_TEST_SYSCALL
+/* The host test supplies the file's text (NULL: no file), handed out in pieces like read(2). */
 extern const char *moqi_test_nsswitch_conf;
-static size_t nsswitch_conf_read(char *buf, size_t cap) {
-    if (!moqi_test_nsswitch_conf) return 0;
-    size_t n = strlen(moqi_test_nsswitch_conf);
+static size_t nss_test_off;
+static long nss_open(void) {
+    nss_test_off = 0;
+    return moqi_test_nsswitch_conf ? 0 : -2;
+}
+static long nss_read(long fd, char *buf, size_t cap) {
+    (void)fd;
+    size_t n = strlen(moqi_test_nsswitch_conf + nss_test_off);
     if (n > cap) n = cap;
-    memcpy(buf, moqi_test_nsswitch_conf, n);
-    return n;
+    memcpy(buf, moqi_test_nsswitch_conf + nss_test_off, n);
+    nss_test_off += n;
+    return (long)n;
 }
+static void nss_close(long fd) { (void)fd; }
 #else
-static size_t nsswitch_conf_read(char *buf, size_t cap) {
-    long fd = syscall3(SYS_open, (long)"/etc/nsswitch.conf", 0 /* O_RDONLY */, 0);
-    if (fd < 0) return 0;
-    long n = 0;
-    while (n < (long)cap) {
-        long r = syscall3(SYS_read, fd, (long)(buf + n), (long)cap - n);
-        if (r <= 0) break;
-        n += r;
-    }
-    syscall1(SYS_close, fd);
-    return (size_t)n;
-}
+static long nss_open(void) { return syscall3(SYS_open, (long)"/etc/nsswitch.conf", 0 /* O_RDONLY */, 0); }
+static long nss_read(long fd, char *buf, size_t cap) { return syscall3(SYS_read, fd, (long)buf, (long)cap); }
+static void nss_close(long fd) { syscall1(SYS_close, fd); }
 #endif
 
-/* The hosts sources of /etc/nsswitch.conf, read afresh on every lookup (glibc rereads a changed file too). */
+/* A hosts line keeps its first NSS_LINE_MAX bytes; other lines are skipped whatever their length. */
+#define NSS_LINE_MAX 1024
+
+/* The hosts sources of /etc/nsswitch.conf, read afresh on every lookup (glibc rereads a changed file too). The whole file is
+ * read in pieces and the last complete hosts line kept, so its length does not matter (glibc 2.44, measured with 100000
+ * bytes). */
 static size_t hosts_sources(struct nss_source *out) {
-    char buf[2048];
-    size_t len = nsswitch_conf_read(buf, sizeof buf);
-    return nsswitch_hosts(len ? buf : (const char *)0, len, out, NSS_HOSTS_MAX);
+    char chunk[512], line[NSS_LINE_MAX], last[NSS_LINE_MAX];
+    size_t ll = 0, last_len = 0;
+    int have = 0;
+    long fd = nss_open();
+    if (fd >= 0) {
+        for (;;) {
+            long r = nss_read(fd, chunk, sizeof chunk);
+            size_t n = r > 0 ? (size_t)r : 0;
+            for (size_t i = 0; i < n; i++) {
+                if (chunk[i] != '\n') {
+                    if (ll < sizeof line) line[ll] = chunk[i];
+                    ll++;
+                    continue;
+                }
+                size_t keep = ll < sizeof line ? ll : sizeof line;
+                if (nss_hosts_line(line, 0, keep)) {
+                    memcpy(last, line, keep);
+                    last_len = keep;
+                    have = 1;
+                }
+                ll = 0;
+            }
+            if (r <= 0) break;
+        }
+        /* A last line without its newline is not used: glibc's getline loop stops at end of file before parsing it. */
+        nss_close(fd);
+    }
+    return nsswitch_hosts(have ? last : (const char *)0, last_len, out, NSS_HOSTS_MAX);
 }
 
 /* Whether `status` ends the lookup after source `s`. */

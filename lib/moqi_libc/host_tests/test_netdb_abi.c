@@ -1505,6 +1505,42 @@ int main(void) {
                 h_errno = 0;
                 assert(getaddrinfo("a.test", 0, &h, &r) == EAI_NONAME && q_calls == 0);
             }
+            {
+                /* The whole of /etc/nsswitch.conf is read, however long (glibc 2.44, measured with 100000 bytes): the last
+                 * hosts line decides even past the first 2048 bytes, and a line longer than the line buffer does not hide the
+                 * next one. A last line without its newline is ignored (glibc's getline loop stops at end of file). */
+                static char big[9000];
+                size_t o = 0;
+                memcpy(big + o, "hosts:\n", 7);
+                o += 7;
+                while (o < 5000) {
+                    memcpy(big + o, "# padding padding padding padding paddi\n", 40);
+                    o += 40;
+                }
+                big[o++] = '#';
+                while (o < 8000) big[o++] = 'x';
+                big[o++] = '\n';
+                memcpy(big + o, "hosts: files\n", 13);
+                o += 13;
+                big[o] = 0;
+                const char *hosts_was = moqi_test_etc_hosts;
+                moqi_test_etc_hosts = "10.5.34.1 late534.test\n";
+                moqi_test_nsswitch_conf = big;
+                q_script(one, ok, 1);
+                struct hostent *lp = gethostbyname("late534.test");
+                assert(lp && (unsigned char)lp->h_addr_list[0][3] == 1 && q_calls == 0);
+                memcpy(big + o, "hosts:", 7);
+                lp = gethostbyname("late534.test");
+                assert(lp && q_calls == 0);
+                memcpy(big + o, "hosts:\n", 8);
+                h_errno = 0;
+                assert(!gethostbyname("late534.test") && h_errno == NETDB_INTERNAL);
+                moqi_test_nsswitch_conf = "hosts: dns";
+                q_script(one, ok, 1);
+                lp = gethostbyname("late534.test");
+                assert(lp && (unsigned char)lp->h_addr_list[0][3] == 1 && q_calls == 0); /* no complete line: "files dns" */
+                moqi_test_etc_hosts = hosts_was;
+            }
             moqi_test_nsswitch_conf = "hosts: files\n";
             moqi_test_etc_hosts = "";
             {
