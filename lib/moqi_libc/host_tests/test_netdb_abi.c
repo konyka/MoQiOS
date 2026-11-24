@@ -1078,6 +1078,27 @@ int main(void) {
             assert(getaddrinfo("x", 0, &hints, &res) == EAI_NODATA);
             q_script(srch, sf_end, 6);
             assert(getaddrinfo("x", 0, &hints, &res) == EAI_AGAIN);
+            /* hello531: "options single-request" (glibc 2.44, measured; any word starting with it, so single-request-reopen
+             * too): the A query, its reply, then the AAAA query, each through dns_query/dns_query6; the pair rule is unchanged. A
+             * failure of the A half that ends the pair (no reply) skips the AAAA query. */
+            static const char sr[] = "nameserver 10.0.0.1\noptions attempts:1 single-request\n";
+            static const char srr[] = "nameserver 10.0.0.1\noptions attempts:1 single-request-reopenx\n";
+            static const char notsr[] = "nameserver 10.0.0.1\noptions attempts:1 single-req\n";
+            static const long both_ok[] = {0, 0}, a_to[] = {-110, 0};
+            q_script(sr, both_ok, 2);
+            assert(getaddrinfo("s.test", 0, &hints, &res) == 0 && res->ai_family == AF_INET6 && res->ai_next && strcmp(q_log, "s.test@1/5;s.test/6@1/5;") == 0);
+            freeaddrinfo(res);
+            q_script(srr, both_ok, 2);
+            assert(getaddrinfo("s.test", 0, &hints, &res) == 0 && strcmp(q_log, "s.test@1/5;s.test/6@1/5;") == 0);
+            freeaddrinfo(res);
+            q_script(notsr, both_ok, 2);
+            assert(getaddrinfo("s.test", 0, &hints, &res) == 0 && strcmp(q_log, "s.test/2@1/5;") == 0);
+            freeaddrinfo(res);
+            q_script(sr, a_to, 2);
+            assert(getaddrinfo("s.test", 0, &hints, &res) == EAI_AGAIN && strcmp(q_log, "s.test@1/5;") == 0);
+            q_script("nameserver 10.0.0.1\nsearch d1 d2\noptions attempts:1 single-request\n", a_only, 4);
+            assert(getaddrinfo("x", 0, &hints, &res) == 0 && res->ai_family == AF_INET && res->ai_next == 0 && strcmp(q_log, "x.d1@1/5;x.d1/6@1/5;") == 0);
+            freeaddrinfo(res);
             /* A server that does not reply moves to the next one with the pair. */
             static const char two[] = "nameserver 10.0.0.1\nnameserver 10.0.0.2\noptions attempts:1 timeout:2\n";
             static const long to_ok[] = {-110, -110, 0, 0};
