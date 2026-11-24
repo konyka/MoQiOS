@@ -2621,7 +2621,7 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
         if (copy.copyFromUser(&hdr, @ptrFromInt(msg_ptr), 56) != 56) return -14;
         return recvErrqueueEntry(net_mod.tcp.tcpTakeQueuedError(cur.fd_table.fds[fd].tcb_idx) orelse return -11, msg_ptr, &hdr);
     }
-    if (flags & ~(urg.MSG_OOB | rf_tcp.MSG_PEEK | net_mod.tcp_recv_policy.MSG_DONTWAIT | rf_tcp.MSG_WAITALL) != 0) return -22;
+    if (flags & ~(urg.MSG_OOB | rf_tcp.MSG_PEEK | net_mod.tcp_recv_policy.MSG_DONTWAIT | rf_tcp.MSG_WAITALL | rf_tcp.MSG_TRUNC) != 0) return -22;
     if (fd >= vfs_mod.MAX_FDS or cur.fd_table.fds[fd].fd_type != .tcp_socket) return -88;
     if (flags & urg.MSG_OOB != 0) return tcpRecvmsgOob(cur.fd_table.fds[fd].tcb_idx, msg_ptr, flags);
 
@@ -2631,6 +2631,10 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
 
     const iov_ptr: u64 = bo.readU64At(&msghdr_buf, 16);
     const iov_len: u64 = bo.readU64At(&msghdr_buf, 24);
+    // MSG_TRUNC (tcp_recvmsg_locked): the iovecs' room is taken (or peeked) and counted, nothing is copied, so a NULL base is fine
+    // and no iovec at all is a 0-byte receive (measured, hello556).
+    const msg_trunc_tcp = rf_tcp.truncReportsFullLength(flags);
+    if (msg_trunc_tcp and iov_len == 0) return 0;
 
     if (iov_ptr == 0 or iov_ptr >= 0x0000_8000_0000_0000) return -14;
     if (iov_len == 0 or iov_len > 1024) return -22;
@@ -2650,11 +2654,11 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
         if (copy.copyFromUser(&iov_buf, src, 16) != iov_buf.len) return -14;
         const iov_base: u64 = bo.readU64At(&iov_buf, 0);
         const iov_sz: u64 = bo.readU64At(&iov_buf, 8);
-        if (iov_base == 0 or iov_base >= 0x0000_8000_0000_0000) return -14;
+        if (!msg_trunc_tcp and (iov_base == 0 or iov_base >= 0x0000_8000_0000_0000)) return -14;
         if (iov_sz == 0) return -22;
         if (nsegs == segs.len or room >= 4096) break;
         const take: u32 = @intCast(@min(iov_sz, @as(u64, 4096 - room)));
-        if (!copy.validateUserBufferWritable(iov_base, take)) {
+        if (!msg_trunc_tcp and !copy.validateUserBufferWritable(iov_base, take)) {
             if (nsegs == 0) return -14;
             break;
         }
@@ -2692,6 +2696,7 @@ pub fn recvmsg(fd: u32, msg_ptr: u64, flags: u32) i64 {
         }
     }
     if (got == 0) return 0;
+    if (msg_trunc_tcp) return @intCast(got);
 
     // Scatter across the iovecs.
     var off: u32 = 0;

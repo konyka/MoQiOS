@@ -19187,3 +19187,10 @@ test "MSG_TRUNC on a TCP recv takes the bytes without copying them, even into NU
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (!tcp_trunc and (buf == 0 or buf >= 0x0000_8000_0000_0000 or len == 0)) return -1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, ss, "if (result > 0 and !tcp_trunc) {") != null);
 }
+
+test "MSG_TRUNC on a TCP recvmsg takes the iovec room without copying, a NULL iovec base included (Linux 7.x, measured) (hello556)" {
+    const ss = kt.socket_syscall_source;
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (flags & ~(urg.MSG_OOB | rf_tcp.MSG_PEEK | net_mod.tcp_recv_policy.MSG_DONTWAIT | rf_tcp.MSG_WAITALL | rf_tcp.MSG_TRUNC) != 0) return -22;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "const msg_trunc_tcp = rf_tcp.truncReportsFullLength(flags);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss, "if (msg_trunc_tcp) return @intCast(got);") != null);
+}
