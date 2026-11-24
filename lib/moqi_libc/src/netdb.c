@@ -949,9 +949,11 @@ static int nss_word_is(const char *w, size_t n, const char *lit) {
     return 1;
 }
 
-/* glibc's nss_parse_service_list on text[a, b): the sources into `out`, or 0 when the line is refused. */
-static size_t nss_parse_list(const char *t, size_t i, size_t b, struct nss_source *out, size_t cap) {
+/* glibc's nss_parse_service_list on text[a, b): the sources into `out`, or 0 when the line is refused. `bad`, when given, is
+ * set only when the line does not parse, so an empty but valid list ("hosts:" alone) can be told apart. */
+static size_t nss_parse_list_err(const char *t, size_t i, size_t b, struct nss_source *out, size_t cap, int *bad) {
     size_t n = 0;
+    if (bad) *bad = 0;
     for (;;) {
         while (i < b && nss_space(t[i])) i++;
         if (i >= b) break;
@@ -976,16 +978,16 @@ static size_t nss_parse_list(const char *t, size_t i, size_t b, struct nss_sourc
                 else if (nss_word_is(t + w, i - w, "NOTFOUND")) status = NSS_STATUS_NOTFOUND;
                 else if (nss_word_is(t + w, i - w, "UNAVAIL")) status = NSS_STATUS_UNAVAIL;
                 else if (nss_word_is(t + w, i - w, "TRYAGAIN")) status = NSS_STATUS_TRYAGAIN;
-                else return 0;
+                else { if (bad) *bad = 1; return 0; }
                 while (i < b && nss_space(t[i])) i++;
-                if (i >= b || t[i] != '=') return 0;
+                if (i >= b || t[i] != '=') { if (bad) *bad = 1; return 0; }
                 do i++; while (i < b && nss_space(t[i]));
                 w = i;
                 while (i < b && !nss_space(t[i]) && t[i] != '=' && t[i] != ']') i++;
                 int ret;
                 if (nss_word_is(t + w, i - w, "return")) ret = 1;
                 else if (nss_word_is(t + w, i - w, "continue") || nss_word_is(t + w, i - w, "merge")) ret = 0;
-                else return 0;
+                else { if (bad) *bad = 1; return 0; }
                 unsigned bit = 1u << status;
                 if (not) {
                     unsigned keep = s.stop & bit;
@@ -996,7 +998,7 @@ static size_t nss_parse_list(const char *t, size_t i, size_t b, struct nss_sourc
                 }
                 while (i < b && nss_space(t[i])) i++;
             } while (i < b && t[i] != ']');
-            if (i >= b) return 0; /* no ']' */
+            if (i >= b) { if (bad) *bad = 1; return 0; } /* no ']' */
             i++;
         }
         if (n < cap) out[n++] = s;
@@ -1004,16 +1006,41 @@ static size_t nss_parse_list(const char *t, size_t i, size_t b, struct nss_sourc
     return n;
 }
 
-/* The offset just past "hosts:" when text[pos, end) is a hosts line, else 0. */
-static size_t nss_hosts_line(const char *text, size_t pos, size_t end) {
+static size_t nss_parse_list(const char *t, size_t i, size_t b, struct nss_source *out, size_t cap) {
+    return nss_parse_list_err(t, i, b, out, cap, (int *)0);
+}
+
+/* The databases glibc knows (nss/databases.def): a line of one of them whose sources do not parse voids the whole file. */
+static const char *const nss_databases[] = {
+    "aliases", "ethers", "group", "group_compat", "gshadow", "hosts", "initgroups", "netgroup", "networks", "passwd",
+    "passwd_compat", "protocols", "publickey", "rpc", "services", "shadow", "shadow_compat",
+};
+
+/* The database a line names, and the offset just past its colon. `db` is its index in nss_databases, or -1 when the line names
+ * none of them (a syntax error, a comment or another database). */
+static size_t nss_line_db(const char *text, size_t pos, size_t end, int *db) {
+    *db = -1;
     size_t i = pos;
     while (i < end && nss_space(text[i])) i++;
     size_t w = i;
     while (i < end && !nss_space(text[i]) && text[i] != ':') i++;
     size_t wl = i - w;
     while (i < end && nss_space(text[i])) i++;
-    if (i < end && text[i] == ':' && wl == 5 && memcmp(text + w, "hosts", 5) == 0) return i + 1;
-    return 0;
+    if (i >= end || text[i] != ':' || wl == 0) return 0;
+    for (size_t k = 0; k < sizeof nss_databases / sizeof nss_databases[0]; k++) {
+        if (strlen(nss_databases[k]) == wl && memcmp(text + w, nss_databases[k], wl) == 0) {
+            *db = (int)k;
+            break;
+        }
+    }
+    return i + 1;
+}
+
+/* The offset just past "hosts:" when text[pos, end) is a hosts line, else 0. */
+static size_t nss_hosts_line(const char *text, size_t pos, size_t end) {
+    int db;
+    size_t a = nss_line_db(text, pos, end, &db);
+    return a && db >= 0 && strcmp(nss_databases[db], "hosts") == 0 ? a : 0;
 }
 
 size_t nsswitch_hosts(const char *text, size_t len, struct nss_source *out, size_t cap) {
@@ -1067,8 +1094,12 @@ static long nss_read(long fd, char *buf, size_t cap) { return syscall3(SYS_read,
 static void nss_close(long fd) { syscall1(SYS_close, fd); }
 #endif
 
-/* A hosts line keeps its first NSS_LINE_MAX bytes; other lines are skipped whatever their length. */
+/* A line of a known database keeps its first NSS_LINE_MAX bytes; other lines are skipped whatever their length. */
 #define NSS_LINE_MAX 1024
+
+/* nsswitch.conf has a line of a known database whose sources do not parse: every lookup is NETDB_INTERNAL with errno EINVAL,
+ * getaddrinfo and getnameinfo EAI_SYSTEM, and no source is asked (glibc 2.44, measured). */
+#define NSS_SOURCES_VOID ((size_t)-1)
 
 /* The hosts sources of /etc/nsswitch.conf, read afresh on every lookup (glibc rereads a changed file too). The whole file is
  * read in pieces and the last complete hosts line kept, so its length does not matter (glibc 2.44, measured with 100000
@@ -1076,31 +1107,41 @@ static void nss_close(long fd) { syscall1(SYS_close, fd); }
 static size_t hosts_sources(struct nss_source *out) {
     char chunk[512], line[NSS_LINE_MAX], last[NSS_LINE_MAX];
     size_t ll = 0, last_len = 0;
-    int have = 0;
+    int have = 0, voided = 0;
     long fd = nss_open();
     if (fd >= 0) {
         for (;;) {
             long r = nss_read(fd, chunk, sizeof chunk);
             size_t n = r > 0 ? (size_t)r : 0;
-            for (size_t i = 0; i < n; i++) {
+            for (size_t i = 0; i < n && !voided; i++) {
                 if (chunk[i] != '\n') {
                     if (ll < sizeof line) line[ll] = chunk[i];
                     ll++;
                     continue;
                 }
                 size_t keep = ll < sizeof line ? ll : sizeof line;
-                if (nss_hosts_line(line, 0, keep)) {
-                    memcpy(last, line, keep);
-                    last_len = keep;
-                    have = 1;
+                int db;
+                size_t a = nss_line_db(line, 0, keep, &db);
+                if (a && db >= 0) {
+                    /* Any known database's line must parse; glibc stops reading the file at the first one that does not. */
+                    struct nss_source tmp[NSS_HOSTS_MAX];
+                    int bad = 0;
+                    nss_parse_list_err(line, a, keep, tmp, NSS_HOSTS_MAX, &bad);
+                    if (bad) voided = 1;
+                    else if (strcmp(nss_databases[db], "hosts") == 0) {
+                        memcpy(last, line, keep);
+                        last_len = keep;
+                        have = 1;
+                    }
                 }
                 ll = 0;
             }
-            if (r <= 0) break;
+            if (r <= 0 || voided) break;
         }
         /* A last line without its newline is not used: glibc's getline loop stops at end of file before parsing it. */
         nss_close(fd);
     }
+    if (voided) return NSS_SOURCES_VOID;
     return nsswitch_hosts(have ? last : (const char *)0, last_len, out, NSS_HOSTS_MAX);
 }
 
@@ -1492,6 +1533,10 @@ static void lookup_name(const char *name, int af, char *hosts, size_t hosts_cap,
         size_t nsrc = hosts_sources(src);
         int status = NSS_STATUS_UNAVAIL;
         ans->herr = NETDB_INTERNAL; /* no source at all, or only ones this library does not have */
+        if (nsrc == NSS_SOURCES_VOID) {
+            ans->rc = EINVAL; /* a known database's line does not parse: the whole file is void */
+            return;
+        }
         for (size_t s = 0; s < nsrc; s++) {
             ans->names = (const char *)0;
             ans->naddrs = 0;
@@ -1563,6 +1608,10 @@ static void lookup_addr(const void *addr, unsigned int len, int family, char *ho
     size_t names_len = 0;
     int status = NSS_STATUS_UNAVAIL;
     ans->herr = NETDB_INTERNAL;
+    if (nsrc == NSS_SOURCES_VOID) {
+        ans->rc = EINVAL;
+        return;
+    }
     for (size_t s = 0; s < nsrc; s++) {
         if (src[s].service == NSS_SERVICE_FILES) {
             size_t n = etc_hosts_read_into(hosts, hosts_cap);
@@ -1633,7 +1682,7 @@ static struct hostent *static_result(struct host_answer *ans) {
     if (!ans->names) {
         if (ans->herr != HERR_KEEP) h_errno = ans->herr;
         if (ans->rc == EAFNOSUPPORT && ans->herr == NETDB_INTERNAL) errno = EAFNOSUPPORT;
-        if (ans->rc == ENOENT) errno = ENOENT;
+        if (ans->rc == ENOENT || ans->rc == EINVAL) errno = ans->rc;
         return (struct hostent *)0;
     }
     const char *list[HOSTENT_ADDRS_MAX];
@@ -2032,6 +2081,18 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
          * have is EAI_SYSTEM (glibc 2.44, measured). */
         struct nss_source src[NSS_HOSTS_MAX];
         size_t nsrc = hosts_sources(src);
+        if (nsrc == NSS_SOURCES_VOID) {
+            /* glibc 2.44 (measured): AF_INET without AI_CANONNAME goes through gethostbyname2_r, which sets h_errno to
+             * NETDB_INTERNAL and errno to EINVAL. The other requests find no service and leave h_errno alone: EAI_SYSTEM when it
+             * already was NETDB_INTERNAL, else EAI_NONAME; errno is ENOENT either way. */
+            if (family == AF_INET && !(flags & AI_CANONNAME)) {
+                h_errno = NETDB_INTERNAL;
+                errno = EINVAL;
+                return EAI_SYSTEM;
+            }
+            errno = ENOENT;
+            return h_errno == NETDB_INTERNAL ? EAI_SYSTEM : EAI_NONAME;
+        }
         const char *names = (const char *)0;
         size_t names_len = 0;
         int status = NSS_STATUS_UNAVAIL, code = EAI_SYSTEM;

@@ -1539,6 +1539,68 @@ int main(void) {
                 q_script(one, ok, 1);
                 lp = gethostbyname("late534.test");
                 assert(lp && (unsigned char)lp->h_addr_list[0][3] == 1 && q_calls == 0); /* no complete line: "files dns" */
+                /* A line whose sources do not parse voids the whole file, whatever database it names and wherever it is
+                 * (glibc 2.44 nss_database_reload_1 stops at the first __nss_action_parse failure and keeps no services):
+                 * every lookup is then NETDB_INTERNAL with errno EINVAL, getaddrinfo and getnameinfo EAI_SYSTEM, and no
+                 * source is asked. A database glibc does not know (sudoers, automount) and a comment are skipped. */
+                static const char *const voids[] = {
+                    "hosts: files\npasswd: files [\n", "passwd: files [\nhosts: files\n", "hosts: files\ngroup: x [FOO=bar]\n",
+                    "hosts: files\nservices: files [\n", "hosts: files\nshadow: files [UNAVAIL=return\n",
+                    "hosts: files\naliases: files [NOTFOUND=foo]\n", "hosts: dns []\nhosts: files\n",
+                    "hosts: files\n  passwd : files [\n", "group_compat: x [\n",
+                };
+                for (unsigned v = 0; v < sizeof voids / sizeof voids[0]; v++) {
+                    moqi_test_nsswitch_conf = voids[v];
+                    q_script(one, ok, 1);
+                    struct hostent hv, *rv = (struct hostent *)1;
+                    char bv[512];
+                    int hv_err = 0;
+                    uint8_t lateaddr[4] = {10, 5, 34, 1};
+                    h_errno = 0;
+                    errno = 0;
+                    assert(!gethostbyname("late534.test") && h_errno == NETDB_INTERNAL && errno == EINVAL);
+                    h_errno = 0;
+                    errno = 0;
+                    assert(!gethostbyaddr(lateaddr, 4, AF_INET) && h_errno == NETDB_INTERNAL && errno == EINVAL);
+                    errno = 0;
+                    assert(gethostbyname_r("late534.test", &hv, bv, sizeof bv, &rv, &hv_err) == EINVAL && !rv &&
+                           hv_err == NETDB_INTERNAL);
+                    struct addrinfo hints4, *r4 = (struct addrinfo *)0;
+                    memset(&hints4, 0, sizeof hints4);
+                    hints4.ai_family = AF_INET;
+                    errno = 0;
+                    h_errno = 0;
+                    assert(getaddrinfo("late534.test", 0, &hints4, &r4) == EAI_SYSTEM && errno == EINVAL && h_errno == NETDB_INTERNAL);
+                    /* Only AF_INET without AI_CANONNAME (try_simple_gethostbyname) sees gethostbyname2_r's EINVAL; the other
+                     * requests find no service through get_nss_addresses and are EAI_NONAME with errno ENOENT. */
+                    static const int other[][2] = {{AF_INET, AI_CANONNAME}, {AF_INET6, 0}, {AF_UNSPEC, 0}};
+                    for (unsigned k = 0; k < 3; k++) {
+                        struct addrinfo ho, *ro = (struct addrinfo *)0;
+                        memset(&ho, 0, sizeof ho);
+                        ho.ai_family = other[k][0];
+                        ho.ai_flags = other[k][1];
+                        errno = 0;
+                        h_errno = 0;
+                        assert(getaddrinfo("late534.test", 0, &ho, &ro) == EAI_NONAME && errno == ENOENT && h_errno == 0);
+                        errno = 0;
+                        h_errno = NETDB_INTERNAL; /* left by an earlier call: glibc maps it to EAI_SYSTEM */
+                        assert(getaddrinfo("late534.test", 0, &ho, &ro) == EAI_SYSTEM && errno == ENOENT);
+                    }
+                    uint8_t sal[16] = {2, 0, 0, 80, 10, 5, 34, 1};
+                    char hbuf[64];
+                    assert(getnameinfo(sal, 16, hbuf, sizeof hbuf, 0, 0, 0) == EAI_SYSTEM);
+                    assert(q_calls == 0);
+                }
+                /* Unknown databases and comments do not void it. */
+                static const char *const kept[] = {"hosts: files\nsudoers: files [\n", "hosts: files\nautomount: x [\n",
+                                                   "hosts: files\nunknowndb: x [\n", "hosts: files\n#passwd: files [\n",
+                                                   "hosts: files\npasswd:\n"};
+                for (unsigned v = 0; v < sizeof kept / sizeof kept[0]; v++) {
+                    moqi_test_nsswitch_conf = kept[v];
+                    q_script(one, ok, 1);
+                    lp = gethostbyname("late534.test");
+                    assert(lp && (unsigned char)lp->h_addr_list[0][3] == 1 && q_calls == 0);
+                }
                 moqi_test_etc_hosts = hosts_was;
             }
             moqi_test_nsswitch_conf = "hosts: files\n";
