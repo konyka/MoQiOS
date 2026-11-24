@@ -647,6 +647,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello527"); /* pipe writes into a hole when the pipe holds data */
     run_test("hello528"); /* the hosts line of /etc/nsswitch.conf */
     run_test("hello529"); /* a link-local nameserver with a %scope */
+    run_test("hello530"); /* AF_UNSPEC asks A and AAAA together */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

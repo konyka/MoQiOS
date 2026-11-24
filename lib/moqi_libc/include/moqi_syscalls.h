@@ -92,6 +92,7 @@
 #define SYS_dns_query       507
 #define SYS_dns_ptr         508
 #define SYS_dns_query6      509
+#define SYS_dns_query2      510
 
 /* Processes, identity and terminals */
 #define SYS_pause       34

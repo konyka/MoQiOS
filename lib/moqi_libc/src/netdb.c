@@ -334,18 +334,68 @@ static size_t resolv_first_server(const struct resolv_opts *opt, size_t nns) {
     return __atomic_fetch_add(&resolv_rotate_next, 1u, __ATOMIC_ACQ_REL) % nns;
 }
 
+/* One result for the A and AAAA halves of an AF_UNSPEC pair (0 or -errno each), as glibc 2.44 combines them (measured with every
+ * pair of reply codes; the kernel's dns_policy.pairResult is the same rule): either answering is an answer; else an A failure
+ * other than NXDOMAIN, NODATA, SERVFAIL or REFUSED wins, then NXDOMAIN from either, then such an AAAA failure, then NODATA, then
+ * the A result. */
+long resolv_pair_result(long a, long b) {
+    if (a == 0 || b == 0) return 0;
+    int soft_a = a == -2 || a == -61 || a == -11 || a == -111, soft_b = b == -2 || b == -61 || b == -11 || b == -111;
+    if (!soft_a) return a;
+    if (a == -2 || b == -2) return -2;
+    if (!soft_b) return b;
+    if (a == -61 || b == -61) return -61;
+    return a;
+}
+
+/* dns_query2 (510) for both halves; their results land in pair->r4/r6 and the combined one is returned. */
+static long resolv_ask_pair(const char *name, const struct resolv_server *sv, long wait_ms, struct resolv_pair *pair) {
+    if (sv->unusable) return pair->r4 = pair->r6 = -101;
+    long flags = sv->v6 ? RESOLV_SERVER6_FLAG | (sv->scope ? RESOLV_SCOPE6_FLAG : 0) : 0;
+    long r = NETDB_SYSCALL6(SYS_dns_query2, (long)name, (long)sv->addr, wait_ms | flags, (long)pair->a4.buf, (long)pair->a6.buf,
+                            (long)sizeof pair->a4.buf);
+    if (r < 0) return pair->r4 = pair->r6 = r; /* the call as a whole failed */
+    pair->r4 = -(r & 0xff);
+    pair->r6 = -((r >> 8) & 0xff);
+    pair->a4.len = pair->r4 == 0 ? sizeof pair->a4.buf : 0;
+    pair->a6.len = pair->r6 == 0 ? sizeof pair->a6.buf : 0;
+    return resolv_pair_result(pair->r4, pair->r6);
+}
+
 static long resolve_one(const char *name, uint8_t *out, struct resolv_server *ns, size_t nns, const struct resolv_opts *opt,
-                        struct resolv_answer *ans, int af) {
+                        struct resolv_answer *ans, int af, struct resolv_pair *pair) {
     if (ans) ans->len = 0;
+    if (pair) {
+        pair->a4.len = pair->a6.len = 0;
+        pair->r4 = pair->r6 = -110;
+    }
     /* The kernel's own server (no nameserver line) answers A queries only. */
-    if (nns == 0) return af == AF_INET6 ? -2 : NETDB_SYSCALL2(SYS_dns_resolve, (long)name, (long)out);
+    if (nns == 0) {
+        if (pair) {
+            pair->r6 = -2;
+            pair->r4 = NETDB_SYSCALL2(SYS_dns_resolve, (long)name, (long)out);
+            if (pair->r4 == 0) {
+                /* The one address under the asked name, in the kernel's answer form. */
+                size_t k = strlen(name);
+                if (k > 252) k = 252;
+                pair->a4.buf[0] = 1; pair->a4.buf[1] = 0; pair->a4.buf[2] = 4;
+                memcpy(pair->a4.buf + 3, out, 4);
+                memcpy(pair->a4.buf + 7, name, k);
+                pair->a4.buf[7 + k] = 0;
+                pair->a4.len = 8 + k;
+            }
+            return resolv_pair_result(pair->r4, pair->r6);
+        }
+        return af == AF_INET6 ? -2 : NETDB_SYSCALL2(SYS_dns_resolve, (long)name, (long)out);
+    }
     long nr = af == AF_INET6 ? SYS_dns_query6 : SYS_dns_query;
     long last_reply = -110; /* ETIMEDOUT: no server replied (or attempts:0 asked nobody) */
     size_t first = resolv_first_server(opt, nns);
     for (int a = 0; a < opt->attempts; a++) {
         for (size_t i = 0; i < nns; i++) {
-            long r = resolv_ask(nr, (long)name, (long)out, &ns[(first + i) % nns], resolv_wait_ms(opt->timeout, i, nns),
-                                ans ? (long)ans->buf : 0, ans ? (long)sizeof ans->buf : 0);
+            long r = pair ? resolv_ask_pair(name, &ns[(first + i) % nns], resolv_wait_ms(opt->timeout, i, nns), pair)
+                          : resolv_ask(nr, (long)name, (long)out, &ns[(first + i) % nns], resolv_wait_ms(opt->timeout, i, nns),
+                                       ans ? (long)ans->buf : 0, ans ? (long)sizeof ans->buf : 0);
             if (r == 0 && ans) ans->len = sizeof ans->buf;
             if (r == -11 || r == -111) last_reply = r; /* SERVFAIL; NOTIMP or REFUSED: the last reply is what res_search sees */
             if (r == -11 || r == -111 || r == -110 || r == -101) continue; /* -101: the server cannot be reached, no wait */
@@ -365,10 +415,26 @@ long resolv_lookup(const char *name, uint8_t out[4], char *found, size_t found_c
     return resolv_lookup_af(name, AF_INET, out, found, found_cap, ans);
 }
 
-/* The file text and the candidate names are per call (on the stack): two threads resolving at once share nothing. */
+static long resolv_search(const char *name, int af, uint8_t *out, char *found, size_t found_cap, struct resolv_answer *ans,
+                          struct resolv_pair *pair);
+
 long resolv_lookup_af(const char *name, int af, uint8_t *out, char *found, size_t found_cap, struct resolv_answer *ans) {
     if (!name || !out) return -22; /* EINVAL */
     if (af != AF_INET && af != AF_INET6) return -97; /* EAFNOSUPPORT */
+    return resolv_search(name, af, out, found, found_cap, ans, (struct resolv_pair *)0);
+}
+
+long resolv_lookup_pair(const char *name, struct resolv_pair *pair) {
+    if (!name || !pair) return -22;
+    uint8_t out[4];
+    pair->canon[0] = 0;
+    return resolv_search(name, AF_UNSPEC, out, pair->canon, sizeof pair->canon, (struct resolv_answer *)0, pair);
+}
+
+/* The file text and the candidate names are per call (on the stack): two threads resolving at once share nothing. With `pair`
+ * each candidate is asked for both A and AAAA at once and the pair's combined result drives the list. */
+static long resolv_search(const char *name, int af, uint8_t *out, char *found, size_t found_cap, struct resolv_answer *ans,
+                          struct resolv_pair *pair) {
     char resolv_conf_buf[2048];
     char resolv_cand[RESOLV_MAX_CANDIDATES][256];
     struct resolv_answer local;
@@ -389,18 +455,20 @@ long resolv_lookup_af(const char *name, int af, uint8_t *out, char *found, size_
      * long to send) ends the domain list, though the name as given is still asked if it has not been. With nothing found the
      * result is the as-given query's when it came first, else NODATA if a domain had it, else SERVFAIL if one had that, else the
      * last query's. */
-    if (nc == 0) return resolve_one(name, out, ns, nns, &opt, ans, af);
+    if (nc == 0) return resolve_one(name, out, ns, nns, &opt, ans, af, pair);
     long saved = 0, last = -2;
     int asis_first = 0, got_nodata = 0, got_servfail = 0, done = 0;
     for (size_t i = 0; i < nc; i++) {
         int is_name = strcmp(resolv_cand[i], name) == 0 || (strlen(name) == strlen(resolv_cand[i]) + 1 && name[strlen(name) - 1] == '.');
         if (!is_name && done) continue;
-        long r = resolve_one(is_name ? name : resolv_cand[i], out, ns, nns, &opt, ans, af);
+        long r = resolve_one(is_name ? name : resolv_cand[i], out, ns, nns, &opt, ans, af, pair);
         if (r == 0) {
             if (found && found_cap) {
-                /* The canonical name of the answer (the end of its CNAME chain), else the name that was asked. */
+                /* The canonical name of the answer (the end of its CNAME chain), else the name that was asked; for a pair, the
+                 * AAAA answer's when it has one (glibc lists the IPv6 addresses first). */
                 const char *canon = resolv_cand[i];
-                if (ans && ans->len) canon = (const char *)ans->buf + 3 + ans->buf[2] * ans->buf[0];
+                const struct resolv_answer *ca = pair ? (pair->a6.len ? &pair->a6 : &pair->a4) : ans;
+                if (ca && ca->len) canon = (const char *)ca->buf + 3 + ca->buf[2] * ca->buf[0];
                 size_t k = strlen(canon);
                 if (k >= found_cap) k = found_cap - 1;
                 memcpy(found, canon, k);
@@ -1936,6 +2004,34 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
                 long r6 = -2, r4 = -2;
                 uint8_t a16[16];
                 struct resolv_answer ra;
+                if (family == AF_UNSPEC) {
+                    /* Both at once (hello530): one dns_query2 per candidate and server; IPv6 addresses first. */
+                    struct resolv_pair *pr = (struct resolv_pair *)malloc(sizeof *pr); /* 11 KiB: off the 64 KiB thread stacks */
+                    if (!pr) return EAI_MEMORY;
+                    long rp = resolv_lookup_pair(node, pr);
+                    r4 = pr->r4;
+                    r6 = pr->r6;
+                    if (rp == 0) {
+                        uint8_t got[GAI_MAX_ADDRS][16];
+                        size_t k = r6 == 0 ? resolv_answer_unpack(&pr->a6, got, GAI_MAX_ADDRS, (char *)0, 0) : 0;
+                        for (size_t i = 0; i < k && naddrs < GAI_MAX_ADDRS; i++) {
+                            memset(&addrs[naddrs], 0, sizeof addrs[naddrs]);
+                            addrs[naddrs].family = AF_INET6;
+                            memcpy(addrs[naddrs].addr, got[i], 16);
+                            naddrs++;
+                        }
+                        k = r4 == 0 ? resolv_answer_unpack(&pr->a4, got, GAI_MAX_ADDRS, (char *)0, 0) : 0;
+                        for (size_t i = 0; i < k && naddrs < GAI_MAX_ADDRS; i++) {
+                            set_v4(&addrs[naddrs], got[i][0], got[i][1], got[i][2], got[i][3]);
+                            naddrs++;
+                        }
+                        memcpy(canon_buf, pr->canon, strlen(pr->canon) + 1);
+                    } else {
+                        r4 = r6 = rp;
+                    }
+                    free(pr);
+                    want6 = want4 = 0;
+                }
                 if (want6) {
                     r6 = resolv_lookup_af(node, AF_INET6, a16, canon_buf, sizeof canon_buf, &ra);
                     if (r6 == 0) {
@@ -1974,7 +2070,7 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
                     }
                 }
                 if (naddrs == 0) {
-                    long rs[2] = {want6 ? r6 : 0, want4 ? r4 : 0};
+                    long rs[2] = {want6 || family == AF_UNSPEC ? r6 : 0, want4 || family == AF_UNSPEC ? r4 : 0};
                     int nx = 0, nd = 0;
                     for (int i = 0; i < 2; i++) {
                         if (rs[i] == -2 || rs[i] == -22 || rs[i] == -36 || rs[i] == -71) nx = 1;

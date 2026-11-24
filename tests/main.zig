@@ -18816,8 +18816,8 @@ test "an IPv6 nameserver: dns_query/dns_query6/dns_ptr take a 16-byte server whe
     try std.testing.expect(!dp.acceptResponse6(srv6, 53, srv6, 7, 8));
     // Wiring: the three system calls read the server with readServer, and dns.zig takes a Server for every query.
     const se = kt.syscall_entry_source;
-    // dns_query and dns_query6 share one path; dns_ptr has the other.
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, se, "const server = readDnsServer(server_ptr, timeout_arg) orelse return -22;"));
+    // dns_query and dns_query6 share one path; dns_ptr and dns_query2 (hello530) have the others.
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, se, "const server = readDnsServer(server_ptr, timeout_arg) orelse return -22;"));
     const dns = kt.dns_source;
     try std.testing.expect(std.mem.indexOf(u8, dns, "pub const Server = union(enum) { v4: [4]u8, v6: [16]u8 };") != null);
     try std.testing.expect(std.mem.indexOf(u8, dns, "udp.sendToV6(s6, DNS_PORT, src_port, &pkt, @intCast(offset))") != null);
@@ -18926,7 +18926,43 @@ test "dns_query/dns_query6/dns_ptr take a scoped IPv6 nameserver: a link-local o
     // Wiring: the three system calls strip both flags from the limit, and readDnsServer reads the scope and checks it before any
     // network wait.
     const se = kt.syscall_entry_source;
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, se, "const timeout_ms = timeout_arg & ~(dp.SERVER6_FLAG | dp.SCOPE6_FLAG);"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, se, "const timeout_ms = timeout_arg & ~(dp.SERVER6_FLAG | dp.SCOPE6_FLAG);")); // with dns_query2 (hello530)
     try std.testing.expect(std.mem.indexOf(u8, se, "const e = dp.scopedServerErrno(s6, scope, @import(\"../../net/nic.zig\").isActive());") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "if (timeout_arg & dp.SCOPE6_FLAG != 0 and timeout_arg & dp.SERVER6_FLAG == 0) return null;") != null);
+}
+
+test "dns_query2 (510): an AF_UNSPEC lookup's A and AAAA queries leave together, and their two replies decide the search together (hello530)" {
+    const dp = kt.dns_policy;
+    // glibc 2.44 (measured, search d1 d2): the pair for one candidate name ends the search list when either half answers; else
+    // the two results combine into one, which goes on to the next domain for NXDOMAIN (-2), NODATA (-61) and SERVFAIL (-11) and
+    // ends it otherwise (FORMERR -71, REFUSED -111, no reply -110).
+    const nx: i64 = -2;
+    const nd: i64 = -61;
+    const sf: i64 = -11;
+    const rf: i64 = -111;
+    const fe: i64 = -71;
+    const to: i64 = -110;
+    const rows = [_][3]i64{
+        .{ nx, nx, nx }, .{ nx, nd, nx }, .{ nx, sf, nx }, .{ nx, rf, nx }, .{ nx, fe, nx },
+        .{ nd, nx, nx }, .{ nd, nd, nd }, .{ nd, sf, nd }, .{ nd, rf, nd }, .{ nd, fe, fe },
+        .{ sf, nx, nx }, .{ sf, nd, nd }, .{ sf, sf, sf }, .{ sf, rf, sf }, .{ sf, fe, fe },
+        .{ rf, nx, nx }, .{ rf, nd, nd }, .{ rf, sf, rf }, .{ rf, rf, rf }, .{ rf, fe, fe },
+        .{ fe, nx, fe }, .{ fe, nd, fe }, .{ fe, sf, fe }, .{ fe, rf, fe }, .{ fe, fe, fe },
+        .{ to, nx, to }, .{ nx, to, nx },
+    };
+    for (rows) |r| try std.testing.expectEqual(r[2], dp.pairResult(r[0], r[1]));
+    // Either half answering is an answer.
+    try std.testing.expectEqual(@as(i64, 0), dp.pairResult(0, nx));
+    try std.testing.expectEqual(@as(i64, 0), dp.pairResult(fe, 0));
+    // The two results travel in one return value: the A result's errno in bits 0-7, the AAAA one's in bits 8-15.
+    try std.testing.expectEqual(@as(i64, 2 | 61 << 8), dp.packPair(nx, nd));
+    try std.testing.expectEqual(@as(i64, 0), dp.packPair(0, 0));
+    try std.testing.expectEqual(@as(i64, 110 << 8), dp.packPair(0, to));
+    // Wiring: 510 checks its arguments before any wait and asks both types from one port.
+    const se = kt.syscall_entry_source;
+    try std.testing.expect(std.mem.indexOf(u8, se, "510 => { // dns_query2(name, server, timeout_ms, ans_a, ans_aaaa, ans_len)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "if (ans_len < 256) return -34; // ERANGE") != null);
+    const dns = kt.dns_source;
+    try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryPair(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans4: *dns_answer.Answer, ans6: *dns_answer.Answer) [2]dns_policy.Outcome {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "const ids = [2]u16{ newQueryId(), newQueryId() };") != null);
 }

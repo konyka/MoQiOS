@@ -151,6 +151,29 @@ pub fn queryResult(o: Outcome) i64 {
     };
 }
 
+/// One result for the A (`a`) and AAAA (`b`) halves of an AF_UNSPEC lookup's pair of queries to one name, as -errno values
+/// (queryResult), which the search list then treats like a single query's (glibc 2.44, measured with every pair of reply codes):
+/// either half answering is an answer; else an A failure that is not NXDOMAIN, NODATA, SERVFAIL or REFUSED (FORMERR, no reply)
+/// wins, then NXDOMAIN from either, then any such AAAA failure, then NODATA from either, then the A result.
+pub fn pairResult(a: i64, b: i64) i64 {
+    if (a == 0 or b == 0) return 0;
+    const soft = struct {
+        fn f(r: i64) bool {
+            return r == -2 or r == -61 or r == -11 or r == -111;
+        }
+    }.f;
+    if (!soft(a)) return a;
+    if (a == -2 or b == -2) return -2;
+    if (!soft(b)) return b;
+    if (a == -61 or b == -61) return -61;
+    return a;
+}
+
+/// dns_query2's return value for the two results (0 or -errno each): the A errno in bits 0-7, the AAAA one in bits 8-15.
+pub fn packPair(a: i64, b: i64) i64 {
+    return (@as(i64, @intCast(-a)) & 0xff) | (@as(i64, @intCast(-b)) & 0xff) << 8;
+}
+
 /// The 2-byte big-endian length a DNS message carries over TCP (RFC 1035 4.2.2), into `out[0..2]`.
 pub fn tcpLength(out: []u8, len: u16) void {
     out[0] = @intCast(len >> 8);

@@ -41,6 +41,14 @@ size_t resolv_answer_unpack(const struct resolv_answer *ans, uint8_t addrs[][16]
  * 509). With no nameserver line AF_INET6 is -ENOENT (the kernel's own server answers A queries only). */
 long resolv_lookup_af(const char *name, int af, uint8_t *out, char *found, size_t found_cap, struct resolv_answer *ans);
 
+/* The A and AAAA lookups of getaddrinfo(AF_UNSPEC) at once, as glibc 2.44 sends them (measured): each candidate of the search
+ * list is asked for both through dns_query2 (510) from one port, and the pair's combined result (resolv_pair_result) drives the
+ * list and the server order. Returns that result; r4/r6 are the halves' own results for the candidate that ended the lookup,
+ * a4/a6 their answers when they answered, and canon the canonical name (the AAAA answer's when it has one). */
+struct resolv_pair { struct resolv_answer a4, a6; long r4, r6; char canon[256]; };
+long resolv_lookup_pair(const char *name, struct resolv_pair *pair);
+long resolv_pair_result(long a, long b);
+
 /* The host name of `addr` (4 bytes for AF_INET, 16 for AF_INET6) from a PTR query to the nameservers of /etc/resolv.conf, with
  * its timeout and attempts, through dns_ptr (508); NUL-terminated and cut to `cap`. 0 or the dns_query results; -ENOENT also when
  * the file names no nameserver. gethostbyaddr and getnameinfo use it for an address /etc/hosts does not name. */

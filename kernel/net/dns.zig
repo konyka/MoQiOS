@@ -174,6 +174,80 @@ pub fn queryPtr(addr: []const u8, server: Server, timeout_ns: u64, yield: Yield,
     return queryType(qname, server, timeout_ns, yield, ans, TYPE_PTR);
 }
 
+/// The A and AAAA queries for `hostname` sent back to back from one port to `server`, as glibc 2.44 sends an AF_UNSPEC lookup's
+/// pair (measured), waiting at most `timeout_ns` for both replies: how each ended, the A half first. A truncated reply asks that
+/// half again over TCP. Literals and static names answer the A half and are NODATA for AAAA, without a query.
+pub fn queryPair(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans4: *dns_answer.Answer, ans6: *dns_answer.Answer) [2]dns_policy.Outcome {
+    if (hostname.len == 0 or hostname.len > MAX_NAME) return .{ .nxdomain, .nxdomain };
+    const local: ?[4]u8 = @import("static_hosts.zig").lookup(hostname) orelse if (isIpV4(hostname)) parseIpV4(hostname) else null;
+    if (local) |ip| {
+        dns_answer.single(ans4, hostname, ip);
+        return .{ .answer, .nodata };
+    }
+    var out: [2]dns_policy.Outcome = .{ .timeout, .timeout };
+    var done = [2]bool{ false, false };
+    const qtypes = [2]u16{ TYPE_A_Q, TYPE_AAAA };
+    const answers = [2]*dns_answer.Answer{ ans4, ans6 };
+    const src_port = udp.reserveEphemeralFor(server == .v6) orelse return .{ .failed, .failed };
+    defer udp.releasePort(src_port);
+    const ids = [2]u16{ newQueryId(), newQueryId() };
+    var pkts: [2][512]u8 = undefined;
+    var lens: [2]usize = undefined;
+    for (0..2) |k| lens[k] = buildQuery(&pkts[k], hostname, qtypes[k], ids[k]);
+    // Both go out before any reply is read (see queryUdp for why a send is retried).
+    const send_start = tsc.nanos();
+    var send_iters: u32 = 0;
+    var sent = [2]bool{ false, false };
+    while (!(sent[0] and sent[1]) and !dns_policy.waitExpiredAfter(send_start, tsc.nanos(), send_iters, timeout_ns)) : (send_iters += 1) {
+        for (0..2) |k| {
+            if (sent[k]) continue;
+            sent[k] = switch (server) {
+                .v4 => |s4| udp.sendTo(s4, DNS_PORT, src_port, &pkts[k], @intCast(lens[k])),
+                .v6 => |s6| udp.sendToV6(s6, DNS_PORT, src_port, &pkts[k], @intCast(lens[k])),
+            };
+        }
+        if (sent[0] and sent[1]) break;
+        pumpRx();
+        if (yield) |y| (if (!y()) return .{ .interrupted, .interrupted }) else cpu.pause();
+    }
+    if (!(sent[0] and sent[1])) return .{ .timeout, .timeout };
+    const start = tsc.nanos();
+    var wait_iters: u32 = 0;
+    while (!(done[0] and done[1]) and !dns_policy.waitExpiredAfter(start, tsc.nanos(), wait_iters, timeout_ns)) : (wait_iters += 1) {
+        pumpRx();
+        var buf: [MAX_REPLY]u8 = undefined;
+        var from_ip: [4]u8 = .{ 0, 0, 0, 0 };
+        var from6: [16]u8 = @splat(0);
+        var from_port: u16 = 0;
+        var full: u16 = 0;
+        const n = switch (server) {
+            .v4 => udp.recvFrom(src_port, &buf, @intCast(buf.len), &from_ip, &from_port),
+            .v6 => udp.recvFromV6Ex(src_port, &buf, @intCast(buf.len), &from6, &from_port, &full, false),
+        };
+        if (n >= 12) {
+            const id = bo.readU16BeAt(&buf, 0);
+            for (0..2) |k| {
+                if (done[k]) continue;
+                const accepted = switch (server) {
+                    .v4 => |s4| dns_policy.acceptResponse(from_ip, from_port, s4, id, ids[k]),
+                    .v6 => |s6| dns_policy.acceptResponse6(from6, from_port, s6, id, ids[k]),
+                };
+                if (!accepted) continue;
+                if (readReply(buf[0..@intCast(n)], hostname, qtypes[k], answers[k])) |res| {
+                    out[k] = res.outcome;
+                    done[k] = true;
+                }
+            }
+            continue; // another datagram may be queued
+        }
+        if (yield) |y| (if (!y()) return .{ if (done[0]) out[0] else .interrupted, if (done[1]) out[1] else .interrupted }) else cpu.pause();
+    }
+    for (0..2) |k| {
+        if (out[k] == .truncated) out[k] = queryTcp(hostname, server, timeout_ns, yield, answers[k], qtypes[k]).outcome;
+    }
+    return out;
+}
+
 const TYPE_A_Q: u16 = 1;
 const TYPE_PTR: u16 = 12;
 const TYPE_AAAA: u16 = 28;

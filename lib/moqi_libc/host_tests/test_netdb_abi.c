@@ -68,6 +68,32 @@ long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, lo
         }
         return r;
     }
+    if (nr == SYS_dns_query2) {
+        /* dns_query2 (510): the next two scripted replies (A, then AAAA), logged as "name/2@server/limit;"; an answering half
+         * gets 10.0.0.<call number> or 2001:db8::<call number> under the asked name. */
+        long ra = q_calls < q_n ? q_reply[q_calls] : -38;
+        long rb = q_calls + 1 < q_n ? q_reply[q_calls + 1] : -38;
+        q_calls += 2;
+        size_t l2 = strlen(q_log);
+        const unsigned char *sv = (const unsigned char *)a2;
+        int six2 = (a3 & 0x80000000L) != 0;
+        snprintf(q_log + l2, sizeof q_log - l2, "%s/2@%s%u/%ld;", (const char *)a1, six2 ? "v" : "", (six2 ? sv[15] : sv[3]) % 10,
+                 (a3 & 0x3fffffffL) / 1000);
+        long rr[2] = {ra, rb};
+        unsigned char *dst[2] = {(unsigned char *)a4, (unsigned char *)a5};
+        for (int k = 0; k < 2; k++) {
+            if (rr[k] != 0) continue;
+            size_t al = k ? 16 : 4;
+            unsigned char *ans = dst[k];
+            ans[0] = 1; ans[1] = 0; ans[2] = (unsigned char)al;
+            memset(ans + 3, 0, al);
+            if (al == 4) { ans[3] = 10; ans[6] = (unsigned char)(q_calls - 1 + k); }
+            else { ans[3] = 0x20; ans[4] = 0x01; ans[5] = 0x0d; ans[6] = 0xb8; ans[18] = (unsigned char)(q_calls - 1 + k); }
+            strcpy((char *)ans + 3 + al, (const char *)a1);
+        }
+        (void)a6;
+        return (-ra & 0xff) | (-rb & 0xff) << 8;
+    }
     long r = (nr == SYS_dns_query || nr == SYS_dns_query6) && q_calls < q_n ? q_reply[q_calls] : -38;
     q_calls++;
     size_t l = strlen(q_log);
@@ -134,18 +160,22 @@ static void q_script(const char *conf, const long *replies, int n) {
  * allocator. (It cannot forward to the host malloc: with -fno-builtin that would call back into this function.) */
 #include <stdlib.h>
 static unsigned char arena[1 << 16];
-static size_t arena_used;
+static size_t arena_used, arena_last;
 static int live_allocs;
 void *malloc(size_t n) {
     n = (n + 15) & ~(size_t)15;
     if (arena_used + n > sizeof(arena)) return (void *)0;
     void *p = arena + arena_used;
+    arena_last = arena_used;
     arena_used += n;
     live_allocs++;
     return p;
 }
+/* The most recent block is given back, so a temporary buffer (getaddrinfo's AF_UNSPEC pair, hello530) does not use up the arena. */
 void free(void *p) {
-    if (p) live_allocs--;
+    if (!p) return;
+    live_allocs--;
+    if (p == arena + arena_last) arena_used = arena_last;
 }
 
 /* Scripted socket layer for tcp_connect_host(): records every call number in order and answers per call number. */
@@ -1001,15 +1031,16 @@ int main(void) {
         struct addrinfo hints, *res = 0;
         memset(&hints, 0, sizeof hints);
         hints.ai_socktype = SOCK_STREAM;
+        /* hello530: AF_UNSPEC sends both at once through dns_query2 (510); the scripted replies are A first, then AAAA. */
         q_script(one, ok2, 2);
         assert(getaddrinfo("both.test", 0, &hints, &res) == 0);
         assert(res && res->ai_family == AF_INET6 && res->ai_next && res->ai_next->ai_family == AF_INET && res->ai_next->ai_next == 0);
-        assert(strcmp(q_log, "both.test/6@1/5;both.test@1/5;") == 0);
-        freeaddrinfo(res);
-        q_script(one, nd_ok, 2);
-        assert(getaddrinfo("v4.test", 0, &hints, &res) == 0 && res->ai_family == AF_INET && res->ai_next == 0);
+        assert(strcmp(q_log, "both.test/2@1/5;") == 0);
         freeaddrinfo(res);
         q_script(one, ok_nd, 2);
+        assert(getaddrinfo("v4.test", 0, &hints, &res) == 0 && res->ai_family == AF_INET && res->ai_next == 0);
+        freeaddrinfo(res);
+        q_script(one, nd_ok, 2);
         assert(getaddrinfo("v6.test", 0, &hints, &res) == 0 && res->ai_family == AF_INET6 && res->ai_next == 0);
         freeaddrinfo(res);
         q_script(one, nd_nx, 2);
@@ -1022,6 +1053,39 @@ int main(void) {
         assert(getaddrinfo("x.test", 0, &hints, &res) == EAI_NODATA);
         q_script(one, sf_sf, 2);
         assert(getaddrinfo("x.test", 0, &hints, &res) == EAI_AGAIN);
+        /* The pair's combined result drives the search list (glibc 2.44, measured): one half answering ends it, even when the
+         * other half failed and a later domain has both; both failing softly goes on; FORMERR or REFUSED ends the domains. */
+        {
+            static const char srch[] = "nameserver 10.0.0.1\nsearch d1 d2\noptions attempts:1\n";
+            static const long a_only[] = {0, -2, 0, 0}, soft[] = {-2, -61, 0, 0}, sf2[] = {-11, -11, 0, 0}, fe2[] = {-71, -2, -2, -2};
+            static const long rf2[] = {-111, -11, -2, -2}, nd_end[] = {-2, -2, -2, -2, -61, -61}, sf_end[] = {-2, -2, -2, -2, -11, -11};
+            hints.ai_family = AF_UNSPEC;
+            hints.ai_flags = 0;
+            q_script(srch, a_only, 4);
+            assert(getaddrinfo("x", 0, &hints, &res) == 0 && res->ai_family == AF_INET && res->ai_next == 0 && strcmp(q_log, "x.d1/2@1/5;") == 0);
+            freeaddrinfo(res);
+            q_script(srch, soft, 4);
+            assert(getaddrinfo("x", 0, &hints, &res) == 0 && res->ai_next && strcmp(q_log, "x.d1/2@1/5;x.d2/2@1/5;") == 0);
+            freeaddrinfo(res);
+            q_script(srch, sf2, 4);
+            assert(getaddrinfo("x", 0, &hints, &res) == 0 && strcmp(q_log, "x.d1/2@1/5;x.d2/2@1/5;") == 0);
+            freeaddrinfo(res);
+            q_script(srch, fe2, 4);
+            assert(getaddrinfo("x", 0, &hints, &res) == EAI_NONAME && strcmp(q_log, "x.d1/2@1/5;x/2@1/5;") == 0);
+            q_script(srch, rf2, 4);
+            assert(getaddrinfo("x", 0, &hints, &res) == EAI_NONAME && strcmp(q_log, "x.d1/2@1/5;x/2@1/5;") == 0);
+            q_script(srch, nd_end, 6);
+            assert(getaddrinfo("x", 0, &hints, &res) == EAI_NODATA);
+            q_script(srch, sf_end, 6);
+            assert(getaddrinfo("x", 0, &hints, &res) == EAI_AGAIN);
+            /* A server that does not reply moves to the next one with the pair. */
+            static const char two[] = "nameserver 10.0.0.1\nnameserver 10.0.0.2\noptions attempts:1 timeout:2\n";
+            static const long to_ok[] = {-110, -110, 0, 0};
+            q_script(two, to_ok, 4);
+            assert(getaddrinfo("y.test", 0, &hints, &res) == 0 && res->ai_next && strcmp(q_log, "y.test/2@1/2;y.test/2@2/2;") == 0);
+            freeaddrinfo(res);
+            hints.ai_family = AF_UNSPEC;
+        }
         /* AF_INET6: AAAA only; AI_V4MAPPED maps the A answer when there is no AAAA; with an AAAA it is not asked unless AI_ALL. */
         hints.ai_family = AF_INET6;
         q_script(one, nd_ok, 2);

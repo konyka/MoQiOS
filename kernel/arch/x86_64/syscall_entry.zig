@@ -2618,6 +2618,9 @@ pub fn syscallDispatch(frame: *SyscallFrame) callconv(.c) void {
         509 => { // dns_query6(name, out16, server4, timeout_ms, ans, ans_len) — dns_query for AAAA records
             frame.rax = @bitCast(syscallDnsQueryType(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9, true));
         },
+        510 => { // dns_query2(name, server, timeout_ms, ans_a, ans_aaaa, ans_len) — the A and AAAA queries of an AF_UNSPEC lookup at once
+            frame.rax = @bitCast(syscallDnsQuery2(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
+        },
         508 => { // dns_ptr(addr, family, server4, timeout_ms, name_out, name_len) — a reverse (PTR) query to one server
             frame.rax = @bitCast(syscallDnsPtr(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9));
         },
@@ -6724,6 +6727,52 @@ fn syscallDnsQueryType(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_arg
         if (copy.copyToUser(@ptrFromInt(ans_ptr), enc[0..n], n) != n) return -14;
     }
     return 0;
+}
+
+/// dns_query2(name, server, timeout_arg, ans_a, ans_aaaa, ans_len) (510): the A and AAAA queries for `name` to one server at once,
+/// waiting at most the limit for both replies. The server and limit as dns_query; each answer buffer gets its half's encoded
+/// answer when that half answered. Returns dns_policy.packPair of the two results (each as dns_query's), or a -errno for the call
+/// as a whole: EFAULT, EINVAL, ERANGE (`ans_len` under 256), ENOENT/ENAMETOOLONG/EINVAL for the name, before any query.
+fn syscallDnsQuery2(name_ptr: u64, server_ptr: u64, timeout_arg: u64, ans_a: u64, ans_aaaa: u64, ans_len: u64) i64 {
+    const copy = @import("../../mm/copy_from_user.zig");
+    const hp = @import("../../net/hostname_policy.zig");
+    const dp = @import("../../net/dns_policy.zig");
+    const timeout_ms = timeout_arg & ~(dp.SERVER6_FLAG | dp.SCOPE6_FLAG);
+    const server = readDnsServer(server_ptr, timeout_arg) orelse return -22;
+    if (server == .fault) return -14;
+    if (server == .err) return server.err;
+    if (!dp.timeoutValid(timeout_ms)) return -22;
+    if (ans_len < 256) return -34; // ERANGE
+    const cap: usize = @intCast(@min(ans_len, 4096));
+    if (!copy.validateUserBufferWritable(ans_a, cap) or !copy.validateUserBufferWritable(ans_aaaa, cap)) return -14;
+    var buf: [256]u8 = undefined;
+    const name = switch (userPathResult(name_ptr, &buf)) {
+        .ok => |n| n,
+        .err => |e| return e,
+    };
+    switch (hp.check(name)) {
+        .ok => {},
+        .empty => return -2, // ENOENT
+        .too_long => return -36, // ENAMETOOLONG
+        .invalid => return -22, // EINVAL
+    }
+    const da = @import("../../net/dns_answer.zig");
+    var ans4: da.Answer = .{};
+    var ans6: da.Answer = .{};
+    const r = @import("../../net/dns.zig").queryPair(hp.stripTrailingDot(name), server.ok, timeout_ms * 1_000_000, dnsSleep, &ans4, &ans6);
+    var res = [2]i64{ dp.queryResult(r[0]), dp.queryResult(r[1]) };
+    const dsts = [2]u64{ ans_a, ans_aaaa };
+    const answers = [2]*const da.Answer{ &ans4, &ans6 };
+    for (0..2) |k| {
+        if (res[k] != 0) continue;
+        var enc: [da.MAX_ENCODED]u8 = undefined;
+        const n = da.encode(answers[k], enc[0..@min(cap, enc.len)]) orelse {
+            res[k] = -90; // EMSGSIZE
+            continue;
+        };
+        if (copy.copyToUser(@ptrFromInt(dsts[k]), enc[0..n], n) != n) return -14;
+    }
+    return dp.packPair(res[0], res[1]);
 }
 
 /// The nameserver of dns_query, dns_query6 or dns_ptr: 4 bytes at `server_ptr`, or 16 when SERVER6_FLAG is set in `timeout_arg`
