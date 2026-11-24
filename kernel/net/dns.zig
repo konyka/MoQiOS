@@ -374,10 +374,10 @@ fn queryTcpN(comptime n: usize, hostname: []const u8, dns_server: Server, timeou
         pumpRx();
         _ = @import("lo.zig").drain();
         const st = tcp.tcpPoll(idx);
-        if (st < 0) return all(.tcp_failed); // refused or reset
+        if (st < 0) return tcpGaveUp(.poll, st, sent, total, got, all(.tcp_failed)); // refused or reset
         if (st == 1 and sent < total) {
             const w = tcp.tcpSend(idx, pkt[sent..].ptr, @intCast(total - sent));
-            if (w < 0) return all(.tcp_failed);
+            if (w < 0) return tcpGaveUp(.send, w, sent, total, got, all(.tcp_failed));
             sent += @intCast(w);
             _ = @import("lo.zig").drain();
         }
@@ -415,8 +415,8 @@ fn queryTcpN(comptime n: usize, hostname: []const u8, dns_server: Server, timeou
                 }
                 continue;
             }
-            if (r == 0) return all(.tcp_failed); // closed before every reply
-            if (r != -11) return all(.tcp_failed);
+            if (r == 0) return tcpGaveUp(.eof, 0, sent, total, got, all(.tcp_failed)); // closed before every reply
+            if (r != -11) return tcpGaveUp(.recv, r, sent, total, got, all(.tcp_failed));
         }
         if (yield) |y| (if (!y()) {
             for (0..n) |q| (if (!done[q]) {
@@ -425,7 +425,28 @@ fn queryTcpN(comptime n: usize, hostname: []const u8, dns_server: Server, timeou
             return out;
         }) else cpu.pause();
     }
-    return out;
+    return tcpGaveUp(.timeout, @intCast(iters), sent, total, got, out);
+}
+
+const TcpStop = enum { poll, send, recv, eof, timeout };
+
+/// One serial line when a DNS query over TCP stops without its answers (connection refused or reset, closed early, a send or recv
+/// error, or the wait ran out): which, the value, and how far it got (query bytes sent of total, reply bytes read). Rare, and it is
+/// what is needed to tell these apart when a lookup fails only now and then (hello539 B). Returns `r`.
+fn tcpGaveUp(comptime why: TcpStop, v: i64, sent: usize, total: usize, got: usize, r: anytype) @TypeOf(r) {
+    const ser = @import("../arch/arch.zig").serial;
+    const fm = @import("../lib/fmt.zig");
+    ser.writeString("[dns] tcp " ++ @tagName(why) ++ " v=");
+    if (v < 0) ser.writeString("-");
+    fm.writeDecimal64(@abs(v));
+    ser.writeString(" sent=");
+    fm.writeDecimal64(sent);
+    ser.writeString("/");
+    fm.writeDecimal64(total);
+    ser.writeString(" got=");
+    fm.writeDecimal64(got);
+    ser.writeString("\n");
+    return r;
 }
 
 fn queryUdp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16, qf: dns_policy.QueryFlags) Result {

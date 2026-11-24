@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 static void print(const char *s) { fputs(s, stdout); fflush(stdout); }
 static long sock_udp(void) { int s = socket(AF_INET, SOCK_DGRAM, 0); return s < 0 ? -errno : s; }
@@ -48,6 +49,7 @@ static long wrt(long s, const void *b, long n) { long r = write((int)s, b, (size
 #include "../lib/moqi_libc/include/signal.h"
 #include "../lib/moqi_libc/include/netdb.h"
 #include "../lib/moqi_libc/include/fcntl.h"
+#include "../lib/moqi_libc/include/time.h"
 #define NR_SENDTO 121
 #define NR_RECVFROM 122
 static long sock_udp(void) { return syscall3(SYS_socket, 2, 2, 0); }
@@ -238,10 +240,16 @@ int main(void) {
              ready[1] ? ready[1] : '-', wr, wn, a);
     check(ready[0] == 'R' && ready[1] == 'R' && wr == 0 && wn == 0 && a_ok, msg);
 
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     h = gethostbyname("huge539.test");
+    clock_gettime(CLOCK_MONOTONIC, &t1);
     int b_ok = good(h);
     describe(h, b, sizeof b);
-    snprintf(msg, sizeof msg, "B: 4000 records, 64029 bytes over TCP: %s (hit/0.1/>=64)", b);
+    long b_ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    /* The time it took goes with the result: an occasional failure under load (see the review document) is told apart from a
+     * timeout by it, and the kernel prints why a TCP query gave up ("[dns] tcp ..."). */
+    snprintf(msg, sizeof msg, "B: 4000 records, 64029 bytes over TCP: %s in %ld ms (hit/0.1/>=64)", b, b_ms);
     check(b_ok, msg);
 
     struct addrinfo hints, *res = 0;

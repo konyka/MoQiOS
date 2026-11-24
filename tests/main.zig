@@ -18849,7 +18849,7 @@ test "use-vc asks an AF_UNSPEC pair on one TCP connection, both queries before a
     try std.testing.expect(std.mem.indexOf(u8, dns, "return queryTcpN(1, hostname, dns_server, timeout_ns, yield, .{ans}, .{qtype}, qf)[0];") != null);
     try std.testing.expect(std.mem.indexOf(u8, dns, "queryTcpN(2, hostname, server, timeout_ns, yield, .{ ans4, ans6 }, .{ TYPE_A_Q, TYPE_AAAA }, qf)") != null);
     // A connection that closes before every reply fails the whole pair, an answered half included (glibc: EAI_AGAIN).
-    try std.testing.expect(std.mem.indexOf(u8, dns, "if (r == 0) return all(.tcp_failed); // closed before every reply") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "if (r == 0) return tcpGaveUp(.eof, 0, sent, total, got, all(.tcp_failed)); // closed before every reply") != null);
 }
 
 test "AAAA answers: dns_answer reads type-28 records of 16 bytes for an AAAA query, A records for an A query (hello525)" {
@@ -19200,4 +19200,11 @@ test "write() of 0 bytes on a ping socket goes to the send path, which refuses a
     try std.testing.expect(std.mem.indexOf(u8, fio, "if (d.fd_type == .udp_socket) return true;") != null);
     try std.testing.expect(std.mem.indexOf(u8, fio, "if (d.fd_type == .udp_socket) return !d.udp_ping;") == null);
     try std.testing.expectEqual(@as(i64, -22), kt.ping_policy.sendErrno(0, 0, 0));
+}
+
+test "a DNS query over TCP that stops without its answers says why on the serial console (hello539 B diagnosis)" {
+    const dns = kt.dns_source;
+    // Every early exit of queryTcpN goes through tcpGaveUp: refused or reset, a send or recv error, closed early, out of time.
+    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, dns, "return tcpGaveUp(."));
+    try std.testing.expect(std.mem.indexOf(u8, dns, "return all(.tcp_failed); // refused or reset") == null);
 }
