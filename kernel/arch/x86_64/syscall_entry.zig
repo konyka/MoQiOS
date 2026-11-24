@@ -6691,9 +6691,10 @@ fn syscallDnsQueryType(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_arg
     const dp = @import("../../net/dns_policy.zig");
     const out_len: usize = if (v6) 16 else 4;
     if (!copy.validateUserBufferWritable(out_ptr, out_len)) return -14; // EFAULT, before any network wait
-    const timeout_ms = timeout_arg & ~dp.SERVER6_FLAG;
+    const timeout_ms = timeout_arg & ~(dp.SERVER6_FLAG | dp.SCOPE6_FLAG);
     const server = readDnsServer(server_ptr, timeout_arg) orelse return -22;
     if (server == .fault) return -14;
+    if (server == .err) return server.err;
     if (!dp.timeoutValid(timeout_ms)) return -22;
     if (ans_len != 0 and ans_len < 256) return -34; // ERANGE
     if (ans_len != 0 and !copy.validateUserBufferWritable(ans_ptr, @intCast(@min(ans_len, 4096)))) return -14;
@@ -6726,19 +6727,30 @@ fn syscallDnsQueryType(name_ptr: u64, out_ptr: u64, server_ptr: u64, timeout_arg
 }
 
 /// The nameserver of dns_query, dns_query6 or dns_ptr: 4 bytes at `server_ptr`, or 16 when SERVER6_FLAG is set in `timeout_arg`
-/// (an IPv4-mapped one is asked over IPv4). null for an address that is not a unicast server (EINVAL); .fault for a bad pointer.
-const DnsServerArg = union(enum) { ok: @import("../../net/dns.zig").Server, fault };
+/// (an IPv4-mapped one is asked over IPv4); with SCOPE6_FLAG as well a u32 scope id follows them. null for an address that is not a
+/// unicast server, or SCOPE6_FLAG without SERVER6_FLAG (EINVAL); .fault for a bad pointer; .err for a link-local server whose scope
+/// is not the NIC's (scopedServerErrno), before any network wait.
+const DnsServerArg = union(enum) { ok: @import("../../net/dns.zig").Server, fault, err: i64 };
 fn readDnsServer(server_ptr: u64, timeout_arg: u64) ?DnsServerArg {
     const copy = @import("../../mm/copy_from_user.zig");
     const dp = @import("../../net/dns_policy.zig");
+    if (timeout_arg & dp.SCOPE6_FLAG != 0 and timeout_arg & dp.SERVER6_FLAG == 0) return null;
     if (timeout_arg & dp.SERVER6_FLAG != 0) {
         var s6: [16]u8 = undefined;
         if (copy.copyFromUser(&s6, @ptrFromInt(server_ptr), 16) != 16) return .fault;
+        var scope: u32 = 0;
+        if (timeout_arg & dp.SCOPE6_FLAG != 0) {
+            var sb: [4]u8 = undefined;
+            if (copy.copyFromUser(&sb, @ptrFromInt(server_ptr + 16), 4) != 4) return .fault;
+            scope = std.mem.readInt(u32, &sb, .little);
+        }
         if (dp.mappedV4(s6)) |s4| {
             if (!dp.serverUsable(s4)) return null;
             return .{ .ok = .{ .v4 = s4 } };
         }
         if (!dp.serverUsable6(s6)) return null;
+        const e = dp.scopedServerErrno(s6, scope, @import("../../net/nic.zig").isActive());
+        if (e != 0) return .{ .err = e };
         return .{ .ok = .{ .v6 = s6 } };
     }
     var s4: [4]u8 = undefined;
@@ -6763,9 +6775,10 @@ fn syscallDnsPtr(addr_ptr: u64, family: u64, server_ptr: u64, timeout_arg: u64, 
     if (!copy.validateUserBufferWritable(out_ptr, 256)) return -14;
     var addr: [16]u8 = undefined;
     if (copy.copyFromUser(addr[0..alen], @ptrFromInt(addr_ptr), alen) != alen) return -14;
-    const timeout_ms = timeout_arg & ~dp.SERVER6_FLAG;
+    const timeout_ms = timeout_arg & ~(dp.SERVER6_FLAG | dp.SCOPE6_FLAG);
     const server = readDnsServer(server_ptr, timeout_arg) orelse return -22;
     if (server == .fault) return -14;
+    if (server == .err) return server.err;
     if (!dp.timeoutValid(timeout_ms)) return -22;
     const da = @import("../../net/dns_answer.zig");
     var ans: da.Answer = .{};

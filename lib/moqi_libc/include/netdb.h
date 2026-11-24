@@ -56,12 +56,14 @@ long resolv_ptr(const void *addr, int family, char *name, size_t cap);
 size_t resolv_conf_servers(const char *text, size_t len, uint8_t out[][4], size_t cap);
 
 /* A nameserver of /etc/resolv.conf: an IPv4 address (addr[0..4]) or, with v6 set, an IPv6 one (addr[0..16]). */
-struct resolv_server { uint8_t addr[16]; int v6; };
+/* `addr` is followed by `scope` so that a scoped server's 20 bytes go to the kernel as they are (SCOPE6_FLAG). */
+struct resolv_server { uint8_t addr[16]; uint32_t scope; int v6; int unusable; };
 
 /* resolv_conf_servers with IPv6 nameservers too, as glibc's res_init keeps them (measured): up to `cap` in file order, IPv4 and IPv6
- * mixed. An IPv6 line is an inet_pton(AF_INET6) address; ::, multicast and a "%scope" suffix (no interface routing for the resolver
- * here) are left out. An IPv4-mapped ::ffff:a.b.c.d is kept as IPv6 and the kernel asks it over IPv4. gethostbyname_ipv4 and the
- * others use this list. */
+ * mixed. An IPv6 line is an inet_pton(AF_INET6) address; :: and multicast are left out. An IPv4-mapped ::ffff:a.b.c.d is kept as
+ * IPv6 and the kernel asks it over IPv4. A "%scope" suffix (glibc 2.44, measured) is an interface name or a number (digits only, at
+ * most 4294967295) and gives a link-local server its `scope`; a link-local server without a valid one keeps its slot but is
+ * `unusable`, never asked. Any other address ignores the suffix. gethostbyname_ipv4 and the others use this list. */
 size_t resolv_conf_servers_any(const char *text, size_t len, struct resolv_server *out, size_t cap);
 
 /* The names gethostbyname_ipv4 asks for `name`, in order, as glibc's res_search builds them from an /etc/resolv.conf text

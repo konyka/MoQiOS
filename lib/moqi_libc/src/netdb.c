@@ -1,6 +1,7 @@
 /* netdb.c — hostname resolution wrappers (see include/netdb.h). */
 #include "../include/netdb.h"
 #include "../include/byteorder.h"
+#include "../include/errno.h"
 
 /* The host unit test links this file against a recording stub instead of the real `syscall` instruction. */
 #ifdef MOQI_HOST_TEST_SYSCALL
@@ -59,6 +60,26 @@ size_t resolv_conf_servers(const char *text, size_t len, uint8_t out[][4], size_
 
 #define RESOLV_MAXNS 3
 
+unsigned int if_nametoindex(const char *name);
+
+/* The interface index of a nameserver's "%scope": all digits as a number (at most 4294967295), else an interface name; 0 when it
+ * is neither (glibc 2.44 res_init, measured). */
+static uint32_t resolv_scope(const char *s) {
+    if (!*s) return 0;
+    uint64_t v = 0;
+    const char *p = s;
+    while (*p >= '0' && *p <= '9') {
+        v = v * 10 + (uint64_t)(*p - '0');
+        if (v > 0xFFFFFFFFu) return 0;
+        p++;
+    }
+    if (!*p) return (uint32_t)v;
+    int saved = errno;
+    unsigned idx = if_nametoindex(s);
+    errno = saved;
+    return idx;
+}
+
 size_t resolv_conf_servers_any(const char *text, size_t len, struct resolv_server *out, size_t cap) {
     static const char kw[] = "nameserver";
     const size_t kl = sizeof kw - 1;
@@ -85,14 +106,21 @@ size_t resolv_conf_servers_any(const char *text, size_t len, struct resolv_serve
                         memcpy(o->addr, ip, 4);
                         count++;
                     }
-                } else if (!strchr(addr, '%') && ipv6_from_text(addr, ip)) {
-                    /* glibc keeps every IPv6 nameserver line; ::, multicast (the kernel refuses them) and a "%scope" one (no
-                     * interface routing for it here) are left out. */
+                } else {
+                    /* glibc keeps every IPv6 nameserver line but :: and multicast (the kernel refuses them). */
+                    char *pct = strchr(addr, '%');
+                    if (pct) *pct = 0;
                     int nonzero = 0;
-                    for (int k = 0; k < 16; k++) nonzero |= ip[k];
+                    if (ipv6_from_text(addr, ip)) {
+                        for (int k = 0; k < 16; k++) nonzero |= ip[k];
+                    }
                     if (nonzero && ip[0] != 0xff) {
                         o->v6 = 1;
                         memcpy(o->addr, ip, 16);
+                        if (ip[0] == 0xfe && (ip[1] & 0xc0) == 0x80) {
+                            o->scope = pct ? resolv_scope(pct + 1) : 0;
+                            o->unusable = o->scope == 0;
+                        }
                         count++;
                     }
                 }
@@ -106,8 +134,11 @@ size_t resolv_conf_servers_any(const char *text, size_t len, struct resolv_serve
 /* Ask `out` of server `sv` through `nr` (507, 508 or 509), with its address in the form the kernel takes: 4 bytes, or 16 with
  * SERVER6_FLAG in the timeout argument. */
 #define RESOLV_SERVER6_FLAG 0x80000000L
+#define RESOLV_SCOPE6_FLAG 0x40000000L
 static long resolv_ask(long nr, long a1, long a2, const struct resolv_server *sv, long wait_ms, long a5, long a6) {
-    return NETDB_SYSCALL6(nr, a1, a2, (long)sv->addr, wait_ms | (sv->v6 ? RESOLV_SERVER6_FLAG : 0), a5, a6);
+    if (sv->unusable) return -101; /* ENETUNREACH: a link-local server with no interface fails at once, as in glibc */
+    long flags = sv->v6 ? RESOLV_SERVER6_FLAG | (sv->scope ? RESOLV_SCOPE6_FLAG : 0) : 0;
+    return NETDB_SYSCALL6(nr, a1, a2, (long)sv->addr, wait_ms | flags, a5, a6);
 }
 #define RESOLV_NAME_MAX 253
 #define RESOLV_LABEL_MAX 63
@@ -317,7 +348,7 @@ static long resolve_one(const char *name, uint8_t *out, struct resolv_server *ns
                                 ans ? (long)ans->buf : 0, ans ? (long)sizeof ans->buf : 0);
             if (r == 0 && ans) ans->len = sizeof ans->buf;
             if (r == -11 || r == -111) last_reply = r; /* SERVFAIL; NOTIMP or REFUSED: the last reply is what res_search sees */
-            if (r == -11 || r == -111 || r == -110) continue;
+            if (r == -11 || r == -111 || r == -110 || r == -101) continue; /* -101: the server cannot be reached, no wait */
             return r; /* an answer, NXDOMAIN, NODATA, another RCODE, or a bad argument */
         }
     }
@@ -428,7 +459,7 @@ long resolv_ptr(const void *addr, int family, char *name, size_t cap) {
         for (size_t i = 0; i < nns; i++) {
             long r = resolv_ask(SYS_dns_ptr, (long)addr, family, &ns[(first + i) % nns], resolv_wait_ms(opt.timeout, i, nns), (long)buf, (long)sizeof buf);
             if (r == -11 || r == -111) last = r;
-            if (r == -11 || r == -111 || r == -110) continue;
+            if (r == -11 || r == -111 || r == -110 || r == -101) continue;
             if (r == 0) {
                 size_t k = strnlen(buf, sizeof buf);
                 if (k >= cap) k = cap - 1;

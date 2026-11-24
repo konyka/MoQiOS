@@ -53,7 +53,13 @@ long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, lo
         const unsigned char *ad = (const unsigned char *)a1;
         unsigned last = a2 == 2 ? ad[3] : ad[15];
         int six = (a4 & 0x80000000L) != 0;
-        int w = snprintf(q_log + l, sizeof q_log - l, "ptr%ld:%u@%s%u;", a2, last, six ? "v" : "", six ? ((const unsigned char *)a3)[15] : ((const unsigned char *)a3)[3]);
+        char sc[16] = "";
+        if (a4 & 0x40000000L) {
+            uint32_t v;
+            memcpy(&v, (const unsigned char *)a3 + 16, 4);
+            snprintf(sc, sizeof sc, "%%%u", v);
+        }
+        int w = snprintf(q_log + l, sizeof q_log - l, "ptr%ld:%u@%s%u%s;", a2, last, six ? "v" : "", six ? ((const unsigned char *)a3)[15] : ((const unsigned char *)a3)[3], sc);
         (void)w;
         (void)a4;
         if (r == 0) {
@@ -77,8 +83,14 @@ long moqi_test_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, lo
         int six = (a4 & 0x80000000L) != 0;
         if (six) q_log[l++] = 'v';
         q_log[l++] = (char)('0' + (six ? srv[15] : srv[3]) % 10);
+        if (a4 & 0x40000000L) {
+            /* A scoped IPv6 server: the scope id follows the 16 bytes. */
+            uint32_t v;
+            memcpy(&v, srv + 16, 4);
+            l += (size_t)snprintf(q_log + l, sizeof q_log - l, "%%%u", v);
+        }
         q_log[l++] = '/';
-        long ms = (a4 & 0x7fffffffL) / 1000;
+        long ms = (a4 & 0x3fffffffL) / 1000;
         if (ms >= 10) q_log[l++] = (char)('0' + ms / 10 % 10);
         q_log[l++] = (char)('0' + ms % 10);
         q_log[l++] = ';';
@@ -1041,9 +1053,51 @@ int main(void) {
         static const char mix[] = "nameserver ::1\nnameserver 10.0.0.1\nnameserver 2001:db8::53 # x\nnameserver 10.0.0.2\n";
         assert(resolv_conf_servers_any(mix, sizeof mix - 1, sv, 3) == 3);
         assert(sv[0].v6 && sv[0].addr[15] == 1 && !sv[1].v6 && sv[1].addr[3] == 1 && sv[2].v6 && sv[2].addr[15] == 0x53);
-        static const char odd[] = "nameserver ::\nnameserver ff02::1\nnameserver fe80::1%lo\nnameserver 2001:db8::zz\nnameserver [::1]\n"
+        static const char odd[] = "nameserver ::\nnameserver ff02::1\nnameserver ff02::1%eth0\nnameserver 2001:db8::zz\nnameserver [::1]\n"
                                   "nameserver ::ffff:10.0.0.5\n";
         assert(resolv_conf_servers_any(odd, sizeof odd - 1, sv, 3) == 1 && sv[0].v6 && sv[0].addr[10] == 0xff && sv[0].addr[15] == 5);
+        /* hello529: a "%scope" (glibc 2.44 res_init, measured). A link-local server keeps its slot either way; it needs the scope of
+         * an interface, by name or number (digits only: no sign, no overflow; the name's case kept), else it is unusable. Any other
+         * address ignores the suffix. The kernel gets the scope after the address, with bit 30 of the timeout set. */
+        static const char sc[] = "nameserver fe80::53%eth0\nnameserver fe80::53%02\nnameserver ::1%bogus\n";
+        assert(resolv_conf_servers_any(sc, sizeof sc - 1, sv, 3) == 3);
+        assert(sv[0].v6 && sv[0].scope == 2 && !sv[0].unusable && sv[0].addr[0] == 0xfe && sv[0].addr[15] == 0x53);
+        assert(sv[1].scope == 2 && !sv[1].unusable && sv[2].scope == 0 && !sv[2].unusable && sv[2].addr[15] == 1);
+        static const char sc2[] = "nameserver fe80::53%lo\nnameserver fe80::53%99\nnameserver ff02::1%eth0\n";
+        assert(resolv_conf_servers_any(sc2, sizeof sc2 - 1, sv, 3) == 2 && sv[0].scope == 1 && sv[1].scope == 99);
+        static const char bad[] = "nameserver fe80::53\nnameserver fe80::53%bogus\nnameserver fe80::53%\nnameserver fe80::53%+2\n"
+                                  "nameserver fe80::53%2x\nnameserver fe80::53%4294967296\nnameserver FE80::53%ETH0\n";
+        size_t off = 0;
+        for (int k = 0; k < 7; k++) {
+            size_t e = off;
+            while (bad[e] != '\n') e++;
+            assert(resolv_conf_servers_any(bad + off, e - off + 1, sv, 3) == 1 && sv[0].v6 && sv[0].unusable);
+            off = e + 1;
+        }
+        /* An unusable server is never asked and fails at once, like a server the kernel cannot reach (ENETUNREACH for a scope that
+         * is not the NIC's): the next one is asked, and with none left the lookup is TRY_AGAIN. Three of them fill the list. */
+        {
+            static const char c1[] = "nameserver fe80::53\nnameserver 10.0.0.2\noptions attempts:1 timeout:2\n";
+            static const char c2[] = "nameserver fe80::53%lo\nnameserver fe80::53%99\nnameserver fe80::53\nnameserver 10.0.0.2\n"
+                                     "options attempts:1\n";
+            static const char c3[] = "nameserver fe80::53%eth0\noptions attempts:1 timeout:2\n";
+            static const long okr[] = {0}, unr[] = {-101, -101};
+            uint8_t o4[4];
+            q_script(c1, okr, 1);
+            assert(gethostbyname_ipv4("x.y", o4) == 0 && strcmp(q_log, "x.y@2/2;") == 0);
+            q_script(c2, unr, 2);
+            assert(gethostbyname_ipv4("x.y", o4) == -110 && strcmp(q_log, "x.y@v3%1/5;x.y@v3%99/3;") == 0);
+            q_script(c2, unr, 2);
+            assert(!gethostbyname("x.y") && h_errno == TRY_AGAIN && q_calls == 2);
+            q_script(c3, okr, 1);
+            assert(gethostbyname_ipv4("x.y", o4) == 0 && strcmp(q_log, "x.y@v3%2/2;") == 0);
+            q_script(c3, okr, 1);
+            uint8_t pa4[4] = {10, 2, 3, 4};
+            assert(gethostbyaddr(pa4, 4, AF_INET) && strcmp(q_log, "ptr2:4@v83%2;") == 0);
+            static const char c4[] = "nameserver fe80::53\noptions attempts:1\n";
+            q_script(c4, okr, 1);
+            assert(!gethostbyaddr(pa4, 4, AF_INET) && h_errno == TRY_AGAIN && q_calls == 0);
+        }
         /* The IPv4-only list is unchanged. */
         uint8_t n4[3][4];
         assert(resolv_conf_servers(mix, sizeof mix - 1, n4, 3) == 2 && n4[0][3] == 1 && n4[1][3] == 2);

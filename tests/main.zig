@@ -18382,7 +18382,7 @@ test "dns_query (507): a reply's RCODE and answers decide the outcome, and the w
     try std.testing.expect(std.mem.indexOf(u8, se, "if (ans_len != 0 and ans_len < 256) return -34; // ERANGE") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "const n = da.encode(&ans, enc[0..@intCast(@min(ans_len, enc.len))]) orelse return -90; // EMSGSIZE") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "if (!dp.timeoutValid(timeout_ms)) return -22;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, se, "const timeout_ms = timeout_arg & ~dp.SERVER6_FLAG;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "const timeout_ms = timeout_arg & ~(dp.SERVER6_FLAG | dp.SCOPE6_FLAG);") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "dns.queryVia(hp.stripTrailingDot(name), server.ok, timeout_ms * 1_000_000, dnsSleep, &ans);") != null);
     const dns = kt.dns_source;
     try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn queryVia(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer) Result {") != null);
@@ -18906,4 +18906,27 @@ test "a pipe write whose source runs into a hole, into a pipe that already holds
     // write() and writev() to a pipe size the write with it before any byte goes in.
     try std.testing.expect(std.mem.indexOf(u8, kt.file_io_source, "vfs_mod.pipeFaultedTakes(") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.readv_source, "vfs_mod.pipeFaultedTakes(") != null);
+}
+
+test "dns_query/dns_query6/dns_ptr take a scoped IPv6 nameserver: a link-local one only through the NIC (hello529)" {
+    const dp = kt.dns_policy;
+    // Bit 30 of the timeout argument, with bit 31: the scope id (u32) follows the 16 bytes of the address.
+    try std.testing.expectEqual(@as(u64, 0x4000_0000), dp.SCOPE6_FLAG);
+    const ll = [16]u8{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 };
+    const g = [16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 };
+    // glibc 2.44 (measured): a link-local server is asked through the interface its scope names; one with the scope of an interface
+    // that has no link-local address (lo), or of none, fails at once (ENETUNREACH here, no wait). Any other address ignores the scope.
+    try std.testing.expectEqual(@as(i64, 0), dp.scopedServerErrno(ll, 2, true));
+    try std.testing.expectEqual(@as(i64, -101), dp.scopedServerErrno(ll, 2, false));
+    try std.testing.expectEqual(@as(i64, -101), dp.scopedServerErrno(ll, 1, true));
+    try std.testing.expectEqual(@as(i64, -101), dp.scopedServerErrno(ll, 99, true));
+    try std.testing.expectEqual(@as(i64, -101), dp.scopedServerErrno(ll, 0, true));
+    try std.testing.expectEqual(@as(i64, 0), dp.scopedServerErrno(g, 99, false));
+    try std.testing.expectEqual(@as(i64, 0), dp.scopedServerErrno(.{ 0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 7, true));
+    // Wiring: the three system calls strip both flags from the limit, and readDnsServer reads the scope and checks it before any
+    // network wait.
+    const se = kt.syscall_entry_source;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, se, "const timeout_ms = timeout_arg & ~(dp.SERVER6_FLAG | dp.SCOPE6_FLAG);"));
+    try std.testing.expect(std.mem.indexOf(u8, se, "const e = dp.scopedServerErrno(s6, scope, @import(\"../../net/nic.zig\").isActive());") != null);
+    try std.testing.expect(std.mem.indexOf(u8, se, "if (timeout_arg & dp.SCOPE6_FLAG != 0 and timeout_arg & dp.SERVER6_FLAG == 0) return null;") != null);
 }

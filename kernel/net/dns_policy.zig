@@ -46,6 +46,18 @@ pub fn mappedV4(ip: [16]u8) ?[4]u8 {
 /// instead of 4. The limit is the low bits.
 pub const SERVER6_FLAG: u64 = 0x8000_0000;
 
+/// Bit 30, with SERVER6_FLAG: the 16 bytes are followed by a u32 scope id (/etc/resolv.conf "nameserver fe80::1%eth0").
+pub const SCOPE6_FLAG: u64 = 0x4000_0000;
+
+/// Whether a scoped IPv6 server can be asked: a link-local one only through the NIC (interface 2 while it is up, the only interface
+/// with a link-local address); glibc 2.44 fails such a server at once otherwise (measured), here -ENETUNREACH. Any other address
+/// ignores the scope.
+pub fn scopedServerErrno(ip: [16]u8, scope: u32, nic_active: bool) i64 {
+    if (!(ip[0] == 0xfe and (ip[1] & 0xc0) == 0x80)) return 0;
+    if (scope == 2 and nic_active) return 0;
+    return -101; // ENETUNREACH
+}
+
 /// What an accepted reply (right server, port and id) means for the query: it carries answers to look through, it settles that
 /// there is no address (an error RCODE such as NXDOMAIN, SERVFAIL or REFUSED, or NOERROR with no answers), or it is not a response.
 pub const Verdict = enum { answer, no_address, ignore };
