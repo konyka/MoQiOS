@@ -6,6 +6,7 @@
 ///   - Response parsing with header, question, answer sections
 ///   - Simple 16-entry LRU cache with TTL expiry
 ///   - Kernel API: dnsResolve(hostname) → [4]u8
+const std = @import("std");
 const serial = @import("../arch/arch.zig").serial;
 const cpu = @import("../arch/arch.zig").cpu;
 const udp = @import("udp.zig");
@@ -177,8 +178,8 @@ pub fn queryPtr(addr: []const u8, server: Server, timeout_ns: u64, yield: Yield,
 /// The A and AAAA queries for `hostname` sent back to back from one port to `server`, as glibc 2.44 sends an AF_UNSPEC lookup's
 /// pair (measured), waiting at most `timeout_ns` for both replies: how each ended, the A half first. A truncated reply asks that
 /// half again over TCP. Literals and static names answer the A half and are NODATA for AAAA, without a query. With `qf.vc`
-/// (options use-vc) both are asked over TCP only, one connection each (glibc sends both on one connection). With `qf.edns0` both
-/// carry an OPT record.
+/// (options use-vc) both are asked over TCP only, on one connection (queryTcpN, as glibc does). With `qf.edns0` both carry an OPT
+/// record.
 pub fn queryPair(hostname: []const u8, server: Server, timeout_ns: u64, yield: Yield, ans4: *dns_answer.Answer, ans6: *dns_answer.Answer, qf: dns_policy.QueryFlags) [2]dns_policy.Outcome {
     if (hostname.len == 0 or hostname.len > MAX_NAME) return .{ .nxdomain, .nxdomain };
     const local: ?[4]u8 = @import("static_hosts.zig").lookup(hostname) orelse if (isIpV4(hostname)) parseIpV4(hostname) else null;
@@ -187,9 +188,8 @@ pub fn queryPair(hostname: []const u8, server: Server, timeout_ns: u64, yield: Y
         return .{ .answer, .nodata };
     }
     if (qf.vc) {
-        const a = queryTcp(hostname, server, timeout_ns, yield, ans4, TYPE_A_Q, qf.edns0).outcome;
-        if (a == .interrupted) return .{ .interrupted, .interrupted };
-        return .{ a, queryTcp(hostname, server, timeout_ns, yield, ans6, TYPE_AAAA, qf.edns0).outcome };
+        const r = queryTcpN(2, hostname, server, timeout_ns, yield, .{ ans4, ans6 }, .{ TYPE_A_Q, TYPE_AAAA }, qf.edns0);
+        return .{ r[0].outcome, r[1].outcome };
     }
     var out: [2]dns_policy.Outcome = .{ .timeout, .timeout };
     var done = [2]bool{ false, false };
@@ -304,29 +304,57 @@ fn readReply(msg: []const u8, hostname: []const u8, qtype: u16, ans: *dns_answer
 }
 
 /// The query over TCP to `dns_server`:53 (RFC 1035 4.2.2: a 2-byte length, then the message), waiting at most `timeout_ns` for the
-/// connection and the whole reply. A refused, reset or closed connection is `tcp_failed`. A reply longer than the stack buffer
-/// moves to a heap buffer of the length its prefix announces (up to 2 + 65535 bytes), as glibc reads it whole (hello539).
+/// connection and the whole reply: queryTcpN with one query.
 fn queryTcp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16, edns0: bool) Result {
+    return queryTcpN(1, hostname, dns_server, timeout_ns, yield, .{ans}, .{qtype}, edns0)[0];
+}
+
+/// `n` queries for `hostname` (types `qtypes`, answers into `answers`) on one TCP connection to `dns_server`:53, all sent before
+/// any reply is read, as glibc 2.44 asks an AF_UNSPEC pair under "options use-vc" (measured, single-request too). Each reply goes
+/// to the waiting query whose id it carries (dns_policy.pendingFor), in whatever order they come; a reply with no such id, or that
+/// is not a response, fails the queries still waiting. A refused, reset or closed connection fails every query, an answered one
+/// included (glibc: EAI_AGAIN when the connection closes after the A reply, measured). A reply longer than the stack buffer moves
+/// to a heap buffer of the length its prefix announces (up to 2 + 65535 bytes), as glibc reads it whole (hello539). The wait is
+/// at most `timeout_ns`; glibc's read on the connection has no limit (measured: still waiting after 20 s with timeout:1), which is
+/// not copied, so a server that never replies cannot hold the caller forever.
+fn queryTcpN(comptime n: usize, hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, answers: [n]*dns_answer.Answer, qtypes: [n]u16, edns0: bool) [n]Result {
     const tcp = @import("tcp.zig");
     const sched = @import("../proc/sched.zig");
-    var pkt: [2 + 512]u8 = undefined;
-    const query_id = newQueryId();
-    const qlen = buildQuery(pkt[2..], hostname, qtype, query_id, edns0);
-    dns_policy.tcpLength(&pkt, @intCast(qlen));
+    const slab = @import("../mm/slab.zig");
+    const all = struct {
+        fn f(o: dns_policy.Outcome) [n]Result {
+            var r: [n]Result = undefined;
+            for (&r) |*x| x.* = .{ .outcome = o };
+            return r;
+        }
+    }.f;
+    var out: [n]Result = all(.timeout);
+    var done = [_]bool{false} ** n;
+    var ids: [n]u16 = undefined;
+    var pkt: [n * (2 + 512)]u8 = undefined;
+    var total: usize = 0;
+    for (0..n) |k| {
+        // Distinct ids, so each reply has exactly one query.
+        ids[k] = newQueryId();
+        while (dns_policy.pendingFor(ids[0..k], done[0..k], ids[k]) != null) ids[k] = newQueryId();
+        const qlen = buildQuery(pkt[total + 2 ..][0..512], hostname, qtypes[k], ids[k], edns0);
+        dns_policy.tcpLength(pkt[total..], @intCast(qlen));
+        total += 2 + qlen;
+    }
     const owner = sched.currentTaskIndex() orelse 0;
     const idx: u32 = switch (dns_server) {
         .v4 => |s4| blk: {
             const raw = tcp.tcpConnect(s4, DNS_PORT, owner);
-            if (raw < 0) return .{ .outcome = .tcp_failed };
+            if (raw < 0) return all(.tcp_failed);
             break :blk @intCast(raw);
         },
         .v6 => |s6| blk: {
             const raw = tcp.tcpSocket(owner);
-            if (raw < 0) return .{ .outcome = .tcp_failed };
+            if (raw < 0) return all(.tcp_failed);
             const i: u32 = @intCast(raw);
             if (tcp.tcpSetIpv6(i) != 0 or tcp.tcpConnectSocketV6(i, s6, DNS_PORT) != 0) {
                 _ = tcp.tcpClose(i);
-                return .{ .outcome = .tcp_failed };
+                return all(.tcp_failed);
             }
             break :blk i;
         },
@@ -335,50 +363,68 @@ fn queryTcp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yi
     const start = tsc.nanos();
     var iters: u32 = 0;
     var sent: usize = 0;
-    const slab = @import("../mm/slab.zig");
     var small: [2 + MAX_REPLY]u8 = undefined;
     var buf: []u8 = &small;
     var big: ?[*]u8 = null;
     defer if (big) |b| slab.kfree(@ptrCast(b));
     var got: usize = 0;
+    var left: usize = n;
     while (!dns_policy.waitExpiredAfter(start, tsc.nanos(), iters, timeout_ns)) : (iters += 1) {
         pumpRx();
         _ = @import("lo.zig").drain();
         const st = tcp.tcpPoll(idx);
-        if (st < 0) return .{ .outcome = .tcp_failed }; // refused or reset
-        if (st == 1 and sent < 2 + qlen) {
-            const w = tcp.tcpSend(idx, pkt[sent..].ptr, @intCast(2 + qlen - sent));
-            if (w < 0) return .{ .outcome = .tcp_failed };
+        if (st < 0) return all(.tcp_failed); // refused or reset
+        if (st == 1 and sent < total) {
+            const w = tcp.tcpSend(idx, pkt[sent..].ptr, @intCast(total - sent));
+            if (w < 0) return all(.tcp_failed);
             sent += @intCast(w);
             _ = @import("lo.zig").drain();
         }
-        if (sent == 2 + qlen) {
+        if (sent == total) {
             const r = tcp.tcpRecv(idx, buf[got..].ptr, @intCast(buf.len - got));
             if (r > 0) {
                 got += @intCast(r);
-                const need = dns_policy.tcpFrameNeed(buf[0..got]) orelse continue;
-                if (need > buf.len) {
-                    const p: [*]u8 = @ptrCast(slab.kmalloc(need) orelse return .{ .outcome = .failed });
-                    @memcpy(p[0..got], buf[0..got]);
-                    big = p;
-                    buf = p[0..need];
-                    continue;
-                }
-                if (got < need) continue;
-                const msg = buf[2..need];
-                if (msg.len < 12 or bo.readU16BeAt(msg.ptr, 0) != query_id) return .{ .outcome = .failed };
-                if (readReply(msg, hostname, qtype, ans)) |res| {
+                // Every whole reply in the buffer, one after the other.
+                while (dns_policy.tcpFrameNeed(buf[0..got])) |need| {
+                    if (need > buf.len) {
+                        const p: [*]u8 = @ptrCast(slab.kmalloc(need) orelse return all(.failed));
+                        @memcpy(p[0..got], buf[0..got]);
+                        if (big) |b| slab.kfree(@ptrCast(b));
+                        big = p;
+                        buf = p[0..need];
+                        break;
+                    }
+                    if (got < need) break;
+                    const msg = buf[2..need];
+                    const k = if (msg.len >= 12) dns_policy.pendingFor(&ids, &done, bo.readU16BeAt(msg.ptr, 0)) else null;
+                    const res: ?Result = if (k) |q| readReply(msg, hostname, qtypes[q], answers[q]) else null;
+                    if (res == null) {
+                        for (0..n) |q| (if (!done[q]) {
+                            out[q] = .{ .outcome = .failed };
+                        });
+                        return out;
+                    }
                     // A truncated TCP reply has nowhere further to go.
-                    return if (res.outcome == .truncated) .{ .outcome = .failed } else res;
+                    out[k.?] = if (res.?.outcome == .truncated) .{ .outcome = .failed } else res.?;
+                    done[k.?] = true;
+                    left -= 1;
+                    if (left == 0) return out;
+                    std.mem.copyForwards(u8, buf[0 .. got - need], buf[need..got]);
+                    got -= need;
                 }
-                return .{ .outcome = .failed };
+                continue;
             }
-            if (r == 0) return .{ .outcome = .tcp_failed }; // closed before the whole reply
-            if (r != -11) return .{ .outcome = .tcp_failed };
+            if (r == 0) return all(.tcp_failed); // closed before every reply
+            if (r != -11) return all(.tcp_failed);
         }
-        if (yield) |y| (if (!y()) return .{ .outcome = .interrupted }) else cpu.pause();
+        if (yield) |y| (if (!y()) {
+            for (0..n) |q| (if (!done[q]) {
+                out[q] = .{ .outcome = .interrupted };
+            });
+            return out;
+        }) else cpu.pause();
     }
-    return .{ .outcome = .timeout };
+    return out;
 }
 
 fn queryUdp(hostname: []const u8, dns_server: Server, timeout_ns: u64, yield: Yield, ans: *dns_answer.Answer, qtype: u16, edns0: bool) Result {

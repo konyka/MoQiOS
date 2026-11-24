@@ -1315,8 +1315,10 @@ int main(void) {
         q_script(vc, ok2, 2);
         assert(getaddrinfo("v.test", 0, &hints, &res) == 0 && strcmp(q_log, "v.test/2@1/5/tcp;") == 0);
         freeaddrinfo(res);
+        /* hello543: with use-vc, single-request still asks the pair on one connection, both before any reply (glibc 2.44,
+         * measured): one dns_query2 call. */
         q_script("nameserver 10.0.0.1\noptions attempts:1 use-vc single-request\n", ok2, 2);
-        assert(getaddrinfo("v.test", 0, &hints, &res) == 0 && strcmp(q_log, "v.test@1/5/tcp;v.test/6@1/5/tcp;") == 0);
+        assert(getaddrinfo("v.test", 0, &hints, &res) == 0 && strcmp(q_log, "v.test/2@1/5/tcp;") == 0);
         freeaddrinfo(res);
         uint8_t pa[4] = {10, 2, 3, 4};
         q_script(vc, ok, 1);

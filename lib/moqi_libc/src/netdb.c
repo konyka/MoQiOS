@@ -434,9 +434,10 @@ static long resolve_one(const char *name, uint8_t *out, struct resolv_server *ns
     for (int a = 0; a < opt->attempts; a++) {
         for (size_t i = 0; i < nns; i++) {
             long r;
-            if (pair && opt->single_request) {
+            if (pair && opt->single_request && !opt->use_vc) {
                 /* "options single-request": the A query, its reply, then the AAAA query (glibc 2.44, measured); an A query that
-                 * gets no reply ends the pair without the AAAA one. */
+                 * gets no reply ends the pair without the AAAA one. With use-vc the pair still goes out together on one
+                 * connection (measured), so dns_query2 asks it. */
                 const struct resolv_server *sv = &ns[(first + i) % nns];
                 long w = resolv_wait_ms(opt->timeout, i, nns) | vc;
                 uint8_t o16[16];

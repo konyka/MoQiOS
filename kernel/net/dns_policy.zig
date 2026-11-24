@@ -226,6 +226,15 @@ pub fn tcpFrameNeed(got: []const u8) ?usize {
     return 2 + n;
 }
 
+/// Which of the queries sharing one TCP connection (ids `ids`, `done` once answered) a reply with id `id` belongs to; null for
+/// none. glibc 2.44 sends an AF_UNSPEC pair on one use-vc connection and takes the replies in either order (measured).
+pub fn pendingFor(ids: []const u16, done: []const bool, id: u16) ?usize {
+    for (ids, 0..) |q, k| {
+        if (!done[k] and q == id) return k;
+    }
+    return null;
+}
+
 /// Whether `got` holds the length prefix and the whole message it announces.
 pub fn tcpFrameComplete(got: []const u8) bool {
     const n = tcpFrameLen(got) orelse return false;

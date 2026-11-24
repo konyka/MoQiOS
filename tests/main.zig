@@ -2035,7 +2035,9 @@ test "dns: the wait for a reply gives the CPU away, so a server on the same CPU 
     try std.testing.expect(std.mem.indexOf(u8, dns, "pub fn resolveYield(hostname: []const u8, yield: Yield) [4]u8 {") != null);
     // Both waits (sending through ARP, and the reply) yield, and a fatal/handled signal during the sleep ends the query.
     // The UDP waits (sending through ARP, and the reply) and the TCP wait (hello524) all yield.
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, dns, "if (yield) |y| (if (!y()) return .{ .outcome = .interrupted }) else cpu.pause();"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, dns, "if (yield) |y| (if (!y()) return .{ .outcome = .interrupted }) else cpu.pause();"));
+    // The TCP wait (queryTcpN, hello543) yields too; a signal ends every query still waiting.
+    try std.testing.expect(std.mem.indexOf(u8, dns, "out[q] = .{ .outcome = .interrupted };") != null);
     const se = kt.syscall_entry_source;
     try std.testing.expect(std.mem.indexOf(u8, se, "@import(\"../../net/dns.zig\").resolveYield(hp.stripTrailingDot(name), dnsSleep)") != null);
     try std.testing.expect(std.mem.indexOf(u8, se, "@import(\"../../net/dns.zig\").resolveVia(hp.stripTrailingDot(name), server, dnsSleep)") != null);
@@ -18802,6 +18804,23 @@ test "resolv.conf options edns0 appends an OPT record with a 1200-byte UDP size 
     const dns = kt.dns_source;
     try std.testing.expect(std.mem.indexOf(u8, dns, "if (edns0) len = dns_policy.appendOpt(pkt, len);") != null);
     try std.testing.expect(std.mem.indexOf(u8, dns, "fn buildQuery(pkt: []u8, hostname: []const u8, qtype: u16, query_id: u16, edns0: bool) usize {") != null);
+}
+
+test "use-vc asks an AF_UNSPEC pair on one TCP connection, both queries before any reply (glibc 2.44, measured) (hello543)" {
+    const dp = kt.dns_policy;
+    // A reply over the shared connection goes to the query whose id it carries and that is still waiting; any other is null.
+    const ids = [_]u16{ 0x1111, 0x2222 };
+    try std.testing.expectEqual(@as(?usize, 0), dp.pendingFor(&ids, &.{ false, false }, 0x1111));
+    try std.testing.expectEqual(@as(?usize, 1), dp.pendingFor(&ids, &.{ false, false }, 0x2222));
+    try std.testing.expectEqual(@as(?usize, null), dp.pendingFor(&ids, &.{ true, false }, 0x1111));
+    try std.testing.expectEqual(@as(?usize, null), dp.pendingFor(&ids, &.{ false, false }, 0x3333));
+    // Wiring: queryTcp is the one-query case of queryTcpN; the use-vc pair asks both on one connection.
+    const dns = kt.dns_source;
+    try std.testing.expect(std.mem.indexOf(u8, dns, "fn queryTcpN(comptime n: usize,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "return queryTcpN(1, hostname, dns_server, timeout_ns, yield, .{ans}, .{qtype}, edns0)[0];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dns, "queryTcpN(2, hostname, server, timeout_ns, yield, .{ ans4, ans6 }, .{ TYPE_A_Q, TYPE_AAAA }, qf.edns0)") != null);
+    // A connection that closes before every reply fails the whole pair, an answered half included (glibc: EAI_AGAIN).
+    try std.testing.expect(std.mem.indexOf(u8, dns, "if (r == 0) return all(.tcp_failed); // closed before every reply") != null);
 }
 
 test "AAAA answers: dns_answer reads type-28 records of 16 bytes for an AAAA query, A records for an A query (hello525)" {
