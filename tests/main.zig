@@ -19137,7 +19137,7 @@ test "SO_PEEK_OFF on UDP sockets: a peek skips whole datagrams before the offset
     // Wiring: UDP keeps the offset in its port options and accepts the option.
     const so = kt.socket_opt_source;
     // hello553 then took in TCP as well: only raw sockets refuse the option.
-    try std.testing.expect(std.mem.indexOf(u8, so, "if (optname == sp.SO_PEEK_OFF and ref == .raw) return -92;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (optname == sp.SO_PEEK_OFF and ref == .raw) return -95; // EOPNOTSUPP") != null);
     const udp = kt.udp_source;
     try std.testing.expect(std.mem.indexOf(u8, udp, "sp.udpPeekAt(") != null);
 }
@@ -19165,11 +19165,17 @@ test "write() of 0 bytes on a UDP or AF_UNIX message socket and a 0-byte AF_UNIX
 
 test "SO_PEEK_OFF on TCP sockets: peeks start at the offset and advance it, reads pull it back (Linux 7.x tcp_recvmsg, measured) (hello553)" {
     const so = kt.socket_opt_source;
-    try std.testing.expect(std.mem.indexOf(u8, so, "if (optname == sp.SO_PEEK_OFF and ref == .raw) return -92;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so, "if (optname == sp.SO_PEEK_OFF and ref == .raw) return -95; // EOPNOTSUPP") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, ".peek_off = o.peek_off,") != null);
     try std.testing.expect(std.mem.indexOf(u8, so, "o.peek_off = st.peek_off;") != null);
     const t = kt.tcp_source;
     try std.testing.expect(std.mem.indexOf(u8, t, "const start = sp.peekStart(tcb.options.peek_off) orelse 0;") != null);
     try std.testing.expect(std.mem.indexOf(u8, t, "tcb.options.peek_off = sp.peekAdvance(tcb.options.peek_off, to_read);") != null);
     try std.testing.expect(std.mem.indexOf(u8, t, "tcb.options.peek_off = sp.readPullBack(tcb.options.peek_off, to_read);") != null);
+}
+
+test "SO_PEEK_OFF on a raw socket is EOPNOTSUPP for get and set, as Linux sk_set_peek_off has no raw handler (measured) (hello554)" {
+    const so = kt.socket_opt_source;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, so, "optname == sp.SO_PEEK_OFF and ref == .raw) return -95; // EOPNOTSUPP"));
+    try std.testing.expect(std.mem.indexOf(u8, so, "optname == sp.SO_PEEK_OFF and ref == .raw) return -92;") == null);
 }

@@ -1076,7 +1076,7 @@ pub fn sysSetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen:
     }
     if (level == ipo.SOL_IP or level == ipo.SOL_IPV6) return setIpOpt(ref, resolved_v6, level, optname, optval_ptr, optlen);
     if (level != SOL_SOCKET and level != SOL_TCP) return unknownLevel(ref, resolved_v6, false);
-    if (level == SOL_SOCKET and optname == sp.SO_PEEK_OFF and ref == .raw) return -92;
+    if (level == SOL_SOCKET and optname == sp.SO_PEEK_OFF and ref == .raw) return -95; // EOPNOTSUPP
     switch (ref) {
         .tcp => |idx| {
             if (level == SOL_SOCKET and (sp.storedOnly(optname) or optname == sp.SO_PEEK_OFF or (sp.flagBit(optname) != null and optname != SO_REUSEADDR and optname != SO_KEEPALIVE))) {
@@ -1192,8 +1192,9 @@ pub fn sysGetSockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_
         },
     }
 
-    // SO_PEEK_OFF is kept and acted on for AF_UNIX (hello549), UDP (hello550) and TCP (hello553); raw sockets refuse it.
-    if (optname == sp.SO_PEEK_OFF and ref == .raw) return -92;
+    // SO_PEEK_OFF is kept and acted on for AF_UNIX (hello549), UDP (hello550) and TCP (hello553); a raw socket has no
+    // set_peek_off, so Linux answers EOPNOTSUPP for get and set (hello554).
+    if (optname == sp.SO_PEEK_OFF and ref == .raw) return -95; // EOPNOTSUPP
     var val: [16]u8 = undefined;
     const val_len = sp.encodeGet(stored, facts, optname, &val) orelse return -92;
     const to_copy = @min(val_len, user_optlen);
