@@ -13046,7 +13046,7 @@ test "capget/capset speak Linux's header versions and capability numbers, and st
     try std.testing.expect(std.mem.indexOf(u8, se, "cur.permitted_caps = abi.decode(new_per, old_per_flags);") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".cap_eff = cap_abi.encode(tt.effective_caps),") != null);
     try std.testing.expect(std.mem.indexOf(u8, kt.procfs_source, ".cap_bnd = cap_abi.BOUNDING,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kt.pid_status_source, "o.str(\"\\nCapAmb:\\t0000000000000000\\n\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kt.pid_status_source, "o.str(\"\\nCapAmb:\\t0000000000000000\");") != null);
 }
 
 test "only SIGKILL takes a task out of the stopped state at once; other fatal or handled signals wait for SIGCONT" {

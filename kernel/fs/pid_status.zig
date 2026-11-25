@@ -56,6 +56,9 @@ pub const Status = struct {
     cap_prm: u64,
     cap_eff: u64,
     cap_bnd: u64,
+    /// Voluntary / involuntary context-switch counts (Linux voluntary_ctxt_switches / nonvoluntary_ctxt_switches).
+    vol_switches: u64 = 0,
+    nonvol_switches: u64 = 0,
     /// Peak address-space size in kB (Linux VmPeak, the high-water mark of VmSize); null with the other Vm lines.
     vm_peak_kb: ?u64 = null,
     /// Address-space size and resident size in kB; null for a task without a user address space (Linux prints no Vm lines for kernel threads).
@@ -232,7 +235,12 @@ pub fn render(buf: [*]u8, max_len: u32, s: Status) u32 {
     o.hex16(s.cap_eff);
     o.str("\nCapBnd:\t");
     o.hex16(s.cap_bnd);
-    o.str("\nCapAmb:\t0000000000000000\n");
+    o.str("\nCapAmb:\t0000000000000000");
+    o.str("\nvoluntary_ctxt_switches:\t");
+    o.dec(s.vol_switches);
+    o.str("\nnonvoluntary_ctxt_switches:\t");
+    o.dec(s.nonvol_switches);
+    o.char('\n');
     return o.pos;
 }
 
@@ -267,12 +275,12 @@ fn sample() Status {
 }
 
 test "status text: every field in Linux order, tab separated" {
-    var buf: [512]u8 = undefined;
+    var buf: [640]u8 = undefined;
     const n = render(&buf, buf.len, sample());
     try std.testing.expectEqualStrings(
         "Name:\tcat\nUmask:\t0022\nState:\tR (running)\nTgid:\t42\nNgid:\t0\nPid:\t42\nPPid:\t7\nTracerPid:\t0\n" ++
             "Uid:\t1000\t1001\t1002\t1001\nGid:\t1000\t1000\t1000\t1000\nFDSize:\t64\nGroups:\t10 1000 \nVmPeak:\t  231788 kB\nVmSize:\t  231788 kB\nVmRSS:\t    2780 kB\nVmData:\t     240 kB\nVmStk:\t     132 kB\nVmExe:\t       8 kB\nVmLib:\t       0 kB\nVmPTE:\t      40 kB\nVmSwap:\t       0 kB\nThreads:\t1\nNoNewPrivs:\t0\n" ++
-            "CapInh:\t0000000800000000\nCapPrm:\t00000000000000c0\nCapEff:\t0000000000000080\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n",
+            "CapInh:\t0000000800000000\nCapPrm:\t00000000000000c0\nCapEff:\t0000000000000080\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n",
         buf[0..n],
     );
 }

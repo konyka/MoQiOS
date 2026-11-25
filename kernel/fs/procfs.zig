@@ -446,6 +446,8 @@ fn generatePidStatus(pid: u32, buf: [*]u8, max_len: u32) u32 {
         .cap_prm = cap_abi.encode(tt.permitted_caps),
         .cap_eff = cap_abi.encode(tt.effective_caps),
         .cap_bnd = cap_abi.BOUNDING,
+        .vol_switches = tt.nvcsw,
+        .nonvol_switches = tt.nivcsw,
     };
     task_mod.unlockTask(flags);
     defer if (root != 0) user_space.destroyUserSpace(root);
