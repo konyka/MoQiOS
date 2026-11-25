@@ -12,6 +12,8 @@ pub const ProcFile = enum(u8) {
     pid_stat,
     pid_cmdline,
     pid_rss,
+    /// /proc/<pid>/statm: seven page counts (size resident shared text lib data dt).
+    pid_statm,
     /// /proc/<pid>/comm: the process name and a newline.
     pid_comm,
     version,
@@ -180,7 +182,7 @@ const root_files = [_][]const u8{ "meminfo", "cpuinfo", "uptime", "version", "lo
 /// The fixed directories /proc lists after its files.
 const root_dirs = [_][]const u8{ "net", "sys" };
 /// What a /proc/<pid> directory lists.
-const pid_files = [_][]const u8{ "status", "maps", "stat", "cmdline", "rss", "comm", "fd" };
+const pid_files = [_][]const u8{ "status", "maps", "stat", "statm", "cmdline", "rss", "comm", "fd" };
 
 /// The entry at position `pos` of /proc ("." and "..", the files, self, then one directory per live process), or null past the end. A
 /// thread is part of its process and is not listed on its own, as on Linux.
@@ -274,6 +276,7 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
         .pid_status => generatePidStatus(pid, buf, max_len),
         .pid_maps => generatePidMaps(pid, buf, max_len),
         .pid_stat => generatePidStat(pid, buf, max_len),
+        .pid_statm => generatePidStatm(pid, buf, max_len),
         .pid_cmdline => generatePidCmdline(pid, buf, max_len),
         .pid_rss => generatePidRss(pid, buf, max_len),
         .pid_comm => generatePidComm(pid, buf, max_len),
@@ -564,6 +567,51 @@ fn generatePidStat(pid: u32, buf: [*]u8, max_len: u32) u32 {
     pos = appendStr(buf, pos, max_len, " ");
     pos = appendDec(buf, pos, max_len, @intCast(t.parent_tid));
     pos = appendStr(buf, pos, max_len, " 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n");
+    return pos;
+}
+
+/// Generate /proc/<pid>/statm: seven page counts, space separated (Linux fs/proc/array.c proc_pid_statm).
+///   size   — total program size (VmSize in pages)
+///   resident — resident set (VmRSS in pages)
+///   shared — resident file-backed pages (0 here: no shared file mappings are tracked separately)
+///   text   — executable pages (VmExe)
+///   lib    — 0 (unused since Linux 2.6)
+///   data   — data + stack pages (VmData + VmStk)
+///   dt     — 0 (dirty pages; always 0 on Linux)
+fn generatePidStatm(pid: u32, buf: [*]u8, max_len: u32) u32 {
+    const task_mod = @import("../proc/task.zig");
+    const user_space = @import("../mm/user_space.zig");
+    const flags = task_mod.lockTask();
+    const t = findTaskByPid(pid) orelse {
+        task_mod.unlockTask(flags);
+        return appendStr(buf, 0, max_len, "0 0 0 0 0 0 0\n");
+    };
+    const PAGE: u64 = 4096;
+    const root = t.page_table_phys;
+    if (root != 0) user_space.retainUserSpace(root); // keep the page table alive for residentUserPages after the task lock drops
+    const image: u64 = if (t.mm) |m| (if (m.brk_start > user_space.USER_CODE_BASE) m.brk_start - user_space.USER_CODE_BASE else 0) else 0;
+    const charged: u64 = if (t.mm) |m| @atomicLoad(u64, &m.as_used, .monotonic) else 0;
+    const data_bytes: u64 = if (t.mm) |m| @atomicLoad(u64, &m.data_used, .monotonic) else 0;
+    const code_bytes: u64 = if (t.mm) |m| m.code_bytes else 0;
+    const stk_bytes: u64 = if (t.mm != null and user_space.USER_STACK_TOP > t.stack_limit) user_space.USER_STACK_TOP - t.stack_limit else 0;
+    task_mod.unlockTask(flags);
+    defer if (root != 0) user_space.destroyUserSpace(root);
+    const size_pg = (image + charged) / PAGE;
+    const rss_pg: u64 = if (root != 0 and comptime @import("builtin").cpu.arch == .x86_64)
+        @import("../arch/x86_64/paging.zig").residentUserPages(root)
+    else
+        0;
+    const text_pg = code_bytes / PAGE;
+    const data_pg = (data_bytes + stk_bytes) / PAGE;
+    var pos: u32 = 0;
+    pos = appendDec(buf, pos, max_len, @intCast(size_pg));
+    pos = appendChar(buf, pos, max_len, ' ');
+    pos = appendDec(buf, pos, max_len, @intCast(rss_pg));
+    pos = appendStr(buf, pos, max_len, " 0 ");
+    pos = appendDec(buf, pos, max_len, @intCast(text_pg));
+    pos = appendStr(buf, pos, max_len, " 0 ");
+    pos = appendDec(buf, pos, max_len, @intCast(data_pg));
+    pos = appendStr(buf, pos, max_len, " 0\n");
     return pos;
 }
 

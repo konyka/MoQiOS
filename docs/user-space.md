@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello571`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello572`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -544,6 +544,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello569 | `/proc/<pid>/status` 的 `VmSwap` 行（与 Linux 实测相同）：换出页的 kB，右对齐八列，在 VmStk 之后，内核线程没有。swap 关闭时（smoke 镜像）运行进程没有换出页，VmSwap 为 0，但行仍在：A 行存在且为 0；B 紧跟在 VmStk 之后（MoQiOS 不印 VmPTE）；C pid 0 的空闲线程没有 Vm 行 |
 | hello570 | `/proc/<pid>/status` 的 `VmExe`、`VmLib` 行（与 Linux 实测相同）：可执行代码段大小和库大小的 kB，在 VmStk 之后、VmSwap 之前。MoQiOS 是静态二进制（平坦或非 PIE ELF，无共享库），所以 VmLib 恒为 0，VmExe 是可执行段大小。A VmExe 为正；B VmLib 为 0；C 顺序 VmStk<VmExe<VmLib；D pid 0 的空闲线程没有 Vm 行 |
 | hello571 | `/proc/<pid>/status` 的 `VmPTE` 行（与 Linux 实测相同）：进程页表自身占用的 kB，右对齐八列，在 VmLib 之后、VmSwap 之前。A VmPTE 为正；B 映射并触碰更多地址空间后不减小（多了叶级页表）；C 顺序 VmLib<VmPTE<VmSwap；D pid 0 的空闲线程没有 Vm 行 |
+| hello572 | `/proc/<pid>/statm`（与 Linux 实测相同）：七个页数字段 size resident shared text lib data dt。MoQiOS 填 size（VmSize）、resident（VmRSS）、shared 0、text（VmExe）、lib 0、data（VmData+VmStk）、dt 0。A 文件打开且正好七个数；B size>=resident、text>0、shared/lib/dt 都是 0；C data 为正 |
 | hello526 | `/etc/resolv.conf` 的 IPv6 nameserver（与 glibc 2.44 实测相同）：[::1]:53 和 127.0.0.1:53 上各一个本机 DNS 服务器；只写 `nameserver ::1` 时经 IPv6 查询并得到应答（A）；`::1` 在前时只问 IPv6 服务器（B）；不应答的 IPv6 服务器在前时换到 IPv4 服务器（C）；`gethostbyaddr` 也经 IPv6 服务器（D）；`::ffff:127.0.0.1` 按 IPv4 服务器询问（E）；两个服务器能在同一端口分别绑定 [::1] 和 127.0.0.1 |
 | hello525 | AAAA 记录（与 glibc 2.44 实测相同）：本机服务器知道双栈、只有 IPv4、只有 IPv6 三个名字；`gethostbyname2(AF_INET6)` 发 AAAA 查询并返回 16 字节地址（A）；只有 A 记录的名字在 `AF_INET6` 下为 `NO_DATA`（B）；`getaddrinfo` 的 `AF_UNSPEC` 发 AAAA 和 A 两个查询，IPv6 地址在前（C）；单栈名字只给那个族（D）；`AF_INET6` 对只有 IPv4 的名字为 `EAI_NODATA`，带 `AI_V4MAPPED` 时给映射地址（E）；不存在的名字为 `EAI_NONAME`（F） |
 | hello524 | 截断应答改用 TCP（与 glibc 2.44 `res_send` 实测相同）：本机服务器的 UDP 应答都带 TC 位，TCP（2 字节长度加报文）按名字回答；`gethostbyname` 先问 UDP、再问 TCP，得到 TCP 的三个地址（A）；UDP 应答带 TC 且有记录时也不用，用 TCP 的结果（B）；TCP 回 NXDOMAIN 为 `HOST_NOT_FOUND`（C）；TCP 连接在应答前关闭为 `TRY_AGAIN`（D）；服务器没有 TCP 监听时立即 `TRY_AGAIN`（E） |
