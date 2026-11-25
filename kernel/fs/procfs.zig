@@ -583,6 +583,9 @@ fn generatePidStat(pid: u32, buf: [*]u8, max_len: u32) u32 {
     const cpu = task_mod.groupTimesLocked(tgid, tsc.read(), tsc.tsc_freq_mhz);
     const utime_ticks = cpu.user_us / 10_000;
     const stime_ticks = cpu.sys_us / 10_000;
+    // Fields 16/17 (cutime/cstime): CPU time of reaped children, in clock ticks.
+    const cutime_ticks = cpu.child_user_us / 10_000;
+    const cstime_ticks = cpu.child_sys_us / 10_000;
     task_mod.unlockTask(flags);
     defer if (root != 0) user_space.destroyUserSpace(root);
     const vsize = image + charged;
@@ -604,8 +607,13 @@ fn generatePidStat(pid: u32, buf: [*]u8, max_len: u32) u32 {
     pos = appendDec(buf, pos, max_len, @intCast(utime_ticks));
     pos = appendChar(buf, pos, max_len, ' ');
     pos = appendDec(buf, pos, max_len, @intCast(stime_ticks));
-    // Fields 16..19 (cutime, cstime, priority, nice): 4 zeros.
-    pos = appendStr(buf, pos, max_len, " 0 0 0 0 ");
+    pos = appendChar(buf, pos, max_len, ' ');
+    // Field 16: cutime. Field 17: cstime.
+    pos = appendDec(buf, pos, max_len, @intCast(cutime_ticks));
+    pos = appendChar(buf, pos, max_len, ' ');
+    pos = appendDec(buf, pos, max_len, @intCast(cstime_ticks));
+    // Fields 18..19 (priority, nice): 2 zeros.
+    pos = appendStr(buf, pos, max_len, " 0 0 ");
     // Field 20: num_threads.
     pos = appendDec(buf, pos, max_len, @intCast(threads));
     // Field 21 (itrealvalue): 0. Field 22: starttime in clock ticks since boot.
