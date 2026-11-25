@@ -20,6 +20,12 @@ static int g_xtrace;
 /* "sh -u" / "set -u" (POSIX nounset): expanding a variable that is not set is an error. */
 static int g_nounset;
 
+/* Positional parameters: set by "sh -s a b" and "sh FILE a b" (the latter does not exist yet). $1..$9, $#, $@ and $0
+ * are read by expand_vars. argc/argv point into main's argv or into the parsed "set --" words (not yet). */
+#define MAX_POS 10
+static int g_pos_argc;
+static const char *g_pos_argv[MAX_POS]; /* [0] is $0, [1]..[9] are $1..$9 */
+
 /* Utility functions */
 
 /* True when standard input is a terminal: the prompt and the echo of typed characters are for people, and only a terminal can have
@@ -80,6 +86,14 @@ static void out_str(const char *s) {
     size_t n = 0;
     while (s[n]) n++;
     write(g_out_fd, s, n);
+}
+
+/* Error messages inside a child process (run_command) must go to standard error, not standard output: in a pipeline the
+ * child's stdout is a pipe, and writing to it would feed "sh: echo: exec failed" into the next command as input. */
+static void err_str(const char *s) {
+    size_t n = 0;
+    while (s[n]) n++;
+    write(STDERR_FILENO, s, n);
 }
 
 /* Quoting. Before a line is split into list elements, pipeline commands and words, protect_quotes() rewrites it in place and
@@ -219,6 +233,26 @@ static int expand_vars(const char *src, char *dst, int max) {
             char num[24];
             int n = bang ? snprintf(num, sizeof(num), "%ld", g_last_bg) : snprintf(num, sizeof(num), "%d", g_last_code);
             for (int v = 0; v < n && di < max - 1; v++) dst[di++] = num[v];
+        } else if ((src[si] == '$' || src[si] == QUOTED_DOLLAR) &&
+                   (src[si + 1] >= '0' && src[si + 1] <= '9')) {
+            int idx = src[si + 1] - '0';
+            si += 2;
+            const char *val = idx < g_pos_argc ? g_pos_argv[idx] : "";
+            for (int v = 0; val[v] && di < max - 1; v++) dst[di++] = val[v];
+        } else if ((src[si] == '$' || src[si] == QUOTED_DOLLAR) && src[si + 1] == '#') {
+            si += 2;
+            char num[12];
+            int n = snprintf(num, sizeof(num), "%d", g_pos_argc > 0 ? g_pos_argc - 1 : 0);
+            for (int v = 0; v < n && di < max - 1; v++) dst[di++] = num[v];
+        } else if ((src[si] == '$' || src[si] == QUOTED_DOLLAR) && src[si + 1] == '@') {
+            int quoted = src[si] == QUOTED_DOLLAR;
+            si += 2;
+            for (int a = 1; a < g_pos_argc; a++) {
+                if (a > 1 && di < max - 1) dst[di++] = quoted ? protect_char(' ') : ' ';
+                const char *val = g_pos_argv[a];
+                for (int v = 0; val[v] && di < max - 1; v++)
+                    dst[di++] = quoted ? protect_char(val[v]) : val[v];
+            }
         } else if (src[si] == '$' || src[si] == QUOTED_DOLLAR) {
             int quoted = src[si] == QUOTED_DOLLAR;
             si++;
@@ -274,9 +308,9 @@ static void run_command(const char *cmd, int pipe_in, int pipe_out, const char *
     if (redir_in && redir_in[0]) {
         long fd = open(redir_in, O_RDONLY, 0);
         if (fd < 0) {
-            print("sh: cannot open ");
-            print(redir_in);
-            print("\n");
+            err_str("sh: cannot open ");
+            err_str(redir_in);
+            err_str("\n");
             _exit(1);
         }
         dup2((int)fd, STDIN_FILENO);
@@ -287,9 +321,9 @@ static void run_command(const char *cmd, int pipe_in, int pipe_out, const char *
     if (redir_out && redir_out[0]) {
         long fd = open(redir_out, O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC), 0644);
         if (fd < 0) {
-            print("sh: cannot open ");
-            print(redir_out);
-            print("\n");
+            err_str("sh: cannot open ");
+            err_str(redir_out);
+            err_str("\n");
             _exit(1);
         }
         dup2((int)fd, STDOUT_FILENO);
@@ -324,11 +358,24 @@ static void run_command(const char *cmd, int pipe_in, int pipe_out, const char *
     for (int i = 0; i < nargs; i++) argv[i + 1] = args[i];
     argv[nargs + 1] = (void*)0;
 
+    /* Built-ins that must also work inside a pipeline's fork+exec child (the single-command path handles them directly in the
+     * parent and never reaches here; see execute_pipeline's ncmds==1 branch). */
+    if (strcmp(name, "echo") == 0) {
+        for (int i = 0; i < nargs; i++) {
+            if (i) write(STDOUT_FILENO, " ", 1);
+            write(STDOUT_FILENO, args[i], strlen(args[i]));
+        }
+        write(STDOUT_FILENO, "\n", 1);
+        _exit(0);
+    }
+    if (strcmp(name, "true") == 0) _exit(0);
+    if (strcmp(name, "false") == 0) _exit(1);
+
     execve(name, argv, environ);
     /* If execve returns, it failed */
-    print("sh: ");
-    print(name);
-    print(": exec failed\n");
+    err_str("sh: ");
+    err_str(name);
+    err_str(": exec failed\n");
     _exit(127);
 }
 
@@ -840,18 +887,22 @@ int main(int argc, char **argv, char **envp) {
     /* "sh -c command": run one command line (pipes, redirection and the built-ins work as at the prompt), print nothing of its
      * own, and end with the command's exit status; a command killed by a signal ends the shell with 128 + signal. system() in
      * the C library starts the shell like this. */
-    /* Leading options: -e (errexit), -u (nounset), -x (xtrace) and -c, alone or together ("-e -c", "-ec", "-xuec"). */
+    /* Leading options: -e (errexit), -u (nounset), -x (xtrace), -s (read stdin with positional params) and -c, alone or
+     * together ("-e -c", "-ec", "-xues"). */
     int argi = 1;
     int want_c = 0;
+    int want_s = 0;
     while (argi < argc && argv[argi][0] == '-' && argv[argi][1] != '\0') {
+        if (argv[argi][1] == '-' && argv[argi][2] == '\0') { argi++; break; } /* "--" ends options */
         const char *o = argv[argi] + 1;
         int known = 1;
-        for (const char *q = o; *q; q++) known &= (*q == 'e' || *q == 'u' || *q == 'x' || *q == 'c');
+        for (const char *q = o; *q; q++) known &= (*q == 'e' || *q == 'u' || *q == 'x' || *q == 's' || *q == 'c');
         if (!known) break;
         for (const char *q = o; *q; q++) {
             if (*q == 'e') g_errexit = 1;
             if (*q == 'x') g_xtrace = 1;
             if (*q == 'u') g_nounset = 1;
+            if (*q == 's') want_s = 1;
             if (*q == 'c') want_c = 1;
         }
         argi++;
@@ -866,6 +917,15 @@ int main(int argc, char **argv, char **envp) {
         if (status < 0) return 1;
         int sig = status & 0x7f;
         return sig ? 128 + sig : (status >> 8) & 0xff;
+    }
+
+    /* "sh -s [args]": read commands from standard input, remaining arguments are positional parameters $1..$9 (capped at 9). */
+    if (want_s) {
+        g_pos_argv[0] = "sh";
+        g_pos_argc = 1;
+        while (argi < argc && g_pos_argc < MAX_POS) {
+            g_pos_argv[g_pos_argc++] = argv[argi++];
+        }
     }
 
     /* "sh FILE": run the commands in FILE as if they had been piped in. The file replaces standard input; one that cannot be opened,
