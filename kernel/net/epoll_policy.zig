@@ -63,6 +63,7 @@ pub const CTL_DEL: i32 = 2;
 pub const CTL_MOD: i32 = 3;
 
 pub const EPOLLIN: u32 = 0x001;
+pub const EPOLLPRI: u32 = 0x002;
 pub const EPOLLOUT: u32 = 0x004;
 pub const EPOLLERR: u32 = 0x008;
 pub const EPOLLHUP: u32 = 0x010;
@@ -192,3 +193,14 @@ pub fn nestDepthExceeded(levels_below_added: u32, levels_above_receiver: u32) bo
     return levels_below_added + 1 + levels_above_receiver > EP_MAX_NESTS;
 }
 
+
+test "EPOLLPRI (urgent data) is a reportable event, filtered by the interest mask like any other" {
+    // hello567: a TCP socket with an unread urgent byte is ready with PRI (0x002) from tcp_ready_policy; epoll must report it only
+    // when the registration asked for it, and always as the same value poll's POLLPRI uses.
+    try std.testing.expectEqual(@as(u32, 0x002), EPOLLPRI);
+    try std.testing.expectEqual(@as(u32, EPOLLPRI), notifyMatch(EPOLLPRI, EPOLLPRI));
+    try std.testing.expectEqual(@as(u32, EPOLLPRI | EPOLLIN), notifyMatch(EPOLLPRI | EPOLLIN, EPOLLIN | EPOLLPRI));
+    // An EPOLLIN-only registration is not made ready by PRI alone (only ERR/HUP bypass the mask).
+    try std.testing.expectEqual(@as(u32, 0), notifyMatch(EPOLLPRI, EPOLLIN));
+    try std.testing.expectEqual(@as(u32, 0), notifyMatch(EPOLLIN, EPOLLPRI));
+}
