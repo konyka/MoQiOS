@@ -2148,6 +2148,8 @@ pub const FdTable = struct {
                         pfile = .pid_stat;
                     } else if (str.eql(file_part, "statm")) {
                         pfile = .pid_statm;
+                    } else if (str.eql(file_part, "limits")) {
+                        pfile = .pid_limits;
                     } else if (str.eql(file_part, "cmdline")) {
                         pfile = .pid_cmdline;
                     } else if (str.eql(file_part, "rss")) {

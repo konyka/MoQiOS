@@ -14,6 +14,8 @@ pub const ProcFile = enum(u8) {
     pid_rss,
     /// /proc/<pid>/statm: seven page counts (size resident shared text lib data dt).
     pid_statm,
+    /// /proc/<pid>/limits: the resource limits (soft/hard/units), one line each.
+    pid_limits,
     /// /proc/<pid>/comm: the process name and a newline.
     pid_comm,
     version,
@@ -182,7 +184,7 @@ const root_files = [_][]const u8{ "meminfo", "cpuinfo", "uptime", "version", "lo
 /// The fixed directories /proc lists after its files.
 const root_dirs = [_][]const u8{ "net", "sys" };
 /// What a /proc/<pid> directory lists.
-const pid_files = [_][]const u8{ "status", "maps", "stat", "statm", "cmdline", "rss", "comm", "fd" };
+const pid_files = [_][]const u8{ "status", "maps", "stat", "statm", "limits", "cmdline", "rss", "comm", "fd" };
 
 /// The entry at position `pos` of /proc ("." and "..", the files, self, then one directory per live process), or null past the end. A
 /// thread is part of its process and is not listed on its own, as on Linux.
@@ -277,6 +279,7 @@ pub fn procRead(file: ProcFile, pid: u32, buf: [*]u8, max_len: u32) u32 {
         .pid_maps => generatePidMaps(pid, buf, max_len),
         .pid_stat => generatePidStat(pid, buf, max_len),
         .pid_statm => generatePidStatm(pid, buf, max_len),
+        .pid_limits => generatePidLimits(pid, buf, max_len),
         .pid_cmdline => generatePidCmdline(pid, buf, max_len),
         .pid_rss => generatePidRss(pid, buf, max_len),
         .pid_comm => generatePidComm(pid, buf, max_len),
@@ -692,6 +695,63 @@ fn generatePidStatm(pid: u32, buf: [*]u8, max_len: u32) u32 {
     pos = appendStr(buf, pos, max_len, " 0 ");
     pos = appendDec(buf, pos, max_len, @intCast(data_pg));
     pos = appendStr(buf, pos, max_len, " 0\n");
+    return pos;
+}
+
+/// /proc/<pid>/limits — the resource limits in Linux's format (header + one line per resource: name, soft, hard, units).
+fn generatePidLimits(pid: u32, buf: [*]u8, max_len: u32) u32 {
+    const task_mod = @import("../proc/task.zig");
+    const rl = @import("../proc/rlimit.zig");
+    const gs = @import("../mm/group_state.zig");
+    var pos: u32 = 0;
+    pos = appendStr(buf, pos, max_len, "Limit                     Soft Limit           Hard Limit           Units     \n");
+    const flags = task_mod.lockTask();
+    const t = findTaskByPid(pid);
+    var lim: gs.Limits = undefined;
+    var have = false;
+    if (t) |tt| {
+        if (tt.mm) |m| {
+            lim = m.grp.lim;
+            have = true;
+        }
+    }
+    task_mod.unlockTask(flags);
+    // Linux prints 16 resources in this fixed order: name, units.
+    const names = [_][]const u8{ "Max cpu time", "Max file size", "Max data size", "Max stack size", "Max core file size", "Max resident set", "Max processes", "Max open files", "Max locked memory", "Max address space", "Max file locks", "Max pending signals", "Max msgqueue size", "Max nice priority", "Max realtime priority", "Max realtime timeout" };
+    const units = [_][]const u8{ "seconds", "bytes", "bytes", "bytes", "bytes", "bytes", "processes", "files", "bytes", "bytes", "locks", "signals", "bytes", "", "", "us" };
+    for (0..16) |r| {
+        const l: rl.Limit = if (have) lim.get(@intCast(r)) else .{ .cur = rl.RLIM_INFINITY, .max = rl.RLIM_INFINITY };
+        pos = appendLimitLine(buf, pos, max_len, names[r], l, units[r]);
+    }
+    return pos;
+}
+
+fn appendLimitLine(buf: [*]u8, start: u32, max_len: u32, name: []const u8, l: @import("../proc/rlimit.zig").Limit, units: []const u8) u32 {
+    var pos = start;
+    pos = appendStr(buf, pos, max_len, name);
+    var pad: u32 = 26;
+    if (name.len < pad) pad -= @intCast(name.len) else pad = 1;
+    while (pad > 0) : (pad -= 1) pos = appendChar(buf, pos, max_len, ' ');
+    pos = appendLimitValue(buf, pos, max_len, l.cur);
+    pos = appendLimitValue(buf, pos, max_len, l.max);
+    pos = appendStr(buf, pos, max_len, units);
+    pos = appendChar(buf, pos, max_len, '\n');
+    return pos;
+}
+
+fn appendLimitValue(buf: [*]u8, start: u32, max_len: u32, v: u64) u32 {
+    var pos = start;
+    if (v == @import("../proc/rlimit.zig").RLIM_INFINITY) {
+        pos = appendStr(buf, pos, max_len, "unlimited            ");
+    } else {
+        pos = appendDec(buf, pos, max_len, @intCast(v));
+        // right-pad the soft/hard column to 21 chars like Linux
+        var n: u32 = 0;
+        var x = v;
+        if (x == 0) n = 1 else while (x > 0) : (x /= 10) { n += 1; }
+        var pad: u32 = 21 -| n;
+        while (pad > 0) : (pad -= 1) pos = appendChar(buf, pos, max_len, ' ');
+    }
     return pos;
 }
 

@@ -51,6 +51,19 @@ pub const Limits = struct {
     fsize: Limit,
     /// Limits without an enforcement point (CORE, RSS, CPU, ...): recorded so get/set/prlimit64 round-trip.
     recorded: rlimit.RecordedLimits,
+
+    /// The current (soft, hard) limit of Linux resource number `resource` (0..15), for getrlimit/prlimit64 and /proc/<pid>/limits.
+    pub fn get(self: *const Limits, resource: u32) Limit {
+        return switch (resource) {
+            1 => self.fsize,
+            2 => self.data,
+            3 => self.stack,
+            6 => self.nproc,
+            7 => self.nofile,
+            9 => self.as,
+            else => if (rlimit.recordedSlot(resource)) |slot| self.recorded.get(slot) else .{ .cur = rlimit.RLIM_INFINITY, .max = rlimit.RLIM_INFINITY },
+        };
+    }
 };
 
 /// The file-system context (Linux fs_struct, CLONE_FS): current directory and umask.
