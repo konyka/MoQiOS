@@ -13702,3 +13702,27 @@ ramdisk 多了 23.2 MiB，空闲内存正好少了 23.2 MiB。内核在整个启
 - 红灯：init 里把 hello562 提前到 hello3 之前，换回旧 `user/sh.c`，QEMU 下 A、B、D、E 失败（`set -u` 不报错、`$?` 读到前一个 `set` 返回的 2），G 停在 shell 交互模式（旧 shell 不认 `-u`）；绿灯 A–H 全部通过。
 - 宿主机 `gcc -DHOST` 版 A–H 通过；宿主机测试、`zig build test`、`zig build`、`zig build -Darch=riscv64`、`zig build -Darch=aarch64`、`git diff --check` 通过。
 - 完整 smoke：SMP=1、SMP=2 都是 `rc=0`。
+
+## 补充：shell 的 `-s`、位置参数与 `--`；子进程错误消息写 stderr；管道里的内建（hello563）
+
+**问题**：
+- hello559–hello562 各节的局限：`-s` 不支持，shell 也没有位置参数（`$0`–`$9`、`$#`、`$@`），`--` 不结束选项。
+- `run_command`（管道和外部命令的子进程）的错误消息用 `print` 写到标准输出。管道里前一个命令失败时，`sh: echo: exec failed` 被管进下一个命令；下一个命令若是 shell，会把这行当命令运行，又报 `sh: sh:: exec failed`。
+- 管道里的每个命令都在子进程里经 `run_command` 运行，内建 `echo`、`true`、`false` 只在单命令路径处理，在管道里会 `execve("echo")` 失败。
+
+**宿主机实测（`bash --posix`）**：`sh -s alpha < file` 从文件读命令，`$1` 为 `alpha`；`$#` 不含 `$0`；`"$@"` 按空格拼起全部位置参数；`-es` 同时打开 errexit；`--` 结束选项，后面的参数都是位置参数；参数不够时 `$3` 为空。
+
+**TDD**：目标机 `hello563`（A–H 见 `docs/user-space.md`），带 `-DHOST` 分支，宿主机用 bash 通过。红灯（已提交的 `sh.c`）：A–G 失败（旧 shell 不认 `-s`，把参数当文件名，127），H 通过。第一次绿灯 F 失败（`--` 被当作 `$1`），加上 `--` 处理后 A–H 通过。测试最初写成 `echo cmd | sh -s arg`，正是这样才发现了上面后两个问题，命令改为先写入文件再 `sh -s arg < file`。
+
+**实现**（`user/sh.c`）：
+- `g_pos_argc`、`g_pos_argv[MAX_POS]`：`-s` 时 `$0` 为 `"sh"`，其余参数依次为 `$1`–`$9`。
+- `expand_vars`：`$0`–`$9`（超出个数为空）、`$#`、`$@`（双引号里展开出的空格和分隔符受保护）。
+- 选项：`-s` 可与 `-e`、`-u`、`-x`、`-c` 合写；`--` 结束选项。
+- `err_str`：`run_command` 里三处错误消息（输入、输出文件打不开，`execve` 失败）改写到标准错误。
+- `run_command` 在 `execve` 之前处理 `echo`、`true`、`false`。这也修正了 hello561 H：完整 smoke 里 `echo q | hello11` 的 `echo` 失败，`exec failed` 改写 stderr 后混进了 H 捕获的追踪输出、长度不符。之前定向运行时 H 通过，是因为那条消息还写在 stdout，被管进了 hello11。
+
+**局限**：只有 `$0`–`$9`（没有 `${10}`）；没有 `shift`、`set --`；`sh FILE a b` 不把多余参数当位置参数；管道子进程里只有 `echo`、`true`、`false` 三个内建（`cd`、`export` 在子进程里没有意义）。
+
+**验证**：
+- 红绿对照见上。宿主机 `gcc -DHOST` 版 A–H 通过；宿主机测试、`zig build test`、`zig build`、`zig build -Darch=riscv64`、`zig build -Darch=aarch64`、`git diff --check` 通过。
+- 完整 smoke：第一次 SMP=2 因 hello561 H 失败（原因见上）；在 `run_command` 加内建之后，SMP=2、SMP=1 都是 `rc=0`，hello561、hello563 都 PASS。
