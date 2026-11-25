@@ -428,6 +428,27 @@ static int execute_pipeline(const char *line) {
             g_njobs = 0;
             return 0;
         }
+        /* "set -e" / "set +e" switch errexit on and off (several letters at once, "-e" only); any other option is status 2 with a
+         * message, as in bash --posix. Without an argument it does nothing. */
+        if (strcmp(cmd, "set") == 0) {
+            const char *rest = cmds[0];
+            int idx = 0;
+            while (rest[idx] && rest[idx] != ' ') idx++;
+            for (;;) {
+                while (rest[idx] == ' ') idx++;
+                if (rest[idx] != '-' && rest[idx] != '+') break;
+                int on = rest[idx] == '-';
+                idx++;
+                for (; rest[idx] && rest[idx] != ' '; idx++) {
+                    if (rest[idx] != 'e') {
+                        print("sh: set: unknown option\n");
+                        return 2 << 8;
+                    }
+                    g_errexit = on;
+                }
+            }
+            return 0;
+        }
         /* "true" and "false" are status 0 and 1, as in every POSIX shell (there is no program for either). */
         if (strcmp(cmd, "true") == 0) return 0;
         if (strcmp(cmd, "false") == 0) return 1 << 8;
@@ -698,8 +719,14 @@ static int execute_list(const char *line) {
             elem[n++] = *p++;
         elem[n] = '\0';
         int bg = (*p == '&' && p[1] != '&');
+        int negated = 0;
         if (run_next) {
             const char *e = skip_spaces(elem);
+            /* "! pipeline": its status inverted (0 becomes 1, anything else 0). The "!" is a word of its own: "!true" is a command. */
+            if (e[0] == '!' && (e[1] == ' ' || e[1] == '\t' || e[1] == '\0')) {
+                negated = 1;
+                e = skip_spaces(e + 1);
+            }
             if (*e) {
                 char expanded[256];
                 expand_vars(e, expanded, sizeof(expanded));
@@ -709,10 +736,12 @@ static int execute_list(const char *line) {
             } else {
                 status = 0;
             }
+            if (negated) status = status_ok(status) ? (1 << 8) : 0;
             set_last_code(status);
         }
-        /* -e: a failure ends the shell, except when the next separator (&& or ||) tests this status, as the left side of a list. */
-        if (g_errexit && run_next && !bg && !status_ok(status) && !(*p == '&' && p[1] == '&') && !(*p == '|' && p[1] == '|')) {
+        /* -e: a failure ends the shell, except when the next separator (&& or ||) tests this status, as the left side of a list, or the
+         * pipeline was negated with "!" (POSIX: errexit ignores it). */
+        if (g_errexit && run_next && !bg && !negated && !status_ok(status) && !(*p == '&' && p[1] == '&') && !(*p == '|' && p[1] == '|')) {
             int sig = status < 0 ? 0 : status & 0x7f;
             exit(status < 0 ? 1 : sig ? 128 + sig : (status >> 8) & 0xff);
         }
