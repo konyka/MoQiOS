@@ -1892,7 +1892,7 @@ pub fn setNice(t: *task.Task, nice: i32) void {
 /// Get the nice value of a task from its internal priority.
 /// F3: RT tasks report nice 0 (their `priority` field holds the RT band
 /// 0..98, which is meaningless as a nice value).
-pub fn getNice(t: *task.Task) i32 {
+pub fn getNice(t: *const task.Task) i32 {
     if (sched_policy.isRtClass(t.sched_policy)) return 0;
     return @as(i32, @intCast(t.priority)) - 20;
 }

@@ -577,6 +577,9 @@ fn generatePidStat(pid: u32, buf: [*]u8, max_len: u32) u32 {
     const state_c = @import("pid_status.zig").stateOf(t.state == .zombie, t.stopped, t.state == .blocked).letter();
     const ppid = t.parent_tid;
     const starttime_ticks = t.start_ns / 10_000_000; // ns → 100 Hz clock ticks since boot (sysconf(_SC_CLK_TCK) == 100)
+    // Fields 18/19 (priority/nice): Linux reports priority = 20 + nice for a normal task, and the nice value itself.
+    const nice_val = @import("../proc/sched.zig").getNice(t);
+    const prio_val = 20 + nice_val;
     // Fields 14/15 (utime/stime): the process's user and system CPU time in clock ticks (µs → 100 Hz: /10000). groupTimesLocked
     // needs the task lock, which we hold here.
     const tsc = @import("../arch/arch.zig").tsc;
@@ -612,8 +615,17 @@ fn generatePidStat(pid: u32, buf: [*]u8, max_len: u32) u32 {
     pos = appendDec(buf, pos, max_len, @intCast(cutime_ticks));
     pos = appendChar(buf, pos, max_len, ' ');
     pos = appendDec(buf, pos, max_len, @intCast(cstime_ticks));
-    // Fields 18..19 (priority, nice): 2 zeros.
-    pos = appendStr(buf, pos, max_len, " 0 0 ");
+    pos = appendChar(buf, pos, max_len, ' ');
+    // Field 18: priority. Field 19: nice (can be negative).
+    pos = appendDec(buf, pos, max_len, @intCast(prio_val));
+    pos = appendChar(buf, pos, max_len, ' ');
+    if (nice_val < 0) {
+        pos = appendChar(buf, pos, max_len, '-');
+        pos = appendDec(buf, pos, max_len, @intCast(-nice_val));
+    } else {
+        pos = appendDec(buf, pos, max_len, @intCast(nice_val));
+    }
+    pos = appendChar(buf, pos, max_len, ' ');
     // Field 20: num_threads.
     pos = appendDec(buf, pos, max_len, @intCast(threads));
     // Field 21 (itrealvalue): 0. Field 22: starttime in clock ticks since boot.
