@@ -524,6 +524,34 @@ pub fn residentUserPages(pml4_phys: u64) u64 {
     return pages;
 }
 
+/// Count the user pages that have been swapped out (non-present leaf PTEs carrying a swap entry), for /proc/<pid>/status VmSwap.
+/// A swap entry is a non-present page-table leaf with the swap marker set (mm/pte_kind.zig); it sits only at the PT level, so a
+/// huge PDE is never a swap entry. Intermediate tables of a fully swapped range stay present, so the walk reaches the leaves.
+pub fn swappedUserPages(pml4_phys: u64) u64 {
+    const pte_kind = @import("../../mm/pte_kind.zig");
+    const pml4: *PageTable = hhdm.physToPtr(PageTable, pml4_phys);
+    var pages: u64 = 0;
+    for (0..256) |pml4_i| {
+        const pml4e = pml4.entries[pml4_i];
+        if (!pml4e.present or !pml4e.user) continue;
+        const pdpt: *PageTable = hhdm.physToPtr(PageTable, pml4e.getPhysAddr());
+        for (0..512) |pdpt_i| {
+            const pdpte = pdpt.entries[pdpt_i];
+            if (!pdpte.present or !pdpte.user or pdpte.huge_page) continue;
+            const pd: *PageTable = hhdm.physToPtr(PageTable, pdpte.getPhysAddr());
+            for (0..512) |pd_i| {
+                const pde = pd.entries[pd_i];
+                if (!pde.present or !pde.user or pde.huge_page) continue;
+                const pt: *PageTable = hhdm.physToPtr(PageTable, pde.getPhysAddr());
+                for (pt.entries) |pte| {
+                    if (!pte.present and pte_kind.classify(@bitCast(pte)) == .swap) pages += 1;
+                }
+            }
+        }
+    }
+    return pages;
+}
+
 /// Walk the user-space page table and collect VMA ranges (up to max_vmas).
 /// Returns number of VMAs found.
 pub fn enumerateVMAs(pml4_phys: u64, out: []VMAEntry) u32 {
