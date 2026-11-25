@@ -524,6 +524,32 @@ pub fn residentUserPages(pml4_phys: u64) u64 {
     return pages;
 }
 
+/// Count the page-table pages backing the user half of this address space, for /proc/<pid>/status VmPTE (Linux mm->pgtables_bytes).
+/// The PML4 itself plus every present user PDPT, PD and PT is one 4 KiB page; a 1 GiB or 2 MiB huge mapping has no lower table, so
+/// those levels are not counted when the entry is a huge page.
+pub fn pageTablePages(pml4_phys: u64) u64 {
+    const pml4: *PageTable = hhdm.physToPtr(PageTable, pml4_phys);
+    var tables: u64 = 1; // the PML4 page
+    for (0..256) |pml4_i| {
+        const pml4e = pml4.entries[pml4_i];
+        if (!pml4e.present or !pml4e.user) continue;
+        tables += 1; // a PDPT page
+        const pdpt: *PageTable = hhdm.physToPtr(PageTable, pml4e.getPhysAddr());
+        for (0..512) |pdpt_i| {
+            const pdpte = pdpt.entries[pdpt_i];
+            if (!pdpte.present or !pdpte.user or pdpte.huge_page) continue;
+            tables += 1; // a PD page
+            const pd: *PageTable = hhdm.physToPtr(PageTable, pdpte.getPhysAddr());
+            for (0..512) |pd_i| {
+                const pde = pd.entries[pd_i];
+                if (!pde.present or !pde.user or pde.huge_page) continue;
+                tables += 1; // a PT page
+            }
+        }
+    }
+    return tables;
+}
+
 /// Count the user pages that have been swapped out (non-present leaf PTEs carrying a swap entry), for /proc/<pid>/status VmSwap.
 /// A swap entry is a non-present page-table leaf with the swap marker set (mm/pte_kind.zig); it sits only at the PT level, so a
 /// huge PDE is never a swap entry. Intermediate tables of a fully swapped range stay present, so the walk reaches the leaves.

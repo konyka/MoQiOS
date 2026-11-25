@@ -688,6 +688,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello568"); /* /proc/<pid>/status VmStk */
     run_test("hello569"); /* /proc/<pid>/status VmSwap */
     run_test("hello570"); /* /proc/<pid>/status VmExe/VmLib */
+    run_test("hello571"); /* /proc/<pid>/status VmPTE */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

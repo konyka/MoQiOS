@@ -66,6 +66,8 @@ pub const Status = struct {
     /// Executable code and library sizes in kB (Linux VmExe / VmLib); null with the other Vm lines. VmLib is always 0 here.
     vm_exe_kb: ?u64 = null,
     vm_lib_kb: ?u64 = null,
+    /// Page-table pages in kB (Linux VmPTE); null with the other Vm lines.
+    vm_pte_kb: ?u64 = null,
     /// Swapped-out pages in kB (Linux VmSwap); null with the other Vm lines.
     vm_swap_kb: ?u64 = null,
 };
@@ -204,6 +206,10 @@ pub fn render(buf: [*]u8, max_len: u32, s: Status) u32 {
         o.str("\nVmLib:\t");
         o.kb8(lib);
     }
+    if (s.vm_pte_kb) |pte| {
+        o.str("\nVmPTE:\t");
+        o.kb8(pte);
+    }
     if (s.vm_swap_kb) |sw| {
         o.str("\nVmSwap:\t");
         o.kb8(sw);
@@ -248,6 +254,7 @@ fn sample() Status {
         .vm_stk_kb = 132,
         .vm_exe_kb = 8,
         .vm_lib_kb = 0,
+        .vm_pte_kb = 40,
         .vm_swap_kb = 0,
     };
 }
@@ -257,7 +264,7 @@ test "status text: every field in Linux order, tab separated" {
     const n = render(&buf, buf.len, sample());
     try std.testing.expectEqualStrings(
         "Name:\tcat\nUmask:\t0022\nState:\tR (running)\nTgid:\t42\nNgid:\t0\nPid:\t42\nPPid:\t7\nTracerPid:\t0\n" ++
-            "Uid:\t1000\t1001\t1002\t1001\nGid:\t1000\t1000\t1000\t1000\nFDSize:\t64\nGroups:\t10 1000 \nVmSize:\t  231788 kB\nVmRSS:\t    2780 kB\nVmData:\t     240 kB\nVmStk:\t     132 kB\nVmExe:\t       8 kB\nVmLib:\t       0 kB\nVmSwap:\t       0 kB\nThreads:\t1\nNoNewPrivs:\t0\n" ++
+            "Uid:\t1000\t1001\t1002\t1001\nGid:\t1000\t1000\t1000\t1000\nFDSize:\t64\nGroups:\t10 1000 \nVmSize:\t  231788 kB\nVmRSS:\t    2780 kB\nVmData:\t     240 kB\nVmStk:\t     132 kB\nVmExe:\t       8 kB\nVmLib:\t       0 kB\nVmPTE:\t      40 kB\nVmSwap:\t       0 kB\nThreads:\t1\nNoNewPrivs:\t0\n" ++
             "CapInh:\t0000000800000000\nCapPrm:\t00000000000000c0\nCapEff:\t0000000000000080\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n",
         buf[0..n],
     );
@@ -281,7 +288,7 @@ test "status text: umask is four octal digits, groups may be none, a thread has 
     s.no_new_privs = true;
     n = render(&buf, buf.len, s);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "Tgid:\t42\nNgid:\t0\nPid:\t43\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "Groups:\t\nVmSize:\t  231788 kB\nVmRSS:\t    2780 kB\nVmData:\t     240 kB\nVmStk:\t     132 kB\nVmExe:\t       8 kB\nVmLib:\t       0 kB\nVmSwap:\t       0 kB\nThreads:\t2\nNoNewPrivs:\t1\nCapInh:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "Groups:\t\nVmSize:\t  231788 kB\nVmRSS:\t    2780 kB\nVmData:\t     240 kB\nVmStk:\t     132 kB\nVmExe:\t       8 kB\nVmLib:\t       0 kB\nVmPTE:\t      40 kB\nVmSwap:\t       0 kB\nThreads:\t2\nNoNewPrivs:\t1\nCapInh:") != null);
 }
 
 test "status text: the output is cut at the buffer size and never overruns it" {
@@ -324,13 +331,14 @@ test "status text: Vm lines are right-aligned in eight columns and absent for a 
     s.vm_size_kb = 0;
     s.vm_rss_kb = 123456789;
     var n = render(&buf, buf.len, s);
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "VmSize:\t       0 kB\nVmRSS:\t123456789 kB\nVmData:\t     240 kB\nVmStk:\t     132 kB\nVmExe:\t       8 kB\nVmLib:\t       0 kB\nVmSwap:\t       0 kB\nThreads:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "VmSize:\t       0 kB\nVmRSS:\t123456789 kB\nVmData:\t     240 kB\nVmStk:\t     132 kB\nVmExe:\t       8 kB\nVmLib:\t       0 kB\nVmPTE:\t      40 kB\nVmSwap:\t       0 kB\nThreads:") != null);
     s.vm_size_kb = null;
     s.vm_rss_kb = null;
     s.vm_data_kb = null;
     s.vm_stk_kb = null;
     s.vm_exe_kb = null;
     s.vm_lib_kb = null;
+    s.vm_pte_kb = null;
     s.vm_swap_kb = null;
     n = render(&buf, buf.len, s);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "Vm") == null);

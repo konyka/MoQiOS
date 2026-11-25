@@ -453,6 +453,7 @@ fn generatePidStatus(pid: u32, buf: [*]u8, max_len: u32) u32 {
             st.vm_exe_kb = m.code_bytes / 1024;
             st.vm_lib_kb = 0; // static flat/ELF binaries, no shared libraries
         }
+        st.vm_pte_kb = @import("../arch/x86_64/paging.zig").pageTablePages(root) * 4;
         st.vm_swap_kb = @import("../arch/x86_64/paging.zig").swappedUserPages(root) * 4;
     }
     st.name = name[0..@import("../proc/comm_policy.zig").textLen(&name)];
