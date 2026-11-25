@@ -577,6 +577,12 @@ fn generatePidStat(pid: u32, buf: [*]u8, max_len: u32) u32 {
     const state_c = @import("pid_status.zig").stateOf(t.state == .zombie, t.stopped, t.state == .blocked).letter();
     const ppid = t.parent_tid;
     const starttime_ticks = t.start_ns / 10_000_000; // ns → 100 Hz clock ticks since boot (sysconf(_SC_CLK_TCK) == 100)
+    // Fields 14/15 (utime/stime): the process's user and system CPU time in clock ticks (µs → 100 Hz: /10000). groupTimesLocked
+    // needs the task lock, which we hold here.
+    const tsc = @import("../arch/arch.zig").tsc;
+    const cpu = task_mod.groupTimesLocked(tgid, tsc.read(), tsc.tsc_freq_mhz);
+    const utime_ticks = cpu.user_us / 10_000;
+    const stime_ticks = cpu.sys_us / 10_000;
     task_mod.unlockTask(flags);
     defer if (root != 0) user_space.destroyUserSpace(root);
     const vsize = image + charged;
@@ -592,8 +598,14 @@ fn generatePidStat(pid: u32, buf: [*]u8, max_len: u32) u32 {
     pos = appendChar(buf, pos, max_len, state_c);
     pos = appendStr(buf, pos, max_len, " ");
     pos = appendDec(buf, pos, max_len, @intCast(ppid));
-    // Fields 5..19 (pgrp..nice): 15 zeros.
-    pos = appendStr(buf, pos, max_len, " 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 ");
+    // Fields 5..13 (pgrp, session, tty_nr, tpgid, flags, minflt, cminflt, majflt, cmajflt): 9 zeros.
+    pos = appendStr(buf, pos, max_len, " 0 0 0 0 0 0 0 0 0 ");
+    // Field 14: utime. Field 15: stime (clock ticks).
+    pos = appendDec(buf, pos, max_len, @intCast(utime_ticks));
+    pos = appendChar(buf, pos, max_len, ' ');
+    pos = appendDec(buf, pos, max_len, @intCast(stime_ticks));
+    // Fields 16..19 (cutime, cstime, priority, nice): 4 zeros.
+    pos = appendStr(buf, pos, max_len, " 0 0 0 0 ");
     // Field 20: num_threads.
     pos = appendDec(buf, pos, max_len, @intCast(threads));
     // Field 21 (itrealvalue): 0. Field 22: starttime in clock ticks since boot.

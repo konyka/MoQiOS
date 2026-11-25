@@ -1574,7 +1574,7 @@ pub fn cpuSnapshot(m: *const Task) cpu_time_policy.Member {
 
 /// CPU time of the thread group `gid` (task_lock held): every live member,
 /// the time of reclaimed threads, and the children the leader waited for.
-fn groupTimesLocked(gid: u32, now_tsc: u64, tsc_mhz: u64) cpu_time_policy.Times {
+pub fn groupTimesLocked(gid: u32, now_tsc: u64, tsc_mhz: u64) cpu_time_policy.Times {
     var total: cpu_time_policy.Times = .{};
     var bits = slot_bitmap;
     while (bits != 0) {
