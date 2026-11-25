@@ -576,6 +576,7 @@ fn generatePidStat(pid: u32, buf: [*]u8, max_len: u32) u32 {
     const charged: u64 = if (t.mm) |m| @atomicLoad(u64, &m.as_used, .monotonic) else 0;
     const state_c = @import("pid_status.zig").stateOf(t.state == .zombie, t.stopped, t.state == .blocked).letter();
     const ppid = t.parent_tid;
+    const starttime_ticks = t.start_ns / 10_000_000; // ns → 100 Hz clock ticks since boot (sysconf(_SC_CLK_TCK) == 100)
     task_mod.unlockTask(flags);
     defer if (root != 0) user_space.destroyUserSpace(root);
     const vsize = image + charged;
@@ -595,8 +596,10 @@ fn generatePidStat(pid: u32, buf: [*]u8, max_len: u32) u32 {
     pos = appendStr(buf, pos, max_len, " 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 ");
     // Field 20: num_threads.
     pos = appendDec(buf, pos, max_len, @intCast(threads));
-    // Fields 21 (itrealvalue), 22 (starttime): 0.
-    pos = appendStr(buf, pos, max_len, " 0 0 ");
+    // Field 21 (itrealvalue): 0. Field 22: starttime in clock ticks since boot.
+    pos = appendStr(buf, pos, max_len, " 0 ");
+    pos = appendDec(buf, pos, max_len, @intCast(starttime_ticks));
+    pos = appendChar(buf, pos, max_len, ' ');
     // Field 23: vsize in bytes.
     pos = appendDec(buf, pos, max_len, @intCast(vsize));
     pos = appendChar(buf, pos, max_len, ' ');

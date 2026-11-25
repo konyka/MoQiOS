@@ -318,6 +318,9 @@ pub const Task = struct {
     /// alarm() deadline in TSC nanoseconds (0 = no alarm set).
     alarm_deadline: u64 = 0,
 
+    /// Monotonic nanoseconds (tsc.nanos()) at which this task slot was allocated, for /proc/<pid>/stat field 22 (starttime, in
+    /// clock ticks since boot). Set in allocSlot.
+    start_ns: u64 = 0,
     /// nanosleep() wake deadline in TSC nanoseconds (0 = not sleeping).
     /// Scanned every timer tick against sched.sleep_bm — see sched.sleepTimerTick.
     sleep_deadline_ns: u64 = 0,
@@ -712,6 +715,8 @@ fn zeroSlot(slot: u32) void {
         bytes[0..@sizeOf(Task)],
         &tasks[slot].incarnation,
     );
+    // Record when this task was built, for /proc/<pid>/stat field 22 (starttime). Set after the zero so it survives the reset.
+    tasks[slot].start_ns = @import("../arch/arch.zig").tsc.nanos();
 }
 var task_lock: IrqSpinlock = .{};
 
