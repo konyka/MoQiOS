@@ -58,7 +58,11 @@ pub const Mm = struct {
     /// Size of the executable (text) segments in bytes, for /proc/<pid>/status VmExe (Linux mm->end_code - mm->start_code,
     /// rounded to pages). Set by the loader from the PF_X program headers; 0 for a flat binary's single page is set too. A fork
     /// child and exec both get the value of the image they run. VmLib is always 0 here (static flat/ELF binaries, no shared libs).
-    code_bytes: u64 = 0,
+    /// u32 is enough: the image (code segments) is at most a few MiB, well under 4 GiB.
+    code_bytes: u32 = 0,
+    /// High-water mark of as_used in whole pages, for /proc/<pid>/status VmPeak (Linux mm->hiwater_vm). Narrow (u32 pages) so Mm
+    /// stays in the 1024-byte slab class. Updated when as_used grows and refreshed lazily on read; fork inherits it, exec resets.
+    as_peak_pages: u32 = 0,
     /// RLIMIT_AS / RLIMIT_DATA charge of this address space, in bytes (Linux mm->total_vm / data_vm): brk heap pages,
     /// tracked mmap regions and demand-faulted stack pages. One counter per address space, so CLONE_VM threads charge
     /// the same one. Written under vm_lock; a fresh address space (exec) starts at 0, a fork child at the parent's.
@@ -76,6 +80,13 @@ pub const Mm = struct {
     pub fn inheritCharges(mm: *Mm, parent: *const Mm) void {
         mm.as_used = parent.as_used;
         mm.data_used = parent.data_used;
+        mm.as_peak_pages = parent.as_peak_pages;
+    }
+
+    /// Raise the VmPeak high-water mark to the current as_used (in pages). Call after any growth of as_used.
+    pub fn bumpAsPeak(mm: *Mm) void {
+        const pages: u32 = @truncate(mm.as_used / 4096);
+        if (pages > mm.as_peak_pages) mm.as_peak_pages = pages;
     }
 
     /// A new address space copied from `parent` (fork, clone without CLONE_VM) starts with the parent's resource limits; exec

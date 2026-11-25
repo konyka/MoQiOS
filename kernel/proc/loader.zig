@@ -260,7 +260,7 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
     if (task.getTask(new_task)) |t| {
         if (t.mm) |m| {
             m.setBreak(highest_addr);
-            m.code_bytes = code_bytes;
+            m.code_bytes = @truncate(code_bytes);
         }
         t.comm = @import("comm_policy.zig").fromProgram(name);
     }
@@ -369,7 +369,7 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32, 
         if (t.mm) |m| {
             m.setBreak(heap_start);
             // A flat binary maps its whole image as one executable region (no segment headers); count it all as VmExe code.
-            m.code_bytes = allocated * paging.PAGE_SIZE;
+            m.code_bytes = @truncate(allocated * paging.PAGE_SIZE);
         }
         t.comm = @import("comm_policy.zig").fromProgram(name);
     }

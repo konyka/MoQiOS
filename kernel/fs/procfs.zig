@@ -421,6 +421,11 @@ fn generatePidStatus(pid: u32, buf: [*]u8, max_len: u32) u32 {
     const image: u64 = if (tt.mm) |m| (if (m.brk_start > user_space.USER_CODE_BASE) m.brk_start - user_space.USER_CODE_BASE else 0) else 0;
     const charged: u64 = if (tt.mm) |m| @atomicLoad(u64, &m.as_used, .monotonic) else 0;
     const data_charged: u64 = if (tt.mm) |m| @atomicLoad(u64, &m.data_used, .monotonic) else 0;
+    // VmPeak: refresh the high-water mark so it is never below the current as_used, then read it back (in bytes).
+    const peak_charged: u64 = if (tt.mm) |m| blk: {
+        m.bumpAsPeak();
+        break :blk @as(u64, m.as_peak_pages) * 4096;
+    } else 0;
     @memcpy(&name, &tt.comm);
     const ng: usize = @min(@as(usize, tt.ngroups), groups.len);
     @memcpy(groups[0..ng], tt.groups[0..ng]);
@@ -447,6 +452,7 @@ fn generatePidStatus(pid: u32, buf: [*]u8, max_len: u32) u32 {
     if (root != 0 and comptime @import("builtin").cpu.arch == .x86_64) {
         st.vm_rss_kb = @import("../arch/x86_64/paging.zig").residentUserPages(root) * 4;
         st.vm_size_kb = (image + charged) / 1024;
+        st.vm_peak_kb = (image + peak_charged) / 1024;
         st.vm_data_kb = data_charged / 1024;
         // VmStk: the stack's current extent, from USER_STACK_TOP down to the growth watermark (Linux stack_vma size). A task that
         // never touched its stack still shows the initial limit (stack_limit starts at stack_top - 64 pages).

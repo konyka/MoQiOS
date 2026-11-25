@@ -1017,7 +1017,10 @@ fn handleDemandPage(fault_addr: u64) bool {
         pmm.freePage(phys);
         return false;
     };
-    if (in_stack_range) current.asUsed().* += paging_mod.PAGE_SIZE;
+    if (in_stack_range) {
+        current.asUsed().* += paging_mod.PAGE_SIZE;
+        if (current.mm) |m| m.bumpAsPeak();
+    }
 
     return true;
 }

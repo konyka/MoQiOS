@@ -124,6 +124,7 @@ pub fn brk(addr: u64) i64 {
             };
         }
         cur.asUsed().* += delta_bytes; // RLIMIT_AS charge (checked above)
+        if (cur.mm) |m| m.bumpAsPeak();
         cur.dataUsed().* += delta_bytes; // RLIMIT_DATA charge (checked above)
         mlock_gate.recordIfFuture(cur, old_page, new_page - old_page);
     } else if (new_page < old_page) {

@@ -184,7 +184,7 @@ pub fn prepareExecName(name: []const u8, argv_ptr: u64, envp_ptr: u64) Prepared 
     // RLIMIT_AS limits are preserved, but every charged byte belonged to the
     // replaced image — the fresh image starts uncharged (see docs/rlimit.md).
     new_mm.setBreak(result.brk);
-    new_mm.code_bytes = result.code_bytes; // VmExe follows the new image
+    new_mm.code_bytes = @truncate(result.code_bytes); // VmExe follows the new image
     // The old TLS block belonged to the replaced image. Program the CPU too:
     // execve returns straight to user space without passing through the
     // scheduler, so the stale base would otherwise survive into the new image.
