@@ -20,11 +20,13 @@ static int g_xtrace;
 /* "sh -u" / "set -u" (POSIX nounset): expanding a variable that is not set is an error. */
 static int g_nounset;
 
-/* Positional parameters: set by "sh -s a b" and "sh FILE a b" (the latter does not exist yet). $1..$9, $#, $@ and $0
- * are read by expand_vars. argc/argv point into main's argv or into the parsed "set --" words (not yet). */
+/* Positional parameters: $0 and $1..$9, set by "sh -s a b", "sh FILE a b" and "sh -c CMD name a b" (pointers into main's argv),
+ * changed by "shift" and "set -- a b" (whose words are copied into g_pos_store). $#, $@ and $0..$9 are read by expand_vars. Only
+ * nine are kept; more arguments are dropped. */
 #define MAX_POS 10
 static int g_pos_argc;
 static const char *g_pos_argv[MAX_POS]; /* [0] is $0, [1]..[9] are $1..$9 */
+static char g_pos_store[MAX_POS - 1][64];
 
 /* Utility functions */
 
@@ -541,6 +543,25 @@ static int execute_pipeline(const char *line) {
             for (;;) {
                 while (rest[idx] == ' ') idx++;
                 if (rest[idx] != '-' && rest[idx] != '+') break;
+                if (rest[idx] == '-' && rest[idx + 1] == '-' && (rest[idx + 2] == ' ' || rest[idx + 2] == '\0')) {
+                    /* "set -- a b": the words after "--" become $1..$9 ("set --" alone clears them); $0 stays. They are copied,
+                     * since the command line they come from is gone after this command. */
+                    const char *w = rest + idx + 2;
+                    int n = 1;
+                    for (;;) {
+                        char word[64];
+                        w = copy_token(word, sizeof(word), w);
+                        if (!word[0]) break;
+                        if (n < MAX_POS) {
+                            snprintf(g_pos_store[n - 1], sizeof(g_pos_store[0]), "%s", word);
+                            g_pos_argv[n] = g_pos_store[n - 1];
+                            n++;
+                        }
+                    }
+                    if (g_pos_argc == 0) g_pos_argv[0] = "sh";
+                    g_pos_argc = n;
+                    return 0;
+                }
                 int on = rest[idx] == '-';
                 idx++;
                 for (; rest[idx] && rest[idx] != ' '; idx++) {
@@ -556,6 +577,33 @@ static int execute_pipeline(const char *line) {
                     }
                 }
             }
+            return 0;
+        }
+        /* "shift [n]": drop the first n positional parameters (1 by default). n larger than $# is status 1 and changes nothing; a
+         * non-number is an error, which ends a shell that is not interactive with status 2 (bash --posix). */
+        if (strcmp(cmd, "shift") == 0) {
+            char word[64];
+            const char *after = copy_token(word, sizeof(word), cmds[0]);
+            copy_token(word, sizeof(word), after);
+            int n = 1;
+            if (word[0]) {
+                n = 0;
+                for (const char *d = word; *d; d++) {
+                    if (*d < '0' || *d > '9' || n > 1000) {
+                        err_str("sh: shift: numeric argument required\n");
+                        if (!g_interactive || g_command_mode) exit(2);
+                        return 2 << 8;
+                    }
+                    n = n * 10 + (*d - '0');
+                }
+            }
+            int have = g_pos_argc > 0 ? g_pos_argc - 1 : 0;
+            if (n > have) {
+                err_str("sh: shift: shift count out of range\n");
+                return 1 << 8;
+            }
+            for (int i = 1; i + n < g_pos_argc; i++) g_pos_argv[i] = g_pos_argv[i + n];
+            g_pos_argc -= n;
             return 0;
         }
         /* "true" and "false" are status 0 and 1, as in every POSIX shell (there is no program for either). */
@@ -910,6 +958,10 @@ int main(int argc, char **argv, char **envp) {
     }
     if (want_c && argi < argc) {
         g_command_mode = 1;
+        /* "sh -c CMD name a b": name is $0 and a b are $1.. (POSIX); without them $0 is "sh". */
+        g_pos_argv[0] = argi + 1 < argc ? argv[argi + 1] : "sh";
+        g_pos_argc = 1;
+        for (int a = argi + 2; a < argc && g_pos_argc < MAX_POS; a++) g_pos_argv[g_pos_argc++] = argv[a];
         char quoted[256];
         snprintf(quoted, sizeof(quoted), "%s", argv[argi]);
         protect_quotes(quoted);
@@ -928,9 +980,12 @@ int main(int argc, char **argv, char **envp) {
         }
     }
 
-    /* "sh FILE": run the commands in FILE as if they had been piped in. The file replaces standard input; one that cannot be opened,
-     * or is not a regular readable file, is status 127 and nothing runs. Further arguments are ignored. */
-    if (argi < argc && argv[argi][0] != '-') {
+    /* "sh FILE a b": run the commands in FILE as if they had been piped in, with $0 the file name and a b as $1... The file replaces
+     * standard input; one that cannot be opened, or is not a regular readable file, is status 127 and nothing runs. */
+    if (!want_s && argi < argc && argv[argi][0] != '-') {
+        g_pos_argv[0] = argv[argi];
+        g_pos_argc = 1;
+        for (int a = argi + 1; a < argc && g_pos_argc < MAX_POS; a++) g_pos_argv[g_pos_argc++] = argv[a];
         long fd = open(argv[argi], O_RDONLY, 0);
         if (fd < 0) {
             print("sh: cannot open ");
