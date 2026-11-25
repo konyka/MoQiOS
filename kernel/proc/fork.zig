@@ -73,6 +73,7 @@ pub fn fork(frame: *SyscallFrame) i64 {
     if (child.mm) |child_mm| {
         if (parent.mm) |parent_mm| {
             child_mm.inheritBreak(parent_mm);
+            child_mm.code_bytes = parent_mm.code_bytes; // VmExe follows the forked image
             child_mm.inheritCharges(parent_mm);
             child_mm.inheritLimits(parent_mm);
             child_mm.inheritFs(parent_mm);

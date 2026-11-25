@@ -64,16 +64,10 @@ int main(void) {
         const char *nl = strchr(stk + 1, '\n'); /* end of the VmStk line */
         adjacent = nl != (void *)0 && nl == sw;
     }
-#ifdef HOST
-    /* Linux has VmPTE between VmStk and VmSwap, so they are not adjacent there; only the order holds. */
+    /* VmSwap comes after VmStk; VmExe/VmLib (hello570) sit between them, so they are not adjacent. */
     snprintf(msg, sizeof msg, "B: VmSwap comes after VmStk (order %d)", order);
     check(order, msg);
     (void)adjacent;
-#else
-    /* MoQiOS prints no VmPTE, so VmSwap sits immediately after VmStk. */
-    snprintf(msg, sizeof msg, "B: VmSwap comes right after VmStk (order %d, adjacent %d)", order, adjacent);
-    check(order && adjacent, msg);
-#endif
 
     /* C: a kernel thread has no VmSwap line. */
     long kn = slurp("/proc/0/status", buf, sizeof buf);

@@ -20,6 +20,8 @@ pub const ExecResult = struct {
     entry: u64,
     stack_top: u64,
     brk: u64,
+    /// Executable (PF_X) segment bytes, page-rounded, for VmExe.
+    code_bytes: u64 = 0,
 };
 
 // ELF64 structures + header/phdr parsing live in the shared module (SK-44).
@@ -95,6 +97,7 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
 
     // Track highest loaded address for brk initialization
     var highest_addr: u64 = 0;
+    var code_bytes: u64 = 0;
     var success = true;
     var loaded_segments: u32 = 0;
 
@@ -200,6 +203,7 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
         if (seg_end > highest_addr) {
             highest_addr = seg_end;
         }
+        if (executable) code_bytes += num_pages * paging.PAGE_SIZE;
         loaded_segments += 1;
     }
 
@@ -254,7 +258,10 @@ fn loadElf(file: ramdisk.RamdiskFile, ehdr: *const Elf64_Ehdr, name: []const u8,
 
     // Set initial brk to just after the highest loaded segment
     if (task.getTask(new_task)) |t| {
-        if (t.mm) |m| m.setBreak(highest_addr);
+        if (t.mm) |m| {
+            m.setBreak(highest_addr);
+            m.code_bytes = code_bytes;
+        }
         t.comm = @import("comm_policy.zig").fromProgram(name);
     }
 
@@ -359,7 +366,11 @@ fn loadFlatBinary(file: ramdisk.RamdiskFile, name: []const u8, parent_tid: u32, 
 
     const heap_start = user_space.USER_CODE_BASE + allocated * paging.PAGE_SIZE;
     if (task.getTask(new_task)) |t| {
-        if (t.mm) |m| m.setBreak(heap_start);
+        if (t.mm) |m| {
+            m.setBreak(heap_start);
+            // A flat binary maps its whole image as one executable region (no segment headers); count it all as VmExe code.
+            m.code_bytes = allocated * paging.PAGE_SIZE;
+        }
         t.comm = @import("comm_policy.zig").fromProgram(name);
     }
 
@@ -402,6 +413,7 @@ pub fn loadProgramForExec(name: []const u8, argv: []const []const u8, envp: []co
 
     const new_pml4 = user_space.createUserSpace() orelse return null;
     var highest_addr: u64 = 0;
+    var code_bytes: u64 = 0;
     var success = true;
     var loaded_segments: u32 = 0;
     const phnum = ehdr.e_phnum;
@@ -467,6 +479,7 @@ pub fn loadProgramForExec(name: []const u8, argv: []const []const u8, envp: []co
         }
         const seg_end = seg_vaddr + seg_memsz;
         if (seg_end > highest_addr) highest_addr = seg_end;
+        if (seg_executable) code_bytes += num_pages * paging.PAGE_SIZE;
         loaded_segments += 1;
     }
 
@@ -515,5 +528,6 @@ pub fn loadProgramForExec(name: []const u8, argv: []const []const u8, envp: []co
         .entry = ehdr.e_entry,
         .stack_top = user_rsp,
         .brk = highest_addr,
+        .code_bytes = code_bytes,
     };
 }

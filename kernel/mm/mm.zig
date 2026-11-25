@@ -55,6 +55,10 @@ pub const Mm = struct {
     /// loader left the break (it may never retreat below it); 0 in both means no heap was set up for this image.
     brk_start: u64 = 0,
     brk_current: u64 = 0,
+    /// Size of the executable (text) segments in bytes, for /proc/<pid>/status VmExe (Linux mm->end_code - mm->start_code,
+    /// rounded to pages). Set by the loader from the PF_X program headers; 0 for a flat binary's single page is set too. A fork
+    /// child and exec both get the value of the image they run. VmLib is always 0 here (static flat/ELF binaries, no shared libs).
+    code_bytes: u64 = 0,
     /// RLIMIT_AS / RLIMIT_DATA charge of this address space, in bytes (Linux mm->total_vm / data_vm): brk heap pages,
     /// tracked mmap regions and demand-faulted stack pages. One counter per address space, so CLONE_VM threads charge
     /// the same one. Written under vm_lock; a fresh address space (exec) starts at 0, a fork child at the parent's.

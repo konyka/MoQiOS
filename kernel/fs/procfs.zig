@@ -449,6 +449,10 @@ fn generatePidStatus(pid: u32, buf: [*]u8, max_len: u32) u32 {
         // never touched its stack still shows the initial limit (stack_limit starts at stack_top - 64 pages).
         if (tt.mm != null and user_space.USER_STACK_TOP > tt.stack_limit)
             st.vm_stk_kb = (user_space.USER_STACK_TOP - tt.stack_limit) / 1024;
+        if (tt.mm) |m| {
+            st.vm_exe_kb = m.code_bytes / 1024;
+            st.vm_lib_kb = 0; // static flat/ELF binaries, no shared libraries
+        }
         st.vm_swap_kb = @import("../arch/x86_64/paging.zig").swappedUserPages(root) * 4;
     }
     st.name = name[0..@import("../proc/comm_policy.zig").textLen(&name)];
