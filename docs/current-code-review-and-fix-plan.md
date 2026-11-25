@@ -13792,3 +13792,9 @@ ramdisk 多了 23.2 MiB，空闲内存正好少了 23.2 MiB。内核在整个启
 **验证**：
 - 红灯/绿灯见上。宿主机 `gcc -DHOST` 版 A–C 通过；宿主机测试、`zig build test`、`zig build`、`zig build -Darch=riscv64`、`zig build -Darch=aarch64`、`git diff --check` 通过。
 - 完整 smoke：第一次 SMP=2 失败在 hello200 H（过时断言）和 hello265 J（夹取把相邻记录误当空洞），都属于本次改动的回归；修正夹取逻辑（走连续匿名记录链的末尾而非单条记录）并更新 hello200 H 断言后，SMP=1、SMP=2 都是 `rc=0`，hello566、hello188、hello199、hello200、hello210、hello265 都 PASS。
+
+## CI 偶发：hello108「RT task lost the CPU to reaping」（2d9fcf2c 的 CI）
+
+- 现象：hello565 的提交（2d9fcf2c）推上去后，CI 的 `smoke-qemu`（SMP=1）在 hello108 报 `FAIL RT task lost the CPU to reaping`，同次 `smoke-qemu-smp2` 和 host-tests、smoke-cross-arch 都通过。本地 SMP=1、SMP=2 的完整 smoke 都通过。
+- 判断：这是文档第三十六/三十九/四十轮（约 4523 行起）记录过的 hello108 偶发失败，根因是宿主机 CPU 竞争导致 RT 任务被回收孤儿进程时被抢走，不是内核缺陷；hello565 只改 execve 的字符串缓冲和 shell，不碰调度。CI runner 比本地慢、更容易触发。
+- 处理：不改代码。若再连续出现，按 4523 行那节的思路给 hello108 放宽阈值或记录更多现场，但需要先拿到多次样本确认不是新回归。
