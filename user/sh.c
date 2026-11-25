@@ -14,6 +14,9 @@ static int g_command_mode;
 /* "sh -e" (POSIX set -e): a command that fails ends the shell with its status, unless an && or || list tests that status. */
 static int g_errexit;
 
+/* "sh -x" / "set -x" (POSIX xtrace): each command is written to standard error, after expansion, before it runs. */
+static int g_xtrace;
+
 /* Utility functions */
 
 /* True when standard input is a terminal: the prompt and the echo of typed characters are for people, and only a terminal can have
@@ -314,6 +317,42 @@ static void run_command(const char *cmd, int pipe_in, int pipe_out, const char *
     _exit(127);
 }
 
+/* xtrace: "+ " and the words of each command of the pipeline (redirections left out) on a line of their own, written to standard
+ * error. A word with anything but letters, digits and "_./,:=@%+-" in it is shown in single quotes, a quote in it as '\'', so the
+ * line can be read back by a shell; bash --posix writes the same. */
+static int xtrace_safe(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '/' ||
+           c == ',' || c == ':' || c == '=' || c == '@' || c == '%' || c == '+' || c == '-';
+}
+
+static void xtrace_command(const char *cmd) {
+    char line[512];
+    int n = 0;
+    line[n++] = '+';
+    const char *q = cmd;
+    for (;;) {
+        q = skip_spaces(q);
+        if (*q == '\0' || *q == '|' || *q == '>' || *q == '<') break;
+        char word[256];
+        q = copy_token(word, sizeof(word), q);
+        int plain = word[0] != '\0';
+        for (const char *c = word; *c; c++) plain &= xtrace_safe(*c);
+        if (n < (int)sizeof(line) - 1) line[n++] = ' ';
+        if (!plain && n < (int)sizeof(line) - 1) line[n++] = '\'';
+        for (const char *c = word; *c; c++) {
+            if (*c == '\'' && !plain) {
+                for (const char *e = "'\\''"; *e; e++)
+                    if (n < (int)sizeof(line) - 1) line[n++] = *e;
+            } else if (n < (int)sizeof(line) - 1) {
+                line[n++] = *c;
+            }
+        }
+        if (!plain && n < (int)sizeof(line) - 1) line[n++] = '\'';
+    }
+    line[n++] = '\n';
+    write(STDERR_FILENO, line, (size_t)n);
+}
+
 /* Parse and execute a pipeline: cmd1 | cmd2 | cmd3 ...
    Returns the exit code of the last command. */
 static int execute_pipeline(const char *line) {
@@ -381,6 +420,9 @@ static int execute_pipeline(const char *line) {
         cmds[0] = single;
     }
 
+    if (g_xtrace)
+        for (int i = 0; i < ncmds; i++) xtrace_command(cmds[i]);
+
     if (ncmds == 1) {
         /* Single command — no pipes */
         char cmd[64];
@@ -428,8 +470,8 @@ static int execute_pipeline(const char *line) {
             g_njobs = 0;
             return 0;
         }
-        /* "set -e" / "set +e" switch errexit on and off (several letters at once, "-e" only); any other option is status 2 with a
-         * message, as in bash --posix. Without an argument it does nothing. */
+        /* "set -e" / "set +e" switch errexit on and off, "set -x" / "set +x" xtrace (several letters at once, as "-ex"); any other
+         * option is status 2 with a message, as in bash --posix. Without an argument it does nothing. */
         if (strcmp(cmd, "set") == 0) {
             const char *rest = cmds[0];
             int idx = 0;
@@ -440,11 +482,14 @@ static int execute_pipeline(const char *line) {
                 int on = rest[idx] == '-';
                 idx++;
                 for (; rest[idx] && rest[idx] != ' '; idx++) {
-                    if (rest[idx] != 'e') {
+                    if (rest[idx] == 'e') {
+                        g_errexit = on;
+                    } else if (rest[idx] == 'x') {
+                        g_xtrace = on;
+                    } else {
                         print("sh: set: unknown option\n");
                         return 2 << 8;
                     }
-                    g_errexit = on;
                 }
             }
             return 0;
@@ -766,16 +811,17 @@ int main(int argc, char **argv, char **envp) {
     /* "sh -c command": run one command line (pipes, redirection and the built-ins work as at the prompt), print nothing of its
      * own, and end with the command's exit status; a command killed by a signal ends the shell with 128 + signal. system() in
      * the C library starts the shell like this. */
-    /* Leading options: -e (errexit) and -c, alone or together ("-e -c", "-ec", "-ce"). */
+    /* Leading options: -e (errexit), -x (xtrace) and -c, alone or together ("-e -c", "-ec", "-xec"). */
     int argi = 1;
     int want_c = 0;
     while (argi < argc && argv[argi][0] == '-' && argv[argi][1] != '\0') {
         const char *o = argv[argi] + 1;
         int known = 1;
-        for (const char *q = o; *q; q++) known &= (*q == 'e' || *q == 'c');
+        for (const char *q = o; *q; q++) known &= (*q == 'e' || *q == 'x' || *q == 'c');
         if (!known) break;
         for (const char *q = o; *q; q++) {
             if (*q == 'e') g_errexit = 1;
+            if (*q == 'x') g_xtrace = 1;
             if (*q == 'c') want_c = 1;
         }
         argi++;
