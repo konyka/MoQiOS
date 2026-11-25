@@ -445,6 +445,10 @@ fn generatePidStatus(pid: u32, buf: [*]u8, max_len: u32) u32 {
         st.vm_rss_kb = @import("../arch/x86_64/paging.zig").residentUserPages(root) * 4;
         st.vm_size_kb = (image + charged) / 1024;
         st.vm_data_kb = data_charged / 1024;
+        // VmStk: the stack's current extent, from USER_STACK_TOP down to the growth watermark (Linux stack_vma size). A task that
+        // never touched its stack still shows the initial limit (stack_limit starts at stack_top - 64 pages).
+        if (tt.mm != null and user_space.USER_STACK_TOP > tt.stack_limit)
+            st.vm_stk_kb = (user_space.USER_STACK_TOP - tt.stack_limit) / 1024;
     }
     st.name = name[0..@import("../proc/comm_policy.zig").textLen(&name)];
     return ps.render(buf, max_len, st);
