@@ -11,6 +11,9 @@
 /* Set by "sh -c": no prompt, no farewell. */
 static int g_command_mode;
 
+/* "sh -e" (POSIX set -e): a command that fails ends the shell with its status, unless an && or || list tests that status. */
+static int g_errexit;
+
 /* Utility functions */
 
 /* True when standard input is a terminal: the prompt and the echo of typed characters are for people, and only a terminal can have
@@ -425,6 +428,9 @@ static int execute_pipeline(const char *line) {
             g_njobs = 0;
             return 0;
         }
+        /* "true" and "false" are status 0 and 1, as in every POSIX shell (there is no program for either). */
+        if (strcmp(cmd, "true") == 0) return 0;
+        if (strcmp(cmd, "false") == 0) return 1 << 8;
         if (strcmp(cmd, "exit") == 0) {
             /* "exit N" ends the shell with status N (low 8 bits); without a number it is 0. The farewell is only for people. */
             const char *rest = cmds[0];
@@ -705,6 +711,11 @@ static int execute_list(const char *line) {
             }
             set_last_code(status);
         }
+        /* -e: a failure ends the shell, except when the next separator (&& or ||) tests this status, as the left side of a list. */
+        if (g_errexit && run_next && !bg && !status_ok(status) && !(*p == '&' && p[1] == '&') && !(*p == '|' && p[1] == '|')) {
+            int sig = status < 0 ? 0 : status & 0x7f;
+            exit(status < 0 ? 1 : sig ? 128 + sig : (status >> 8) & 0xff);
+        }
         if (*p == '\0') break;
         if (*p == ';' || bg) {
             run_next = 1;
@@ -726,10 +737,25 @@ int main(int argc, char **argv, char **envp) {
     /* "sh -c command": run one command line (pipes, redirection and the built-ins work as at the prompt), print nothing of its
      * own, and end with the command's exit status; a command killed by a signal ends the shell with 128 + signal. system() in
      * the C library starts the shell like this. */
-    if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
+    /* Leading options: -e (errexit) and -c, alone or together ("-e -c", "-ec", "-ce"). */
+    int argi = 1;
+    int want_c = 0;
+    while (argi < argc && argv[argi][0] == '-' && argv[argi][1] != '\0') {
+        const char *o = argv[argi] + 1;
+        int known = 1;
+        for (const char *q = o; *q; q++) known &= (*q == 'e' || *q == 'c');
+        if (!known) break;
+        for (const char *q = o; *q; q++) {
+            if (*q == 'e') g_errexit = 1;
+            if (*q == 'c') want_c = 1;
+        }
+        argi++;
+        if (want_c) break;
+    }
+    if (want_c && argi < argc) {
         g_command_mode = 1;
         char quoted[256];
-        snprintf(quoted, sizeof(quoted), "%s", argv[2]);
+        snprintf(quoted, sizeof(quoted), "%s", argv[argi]);
         protect_quotes(quoted);
         int status = execute_list(quoted);
         if (status < 0) return 1;
@@ -739,11 +765,11 @@ int main(int argc, char **argv, char **envp) {
 
     /* "sh FILE": run the commands in FILE as if they had been piped in. The file replaces standard input; one that cannot be opened,
      * or is not a regular readable file, is status 127 and nothing runs. Further arguments are ignored. */
-    if (argc >= 2 && argv[1][0] != '-') {
-        long fd = open(argv[1], O_RDONLY, 0);
+    if (argi < argc && argv[argi][0] != '-') {
+        long fd = open(argv[argi], O_RDONLY, 0);
         if (fd < 0) {
             print("sh: cannot open ");
-            print(argv[1]);
+            print(argv[argi]);
             print("\n");
             return 127;
         }
@@ -753,7 +779,7 @@ int main(int argc, char **argv, char **envp) {
         long got = read((int)fd, &probe, 1);
         if (got < 0) {
             print("sh: cannot read ");
-            print(argv[1]);
+            print(argv[argi]);
             print("\n");
             return 127;
         }
