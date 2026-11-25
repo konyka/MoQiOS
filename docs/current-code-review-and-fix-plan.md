@@ -13876,7 +13876,13 @@ ramdisk 多了 23.2 MiB，空闲内存正好少了 23.2 MiB。内核在整个启
 
 **实现**：`kernel/arch/x86_64/paging.zig` 新增 `pageTablePages`：数用户半的页表页（PML4 自身 1 页 + 每个 present 的用户 PDPT/PD/PT；巨页条目没有下层表，不计）。`pid_status.zig` 的 `Status` 新增 `vm_pte_kb`，render 在 VmLib 后印 `VmPTE`；`procfs.zig` 赋 `pageTablePages(root) * 4`。
 
-**局限**：只数用户半（PML4 条目 0..255）；`VmPeak`/`VmHWM` 仍没有（需要在 as_used / RSS 的每个升降点维护峰值，改动面大）。
+**局限**：只数用户半（PML4 条目 0..255）；`VmPeak`/`VmHWM` 仍没有。
+
+## 核实：`VmPeak`/`VmHWM` 被 `Mm` 的 1024 字节 slab 预算挡住（2026-11-25）
+
+- 目标：给 `/proc/<pid>/status` 补 `VmPeak`（VmSize 峰值）。VmPeak = image + max(as_used)，只需在 `Mm` 加一个 `as_peak: u64`，在 as_used 的 6 个增长点 bump，读取时再惰性刷新；fork 继承、exec 随新 as_used 重置。实现写完、`zig build` 通过。
+- 阻塞点：`Mm` 当前正好 1024 字节（`tests/main.zig` 的 "Mm still fits the 1024-byte slab class" 钉死 `@sizeOf(Mm) <= 1024`——超过 1024 后 kmalloc 会给每个地址空间整页，是真实回归）。加一个 u64 后实测 `MM_SIZE=1032`，溢出 8 字节，该测试失败。`Mm` 没有可回收的空隙（`code_bytes`、`start_ns` 等近期字段已把它填满）。
+- 结论：`VmPeak`/`VmHWM` 不是"大/慢"，而是被 `Mm` 的 slab 预算硬挡住；要做必须先腾出 8 字节（例如把某个 u64 计数压成 u32 页数，或把峰值移到 group_state 页里），这是一次独立的、有回归风险的重构，留作后续。本轮改动已全部回退。RSS 峰值（VmHWM）另外还缺一个存储点：RSS 是读取时遍历页表算的，没有单一的增减点可挂钩。
 
 **验证**：
 - 红绿灯见上。宿主机 `gcc -DHOST` 版 A–D 通过；宿主机测试、`zig build test`、`zig build`、`zig build -Darch=riscv64`、`zig build -Darch=aarch64`、`git diff --check` 通过。
