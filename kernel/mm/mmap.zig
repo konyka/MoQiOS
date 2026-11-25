@@ -1824,6 +1824,33 @@ fn unmapTailOfMapping(cur: *task_mod.Task, cut_base: u64, cut_pages: u64) bool {
 }
 
 /// Whether [addr, +pages) is covered end to end by tracked anonymous regions that touch each other (mprotect leaves one record per protection).
+/// End address of the run of adjacent anonymous, freeable regions that starts at `addr` (following records that butt up against
+/// each other, as an mprotect split leaves them), or null if `addr` is not in such a region. Used to clamp an mremap old_size that
+/// runs past the end of the mapping back to where the mapping actually ends — not into a hole, and not short of a neighbouring
+/// record that `coveredByAnonymousRegions` would still treat as part of the same range.
+fn anonSpanEnd(task: *task_mod.Task, addr: u64) ?u64 {
+    const page = user_space.PAGE_SIZE;
+    var at = addr;
+    var start_ok = false;
+    advance: while (true) {
+        var bits = task.vma().active_bm;
+        while (bits != 0) {
+            const i: usize = @intCast(@ctz(bits));
+            bits &= bits - 1;
+            const r = &task.vma().regions[i];
+            if (!r.active or r.file_kind != 0 or r.no_free) continue;
+            const end = r.base + r.num_pages * page;
+            if (r.base <= at and at < end) {
+                at = end;
+                start_ok = true;
+                continue :advance;
+            }
+        }
+        break;
+    }
+    return if (start_ok) at else null;
+}
+
 fn coveredByAnonymousRegions(task: *task_mod.Task, addr: u64, pages: u64) bool {
     const page = user_space.PAGE_SIZE;
     if (pages == 0) return false;
@@ -1905,8 +1932,22 @@ fn moveSpanningRecords(cur: *task_mod.Task, old_addr: u64, pages: u64, new_base:
 /// The part of mremap that runs under the VM lock once the arguments are validated. A range that is only part of a
 /// tracked region is first split off as a region of its own (Linux splits the vma the same way), the whole-region code
 /// then moves or resizes it, and the pieces that end up adjacent again are merged back.
-fn mremapRegion(cur: *task_mod.Task, old_addr: u64, old_pages: u64, new_pages: u64, mflags: u32, new_addr_hint: u64) i64 {
+fn mremapRegion(cur: *task_mod.Task, old_addr: u64, old_pages_in: u64, new_pages: u64, mflags: u32, new_addr_hint: u64) i64 {
     const PAGE: u64 = 4096;
+    var old_pages = old_pages_in;
+    // old_size may run past the end of the mapping old_addr falls in (Linux only requires old_addr itself to be mapped; the
+    // remaining pages of old_size may be a hole). A same-size or shrinking request (not a grow, not a FIXED move) then acts on
+    // the mapping that is actually there: clamp old_pages to the end of the anonymous region holding old_addr so the no-op and
+    // tail-unmap paths below see the real length. A grow or a FIXED move keeps the full old_pages (Linux faults those EFAULT/EINVAL).
+    if (old_addr % PAGE == 0 and new_pages <= old_pages and (mflags & MREMAP_FIXED) == 0) {
+        if (anonSpanEnd(cur, old_addr)) |span_end| {
+            const req_end = old_addr + old_pages * PAGE;
+            if (span_end < req_end) {
+                old_pages = (span_end - old_addr) / PAGE;
+                if (new_pages > old_pages) return @bitCast(old_addr); // the whole mapping is kept: a no-op
+            }
+        }
+    }
     // A range that crosses protection boundaries (several records after an mprotect). Linux (measured): shrinking unmaps the tail whatever vmas it
     // spans; growing it is EFAULT, with or without MAYMOVE; moving it with MREMAP_FIXED and the same size carries every piece along.
     if (old_addr % PAGE == 0 and regionContaining(cur, old_addr, old_pages) == null and coveredByAnonymousRegions(cur, old_addr, old_pages)) {

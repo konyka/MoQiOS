@@ -226,11 +226,13 @@ static void s_mremap_sub(void) {
     check(mapped(dst2) && !mapped(dst2 + PG), "H: only 1 page exists at the new place");
     check(mapped(j) && mapped(j + PG) && mapped(j + 5 * PG) && mapped(j + 7 * PG), "H: and the head and the tail are intact");
 
-    /* A range that ends past the mapping is not a sub-range: Linux allows it, this kernel refuses it (documented). */
+    /* A range whose old_size runs past the end of its mapping: Linux only needs old_addr to be mapped and clamps the rest to the
+     * mapping, so a same-size remap is a no-op that returns old_addr (hello566). The mapping stays whole. */
     char *k = (char *)mmap((void *)0, 4 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     errno = 0;
     char *kr = (char *)mremap(k + 2 * PG, 4 * PG, 4 * PG, MREMAP_MAYMOVE);
-    check(kr == MAP_FAILED, "H: a range that runs past the end of its mapping is refused (this kernel; Linux accepts it)");
+    check(kr == k + 2 * PG, "H: a same-size remap whose old_size runs past the mapping end is a no-op returning old_addr");
+    check(mapped(k) && mapped(k + 2 * PG) && mapped(k + 3 * PG), "H: and the mapping is left whole");
 }
 
 static void s_lock(void) {
