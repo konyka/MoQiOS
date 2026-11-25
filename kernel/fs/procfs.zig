@@ -552,21 +552,58 @@ fn appendHex(buf: [*]u8, pos: u32, max_len: u32, val: u64) u32 {
     return p;
 }
 
-/// Generate /proc/PID/stat — Linux-compatible single-line format.
+/// Generate /proc/PID/stat — Linux-compatible single-line format. Fields 1-4 (pid, comm, state, ppid), 20 (num_threads), 23
+/// (vsize, bytes) and 24 (rss, pages) carry real values; the rest are 0 (scheduler/timing counters this kernel does not expose).
 fn generatePidStat(pid: u32, buf: [*]u8, max_len: u32) u32 {
+    const task_mod = @import("../proc/task.zig");
+    const user_space = @import("../mm/user_space.zig");
+    const flags = task_mod.lockTask();
     const t = findTaskByPid(pid) orelse {
+        task_mod.unlockTask(flags);
         return appendStr(buf, 0, max_len, "0 (none) Z 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n");
     };
+    const tgid: u32 = if (t.is_thread and t.parent_tid != 0) t.parent_tid else t.tid;
+    var threads: u32 = 0;
+    var j: u32 = 0;
+    while (j < task_mod.MAX_TASKS) : (j += 1) {
+        const m = task_mod.getTask(j) orelse continue;
+        const member_of = if (m.is_thread and m.parent_tid != 0) m.parent_tid else m.tid;
+        if (member_of == tgid and m.state != .zombie) threads += 1;
+    }
+    const root = t.page_table_phys;
+    if (root != 0) user_space.retainUserSpace(root);
+    const image: u64 = if (t.mm) |m| (if (m.brk_start > user_space.USER_CODE_BASE) m.brk_start - user_space.USER_CODE_BASE else 0) else 0;
+    const charged: u64 = if (t.mm) |m| @atomicLoad(u64, &m.as_used, .monotonic) else 0;
+    const state_c = @import("pid_status.zig").stateOf(t.state == .zombie, t.stopped, t.state == .blocked).letter();
+    const ppid = t.parent_tid;
+    task_mod.unlockTask(flags);
+    defer if (root != 0) user_space.destroyUserSpace(root);
+    const vsize = image + charged;
+    const rss_pg: u64 = if (root != 0 and comptime @import("builtin").cpu.arch == .x86_64)
+        @import("../arch/x86_64/paging.zig").residentUserPages(root)
+    else
+        0;
     var pos: u32 = 0;
     pos = appendDec(buf, pos, max_len, @intCast(pid));
     pos = appendStr(buf, pos, max_len, " (");
     pos = appendStr(buf, pos, max_len, commText(t));
     pos = appendStr(buf, pos, max_len, ") ");
-    // State character
-    pos = appendChar(buf, pos, max_len, @import("pid_status.zig").stateOf(t.state == .zombie, t.stopped, t.state == .blocked).letter());
+    pos = appendChar(buf, pos, max_len, state_c);
     pos = appendStr(buf, pos, max_len, " ");
-    pos = appendDec(buf, pos, max_len, @intCast(t.parent_tid));
-    pos = appendStr(buf, pos, max_len, " 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n");
+    pos = appendDec(buf, pos, max_len, @intCast(ppid));
+    // Fields 5..19 (pgrp..nice): 15 zeros.
+    pos = appendStr(buf, pos, max_len, " 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 ");
+    // Field 20: num_threads.
+    pos = appendDec(buf, pos, max_len, @intCast(threads));
+    // Fields 21 (itrealvalue), 22 (starttime): 0.
+    pos = appendStr(buf, pos, max_len, " 0 0 ");
+    // Field 23: vsize in bytes.
+    pos = appendDec(buf, pos, max_len, @intCast(vsize));
+    pos = appendChar(buf, pos, max_len, ' ');
+    // Field 24: rss in pages.
+    pos = appendDec(buf, pos, max_len, @intCast(rss_pg));
+    // Fields 25..34: 10 zeros.
+    pos = appendStr(buf, pos, max_len, " 0 0 0 0 0 0 0 0 0 0\n");
     return pos;
 }
 
