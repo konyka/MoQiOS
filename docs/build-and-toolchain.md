@@ -456,7 +456,10 @@ no `duration_ms`. This P1 mode does not provide QEMU runtime samples.
   `zig build run` 下的 QEMU `hello*` 运行时测试为准。GitHub CI 在每次推送和拉取请求运行
   `zig build test --summary all`（host-tests 作业），并自 2026-08-14 起以 `smoke-qemu` 作业
   运行 QEMU 冒烟门禁（`zig build smoke` 单核 + `zig build smoke-smp` 双核，TCG 软模拟，
-  不依赖 /dev/kvm；Limine 按固定 commit 现场克隆构建，disk.img 走 manifest 校验）。
+  不依赖 /dev/kvm；Limine 按固定 commit 现场克隆构建，disk.img 走 manifest 校验）。2026-11-25 起单核和双核
+  分成两个并行作业 `smoke-qemu`（SMP=1）和 `smoke-qemu-smp2`（SMP=2），各自上限 55 分钟：两步共用一个 60 分钟作业时，
+  两个 1500 秒的 smoke 上限加上安装和构建已经超过作业上限，b128296e 的运行在 SMP=2 中途被取消。
+  `tools/tests/test_qemu_smoke_keeps_failure_log.sh` 检查每个作业的上限不小于它的 smoke 步骤上限之和加 15 分钟。
 
 ---
 
@@ -538,7 +541,7 @@ POSIX 消息队列的属性决策属于主机测试覆盖：测试验证 `O_CREA
 
 **需要不跑真实 `syscall` 指令的包装器测试**（如 `netdb.c`）：源文件里用 `#ifdef MOQI_HOST_TEST_SYSCALL` 把系统调用换成一个由测试提供的桩函数（`moqi_test_syscall2`），`run_tests.sh` 对这个源文件加 `-DMOQI_HOST_TEST_SYSCALL` 单独编译。这样能在宿主机上检查参数顺序、错误码原样透传、NULL 参数被包装器拒绝，而不需要内核。
 
-GitHub CI 还分三个层次运行 QEMU：`smoke-qemu` 保持 x86_64 的单核/双核
+GitHub CI 还分三个层次运行 QEMU：`smoke-qemu` 和 `smoke-qemu-smp2` 分别做 x86_64 的单核、双核
 boot-to-shell 测试（安装 `qemu-system-x86` 与 `xorriso`）；`smoke-cross-arch`
 安装 `qemu-system-misc`（riscv64）与 `qemu-system-arm`（aarch64）并串行运行当前稳定的 `smoke-riscv` 与
 `smoke-aarch64` 合约。2026-10 之前该 job 只装了 `qemu-system-misc`，AArch64 一步每次都报

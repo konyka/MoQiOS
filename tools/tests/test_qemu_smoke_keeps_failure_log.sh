@@ -79,5 +79,32 @@ else
     bad "the default MOQI_SMOKE_TIMEOUT (${default_timeout:-none} s) differs from the x86_64 CI smoke steps' limit (${ci_timeouts:-none})"
 fi
 
+# 6. A CI job must have room for every x86_64 smoke step it runs. Both steps used to share one 60-minute job: 2 x 1500 s is
+# 50 minutes before Zig and QEMU are installed, and run for b128296e was cancelled by the job limit during SMP=2 (SMP=1 had
+# taken 34 minutes and the Zig download 13). Each job's limit has to cover its smoke steps' MOQI_SMOKE_TIMEOUT plus 15 minutes
+# for checkout, installs and the build.
+job_budget="$(awk '
+    function flush() { if (job != "" && smoke > 0) printf "%s %d %d\n", job, smoke, limit }
+    /^  [A-Za-z0-9_-]+:$/ { flush(); job = $1; sub(":", "", job); smoke = 0; limit = 0; in_smoke = 0 }
+    /^    timeout-minutes:/ { limit = $2 }
+    /^ *- name:/ { in_smoke = 0 }
+    /run: zig build smoke/ { in_smoke = 1 }
+    in_smoke && /MOQI_SMOKE_TIMEOUT:/ { smoke += $2; in_smoke = 0 }
+    END { flush() }' "$PROJECT_DIR/.github/workflows/test.yml")"
+budget_ok=1
+[ -n "$job_budget" ] || budget_ok=0
+while read -r job smoke limit; do
+    [ -n "$job" ] || continue
+    if [ "$limit" -le 0 ] || [ $((smoke / 60 + 15)) -gt "$limit" ]; then
+        budget_ok=0
+        echo "  job $job: smoke steps ${smoke} s, job limit ${limit} min"
+    fi
+done <<< "$job_budget"
+if [ "$budget_ok" -eq 1 ]; then
+    ok "each CI job's timeout-minutes covers its x86_64 smoke steps' MOQI_SMOKE_TIMEOUT plus 15 minutes"
+else
+    bad "a CI job's timeout-minutes is shorter than its x86_64 smoke steps' MOQI_SMOKE_TIMEOUT plus 15 minutes"
+fi
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

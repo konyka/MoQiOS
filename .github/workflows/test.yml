@@ -26,7 +26,12 @@ jobs:
   # commit 克隆构建；disk.img 是跟踪在库的规范 fixture（manifest 校验）。
   smoke-qemu:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # One job per CPU count, each with its own limit: the two steps used to share a 60-minute job, which is less than their two
+    # 1500 s MOQI_SMOKE_TIMEOUT limits plus the installs and builds, and the run for b128296e was cancelled during SMP=2 after the
+    # Zig download took 13 minutes and SMP=1 34 (8 of them building). 55 minutes covers that worst case for one step: 13 + 8 + 25
+    # plus the QEMU install. The two jobs also run in parallel. tools/tests/test_qemu_smoke_keeps_failure_log.sh checks that each
+    # job's limit covers its smoke steps plus 15 minutes.
+    timeout-minutes: 55
     steps:
       # v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -56,6 +61,42 @@ jobs:
         run: zig build smoke
         env:
           MOQI_SMOKE_TIMEOUT: 1500
+      # The serial log of a failed smoke is copied to /tmp by the script but the runner is thrown away; print what a timeout needs to be
+      # told apart from a hang: how far the boot got and the last lines.
+      - name: Show the failing serial log
+        if: failure()
+        run: |
+          for f in /tmp/moqios-smoke-last-failure-smp*.log; do
+            [ -f "$f" ] || continue
+            echo "=== $f ($(wc -l < "$f") lines)"
+            echo "--- hello probes that finished:"; grep -a -cE "^hello[0-9]+ done" "$f" || true
+            echo "--- last hello started:"; grep -a -E "^spawned hello|^\[spawn\] loading" "$f" | tail -n 2 || true
+            echo "--- last 40 lines:"; tail -n 40 "$f"
+          done
+
+  smoke-qemu-smp2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install Zig 0.16.0
+        run: |
+          curl -sSfL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | sudo tar -xJ -C /opt
+          echo "/opt/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+      - name: Install QEMU and xorriso
+        # The same install as the smoke-qemu job.
+        timeout-minutes: 11
+        run: |
+          for attempt in 1 2 3; do
+            if sudo timeout 240 apt-get update && sudo timeout 240 apt-get install -y --no-install-recommends qemu-system-x86 xorriso ipxe-qemu; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed or timed out" >&2
+            sleep 5
+          done
+          exit 1
+      # The same 1500 s limit as SMP=1 (see the smoke-qemu job).
       - name: Smoke SMP=2
         run: zig build smoke-smp
         env:
