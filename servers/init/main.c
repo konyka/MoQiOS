@@ -679,6 +679,7 @@ int main(int argc, char **argv, char **envp) {
     run_test("hello559"); /* sh -e */
     run_test("hello560"); /* set -e, set +e and ! in the shell */
     run_test("hello561"); /* set -x, set +x and sh -x */
+    run_test("hello562"); /* set -u, set +u and sh -u */
     run_test("hello190"); /* hostile-argument sweep over every system call */
     run_test("hello191"); /* deep hostile-argument sweep (arguments that pass validation) */
     run_test("hello192"); /* stateful hostile-argument sweep (chains of calls on live objects) */

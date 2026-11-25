@@ -94,7 +94,7 @@ C 版保持成功路径的字节级行为一致：相同 spawn 顺序、相同�
 
 职责：
 
-1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello561`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
+1. 顺序 `spawn` 自动化测试程序（当前从 `hello2` 到 `hello562`，权威序列是 `servers/init/main.c`；其中 `hello6`、`hello11`、`hello28`、`hello116`、`hello149`、`hello230`–`hello233` **不**在
    init 自动序列内：它们分别是会阻塞的键盘程序、exec 目标、手工复现程序和被别的测试启动的探针），并 `waitpid` 收回；随后进入交互 shell。
 2. 仅监督 `servers/init/main.c` 中 `persistent_services` 显式登记的常驻服务；当前列表为
    `syslogd` 和 `devmgr`。`hello*` 测试与 `sh` 均为一次性进程，不纳入监督。
@@ -150,6 +150,7 @@ main():
 | `true` / `false` | 状态 0 / 1（hello559） |
 | `set -e` / `set +e` | 打开、关闭 errexit（可以写在一行中间）；其他选项打印 `sh: set: unknown option`、状态 2（hello560） |
 | `set -x` / `set +x` | 打开、关闭 xtrace：每个命令运行前把 `+ ` 和展开后的单词写到标准错误（hello561） |
+| `set -u` / `set +u` | 打开、关闭 nounset：展开没有设置的变量（或还没有后台任务时的 `$!`）时在标准错误写 `sh: NAME: parameter not set`，这一行剩下的命令不再运行；`sh -c` 以 127 结束，脚本文件和管道输入以 1 结束，交互时只丢掉这一行（hello562） |
 | `pid` | 打印当前 PID |
 | `echo [args...]` | 回显参数 |
 | `ls [path]` | 列出目录（`opendir`/`readdir`，每行一个名字，不含 `.` 和 `..`）；不带参数列工作目录；`path` 是文件则打印它的名字；打不开则报错并以状态 1 结束 |
@@ -170,7 +171,7 @@ main():
 
 ### 3.2a 命令列表与 `sh -c`
 
-- `sh -e`（POSIX `set -e`，hello559）：一个命令失败时 shell 以它的状态结束，除非紧接着的 `&&` 或 `||` 检测这个状态（列表左边的命令）；后台任务不算。可与 `-c` 合写（`-e -c`、`-ec`、`-ce`），也用于 `sh -e FILE` 和 `sh -e < FILE`。`sh -x`（hello561）打开 xtrace：每个命令运行前，把 `+ ` 和展开后的单词（不含重定向）写到标准错误，管道里每个命令一行；单词含字母、数字和 `_./,:=@%+-` 以外的字符时用单引号括起，其中的单引号写作 `'\''`，与 `bash --posix` 相同；`-x` 可与 `-e`、`-c` 合写（`-xec`）。其他选项（`-s` 等）不认，以 `-` 开头的参数不当作文件名。`! 命令`（`!` 后面要有空白）把状态取反（0 变 1，其他变 0），被取反的命令在 `-e` 下不会让 shell 结束（hello560）。
+- `sh -e`（POSIX `set -e`，hello559）：一个命令失败时 shell 以它的状态结束，除非紧接着的 `&&` 或 `||` 检测这个状态（列表左边的命令）；后台任务不算。可与 `-c` 合写（`-e -c`、`-ec`、`-ce`），也用于 `sh -e FILE` 和 `sh -e < FILE`。`sh -x`（hello561）打开 xtrace：每个命令运行前，把 `+ ` 和展开后的单词（不含重定向）写到标准错误，管道里每个命令一行；单词含字母、数字和 `_./,:=@%+-` 以外的字符时用单引号括起，其中的单引号写作 `'\''`，与 `bash --posix` 相同；`-x` 可与 `-e`、`-c` 合写（`-xec`）。`sh -u`（hello562）打开 nounset，见 `set -u`。其他选项（`-s` 等）不认，以 `-` 开头的参数不当作文件名。`! 命令`（`!` 后面要有空白）把状态取反（0 变 1，其他变 0），被取反的命令在 `-e` 下不会让 shell 结束（hello560）。
 - `sh -c "<命令行>"`：不打印提示符和 `bye`，执行一行后以最后一个命令的退出状态结束（被信号杀死则 128+信号）；`system()` 就是这样启动它。命令行整体是 `execve` 的一个参数，最长 127 字节；更长的 `system()` 返回 127（shell 没启动）。
 - 命令之间可以用 `;`（总是执行下一个）、`&&`（上一个成功才执行）、`||`（上一个失败才执行）连接，自左向右求值，没有优先级和括号；状态是最后一个**实际执行**的管道的状态。`exit N` 在被执行到时结束 shell，其后的命令不再运行。
 - 变量：`$NAME` 和 `$?` 在**每个列表元素即将运行之前**展开（不是读入整行时），所以 `$?`（上一个实际运行的命令的退出码，信号杀死为 128+信号，一个命令都没跑过时为 0；被 `&&`/`||` 跳过的命令不改变它）和同一行里前面 `export` 的变量都是最新的。双引号内的 `$X` 同样展开，但展开出的值里的空格和分隔符会被保护（`"$X"` 始终是一个单词）。
@@ -531,6 +532,7 @@ hello45 之后的程序由当前 `servers/init/main.c` 按验收门禁顺序启�
 | hello559 | shell 的 `-e`（与 `bash --posix` 实测相同）：`sh -e FILE` 在第一个失败的行停止、状态 1（A）；文件里 `a \|\| b`、`a && b` 不会让它停止，之后单独的失败会（B）；`sh -e -c` 在命令行内停止（C）；`sh -ec` 同 C（D）；失败程序自己的退出码（hello11 的 42）成为 shell 的状态（E）；`sh -e < FILE` 同 A（F）；不带 `-e` 时整个文件都执行（G）。同时新增内建 `true`、`false` |
 | hello560 | shell 的 `set -e`/`set +e` 和 `!`（与 `bash --posix` 实测相同）：一行中间的 `set -e` 打开 errexit，之后的失败结束 shell、状态 1（A）；`set +e` 再关掉（B）；`! true` 为 1、`! false` 为 0（C）；`-e` 下被取反的命令不结束 shell（D）；不带空白的 `!true` 是一个名为 `!true` 的命令，127（E）；`set -q` 为未知选项、状态 2（F）；`set -e; false \|\| true` 不结束 shell（G） |
 | hello561 | shell 的 xtrace（与 `bash --posix` 实测相同）：`set -x` 后 `echo hi` 在标准错误写 `+ echo hi`（A）；写出的是展开后的单词（B）；含空白或单引号的单词用单引号括起（C）；`set +x` 本身被追踪，之后关闭（D）；`sh -x -c`（E）；`sh -xe -c` 追踪失败的命令后停止、状态 1（F）；`!` 不写出，`&&`/`\|\|` 中被跳过的命令不追踪（G）；管道里每个命令各一行（H） |
+| hello562 | shell 的 nounset（与 `bash --posix` 实测相同）：`set -u` 后展开没有设置的变量，`sh -c` 在第一个 echo 之后以 127 结束，标准错误里有变量名（A）；双引号里也一样（B）；设为空串的变量算已设置（C）；`$?` 总是已设置（D）；还没有后台任务时 `$!` 未设置（E）；`set +u` 再关掉（F）；`sh -u -c`（G）；`sh -u FILE` 以 1 结束（H） |
 | hello526 | `/etc/resolv.conf` 的 IPv6 nameserver（与 glibc 2.44 实测相同）：[::1]:53 和 127.0.0.1:53 上各一个本机 DNS 服务器；只写 `nameserver ::1` 时经 IPv6 查询并得到应答（A）；`::1` 在前时只问 IPv6 服务器（B）；不应答的 IPv6 服务器在前时换到 IPv4 服务器（C）；`gethostbyaddr` 也经 IPv6 服务器（D）；`::ffff:127.0.0.1` 按 IPv4 服务器询问（E）；两个服务器能在同一端口分别绑定 [::1] 和 127.0.0.1 |
 | hello525 | AAAA 记录（与 glibc 2.44 实测相同）：本机服务器知道双栈、只有 IPv4、只有 IPv6 三个名字；`gethostbyname2(AF_INET6)` 发 AAAA 查询并返回 16 字节地址（A）；只有 A 记录的名字在 `AF_INET6` 下为 `NO_DATA`（B）；`getaddrinfo` 的 `AF_UNSPEC` 发 AAAA 和 A 两个查询，IPv6 地址在前（C）；单栈名字只给那个族（D）；`AF_INET6` 对只有 IPv4 的名字为 `EAI_NODATA`，带 `AI_V4MAPPED` 时给映射地址（E）；不存在的名字为 `EAI_NONAME`（F） |
 | hello524 | 截断应答改用 TCP（与 glibc 2.44 `res_send` 实测相同）：本机服务器的 UDP 应答都带 TC 位，TCP（2 字节长度加报文）按名字回答；`gethostbyname` 先问 UDP、再问 TCP，得到 TCP 的三个地址（A）；UDP 应答带 TC 且有记录时也不用，用 TCP 的结果（B）；TCP 回 NXDOMAIN 为 `HOST_NOT_FOUND`（C）；TCP 连接在应答前关闭为 `TRY_AGAIN`（D）；服务器没有 TCP 监听时立即 `TRY_AGAIN`（E） |

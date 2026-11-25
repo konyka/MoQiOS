@@ -17,6 +17,9 @@ static int g_errexit;
 /* "sh -x" / "set -x" (POSIX xtrace): each command is written to standard error, after expansion, before it runs. */
 static int g_xtrace;
 
+/* "sh -u" / "set -u" (POSIX nounset): expanding a variable that is not set is an error. */
+static int g_nounset;
+
 /* Utility functions */
 
 /* True when standard input is a terminal: the prompt and the echo of typed characters are for people, and only a terminal can have
@@ -173,6 +176,7 @@ static void set_last_code(int status) {
 #define MAX_JOBS 16
 static int g_background;
 static long g_last_bg;
+static int g_have_bg;
 static long g_jobs[MAX_JOBS];
 static int g_njobs;
 
@@ -199,11 +203,18 @@ static void jobs_reap_finished(void) {
     }
 }
 
+/* With nounset, expand_vars() stops at the first variable that is not set, returns -1 and leaves its name here. */
+static char g_unset_name[64];
+
 static int expand_vars(const char *src, char *dst, int max) {
     int si = 0, di = 0;
     while (src[si] && di < max - 1) {
         if ((src[si] == '$' || src[si] == QUOTED_DOLLAR) && (src[si + 1] == '?' || src[si + 1] == '!')) {
             int bang = src[si + 1] == '!';
+            if (bang && !g_have_bg && g_nounset) {
+                snprintf(g_unset_name, sizeof(g_unset_name), "$!");
+                return -1;
+            }
             si += 2;
             char num[24];
             int n = bang ? snprintf(num, sizeof(num), "%ld", g_last_bg) : snprintf(num, sizeof(num), "%d", g_last_code);
@@ -225,6 +236,10 @@ static int expand_vars(const char *src, char *dst, int max) {
                 long vlen = moqi_getenv(key, val, sizeof(val));
                 const char *inherited = vlen >= 0 ? (const char *)0 : getenv(key);
                 if (inherited) vlen = (long)strlen(inherited);
+                if (vlen < 0 && g_nounset) {
+                    snprintf(g_unset_name, sizeof(g_unset_name), "%s", key);
+                    return -1;
+                }
                 if (vlen >= 0) {
                     for (int v = 0; v < vlen && di < max - 1; v++) {
                         char ch = inherited ? inherited[v] : val[v];
@@ -471,7 +486,7 @@ static int execute_pipeline(const char *line) {
             return 0;
         }
         /* "set -e" / "set +e" switch errexit on and off, "set -x" / "set +x" xtrace (several letters at once, as "-ex"); any other
-         * option is status 2 with a message, as in bash --posix. Without an argument it does nothing. */
+         * option is status 2 with a message, as in bash --posix; "-u" / "+u" is nounset. Without an argument it does nothing. */
         if (strcmp(cmd, "set") == 0) {
             const char *rest = cmds[0];
             int idx = 0;
@@ -486,6 +501,8 @@ static int execute_pipeline(const char *line) {
                         g_errexit = on;
                     } else if (rest[idx] == 'x') {
                         g_xtrace = on;
+                    } else if (rest[idx] == 'u') {
+                        g_nounset = on;
                     } else {
                         print("sh: set: unknown option\n");
                         return 2 << 8;
@@ -659,6 +676,7 @@ not_builtin:;
         /* Parent: a background job is only recorded; a foreground one is waited for by its own pid */
         if (g_background) {
             g_last_bg = pid;
+            g_have_bg = 1;
             job_add(pid);
             return 0;
         }
@@ -727,6 +745,7 @@ not_builtin:;
 
     if (g_background) {
         g_last_bg = last_pid;
+        g_have_bg = 1;
         job_add(last_pid);
         return 0;
     }
@@ -774,7 +793,17 @@ static int execute_list(const char *line) {
             }
             if (*e) {
                 char expanded[256];
-                expand_vars(e, expanded, sizeof(expanded));
+                if (expand_vars(e, expanded, sizeof(expanded)) < 0) {
+                    /* nounset: an unset variable ends a shell that is not interactive (127 under -c, 1 for a script or piped
+                     * input, as bash --posix does); at the prompt the rest of the line is dropped. */
+                    char m[96];
+                    int ml = snprintf(m, sizeof(m), "sh: %s: parameter not set\n", g_unset_name);
+                    write(STDERR_FILENO, m, (size_t)ml);
+                    if (g_command_mode) exit(127);
+                    if (!g_interactive) exit(1);
+                    set_last_code(127 << 8);
+                    return 127 << 8;
+                }
                 g_background = bg;
                 status = execute_pipeline(expanded);
                 g_background = 0;
@@ -811,17 +840,18 @@ int main(int argc, char **argv, char **envp) {
     /* "sh -c command": run one command line (pipes, redirection and the built-ins work as at the prompt), print nothing of its
      * own, and end with the command's exit status; a command killed by a signal ends the shell with 128 + signal. system() in
      * the C library starts the shell like this. */
-    /* Leading options: -e (errexit), -x (xtrace) and -c, alone or together ("-e -c", "-ec", "-xec"). */
+    /* Leading options: -e (errexit), -u (nounset), -x (xtrace) and -c, alone or together ("-e -c", "-ec", "-xuec"). */
     int argi = 1;
     int want_c = 0;
     while (argi < argc && argv[argi][0] == '-' && argv[argi][1] != '\0') {
         const char *o = argv[argi] + 1;
         int known = 1;
-        for (const char *q = o; *q; q++) known &= (*q == 'e' || *q == 'x' || *q == 'c');
+        for (const char *q = o; *q; q++) known &= (*q == 'e' || *q == 'u' || *q == 'x' || *q == 'c');
         if (!known) break;
         for (const char *q = o; *q; q++) {
             if (*q == 'e') g_errexit = 1;
             if (*q == 'x') g_xtrace = 1;
+            if (*q == 'u') g_nounset = 1;
             if (*q == 'c') want_c = 1;
         }
         argi++;
