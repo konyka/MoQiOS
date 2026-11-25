@@ -341,9 +341,9 @@ int main(int argc, char **argv, char **envp) {
     st = system("export 1ABC=1");
     check(exited(st, 1), "B: a name that starts with a digit is status 1");
 
-    /* B13: an argument that does not fit is an error, not a silent cut. execve copies each argument into a 127-byte buffer; a longer
-     * one used to be truncated there, so "sh -c LONGLINE" ran a different, shorter command. Now execve says E2BIG, and system()
-     * therefore reports the shell as not started (status 127). A line of up to 127 bytes still works whole. */
+    /* B13: a command line that used to be cut at 127 bytes now runs whole. The execve argument strings share the 4 KiB stack page
+     * (see hello565), so a 135-byte "sh -c" line runs its "exit 3"; only a string past what the page holds is E2BIG. A 150-byte
+     * argument fits now, so execve succeeds and hello11 runs (exit 42); the caller keeps running either way. */
     for (int len = 120; len <= 135; len += 3) {
         char line[200];
         memset(line, ' ', sizeof line);
@@ -354,8 +354,7 @@ int main(int argc, char **argv, char **envp) {
         st = system(line);
         char what[112];
         snprintf(what, sizeof what, "B: a command line of %d bytes ending in 'exit 3' (status 0x%x)", len, (unsigned)st);
-        if (len <= 127) check(exited(st, 3), what);
-        else check(exited(st, 127), what);
+        check(exited(st, 3), what);
     }
     {
         char *av[3] = { (char *)"hello11", (char *)0, (char *)0 };
@@ -365,12 +364,13 @@ int main(int argc, char **argv, char **envp) {
         av[1] = big;
         long kid_pid = fork();
         if (kid_pid == 0) {
+            /* On success execve replaces this image with hello11 (exit 42) and never returns; a return means it failed. */
             long r = MSYS3_EXEC("hello11", av);
-            _exit(r == -7 ? 77 : 78); /* only reached when execve failed */
+            _exit(r == -7 ? 77 : 78);
         }
         int es = -1;
         waitpid(kid_pid, &es, 0);
-        check(exited(es, 77), "B: execve with a 150-byte argument is E2BIG and the caller keeps running (hello11 would exit 42)");
+        check(exited(es, 42), "B: execve with a 150-byte argument now fits and runs hello11 (exit 42)");
     }
 
     /* B14: the biggest argument list that fits. The arguments and the environment strings share one 4 KiB page with the pointer

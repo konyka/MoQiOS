@@ -59,13 +59,6 @@ pub fn prepareExecAt(dirfd: i64, name_ptr: u64, argv_ptr: u64, envp_ptr: u64, fl
 
 /// Load ramdisk program `name` and switch the current task to it. Failures
 /// before the commit point leave the old image intact and report an errno.
-/// True when the user string at `addr` has its NUL right after `len` bytes (it was not longer than the copy buffer).
-fn argEndsHere(addr: u64, len: usize) bool {
-    const copy = @import("../mm/copy_from_user.zig");
-    var b: [1]u8 = undefined;
-    if (copy.copyFromUser(b[0..], @ptrFromInt(addr + len), 1) != 1) return false;
-    return b[0] == 0;
-}
 
 pub fn prepareExecName(name: []const u8, argv_ptr: u64, envp_ptr: u64) Prepared {
     const policy = @import("exec_policy.zig");
@@ -85,54 +78,41 @@ pub fn prepareExecName(name: []const u8, argv_ptr: u64, envp_ptr: u64) Prepared 
     serial.writeString(name);
     serial.writeString("'\n");
 
-    // Build argv array from user-space argv pointer.
-    // Linux semantics: the caller's argv is authoritative — their argv[0] is
-    // the program's argv[0]. Only fall back to the resolved path when the
-    // caller supplied an empty/absent argv.
-    var argv_buffers: [16][128]u8 = undefined;
+    // Build argv and envp from the user pointers. Linux semantics: the caller's argv is authoritative (their argv[0] is the
+    // program's argv[0]); only an empty or absent argv falls back to the resolved name, and an absent envp is an empty environment.
+    // Every string is copied into one pool of ARG_POOL_BYTES, the size of the page they will share on the new stack, so a single
+    // string may be long as long as all of them fit together.
+    var pool: [policy.ARG_POOL_BYTES]u8 = undefined;
+    var used: usize = 0;
     var argv_slices: [16][]const u8 = undefined;
     var argc: usize = 0;
-
-    if (argv_ptr != 0 and argv_ptr < 0x0000_8000_0000_0000) {
+    var envp_slices: [16][]const u8 = undefined;
+    var envc: usize = 0;
+    for ([_]u64{ argv_ptr, envp_ptr }, 0..) |list_ptr, which| {
+        if (list_ptr == 0 or list_ptr >= 0x0000_8000_0000_0000) continue;
+        const out = if (which == 0) &argv_slices else &envp_slices;
+        const count = if (which == 0) &argc else &envc;
         for (0..16) |i| {
             var ptr_bytes: [8]u8 = undefined;
-            const pc = copy.copyFromUser(ptr_bytes[0..], @ptrFromInt(argv_ptr + i * 8), 8);
+            const pc = copy.copyFromUser(ptr_bytes[0..], @ptrFromInt(list_ptr + i * 8), 8);
             if (pc < 8) break;
-            const arg_ptr: u64 = @bitCast(ptr_bytes);
-            if (arg_ptr == 0 or arg_ptr >= 0x0000_8000_0000_0000) break;
-            const al = copy.copyStringFromUser(argv_buffers[i][0..policy.ARG_STRING_MAX], arg_ptr) orelse break;
-            // The copy stops at the buffer end: a string that fills it and is not at its NUL there was cut. That is E2BIG, not a
-            // shorter argument.
-            if (al == policy.ARG_STRING_MAX and !argEndsHere(arg_ptr, al)) return .{ .err = policy.errno(.too_big) };
-            argv_buffers[i][al] = 0;
-            argv_slices[i] = argv_buffers[i][0..al];
-            argc = i + 1;
+            const str_ptr: u64 = @bitCast(ptr_bytes);
+            if (str_ptr == 0 or str_ptr >= 0x0000_8000_0000_0000) break;
+            if (used >= pool.len) return .{ .err = policy.errno(.too_big) };
+            const room = pool.len - used;
+            const sl = copy.copyStringFromUser(pool[used..][0..room], str_ptr) orelse break;
+            // The copy stops at the end of the pool: a string that fills what is left and has no NUL there does not fit. That is
+            // E2BIG, not a shorter argument.
+            if (!policy.argFits(used, sl)) return .{ .err = policy.errno(.too_big) };
+            pool[used + sl] = 0;
+            out[i] = pool[used .. used + sl];
+            used += sl + 1;
+            count.* = i + 1;
         }
     }
     if (argc == 0) {
         argv_slices[0] = name;
         argc = 1;
-    }
-
-    // Build envp array from user-space envp pointer (same rules as argv:
-    // caller's envp is authoritative; absent envp means an empty environment).
-    var envp_buffers: [16][128]u8 = undefined;
-    var envp_slices: [16][]const u8 = undefined;
-    var envc: usize = 0;
-
-    if (envp_ptr != 0 and envp_ptr < 0x0000_8000_0000_0000) {
-        for (0..16) |i| {
-            var ptr_bytes: [8]u8 = undefined;
-            const pc = copy.copyFromUser(ptr_bytes[0..], @ptrFromInt(envp_ptr + i * 8), 8);
-            if (pc < 8) break;
-            const env_ptr: u64 = @bitCast(ptr_bytes);
-            if (env_ptr == 0 or env_ptr >= 0x0000_8000_0000_0000) break;
-            const el = copy.copyStringFromUser(envp_buffers[i][0..policy.ARG_STRING_MAX], env_ptr) orelse break;
-            if (el == policy.ARG_STRING_MAX and !argEndsHere(env_ptr, el)) return .{ .err = policy.errno(.too_big) };
-            envp_buffers[i][el] = 0;
-            envp_slices[i] = envp_buffers[i][0..el];
-            envc = i + 1;
-        }
     }
 
     // The strings and the pointer part of the initial stack share one page: when they cannot fit, say so (E2BIG) before anything

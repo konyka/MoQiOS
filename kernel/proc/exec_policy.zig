@@ -23,12 +23,15 @@ pub fn checkAtFlags(flags: u32) i64 {
     return if ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0) -22 else 0;
 }
 
-/// Longest execve argument or environment string the kernel keeps, not counting the NUL. Anything longer is E2BIG: silently cutting it
-/// would run the program with a different argument than the caller gave.
-pub const ARG_STRING_MAX: usize = 127;
+/// Bytes all execve argument and environment strings may take together, NULs included. They share the one 4 KiB page of the new
+/// program's initial stack (user_stack.fits decides whether the pointer part fits next to them), so there is no limit per string:
+/// one argument may use the whole pool. A list that does not fit is E2BIG; silently cutting a string would run the program with a
+/// different argument than the caller gave.
+pub const ARG_POOL_BYTES: usize = 4096;
 
-pub fn argFits(len: usize) bool {
-    return len <= ARG_STRING_MAX;
+/// True when a string of `len` bytes plus its NUL still fits in a pool that has `used` bytes taken.
+pub fn argFits(used: usize, len: usize) bool {
+    return used <= ARG_POOL_BYTES and len < ARG_POOL_BYTES - used;
 }
 
 pub const Failure = enum { denied, not_found, bad_format, no_memory, fault, too_big };
@@ -40,17 +43,21 @@ pub fn errno(f: Failure) i64 {
         .bad_format => -8, // ENOEXEC
         .no_memory => -12, // ENOMEM
         .fault => -14, // EFAULT
-        .too_big => -7, // E2BIG: an argument or environment string longer than ARG_STRING_MAX
+        .too_big => -7, // E2BIG: the argument and environment strings do not fit ARG_POOL_BYTES / the stack page
     };
 }
 
 const testing = @import("std").testing;
 
-test "an exec argument of up to 127 bytes fits, 128 does not" {
-    try testing.expect(argFits(0));
-    try testing.expect(argFits(127));
-    try testing.expect(!argFits(128));
-    try testing.expect(!argFits(4096));
+test "one exec string may use the whole pool, and the strings share it" {
+    try testing.expect(argFits(0, 0));
+    try testing.expect(argFits(0, 128));
+    try testing.expect(argFits(0, 4095));
+    try testing.expect(!argFits(0, 4096));
+    try testing.expect(argFits(4000, 95));
+    try testing.expect(!argFits(4000, 96));
+    try testing.expect(!argFits(4096, 0));
+    try testing.expect(!argFits(5000, 0));
 }
 
 test "too_big is E2BIG" {

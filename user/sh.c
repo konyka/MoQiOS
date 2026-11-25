@@ -28,11 +28,23 @@ static int g_pos_argc;
 static const char *g_pos_argv[MAX_POS]; /* [0] is $0, [1]..[9] are $1..$9 */
 static char g_pos_store[MAX_POS - 1][64];
 
+/* Copy argument text into the store for $i (1..9) so g_pos_argv[i] never points into a caller buffer that may be reused. */
+static void pos_set(int i, const char *text) {
+    if (i < 1 || i >= MAX_POS) return;
+    snprintf(g_pos_store[i - 1], sizeof(g_pos_store[0]), "%s", text);
+    g_pos_argv[i] = g_pos_store[i - 1];
+}
+
 /* Utility functions */
 
 /* True when standard input is a terminal: the prompt and the echo of typed characters are for people, and only a terminal can have
  * "no data yet" -- on a file or a pipe a read that returns 0 is the end of the input. */
 static int g_interactive = 1;
+
+/* Longest command line the shell takes, NUL included: a typed or read line, a "sh -c" argument, and each list element and its
+ * expansion. execve passes arguments of up to 4 KiB, so a "sh -c" line can be longer than this; it is refused (status 2) rather
+ * than run cut short, since the cut text would be a different command. */
+#define SH_LINE_MAX 1024
 
 /* Result of read_line at the end of the input (and nothing was read on the line). */
 #define LINE_EOF (-2)
@@ -475,7 +487,7 @@ static int execute_pipeline(const char *line) {
 
     /* "cmd args > file" (or "< file"): the text before the first '>' or '<' is the command, the file is not one of its arguments. The fork-and-exec path stops
      * each command at '>' by itself (copy_token), but a built-in reads the raw text, so cut it here for them. */
-    char single[256];
+    static char single[SH_LINE_MAX];
     if (ncmds == 1) {
         int n = 0;
         while (cmds[0][n] && cmds[0][n] != '>' && cmds[0][n] != '<' && n < (int)sizeof(single) - 1) { single[n] = cmds[0][n]; n++; }
@@ -553,8 +565,7 @@ static int execute_pipeline(const char *line) {
                         w = copy_token(word, sizeof(word), w);
                         if (!word[0]) break;
                         if (n < MAX_POS) {
-                            snprintf(g_pos_store[n - 1], sizeof(g_pos_store[0]), "%s", word);
-                            g_pos_argv[n] = g_pos_store[n - 1];
+                            pos_set(n, word);
                             n++;
                         }
                     }
@@ -602,8 +613,10 @@ static int execute_pipeline(const char *line) {
                 err_str("sh: shift: shift count out of range\n");
                 return 1 << 8;
             }
-            for (int i = 1; i + n < g_pos_argc; i++) g_pos_argv[i] = g_pos_argv[i + n];
+            const char *moved[MAX_POS];
+            for (int i = 1; i < g_pos_argc; i++) moved[i] = g_pos_argv[i];
             g_pos_argc -= n;
+            for (int i = 1; i < g_pos_argc; i++) pos_set(i, moved[i + n]);
             return 0;
         }
         /* "true" and "false" are status 0 and 1, as in every POSIX shell (there is no program for either). */
@@ -868,7 +881,7 @@ static int status_ok(int status) {
  * variable exported earlier in the same line are current); an empty element between separators counts as success. A single '&'
  * ends an element like ';' does but starts it as a background job (status 0, "$!" is its pid). */
 static int execute_list(const char *line) {
-    char elem[256];
+    static char elem[SH_LINE_MAX];
     int status = 0;
     int run_next = 1;
     const char *p = line;
@@ -887,7 +900,7 @@ static int execute_list(const char *line) {
                 e = skip_spaces(e + 1);
             }
             if (*e) {
-                char expanded[256];
+                static char expanded[SH_LINE_MAX];
                 if (expand_vars(e, expanded, sizeof(expanded)) < 0) {
                     /* nounset: an unset variable ends a shell that is not interactive (127 under -c, 1 for a script or piped
                      * input, as bash --posix does); at the prompt the rest of the line is dropped. */
@@ -961,8 +974,12 @@ int main(int argc, char **argv, char **envp) {
         /* "sh -c CMD name a b": name is $0 and a b are $1.. (POSIX); without them $0 is "sh". */
         g_pos_argv[0] = argi + 1 < argc ? argv[argi + 1] : "sh";
         g_pos_argc = 1;
-        for (int a = argi + 2; a < argc && g_pos_argc < MAX_POS; a++) g_pos_argv[g_pos_argc++] = argv[a];
-        char quoted[256];
+        for (int a = argi + 2; a < argc && g_pos_argc < MAX_POS; a++) pos_set(g_pos_argc++, argv[a]);
+        static char quoted[SH_LINE_MAX];
+        if (strlen(argv[argi]) >= sizeof(quoted)) {
+            err_str("sh: -c: command line too long\n");
+            return 2;
+        }
         snprintf(quoted, sizeof(quoted), "%s", argv[argi]);
         protect_quotes(quoted);
         int status = execute_list(quoted);
@@ -975,9 +992,7 @@ int main(int argc, char **argv, char **envp) {
     if (want_s) {
         g_pos_argv[0] = "sh";
         g_pos_argc = 1;
-        while (argi < argc && g_pos_argc < MAX_POS) {
-            g_pos_argv[g_pos_argc++] = argv[argi++];
-        }
+        while (argi < argc && g_pos_argc < MAX_POS) pos_set(g_pos_argc++, argv[argi++]);
     }
 
     /* "sh FILE a b": run the commands in FILE as if they had been piped in, with $0 the file name and a b as $1... The file replaces
@@ -985,7 +1000,7 @@ int main(int argc, char **argv, char **envp) {
     if (!want_s && argi < argc && argv[argi][0] != '-') {
         g_pos_argv[0] = argv[argi];
         g_pos_argc = 1;
-        for (int a = argi + 1; a < argc && g_pos_argc < MAX_POS; a++) g_pos_argv[g_pos_argc++] = argv[a];
+        for (int a = argi + 1; a < argc && g_pos_argc < MAX_POS; a++) pos_set(g_pos_argc++, argv[a]);
         long fd = open(argv[argi], O_RDONLY, 0);
         if (fd < 0) {
             print("sh: cannot open ");
@@ -1020,7 +1035,7 @@ int main(int argc, char **argv, char **envp) {
     for (;;) {
         jobs_reap_finished();
         if (g_interactive) print("> ");
-        char line[256];
+        static char line[SH_LINE_MAX];
         int len = read_line(line, sizeof(line));
         if (len == LINE_EOF) {
             int sig = last_status & 0x7f;
